@@ -1,0 +1,12 @@
+# Project-wide shellcheck configuration. CI runs `shellcheck -S style`; this
+# file pins the baseline so local runs match.
+shell=bash
+
+# Inline `# shellcheck disable=...` directives in ops.sh remain authoritative
+# for one-off exceptions (e.g. intentional word-splitting on alias expansion).
+# Global exclusions listed here should stay short and well-justified.
+
+# SC2016: single-quoted '$VAR' strings in ops.sh are intentionally unexpanded
+# on the host and expanded later by bash -c inside the container
+# (cmd_run --nix-cleanup / --update). Declared file-wide in ops.sh.
+disable=SC2016

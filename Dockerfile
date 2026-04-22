@@ -1,0 +1,220 @@
+# syntax=docker/dockerfile:1.6
+#
+# ops-dev — Arch-based dev container image used by ops.sh.
+# Ships: mise + Nix (packages via the merged mise-nix plugin, flake.nix env
+# activation) + base dev tools (git, semgrep, qlty, gh, ripgrep, jq, ast-grep,
+# node@lts). CLI agents (claude-code, gemini-cli, opencode, codex) are NOT
+# baked — they are installed on demand by ops.sh when you pass --claude /
+# --gemini / --opencode / --codex, and persist in the ops-share-mise volume.
+# mise handles both Nix package installation (nix:pkg@ver) and flake.nix
+# dev-shell activation; no other package manager is involved.
+#
+# Build args:
+#   USER_UID=$(id -u) USER_GID=$(id -g) USER_NAME=$(id -un)   match host user to avoid
+#                                                              file-ownership headaches
+#                                                              on bind-mounted workspaces
+#   USER_LANG=${LANG:-en_US.UTF-8}                             locale compiled at build time
+#   NIX_CLEANUP=true|false                                     run `nix-collect-garbage -d`
+#                                                              at the end of the tooling
+#                                                              layer (default: true — shaves
+#                                                              ~200 MB off the image)
+#
+# Build secret (passed only in-process, never baked into image layers):
+#   --secret id=github_token,env=GITHUB_TOKEN                  classic PAT, no scope — lifts
+#                                                              GitHub API rate limit during Nix
+#                                                              resolution (60 → 5000 req/h).
+#                                                              Read at build time from
+#                                                              /run/secrets/github_token if set.
+#
+# Build (recommended, via ops.sh):
+#   ./ops.sh build
+# Or directly:
+#   nerdctl build -t ops-dev \
+#     --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) \
+#     --build-arg USER_NAME=$(id -un) \
+#     --build-arg USER_LANG=${LANG:-en_US.UTF-8} \
+#     .
+
+FROM archlinux:base
+
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG USER_NAME=dev
+ARG USER_LANG=en_US.UTF-8
+ARG NIX_CLEANUP=true
+# Pinning: override NIX_VERSION / NIX_INSTALL_SHA256 / MISE_INSTALL_SHA256 at
+# build time to enforce byte-exact reproducibility. When SHA args are empty,
+# we fall back to HTTPS-only trust against the upstream mirror (the Nix and
+# mise installer scripts each verify their own binary payloads internally).
+ARG NIX_VERSION=2.32.2
+ARG NIX_INSTALL_SHA256=
+ARG MISE_INSTALL_SHA256=
+
+# -----------------------------------------------------------------------------
+# 1. System packages + locales
+# -----------------------------------------------------------------------------
+# archlinux:base strips locale data via NoExtract rules in /etc/pacman.conf
+# (usr/share/i18n/* and usr/share/locale/* — only en_* / C / POSIX kept).
+# We drop those rules, then reinstall glibc WITHOUT --needed so all locale
+# source files get re-extracted, allowing locale-gen to compile USER_LANG.
+RUN sed -i '/^NoExtract/d' /etc/pacman.conf \
+ && pacman -Syu --noconfirm --needed \
+      bash-completion ca-certificates curl sudo which \
+ && pacman -S --noconfirm glibc \
+ && sed -i "/${USER_LANG}/s/^# *//" /etc/locale.gen \
+ && locale-gen \
+ && pacman -Scc --noconfirm \
+ && rm -rf /var/cache/pacman/pkg/*
+
+ENV LANG=${USER_LANG} \
+    LC_ALL=${USER_LANG} \
+    TERM=xterm-256color \
+    MISE_TRUSTED_CONFIG_PATHS=/workspace \
+    MISE_EXPERIMENTAL=true \
+    MISE_INSTALL_PATH=/opt/mise/bin/mise \
+    MISE_DATA_DIR=/opt/mise/data \
+    MISE_CACHE_DIR=/opt/mise/cache \
+    MISE_CONFIG_DIR=/opt/mise/config \
+    MISE_STATE_DIR=/opt/mise/state
+# Relocating mise + nix-profile out of $HOME (to /opt/mise and /opt/nix-home)
+# means the ops-mise volume and the nix profile symlink survive a $HOME
+# bind-mount (e.g. --with-home / --with-home-volumes).
+
+# -----------------------------------------------------------------------------
+# 2. Non-root user with matching UID/GID
+# -----------------------------------------------------------------------------
+RUN groupadd -g "${USER_GID}" "${USER_NAME}" \
+ && useradd -m -u "${USER_UID}" -g "${USER_GID}" -s /bin/bash "${USER_NAME}" \
+ && echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" \
+ && chmod 440 "/etc/sudoers.d/${USER_NAME}" \
+ && mkdir -m 0755 /nix /opt/mise /opt/nix-home \
+ && chown "${USER_NAME}:${USER_NAME}" /nix /opt/mise /opt/nix-home
+# /nix is pre-created so the single-user Nix installer can write there as a
+# non-root user. /opt/mise holds the mise binary + data (shims, installs,
+# plugins) outside $HOME so an ops-mise volume on /opt/mise/data survives a
+# --with-home bind-mount. /opt/nix-home is the HOME passed to the Nix
+# installer so .nix-profile and the XDG state dir land outside user $HOME.
+
+# Rootless nerdctl limitation: in rootless mode, host UID 1000 maps to container
+# UID 0 (root in the namespace). This USER runs the process as UID 1000 inside
+# the container, which corresponds to UID ~101000 on the host — unable to read
+# or write bind-mounted files owned by host UID 1000 (e.g. ~/.claude, $PWD).
+# Workaround: launch tools needing access to host files with --user 0
+# (container root = host UID 1000) and --env HOME=/home/<user>.
+USER ${USER_NAME}
+WORKDIR /home/${USER_NAME}
+
+# Pre-create XDG-style user dirs so bind-mounts don't create their parent
+# dirs as root:root at runtime, breaking later writes (e.g. uv, opencode).
+# mise-related dirs live under /opt/mise (see ENV above) so they are not
+# pre-created here.
+RUN mkdir -p "$HOME/.local/bin" \
+             "$HOME/.local/share" \
+             "$HOME/.local/state" \
+             "$HOME/.cache" \
+             "$HOME/.config"
+
+# -----------------------------------------------------------------------------
+# 3. Nix single-user (required by the mise-nix plugin; no daemon possible in
+#    rootless mode)
+# -----------------------------------------------------------------------------
+# System-wide /etc/nix/nix.conf is read regardless of $HOME ownership, which
+# matters in rootless: /home/$USER is UID 1000 in namespace but we run as UID 0,
+# so Nix warns and falls back to /root — skipping the user's ~/.config/nix/nix.conf.
+# Setting build-users-group empty here keeps nix in single-user mode even then.
+#
+# We run the installer with HOME=/opt/nix-home so the .nix-profile symlink,
+# XDG state dir (.local/state/nix) and bash-profile hooks land under
+# /opt/nix-home/* instead of user $HOME. /opt/nix-home is image-baked (not a
+# volume), so its symlinks resolve to /nix/store paths served by ops-nix at
+# runtime. Experimental features live in /etc/nix/nix.conf (system-wide), so
+# we no longer need a user-level nix.conf.
+# Installer is fetched from a versioned URL (not the floating /nix/install)
+# and, when NIX_INSTALL_SHA256 is set, checksum-verified before execution.
+# No GitHub token is written into /etc/nix/nix.conf: it would persist in the
+# image layer. GITHUB_TOKEN is consumed only transiently by the RUN below
+# that performs `mise use` (via --mount=type=secret), never baked in.
+RUN HOME=/opt/nix-home curl -fsSL --retry 3 --max-time 120 \
+      -o /tmp/nix-install.sh "https://releases.nixos.org/nix/nix-${NIX_VERSION}/install" \
+ && if [ -n "${NIX_INSTALL_SHA256}" ]; then \
+      echo "${NIX_INSTALL_SHA256}  /tmp/nix-install.sh" | sha256sum -c -; \
+    fi \
+ && HOME=/opt/nix-home sh /tmp/nix-install.sh --no-daemon \
+ && rm -f /tmp/nix-install.sh \
+ && sudo mkdir -p /etc/nix \
+ && printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' \
+      | sudo tee /etc/nix/nix.conf > /dev/null
+
+# Expose nix + mise shims in PATH for every subsequent RUN and for the
+# Lua hooks that mise spawns as sub-processes (which inherit the ENV PATH,
+# not the transient PATH set by `source nix.sh`). Paths are rooted at /opt/*
+# so they remain valid even when $HOME is bind-mounted from the host.
+ENV PATH=/opt/nix-home/.nix-profile/bin:/opt/mise/data/shims:/opt/mise/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# -----------------------------------------------------------------------------
+# 4. mise (env-manager — single ~20 MB binary, installed at /opt/mise/bin)
+# -----------------------------------------------------------------------------
+# Installer reads MISE_INSTALL_PATH + MISE_*_DIR from ENV above to place the
+# binary at /opt/mise/bin/mise and state/cache/data under /opt/mise/*.
+RUN curl -fsSL --retry 3 --max-time 120 -o /tmp/mise-install.sh https://mise.run \
+ && if [ -n "${MISE_INSTALL_SHA256}" ]; then \
+      echo "${MISE_INSTALL_SHA256}  /tmp/mise-install.sh" | sha256sum -c -; \
+    fi \
+ && sh /tmp/mise-install.sh \
+ && rm -f /tmp/mise-install.sh \
+ && chmod 755 /opt/mise/bin/mise
+
+# -----------------------------------------------------------------------------
+# 5. mise tools (merged mise-nix plugin + GitHub/npm backends) + shell setup
+# -----------------------------------------------------------------------------
+# The local mise-nix plugin is copied straight into
+# /opt/mise/data/plugins/nix/ so mise auto-discovers it (MISE_DATA_DIR).
+# Base dev tools are installed in one `mise use -g` pass (nix:* via the
+# plugin, github:* via the built-in backend). node@lts is baked as the base
+# for any npm: agent that ops.sh later installs on demand. bashrc is
+# populated last, with mise activation followed by a fast
+# command_not_found override (mise's default handler runs a network lookup
+# per unknown command, which is slow).
+COPY --chown=${USER_NAME}:${USER_NAME} mise/ /opt/mise/data/plugins/nix/
+
+RUN --mount=type=secret,id=github_token,required=false \
+    . /opt/nix-home/.nix-profile/etc/profile.d/nix.sh \
+ && if [ -s /run/secrets/github_token ]; then \
+      export GITHUB_TOKEN="$(cat /run/secrets/github_token)"; \
+      export NIX_CONFIG="access-tokens = github.com=${GITHUB_TOKEN}"; \
+    fi \
+ && /opt/mise/bin/mise use -g \
+      nix:git nix:semgrep \
+      github:qltysh/qlty github:cli/cli github:BurntSushi/ripgrep \
+      github:jqlang/jq github:ast-grep/ast-grep \
+      node@lts \
+ && mkdir -p /nix/var/nix/gcroots/mise \
+ && for f in /opt/mise/data/installs/nix-*/*; do \
+      [ -L "$f" ] || continue; \
+      t=$(readlink -f "$f"); \
+      case "$t" in \
+        /nix/store/*) \
+          ln -sfn "$t" "/nix/var/nix/gcroots/mise/$(basename "$(dirname "$f")")-$(basename "$f")"; \
+          ;; \
+      esac; \
+    done \
+ && if [ "$NIX_CLEANUP" = "true" ]; then \
+      HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d; \
+    fi \
+ && echo 'source /opt/nix-home/.nix-profile/etc/profile.d/nix.sh' >> "$HOME/.bashrc" \
+ && echo '. /usr/share/bash-completion/bash_completion' >> "$HOME/.bashrc" \
+ && echo 'alias ls="ls --color=auto"'     >> "$HOME/.bashrc" \
+ && echo 'alias ll="ls -lh"'               >> "$HOME/.bashrc" \
+ && echo 'alias la="ls -A"'                >> "$HOME/.bashrc" \
+ && echo 'alias l="ls -CF"'                >> "$HOME/.bashrc" \
+ && echo 'alias grep="grep --color=auto"'  >> "$HOME/.bashrc" \
+ && echo 'PS1="\[\e[01;36m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ "' >> "$HOME/.bashrc" \
+ && echo 'eval "$(mise activate bash)"' >> "$HOME/.bashrc" \
+ && echo 'command_not_found_handle() { printf "bash: %s: command not found\n" "$1" >&2; return 127; }' >> "$HOME/.bashrc"
+
+# -----------------------------------------------------------------------------
+# 6. Entrypoint (PATH is set right after the Nix install above)
+# -----------------------------------------------------------------------------
+WORKDIR /workspace
+
+CMD ["bash"]

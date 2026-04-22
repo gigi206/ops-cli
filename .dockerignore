@@ -1,0 +1,15 @@
+# Don't ship plugin vendor git history into the image
+mise/.git
+mise/.github
+mise/spec
+mise/test
+mise/node_modules
+
+# Backups and transient archives
+*.bak
+*.bak-*
+ops-dev-backup.tar.gz
+
+# Editor / tooling noise
+.vscode
+.idea
