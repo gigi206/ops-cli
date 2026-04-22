@@ -1,0 +1,13 @@
+# Test artefacts — two tests in tests/test_images.bats create these next to
+# ops.sh to verify the Dockerfile.<key> auto-detection path. Their trap EXIT
+# cleanup is best-effort, so they may occasionally survive a test run.
+Dockerfile.autodetect
+Dockerfile.ml
+
+# Per-image Dockerfile hash + build locks (when OPS_CACHE points into the repo)
+.sha256sum
+*.lock
+
+# Backup files created manually (never commit)
+*.bak
+*.bak-*

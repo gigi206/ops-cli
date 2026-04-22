@@ -1,0 +1,138 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Workflow-wide least-privilege: read-only access to repo contents.
+# Individual jobs may widen this (they currently don't need to).
+permissions:
+  contents: read
+
+jobs:
+  bats:
+    name: bats + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache apt packages
+        id: apt-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives/*.deb
+          key: apt-bats-shellcheck-${{ runner.os }}-v1
+
+      - name: Install bats + shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats shellcheck
+
+      - name: Shellcheck ops.sh (style level)
+        run: shellcheck -S style ops.sh
+
+      - name: Bash syntax check
+        run: bash -n ops.sh
+
+      - name: Run bats tests
+        run: bats --tap tests/
+
+  hadolint:
+    name: hadolint Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          # DL3008: apt pin — intentional for pacman base image, not applicable
+          # DL3059: multiple RUN — we batch on purpose for cacheability
+          ignore: DL3008,DL3059
+      - name: hadolint Dockerfile.debian (if present)
+        if: hashFiles('Dockerfile.debian') != ''
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.debian
+          ignore: DL3008,DL3059
+
+  runtime-build:
+    name: build smoke (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    needs: [bats, hadolint]
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [docker, podman, nerdctl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install docker
+        if: matrix.runtime == 'docker'
+        run: |
+          # docker is preinstalled on ubuntu-latest, just verify
+          docker --version
+
+      - name: Install podman
+        if: matrix.runtime == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Prepare systemd user session (nerdctl)
+        if: matrix.runtime == 'nerdctl'
+        run: |
+          sudo loginctl enable-linger "$USER" || true
+          # Ensure XDG_RUNTIME_DIR exists so `systemctl --user` works in the
+          # non-interactive shell of the workflow step.
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+
+      - name: Install nerdctl via ops.sh
+        if: matrix.runtime == 'nerdctl'
+        env:
+          XDG_RUNTIME_DIR: /run/user/1001   # ubuntu-latest runner UID
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Non-interactive install: pipe Y so the "Overwrite?" prompt is accepted.
+          yes Y | OPS_RUNTIME=nerdctl ./ops.sh nerdctl install
+          systemctl --user start containerd.service || true
+
+      - name: Build image (${{ matrix.runtime }})
+        env:
+          OPS_RUNTIME: ${{ matrix.runtime }}
+          GITHUB_TOKEN: ${{ github.token }}
+          # Skip the nix cleanup step to keep CI under ~5 min
+          # (the actual Nix build still runs; only the GC is skipped)
+        run: |
+          # Minimal smoke: parse + tag the Dockerfile without pulling the
+          # entire Nix tree. We run `build` with a tiny base to validate the
+          # full pipeline of ops.sh (flags, lock, hash, labels) against every
+          # runtime — not the heavy Arch image itself (which would take 30min+).
+          cat > Dockerfile.cismoke <<'EOF'
+          # syntax=docker/dockerfile:1.6
+          FROM docker.io/library/alpine:3.19
+          ARG USER_UID=1000
+          ARG USER_GID=1000
+          ARG USER_NAME=ci
+          ARG USER_LANG=C
+          RUN addgroup -g "$USER_GID" "$USER_NAME" \
+           && adduser -D -u "$USER_UID" -G "$USER_NAME" "$USER_NAME"
+          USER ${USER_NAME}
+          CMD ["sh"]
+          EOF
+          OPS_IMAGE=localhost/ops-ci-smoke \
+          OPS_DOCKERFILE=Dockerfile.cismoke \
+            ./ops.sh build
+          # Sanity: the image must exist and carry the ops.dockerfile label
+          if [ "$OPS_RUNTIME" = "nerdctl" ]; then
+            bin="$HOME/.local/share/ops/nerdctl/bin/nerdctl"
+          else
+            bin="$OPS_RUNTIME"
+          fi
+          "$bin" image inspect localhost/ops-ci-smoke --format '{{index .Config.Labels "ops.dockerfile"}}' | grep -q 'Dockerfile.cismoke'

@@ -1,0 +1,74 @@
+mise plugin "nix"
+Copyright (c) 2026 Ghislain LE MEUR
+
+This product is a derivative work combining source code from two upstream
+mise plugins. Each source file carries an SPDX-License-Identifier header
+declaring its applicable license. A summary is provided below.
+
+================================================================================
+Upstream projects
+================================================================================
+
+1. jbadeau/mise-nix
+   License:  Apache License, Version 2.0 (see LICENSE)
+   Copyright: (c) 2024 Jose Badeau
+   Source:   https://github.com/jbadeau/mise-nix
+   Version:  mise-nix@0.19.0 (commit 0976609, 2026-04-16)
+
+2. mise-plugins/mise-nix (fork of joshbode/mise-nix)
+   License:  MIT License (see LICENSE.MIT)
+   Copyright: (c) 2024 Josh Bode
+   Source:   https://github.com/mise-plugins/mise-nix
+   Version:  main branch, imported around 2026-04
+             (exact commit SHA not pinned at import time; for byte-exact
+             reproducibility, re-import from a specific tag or commit and
+             update this line.)
+
+================================================================================
+Per-file license map
+================================================================================
+
+Files licensed under Apache-2.0 (see LICENSE) -- from jbadeau/mise-nix:
+  hooks/backend_exec_env.lua       (modified by Ghislain LE MEUR, shell escape)
+  hooks/backend_install.lua
+  hooks/backend_list_versions.lua
+  lib/flake.lua                    (modified by Ghislain LE MEUR, pass parsed desc to security)
+  lib/install.lua                  (modified by Ghislain LE MEUR, ~18 lines)
+  lib/jetbrains.lua                (modified by Ghislain LE MEUR, plugin_matcher)
+  lib/logger.lua
+  lib/neovim.lua                   (modified by Ghislain LE MEUR, plugin_matcher)
+  lib/nixhub.lua                   (modified by Ghislain LE MEUR, ~70 lines)
+  lib/platform.lua                 (modified by Ghislain LE MEUR, shell escape)
+  lib/security.lua                 (modified by Ghislain LE MEUR, stricter path checks)
+  lib/shell.lua                    (modified by Ghislain LE MEUR, +shquote helper)
+  lib/tempdir.lua                  (modified by Ghislain LE MEUR, mktemp-based)
+  lib/version.lua
+  lib/vscode.lua                   (modified by Ghislain LE MEUR, plugin_matcher)
+  lib/vsix.lua                     (modified by Ghislain LE MEUR, version field)
+
+Files authored by Ghislain LE MEUR (Apache-2.0):
+  lib/plugin_matcher.lua           (shared plugin-detection helpers)
+  metadata.lua                     (combined-work manifest)
+
+Files licensed under MIT (see LICENSE.MIT) -- from mise-plugins/mise-nix:
+  hooks/mise_env.lua
+  hooks/mise_path.lua
+  lib/utils.lua
+  types.lua
+
+================================================================================
+Modifications summary
+================================================================================
+
+Modifications by Ghislain LE MEUR (2026):
+  - Set PLUGIN.name to "nix" in metadata.lua so both addressings use
+    the same prefix: backend ("nix:pkg@ver") and env plugin
+    ([env] _.nix = true).
+  - Adapted lib/nixhub.lua to the new nixhub API (~70 lines).
+  - Extended lib/install.lua with additional logic (~18 lines).
+  - Imported the four MIT-licensed files listed above into the Apache-licensed
+    backend plugin tree; each retains an SPDX header crediting Josh Bode.
+
+The combined work is distributed under the Apache License, Version 2.0.
+Files licensed under MIT retain their original copyright and license and must
+be redistributed together with LICENSE.MIT.
