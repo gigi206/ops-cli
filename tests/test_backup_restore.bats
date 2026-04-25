@@ -32,12 +32,14 @@ setup() {
     # Our volume inspect mock succeeds by default for image inspect, but
     # volume inspect is a no-op (just exits 0) — so the guard passes.
     run env OPS_RUNTIME=docker "$(ops_sh)" backup ops-share-nix
+    [ "$status" -eq 0 ]
     # docker run should be invoked with tar -czf
     grep -qE 'run .*-v ops-share-nix:/data.*alpine tar -czf' "$MOCK_LOG"
 }
 
 @test "backup passes volume name as read-only mount" {
     run env OPS_RUNTIME=docker "$(ops_sh)" backup my-vol
+    [ "$status" -eq 0 ]
     grep -qE 'my-vol:/data:ro' "$MOCK_LOG"
 }
 
@@ -54,21 +56,25 @@ setup() {
     # We can't easily force a real TTY; verify the opposite — the guard
     # is NOT triggered when stdin is piped (via heredoc).
     run bash -c "echo fake-tar-data | env OPS_RUNTIME=docker '$(ops_sh)' restore some-vol"
+    [ "$status" -eq 0 ]
     [[ "$output" != *"Refusing to read"* ]]
 }
 
 @test "restore creates the volume first (ensure_volume)" {
     run bash -c "echo data | env OPS_RUNTIME=docker '$(ops_sh)' restore new-vol"
+    [ "$status" -eq 0 ]
     grep -qE 'volume create --label ops.volume=true new-vol' "$MOCK_LOG"
 }
 
 @test "restore calls docker run with tar -xzf" {
     run bash -c "echo data | env OPS_RUNTIME=docker '$(ops_sh)' restore my-vol"
+    [ "$status" -eq 0 ]
     grep -qE 'run .*-v my-vol:/data.*alpine tar -xzf' "$MOCK_LOG"
 }
 
 @test "restore passes volume name as writable mount" {
     run bash -c "echo data | env OPS_RUNTIME=docker '$(ops_sh)' restore my-vol"
+    [ "$status" -eq 0 ]
     # NO :ro on restore (writable)
     grep -qE 'my-vol:/data (--user|--rm|alpine)' "$MOCK_LOG" || \
         grep -qE 'my-vol:/data\b' "$MOCK_LOG"

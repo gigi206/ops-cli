@@ -42,9 +42,11 @@ function M.install_via_vsix(vsix_path)
     return true, "skipped_in_ci"
   end
 
-  -- Try to install the extension locally
-  local install_cmd = 'code --install-extension "%s"'
-  local final_cmd = string.format(install_cmd .. ' 2>&1', vsix_path)
+  -- Try to install the extension locally.
+  -- shell.shquote() wraps vsix_path in single quotes and escapes any embedded
+  -- apostrophes — the previous literal "…%s…" double-quoted form let a weird
+  -- path (unlikely but possible on tmpfs test fixtures) break out of the word.
+  local final_cmd = "code --install-extension " .. shell.shquote(vsix_path) .. " 2>&1"
 
   local ok, output = shell.try_exec(final_cmd)
 
@@ -91,7 +93,7 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
   -- Read package.json to extract extension metadata
   local package_json_path = ext_path .. "/package.json"
   local package_json_content = ""
-  local ok, result = shell.try_exec('cat "%s"', package_json_path)
+  local ok, result = shell.try_exec("cat " .. shell.shquote(package_json_path))
   if ok then
     package_json_content = result
   end
@@ -133,7 +135,15 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
   local content_types = [[<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension=".json" ContentType="application/json"/><Default Extension=".vsixmanifest" ContentType="text/xml"/><Default Extension=".md" ContentType="text/markdown"/><Default Extension=".js" ContentType="application/javascript"/><Default Extension=".ts" ContentType="application/typescript"/><Default Extension=".html" ContentType="text/html"/><Default Extension=".css" ContentType="text/css"/><Default Extension=".scss" ContentType="text/css"/><Default Extension=".less" ContentType="text/css"/><Default Extension=".xml" ContentType="text/xml"/><Default Extension=".yaml" ContentType="text/yaml"/><Default Extension=".yml" ContentType="text/yaml"/><Default Extension=".txt" ContentType="text/plain"/><Default Extension=".log" ContentType="text/plain"/><Default Extension=".py" ContentType="text/plain"/><Default Extension=".go" ContentType="text/plain"/><Default Extension=".java" ContentType="text/plain"/><Default Extension=".c" ContentType="text/plain"/><Default Extension=".cpp" ContentType="text/plain"/><Default Extension=".h" ContentType="text/plain"/><Default Extension=".hpp" ContentType="text/plain"/><Default Extension=".rs" ContentType="text/plain"/><Default Extension=".php" ContentType="text/plain"/><Default Extension=".rb" ContentType="text/plain"/><Default Extension=".sh" ContentType="text/plain"/><Default Extension=".png" ContentType="image/png"/><Default Extension=".jpg" ContentType="image/jpeg"/><Default Extension=".jpeg" ContentType="image/jpeg"/><Default Extension=".gif" ContentType="image/gif"/><Default Extension=".svg" ContentType="image/svg+xml"/><Default Extension=".ico" ContentType="image/x-icon"/><Default Extension=".ttf" ContentType="font/ttf"/><Default Extension=".woff" ContentType="font/woff"/><Default Extension=".woff2" ContentType="font/woff2"/><Default Extension=".eot" ContentType="application/vnd.ms-fontobject"/></Types>]]
   
-  shell.exec('cat > "%s/[Content_Types].xml" << \'EOF\'\n%sEOF', temp_dir, content_types)
+  -- Write directly via Lua io so arbitrary content (including a lone "EOF"
+  -- line) can't prematurely close a shell heredoc.
+  do
+    local ct_path = temp_dir .. "/[Content_Types].xml"
+    local fh, err = io.open(ct_path, "w")
+    if not fh then error("failed to open " .. ct_path .. ": " .. tostring(err)) end
+    fh:write(content_types)
+    fh:close()
+  end
   
   -- Determine icon and license paths
   local icon_path = ""
@@ -145,7 +155,7 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
     -- Look for common icon files
     local common_icons = {"icon.png", "images/icon.png", "media/icon.png", "assets/icon.png"}
     for _, icon_file in ipairs(common_icons) do
-      local ok, _ = shell.try_exec('test -f "%s"', ext_path .. "/" .. icon_file)
+      local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/" .. icon_file))
       if ok then
         icon_path = "extension/" .. icon_file
         break
@@ -156,7 +166,7 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
   -- Look for license files
   local common_licenses = {"LICENSE", "LICENSE.txt", "LICENSE.md", "license", "license.txt", "license.md"}
   for _, license_file in ipairs(common_licenses) do
-    local ok, _ = shell.try_exec('test -f "%s"', ext_path .. "/" .. license_file)
+    local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/" .. license_file))
     if ok then
       license_path = "extension/" .. license_file
       break
@@ -211,8 +221,8 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
     tags, categories, package_data.engine,
     license_path ~= "" and string.format('\n\t\t\t<License>%s</License>', license_path) or "",
     icon_path ~= "" and string.format('\n\t\t\t<Icon>%s</Icon>', icon_path) or "",
-    (function() local ok, _ = shell.try_exec('test -f "%s"', ext_path .. "/README.md"); return ok end)() and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />' or "",
-    (function() local ok, _ = shell.try_exec('test -f "%s"', ext_path .. "/CHANGELOG.md"); return ok end)() and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true" />' or "",
+    (function() local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/README.md")); return ok end)() and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />' or "",
+    (function() local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/CHANGELOG.md")); return ok end)() and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true" />' or "",
     license_path ~= "" and string.format('\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="%s" Addressable="true" />', license_path) or ""
   )
   
@@ -221,7 +231,13 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
     vsix_manifest = vsix_manifest:gsub("</Assets>", string.format('\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="%s" Addressable="true" />\n\t\t</Assets>', icon_path))
   end
   
-  shell.exec('cat > "%s/extension.vsixmanifest" << \'EOF\'\n%sEOF', temp_dir, vsix_manifest)
+  do
+    local mf_path = temp_dir .. "/extension.vsixmanifest"
+    local fh, err = io.open(mf_path, "w")
+    if not fh then error("failed to open " .. mf_path .. ": " .. tostring(err)) end
+    fh:write(vsix_manifest)
+    fh:close()
+  end
 end
 
 -- VSIX file creation and installation in temporary directory only
@@ -232,18 +248,25 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
 
   -- First try the exact extension ID
   local test_path = nix_store_path .. "/share/vscode/extensions/" .. ext_id
-  if shell.try_exec('test -d "%s"', test_path) then
+  if shell.try_exec("test -d " .. shell.shquote(test_path)) then
     ext_path = test_path
   else
-    -- Try to find the actual directory name (case-insensitive)
-    local ok, find_result = shell.try_exec('find "%s/share/vscode/extensions" -maxdepth 1 -type d -iname "%s" 2>/dev/null | head -1',
-                                           nix_store_path, ext_id)
+    -- Try to find the actual directory name (case-insensitive).
+    -- ext_id is injected into `-iname` where find treats it as a glob, not a
+    -- shell command — shquoting the full argument keeps shell metacharacters
+    -- harmless.
+    local ext_root = nix_store_path .. "/share/vscode/extensions"
+    local ok, find_result = shell.try_exec(
+      "find " .. shell.shquote(ext_root) ..
+      " -maxdepth 1 -type d -iname " .. shell.shquote(ext_id) .. " 2>/dev/null | head -1")
     if ok and find_result and type(find_result) == "string" and find_result ~= "" then
       ext_path = find_result:gsub("%s+$", "") -- trim whitespace
     else
       -- Last resort: get the first (and likely only) extension directory
-      ok, find_result = shell.try_exec('find "%s/share/vscode/extensions" -maxdepth 1 -type d ! -path "%s/share/vscode/extensions" 2>/dev/null | head -1',
-                                       nix_store_path, nix_store_path)
+      ok, find_result = shell.try_exec(
+        "find " .. shell.shquote(ext_root) ..
+        " -maxdepth 1 -type d ! -path " .. shell.shquote(ext_root) ..
+        " 2>/dev/null | head -1")
       if ok and find_result and type(find_result) == "string" and find_result ~= "" then
         ext_path = find_result:gsub("%s+$", "")
         logger.debug("Using found extension directory: " .. ext_path)
@@ -259,56 +282,76 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
 
   -- Debug: Check if extension path exists and what's in it
   logger.debug("Extension path: " .. ext_path)
-  local ls_result = shell.try_exec('ls -la "%s" 2>&1', ext_path)
+  local ls_result = shell.try_exec("ls -la " .. shell.shquote(ext_path) .. " 2>&1")
   if ls_result then
     logger.debug("Extension directory contents: " .. tostring(ls_result))
   end
 
   -- Check if package.json exists directly in the extension path
-  local pkg_check = shell.try_exec('test -f "%s/package.json" && echo "package.json found at root" || echo "package.json NOT at root"', ext_path)
+  local pkg_check = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/package.json")
+    .. ' && echo "package.json found at root" || echo "package.json NOT at root"')
   logger.debug("Package.json check: " .. tostring(pkg_check))
 
-  -- Create VSIX file with proper structure using temporary directory
+  -- Create VSIX file with proper structure using temporary directory.
+  -- Capture install_ok / install_status in the outer scope: pcall wrapping a
+  -- function that returns multiple values collapses them on a 2-var
+  -- destructure, and with_temp_dir now removes the directory on return so
+  -- the VSIX file no longer exists past this block anyway.
   local vsix_path = nil
+  local install_ok, install_status = nil, nil
   local zip_ok, zip_result = pcall(function()
-    return tempdir.with_temp_dir("mise_vsix_" .. ext_id:gsub("%.", "_"), function(temp_dir)
+    tempdir.with_temp_dir("mise_vsix_" .. ext_id:gsub("%.", "_"), function(temp_dir)
       -- Set the VSIX path within the temp directory
       vsix_path = temp_dir .. "/" .. vsix_name
 
-      cmd.exec("mkdir -p " .. file.join_path(temp_dir, "extension"))
-      -- Copy extension files, handling different possible structures
+      cmd.exec("mkdir -p " .. shell.shquote(file.join_path(temp_dir, "extension")))
+      -- Copy extension files, handling different possible structures.
+      -- shquote wraps the bases; the `/*` glob and trailing `/` live outside
+      -- the quoted words so the shell expands them.
       local copy_success = pcall(function()
         -- Try copying all contents from the extension directory
-        shell.exec('cp -r "%s"/* "%s/extension/"', ext_path, temp_dir)
+        shell.exec("cp -r " .. shell.shquote(ext_path) .. "/* " .. shell.shquote(temp_dir) .. "/extension/")
       end)
 
       if not copy_success then
         -- Fallback: try copying the directory itself
-        pcall(function()
-          shell.exec('cp -r "%s" "%s/extension_tmp" && mv "%s/extension_tmp"/* "%s/extension/"', ext_path, temp_dir, temp_dir, temp_dir)
+        copy_success = pcall(function()
+          shell.exec("cp -r " .. shell.shquote(ext_path) .. " " .. shell.shquote(temp_dir) .. "/extension_tmp"
+            .. " && mv " .. shell.shquote(temp_dir) .. "/extension_tmp/* " .. shell.shquote(temp_dir) .. "/extension/")
         end)
       end
+      if not copy_success then
+        error("failed to copy extension files from " .. ext_path)
+      end
+      -- Sanity-check: without package.json the resulting VSIX would be
+      -- invalid, so fail loudly rather than producing a silently broken
+      -- artifact further down.
+      local pkg_ok = shell.try_exec("test -f " .. shell.shquote(temp_dir .. "/extension/package.json"))
+      if not pkg_ok then
+        error("extension copy produced no package.json in " .. temp_dir .. "/extension")
+      end
       -- Fix permissions on copied files so they can be deleted
-      shell.exec('chmod -R u+w "%s"', temp_dir)
+      shell.exec("chmod -R u+w " .. shell.shquote(temp_dir))
 
       -- Debug: Check what's actually in the temp directory after copy
-      local temp_contents = shell.try_exec('ls -la "%s/extension/" 2>&1 | head -5', temp_dir)
+      local temp_contents = shell.try_exec("ls -la " .. shell.shquote(temp_dir .. "/extension/") .. " 2>&1 | head -5")
       logger.debug("Temp extension directory contents: " .. tostring(temp_contents))
 
-      local pkg_in_temp = shell.try_exec('test -f "%s/extension/package.json" && echo "package.json exists in temp" || echo "package.json MISSING in temp"', temp_dir)
+      local pkg_in_temp = shell.try_exec("test -f " .. shell.shquote(temp_dir .. "/extension/package.json")
+        .. ' && echo "package.json exists in temp" || echo "package.json MISSING in temp"')
       logger.debug("Package.json in temp: " .. tostring(pkg_in_temp))
 
       -- Create required VSIX manifest files
       M.create_vsix_manifest(temp_dir, ext_id, ext_path)
 
-      shell.exec('cd "%s" && zip -r "%s" . -x "*.DS_Store"', temp_dir, vsix_name)
+      shell.exec("cd " .. shell.shquote(temp_dir) .. " && zip -r " .. shell.shquote(vsix_name) .. ' . -x "*.DS_Store"')
 
       logger.done("Created VSIX: " .. vsix_path)
 
-      -- Install the VSIX file directly from temp directory
-      local install_ok, install_status = M.install_via_vsix(vsix_path)
-
-      return install_ok, install_status
+      -- Install the VSIX file directly from temp directory.
+      -- Results are assigned to the outer locals above so they survive
+      -- tempdir cleanup + the enclosing pcall.
+      install_ok, install_status = M.install_via_vsix(vsix_path)
     end)
   end)
 
@@ -323,12 +366,6 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
     end
     logger.fail("VSIX creation failed: " .. error_msg)
     return false, nil
-  end
-
-  -- zip_result contains the install_ok, install_status from the temp dir function
-  local install_ok, install_status = zip_result, nil
-  if type(zip_result) == "table" then
-    install_ok, install_status = zip_result[1], zip_result[2]
   end
 
   return install_ok, vsix_path, install_status

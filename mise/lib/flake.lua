@@ -157,12 +157,13 @@ function M.parse_reference(flake_ref)
   }
 end
 
--- Get available versions for a flake (mock implementation for now)
+-- Flakes don't expose an enumerable version registry the way classical
+-- package indexes do (no equivalent of `pypi.org/pypi/<pkg>/json`). Callers
+-- that need to pin a specific revision do it through M.build(flake_ref,
+-- version) which appends `/<rev>` or `?rev=…` to the flake URI. This hook
+-- therefore returns a single logical slot — "latest" for remote flakes,
+-- "local" for local ones — so mise's version selector stays consistent.
 function M.get_versions(flake_ref)
-  -- NOTE: This is a mock implementation.
-  -- For flakes, enumerating historical versions like with traditional package registries is complex
-  -- and generally requires inspecting the flake's git history or specific commands.
-  -- For now, we return 'latest' or 'local' as logical representations.
   local parsed = M.parse_reference(flake_ref)
 
   -- Try to get commit info if it's a git-based flake
@@ -212,7 +213,10 @@ function M.build(flake_ref, version)
 
   local env_prefix = platform.get_env_prefix()
   local impure_flag = platform.get_impure_flag()
-  local cmdline = string.format("%snix build %s--no-link --print-out-paths '%s'", env_prefix, impure_flag, build_ref)
+  -- shell.shquote wraps the ref in '…', escaping any embedded single-quote —
+  -- safer than the previous hand-written "'%s'" when build_ref ends up with a
+  -- literal apostrophe (rare in flake URIs, fatal if it happens).
+  local cmdline = string.format("%snix build %s--no-link --print-out-paths %s", env_prefix, impure_flag, shell.shquote(build_ref))
 
   logger.step("Building flake " .. build_ref .. "...")
   local result = shell.exec(cmdline)

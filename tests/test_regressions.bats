@@ -133,7 +133,7 @@ EOF
     # bats tmpdir is under /tmp → whitelist
     export OPS_NERDCTL_HOME="$BATS_TEST_TMPDIR/nerdctl"
     mock_install_tools
-    run bash -c "yes Y | env OPS_RUNTIME=nerdctl '$(ops_sh)' nerdctl install"
+    run bash -c "printf 'Y\nY\nY\n' | env OPS_RUNTIME=nerdctl '$(ops_sh)' nerdctl install"
     [ "$status" -eq 0 ]
     [ -x "$OPS_NERDCTL_HOME/bin/nerdctl" ]
 }

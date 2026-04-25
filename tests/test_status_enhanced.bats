@@ -26,7 +26,10 @@ setup() {
 @test "status shows config file with loaded/missing status" {
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
-    [[ "$output" == *"config:"* ]] || [[ "$output" == *"Config"* ]]
+    # The "config:" label is always emitted; the value is followed by either
+    # "(loaded)" or "(missing)" depending on whether ops.conf exists.
+    [[ "$output" == *"config:"* ]]
+    [[ "$output" == *"(loaded)"* ]] || [[ "$output" == *"(missing)"* ]]
 }
 
 @test "status shows Images section" {
@@ -38,19 +41,21 @@ setup() {
 @test "status marks default image" {
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
-    [[ "$output" == *"default"* ]]
+    # The default image row carries a "(default)" tag; look for the exact
+    # combination rather than a bare "default" substring (too laxist).
+    [[ "$output" == *"localhost/test-img"*"(default)"* ]]
 }
 
 @test "status shows Volumes section" {
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
-    [[ "$output" == *"=== Volumes ==="* ]] || [[ "$output" == *"Volumes"* ]]
+    [[ "$output" == *"=== Volumes ==="* ]]
 }
 
 @test "status shows Containers section" {
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
-    [[ "$output" == *"=== Containers ==="* ]] || [[ "$output" == *"Containers"* ]]
+    [[ "$output" == *"=== Containers ==="* ]]
 }
 
 @test "status Volumes section comes BEFORE Containers" {

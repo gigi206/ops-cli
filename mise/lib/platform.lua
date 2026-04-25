@@ -35,9 +35,15 @@ function M.normalize_os(os)
 end
 
 -- Detect current architecture
+--
+-- The vfox RUNTIME object exposes `archType` (convention matches `osType`).
+-- Upstream mise-nix code used `RUNTIME.arch`, which is never populated by
+-- vfox -- the check always fell through to the `uname -m` branch. We accept
+-- both field names defensively so the fast path works on either API shape,
+-- without breaking when one of them is nil.
 function M.detect_arch()
-  if RUNTIME and RUNTIME.arch then
-    return M.normalize_arch(RUNTIME.arch)
+  if RUNTIME and (RUNTIME.archType or RUNTIME.arch) then
+    return M.normalize_arch(RUNTIME.archType or RUNTIME.arch)
   else
     -- Fallback for cases where RUNTIME is not available (like testing)
     local uname_ok, uname_result = shell.try_exec("uname -m")

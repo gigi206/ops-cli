@@ -55,6 +55,52 @@ setup() {
     ! grep -qE 'build .*--secret' "$MOCK_LOG"
 }
 
+@test "build passes SOURCE_URL build-arg (default applied)" {
+    mock_runtime docker
+    run env OPS_RUNTIME=docker "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+    # SOURCE_URL defaults to an upstream repo URL so the OCI labels
+    # (source / url / documentation) are populated out of the box. We
+    # assert the shape (https:// + non-empty value) rather than the exact
+    # URL so the test survives forks, renames, and local OPS_SOURCE_URL
+    # overrides.
+    grep -qE 'build .*--build-arg SOURCE_URL=https://[^ ]+' "$MOCK_LOG"
+}
+
+@test "build passes empty SOURCE_URL when OPS_SOURCE_URL is explicitly blanked" {
+    # Fork / vendor build that doesn't want to inherit the upstream URL:
+    # OPS_SOURCE_URL="" is honored thanks to \${VAR-default} (bare `-`),
+    # which only applies the default when the var is unset, not when empty.
+    mock_runtime docker
+    run env OPS_RUNTIME=docker OPS_SOURCE_URL="" "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+    # The forwarded value must NOT start with https:// (default was bypassed).
+    ! grep -qE 'build .*--build-arg SOURCE_URL=https://' "$MOCK_LOG"
+    grep -qE 'build .*--build-arg SOURCE_URL=' "$MOCK_LOG"
+}
+
+@test "build forwards OPS_SOURCE_URL from the environment" {
+    # Vendor / fork build pointing the OCI labels at a different repo URL.
+    mock_runtime docker
+    run env OPS_RUNTIME=docker \
+        OPS_SOURCE_URL=https://example.com/ops-cli \
+        "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+    grep -qE 'build .*--build-arg SOURCE_URL=https://example.com/ops-cli' "$MOCK_LOG"
+}
+
+@test "build does NOT forward VERSION/REVISION build-args" {
+    # Both args were dropped: VERSION duplicated OPS_VERSION (already in
+    # `ops --version`) and REVISION was empty in practice unless CI
+    # stamped it. Regression guard so a future revival keeps an explicit
+    # design discussion.
+    mock_runtime docker
+    run env OPS_RUNTIME=docker "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+    ! grep -qE 'build .*--build-arg VERSION=' "$MOCK_LOG"
+    ! grep -qE 'build .*--build-arg REVISION=' "$MOCK_LOG"
+}
+
 @test "build --no-cache is forwarded" {
     mock_runtime docker
     run env OPS_RUNTIME=docker "$(ops_sh)" build --no-cache
@@ -76,4 +122,79 @@ setup() {
     run env OPS_RUNTIME=docker "$(ops_sh)" build
     [ "$status" -eq 0 ]
     grep -qE 'build .*--pull' "$MOCK_LOG"
+}
+
+# OPS_BUILD_ARGS: per-image --build-arg propagation from ops.conf.
+
+@test "OPS_BUILD_ARGS: entry matching OPS_IMAGES key yields --build-arg" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [arch-chrome]="localhost/ops-chrome" )
+declare -A OPS_BUILD_ARGS=( [arch-chrome]="EXTRA_MISE_TOOLS=nix:google-chrome-for-testing" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i arch-chrome build
+    [ "$status" -eq 0 ]
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:google-chrome-for-testing' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS: no entry means no extra --build-arg injected" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [arch]="localhost/ops-dev" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i arch build
+    [ "$status" -eq 0 ]
+    ! grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS: ';' separates multiple pairs" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [multi]="localhost/ops-multi" )
+declare -A OPS_BUILD_ARGS=( [multi]="EXTRA_MISE_TOOLS=nix:chromium;NIX_CLEANUP=false" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i multi build
+    [ "$status" -eq 0 ]
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:chromium' "$MOCK_LOG"
+    grep -qE 'build .*--build-arg NIX_CLEANUP=false' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS: empty value explicitly disables the default tool" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [arch-min]="localhost/ops-min" )
+declare -A OPS_BUILD_ARGS=( [arch-min]="EXTRA_MISE_TOOLS=" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i arch-min build
+    [ "$status" -eq 0 ]
+    # The empty override DOES reach the build ("EXTRA_MISE_TOOLS=" present).
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=' "$MOCK_LOG"
+    # And crucially, no default tool name leaks into --build-arg.
+    ! grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS: ignored when -i points to a raw image ref (no key)" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [arch]="localhost/ops-dev" )
+declare -A OPS_BUILD_ARGS=( [arch]="EXTRA_MISE_TOOLS=nix:chromium" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i localhost/some-other build
+    [ "$status" -eq 0 ]
+    ! grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS' "$MOCK_LOG"
 }

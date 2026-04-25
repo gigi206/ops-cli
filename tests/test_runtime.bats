@@ -74,3 +74,42 @@ setup() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"--user 0:1000"* ]]
 }
+
+@test "rootless podman (Host.Security.Rootless=true) uses 0:GID" {
+    # Exercises the podman branch of _is_rootless (line 87-88 in ops.sh).
+    # The mock reads MOCK_ROOTLESS and echoes it for the
+    # `info --format '{{.Host.Security.Rootless}}'` query.
+    mock_runtime podman
+    run env OPS_RUNTIME=podman MOCK_ROOTLESS=true "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--user 0:1000"* ]]
+}
+
+@test "rootful podman (Host.Security.Rootless=false) uses UID:GID" {
+    # Same branch as above, but the false-path → _is_rootless=no → UID:GID.
+    mock_runtime podman
+    run env OPS_RUNTIME=podman MOCK_ROOTLESS=false "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--user 1000:1000"* ]]
+}
+
+@test "nerdctl is always treated as rootless" {
+    # Line 89 in ops.sh — nerdctl hardcodes _IS_ROOTLESS_CACHE=yes because the
+    # ops-installed nerdctl is always rootless (containerd-rootless-setuptool.sh).
+    local nh="$BATS_TEST_TMPDIR/nh"
+    mkdir -p "$nh/bin"
+    cat > "$nh/bin/nerdctl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+case "$1" in
+    info|--version) ;;
+    images) echo "sha256:deadbeefcafe" ;;
+    container) exit 1 ;;
+esac
+exit 0
+EOF
+    chmod +x "$nh/bin/nerdctl"
+    run env OPS_RUNTIME=nerdctl OPS_NERDCTL_HOME="$nh" "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--user 0:1000"* ]]
+}

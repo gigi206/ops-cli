@@ -51,9 +51,9 @@ Files authored by Ghislain LE MEUR (Apache-2.0):
   metadata.lua                     (combined-work manifest)
 
 Files licensed under MIT (see LICENSE.MIT) -- from mise-plugins/mise-nix:
-  hooks/mise_env.lua
+  hooks/mise_env.lua               (modified by Ghislain LE MEUR, surfaces load_env diagnostics)
   hooks/mise_path.lua
-  lib/utils.lua
+  lib/utils.lua                    (modified by Ghislain LE MEUR, untracked-flake hint + stderr capture + structured error return)
   types.lua
 
 ================================================================================
@@ -68,6 +68,24 @@ Modifications by Ghislain LE MEUR (2026):
   - Extended lib/install.lua with additional logic (~18 lines).
   - Imported the four MIT-licensed files listed above into the Apache-licensed
     backend plugin tree; each retains an SPDX header crediting Josh Bode.
+  - lib/utils.lua: added is_git_tracked() helper and a proactive check that
+    emits a "git add -fN flake.nix flake.lock" hint when flake.nix exists but
+    is untracked by git (the #1 first-run trip-up, since Nix silently ignores
+    untracked files in a git working tree). Also redirected nix's stderr to
+    a temp file and replay it on failure so the underlying diagnostic is
+    visible instead of the generic "Failed to load environment" wrapper.
+    MISE_NIX_HOOK_REENTRY=1 env-var guard breaks the recursion that occurred
+    when git itself was a mise shim. MISE_NIX_ALLOW_UNTRACKED=1 env-var
+    opt-out switches the flake reference from "." (git+file fetcher) to
+    "path:." (path fetcher) so untracked flake.nix can still be read. Final
+    refactor: load_env now returns (devenv, error_lines) instead of calling
+    log.error itself, letting hooks/mise_env.lua decide where to surface
+    diagnostics (used to dedupe messages across MiseEnv + MisePath, which
+    mise runs in separate Lua processes).
+  - hooks/mise_env.lua: surfaces the new structured errors returned by
+    utils.load_env (single source of user-facing diagnostics).
+    hooks/mise_path.lua deliberately discards them so each diagnostic
+    appears exactly once per `mise env` invocation.
 
 The combined work is distributed under the Apache License, Version 2.0.
 Files licensed under MIT retain their original copyright and license and must

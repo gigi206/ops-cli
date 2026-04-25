@@ -4,6 +4,18 @@
 # Prior bug: OPS_ALIASES[cc]="-i arch run --claude" would fail with
 # "unknown subcommand or alias: '-i'" because the global flag loop already
 # ran before expansion.
+#
+# Scope split with test_aliases.bats:
+#   - test_aliases.bats         — baseline alias semantics (string/function,
+#                                 reserved names, listing, single-pass expand).
+#                                 All aliases there start with a subcommand
+#                                 (e.g. "run -i ml-dev").
+#   - test_alias_global_flags.bats (this file) — the narrow case of an alias
+#                                 whose first token is a GLOBAL flag (-i/-n/-f/-H).
+#                                 Kept separate because the code path (second
+#                                 `_parse_global_flags` pass after expansion)
+#                                 is distinct and would otherwise drown in
+#                                 the broader alias test file.
 
 load helpers
 
@@ -70,6 +82,18 @@ EOF
     run env OPS_RUNTIME=docker "$(ops_sh)" plain --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"localhost/test-img"* ]]
+}
+
+@test "-f before subcommand is consumed by _parse_global_flags" {
+    # Regression: `-f PATH build` routes through _parse_global_flags (the
+    # top-of-script pass that runs BEFORE subcommand dispatch), not through
+    # cmd_run's own flag parser. Covers line 2157 in ops.sh. Without this
+    # test, only `ops build -f PATH` (parsed by cmd_run) is exercised.
+    local custom="$BATS_TEST_TMPDIR/Custom.Dockerfile"
+    echo "FROM scratch" > "$custom"
+    run env OPS_RUNTIME=docker "$(ops_sh)" -f "$custom" build
+    [ "$status" -eq 0 ]
+    grep -qE "build .*--file $custom" "$MOCK_LOG"
 }
 
 @test "alias expansion preserves global flags from CLI too" {

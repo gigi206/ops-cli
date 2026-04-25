@@ -11,7 +11,16 @@ local cmd = require("cmd")
 
 local M = {}
 
--- Create a unique temporary directory (no cleanup needed).
+-- Single-quote a value for safe inclusion in a shell command line.
+-- Mirrors shell.shquote but kept local to avoid a require cycle with modules
+-- that pull in tempdir.
+local function shquote(s)
+  return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+-- Create a unique temporary directory.
+-- Callers are responsible for removing the directory when done (prefer
+-- with_temp_dir which handles cleanup automatically).
 function M.create_temp_dir(prefix)
   prefix = prefix or "mise_temp"
   local temp_base = os.getenv("TMPDIR") or "/tmp"
@@ -19,7 +28,7 @@ function M.create_temp_dir(prefix)
   -- trailing XXXXXX is expanded by mktemp itself.
   local safe_prefix = prefix:gsub("[^%w._-]", "_")
   local template = temp_base .. "/" .. safe_prefix .. "_XXXXXXXX"
-  local out = cmd.exec("mktemp -d '" .. template:gsub("'", "'\\''") .. "'")
+  local out = cmd.exec("mktemp -d " .. shquote(template))
   local temp_dir = (out or ""):gsub("%s+$", "")
   if temp_dir == "" then
     error("mktemp failed to create a temporary directory under " .. temp_base)
@@ -27,10 +36,34 @@ function M.create_temp_dir(prefix)
   return temp_dir
 end
 
--- Execute function with temp directory (no cleanup)
+-- Refuse to recursively delete anything outside a short list of temp bases.
+-- Guards against TMPDIR=/ or a prefix injection crafting an absolute path.
+local function is_safe_temp_path(path)
+  if not path or path == "" or path == "/" then return false end
+  local bases = { os.getenv("TMPDIR"), "/tmp", "/var/tmp" }
+  for _, base in ipairs(bases) do
+    if base and base ~= "" and base ~= "/" then
+      -- Must be strictly under base (base + "/" + something).
+      if path:sub(1, #base + 1) == base .. "/" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- Execute `func(temp_dir)` and remove the directory afterwards — even when
+-- `func` raises. Preserves all return values from `func`.
 function M.with_temp_dir(prefix, func)
   local temp_dir = M.create_temp_dir(prefix)
-  return func(temp_dir)
+  local results = table.pack(pcall(func, temp_dir))
+  if is_safe_temp_path(temp_dir) then
+    pcall(function() cmd.exec("rm -rf -- " .. shquote(temp_dir)) end)
+  end
+  if not results[1] then
+    error(results[2])
+  end
+  return table.unpack(results, 2, results.n)
 end
 
 return M

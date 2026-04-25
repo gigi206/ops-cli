@@ -1,9 +1,86 @@
 #!/usr/bin/env bash
 # Shared helpers for bats tests.
+#
+# Isolation model: every test runs in its own subshell with a per-test
+# $BATS_TEST_TMPDIR (bats-core ≥ 1.8), which is what setup_mocks() /
+# setup_ops_env() / mock_runtime_rich() root all their state in. That means
+# PATH tweaks, MOCK_STATE, XDG_CACHE_HOME and HOME overrides never leak
+# between tests — a dedicated `teardown()` would be redundant.
+#
+# Assertion helpers below (assert_success, assert_output_contains, …) exist so
+# new tests can emit precise diagnostics on failure without the boilerplate
+# `[ "$status" -eq 0 ] || { echo …; false; }` dance.
 
 # Resolve the absolute path to ops.sh from the tests directory.
 ops_sh() {
     echo "$BATS_TEST_DIRNAME/../ops.sh"
+}
+
+# ---- assertion helpers -----------------------------------------------------
+# All helpers assume `run` has just executed: $status and $output are set.
+# On failure they print the captured output to stderr so bats surfaces it in
+# the TAP log with full context (much easier to debug a CI failure than the
+# bare `in test file …` single-line default).
+
+assert_success() {
+    if [ "${status:-0}" -ne 0 ]; then
+        printf 'assert_success: expected status 0, got %s\noutput:\n%s\n' \
+            "${status}" "${output-<unset>}" >&2
+        return 1
+    fi
+}
+
+assert_failure() {
+    # Optional first arg = expected non-zero status.
+    if [ "${status:-0}" -eq 0 ]; then
+        printf 'assert_failure: expected non-zero status, got 0\noutput:\n%s\n' \
+            "${output-<unset>}" >&2
+        return 1
+    fi
+    if [ -n "${1:-}" ] && [ "${status}" -ne "$1" ]; then
+        printf 'assert_failure: expected status %s, got %s\noutput:\n%s\n' \
+            "$1" "${status}" "${output-<unset>}" >&2
+        return 1
+    fi
+}
+
+assert_output_contains() {
+    if [[ "${output-}" != *"$1"* ]]; then
+        printf 'assert_output_contains: %q not found\noutput:\n%s\n' \
+            "$1" "${output-<unset>}" >&2
+        return 1
+    fi
+}
+
+refute_output_contains() {
+    if [[ "${output-}" == *"$1"* ]]; then
+        printf 'refute_output_contains: %q WAS present\noutput:\n%s\n' \
+            "$1" "${output-<unset>}" >&2
+        return 1
+    fi
+}
+
+# Count occurrences of a literal pattern in $output (no regex). Useful for
+# catching over-matching bugs where a label or flag leaks multiple times.
+output_count() {
+    grep -oF -- "$1" <<< "${output-}" | wc -l | tr -d '[:space:]'
+}
+
+# Make an isolated copy of ops.sh in $BATS_TEST_TMPDIR and print its path.
+# Use this when a test needs to exercise the `Dockerfile.<key>` auto-detection
+# path (ops.sh looks next to itself via SCRIPT_DIR) without dropping files
+# into the real repo — `$BATS_TEST_TMPDIR` is cleaned up automatically by
+# bats between tests, so no `trap EXIT` housekeeping is needed.
+# Creating the Dockerfile fixture next to the copy is safe:
+#   local ops_bin; ops_bin=$(isolated_ops)
+#   echo "FROM scratch" > "$(dirname "$ops_bin")/Dockerfile.autodetect"
+#   run env OPS_RUNTIME=docker "$ops_bin" build -i autodetect
+isolated_ops() {
+    local d="$BATS_TEST_TMPDIR/ops-bin"
+    mkdir -p "$d"
+    cp "$BATS_TEST_DIRNAME/../ops.sh" "$d/ops.sh"
+    chmod +x "$d/ops.sh"
+    printf '%s' "$d/ops.sh"
 }
 
 # Sets up a mock runtime binary (docker/podman/nerdctl) in a temp PATH dir
@@ -37,6 +114,11 @@ setup_mocks() {
 #   MOCK_CONTAINER_EXISTS   ps -a returns OPS_CONTAINER_NAME (1/0); default 0
 #   MOCK_DANGLING            image ls -f dangling=true emits a line (1/0); default 0
 #   MOCK_CONTAINER_MOUNTS   comma-separated list reported by container inspect
+#
+# For richer scenarios (status/doctor/update with container+image state),
+# use mock_runtime_rich instead — see its block below for the full env var
+# matrix. The basic mock here is sufficient for ~85 % of the suite and
+# deliberately stays small to keep the per-test setup overhead negligible.
 mock_runtime() {
     local name="$1"
     cat > "$MOCK_DIR/$name" <<'MOCK_EOF'
@@ -68,6 +150,10 @@ case "$1" in
         echo "${MOCK_RUNTIME_VERSION:-mock version 1.0.0}"
         ;;
     build)
+        # Lets tests exercise the `build_image || exit $?` failure path by
+        # exporting MOCK_BUILD_FAIL=1 — the mock then exits non-zero to
+        # simulate e.g. a Nix fetch error.
+        [ "${MOCK_BUILD_FAIL:-0}" = "1" ] && exit 2
         ;;
     images)
         [ "${MOCK_IMAGE_EXISTS:-1}" = "1" ] && echo "sha256:deadbeefcafe"
@@ -115,6 +201,141 @@ case "$1" in
 esac
 exit 0
 MOCK_EOF
+    chmod +x "$MOCK_DIR/$name"
+}
+
+# Richer mock that simulates stateful image/container inspection used by
+# cmd_status (visual rendering), cmd_doctor (container orphan/mismatch), and
+# cmd_update (image-ID diff before/after a build). Writes $1 (the binary
+# name) into $MOCK_DIR; reads its configuration from env vars set by the
+# caller before `run`.
+#
+# Runtime knobs (all optional):
+#   MOCK_SEC_OPTIONS       docker info SecurityOptions     (default [name=rootless])
+#   MOCK_PS_LINE           one line for `ps -a --format 'Names|Image|Status|Command'`
+#                          (used by cmd_status)
+#   MOCK_PS_LABELED        one name for `ps -a --filter label=ops.container=true`
+#                          (used by cmd_status / cmd_clean)
+#   MOCK_PS_LABELED_FULL   one `Name|Image` line for the same filter with a
+#                          --format '{{.Names}}|{{.Image}}' (used by cmd_doctor)
+#   MOCK_CTNS_ON_OLD       comma-separated container names to report as running
+#                          on MOCK_OLD_ID (used by cmd_update post-build prompt)
+#   MOCK_IMG_MISSING       image ref whose `image inspect` must return 1 — use
+#                          to simulate orphaned containers
+#   MOCK_IMG_INSPECT_FAIL_ALL=1   make `image inspect` fail for EVERY ref —
+#                          use to drive the "no such key/container/image"
+#                          branch of cmd_inspect
+#   MOCK_OLD_ID            `.Id` returned BEFORE any `build` call   (default sha256:oldid)
+#   MOCK_NEW_ID            `.Id` returned AFTER a `build` call       (default sha256:newid)
+#   MOCK_CLI_USER          container inspect value for ops.cmdline.user label
+#   MOCK_CLI_REAL          container inspect value for ops.cmdline.real label
+#
+# Build state is tracked via a flag file so a mock call to `build` flips the
+# subsequent `.Id` inspection from OLD to NEW within the same test.
+mock_runtime_rich() {
+    local name="${1:-docker}"
+    export MOCK_STATE="$BATS_TEST_TMPDIR/mock-state"
+    mkdir -p "$MOCK_STATE"
+    cat > "$MOCK_DIR/$name" <<'MOCK_RICH_EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+case "$1" in
+    info)
+        case "$*" in
+            *'{{.SecurityOptions}}'*)         echo "${MOCK_SEC_OPTIONS-[name=rootless]}" ;;
+            *'{{.Host.Security.Rootless}}'*)  echo "${MOCK_ROOTLESS:-true}" ;;
+        esac
+        ;;
+    --version) echo "${MOCK_RUNTIME_VERSION:-mock version 1.0.0}" ;;
+    build)
+        # Flip the image-ID flag so `.Id` inspections return MOCK_NEW_ID
+        # from now on (used by cmd_update's pre/post-build diff).
+        touch "$MOCK_STATE/built"
+        ;;
+    images)
+        [ "${MOCK_IMAGE_EXISTS:-1}" = "1" ] && echo "sha256:deadbeefcafe"
+        ;;
+    ps)
+        # Three observed call shapes, detected by the --format or --filter tokens:
+        #   1. filter label=ops.container=true --format '{{.Names}}'               → MOCK_PS_LABELED
+        #   2. filter label=ops.container=true --format '{{.Names}}|{{.Image}}'    → MOCK_PS_LABELED_FULL
+        #   3. no filter --format '{{.Names}}|{{.ImageID}}'                        → loop MOCK_CTNS_ON_OLD
+        #   4. no filter --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Command}}' → MOCK_PS_LINE
+        if [[ "$*" == *"label=ops.container=true"* ]]; then
+            if [[ "$*" == *'{{.Image}}'* ]]; then
+                [ -n "${MOCK_PS_LABELED_FULL:-}" ] && echo "$MOCK_PS_LABELED_FULL"
+            else
+                [ -n "${MOCK_PS_LABELED:-}" ] && echo "$MOCK_PS_LABELED"
+            fi
+            exit 0
+        fi
+        if [[ "$*" == *'{{.ImageID}}'* ]]; then
+            if [ -n "${MOCK_CTNS_ON_OLD:-}" ]; then
+                IFS=',' read -ra _names <<< "$MOCK_CTNS_ON_OLD"
+                for _n in "${_names[@]}"; do
+                    printf '%s|%s\n' "$_n" "${MOCK_OLD_ID:-sha256:oldid}"
+                done
+            fi
+            exit 0
+        fi
+        [ -n "${MOCK_PS_LINE:-}" ] && echo "$MOCK_PS_LINE"
+        ;;
+    image)
+        case "$2" in
+            inspect)
+                _ref="$3"
+                # Simulate a missing image for orphan / doctor tests.
+                if [ "$_ref" = "${MOCK_IMG_MISSING:-}" ]; then
+                    exit 1
+                fi
+                # Simulate every image being missing (for cmd_inspect's
+                # "not found" branch when the profile/container paths also miss).
+                if [ "${MOCK_IMG_INSPECT_FAIL_ALL:-0}" = "1" ]; then
+                    exit 1
+                fi
+                # Pick the response shape off the --format token.
+                if [[ "$*" == *'.Id'* ]]; then
+                    if [ -f "$MOCK_STATE/built" ]; then
+                        echo "${MOCK_NEW_ID:-sha256:newid}"
+                    else
+                        echo "${MOCK_OLD_ID:-sha256:oldid}"
+                    fi
+                elif [[ "$*" == *'.Size'* ]]; then
+                    echo "2000000000|2026-04-20T10:00:00Z|"
+                else
+                    echo "ok"
+                fi
+                ;;
+            ls) ;;
+        esac
+        ;;
+    container)
+        case "$2" in
+            inspect)
+                # Simulate "container doesn't exist" when requested (used by
+                # cmd_inspect's "not found" branch).
+                if [ "${MOCK_CTN_INSPECT_FAIL_ALL:-0}" = "1" ]; then
+                    exit 1
+                fi
+                case "$*" in
+                    *ops.cmdline.user*) echo "${MOCK_CLI_USER:-}" ;;
+                    *ops.cmdline.real*) echo "${MOCK_CLI_REAL:-}" ;;
+                    *ops.dockerfile*)   echo "" ;;
+                    *Mounts*)           echo "" ;;
+                    *)                  echo "ok" ;;
+                esac
+                ;;
+        esac
+        ;;
+    volume)
+        case "$2" in
+            ls|inspect|create|rm) ;;
+        esac
+        ;;
+    start|exec|run|logs|rm|stop|kill|rmi) ;;
+esac
+exit 0
+MOCK_RICH_EOF
     chmod +x "$MOCK_DIR/$name"
 }
 
@@ -293,4 +514,40 @@ isolated_path() {
         done
     fi
     printf '%s' "$d"
+}
+
+# ---- image-integration helpers ---------------------------------------------
+# Used by tests/test_image_integration.bats. They exec into a freshly-spawned
+# container from localhost/ops-dev and skip if the image or runtime is absent
+# (keeps the bats suite green in environments without Docker, e.g. minimal CI
+# runners or dev machines that haven't built the image yet).
+
+# Returns the configured runtime binary (docker/podman/nerdctl), or "" if none
+# is available.
+image_runtime_bin() {
+    local rt
+    for rt in docker podman nerdctl; do
+        if command -v "$rt" >/dev/null 2>&1; then
+            printf '%s' "$rt"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Skip the current test unless localhost/ops-dev exists on the local runtime.
+# Usage: require_ops_image
+require_ops_image() {
+    local rt
+    rt=$(image_runtime_bin) || { skip "no container runtime found (docker/podman/nerdctl)"; }
+    export IMAGE_RUNTIME="$rt"
+    "$rt" image inspect localhost/ops-dev >/dev/null 2>&1 \
+        || skip "localhost/ops-dev not built — run './ops.sh build' first"
+}
+
+# Run a command in a disposable container from localhost/ops-dev. Stdout/exit
+# code from the container become $output/$status (use via `run run_in_image`).
+# All commands are evaluated via /bin/bash -c, so you can chain with &&, |, etc.
+run_in_image() {
+    "$IMAGE_RUNTIME" run --rm --entrypoint /bin/bash localhost/ops-dev -c "$*"
 }

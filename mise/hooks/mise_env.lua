@@ -3,6 +3,9 @@
 
 local utils = require("utils")
 
+---@type Log
+local log = require("log")
+
 ---@dictionary "ignore" | "keep"
 local VARS = {
   HOME = "ignore",
@@ -21,8 +24,15 @@ function PLUGIN.MiseEnv(_, ctx)
   end
 
   ---@cast options Options
-  local result = utils.load_env(options)
+  -- MiseEnv is the hook responsible for surfacing load_env diagnostics
+  -- to the user. MisePath calls load_env too, but silently -- that is
+  -- how we dedupe messages: mise runs each hook in its own Lua process,
+  -- so module-level flags can't bridge them.
+  local result, errs = utils.load_env(options)
   if result == nil then
+    if errs then
+      for _, line in ipairs(errs) do log.error(line) end
+    end
     return {}
   end
 

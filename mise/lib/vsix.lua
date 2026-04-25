@@ -35,7 +35,10 @@ function M.from_nixhub(tool, requested_version, current_os, current_arch)
 
   local env_prefix = platform.get_env_prefix()
   local impure_flag = platform.get_impure_flag()
-  local build_cmd = string.format('%snix build %s--no-link --print-out-paths "%s"', env_prefix, impure_flag, flake_ref)
+  -- shquote the flake_ref so apostrophes / backticks / $() in an upstream
+  -- commit or attribute path can't break out of the quoted word. Matches the
+  -- convention used in flake.lua::build.
+  local build_cmd = string.format("%snix build %s--no-link --print-out-paths %s", env_prefix, impure_flag, shell.shquote(flake_ref))
 
   local build_start = os.time()
   logger.debug("Starting nix build: " .. build_cmd)

@@ -65,6 +65,8 @@ declare -A OPS_CONTAINER_NAMES
 OPS_CONTAINER_NAMES[phantom]="phantom-ctn"
 EOF
     run env OPS_RUNTIME=docker "$(ops_sh)" doctor
+    # doctor exits 0 (clean) or 1 (warnings); anything else means it crashed.
+    [ "$status" -le 1 ]
     [[ "$output" == *"phantom"* ]]
 }
 
@@ -73,6 +75,7 @@ EOF
 # no OPS_IMAGES
 EOF
     run env OPS_RUNTIME=docker "$(ops_sh)" doctor
+    [ "$status" -le 1 ]
     [[ "$output" == *"none defined"* ]]
 }
 
@@ -100,5 +103,6 @@ EOF
 # empty
 EOF
     run env OPS_RUNTIME=docker "$(ops_sh)" doctor
+    [ "$status" -le 1 ]
     [[ "$output" == *"no ops-labeled containers"* ]]
 }

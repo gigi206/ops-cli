@@ -18,11 +18,17 @@ local M = {}
 -- ~/.local/share/mise/installs/nix-*/<ver>/ become dangling after GC.
 local function register_gc_root(store_path, install_path)
   local gc_dir = "/nix/var/nix/gcroots/mise"
-  shell.try_exec("mkdir -p '%s' 2>/dev/null", gc_dir)
+  shell.try_exec("mkdir -p " .. shell.shquote(gc_dir) .. " 2>/dev/null")
   -- Root name = last two install_path segments joined, sanitised
   local segs = install_path:match("([^/]+/[^/]+)$") or install_path
   local rootname = segs:gsub("/", "-"):gsub("[^%w%-_.]", "_")
-  shell.try_exec("ln -sfn '%s' '%s/%s'", store_path, gc_dir, rootname)
+  shell.try_exec("ln -sfn " .. shell.shquote(store_path) .. " " .. shell.shquote(gc_dir .. "/" .. rootname))
+end
+
+-- Escape a Lua pattern so magic characters in a store path like
+-- `/nix/store/abc-def-1.2.3` (contains `-` and `.`) match literally.
+local function _escape_pattern(s)
+  return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
 end
 
 -- Standard tool installation via symlink (PVC-optimized)
@@ -31,8 +37,8 @@ function M.standard_tool(nix_store_path, install_path, label)
 
   -- In containerized environments, check if symlink already exists and is correct
   if shell.is_containerized() then
-    local ok, current_target = shell.try_exec('readlink "%s" 2>/dev/null', install_path)
-    if ok and current_target:match(nix_store_path .. "$") then
+    local ok, current_target = shell.try_exec("readlink " .. shell.shquote(install_path) .. " 2>/dev/null")
+    if ok and current_target and current_target:match(_escape_pattern(nix_store_path) .. "$") then
       logger.debug("Symlink already correct: " .. install_path)
       register_gc_root(nix_store_path, install_path)
       return
@@ -56,8 +62,8 @@ function M.flake_with_hash_workaround(nix_store_path, install_path)
   
   -- In containerized environments, check if target already points correctly to avoid unnecessary I/O
   if shell.is_containerized() then
-    local ok, current_target = shell.try_exec('readlink "%s" 2>/dev/null', hash_path)
-    if ok and current_target:match(nix_store_path .. "$") then
+    local ok, current_target = shell.try_exec("readlink " .. shell.shquote(hash_path) .. " 2>/dev/null")
+    if ok and current_target and current_target:match(_escape_pattern(nix_store_path) .. "$") then
       logger.debug("Hash symlink already correct: " .. hash_path)
       return
     end
@@ -69,7 +75,11 @@ end
 -- Install from nixhub with automatic version resolution
 function M.from_nixhub(tool, requested_version, install_path)
   local current_os = platform.normalize_os(RUNTIME.osType)
-  local current_arch = RUNTIME.archType:lower()
+  -- RUNTIME.archType is vfox-native ("amd64" / "arm64"); pass it through
+  -- unchanged. Do NOT normalize to nix-system names ("x86_64" / "aarch64")
+  -- here -- version.is_compatible matches nixhub platforms_summary strings
+  -- which use the vfox form.
+  local current_arch = RUNTIME.archType and RUNTIME.archType:lower() or ""
   
   local build_result = vsix.from_nixhub(tool, requested_version, current_os, current_arch)
   local nix_store_path = vsix.choose_best_output(build_result.outputs, tool)

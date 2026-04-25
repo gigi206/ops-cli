@@ -33,8 +33,12 @@ end
 
 -- Force create symlink using native file module
 function M.symlink_force(src, dst)
-  -- Remove target first if it exists, then create symlink
-  M.try_exec('rm -rf "%s"', dst)  -- Clean up existing file/symlink
+  -- Remove target first if it exists, then create the new symlink.
+  -- Quote the destination path with shquote() so paths containing spaces,
+  -- quotes, backticks, or `$(...)` cannot break out of the `rm -rf` command
+  -- line. The previous form ('rm -rf "%s"', dst) only protected against
+  -- simple cases.
+  M.try_exec("rm -rf " .. M.shquote(dst))
   file.symlink(src, dst)
 end
 

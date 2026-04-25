@@ -11,9 +11,19 @@
 # `-u` catches unset-variable typos; `pipefail` stops silent pipe failures.
 set -uo pipefail
 
+# Associative arrays (OPS_IMAGES, OPS_ALIASES, OPS_BUILD_ARGS, _OPS_ORIGIN) +
+# extglob patterns require bash 4+; the documented minimum is bash 5 to match
+# tested platforms. Fail fast with a clear message on old bash.
+if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
+    echo "Error: bash 5+ required (found bash ${BASH_VERSION:-unknown})" >&2
+    exit 1
+fi
+
 # Single source of truth for the ops.sh version. Update when cutting a new
-# release; CHANGELOG.md should carry the matching entry.
-OPS_VERSION="0.1.0"
+# release; CHANGELOG.md should carry the matching entry. Dockerfile and
+# Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
+# `docker build .` invocations — keep the three in lockstep.
+OPS_VERSION="1.0.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -25,8 +35,34 @@ for _v in $(compgen -v 2>/dev/null | grep '^OPS_' || true); do _OPS_ORIGIN[$_v]=
 unset _v
 
 _CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ops/ops.conf"
-# shellcheck disable=SC1090
-[ -f "$_CONFIG_FILE" ] && source "$_CONFIG_FILE"
+# Defence-in-depth: `source` executes arbitrary code, so refuse to load the
+# config when it's writable by someone other than the current user (covers the
+# world- / group-writable footgun where a shared $HOME lets an attacker drop
+# into the shell that sources ops.conf). Ownership check uses `stat` with GNU
+# and BSD fallbacks so macOS users keep the guard too.
+if [ -f "$_CONFIG_FILE" ]; then
+    _cfg_owner=""
+    _cfg_perms=""
+    if _cfg_owner=$(stat -c '%u' "$_CONFIG_FILE" 2>/dev/null); then
+        _cfg_perms=$(stat -c '%a' "$_CONFIG_FILE" 2>/dev/null)
+    elif _cfg_owner=$(stat -f '%u' "$_CONFIG_FILE" 2>/dev/null); then
+        _cfg_perms=$(stat -f '%Lp' "$_CONFIG_FILE" 2>/dev/null)
+    fi
+    if [ -n "$_cfg_owner" ] && [ "$_cfg_owner" != "$(id -u)" ]; then
+        echo "Refusing to source $_CONFIG_FILE: owned by UID $_cfg_owner, expected $(id -u)." >&2
+        exit 1
+    fi
+    # World-writable (other-write bit set) is the hard footgun — any user on
+    # the box could inject code. Group-writable is tolerated because Linux
+    # distros with a user-private-group umask (002 on Ubuntu/Debian variants)
+    # legitimately produce 664 files for $HOME content.
+    case "${_cfg_perms:-000}" in
+        *[2367]) echo "Refusing to source $_CONFIG_FILE: world-writable (perms $_cfg_perms)." >&2; exit 1 ;;
+    esac
+    unset _cfg_owner _cfg_perms
+    # shellcheck disable=SC1090
+    source "$_CONFIG_FILE"
+fi
 
 for _v in $(compgen -v 2>/dev/null | grep '^OPS_' || true); do
     [ -z "${_OPS_ORIGIN[$_v]:-}" ] && _OPS_ORIGIN[$_v]='config'
@@ -78,8 +114,14 @@ _resolve_runtime
 # _IS_ROOTLESS_CACHE is initialized in _resolve_runtime.
 _is_rootless() {
     if [ -z "$_IS_ROOTLESS_CACHE" ]; then
-        if [ ! -x "$RUNTIME_BIN" ]; then
-            _IS_ROOTLESS_CACHE=yes
+        # Defense-in-depth fallback: a missing RUNTIME_BIN is already caught by
+        # the `[ ! -x "$RUNTIME_BIN" ]` guard at end-of-script (which exits 1
+        # before any code path that calls _is_rootless can run). This branch
+        # would only fire in an impossible-by-construction state; kept for
+        # safety but not reachable from the test harness.
+        # :nocov:
+        if [ ! -x "$RUNTIME_BIN" ]; then _IS_ROOTLESS_CACHE=yes
+        # :nocov:
         else
             case "$OPS_RUNTIME" in
                 docker)  "$RUNTIME_BIN" info --format '{{.SecurityOptions}}' 2>/dev/null \
@@ -98,6 +140,14 @@ TMP_INSTALL_DIR=""
 OPS_BUILDKITD_TIMEOUT="${OPS_BUILDKITD_TIMEOUT:-10}"
 OPS_CONTAINERD_STARTUP_TIMEOUT="${OPS_CONTAINERD_STARTUP_TIMEOUT:-30}"
 
+# Real-daemon interactions — ensure_buildkitd / stop_buildkitd drive the
+# rootless buildkitd process via rootlesskit, `kill -0`, `wait`, and real
+# PID polling. Replicating that inside a bats mock isn't useful (the mock
+# PID would behave differently from a real rootlesskit child), so these
+# functions are verified end-to-end by the `runtime-build` CI matrix job
+# (.github/workflows/tests.yml) which runs against an actual nerdctl install
+# and exercises: `ensure_buildkitd` → `docker build` → `stop_buildkitd`.
+# :nocov:
 ensure_buildkitd() {
     local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildkit/buildkitd.sock"
     if ! "$OPS_NERDCTL_HOME/bin/buildctl" --addr "unix://$sock" debug workers &>/dev/null; then
@@ -118,7 +168,9 @@ ensure_buildkitd() {
         done
     fi
 }
+# :nocov:
 
+# :nocov:
 stop_buildkitd() {
     if [ -n "${BUILDKITD_PID:-}" ]; then
         kill "$BUILDKITD_PID" 2>/dev/null || true
@@ -134,13 +186,20 @@ stop_buildkitd() {
         BUILDKITD_PID=""
     fi
 }
+# :nocov:
 
+# :nocov:
+# EXIT/INT/TERM trap handler. bashcov can observe `trap` being registered but
+# not the handler body once bash is tearing the process down — the DEBUG
+# trap is gone by then. The handler's logic (stop_buildkitd + rm tempdir) is
+# trivial and indirectly exercised every time a bats test ends cleanly.
 cleanup() {
     stop_buildkitd
     [ -n "${TMP_INSTALL_DIR:-}" ] && rm -rf "$TMP_INSTALL_DIR"
     return 0
 }
 trap cleanup EXIT INT TERM
+# :nocov:
 
 # Shell-quote args for human-readable display: leave simple tokens bare,
 # single-quote anything with special chars. Safe to re-execute, but much
@@ -168,11 +227,21 @@ OPS_USER_GID="${OPS_USER_GID:-$(id -g)}"
 OPS_USER_NAME="${OPS_USER_NAME:-$(id -un)}"
 OPS_USER_LANG="${OPS_USER_LANG:-${LANG:-en_US.UTF-8}}"
 
+# OCI image metadata default. Forwarded to build_image as --build-arg
+# SOURCE_URL, which populates the org.opencontainers.image.{source,url,
+# documentation} labels. Defaults to the upstream repo so the labels are
+# meaningful out of the box; override (or set empty) in ops.conf for a
+# fork or a vendor build.
+OPS_SOURCE_URL="${OPS_SOURCE_URL-https://github.com/gigi206/ops-cli}"
+
 # Container-side $HOME. Distinct from host's $HOME when OPS_USER_NAME differs
 # from the invoking user (rare but breaks bind-mount dest paths otherwise).
 HOME_IN_CTN="/home/$OPS_USER_NAME"
 
-SCRIPT_DIR="$(dirname "$0")"
+# Resolve symlinks so `ops` can be symlinked into /usr/local/bin/ while keeping
+# the companion files (Dockerfile, mise/, scripts/) next to the real ops.sh.
+# Falls back to raw $0 when readlink -f is unavailable (e.g. macOS without coreutils).
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 OPS_DOCKERFILE="${OPS_DOCKERFILE:-$SCRIPT_DIR/Dockerfile}"
 
 # Hash file is derived from OPS_IMAGE so each image has its own cache.
@@ -181,12 +250,46 @@ _hash_file() {
     echo "${XDG_CACHE_HOME:-$HOME/.cache}/ops/${OPS_IMAGE//\//_}.sha256sum"
 }
 
+_hash_dir() {
+    # Hash every regular file under $1, sorted for determinism. Prints
+    # nothing (not even a header) if the directory is absent, so the outer
+    # digest is stable across layouts that don't ship mise/ or scripts/.
+    local dir="$1"
+    [ -d "$dir" ] || return 0
+    # -print0 + sort -z + xargs -0 handles whitespace in paths safely.
+    # Path prefix is stripped so the digest is relocation-invariant (the
+    # same mise/ tree under /tmp/foo vs /home/bar hashes the same).
+    find "$dir" -type f -print0 \
+        | sort -z \
+        | ( cd "$dir" && xargs -0 -I{} sh -c 'f="{}"; f="${f#./}"; sha256sum "$f"' ) 2>/dev/null
+}
+
+# Produce a digest over every input that ends up baked into the image.
+# Changing ANY of these should invalidate the per-image hash cache so that
+# `dockerfile_changed` emits its "rebuild needed" warning:
+#   - the selected Dockerfile
+#   - the mise/ plugin tree (COPY'd into /opt/mise/data/plugins/nix/)
+#   - the scripts/ helpers (COPY'd into /opt/ops/bin/)
+#   - the effective OPS_BUILD_ARGS[<key>] when building via a profile
+# A single `sha256sum` folds all of these into one hex string.
 current_hash() {
     if [ ! -f "$OPS_DOCKERFILE" ]; then
         echo "Error: Dockerfile not found: $OPS_DOCKERFILE" >&2
         return 1
     fi
-    sha256sum "$OPS_DOCKERFILE" | cut -d' ' -f1
+    {
+        sha256sum "$OPS_DOCKERFILE"
+        _hash_dir "$SCRIPT_DIR/mise"
+        _hash_dir "$SCRIPT_DIR/scripts"
+        # Per-profile build args: only impact the image when `-i <key>`
+        # matches a declared OPS_IMAGES key (same condition used by
+        # build_image when it translates OPS_BUILD_ARGS into --build-arg).
+        if [ -n "${_OPS_IMAGE_KEY:-}" ] \
+           && declare -p OPS_BUILD_ARGS >/dev/null 2>&1 \
+           && [ -n "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]:-}" ]; then
+            printf 'build-args: %s\n' "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]}"
+        fi
+    } | sha256sum | cut -d' ' -f1
 }
 
 stored_hash() {
@@ -211,11 +314,16 @@ build_image() {
     # First arg --if-missing: after acquiring the build lock, skip the build if
     # the image now exists (another process may have built it). Prevents the
     # classic TOCTOU between the caller's `images -q` check and the lock grab.
-    local if_missing=0
-    if [ "${1:-}" = "--if-missing" ]; then
-        if_missing=1
+    # --dry-run prints the composed build command and exits 0 without acquiring
+    # the lock or starting buildkitd (invoked via `ops run --build --dry-run`).
+    local if_missing=0 dry_run_build=0
+    while [ "${1:-}" = "--if-missing" ] || [ "${1:-}" = "--dry-run" ]; do
+        case "$1" in
+            --if-missing) if_missing=1 ;;
+            --dry-run)    dry_run_build=1 ;;
+        esac
         shift
-    fi
+    done
 
     if [ ! -f "$OPS_DOCKERFILE" ]; then
         echo "Error: Dockerfile not found: $OPS_DOCKERFILE" >&2
@@ -225,11 +333,12 @@ build_image() {
     local lock_file
     lock_file="$(_hash_file).lock"
     mkdir -p "$(dirname "$lock_file")"
-    if command -v flock >/dev/null 2>&1; then
+    if [ "$dry_run_build" = 0 ] && command -v flock >/dev/null 2>&1; then
         exec 9>"$lock_file"
         if [ "$if_missing" = 1 ]; then
             if ! flock -w 300 9; then
                 echo "Timed out waiting for build lock ($lock_file)" >&2
+                exec 9>&-
                 return 1
             fi
             # Re-check under the lock: if another process built the image, we're done.
@@ -240,6 +349,7 @@ build_image() {
         else
             if ! flock -n 9; then
                 echo "Another build is in progress (lock: $lock_file)" >&2
+                exec 9>&-
                 return 1
             fi
         fi
@@ -250,7 +360,8 @@ build_image() {
     # a 150 MB download across 170+ narinfo fetches.
     local -a extra_build_flags=(--network host)
     if [ "$OPS_RUNTIME" = "nerdctl" ]; then
-        ensure_buildkitd
+        # Skip buildkitd startup in dry-run — we only want to print the cmdline.
+        [ "$dry_run_build" = 0 ] && ensure_buildkitd
         # --allow is a buildkit-specific entitlement grant (nerdctl 2.x also
         # asks for security.insecure when network.host is granted — the daemon
         # is configured to allow it in ensure_buildkitd).
@@ -268,22 +379,112 @@ build_image() {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
         secret_flags+=(--secret "id=github_token,env=GITHUB_TOKEN")
     fi
-    "$RUNTIME_BIN" build -t "$OPS_IMAGE" \
-        --file "$OPS_DOCKERFILE" \
-        --label "ops.dockerfile=$dockerfile_abs" \
-        --pull \
-        "${extra_build_flags[@]}" \
-        --build-arg USER_UID="$OPS_USER_UID" \
-        --build-arg USER_GID="$OPS_USER_GID" \
-        --build-arg USER_NAME="$OPS_USER_NAME" \
-        --build-arg USER_LANG="$OPS_USER_LANG" \
-        "${secret_flags[@]}" \
+
+    # Per-profile build args from OPS_BUILD_ARGS[<image-key>]. Value is a
+    # string of `KEY=VALUE` pairs separated by `;` (a single pair is the
+    # common case). Allows e.g. overriding EXTRA_MISE_TOOLS per image:
+    #   declare -A OPS_BUILD_ARGS=(
+    #     [arch-chrome]="EXTRA_MISE_TOOLS=nix:google-chrome-for-testing"
+    #     [arch-min]="EXTRA_MISE_TOOLS="
+    #   )
+    local -a profile_build_args=()
+    if [ -n "${_OPS_IMAGE_KEY:-}" ] \
+       && declare -p OPS_BUILD_ARGS >/dev/null 2>&1 \
+       && [ -n "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]:-}" ]; then
+        local _pair
+        local -a _profile_pairs=()
+        # IFS=';' splits into KEY=VALUE chunks; `read -ra` avoids globbing
+        # and preserves internal whitespace within each value.
+        IFS=';' read -ra _profile_pairs <<< "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]}"
+        for _pair in "${_profile_pairs[@]}"; do
+            # Trim surrounding whitespace so `;  FOO=bar` works.
+            _pair="${_pair#"${_pair%%[![:space:]]*}"}"
+            _pair="${_pair%"${_pair##*[![:space:]]}"}"
+            [ -n "$_pair" ] && profile_build_args+=(--build-arg "$_pair")
+        done
+    fi
+
+    # OCI-metadata build args. SOURCE_URL populates the source/url/
+    # documentation labels and lets `docker inspect` consumers walk back to
+    # the project. OPS_SOURCE_URL defaults to the upstream repo; override
+    # (or set empty) for a fork / vendor build.
+    local -a oci_build_args=(
+        --build-arg "SOURCE_URL=${OPS_SOURCE_URL:-}"
+    )
+
+    local -a build_cmd=(
+        "$RUNTIME_BIN" build -t "$OPS_IMAGE"
+        --file "$OPS_DOCKERFILE"
+        --label "ops.dockerfile=$dockerfile_abs"
+        --pull
+        "${extra_build_flags[@]}"
+        --build-arg USER_UID="$OPS_USER_UID"
+        --build-arg USER_GID="$OPS_USER_GID"
+        --build-arg USER_NAME="$OPS_USER_NAME"
+        --build-arg USER_LANG="$OPS_USER_LANG"
+        "${oci_build_args[@]}"
+        "${profile_build_args[@]}"
+        "${secret_flags[@]}"
         "$@" "$SCRIPT_DIR"
+    )
+
+    if [ "$dry_run_build" = 1 ]; then
+        _dry_run_print "${build_cmd[@]}"
+        echo
+        return 0
+    fi
+
+    "${build_cmd[@]}"
     local ret=$?
-    [ $ret -eq 0 ] && save_hash
+    # Propagate save_hash failure so the next build/run doesn't silently skip
+    # the "Dockerfile changed" warning because the cache file never landed.
+    if [ $ret -eq 0 ]; then
+        save_hash || ret=$?
+    fi
     [ "$OPS_RUNTIME" = "nerdctl" ] && stop_buildkitd
     command -v flock >/dev/null 2>&1 && exec 9>&-
     return $ret
+}
+
+# Render an argv through `printf '%q '` while redacting secret values in
+# `--env KEY=VALUE` / `-e KEY=VALUE` / `--build-arg KEY=VALUE` pairs whose
+# KEY ends in TOKEN, KEY, SECRET, or PASSWORD (case-sensitive match on the
+# key suffix). Used by every --dry-run path so a shared transcript doesn't
+# leak GITHUB_TOKEN, ANTHROPIC_API_KEY, etc.
+_dry_run_print() {
+    local arg next key
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --env|-e|--build-arg)
+                if [ $# -ge 2 ]; then
+                    next="$2"
+                    key="${next%%=*}"
+                    # Redact only when the arg is `KEY=VAL` (contains `=`) and
+                    # the key name matches the sensitive suffix list.
+                    if [ "$key" != "$next" ]; then
+                        case "$key" in
+                            *TOKEN|*KEY|*SECRET|*PASSWORD|*PASSWD)
+                                # Placeholder uses plain letters so `printf
+                                # '%q'` doesn't shell-escape it (`***` and
+                                # `<redacted>` both get backslash-escaped,
+                                # breaking grep-style assertions on the
+                                # dry-run output).
+                                printf '%q %q ' "$arg" "${key}=REDACTED"
+                                shift 2
+                                continue
+                                ;;
+                        esac
+                    fi
+                    printf '%q %q ' "$arg" "$next"
+                    shift 2
+                    continue
+                fi
+                ;;
+        esac
+        printf '%q ' "$arg"
+        shift
+    done
 }
 
 show_help() {
@@ -336,8 +537,14 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
   -H, --nerdctl-home PATH   nerdctl directory        (default: ~/.local/share/ops/nerdctl)
       --no-rm               Keep container on exit   (default: removed)
       --dry-run             Print the runtime command instead of executing it
-  -b, --build [ARGS]        Build the image
-      --no-cache            Invalidate build cache
+  -h, --help                Show this help and exit
+  -b, --build               Build the image (honors --no-cache)
+      --no-cache            Invalidate build cache (requires --build)
+      --install             Run \`mise install\` (from the workdir's mise.toml)
+                            before the real command. Stand-alone gives you
+                            an interactive bash after install; combinable
+                            with --claude / --gemini / --opencode / --codex
+                            and with an explicit command after \`--\`.
       --nix-cleanup         Run nix-collect-garbage -d inside the container
       --update              Update mise and nix store inside the container
       --no-mount-home       Do not bind-mount host \$HOME (default: mounted).
@@ -351,6 +558,14 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
       --isolated-volumes    Use per-container volumes (\$OPS_CONTAINER_NAME-nix,
                             \$OPS_CONTAINER_NAME-mise) instead of the shared
                             ops-share-nix / ops-share-mise defaults
+      --no-trust-workdir    Do not auto-trust the workdir's mise.toml (default:
+                            trusted via MISE_TRUSTED_CONFIG_PATHS=\$PWD so
+                            mise activates without prompting). Use this flag
+                            when running in a repo whose mise.toml you don't
+                            fully trust; global opt-out via OPS_TRUST_WORKDIR=0.
+      --no-wayland          Disable the auto Wayland socket forward (enabled
+                            by default when \$WAYLAND_DISPLAY is set on the
+                            host). X11 is not auto-forwarded (deprecated).
       --no-claude-mount     Do not bind-mount ~/.claude (only meaningful with
                             --no-mount-home)
       --no-gemini-mount     Do not bind-mount ~/.gemini (only meaningful with
@@ -416,8 +631,32 @@ _assert_safe_install_path() {
     esac
 }
 
+# Fetch the latest release tag for a GitHub repo via the REST API, stripping
+# a leading `v` if present. Uses GITHUB_TOKEN (if set) to lift the 60 req/h
+# anonymous cap to 5000 req/h without writing the token to disk. Prints the
+# bare version on stdout; returns non-zero with an empty stdout if the call
+# fails or the payload can't be parsed. Factored out of cmd_install and
+# cmd_update to avoid drift between the two copies.
+_fetch_github_latest_tag() {
+    local repo="$1"
+    local -a gh_auth=()
+    [ -n "${GITHUB_TOKEN:-}" ] && gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    curl -fsSL --max-time 20 "${gh_auth[@]}" \
+        "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' \
+        | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/'
+}
+
 cmd_install() {
     local install_dir="$OPS_NERDCTL_HOME"
+
+    # Safety check upfront -- before any network call. Previously this check
+    # ran after the tarball + SHA256SUMS downloads, which meant a user who
+    # typed `OPS_NERDCTL_HOME=/usr ops nerdctl install` by mistake waited a
+    # full download only to be refused. Moving the guard here also lets
+    # test_regressions.bats exercise the refusal path without needing a
+    # curl mock.
+    _assert_safe_install_path "$install_dir" install || exit 1
 
     local missing=() cmd
     for cmd in curl tar sha256sum systemctl uname mktemp awk; do
@@ -437,7 +676,7 @@ cmd_install() {
 
     echo "Fetching latest nerdctl release..."
     local version
-    version="$(curl -fsSL https://api.github.com/repos/containerd/nerdctl/releases/latest | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')"
+    version="$(_fetch_github_latest_tag "containerd/nerdctl")"
     if [ -z "$version" ]; then
         echo "Failed to fetch version from GitHub (rate-limited or offline?)." >&2; exit 1
     fi
@@ -448,10 +687,14 @@ cmd_install() {
     TMP_INSTALL_DIR="$(mktemp -d)"
 
     echo "Downloading $tarball..."
-    curl -fsSL "$base_url/$tarball" -o "$TMP_INSTALL_DIR/$tarball"
+    if ! curl -fsSL "$base_url/$tarball" -o "$TMP_INSTALL_DIR/$tarball"; then
+        echo "Error: failed to download $tarball" >&2; exit 1
+    fi
 
     echo "Verifying checksum..."
-    curl -fsSL "$base_url/SHA256SUMS" -o "$TMP_INSTALL_DIR/SHA256SUMS"
+    if ! curl -fsSL "$base_url/SHA256SUMS" -o "$TMP_INSTALL_DIR/SHA256SUMS"; then
+        echo "Error: failed to download SHA256SUMS" >&2; exit 1
+    fi
     local expected_line
     expected_line=$(awk -v f="$tarball" '$2==f' "$TMP_INSTALL_DIR/SHA256SUMS")
     if [ -z "$expected_line" ]; then
@@ -461,15 +704,12 @@ cmd_install() {
         echo "Checksum verification failed for $tarball" >&2; exit 1
     fi
 
-    # Safety: refuse to rm -rf anything that isn't clearly under $HOME/.local
-    # or an explicit ops-owned path. Prevents an OPS_NERDCTL_HOME=/ or
-    # =/usr accident from destroying the host.
-    _assert_safe_install_path "$install_dir" install || exit 1
-
     if [ -d "$install_dir" ] && [ -n "$(ls -A "$install_dir" 2>/dev/null)" ]; then
-        printf "Directory %s is not empty. Overwrite? [Y/n] " "$install_dir"
+        # Default is "no" on destructive prompts: a bare Enter must not nuke
+        # an existing install. The test suite explicitly sends "Y" to accept.
+        printf "Directory %s is not empty. Overwrite? [y/N] " "$install_dir"
         read -r answer
-        if [[ "$answer" =~ ^[nN]$ ]]; then
+        if [[ ! "$answer" =~ ^[yY]$ ]]; then
             echo "Aborted."; exit 1
         fi
         rm -rf "$install_dir"
@@ -504,16 +744,18 @@ cmd_uninstall() {
     rm -f "$unit_file"
     systemctl --user daemon-reload
 
-    printf "Remove binaries (%s)? [Y/n] " "$install_dir"
+    # Destructive default = N: bare Enter keeps the binaries / data. A user who
+    # really wants to wipe them types "y" explicitly.
+    printf "Remove binaries (%s)? [y/N] " "$install_dir"
     read -r answer
-    if [[ ! "$answer" =~ ^[nN]$ ]]; then
+    if [[ "$answer" =~ ^[yY]$ ]]; then
         rm -rf "$install_dir"
         echo "Binaries removed."
     fi
 
-    printf "Remove containerd data (images, containers, snapshots) (%s)? [Y/n] " "$containerd_data"
+    printf "Remove containerd data (images, containers, snapshots) (%s)? [y/N] " "$containerd_data"
     read -r answer
-    if [[ ! "$answer" =~ ^[nN]$ ]]; then
+    if [[ "$answer" =~ ^[yY]$ ]]; then
         rm -rf "$containerd_data"
         echo "Data removed."
     fi
@@ -522,6 +764,29 @@ cmd_uninstall() {
 }
 
 cmd_runtime() {
+    # Special case: a bare `ops runtime --help` (no other args) shows ops-cli's
+    # own help for the subcommand. As soon as another arg is present
+    # (`ops runtime --help build`, `ops runtime ps --help`), we forward
+    # everything to the runtime — matching the proxy contract.
+    if [ $# -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+        cat <<EOF
+Usage: $(basename "$0") runtime <ARGS...>
+
+Proxy to the underlying runtime binary ($OPS_RUNTIME → $RUNTIME_BIN). Every
+argument is forwarded verbatim — 'ops runtime' does not parse or rewrite
+anything. Use this for runtime-specific commands ops.sh does not wrap.
+
+Examples:
+  $(basename "$0") runtime ps -a
+  $(basename "$0") runtime rm -f ops-dev
+  $(basename "$0") runtime volume inspect ops-share-nix
+  $(basename "$0") runtime tag localhost/ops-dev-test localhost/ops-dev
+
+The exit code of the runtime is propagated. To see the runtime's own help,
+add any non-flag token: 'ops runtime help', 'ops runtime ps --help', etc.
+EOF
+        return 0
+    fi
     exec "$RUNTIME_BIN" "$@"
 }
 
@@ -560,6 +825,21 @@ _human_bytes() {
 }
 
 cmd_status() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") status [info]
+
+Show the ops state: services (runtime + optional containerd/buildkitd when
+OPS_RUNTIME=nerdctl), images (default + OPS_IMAGES profiles + ops-labelled),
+labelled volumes (ops.volume=true), containers (name, image, coloured state,
+cmd, ops cli, real cli, mounts). 'info' is an alias of 'status'.
+
+No flags.
+EOF
+            return 0
+            ;;
+    esac
     # --- Services (top: runtime + daemons) ---
     echo -e "\033[1;34m=== Services ===\033[0m"
     if [ -f "$_CONFIG_FILE" ]; then
@@ -717,6 +997,34 @@ cmd_status() {
 }
 
 cmd_logs() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") logs|log [NAME] [OPTIONS] [RUNTIME_FLAGS...]
+
+Tail the logs of an ops container. Alias: 'log'.
+
+Arguments:
+  NAME                  Container to follow (default: \$OPS_CONTAINER_NAME = $OPS_CONTAINER_NAME)
+
+Options:
+  -s, --strip           Strip ANSI escape sequences from the output (useful for
+                        TUI programs that use cursor-forward \\e[nC — replaced
+                        with a single space so word boundaries survive).
+  -h, --help            Show this help.
+
+Runtime flags are passed through to the underlying '<runtime> logs ...':
+  --tail N, -n N        Last N lines
+  --since DURATION      e.g. 10m, 1h
+  --until DURATION
+  Any other flag prefixed with '-' is forwarded verbatim.
+
+Example:
+  $(basename "$0") log ops-dev -s --tail 200
+EOF
+            return 0
+            ;;
+    esac
     # First non-flag arg = container name override. Otherwise fall back to OPS_CONTAINER_NAME.
     local target="$OPS_CONTAINER_NAME"
     local -a passthrough=()
@@ -749,6 +1057,29 @@ cmd_logs() {
 }
 
 cmd_clean() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") clean [--dry-run]
+
+Prune ops-tracked resources. Strictly filtered by labels — containers and
+volumes created outside ops.sh are preserved:
+
+  dangling images          (<none>:<none>, regardless of origin)
+  stopped ops containers   (filter: label=ops.container=true, status=exited)
+  ops volumes              (filter: label=ops.volume=true)
+
+Two interactive prompts — one for dangling images + stopped containers,
+one for volumes (separate because volume removal is destructive and not
+always intended).
+
+Options:
+  --dry-run             Show what would be removed, exit without prompting or deleting
+  -h, --help            Show this help
+EOF
+            return 0
+            ;;
+    esac
     local dry=0
     [ "${1:-}" = "--dry-run" ] && { dry=1; shift; }
 
@@ -814,6 +1145,26 @@ cmd_clean() {
 }
 
 cmd_config() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") config
+
+Dump the effective OPS_* configuration with origin tagging:
+  [env]     defined before ops.sh sourced the config file
+  [config]  defined by \$_CONFIG_FILE
+  [default] assigned by a :- fallback in ops.sh
+
+Two sections:
+  Scalars   — every OPS_* simple variable with its resolved value + origin
+  Arrays    — OPS_IMAGES / OPS_DOCKERFILES / OPS_CONTAINER_NAMES /
+              OPS_BUILD_ARGS / OPS_ALIASES / OPS_VOLUMES, each key/value pair
+
+No flags. 'config' does not start the runtime — it's safe to call in scripts.
+EOF
+            return 0
+            ;;
+    esac
     echo -e "\033[1;34m=== Config file ===\033[0m"
     if [ -f "$_CONFIG_FILE" ]; then
         echo -e "  $_CONFIG_FILE \033[32m(loaded)\033[0m"
@@ -847,7 +1198,7 @@ cmd_config() {
 
     echo -e "\n\033[1;34m=== Arrays ===\033[0m"
     local any_array=0
-    for v in OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_ALIASES OPS_VOLUMES; do
+    for v in OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES OPS_VOLUMES; do
         if declare -p "$v" >/dev/null 2>&1; then
             any_array=1
             origin="${_OPS_ORIGIN[$v]:-config}"
@@ -877,9 +1228,29 @@ cmd_config() {
 }
 
 cmd_inspect() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") inspect <KEY>
+
+Show detailed info for KEY. The argument is resolved in this order:
+  1. OPS_IMAGES[KEY]       → treated as an image profile (ref + Dockerfile + container)
+  2. Container named KEY   → existing ops container (label or name match)
+  3. Raw image reference   → any image the runtime knows about
+
+Output:
+  Image section:     ref, ops-key (if profile), size, created, dockerfile label
+  Container section: name, image, coloured state, cmd, ops cli, real cli
+  Mounts section:    bind / volume → destination
+
+Exits 1 if KEY resolves to none of the three.
+EOF
+            return 0
+            ;;
+    esac
     local key="${1:-}"
     if [ -z "$key" ]; then
-        echo "Usage: $(basename "$0") inspect <key|container|image-ref>" >&2
+        echo "Usage: $(basename "$0") inspect <key|container|image-ref>  (see --help for details)" >&2
         exit 1
     fi
 
@@ -999,6 +1370,32 @@ _post_build_prompt() {
 }
 
 cmd_update() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") update [KEY]
+
+Rebuild an ops image and offer to recreate containers running on the
+previous layer. Post-build flow is identical to 'build'; the only
+difference is the KEY pre-resolution:
+
+  $(basename "$0") update              → rebuilds the active/default image
+  $(basename "$0") update <KEY>        → resolves OPS_IMAGES[<KEY>] first
+                                          (image + Dockerfile + container),
+                                          then builds
+
+After a successful build, compares the new image ID to the previous one.
+If they differ, lists every container still on the old ID with its
+'ops.cmdline.user' label (relaunch hint), then offers a [y/N] prompt to
+remove them. Relaunch is manual — containers on the old layer stay
+around otherwise.
+
+No flags. To force a no-cache rebuild, use 'ops run --build --no-cache'
+(or the alias 'ops build --no-cache').
+EOF
+            return 0
+            ;;
+    esac
     local key="${1:-}"
     if [ -n "$key" ]; then
         _resolve_image "$key"
@@ -1013,9 +1410,32 @@ cmd_update() {
 }
 
 cmd_backup() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") backup <VOLUME> > FILE.tar.gz
+
+Stream a runtime volume as a gzip-compressed tar archive to stdout. An
+ephemeral alpine container bind-mounts the volume read-only, pipes tar to
+stdout, and exits.
+
+The stdout redirect is REQUIRED — writing a binary tarball to a TTY is
+almost always a mistake, so the command refuses when stdout is a terminal.
+Override (rarely needed) with OPS_FORCE_TTY=1.
+
+Examples:
+  $(basename "$0") backup ops-share-nix > nix-\$(date +%F).tar.gz
+  $(basename "$0") backup ops-share-mise | ssh other './ops.sh restore ops-share-mise'
+
+Exits 1 if the volume doesn't exist or stdout is a TTY (and OPS_FORCE_TTY
+isn't set).
+EOF
+            return 0
+            ;;
+    esac
     local vol="${1:-}"
     if [ -z "$vol" ]; then
-        echo "Usage: $(basename "$0") backup <volume-name> > backup.tar.gz" >&2
+        echo "Usage: $(basename "$0") backup <volume-name> > backup.tar.gz  (see --help)" >&2
         exit 1
     fi
     if ! "$RUNTIME_BIN" volume inspect "$vol" >/dev/null 2>&1; then
@@ -1034,9 +1454,31 @@ cmd_backup() {
 }
 
 cmd_restore() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") restore <VOLUME> < FILE.tar.gz
+
+Restore a gzip-compressed tar archive from stdin into a runtime volume. An
+ephemeral alpine container mounts the volume read-write, pipes tar from
+stdin, and exits. The target volume is created automatically (with the
+ops.volume=true label) if it doesn't exist.
+
+The stdin redirect is REQUIRED — an empty stdin on a TTY is almost always
+a mistake, so the command refuses when stdin is a terminal.
+
+Examples:
+  $(basename "$0") restore ops-share-nix < nix-2026-04-23.tar.gz
+  ssh other './ops.sh backup ops-share-mise' | $(basename "$0") restore ops-share-mise
+
+Exits 1 on missing argument or TTY stdin.
+EOF
+            return 0
+            ;;
+    esac
     local vol="${1:-}"
     if [ -z "$vol" ]; then
-        echo "Usage: $(basename "$0") restore <volume-name> < backup.tar.gz" >&2
+        echo "Usage: $(basename "$0") restore <volume-name> < backup.tar.gz  (see --help)" >&2
         exit 1
     fi
     if [ -t 0 ]; then
@@ -1050,6 +1492,36 @@ cmd_restore() {
 }
 
 cmd_doctor() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") doctor
+
+Validate OPS_IMAGES ↔ Dockerfile ↔ image label ↔ container coherence.
+Intended as a pre-build scripting hook (see Exit codes below):
+
+  ops doctor >/dev/null && ops build   # only build if config is clean
+
+Checks performed:
+  Config     config file presence at \$_CONFIG_FILE
+  OPS_IMAGES each key has a resolvable Dockerfile:
+               OPS_DOCKERFILES[key], else \$SCRIPT_DIR/Dockerfile.<key>
+             each key's image is built, and its ops.dockerfile label
+             matches the Dockerfile declared for that key
+  Dangling   OPS_DOCKERFILES[k] / OPS_CONTAINER_NAMES[k] without OPS_IMAGES[k]
+  Containers labelled ops.container=true — orphans (image gone), image
+             mismatches (container image != OPS_IMAGES[key])
+
+Exit codes:
+  0    no warnings
+  1    at least one warning
+
+No flags. Doctor queries the runtime (image/container inspect) so it needs
+a working runtime context (unlike 'config' which doesn't).
+EOF
+            return 0
+            ;;
+    esac
     local ok=0 warn=0 k ref declared_df labeled_df declared_abs
     _doc_ok()   { printf '    \033[32m✓\033[0m %s\n' "$1"; ok=$((ok+1)); }
     _doc_warn() { printf '    \033[33m⚠\033[0m %s\n' "$1"; warn=$((warn+1)); }
@@ -1175,7 +1647,7 @@ cmd_self_update() {
 
     echo "Fetching latest release..."
     local latest_version
-    latest_version=$(curl -fsSL https://api.github.com/repos/containerd/nerdctl/releases/latest | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+    latest_version="$(_fetch_github_latest_tag "containerd/nerdctl")"
     if [ -z "$latest_version" ]; then
         echo "Failed to fetch latest version from GitHub (rate-limited or offline?)." >&2; exit 1
     fi
@@ -1212,6 +1684,75 @@ ensure_volume() {
     "$RUNTIME_BIN" --log-level error volume create --label ops.volume=true "$1" >/dev/null 2>&1 || true
 }
 
+# One-time (idempotent) migration: make sure the mise-nix plugin inside the
+# named volume is served as a symlink pointing to the image-baked path
+# /opt/ops/mise-plugin/nix (see Dockerfile section 5 for the rationale).
+#
+# Why: the volume mounted on /opt/mise/data masks the image layer at the
+# same path. Before this refactor, the plugin was copied under
+# /opt/mise/data/plugins/nix/ directly, so the first run populated the
+# volume with the plugin contents AND every subsequent rebuild of the
+# plugin was invisible -- the volume kept the stale copy forever.
+# Now the image ships the plugin at /opt/ops/mise-plugin/nix/ (OUTSIDE
+# the volume) and places a symlink at /opt/mise/data/plugins/nix -> that
+# path. Fresh volumes inherit the symlink automatically. Pre-existing
+# volumes carry a plain directory; this function detects that and
+# replaces it with the symlink. Costs ~200 ms once per volume lifetime.
+_ensure_mise_plugin_symlink() {
+    local volume="$1"
+    # Fast-path: we already migrated (or confirmed clean) this volume in
+    # a previous ops.sh invocation. The marker is a per-host, per-volume
+    # file under XDG_STATE_HOME. Skipping here saves ~1.5 s (the cost of
+    # the throwaway alpine container below) on every subsequent `ops run`.
+    # OPS_SKIP_PLUGIN_MIGRATION_CHECK=1 is an escape hatch for debugging.
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/ops"
+    local marker="$state_dir/plugin-symlink.$volume"
+    if [ -f "$marker" ] && [ "${OPS_SKIP_PLUGIN_MIGRATION_CHECK:-0}" != "1" ]; then
+        return 0
+    fi
+
+    # Probe the current state of /plugins/nix inside the volume. Uses a
+    # throwaway alpine container so we don't need the (heavy) ops-dev
+    # image here.
+    local kind
+    kind=$("$RUNTIME_BIN" run --rm -v "$volume":/data alpine sh -c '
+        if   [ -L /data/plugins/nix ]; then echo symlink
+        elif [ -d /data/plugins/nix ]; then echo dir
+        else                                echo absent
+        fi' 2>/dev/null) || return 0  # runtime/image unavailable → skip, non-fatal
+    case "$kind" in
+        symlink)
+            # Already migrated. Set the marker so next run short-circuits.
+            mkdir -p "$state_dir" && touch "$marker" 2>/dev/null || true
+            ;;
+        absent)
+            # Volume is empty (freshly created, or just wiped with
+            # `docker volume rm`). Leave it alone: writing anything here
+            # would make Docker skip the auto-populate step at the first
+            # mount of the ops-dev image, and the volume would end up
+            # without config/, installs/, shims/, cache/ -- a broken
+            # state. Docker itself copies the image's /opt/mise/data/
+            # contents (symlink included) on the first real mount.
+            # NOT touching the marker here -- we want to re-probe on the
+            # next run (after Docker populates the volume) to confirm the
+            # symlink landed and then memoize.
+            ;;
+        dir)
+            # Pre-existing volume from before the symlink refactor: plugin
+            # files were copied directly under /data/plugins/nix/ and now
+            # mask the image's updated code. Replace the directory with
+            # the symlink so rebuilds take effect.
+            echo "Migrating $volume: legacy plugin directory → symlink (one-time)" >&2
+            if "$RUNTIME_BIN" run --rm -v "$volume":/data alpine sh -c '
+                rm -rf /data/plugins/nix && \
+                mkdir -p /data/plugins && \
+                ln -s /opt/ops/mise-plugin/nix /data/plugins/nix' >/dev/null 2>&1; then
+                mkdir -p "$state_dir" && touch "$marker" 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
 # Adds host paths to extra_volumes as bind mounts, only if they exist.
 # When the path is under the host's $HOME, the destination is remapped to
 # the container's $HOME_IN_CTN — this matters only if OPS_USER_NAME differs
@@ -1244,6 +1785,7 @@ cmd_run() {
     local extra_ports=()
     local build_extra_args=()
     local do_build=""
+    local do_install=0
     local ephemeral=1
     local agent_cmd=""
     local dry_run=0
@@ -1271,13 +1813,27 @@ cmd_run() {
     # --isolated-volumes switches to per-container volumes
     # ($OPS_CONTAINER_NAME-nix, $OPS_CONTAINER_NAME-mise).
     local isolated_volumes=0
+    # Auto-forward the host Wayland socket so GUI apps (Chrome, Electron-
+    # based tools, etc.) can display on the host compositor. Silently no-op
+    # when the host isn't running Wayland ($WAYLAND_DISPLAY unset or socket
+    # missing). --no-wayland disables this. X11 is NOT auto-forwarded —
+    # wire it manually via -v /tmp/.X11-unix and -e DISPLAY if you need it.
+    local wayland_auto=1
+    # trust_workdir=1 injects MISE_TRUSTED_CONFIG_PATHS=$PWD so mise activates
+    # any mise.toml found in the bind-mounted workdir without prompting.
+    # Defaults to OPS_TRUST_WORKDIR (1 unless the user exported 0 in
+    # ops.conf). The CLI flag --no-trust-workdir is the per-invocation
+    # opt-out; set OPS_TRUST_WORKDIR=0 to opt out globally.
+    local trust_workdir="${OPS_TRUST_WORKDIR:-1}"
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --no-trust-workdir)   trust_workdir=0;         shift ;;
             --no-mount-home)      mount_home=0;            shift ;;
             --no-mount-volume)    mount_volume=0;          shift ;;
             --no-nix-volume)      use_nix_volume=0;        shift ;;
             --no-mise-volume)     use_mise_volume=0;       shift ;;
+            --no-wayland)         wayland_auto=0;          shift ;;
             --no-claude-mount)    claude_agent="off";      shift ;;
             --no-gemini-mount)    gemini_agent="off";      shift ;;
             --no-opencode-mount)  opencode_agent="off";    shift ;;
@@ -1294,12 +1850,13 @@ cmd_run() {
             -g|--gid)          OPS_USER_GID="$2";                           shift 2 ;;
             -l|--lang)         OPS_USER_LANG="$2";                          shift 2 ;;
             -v|--volume)       extra_volumes+=("$2");                   shift 2 ;;
-            -H|--nerdctl-home) OPS_NERDCTL_HOME="$(realpath "$2")";
+            -H|--nerdctl-home) OPS_NERDCTL_HOME="$(realpath -m "$2")";
                                export PATH="$OPS_NERDCTL_HOME/bin:$PATH";
                                _resolve_runtime;
                                [ "$OPS_RUNTIME" != "nerdctl" ] && echo "Warning: -H has no effect with OPS_RUNTIME=$OPS_RUNTIME" >&2
                                shift 2 ;;
             -b|--build)        do_build=1;                              shift ;;
+            --install)         do_install=1;                            shift ;;
             --no-cache)        build_extra_args+=(--no-cache);          shift ;;
             --no-rm)           ephemeral=0;                             shift ;;
             --nix-cleanup)     agent_cmd='HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d'; shift ;;
@@ -1328,7 +1885,32 @@ cmd_run() {
         esac
     done
 
-    [ -n "$agent_cmd" ] && set -- bash -c "$agent_cmd" _ "$@"
+    # --install: run `mise install` (from the workdir's mise.toml) before the
+    # real command. Three cases, depending on what else was asked:
+    #   1. an agent_cmd is already set (e.g. --claude / --update)
+    #        → chain: `mise install && (agent_cmd)`
+    #   2. an explicit command was given after `--`
+    #        → chain: `mise install && exec "$@"`
+    #   3. no command at all (plain `ops run --install`)
+    #        → chain: `mise install && exec bash`  (interactive shell after install)
+    # The `set -- bash -c "$agent_cmd" _ "$@"` line below then hands it off to
+    # the container in a single exec-friendly form.
+    if [ "$do_install" = 1 ]; then
+        if [ -n "$agent_cmd" ]; then
+            agent_cmd="mise install --yes && { $agent_cmd; }"
+        elif [ $# -gt 0 ]; then
+            # shellcheck disable=SC2016  # "$@" is evaluated INSIDE the container's bash -c
+            agent_cmd='mise install --yes && exec "$@"'
+        else
+            agent_cmd="mise install --yes && exec bash --rcfile /etc/ops-bashrc"
+        fi
+    fi
+
+    # Prepend `source /etc/ops-bashrc` so `bash -c` wrappers (claude, gemini,
+    # --update, --nix-cleanup, or a user-supplied `--` command with --install)
+    # inherit PATH/PYTHONPATH/... from the workdir's mise.toml + flake.nix.
+    # The rcfile is idempotent (guarded on $- and OPS_BASHRC_DONE).
+    [ -n "$agent_cmd" ] && set -- bash -c "source /etc/ops-bashrc; $agent_cmd" _ "$@"
 
     # Compute --user AFTER flag parsing so -u/-g CLI overrides take effect.
     local user_arg
@@ -1343,21 +1925,26 @@ cmd_run() {
     fi
 
     if [ -n "$do_build" ]; then
-        local old_id
-        old_id=$("$RUNTIME_BIN" image inspect "$OPS_IMAGE" --format '{{.Id}}' 2>/dev/null || true)
+        local old_id=""
+        [ "$dry_run" = 0 ] && old_id=$("$RUNTIME_BIN" image inspect "$OPS_IMAGE" --format '{{.Id}}' 2>/dev/null || true)
         # Do NOT forward "$@" to build_image: anything after -- is the container
         # command, not a build flag, and would be appended after the context
         # path ("$@" "$SCRIPT_DIR"), breaking `docker build`.
-        build_image "${build_extra_args[@]}"
+        local -a build_prefix=()
+        [ "$dry_run" = 1 ] && build_prefix=(--dry-run)
+        build_image "${build_prefix[@]}" "${build_extra_args[@]}"
         local ret=$?
-        if [ $ret -eq 0 ]; then
+        if [ $ret -eq 0 ] && [ "$dry_run" = 0 ]; then
             _post_build_prompt "$old_id"
         fi
         exit $ret
     fi
 
     if [ $# -eq 0 ]; then
-        set -- bash
+        # --rcfile bakes mise activation + nix profile sourcing so interactive
+        # shells work even when $HOME is bind-mounted from the host (which
+        # shadows the image's $HOME/.bashrc).
+        set -- bash --rcfile /etc/ops-bashrc
     fi
 
     if ! "$RUNTIME_BIN" images -q "$OPS_IMAGE" 2>/dev/null | grep -q .; then
@@ -1386,9 +1973,13 @@ cmd_run() {
     if [ -n "$running" ]; then
         if [ ${#extra_volumes[@]} -gt 0 ]; then
             local mounted missing=()
+            # Format emits `Source:Destination ` per mount (trailing space). Matching
+            # with a trailing space anchors the comparison to whole entries — bare
+            # `grep -qF "$v"` would accept `/foo/bar:/bar` as containing `/foo` and
+            # wrongly conclude that a different volume was already mounted.
             mounted=$("$RUNTIME_BIN" container inspect "$OPS_CONTAINER_NAME" --format '{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' 2>/dev/null)
             for v in "${extra_volumes[@]}"; do
-                echo "$mounted" | grep -qF "$v" || missing+=("$v")
+                echo "$mounted" | grep -qF "$v " || missing+=("$v")
             done
             if [ ${#missing[@]} -gt 0 ]; then
                 echo -e "\033[33m⚠ Container '$OPS_CONTAINER_NAME' is already running — the following volumes cannot be added:\033[0m" >&2
@@ -1403,15 +1994,23 @@ cmd_run() {
             fi
         fi
         if [ -n "$running" ]; then
+            # trust_workdir=1 injects MISE_TRUSTED_CONFIG_PATHS=$PWD so mise
+            # auto-activates any mise.toml in the bind-mounted workdir.
+            # Opt out with --no-trust-workdir or OPS_TRUST_WORKDIR=0 before
+            # running ops on a repo you don't fully trust: a hostile
+            # mise.toml can run tasks/hooks via `mise activate`.
+            local -a trust_env=()
+            [ "$trust_workdir" = 1 ] && trust_env=(--env "MISE_TRUSTED_CONFIG_PATHS=$PWD")
             if [ "$dry_run" = 1 ]; then
-                printf '%q ' "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" \
+                _dry_run_print "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" \
                     --env "HOME=$HOME_IN_CTN" \
                     --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" \
+                    "${trust_env[@]}" \
                     "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
                 echo
                 exit 0
             fi
-            exec "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" --env "HOME=$HOME_IN_CTN" --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
+            exec "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" --env "HOME=$HOME_IN_CTN" --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" "${trust_env[@]}" "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
         fi
     fi
 
@@ -1435,7 +2034,22 @@ cmd_run() {
         mise_volume="${OPS_CONTAINER_NAME}-mise"
     fi
     [ "$use_nix_volume" = 1 ]    && { ensure_volume "$nix_volume";    extra_volumes+=("$nix_volume:/nix"); }
-    [ "$use_mise_volume" = 1 ]   && { ensure_volume "$mise_volume";   extra_volumes+=("$mise_volume:/opt/mise/data"); }
+    [ "$use_mise_volume" = 1 ]   && {
+        ensure_volume "$mise_volume"
+        # Replace any legacy plain-directory plugin in the volume with a
+        # symlink pointing at the image-baked copy, so plugin updates
+        # surface after a rebuild. No-op after the first call.
+        _ensure_mise_plugin_symlink "$mise_volume"
+        extra_volumes+=("$mise_volume:/opt/mise/data")
+    }
+
+    # OPS_DEV_PLUGIN_MOUNT=1: bind-mount the repo's mise/ directory directly
+    # over the image-baked plugin so contributors can iterate on Lua code
+    # without rebuilding the image. Read-only to keep plugin mutations
+    # confined to the host working copy (git-trackable).
+    if [ "${OPS_DEV_PLUGIN_MOUNT:-0}" = "1" ]; then
+        extra_volumes+=("$SCRIPT_DIR/mise:/opt/ops/mise-plugin/nix:ro")
+    fi
 
     # Per-agent state machine (auto / mount / volume / off).
     # First path after primary_dest is the "primary" source dir — its
@@ -1492,6 +2106,11 @@ cmd_run() {
         --workdir "$PWD"
         --volume "$PWD:$PWD"
     )
+    # trust_workdir=1 (default) auto-trusts mise.toml in the bind-mounted
+    # workdir — the usual "mise Trust them?" prompt is suppressed. Disable
+    # with --no-trust-workdir / OPS_TRUST_WORKDIR=0 before running against
+    # an untrusted repo.
+    [ "$trust_workdir" = 1 ] && args+=(--env "MISE_TRUSTED_CONFIG_PATHS=$PWD")
     for v in "${extra_volumes[@]}"; do
         args+=(--volume "$v")
     done
@@ -1505,23 +2124,62 @@ cmd_run() {
             args+=(--volume "$v")
         done
     fi
+    # Auto-forward the Wayland socket when the host runs Wayland. Silent
+    # no-op when any of the preconditions is missing; --no-wayland opts out.
+    if [ "$wayland_auto" = 1 ] \
+       && [ -n "${WAYLAND_DISPLAY:-}" ] \
+       && [ -n "${XDG_RUNTIME_DIR:-}" ] \
+       && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        args+=(--volume "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY")
+        args+=(--env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+        args+=(--env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+    fi
     args+=("${extra_envs[@]}")
     [ ${#extra_ports[@]} -gt 0 ] && args+=("${extra_ports[@]}")
 
     # Build real-CLI snapshot BEFORE injecting cmdline labels (avoids recursive embedding).
-    # Mask sensitive env values (tokens / API keys) in the label so they are
+    # Mask sensitive env values (tokens / API keys) in BOTH labels so they are
     # not readable via `docker inspect` — the container itself still receives
-    # the real values via the extra_envs already in args.
-    local real_cli
+    # the real values via the extra_envs already in args. The masking regex is
+    # applied to:
+    #   - real_cli: the effective `docker run ...` (built from args above)
+    #   - OPS_ORIG_ARGV: the raw user invocation captured at script entry
+    #     (a user who types `ops -e GITHUB_TOKEN=xxx run` would otherwise
+    #     leak the token via ops.cmdline.user).
+    _mask_secrets() {
+        # Two layers of masking applied to the labels:
+        #   1. Explicit known-secret names (the historical list).
+        #   2. Convention fallback: any variable whose name ends in _TOKEN,
+        #      _SECRET, _KEY, _PASSWORD, _PASS, _PWD, _APIKEY, _API_KEY.
+        # Layer 2 catches MY_DB_PASSWORD, SLACK_WEBHOOK_SECRET, etc. without
+        # requiring each to be added by hand. Non-secret names matching the
+        # suffix (e.g. PUBLIC_KEY) are a deliberate false-positive trade-off
+        # in favour of not leaking anything through the label.
+        #
+        # Quote forms covered per pattern:
+        #   KEY=bare_value         → stops at whitespace
+        #   KEY='single quoted'    → consumes up to closing '
+        #   KEY="double quoted"    → consumes up to closing "
+        local explicit='GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY'
+        local convention='[A-Z][A-Z0-9_]*(_TOKEN|_SECRET|_KEY|_API_KEY|_APIKEY|_PASSWORD|_PASS|_PWD)'
+        sed -E \
+            -e "s/(${explicit})='[^']*'/\\1='***'/g" \
+            -e "s/(${explicit})=\"[^\"]*\"/\\1=\"***\"/g" \
+            -e "s/(${explicit})=[^[:space:]'\"]+/\\1=***/g" \
+            -e "s/(${convention})='[^']*'/\\1='***'/g" \
+            -e "s/(${convention})=\"[^\"]*\"/\\1=\"***\"/g" \
+            -e "s/(${convention})=[^[:space:]'\"]+/\\1=***/g"
+    }
+    local real_cli real_cli_masked user_cli_masked
     real_cli="$(_shell_quote "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@")"
-    local real_cli_masked
-    real_cli_masked=$(printf '%s' "$real_cli" \
-        | sed -E "s/(GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY)=[^[:space:]'\"]+/\\1=***/g")
-    args+=(--label "ops.cmdline.user=$OPS_ORIG_ARGV")
+    real_cli_masked=$(printf '%s' "$real_cli" | _mask_secrets)
+    user_cli_masked=$(printf '%s' "$OPS_ORIG_ARGV" | _mask_secrets)
+    unset -f _mask_secrets
+    args+=(--label "ops.cmdline.user=$user_cli_masked")
     args+=(--label "ops.cmdline.real=$real_cli_masked")
 
     if [ "$dry_run" = 1 ]; then
-        printf '%q ' "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@"
+        _dry_run_print "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@"
         echo
         exit 0
     fi
@@ -1531,6 +2189,28 @@ cmd_run() {
 }
 
 cmd_images() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") images|image
+
+List every image profile declared in OPS_IMAGES (associative array in
+\$_CONFIG_FILE). For each entry:
+
+  key           the lookup name you pass to '-i <key>'
+  image         OPS_IMAGES[key] (the image reference)
+  dockerfile    OPS_DOCKERFILES[key], else \$SCRIPT_DIR/Dockerfile.<key>,
+                else the default \$OPS_DOCKERFILE
+  container     OPS_CONTAINER_NAMES[key], else the key itself
+
+'image' (singular) is an alias. No flags.
+
+Declare profiles in \$_CONFIG_FILE:
+  declare -A OPS_IMAGES=([ml]="localhost/ops-ml" [rust]="localhost/ops-rust")
+EOF
+            return 0
+            ;;
+    esac
     echo -e "\033[1;34m=== Declared images (OPS_IMAGES) ===\033[0m"
     if declare -p OPS_IMAGES >/dev/null 2>&1 && [ ${#OPS_IMAGES[@]} -gt 0 ]; then
         local key img df cn
@@ -1568,6 +2248,7 @@ _resolve_image() {
     local name="$1"
     if declare -p OPS_IMAGES >/dev/null 2>&1 && [ -n "${OPS_IMAGES[$name]:-}" ]; then
         OPS_IMAGE="${OPS_IMAGES[$name]}"
+        _OPS_IMAGE_KEY="$name"
         if [ "${_user_set_f:-0}" = 0 ]; then
             if declare -p OPS_DOCKERFILES >/dev/null 2>&1 && [ -n "${OPS_DOCKERFILES[$name]:-}" ]; then
                 OPS_DOCKERFILE="${OPS_DOCKERFILES[$name]}"
@@ -1588,6 +2269,34 @@ _resolve_image() {
 }
 
 cmd_aliases() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") aliases|alias
+
+List user-defined aliases from \$_CONFIG_FILE. Two forms are supported:
+
+  String aliases (OPS_ALIASES associative array):
+    declare -A OPS_ALIASES=(
+      [ml]="run -i localhost/ml-dev -v /data:/data --claude"
+      [web]="run -p 3000:3000 -p 5173:5173"
+    )
+
+  Function aliases (ops_alias_<name>, must echo the argv):
+    ops_alias_dev() { echo run -i arch --claude; }
+
+Reserved names are ignored: built-in subcommands cannot be shadowed
+(run, build, runtime, status, info, logs, log, clean, nerdctl, doctor,
+inspect, config, backup, restore, update, alias, aliases, image, images,
+version, -V, --version, help, -h, --help).
+
+'alias' (singular) is an alias of this command. No flags. Aliases are
+expanded in a single pass — they cannot recursively expand into other
+aliases.
+EOF
+            return 0
+            ;;
+    esac
     echo -e "\033[1;34m=== String aliases (OPS_ALIASES) ===\033[0m"
     if declare -p OPS_ALIASES >/dev/null 2>&1; then
         local key
@@ -1645,7 +2354,7 @@ EOF
 
 # Reserved subcommand names — aliases with these names are ignored so they
 # can't shadow built-in commands.
-_OPS_RESERVED=" nerdctl build runtime status info logs log clean run help -h --help alias aliases image images doctor inspect config backup restore update "
+_OPS_RESERVED=" nerdctl build runtime status info logs log clean run help -h --help alias aliases image images doctor inspect config backup restore update version --version -V "
 
 # Expand a user-defined alias ($1 = name). Echoes the expanded argv to stdout
 # and returns 0 if the name matches a string or function alias; returns 1 if
@@ -1672,6 +2381,11 @@ _expand_alias() {
 _user_set_n=0
 _user_set_f=0
 
+# Set by _resolve_image to the OPS_IMAGES key in use (empty when -i points
+# to a raw image ref outside OPS_IMAGES). build_image reads it to look up
+# per-profile --build-arg entries in OPS_BUILD_ARGS.
+_OPS_IMAGE_KEY=""
+
 # Parse the leading -n / -i / -f / -H global flags and leave the remaining
 # args in the array _parsed_args. Called once on the main argv and a second
 # time after alias expansion (aliases may prepend global flags like
@@ -1683,7 +2397,7 @@ _parse_global_flags() {
             -n|--name)          OPS_CONTAINER_NAME="$2"; _user_set_n=1; shift 2 ;;
             -i|--image)         _resolve_image "$2";                    shift 2 ;;
             -f|--dockerfile)    OPS_DOCKERFILE="$2"; _user_set_f=1;     shift 2 ;;
-            -H|--nerdctl-home)  OPS_NERDCTL_HOME="$(realpath "$2")"
+            -H|--nerdctl-home)  OPS_NERDCTL_HOME="$(realpath -m "$2")"
                                 export PATH="$OPS_NERDCTL_HOME/bin:$PATH"
                                 _resolve_runtime
                                 [ "$OPS_RUNTIME" != "nerdctl" ] && echo "Warning: -H has no effect with OPS_RUNTIME=$OPS_RUNTIME" >&2
@@ -1713,7 +2427,7 @@ set -- "${_parsed_args[@]}"
 # inspect) and would be misleading without the daemon running.
 _skip_runtime_startup() {
     case "${1:-}" in
-        nerdctl|alias|aliases|image|images|help|-h|--help|config) return 0 ;;
+        nerdctl|alias|aliases|image|images|help|-h|--help|config|version|--version|-V) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1725,11 +2439,14 @@ if [ "$OPS_RUNTIME" = "nerdctl" ] && ! _skip_runtime_startup "${1:-}"; then
     if [ -x "$RUNTIME_BIN" ] && ! systemctl --user is-active containerd.service >/dev/null 2>&1; then
         echo "Starting containerd service..."
         systemctl --user start containerd.service
-        _i=0
+        # Dedicated name so a future top-level refactor can't clash with the
+        # `_i` local used inside ensure_buildkitd().
+        _containerd_retry=0
         while ! systemctl --user is-active containerd.service >/dev/null 2>&1 || [ ! -d "/run/user/$(id -u)/containerd-rootless" ]; do
-            sleep 1; _i=$((_i+1))
-            [ $_i -ge "$OPS_CONTAINERD_STARTUP_TIMEOUT" ] && { echo "Timeout after ${OPS_CONTAINERD_STARTUP_TIMEOUT}s: containerd is not responding. Check: systemctl --user status containerd" >&2; exit 1; }
+            sleep 1; _containerd_retry=$((_containerd_retry+1))
+            [ $_containerd_retry -ge "$OPS_CONTAINERD_STARTUP_TIMEOUT" ] && { echo "Timeout after ${OPS_CONTAINERD_STARTUP_TIMEOUT}s: containerd is not responding. Check: systemctl --user status containerd" >&2; exit 1; }
         done
+        unset _containerd_retry
     fi
 
     if [ ! -x "$RUNTIME_BIN" ]; then
