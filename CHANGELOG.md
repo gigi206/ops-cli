@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-04-25
+
 ### Security
 - Secret masking extended to the `ops.cmdline.user` label (previously only the `ops.cmdline.real` label was masked). A user who types `ops -e GITHUB_TOKEN=xxx run` no longer leaks the token via `docker inspect <container>`. The masking regex now also covers single- and double-quoted forms (`KEY='val'` / `KEY="val"`), not just bare values.
 - Secret masking gained a **convention fallback** on top of the explicit list: any uppercase variable name ending in `_TOKEN`, `_SECRET`, `_KEY`, `_API_KEY`, `_APIKEY`, `_PASSWORD`, `_PASS`, or `_PWD` is also masked. Catches `MY_DB_PASSWORD`, `SLACK_WEBHOOK_SECRET`, `STRIPE_API_KEY`, etc. without requiring each to be added by hand. False positives on non-secret names with the same suffix are a deliberate trade-off in favour of not leaking anything.
