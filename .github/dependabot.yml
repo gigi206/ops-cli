@@ -1,0 +1,42 @@
+version: 2
+
+updates:
+  # Keep GitHub Actions (checkout, cache, hadolint-action, trivy-action, ...)
+  # on the latest tags. Weekly cadence is low-noise yet regular enough to
+  # pick up security advisories within a few days.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    # Group every action bump into a single PR per week — each individual
+    # checkout / cache / hadolint / trivy upgrade is low-risk, batching them
+    # keeps the PR queue readable and avoids N separate CI runs.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Watch base images (archlinux:base / debian:testing-slim) + any FROM
+  # target. Dockerfile updates here tend to be digest bumps on the base
+  # images; Nix and mise installers float to upstream "latest" in-layer.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      docker-base-images:
+        patterns:
+          - "*"

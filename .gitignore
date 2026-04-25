@@ -1,13 +1,64 @@
-# Test artefacts — two tests in tests/test_images.bats create these next to
-# ops.sh to verify the Dockerfile.<key> auto-detection path. Their trap EXIT
-# cleanup is best-effort, so they may occasionally survive a test run.
+# Test artefacts — historical entries kept as a safety net. Tests in
+# tests/test_images.bats now create these inside an isolated copy of ops.sh
+# under $BATS_TEST_TMPDIR (see tests/helpers.bash::isolated_ops), so they
+# should no longer leak to the repo root. The lines below guard against
+# regressions in case a future test forgets to use the isolated path.
 Dockerfile.autodetect
 Dockerfile.ml
+# Generated inline by `mise run smoke` and by the CI `runtime-build` matrix
+# job (tests.yml). Both attempt to `rm -f` it at the end, but a Ctrl+C or a
+# failed step can leave it behind — gitignored so it never enters a commit.
+Dockerfile.cismoke
 
-# Per-image Dockerfile hash + build locks (when OPS_CACHE points into the repo)
-.sha256sum
-*.lock
+# Per-image Dockerfile hash + build locks (guard against the unusual case
+# where $XDG_CACHE_HOME or $OPS_CACHE would land inside the repo tree).
+# Hash files are named `<image>.sha256sum`; the old `.sha256sum` entry only
+# matched an exact filename and was a no-op, so it is replaced with a wildcard.
+# The lock glob is scoped to *.sha256sum.lock to avoid swallowing legitimate
+# files that happen to end in `.lock` (flake.lock, Cargo.lock, poetry.lock…).
+*.sha256sum
+*.sha256sum.lock
 
 # Backup files created manually (never commit)
 *.bak
 *.bak-*
+
+# Default output file of `script(1)` — created when contributors record a
+# pseudo-TTY session for debugging (e.g. measuring `ops run` startup time
+# with `script -qc 'docker run -it …'`).
+typescript
+
+# bashcov output (opt-in — see `mise run coverage` and mise.toml).
+# Generated beside the repo as `coverage/index.html` + `coverage/coverage.lcov`.
+coverage/
+.resultset.json
+
+# mise-nix plugin cache (populated when `_.nix = true` is enabled in a
+# downstream project that uses this plugin; never committed from this repo).
+.mise-nix/
+
+# Local flake experiments (never shipped — neither in the repo nor in the
+# container image). Mise-nix activates project-level flakes transparently;
+# contributors who want to try one locally drop flake.nix/flake.lock here
+# and they stay untracked.
+flake.nix
+flake.lock
+
+# Per-contributor mise overlay. Lets you add `[env] _.nix = true` (or any
+# other local-only setting) on top of the shared `mise.toml` without
+# touching the committed file. Read automatically by mise.
+mise.local.toml
+.mise.local.toml
+
+# Environment / secrets (never committed)
+.env
+.env.*
+!.env.example
+
+# Editor / IDE noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

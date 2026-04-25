@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- Copyright (c) 2026 Ghislain LE MEUR
+
 PLUGIN = {
   name              = "nix",
   version           = "1.0.0",

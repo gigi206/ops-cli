@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a new subcommand, flag, or integration.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Scope reminder: `ops.sh` is a single-file bash CLI wrapping
+        docker/podman/nerdctl. Requests that fit stay in scope; rewrites
+        or heavy new deps usually do not.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What are you trying to do that ops-cli makes hard today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        Concrete shape of the change — a new flag, a new subcommand, a
+        Dockerfile knob, etc. Mention edge cases you already thought about.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing flags / aliases / external wrappers you tried first.
+
+  - type: checkboxes
+    id: fit
+    attributes:
+      label: Scope fit
+      options:
+        - label: Stays within the "single-file bash CLI" constraint.
+        - label: Does not add a runtime dependency beyond the existing set (docker/podman/nerdctl/mise/nix/curl/tar/…).
+        - label: Can be covered by a bats test (mocked runtime acceptable).

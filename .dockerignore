@@ -5,6 +5,30 @@ mise/spec
 mise/test
 mise/node_modules
 
+# Repo-level VCS and CI metadata (never needed inside the image)
+.git
+.github
+
+# Test suite + coverage artifacts (dev-only)
+tests/
+coverage/
+*.bats
+
+# Dev tooling state
+.devbox/
+devbox.json
+devbox.lock
+mise.toml
+.editorconfig
+.shellcheckrc
+.gitignore
+
+# Docs not used at runtime
+CHANGELOG.md
+CONTRIBUTING.md
+README.md
+LICENSE
+
 # Backups and transient archives
 *.bak
 *.bak-*
@@ -13,3 +37,20 @@ ops-dev-backup.tar.gz
 # Editor / tooling noise
 .vscode
 .idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local flake experiments (test fixtures, not part of the image build).
+# Kept out of the build context so cache layers never bust on unrelated churn.
+flake.nix
+flake.lock
+.mise-nix/
+
+# Environment / secrets — never ship into layers
+.env
+.env.*
+
+# Log files
+*.log

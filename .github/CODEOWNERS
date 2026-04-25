@@ -1,0 +1,13 @@
+# Default owner for any change. The glob catches files at any depth so a new
+# top-level file is covered out of the box.
+* @gigi206
+
+# Release-sensitive surfaces get an explicit entry. Same owner today, but
+# makes it trivial to hand off a slice later without rewriting the default.
+/ops.sh               @gigi206
+/Dockerfile           @gigi206
+/Dockerfile.debian    @gigi206
+/mise/                @gigi206
+/scripts/             @gigi206
+/.github/workflows/   @gigi206
+/tests/               @gigi206

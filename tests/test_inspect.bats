@@ -21,17 +21,29 @@ _write_conf() { cat > "$XDG_CONFIG_HOME/ops/ops.conf"; }
     [[ "$output" == *"inspect"* ]]
 }
 
-@test "inspect with unknown key exits 1" {
-    # MOCK_IMAGE_EXISTS=1 defaults: image inspect succeeds for any ref. To
-    # simulate "unknown", we disable that fallback.
-    # But our mock always succeeds for `image inspect` — so we expect success
-    # and the inspect treats the arg as a raw image ref.
+@test "inspect with unknown key falls back to raw image ref" {
+    # cmd_inspect resolves in this order: OPS_IMAGES key → container name →
+    # image ref → error. The default mock's `image inspect` always succeeds,
+    # so an unknown name is treated as a raw image reference (the "Image"
+    # section is rendered for it). The exit-1 path (all three lookups fail)
+    # would need a mock that fails image inspect; see the test below.
     run env OPS_RUNTIME=docker "$(ops_sh)" inspect random-unknown-xyz
-    # With the default mock, image inspect returns 0, so this is treated as
-    # a raw image ref. We just ensure no crash and output mentions "Image".
     [ "$status" -eq 0 ]
     [[ "$output" == *"Image"* ]]
     [[ "$output" == *"random-unknown-xyz"* ]]
+}
+
+@test "inspect exits 1 when nothing resolves (profile, container, image all miss)" {
+    # mock_runtime_rich with both inspect-failure toggles flipped: container
+    # inspect and image inspect both return 1, so cmd_inspect's three lookup
+    # paths all miss and the "not found" error is emitted.
+    mock_runtime_rich docker
+    export MOCK_CTN_INSPECT_FAIL_ALL=1 MOCK_IMG_INSPECT_FAIL_ALL=1
+    run env OPS_RUNTIME=docker \
+        MOCK_CTN_INSPECT_FAIL_ALL=1 MOCK_IMG_INSPECT_FAIL_ALL=1 \
+        "$(ops_sh)" inspect totally-unknown-xyz
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not found as OPS_IMAGES key, container, or image"* ]]
 }
 
 @test "inspect resolves OPS_IMAGES key" {

@@ -73,3 +73,34 @@ _ops_eval() {
     result=$(_ops_eval '_shell_quote /path/to/file.tar.gz')
     [[ "$result" == "/path/to/file.tar.gz " ]]
 }
+
+@test "_hash_dir: nonexistent directory returns 0 silently (no output)" {
+    # current_hash() calls _hash_dir for mise/ and scripts/, either of which
+    # may be absent in minimal setups. The function must return 0 without
+    # printing anything so the outer sha256sum pipeline stays deterministic.
+    result=$(_ops_eval '_hash_dir /nonexistent/absolutely/missing; echo "rc=$?"')
+    [[ "$result" == *"rc=0"* ]]
+    # No sha256sum lines, no error messages — the function short-circuits
+    # before find runs.
+    [[ "$result" != *"sha256"* ]]
+    [[ "$result" != *"No such file"* ]]
+}
+
+@test "stored_hash: empty when no cache file exists" {
+    # stored_hash() in ops.sh: `[ -f "$f" ] && cat "$f" || echo ""` — the
+    # empty-string fallback when the per-image cache file doesn't exist.
+    # Fresh XDG_CACHE_HOME guarantees no cached file.
+    local fresh="$BATS_TEST_TMPDIR/fresh-cache"
+    rm -rf "$fresh"
+    result=$(XDG_CACHE_HOME="$fresh" _ops_eval 'stored_hash')
+    [ -z "$result" ]
+}
+
+@test "save_hash: returns 1 when current_hash fails (Dockerfile missing)" {
+    # current_hash returns 1 when OPS_DOCKERFILE doesn't exist; save_hash
+    # uses `h=$(current_hash) || return 1`, so the failure must propagate.
+    # Guards the `h=$(current_hash) || return 1` short-circuit in save_hash.
+    result=$(OPS_DOCKERFILE="/absolutely/nonexistent/Dockerfile" \
+             _ops_eval 'save_hash 2>/dev/null; echo "rc=$?"')
+    [[ "$result" == *"rc=1"* ]]
+}

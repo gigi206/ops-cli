@@ -5,6 +5,7 @@
 -- Nixhub.io API integration for package metadata
 local http = require("http")
 local json = require("json")
+local shell = require("shell")
 
 local M = {}
 
@@ -39,7 +40,12 @@ local function file_exists(path)
 end
 
 local function file_mtime(path)
-  local fh = io.popen("stat -c %Y '" .. path:gsub("'", "'\\''") .. "' 2>/dev/null")
+  -- `stat -c %Y` is GNU (Linux), `stat -f %m` is BSD (macOS). Try GNU first,
+  -- fall back to BSD so the cache TTL logic keeps working on Darwin hosts.
+  -- shell.shquote() replaces the previous ad-hoc gsub escape for consistency
+  -- with the rest of the plugin.
+  local q = shell.shquote(path)
+  local fh = io.popen("stat -c %Y " .. q .. " 2>/dev/null || stat -f %m " .. q .. " 2>/dev/null")
   if not fh then return nil end
   local out = fh:read("*l")
   fh:close()
@@ -62,7 +68,7 @@ local function read_cache(path)
 end
 
 local function write_cache(path, body)
-  os.execute("mkdir -p '" .. cache_dir():gsub("'", "'\\''") .. "'")
+  os.execute("mkdir -p " .. shell.shquote(cache_dir()))
   local fh = io.open(path, "w")
   if not fh then return end
   fh:write(body)
@@ -110,7 +116,7 @@ end
 
 -- Validate that metadata fetch was successful and contains expected data
 function M.validate_metadata(success, data, tool, response)
-  if not success or not data or not data.releases then
+  if not success or type(data) ~= "table" or type(data.releases) ~= "table" then
     -- Create a more user-friendly error message
     local error_msg = "Package not found: " .. tool .. " at https://nixhub.io. Search for available packages at https://search.nixos.org/packages"
     

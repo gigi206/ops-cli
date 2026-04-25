@@ -12,12 +12,13 @@ setup() {
 
 @test "running container: --dry-run emits exec command" {
     # Container running → should print `docker exec -it ...` in dry-run,
-    # not `docker run ...`
+    # not `docker run ...`, and target our test-container by name.
     run env OPS_RUNTIME=docker MOCK_CONTAINER_RUNNING=1 MOCK_CONTAINER_EXISTS=1 \
         "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"exec -it"* ]]
-    [[ "$output" != *"run -it"* ]]
+    [[ "$output" == *"test-container"* ]]
+    [[ "$output" != *" run -it"* ]]
 }
 
 @test "stopped container: starts + exec (no --dry-run sanity)" {
@@ -48,8 +49,10 @@ setup() {
 @test "status shows runtime info" {
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
-    [[ "$output" == *"runtime:"* ]]
-    [[ "$output" == *"docker"* ]]
+    # Tighter than separate "runtime:" + "docker" matches: require them on
+    # the SAME line ("runtime:   docker (…)") to guard against future text
+    # emitting "docker" in an unrelated section first.
+    [[ "$output" =~ runtime:[[:space:]]+docker[[:space:]] ]]
 }
 
 @test "status skips containerd check for non-nerdctl" {

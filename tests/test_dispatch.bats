@@ -40,25 +40,49 @@ setup() {
 
 @test "help reflects current OPS_RUNTIME" {
     run env OPS_RUNTIME=docker "$(ops_sh)" help
+    [ "$status" -eq 0 ]
     [[ "$output" == *"Runtime: docker"* ]]
 }
 
-@test "flat 'install' is no longer a subcommand (nerdctl namespace now)" {
+@test "flat 'install' is not a subcommand (belongs to nerdctl namespace)" {
+    # `install`, `uninstall`, and `self-update` are only valid as subcommands
+    # of `nerdctl` (e.g. `ops nerdctl install`). At the top level they fall
+    # through to the unknown-subcommand handler.
     run env OPS_RUNTIME=docker "$(ops_sh)" install
     [ "$status" -eq 1 ]
     [[ "$output" == *"unknown subcommand or alias"* ]]
 }
 
-@test "flat 'uninstall' is no longer a subcommand" {
+@test "flat 'uninstall' is not a subcommand (belongs to nerdctl namespace)" {
     run env OPS_RUNTIME=docker "$(ops_sh)" uninstall
     [ "$status" -eq 1 ]
     [[ "$output" == *"unknown subcommand or alias"* ]]
 }
 
-@test "flat 'self-update' is no longer a subcommand" {
+@test "flat 'self-update' is not a subcommand (belongs to nerdctl namespace)" {
     run env OPS_RUNTIME=docker "$(ops_sh)" self-update
     [ "$status" -eq 1 ]
     [[ "$output" == *"unknown subcommand or alias"* ]]
+}
+
+@test "'version' subcommand prints OPS_VERSION without starting the runtime" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" version
+    [ "$status" -eq 0 ]
+    [[ "$output" == "ops "* ]]
+    # No containerd/nerdctl auto-start noise should be emitted for `version`.
+    [[ "$output" != *"Starting containerd"* ]]
+}
+
+@test "'--version' flag is equivalent to the version subcommand" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" --version
+    [ "$status" -eq 0 ]
+    [[ "$output" == "ops "* ]]
+}
+
+@test "'-V' flag is equivalent to the version subcommand" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" -V
+    [ "$status" -eq 0 ]
+    [[ "$output" == "ops "* ]]
 }
 
 @test "'nerdctl' with no subcommand prints its help" {

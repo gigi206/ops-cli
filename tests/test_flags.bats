@@ -126,28 +126,35 @@ setup() {
     [[ "$output" == *"-H has no effect"* ]]
 }
 
-@test "GITHUB_TOKEN is forwarded as --env" {
+@test "GITHUB_TOKEN is forwarded as --env (value redacted in --dry-run)" {
     run env OPS_RUNTIME=docker GITHUB_TOKEN=ghp_testtoken "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"GITHUB_TOKEN=ghp_testtoken"* ]]
+    # The flag must be present so the caller can verify forwarding wiring,
+    # but the actual token value is redacted so dry-run transcripts (logs,
+    # pasted bug reports) don't leak credentials.
+    [[ "$output" == *"GITHUB_TOKEN=REDACTED"* ]]
+    [[ "$output" != *"ghp_testtoken"* ]]
 }
 
-@test "ANTHROPIC_API_KEY auto-propagated when set on host" {
+@test "ANTHROPIC_API_KEY auto-propagated when set on host (redacted)" {
     run env OPS_RUNTIME=docker ANTHROPIC_API_KEY=sk-ant-test "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"ANTHROPIC_API_KEY=sk-ant-test"* ]]
+    [[ "$output" == *"ANTHROPIC_API_KEY=REDACTED"* ]]
+    [[ "$output" != *"sk-ant-test"* ]]
 }
 
-@test "OPENAI_API_KEY auto-propagated when set on host" {
+@test "OPENAI_API_KEY auto-propagated when set on host (redacted)" {
     run env OPS_RUNTIME=docker OPENAI_API_KEY=sk-oai-test "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OPENAI_API_KEY=sk-oai-test"* ]]
+    [[ "$output" == *"OPENAI_API_KEY=REDACTED"* ]]
+    [[ "$output" != *"sk-oai-test"* ]]
 }
 
-@test "GEMINI_API_KEY auto-propagated when set on host" {
+@test "GEMINI_API_KEY auto-propagated when set on host (redacted)" {
     run env OPS_RUNTIME=docker GEMINI_API_KEY=g-test "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"GEMINI_API_KEY=g-test"* ]]
+    [[ "$output" == *"GEMINI_API_KEY=REDACTED"* ]]
+    [[ "$output" != *"=g-test"* ]]
 }
 
 @test "--claude-mount bind-mounts ~/.claude (with --no-mount-home)" {
@@ -164,4 +171,56 @@ setup() {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --claude-mount --dry-run 2>&1
     [ "$status" -eq 0 ]
     [[ "$output" == *"Warning:"*"--claude-mount"*"redundant"* ]]
+}
+
+# Auto Wayland socket forward -------------------------------------------------
+
+@test "wayland: auto-forward when WAYLAND_DISPLAY + socket exist" {
+    local xdg="$BATS_TEST_TMPDIR/xdg"
+    mkdir -p "$xdg"
+    # Create a fake Wayland socket (unix stream socket in a subshell via python
+    # is overkill — just touch a file; the check uses `-S` which requires a
+    # real socket. Use the host's $XDG_RUNTIME_DIR/wayland-0 if it exists,
+    # otherwise skip the test.)
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$XDG_RUNTIME_DIR/${WAYLAND_DISPLAY:-wayland-0}" ]; then
+        skip "host has no live Wayland socket at \$XDG_RUNTIME_DIR/\$WAYLAND_DISPLAY"
+    fi
+    run env OPS_RUNTIME=docker \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--volume $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"* ]]
+    [[ "$output" == *"--env WAYLAND_DISPLAY=$WAYLAND_DISPLAY"* ]]
+    [[ "$output" == *"--env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"* ]]
+}
+
+@test "wayland: --no-wayland disables the auto-forward" {
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$XDG_RUNTIME_DIR/${WAYLAND_DISPLAY:-wayland-0}" ]; then
+        skip "host has no live Wayland socket"
+    fi
+    run env OPS_RUNTIME=docker \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        "$(ops_sh)" run --no-wayland --dry-run
+    [ "$status" -eq 0 ]
+    ! [[ "$output" == *"WAYLAND_DISPLAY="* ]]
+    ! [[ "$output" == *"/wayland-"* ]]
+}
+
+@test "wayland: silent no-op when WAYLAND_DISPLAY is unset" {
+    unset WAYLAND_DISPLAY
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    ! [[ "$output" == *"WAYLAND_DISPLAY="* ]]
+}
+
+@test "wayland: silent no-op when socket does not exist" {
+    run env OPS_RUNTIME=docker \
+        XDG_RUNTIME_DIR="$BATS_TEST_TMPDIR/fake-xdg" \
+        WAYLAND_DISPLAY=wayland-0 \
+        "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    ! [[ "$output" == *"WAYLAND_DISPLAY="* ]]
+    ! [[ "$output" == *"/wayland-0:/"* ]]
 }

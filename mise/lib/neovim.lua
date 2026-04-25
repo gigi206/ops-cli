@@ -57,17 +57,20 @@ function M.install_plugin_from_store(nix_store_path, tool_name)
   logger.debug("Plugins directory: " .. plugins_dir)
 
   -- Create plugins directory if it doesn't exist
-  shell.exec('mkdir -p "%s"', plugins_dir)
+  shell.exec("mkdir -p " .. shell.shquote(plugins_dir))
 
-  -- Check if plugin is already installed and points to same path
-  local ok, current_target = shell.try_exec('readlink "%s" 2>/dev/null', plugin_path)
-  if ok and current_target and current_target:match(nix_store_path .. "$") then
+  -- Check if plugin is already installed and points to same path.
+  -- nix_store_path is used below as a Lua pattern anchor, so we escape its
+  -- `-`, `.`, and other magic characters to avoid false matches.
+  local ok, current_target = shell.try_exec("readlink " .. shell.shquote(plugin_path) .. " 2>/dev/null")
+  local anchor = nix_store_path:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1") .. "$"
+  if ok and current_target and current_target:match(anchor) then
     logger.info("Neovim plugin already installed: " .. plugin_name)
     return "already_installed"
   end
 
   -- Remove existing symlink/directory if it exists
-  shell.try_exec('rm -rf "%s"', plugin_path)
+  shell.try_exec("rm -rf " .. shell.shquote(plugin_path))
 
   -- Create symlink to Nix store path
   file.symlink(nix_store_path, plugin_path)

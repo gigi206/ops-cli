@@ -1,8 +1,8 @@
 # ops — Containerized development environment
 
-![tests](../../actions/workflows/tests.yml/badge.svg)
+[![tests](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml)
 
-Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, semgrep, ripgrep, jq, ast-grep, gh, qlty).
+Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, semgrep, ripgrep, jq, ast-grep, gh).
 
 The goal: a single entry point (`ops.sh`) to build, run, debug and update the environment, regardless of the underlying container runtime.
 
@@ -19,6 +19,8 @@ The goal: a single entry point (`ops.sh`) to build, run, debug and update the en
 - [Subcommands](#subcommands)
 - [`run` flags](#run-flags)
 - [Configuration (`ops.conf`) & environment variables](#configuration-opsconf--environment-variables)
+- [Build-time tools (`EXTRA_MISE_TOOLS` / `OPS_BUILD_ARGS`)](#build-time-tools-extra_mise_tools--ops_build_args)
+- [GUI apps (Chrome, Wayland)](#gui-apps-chrome-wayland)
 - [Exit codes](#exit-codes)
 
 **Configuration patterns**
@@ -55,7 +57,8 @@ The goal: a single entry point (`ops.sh`) to build, run, debug and update the en
   - `docker` — installed via `apt install docker-ce` / `pacman -S docker` (or Docker Desktop)
   - `podman` — `apt install podman` / `pacman -S podman`
   - `nerdctl` — **auto-installable** through `ops.sh nerdctl install` (downloads nerdctl-full into `~/.local/share/ops/nerdctl/`)
-- System tooling: `curl`, `tar`, `sha256sum`, `awk`, `sed`, `systemctl` (only required for `nerdctl install`), `realpath` (optional — used to resolve the absolute Dockerfile path for labels; falls back to the raw path if missing)
+- System tooling always used by `ops.sh`: `curl`, `tar`, `sha256sum`, `awk`, `sed`, `grep`, `realpath` (any `coreutils`-shipped build).
+- `nerdctl`-specific extras (only needed when `OPS_RUNTIME=nerdctl`): `systemctl --user` (manages `containerd.service` / auto-start / `self-update`), `mktemp`, `uname` — all required by `nerdctl install`.
 
 The script auto-detects the available runtime in this order: **docker > podman > nerdctl**.
 
@@ -65,15 +68,19 @@ The script auto-detects the available runtime in this order: **docker > podman >
 
 ### Step 1 — clone / copy the files
 
-Place at least these files in a directory (e.g. `~/Documents/msb/`):
+Place at least these files in a directory (e.g. `~/Documents/ops-cli/`):
 
 ```
-ops.sh              ← the wrapper
-Dockerfile          ← default image (Arch-based)
-mise/               ← local mise-nix plugin, COPY'd into the image at build time
+ops.sh              ← [required] the wrapper
+Dockerfile          ← [required] default image (Arch-based)
+scripts/            ← [required] helper wrappers (google-chrome, nix-wrapper,
+                      nix-cli-wrapper). Both Dockerfiles COPY these into
+                      /opt/ops/bin — the build FAILS with "COPY not found"
+                      if the directory is missing.
+mise/               ← [optional] local mise-nix plugin. Without it the image
+                      still builds, but the `nix:pkg@ver` backend and the
+                      `flake.nix` auto-activation feature are disabled.
 ```
-
-(Without `mise/`, the image still builds but the `nix:pkg@ver` backend + `flake.nix` auto-activation features are missing.)
 
 ### Step 2 — make it executable
 
@@ -87,7 +94,7 @@ In `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 # The wrapper itself
-alias ops='~/Documents/msb/ops.sh'
+alias ops='~/Documents/ops-cli/ops.sh'
 
 # One alias per AI agent — type `claude` instead of `ops run --claude`
 alias claude='ops run --claude'
@@ -146,13 +153,14 @@ Downloads nerdctl-full, verifies the SHA256, extracts it into `~/.local/share/op
 | Command | Description |
 |---|---|
 | `run [OPTIONS] [-- CMD...]` | Start or join the dev container. **Default command.** The `--` marks the start of the container command (anything after is no longer parsed as an ops flag). |
+| `version` (`--version`, `-V`) | Prints `ops <OPS_VERSION>`. Does not start the runtime, does not read containerd. |
 | `build [FLAGS]` | Build (or rebuild) the image. After a successful build, compares the new image ID to the previous one and, if it changed, lists containers still running on the old ID with a `relaunch:` hint from the `ops.cmdline.user` label, then offers a `[y/N]` prompt to remove them. |
 | `runtime ARGS...` | Proxy directly to the runtime binary (e.g. `ops.sh runtime ps -a`) |
 | `status` \| `info` | Show the state: services, images (default + profiles + labelled), labelled volumes, containers (name, image, coloured state, cmd, ops cli, real cli, mounts) |
 | `inspect KEY` | Detailed info for an `OPS_IMAGES` key, a container name, or a raw image reference |
 | `config` | Dumps the effective config (all `OPS_*` scalars + arrays) with origin (env/config/default) |
 | `doctor` | Validates config consistency: `OPS_IMAGES`/dockerfiles/`ops.dockerfile` labels, dangling entries, orphan containers (missing image) and mismatches (container on an image ≠ its profile's). Non-zero return code if warnings |
-| `update [KEY]` | Alias of `build`. Accepts an optional profile key to target a specific image from `OPS_IMAGES` (e.g. `ops update ml`); without a key, behaves exactly like `build` on the default image. |
+| `update [KEY]` | Builds (or rebuilds) an image — same post-build flow as `build` (diff image IDs, offer to recreate containers on the previous layer). The only difference: `update KEY` pre-resolves `KEY` against `OPS_IMAGES` **before** the build, while `build` uses the active `-i`/default image. Without a key, `update` behaves exactly like `build` on the default image. |
 | `backup VOL > file.tar.gz` | Streams a volume as tar.gz to stdout (redirection required) |
 | `restore VOL < file.tar.gz` | Restores a volume from a tar.gz on stdin (creates the volume with the `ops.volume=true` label if missing) |
 | `logs\|log [NAME] [-s\|--strip] [FLAGS]` | Tails the logs of a container (NAME defaults to `$OPS_CONTAINER_NAME`, `--strip` drops ANSI codes from TUIs) |
@@ -214,7 +222,7 @@ runtime:            docker (/usr/bin/docker)
 === Scalars ===
   OPS_BUILDKITD_TIMEOUT            = 10                                       [default]
   OPS_CONTAINER_NAME               = ops-dev                                  [config]
-  OPS_DOCKERFILE                   = /home/you/Documents/msb/Dockerfile      [default]
+  OPS_DOCKERFILE                   = /home/you/Documents/ops-cli/Dockerfile  [default]
   OPS_IMAGE                        = localhost/ops-dev                        [env]
   OPS_RUNTIME                      = docker                                   [config]
   OPS_USER_LANG                    = fr_FR.UTF-8                              [config]
@@ -265,7 +273,7 @@ runtime:            docker (/usr/bin/docker)
   ops key:    ml
   size:       987.1MiB
   created:    2026-04-18
-  dockerfile: /home/you/Documents/msb/Dockerfile.ml
+  dockerfile: /home/you/Documents/ops-cli/Dockerfile.ml
 
 === Container ===
   name:       ml
@@ -351,7 +359,9 @@ See the [AI CLI agents](#ai-cli-agents) section below.
 | `--dry-run` | Prints the runtime command without executing it |
 | `--nix-cleanup` | Runs `nix-collect-garbage -d` in the container |
 | `--update` | Updates mise and cleans up the nix store inside the container |
-| `-H, --nerdctl-home PATH` | nerdctl install directory (nerdctl only) |
+| `-H, --nerdctl-home PATH` | nerdctl install directory (nerdctl only; no effect when `OPS_RUNTIME` is docker/podman — warning emitted) |
+| `--no-trust-workdir` | Do not forward `MISE_TRUSTED_CONFIG_PATHS=$PWD` (default: forwarded so `mise activate` doesn't prompt). Use when running in a repo whose `mise.toml` isn't trusted. Global opt-out: `OPS_TRUST_WORKDIR=0`. |
+| `-h, --help` | Shows the `run` help (full flag list) and exits 0 |
 
 ---
 
@@ -377,6 +387,16 @@ OPS_DOCKERFILE=Dockerfile                 # Dockerfile path (relative or absolut
 # Additional volumes (space-separated)
 OPS_VOLUMES="/data:/data /mnt/shared:/mnt/shared"
 
+# Per-image --build-arg overrides (see "Build-time tools" section below).
+# Keys must match OPS_IMAGES keys. Value is "KEY=VALUE" (or "K1=V1;K2=V2").
+# Most common use: override EXTRA_MISE_TOOLS to add/remove tools baked
+# into the image (google-chrome, ngrok, terraform, ...).
+# declare -A OPS_BUILD_ARGS=(
+#   [arch]="EXTRA_MISE_TOOLS=nix:google-chrome nix:ngrok"
+#   [arch-min]="EXTRA_MISE_TOOLS="          # disable default google-chrome
+#   [deb]="EXTRA_MISE_TOOLS=nix:chromium"
+# )
+
 # Container user (defaults = host user)
 # OPS_USER_UID=1000
 # OPS_USER_GID=1000
@@ -397,6 +417,59 @@ GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 # OPENAI_API_KEY=sk-...
 # GEMINI_API_KEY=...
 ```
+
+### Build-time tools (`EXTRA_MISE_TOOLS` / `OPS_BUILD_ARGS`)
+
+The image baseline (`mise use -g nix:git nix:semgrep github:cli/cli ...`) is always installed. On top of it, the Dockerfile accepts an `EXTRA_MISE_TOOLS` build-arg — a **whitespace-separated list of mise tool specs** — whose default is:
+
+```dockerfile
+ARG EXTRA_MISE_TOOLS="nix:google-chrome"
+```
+
+This default installs **Google Chrome** (~300 MB) so the [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) server works out of the box. Google Chrome is one of the two browsers officially supported by the MCP (the other being Chrome for Testing).
+
+> **Why not `chrome-for-testing`?** It is not packaged in nixpkgs at the moment — only `chromium`, `ungoogled-chromium` and `google-chrome` are. If `chrome-for-testing` lands upstream later, you can switch via `OPS_BUILD_ARGS`.
+
+> **Why not `chromium`?** The MCP docs state "Other Chromium-based browsers may work, but this is not guaranteed." — so we pick an officially supported browser by default. If you prefer chromium (open-source, no unfree flag needed), override: `OPS_BUILD_ARGS[<key>]="EXTRA_MISE_TOOLS=nix:chromium"`.
+
+> **Unfree flag** — `google-chrome` is unfree. The Dockerfile already sets both `NIXPKGS_ALLOW_UNFREE=1` (standard Nix var) and `MISE_NIX_ALLOW_UNFREE=true` (mise-nix plugin escape hatch, auto-forwarded to `NIXPKGS_ALLOW_UNFREE=1` when the plugin calls `nix build`). No extra setup needed.
+
+**To opt out** (e.g. you never use Chrome/Puppeteer/Playwright in the container), explicitly set `EXTRA_MISE_TOOLS=""`:
+
+```bash
+# Ad-hoc, single build
+./ops.sh build --build-arg EXTRA_MISE_TOOLS=""
+
+# Permanent, per-profile (via ops.conf)
+declare -A OPS_IMAGES=(
+  [arch]="localhost/ops-dev"
+  [arch-min]="localhost/ops-dev-min"   # no chrome, leaner image
+)
+declare -A OPS_BUILD_ARGS=(
+  [arch-min]="EXTRA_MISE_TOOLS="
+)
+# ./ops.sh -i arch-min build       → no chrome
+# ./ops.sh -i arch build           → google-chrome (default)
+```
+
+**To add more tools**, list them whitespace-separated:
+
+```bash
+declare -A OPS_BUILD_ARGS=(
+  [arch]="EXTRA_MISE_TOOLS=nix:google-chrome nix:ngrok"
+  [arch-full]="EXTRA_MISE_TOOLS=nix:chromium nix:terraform nix:ngrok"
+)
+```
+
+**Semantics of `OPS_BUILD_ARGS`:**
+
+- Associative array keyed by `OPS_IMAGES` key (same keys as `OPS_IMAGES` / `OPS_DOCKERFILES` / `OPS_CONTAINER_NAMES`).
+- Value is one `KEY=VALUE` pair, or several separated by `;` (e.g. `"EXTRA_MISE_TOOLS=nix:chromium;NIX_CLEANUP=false"`).
+- Applied **only** when `-i <key>` matches an `OPS_IMAGES` key. When `-i` points to a raw image ref, no per-profile args are injected.
+- Propagated to `docker build` / `podman build` / `nerdctl build` via `--build-arg`.
+- The default value in the Dockerfile (`nix:google-chrome`) applies **only when no override is set**. An empty override (`EXTRA_MISE_TOOLS=`) explicitly disables it.
+
+**Applicable build-args** (declared in `Dockerfile` / `Dockerfile.debian`): `EXTRA_MISE_TOOLS`, `NIX_CLEANUP`, `MISE_INSTALL_SHA256`, `USER_UID`, `USER_GID`, `USER_NAME`, `USER_LANG`, `SOURCE_URL` (auto-forwarded from `$OPS_SOURCE_URL`).
 
 ### Precedence
 
@@ -425,17 +498,21 @@ Run `ops config` to see every variable tagged with its origin (`[env]` / `[confi
 | `OPS_USER_NAME` | `$(id -un)` | Username in the container |
 | `OPS_USER_LANG` | `$LANG` or `en_US.UTF-8` | Container locale |
 | `OPS_FORCE_TTY` | `0` | When `1`, bypasses the TTY guard on `backup`/`restore` (use with care — defeats the safety net against accidental `backup > /dev/tty`) |
+| `OPS_TRUST_WORKDIR` | `1` | When `1`, forwards `MISE_TRUSTED_CONFIG_PATHS=$PWD` to the container so `mise activate` auto-trusts the workdir's `mise.toml` (no interactive "Trust them?" prompt). Set `0` — globally in `ops.conf` or inline `OPS_TRUST_WORKDIR=0 ops run` — when entering a repo whose `mise.toml` you don't fully trust: a hostile `mise.toml` can execute tasks, hooks, or `[env]` shell expansions on `mise activate`. Per-invocation opt-out: `ops run --no-trust-workdir`. |
+| `OPS_SOURCE_URL` | `https://github.com/gigi206/ops-cli` | Forwarded as `--build-arg SOURCE_URL=…`; populates the `org.opencontainers.image.source` / `url` / `documentation` labels. Fork or vendor build: export `OPS_SOURCE_URL=""` to blank it, or set your own URL. |
+| `OPS_DEV_PLUGIN_MOUNT` | `0` | When `1`, bind-mounts the repo's `mise/` directory read-only over the image-baked plugin path (`/opt/ops/mise-plugin/nix`) so contributors can iterate on the Lua plugin without rebuilding the image. |
 
 ### External variables (no prefix)
 
 | Variable | Role |
 |---|---|
-| `GITHUB_TOKEN` | Injected into `/etc/nix/nix.conf` at build time **and** auto-propagated at runtime. Lifts the GitHub API rate limit 60→5000 req/h. **Classic PAT, no scope required.** Masked in `ops.cmdline.real` label. |
-| `ANTHROPIC_API_KEY` | Auto-propagated to the container when set on the host. Masked in label. |
-| `OPENAI_API_KEY` | Auto-propagated to the container when set on the host. Masked in label. |
-| `GEMINI_API_KEY` | Auto-propagated to the container when set on the host. Masked in label. |
+| `GITHUB_TOKEN` | Passed to the build via **BuildKit secret** (`--secret id=github_token,env=GITHUB_TOKEN`), consumed transiently by the `mise use` step and **never baked into image layers**. Also auto-propagated at runtime. Lifts the GitHub API rate limit 60→5000 req/h. **Classic PAT, no scope required.** Masked in the `ops.cmdline.user` and `ops.cmdline.real` labels. |
+| `ANTHROPIC_API_KEY` | Auto-propagated to the container when set on the host. Masked in both labels. |
+| `OPENAI_API_KEY` | Auto-propagated to the container when set on the host. Masked in both labels. |
+| `GEMINI_API_KEY` | Auto-propagated to the container when set on the host. Masked in both labels. |
 | `LANG`, `HOME`, `TERM`, `COLORTERM` | POSIX standards, honored inside the container. |
 | `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR` | XDG standards — affect `ops.conf` lookup, hash cache location, buildkit socket. |
+| `MISE_NIX_ALLOW_UNTRACKED=1` | Read by the bundled mise-nix plugin **inside the container**. When set, the plugin uses Nix's `path:.` fetcher instead of `git+file:.` so `flake.nix` is read regardless of its git status. Use case: throwaway flakes you don't want to `git add -fN`. Set it via the workdir's `mise.local.toml` `[env]` block (mise exports it before invoking the plugin). Without this var, an untracked `flake.nix` triggers an actionable error pointing at `git -C <root> add -fN flake.nix flake.lock` as the strict-mode fix. |
 
 ### Internal (unit-test only)
 
@@ -552,11 +629,13 @@ Aliases whose name matches a **built-in** subcommand are **ignored** so they don
 
 ```
 run build runtime status info logs log clean
-install uninstall self-update
-alias aliases image images
+nerdctl alias aliases image images
 doctor inspect config backup restore update
+version --version -V
 help -h --help
 ```
+
+> Note: `install`, `uninstall`, and `self-update` live under the `nerdctl` namespace (`ops nerdctl install`) and are **not** reserved at the top level — an alias named `install` would therefore expand normally. The guard applies only to their parent `nerdctl`.
 
 ### Precedence
 
@@ -1000,7 +1079,7 @@ Four pre-integrated AI agents, installed on demand via `mise` (Node.js + npm).
 | `--opencode` | `github:sst/opencode` | `--opencode-mount` | `~/.local/share/opencode`, `~/.config/opencode` |
 | `--codex` | `@openai/codex` | `--codex-mount` | `~/.codex` |
 
-`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GEMINI_API_KEY` are auto-propagated into the container when set on the host — no flag required. All four are masked in the `ops.cmdline.real` label (see [Labels → Security](#%E2%9A%A0-security-secret-exposure)).
+`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GEMINI_API_KEY` are auto-propagated into the container when set on the host — no flag required. All four are masked in **both** the `ops.cmdline.user` and `ops.cmdline.real` labels (see [Labels → Security](#%E2%9A%A0-security-secret-exposure)), so inlining them via `-e KEY=VAL` on the ops command line does not leak them via `docker inspect`.
 
 ### `--foo` vs `--foo-mount`
 
@@ -1098,6 +1177,131 @@ Now `claude-ml` drops you into an ML-ready container with Claude already launche
 
 ---
 
+## GUI apps (Chrome, Wayland)
+
+`ops.sh` auto-forwards the **Wayland** socket when the host runs Wayland — GUI apps like Chrome (baked into the image via `nix:google-chrome`, see [Build-time tools](#build-time-tools-extra_mise_tools--ops_build_args)) can render on the host compositor without any extra setup.
+
+### Prerequisites
+
+- The host is running a Wayland session: `echo $XDG_SESSION_TYPE` must print `wayland`.
+- `$WAYLAND_DISPLAY` is set and `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` is a live socket.
+
+When all of that is true, `ops.sh run` automatically injects:
+```
+--volume $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
+--env    WAYLAND_DISPLAY=$WAYLAND_DISPLAY
+--env    XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
+```
+
+No `xhost`, no X11 socket forwarding, no `.Xauthority` bind-mount — Wayland uses the socket permissions as the auth gate, and your container runs as the same UID as the host user (set via `--build-arg USER_UID=$(id -u)`), so the socket is readable out of the box.
+
+### Launching Chrome via the default run
+
+```bash
+ops run google-chrome
+```
+
+That is literally all you need. The `/opt/ops/bin/google-chrome` wrapper (baked into the image and first in PATH — see the [wrapper section below](#google-chrome-wrapper--for-cli-use-and-chrome-launcher-based-tools)) injects the flags required for Chrome to start inside a rootless container, then execs the real binary. You only need to pass extra flags yourself when you want to override wrapper behaviour.
+
+Flags the wrapper adds automatically:
+
+| Flag | Why |
+|---|---|
+| `--no-sandbox` | Chrome's SUID sandbox cannot work in a rootless container where the binary lives in `/nix/store` (read-only, no setuid). The container is already the sandbox. Standard practice (Playwright, Puppeteer, Selenium CI images do the same). |
+| `--disable-dev-shm-usage` | Avoids renderer crashes when `/dev/shm` in the container is small (64 MB default on Docker). |
+| `--ozone-platform=wayland` (conditional) | Added only when `$WAYLAND_DISPLAY` is set in the container. Switches to the Wayland backend instead of X11/XWayland. |
+| `--enable-features=UseOzonePlatform,WaylandWindowDecorations` (conditional) | Same condition — activates the Ozone path and adds client-side window decorations (titlebar, close button). |
+
+If you need the raw binary without the wrapper (custom flags for testing, benchmarking a specific variant, …), invoke `/opt/mise/data/installs/nix-google-chrome/latest/bin/google-chrome` directly or use `mise exec nix:google-chrome --`.
+
+### Permanent shortcut via `ops.conf`
+
+Because the wrapper already adds the required flags, the alias only needs to invoke `google-chrome`. Add site-specific arguments (start URL, profile dir, proxy, …) as needed.
+
+```bash
+declare -A OPS_ALIASES=(
+  [chrome]="run google-chrome"
+)
+```
+
+Then:
+```bash
+ops chrome                     # opens Chrome with the wrapper defaults
+ops chrome https://example.com # extra args are appended
+```
+
+### Opting out — `--no-wayland`
+
+Disable the auto-forward when you don't want it (headless CI, remote SSH, you're configuring a custom display path):
+```bash
+ops run --no-wayland <cmd>
+```
+
+The Wayland mount + envs are skipped; nothing else changes. `ops.sh` never touches X11 (considered deprecated here) — if you really need X11, wire it manually:
+```bash
+ops run -v /tmp/.X11-unix:/tmp/.X11-unix \
+        -v "$HOME/.Xauthority:/home/$(id -un)/.Xauthority:ro" \
+        -e DISPLAY="$DISPLAY" \
+        -e XAUTHORITY="/home/$(id -un)/.Xauthority" \
+        <cmd>
+```
+
+### Expected non-blocking warnings
+
+When Chrome starts in the container you'll see a handful of errors that are **cosmetic only**:
+- `drmGetDevices2() has not found any devices` / `eglInitialize failed` — no GPU passthrough, Chrome falls back to software rendering. Slower but works.
+- `Failed to connect to bus /run/dbus/system_bus_socket` — DBus system bus not mounted. Kills desktop notifications, UPower, KWallet — not rendering.
+- `Failed to decrypt token for service AccountId-…` — consequence of the missing DBus (no keychain). Login-related state won't persist.
+
+If you care about these, mount DBus too: `-v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket`. The `/etc/machine-id contains 0 characters` warning is already handled by the Dockerfile (populated at build time).
+
+### `google-chrome` wrapper — for CLI use and `chrome-launcher`-based tools
+
+Both Dockerfiles ship a wrapper at **`/opt/ops/bin/google-chrome`** (from `scripts/google-chrome.sh`). The container PATH is **prefixed** with `/opt/ops/bin`, so the wrapper shadows the mise shim at `/opt/mise/data/shims/google-chrome`. Consequence: typing `google-chrome` anywhere inside the container (manually or via [`chrome-launcher`](https://www.npmjs.com/package/chrome-launcher), used by [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp), Puppeteer, Lighthouse) picks up this wrapper automatically.
+
+The wrapper:
+1. Verifies `google-chrome` is actually installed (i.e. you built with `EXTRA_MISE_TOOLS` containing `nix:google-chrome`). If not, it prints a short explanation and exits 127 instead of failing with an obscure error.
+2. Adds `--no-sandbox --disable-dev-shm-usage` unconditionally (both are mandatory in a rootless Nix-backed container — see the Chrome section above).
+3. Appends `--ozone-platform=wayland --enable-features=UseOzonePlatform,WaylandWindowDecorations` **only** when `$WAYLAND_DISPLAY` is set (works headless in CI, switches to Wayland in dev sessions).
+4. Forwards any other arguments from the caller.
+5. Execs the real binary via absolute path from the mise install tree (`/opt/mise/data/installs/nix-google-chrome/latest/bin/google-chrome`) — no PATH recursion, no redundant mise shim traversal. The mise-nix plugin does not install into the Nix user profile, so the mise install tree is the canonical location; the `latest` symlink tracks the active version.
+
+Discoverability is ensured via three redundant hooks so every tool locates the wrapper regardless of how they look for Chrome:
+
+| Hook | Who uses it |
+|---|---|
+| `/opt/ops/bin/google-chrome` + `/opt/ops/bin` first in PATH | Interactive shell, any tool honoring PATH |
+| `ENV CHROME_PATH=/opt/ops/bin/google-chrome` | `chrome-launcher` (Lighthouse, some MCP servers) — highest priority |
+| `ENV PUPPETEER_EXECUTABLE_PATH=/opt/ops/bin/google-chrome` | Any tool using `puppeteer-core` directly |
+| `/usr/bin/google-chrome` symlink → wrapper | Tools with a stripped PATH, `which` fallbacks |
+| `/opt/google/chrome/chrome` symlink → wrapper | `chrome-devtools-mcp` / `puppeteer-core` (hard-codes this path for the "stable" channel on Linux) |
+
+Practical effects:
+
+```bash
+# Interactive: just type `google-chrome`, no flags required
+google-chrome https://example.com
+
+# MCP / Puppeteer / Lighthouse: no CHROME_PATH or --executablePath needed
+```
+
+Example chrome-devtools-mcp config (minimal — no flags, no path override):
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp", "--headless", "--isolated"]
+    }
+  }
+}
+```
+`chrome-launcher` resolves `google-chrome` from the PATH → hits the wrapper → correct flags applied automatically.
+
+> If you ever need the raw binary (e.g. for testing), it's reachable at `/opt/mise/data/installs/nix-google-chrome/latest/bin/google-chrome` or via `mise exec nix:google-chrome -- …`.
+
+---
+
 ## Named volumes `ops-*`
 
 Created on demand, persistent between container launches. Tracked by the **label** `ops.volume=true` (automatically set by `ensure_volume`) — volumes that existed before this change do not carry the label and will only be re-labelled on their next creation.
@@ -1156,10 +1360,17 @@ Guards: refuses to write binary to a terminal (stdout TTY) or read from a TTY (s
 | Resource | Label | Value | Set by |
 |---|---|---|---|
 | Image | `ops.dockerfile` | Absolute path of the Dockerfile used at build time | `build_image` |
+| Image | `org.opencontainers.image.title` | Static: `ops-dev` (Arch) / `ops-dev-debian` | Dockerfile `LABEL` |
+| Image | `org.opencontainers.image.description` | Static: one-liner describing the image stack | Dockerfile `LABEL` |
+| Image | `org.opencontainers.image.licenses` | `Apache-2.0` | Dockerfile `LABEL` |
+| Image | `org.opencontainers.image.authors` | `Ghislain LE MEUR` | Dockerfile `LABEL` |
+| Image | `org.opencontainers.image.source` / `url` / `documentation` | `$OPS_SOURCE_URL` (defaults to upstream repo URL) | `build_image` |
 | Container | `ops.container` | `true` | `cmd_run` |
 | Container | `ops.cmdline.user` | The original `./ops.sh ...` invocation (shell-quoted) | `cmd_run` |
 | Container | `ops.cmdline.real` | The effective `docker run ...` command (shell-quoted) | `cmd_run` |
 | Volume | `ops.volume` | `true` | `ensure_volume` |
+
+The OCI labels follow the [opencontainers image-spec annotations](https://github.com/opencontainers/image-spec/blob/main/annotations.md) so registry UIs (Docker Hub, GHCR, Podman Desktop), `docker image inspect`, and vulnerability scanners (trivy, grype, syft) display the right metadata out of the box when the image is published.
 
 ### Concrete effects
 
@@ -1169,16 +1380,18 @@ Guards: refuses to write binary to a terminal (stdout TTY) or read from a TTY (s
 
 ### ⚠ Security: secret exposure
 
-The `ops.cmdline.real` label contains **the full `docker run` command**, including every `--env KEY=VAL`. Known secret-bearing variables are **masked** in the label as `KEY=***` before it is written:
+The `ops.cmdline.real` label contains **the full `docker run` command**, including every `--env KEY=VAL`. Secret-bearing variables are **masked** in the label as `KEY=***` before it is written. Two layers:
 
-- `GITHUB_TOKEN`
-- `ANTHROPIC_API_KEY`
-- `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
+1. **Explicit list** — always masked:
+   - `GITHUB_TOKEN`
+   - `ANTHROPIC_API_KEY`
+   - `OPENAI_API_KEY`
+   - `GEMINI_API_KEY`
+2. **Convention fallback** — any uppercase variable whose name ends in `_TOKEN`, `_SECRET`, `_KEY`, `_API_KEY`, `_APIKEY`, `_PASSWORD`, `_PASS`, or `_PWD` is **also masked**. Examples: `MY_DB_PASSWORD`, `SLACK_WEBHOOK_SECRET`, `STRIPE_API_KEY`. Non-secret names matching the suffix (e.g. a hypothetical `PUBLIC_KEY`) are a deliberate false-positive trade-off: masking too much is strictly safer than masking too little.
 
-The container itself still receives the real values (via `--env` in the actual invocation, not via the label). **Any other secret** passed through `-e MY_TOKEN=...` or `--env-file` is **not masked** — add its name to the masking regex in `cmd_run` if you need it covered.
+The same masking is applied to **both** `ops.cmdline.user` and `ops.cmdline.real`, so a user who types `ops -e GITHUB_TOKEN=xxx run` does not leak the token via either label. The container itself still receives the real values (via `--env` in the actual invocation, not via the label). If a secret variable happens to use a naming convention outside the list above, add it explicitly to `_mask_secrets` in `cmd_run`.
 
-Layer-level exposure remains: `GITHUB_TOKEN` is baked into the image's `/etc/nix/nix.conf` at build time and is visible in the image layers via `docker image inspect`. Do not push that image to a public registry.
+Layer-level exposure: `GITHUB_TOKEN` is passed to `docker build` via a **BuildKit secret** (`--mount=type=secret`), consumed in-process as `NIX_CONFIG` for the `mise use` step, and never written to disk. `/etc/nix/nix.conf` in the image contains only `experimental-features = nix-command flakes` and `build-users-group =` — no `access-tokens` line. The token does **not** appear in any image layer.
 
 Inspect labels manually:
 ```bash
@@ -1236,7 +1449,7 @@ ops nerdctl self-update         # update nerdctl to the latest release
 ops build                       # rebuild the default image. If old containers run the previous layer,
                                 # they're listed with a relaunch hint and a [y/N] removal prompt.
 ops update ml                   # same flow but targets the `ml` profile from OPS_IMAGES.
-ops                             # without --build: no rebuild is triggered, but a yellow warning
+ops                             # without --build: no rebuild is triggered, but a red warning
                                 # "Dockerfile changed since last build" is emitted so you know.
 ```
 
@@ -1269,8 +1482,8 @@ Useful when debugging flag interactions or writing a new alias:
 ```bash
 ops run --claude --dry-run                   # see what --claude expands to
 ops -i ml -n tmp run --isolated-volumes --dry-run   # inspect a profile + isolation
-ops build --dry-run 2>/dev/null || true      # build path doesn't support --dry-run;
-                                              # use `ops run --build --dry-run` for that
+ops run --build --dry-run                    # print the `docker build …` cmdline
+                                              # without starting the build or buildkitd
 ```
 
 ### Expose a dev server (port publish)
@@ -1475,12 +1688,12 @@ Interactive — prompts separately for the binaries and the containerd data dire
 ```bash
 ./ops.sh nerdctl uninstall
 # Stopping and disabling containerd service...
-# Remove binaries (/home/you/.local/share/ops/nerdctl)? [Y/n]  Y
-# Remove containerd data (images, containers, snapshots) (...)? [Y/n]  n
+# Remove binaries (/home/you/.local/share/ops/nerdctl)? [y/N]  y
+# Remove containerd data (images, containers, snapshots) (...)? [y/N]  n
 # Uninstall complete.
 ```
 
-Answer `n` to the second prompt if you want to reinstall later without losing the image cache.
+Both prompts default to **No** (bare Enter keeps the data). Type `y` explicitly to remove; answer `n` (or just press Enter) to the second prompt if you want to reinstall later without losing the image cache.
 
 ### Tune daemon-startup timeouts on slow machines
 
@@ -1508,6 +1721,47 @@ OPS_FORCE_TTY=1 ops backup ops-share-mise | xxd | head   # bypass the TTY guard
 ---
 
 ## Troubleshooting
+
+### Nix commands inside the container — HOME routing
+
+`$HOME` inside the container is bind-mounted from the host (`/home/<you>` → `/home/<you>`). The Nix single-user installer on the host (if you have one) and the one on the container both read profile state from `$HOME/.local/state/nix/profiles/`. Running a Nix command inside the container would therefore **touch the host profile** by default, which is almost never what you want.
+
+The image ships wrappers at `/opt/ops/bin/` that force `HOME=/opt/nix-home` so stateful commands target the **container** profile. Full matrix of the 12 `nix*` binaries:
+
+| Binary | Wrapped? | Rationale |
+|---|---|---|
+| `nix` | ✅ *selective* | Modern multi-subcommand CLI. Wrapper forces `HOME=/opt/nix-home` only for `profile`, `channel`, `registry`, `upgrade-nix`. All other subcommands (`build`, `shell`, `develop`, `run`, `search`, `eval`, `flake`, `store`, …) pass through transparently to keep the shared host `~/.cache/nix/` build cache. |
+| `nix-env` | ✅ | Installs/removes packages from the Nix user profile. |
+| `nix-channel` | ✅ | Manages `$HOME/.nix-channels` + rebuilds the channels profile. |
+| `nix-store` | ✅ | `--delete`, `--gc`, `--register-validity` modify the store + GC roots. |
+| `nix-collect-garbage` | ✅ | `-d` deletes old profile generations (the bug that started this). |
+| `nix-build` | ❌ | Pure build. Uses `$HOME/.cache/nix/` as eval cache — sharing with the host is a *feature* (faster evaluation across sessions). Creates `./result` in CWD, not `$HOME`. |
+| `nix-shell` | ❌ | Cache-heavy, same rationale as `nix-build`. |
+| `nix-instantiate` | ❌ | Pure evaluation, uses the shared eval cache. |
+| `nix-prefetch-url` | ❌ | Downloads to the shared Nix cache. No profile impact. |
+| `nix-hash` | ❌ | Stateless cryptographic hash. |
+| `nix-copy-closure` | ❌ | Uses `$HOME/.ssh/` for SSH auth. Forcing `HOME=/opt/nix-home` would break key discovery. Wrap manually if you copy closures between container-ish peers. |
+| `nix-daemon` | ❌ | Multi-user daemon mode — not applicable here (we run single-user). |
+
+**Escape hatch** — pass `--host` anywhere in the arguments to explicitly target the host profile:
+
+```bash
+nix-collect-garbage --host -d          # clean the host profile's old generations
+nix profile list --host                # list packages installed on the host profile
+nix-env --host -iA nixpkgs.ripgrep     # install into the host profile
+```
+
+If an upgrade of Nix later introduces a new stateful binary or subcommand not on the list above, wrap it manually inside the container:
+
+```bash
+# For a new standalone binary:
+sudo ln -s /opt/ops/bin/_nix-wrapper /opt/ops/bin/nix-new-thing
+
+# For a new `nix` subcommand: prefix manually
+HOME=/opt/nix-home nix new-subcommand ...
+```
+
+Or add it to `/opt/ops/bin/_nix-cli-wrapper.sh`'s subcommand list and rebuild the image.
 
 ### `Image not found, building...` but the build fails
 
@@ -1562,14 +1816,14 @@ echo 'GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx' >> ~/.config/ops/ops.conf
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 ```
 
-Then rebuild so the token is baked into the image's `/etc/nix/nix.conf`:
+Then rebuild so the token is available to the build-time `mise use` step (fetched from the BuildKit secret, consumed in-process — never written to `/etc/nix/nix.conf`):
 ```bash
 ops build --no-cache    # force a full rebuild
 ```
 
-**⚠ Watch out for the hybrid case**: if the image was built **without** a token and you later provide a token at runtime, the image's `/etc/nix/nix.conf` still contains `access-tokens =` (empty). Nix will not automatically pick up the env token — a rebuild is required. mise/gh do read the env var directly and are therefore covered.
+**⚠ Build-time vs runtime**: the token is needed at two distinct moments. **At build time**, the mise-nix plugin queries the GitHub API to resolve nixpkgs pins; without a token, the build fails with HTTP 403 when the rate limit is hit. **At runtime**, mise and gh inside the container also query GitHub. `ops.sh` propagates `$GITHUB_TOKEN` to both (the build via a BuildKit secret, the runtime via `--env GITHUB_TOKEN`). If the build succeeded without a token (small Nix cache, fast resolve) but fails later at runtime, just make sure `$GITHUB_TOKEN` is exported before invoking `ops run` — no rebuild needed for that case.
 
-**Generate a token**: https://github.com/settings/tokens/new → any name, **no scope required** → Generate. The token is baked into the build layer → do not push that image to a public registry.
+**Generate a token**: https://github.com/settings/tokens/new → any name, **no scope required** → Generate. Because the token is never persisted in the image (BuildKit secret), it is not exposed by `docker image inspect`; still, good hygiene is to keep it in `~/.config/ops/ops.conf` and not in commits.
 
 ### `context deadline exceeded` on `cache.nixos.org`
 
@@ -1657,9 +1911,9 @@ Put it into `~/.config/ops/ops.conf`:
 GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 ```
 
-The token is propagated **at build time** (baked into `/etc/nix/nix.conf`) **and at runtime** (env var for mise/gh).
+The token is propagated **at build time** (via a BuildKit secret, consumed by the `mise use` step as `NIX_CONFIG`) **and at runtime** (env var for mise/gh).
 
-⚠ The token is visible in the **image layers** (`docker image inspect`), baked into `/etc/nix/nix.conf`. It is **not** exposed in the container's `ops.cmdline.real` label — `GITHUB_TOKEN=***` is masked there (see [Labels → Security](#%E2%9A%A0-security-secret-exposure)). Fine for local personal use — do not push the image to a registry.
+ℹ The token is **not** baked into the image — the BuildKit `--mount=type=secret` path makes it available only to the RUN step that reads it, and nothing writes it to disk. It is also masked in the `ops.cmdline.user` and `ops.cmdline.real` labels (see [Labels → Security](#%E2%9A%A0-security-secret-exposure)). As long as the token is not exported in your shell history or committed to git, the image is safe to share.
 
 ---
 
@@ -1668,22 +1922,35 @@ The token is propagated **at build time** (baked into `/etc/nix/nix.conf`) **and
 Core files:
 
 ```
-msb/
+ops-cli/
 ├── ops.sh                       # the wrapper (entry point)
 ├── Dockerfile                   # default image (Arch)
 ├── Dockerfile.debian            # optional Debian-based variant
 ├── README.md                    # this file
+├── CHANGELOG.md                 # Keep-a-Changelog history
+├── LICENSE                      # Apache-2.0
+├── .editorconfig                # indent rules (4 spaces, 2 for Lua/YAML/MD)
+├── .shellcheckrc                # shellcheck CI/local-parity shim (shell=bash; all disables are inline)
+├── .dockerignore                # excludes mise/.git and backups from the build context
+├── .gitignore                   # hash cache + transient artefacts
+├── mise.toml                    # dev toolchain (bats, shellcheck, luacheck, hadolint) + `mise run <task>` entry points
+├── .github/
+│   ├── CODEOWNERS               # default reviewers per path
+│   ├── dependabot.yml           # weekly bumps for GH Actions + Docker bases
+│   ├── pull_request_template.md # PR checklist (image-integration reminder)
+│   └── workflows/tests.yml      # CI (shellcheck + hadolint + luacheck + bats + Docker build matrix + trivy)
 ├── mise/                        # local mise-nix plugin (copied into the image)
-├── tests/                       # bats suite (see the Tests section for the list)
-└── .github/workflows/tests.yml  # CI (shellcheck + hadolint + bats + Docker build matrix)
-```
-
-Optional helpers (not required to run `ops.sh`):
-
-```
-├── setup.sh / setup-debian.sh / setup-nix.sh / setup-debian-deps.sh
-├── mise-plugin/                 # upstream mise-nix sources (vendored for dev)
-├── nerdctl/ / rootfs/           # local artefacts, not packaged
+│   ├── NOTICE                   #   per-file license map (Apache-2.0 + MIT)
+│   ├── LICENSE / LICENSE.MIT    #   upstream licenses (Apache + MIT sources)
+│   ├── metadata.lua             #   PLUGIN descriptor (name=nix)
+│   ├── types.lua                #   Lua type definitions (meta)
+│   ├── hooks/                   #   mise plugin hooks (install, list, env, path)
+│   └── lib/                     #   internal helpers (flake, shell, security, …)
+├── scripts/                     # helper scripts copied into the image
+│   ├── google-chrome.sh         #   google-chrome wrapper (adds --no-sandbox, routes to real binary)
+│   ├── _nix-wrapper.sh          #   generic wrapper for stateful Nix legacy binaries (nix-env, nix-channel, nix-store, nix-collect-garbage)
+│   └── _nix-cli-wrapper.sh      #   wrapper for the modern `nix` CLI — forces HOME only for profile/channel/registry/upgrade-nix subcommands
+└── tests/                       # bats suite (see the Tests section for the list)
 ```
 
 Runtime paths (per user):
@@ -1705,25 +1972,25 @@ Runtime paths (per user):
 ```
 tests/
 ├── helpers.bash                   — runtime mocks + system tool stubs + setup helpers
-├── test_dispatch.bats             — 12 tests: subcommands, runtime proxy, clean
-├── test_runtime.bats              —  8 tests: auto-detection, rootless/rootful, invalid
-├── test_dryrun.bats               — 15 tests: run flag parsing
-├── test_flags.bats                — 22 tests: -u/-g/-l/-H/-e/-p/--env-file/no-*-volume/api-key masking/…
+├── test_dispatch.bats             — 17 tests: subcommands, runtime proxy, clean, version/--version/-V
+├── test_runtime.bats              — 11 tests: auto-detection, rootless/rootful, invalid
+├── test_dryrun.bats               — 22 tests: run flag parsing
+├── test_flags.bats                — 26 tests: -u/-g/-l/-H/-e/-p/--env-file/no-*-volume/api-key masking/…
 ├── test_config.bats               —  5 tests: ops.conf loading + precedence
 ├── test_hash.bats                 —  5 tests: per-image hash + dockerfile_changed
 ├── test_container_state.bats      —  6 tests: running/stopped/logs/status
 ├── test_image_state.bats          —  5 tests: build trigger, volume warning
-├── test_build_flags.bats          —  7 tests: --network host, --allow, build-args
+├── test_build_flags.bats          — 17 tests: --network host, --allow, build-args (incl. OCI VERSION/SOURCE_URL/REVISION forwarding)
 ├── test_install.bats              — 10 tests: full install/uninstall/self-update
 ├── test_aliases.bats              — 14 tests: string + function aliases, reserved names
 ├── test_images.bats               — 14 tests: OPS_IMAGES profiles, -n/-f override, smart -i
-├── test_edge_cases.bats           — 27 tests: --nix-cleanup, --update, HOME_IN_CTN, etc.
+├── test_edge_cases.bats           — 29 tests: --nix-cleanup, --update, HOME_IN_CTN, etc.
 ├── test_labels.bats               —  8 tests: ops.dockerfile / ops.container / ops.cmdline.* / ops.volume labels
 ├── test_doctor.bats               —  9 tests: doctor, OPS_IMAGES/Dockerfiles validation, dangling entries, containers section
-├── test_inspect.bats              —  6 tests: inspect key/container/image ref
+├── test_inspect.bats              —  7 tests: inspect key/container/image ref
 ├── test_cmd_config.bats           —  7 tests: config subcommand, origin tracking (env/config/default)
 ├── test_logs.bats                 —  9 tests: logs|log, [NAME] positional, --strip|-s, --tail N parsing
-├── test_alias_global_flags.bats   —  6 tests: alias regression with -i/-n/-f prefix (cc bug)
+├── test_alias_global_flags.bats   —  7 tests: alias regression with -i/-n/-f prefix (cc bug)
 ├── test_clean_labels.bats         —  7 tests: clean filters by ops.container / ops.volume labels
 ├── test_status_enhanced.bats      —  9 tests: info layout (Services at top, Volumes before Containers)
 ├── test_backup_restore.bats       — 10 tests: cmd_backup / cmd_restore, TTY guards, alpine tar, OPS_FORCE_TTY override
@@ -1731,16 +1998,30 @@ tests/
 ├── test_update_flow.bats          —  4 tests: full cmd_update flow (image ID diff, container rm, (none))
 ├── test_status_visual.bats        —  7 tests: coloured Up/Exited states, ⚠ orphan, cmd:/ops cli:/real cli:
 ├── test_doctor_containers.bats    —  5 tests: doctor Containers — orphan, image mismatch, OK match
-├── test_unit_helpers.bats         — 11 tests: direct unit tests for _human_bytes, _shell_quote (via OPS_SOURCE_ONLY)
-├── test_label_masking.bats        —  7 tests: GITHUB_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY masking in ops.cmdline.real label
-└── test_regressions.bats          — 14 tests: build arg leak fix (#18), --user-name remap (#24), PWD⊂HOME (#23), clean interactive (#20), rootless cache reset (#17), isolated agent volumes, install-path safety, start-fail re-dispatch (#19), and more
+├── test_unit_helpers.bats         — 14 tests: direct unit tests for _human_bytes, _shell_quote (via OPS_SOURCE_ONLY)
+├── test_label_masking.bats        —  8 tests: secret masking in BOTH ops.cmdline.user and ops.cmdline.real labels (GITHUB_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)
+├── test_regressions.bats          — 14 tests: build arg leak fix (#18), --user-name remap (#24), PWD⊂HOME (#23), clean interactive (#20), rootless cache reset (#17), isolated agent volumes, install-path safety, start-fail re-dispatch (#19), and more
+├── test_image_integration.bats    — 29 integration tests against the actually-built localhost/ops-dev image (Nix GC root, chrome hooks, mise config split, machine-id, unfree flags, OCI labels, …). Skips if Docker or the image is absent.
+└── test_subcommand_help.bats      — 18 tests: per-subcommand --help output (doctor/inspect/config/clean/status/logs/backup/restore/update/aliases/images/runtime). Ensures `-h|--help` is intercepted before arg parsing and exits 0.
 ```
+
+### Running the image integration suite
+
+The file `test_image_integration.bats` is the **only** one that touches a real image (everything else mocks). Run it after a local build:
+
+```bash
+./ops.sh build
+bats tests/test_image_integration.bats
+```
+
+CI runs this job (`image-integration`) automatically on pushes to `main` and via manual `workflow_dispatch`. It is **not** triggered on pull requests — building the full Arch image with Nix takes ~15 min and we don't want to block every PR on that. If you want to run it on a PR branch, push to a branch named `main` in your fork or trigger it manually from the Actions tab.
 
 ### Coverage
 
 | Area | Coverage |
 |---|---|
 | Subcommand dispatch (run/build/status/logs/clean/inspect/config/doctor/backup/restore/update) | **100%** |
+| Per-subcommand `--help` / `-h` (doctor/inspect/config/clean/status/info/logs/log/backup/restore/update/aliases/alias/images/image/runtime) | **100%** |
 | Runtime detection (auto/docker/podman/nerdctl/invalid) | **100%** |
 | Config file loading + precedence (env > config) | **100%** |
 | `config` subcommand (origin tracking env/config/default) | **100%** |
@@ -1756,7 +2037,7 @@ tests/
 | Backup / restore (TTY guards, alpine tar, ensure_volume) | **100%** |
 | Per-image hash + rebuild detection | **100%** |
 
-**~98% overall coverage** — 273 tests across 29 files.
+**357 tests across 31 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
 
 ### What remains uncovered
 
@@ -1766,12 +2047,43 @@ tests/
 
 ### Run the tests locally
 
+Two equivalent ways — pick either.
+
+**Option A — via `mise.toml` (recommended if you already use mise)**
+
+A `mise.toml` at the repo root declares the dev toolchain: bats, shellcheck, hadolint (via the `aqua:` backend) plus ruby + bashcov (via the core `ruby` plugin + `gem:` backend, for `mise run coverage`). One-time setup:
+
+```bash
+mise trust            # authorize the repo's mise.toml
+mise install          # fetches all the pinned tools (~2-3 min first time due to ruby compile)
+
+# luacheck is NOT in mise.toml (not packaged in the aqua registry). Install
+# it via your system package manager so `mise run lint` can lint mise/*.lua:
+sudo apt install luacheck          # Debian/Ubuntu
+# or: sudo pacman -S luacheck      # Arch
+# or: brew install luacheck        # macOS
+# Without it, `mise run lint` prints a warning and skips the Lua checks.
+```
+
+Then:
+
+```bash
+mise run lint         # shellcheck + bash -n + luacheck + hadolint
+mise run test         # full mocked bats suite
+mise run ci           # lint + test (mirrors the CI pipeline one-for-one)
+mise run test-image   # integration suite (needs `./ops.sh build` first)
+mise run coverage     # bashcov → coverage/index.html (see mise.toml for caveats)
+mise run smoke        # cismoke Dockerfile build against the active runtime
+```
+
+**Option B — via the distro package manager**
+
 ```bash
 # Debian/Ubuntu
-sudo apt install bats
+sudo apt install bats shellcheck luacheck hadolint
 
 # Arch
-sudo pacman -S bats
+sudo pacman -S bats shellcheck luacheck hadolint
 
 # From the project directory
 bats tests/
@@ -1781,13 +2093,15 @@ bats tests/
 
 The `.github/workflows/tests.yml` workflow runs on every push/PR to `main`:
 
-1. **bats** job: installs `bats` + `shellcheck`, runs `shellcheck -S style ops.sh` (blocking), `bash -n ops.sh`, and the full bats suite.
+1. **bats** job: installs `bats` + `shellcheck` + `luacheck`, runs `shellcheck -S style ops.sh` (blocking), `bash -n ops.sh`, `luacheck mise/` (blocking — lints the whole plugin tree, with `types.lua` excluded because it only carries EmmyLua meta-annotations), and the full bats suite.
 2. **hadolint** job: lints `Dockerfile` (and `Dockerfile.debian` if present).
 3. **runtime build smoke** matrix job (docker / podman / nerdctl): builds a minimal `Dockerfile.cismoke` (alpine base) through `ops.sh build` on each runtime — exercises the full wrapper pipeline (flags, lock, hash, labels, `ensure_buildkitd` on nerdctl) without pulling the heavy Arch/Nix tree.
 
 To reproduce the CI locally:
 ```bash
-shellcheck -S style ops.sh && bash -n ops.sh && bats tests/
+shellcheck -S style ops.sh && bash -n ops.sh
+luacheck mise/ --globals PLUGIN RUNTIME --no-max-line-length --exclude-files mise/types.lua
+bats tests/
 hadolint Dockerfile
 ./ops.sh build          # smoke test against your local runtime
 ```
@@ -1796,4 +2110,12 @@ hadolint Dockerfile
 
 ## License & contributing
 
-Personal project. Use, adapt, fork freely.
+- **License**: Apache License 2.0. See [`LICENSE`](LICENSE); the `mise/` subdir
+  ships its own per-file license map (`mise/NOTICE`, `mise/LICENSE`,
+  `mise/LICENSE.MIT`).
+- **Contributing**: PRs are welcome. The CI pipeline is what gates merges —
+  see [`.github/workflows/tests.yml`](.github/workflows/tests.yml) for the
+  `shellcheck` / `hadolint` / `luacheck` / `bats` / `trivy` jobs you'll need
+  to keep green. `mise run ci` reproduces the unit-test path locally.
+- **Security**: private vulnerability reports go through GitHub's
+  [Report a vulnerability](../../security/advisories/new) flow.

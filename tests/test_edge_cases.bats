@@ -132,13 +132,17 @@ setup() {
     [ "$status" -eq 0 ]
 }
 
-@test "missing Dockerfile causes current_hash to fail cleanly" {
+@test "missing Dockerfile causes build to fail cleanly" {
+    # build_image now refuses to run when OPS_DOCKERFILE doesn't exist, before
+    # it can ever reach the runtime. The old assertion was a tautology
+    # (`status != 0 OR build mock invoked`) — always true regardless. Tighten
+    # to require BOTH a non-zero exit AND the specific error on stderr.
     run env OPS_RUNTIME=docker OPS_DOCKERFILE="/nonexistent/Dockerfile" \
         "$(ops_sh)" build
-    # sha256sum on missing file fails, but ops.sh doesn't explicitly check
-    # for this before calling build. The docker mock still succeeds on build.
-    # save_hash then writes an empty hash — not ideal but tolerated.
-    [ "$status" -ne 0 ] || grep -qE '^build ' "$MOCK_LOG"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Dockerfile not found"* ]]
+    # And the runtime build call must NOT have been issued.
+    ! grep -qE '^build ' "$MOCK_LOG"
 }
 
 @test "--dry-run with --claude-mount + --no-mount-home mounts .claude and injects key" {
@@ -148,8 +152,11 @@ setup() {
         "$(ops_sh)" run --no-mount-home --claude-mount --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *".claude"* ]]
-    # ANTHROPIC_API_KEY is now auto-propagated, no flag required
-    [[ "$output" == *"ANTHROPIC_API_KEY=sk-test"* ]]
+    # ANTHROPIC_API_KEY is auto-propagated as --env; the value is redacted in
+    # --dry-run output (dry-run transcripts don't leak secrets), so we pin
+    # the redaction placeholder rather than the cleartext key.
+    [[ "$output" == *"ANTHROPIC_API_KEY=REDACTED"* ]]
+    [[ "$output" != *"sk-test"* ]]
 }
 
 @test "dockerfile_changed requires hash file to exist (false positive guard)" {
@@ -227,6 +234,34 @@ EOF
     [[ "$output" == *"nerdctl not installed"* ]]
 }
 
+@test "end-of-script auto-install prompt: declining exits 1" {
+    # Exercises lines 2170-2177 in ops.sh: when OPS_RUNTIME=nerdctl AND the
+    # binary at $OPS_NERDCTL_HOME/bin/nerdctl isn't executable AND the
+    # subcommand isn't in _skip_runtime_startup (status isn't), ops.sh prompts
+    # "Run 'nerdctl install' now? [Y/n]". Declining → exit 1.
+    export OPS_NERDCTL_HOME="$BATS_TEST_TMPDIR/no-nerdctl"
+    # Don't pre-create the binary, so RUNTIME_BIN → not executable.
+    run bash -c "printf 'n\n' | env OPS_RUNTIME=nerdctl '$(ops_sh)' status"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"nerdctl not installed"* ]]
+    # Should NOT proceed to cmd_status rendering (no Services header).
+    [[ "$output" != *"=== Services ==="* ]]
+}
+
+@test "end-of-script auto-install prompt: accepting triggers cmd_install" {
+    # Same scenario as above, but answer Y. cmd_install runs and fetches the
+    # version from (mocked) GitHub. We stop short of asserting the full
+    # install succeeded — the subsequent cmd_status would need more mocks —
+    # we just check that cmd_install kicked in (visible via its "Fetching"
+    # + "Downloading" messages).
+    export OPS_NERDCTL_HOME="$BATS_TEST_TMPDIR/to-install-nerdctl"
+    mock_install_tools
+    # Feed 3 Y's to cover: auto-install prompt + any post-install prompts.
+    run bash -c "printf 'Y\nY\nY\n' | env OPS_RUNTIME=nerdctl '$(ops_sh)' status"
+    [[ "$output" == *"nerdctl not installed"* ]]
+    [[ "$output" == *"Fetching latest nerdctl release"* ]]
+}
+
 @test "'nerdctl self-update' aborts cleanly if user declines" {
     export OPS_NERDCTL_HOME="$BATS_TEST_TMPDIR/nerdctl"
     mkdir -p "$OPS_NERDCTL_HOME/bin"
@@ -237,7 +272,7 @@ exit 0
 EOF
     chmod +x "$OPS_NERDCTL_HOME/bin/nerdctl"
     mock_install_tools
-    run bash -c "yes n | env OPS_RUNTIME=nerdctl MOCK_GH_VERSION=v2.0.0 '$(ops_sh)' nerdctl self-update"
+    run bash -c "printf 'n\n' | env OPS_RUNTIME=nerdctl MOCK_GH_VERSION=v2.0.0 '$(ops_sh)' nerdctl self-update"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Aborted"* ]]
 }

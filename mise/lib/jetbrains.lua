@@ -143,10 +143,10 @@ function M.install_plugin(plugin_path, plugin_info)
   logger.debug("Plugin directory: " .. plugins_dir)
 
   -- Create plugins directory if it doesn't exist
-  shell.exec('mkdir -p "%s"', plugins_dir)
+  shell.exec("mkdir -p " .. shell.shquote(plugins_dir))
 
   -- Check if we have JAR files to copy directly to plugins directory
-  local jar_files_ok, jar_files = shell.try_exec('find "%s" -name "*.jar" -type f', plugin_path)
+  local jar_files_ok, jar_files = shell.try_exec("find " .. shell.shquote(plugin_path) .. ' -name "*.jar" -type f')
   if jar_files_ok and jar_files and jar_files:match("%S") then
     -- Copy JAR files directly to plugins directory
     local jar_list = {}
@@ -155,11 +155,11 @@ function M.install_plugin(plugin_path, plugin_info)
       local target_path = plugins_dir .. "/" .. jar_name
 
       -- Check if JAR is already installed
-      if shell.try_exec('test -f "%s"', target_path) then
+      if shell.try_exec("test -f " .. shell.shquote(target_path)) then
         logger.info("JetBrains plugin JAR already installed: " .. jar_name)
         table.insert(jar_list, jar_name)
       else
-        local copy_ok, copy_result = shell.try_exec('cp "%s" "%s"', jar_file, target_path)
+        local copy_ok, copy_result = shell.try_exec("cp " .. shell.shquote(jar_file) .. " " .. shell.shquote(target_path))
         if copy_ok then
           logger.debug("Copied JAR: " .. jar_name)
           table.insert(jar_list, jar_name)
@@ -184,16 +184,17 @@ function M.install_plugin(plugin_path, plugin_info)
   local plugin_install_dir = plugins_dir .. "/" .. plugin_info.plugin_id
 
   -- Check if plugin is already installed
-  if shell.try_exec('test -d "%s"', plugin_install_dir) then
+  if shell.try_exec("test -d " .. shell.shquote(plugin_install_dir)) then
     logger.info("JetBrains plugin already installed: " .. plugin_info.plugin_id)
     return true, "already_installed"
   end
 
   -- Create plugin directory
-  shell.exec('mkdir -p "%s"', plugin_install_dir)
+  shell.exec("mkdir -p " .. shell.shquote(plugin_install_dir))
 
-  -- Copy plugin files
-  local copy_ok, copy_result = shell.try_exec('cp -r "%s"/* "%s/"', plugin_path, plugin_install_dir)
+  -- Copy plugin files. The trailing /* and / are shell syntax, not part of the
+  -- quoted path — we shquote the bases and concat the glob/suffix after.
+  local copy_ok, copy_result = shell.try_exec("cp -r " .. shell.shquote(plugin_path) .. "/* " .. shell.shquote(plugin_install_dir) .. "/")
 
   if copy_ok then
     logger.done("JetBrains plugin installed: " .. plugin_info.plugin_id)
@@ -204,7 +205,7 @@ function M.install_plugin(plugin_path, plugin_info)
     logger.fail("JetBrains plugin installation failed")
     logger.debug("Copy error: " .. (copy_result or "unknown error"))
     -- Clean up failed installation
-    shell.try_exec('rm -rf "%s"', plugin_install_dir)
+    shell.try_exec("rm -rf " .. shell.shquote(plugin_install_dir))
     return false, copy_result
   end
 end
@@ -223,10 +224,14 @@ function M.install_from_nix_store(plugin_info, nix_store_path, tool_name)
   }
 
   for _, path in ipairs(possible_paths) do
-    if shell.try_exec('test -d "%s"', path) then
-      -- Check if this directory contains plugin files (JAR files or plugin.xml)
-      local has_jar = shell.try_exec('find "%s" -name "*.jar" | head -1', path)
-      local has_plugin_xml = shell.try_exec('test -f "%s/META-INF/plugin.xml"', path)
+    local qp = shell.shquote(path)
+    if shell.try_exec("test -d " .. qp) then
+      -- `find | head -1` always exits 0, so the first return value of try_exec
+      -- (the pcall success boolean) would be true even when the directory holds
+      -- zero .jar files. We must inspect the command's stdout to decide.
+      local _, find_out = shell.try_exec("find " .. qp .. ' -name "*.jar" | head -1')
+      local has_jar = type(find_out) == "string" and find_out:match("%S") ~= nil
+      local has_plugin_xml = shell.try_exec("test -f " .. shell.shquote(path .. "/META-INF/plugin.xml"))
 
       if has_jar or has_plugin_xml then
         plugin_path = path

@@ -14,7 +14,7 @@ setup() {
 }
 
 @test "install happy path writes binary and reaches end message" {
-    run bash -c "yes Y | env OPS_RUNTIME=nerdctl '$(ops_sh)' nerdctl install"
+    run bash -c "printf 'Y\nY\nY\n' | env OPS_RUNTIME=nerdctl '$(ops_sh)' nerdctl install"
     [ "$status" -eq 0 ]
     [ -x "$OPS_NERDCTL_HOME/bin/nerdctl" ]
     [[ "$output" == *"Service installed and disabled at boot"* ]]
@@ -35,13 +35,13 @@ setup() {
 @test "install declining overwrite aborts" {
     mkdir -p "$OPS_NERDCTL_HOME/bin"
     echo "dummy" > "$OPS_NERDCTL_HOME/bin/placeholder"
-    run bash -c "yes n | env OPS_RUNTIME=nerdctl '$(ops_sh)' nerdctl install"
+    run bash -c "printf 'n\n' | env OPS_RUNTIME=nerdctl '$(ops_sh)' nerdctl install"
     [ "$status" -eq 1 ]
     [[ "$output" == *"Aborted"* ]]
 }
 
 @test "install fails when tar extraction fails" {
-    run bash -c "yes Y | env OPS_RUNTIME=nerdctl MOCK_TAR_FAIL=1 '$(ops_sh)' nerdctl install"
+    run bash -c "printf 'Y\nY\nY\n' | env OPS_RUNTIME=nerdctl MOCK_TAR_FAIL=1 '$(ops_sh)' nerdctl install"
     [ "$status" -eq 1 ]
     [[ "$output" == *"Extraction failed"* ]]
 }
@@ -87,7 +87,7 @@ exit 0
 EOF
     chmod +x "$OPS_NERDCTL_HOME/bin/nerdctl"
     # Decline the prompt to keep the test scope small.
-    run bash -c "yes n | env OPS_RUNTIME=nerdctl MOCK_GH_VERSION=v1.5.0 '$(ops_sh)' nerdctl self-update"
+    run bash -c "printf 'n\n' | env OPS_RUNTIME=nerdctl MOCK_GH_VERSION=v1.5.0 '$(ops_sh)' nerdctl self-update"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Update nerdctl from 1.2.3 to 1.5.0"* ]]
     [[ "$output" == *"Aborted"* ]]

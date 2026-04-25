@@ -2,11 +2,12 @@
 # file pins the baseline so local runs match.
 shell=bash
 
-# Inline `# shellcheck disable=...` directives in ops.sh remain authoritative
-# for one-off exceptions (e.g. intentional word-splitting on alias expansion).
-# Global exclusions listed here should stay short and well-justified.
-
-# SC2016: single-quoted '$VAR' strings in ops.sh are intentionally unexpanded
-# on the host and expanded later by bash -c inside the container
-# (cmd_run --nix-cleanup / --update). Declared file-wide in ops.sh.
-disable=SC2016
+# Inline `# shellcheck disable=...` directives remain the single source of
+# truth for every exception:
+#   - ops.sh head has a file-wide `shellcheck disable=SC2016` for the
+#     intentional single-quoted '$VAR' strings that `bash -c` inside the
+#     container expands later (cmd_run --nix-cleanup / --update).
+#   - Per-function / per-line waivers (SC2086, SC2317, SC1090, …) live next
+#     to the code that needs them so the reason stays visible at review time.
+# Keep this file as a minimal CI/local-parity shim (just `shell=bash`); any
+# global `disable=` entry ends up masking regressions across unrelated files.

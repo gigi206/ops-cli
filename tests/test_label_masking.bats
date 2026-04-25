@@ -1,9 +1,18 @@
 #!/usr/bin/env bats
-# Secret-masking in the ops.cmdline.real label:
-# - GITHUB_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY
-#   must appear as KEY=*** in the label, not in cleartext.
-# - The container itself still receives the real value via --env (verified
-#   by separate flag tests).
+# Secret handling in --dry-run output. Two orthogonal guarantees:
+#
+# 1. Label masking (ops.cmdline.{user,real}) — GITHUB_TOKEN, ANTHROPIC_API_KEY,
+#    OPENAI_API_KEY, GEMINI_API_KEY never appear in cleartext in either label,
+#    even when the user inlined the secret on the command line.
+# 2. --dry-run redaction (NEW) — the `--env KEY=VAL` position that carries the
+#    secret to the container is also redacted in dry-run output so pasted
+#    transcripts (bug reports, CI logs) don't leak credentials. The
+#    container itself still receives the real value at run time (separate
+#    flag tests pin that down).
+#
+# Assertion strategy: count literal secret occurrences in the dry-run output.
+# With redaction in place the expected count is zero (never cleartext); the
+# `--env KEY=REDACTED` placeholder is asserted separately.
 
 load helpers
 
@@ -14,79 +23,92 @@ setup() {
     mock_runtime docker
 }
 
-@test "GITHUB_TOKEN is masked in ops.cmdline.real label" {
+# Count occurrences of a literal string in the test output.
+_count() {
+    local needle="$1" hay="$2"
+    printf '%s' "$hay" | grep -oF "$needle" | wc -l
+}
+
+@test "GITHUB_TOKEN redacted in --dry-run and absent from labels" {
     run env OPS_RUNTIME=docker GITHUB_TOKEN=ghp_supersecret123 \
         "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    # The --env part still shows the real value (container needs it)
-    [[ "$output" == *"--env GITHUB_TOKEN=ghp_supersecret123"* ]]
-    # But ops.cmdline.real label must mask it
-    # printf %q escapes * as \* in the dry-run shell-quoted output
-    [[ "$output" == *"GITHUB_TOKEN=\\*\\*\\*"* ]]
-    # And must NOT contain the real token inside the label value
-    # Extract substring starting at ops.cmdline.real and assert no secret
-    label_part="${output#*ops.cmdline.real=}"
-    [[ "$label_part" != *"ghp_supersecret123"* ]]
+    # No cleartext anywhere (labels masked + --env redacted).
+    [ "$(_count ghp_supersecret123 "$output")" -eq 0 ]
+    # The --env slot shows the redaction placeholder so the wiring is still
+    # visible to the caller.
+    [[ "$output" == *"GITHUB_TOKEN=REDACTED"* ]]
 }
 
-@test "ANTHROPIC_API_KEY is masked in ops.cmdline.real label" {
+@test "ANTHROPIC_API_KEY redacted in --dry-run and absent from labels" {
     run env OPS_RUNTIME=docker ANTHROPIC_API_KEY=sk-ant-secret \
         "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"ANTHROPIC_API_KEY=\\*\\*\\*"* ]]
-    label_part="${output#*ops.cmdline.real=}"
-    [[ "$label_part" != *"sk-ant-secret"* ]]
+    [ "$(_count sk-ant-secret "$output")" -eq 0 ]
+    [[ "$output" == *"ANTHROPIC_API_KEY=REDACTED"* ]]
 }
 
-@test "OPENAI_API_KEY is masked in ops.cmdline.real label" {
+@test "OPENAI_API_KEY redacted in --dry-run and absent from labels" {
     run env OPS_RUNTIME=docker OPENAI_API_KEY=sk-oai-secret \
         "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OPENAI_API_KEY=\\*\\*\\*"* ]]
-    label_part="${output#*ops.cmdline.real=}"
-    [[ "$label_part" != *"sk-oai-secret"* ]]
+    [ "$(_count sk-oai-secret "$output")" -eq 0 ]
+    [[ "$output" == *"OPENAI_API_KEY=REDACTED"* ]]
 }
 
-@test "GEMINI_API_KEY is masked in ops.cmdline.real label" {
+@test "GEMINI_API_KEY redacted in --dry-run and absent from labels" {
     run env OPS_RUNTIME=docker GEMINI_API_KEY=g-secret-value \
         "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"GEMINI_API_KEY=\\*\\*\\*"* ]]
-    label_part="${output#*ops.cmdline.real=}"
-    [[ "$label_part" != *"g-secret-value"* ]]
+    [ "$(_count g-secret-value "$output")" -eq 0 ]
+    [[ "$output" == *"GEMINI_API_KEY=REDACTED"* ]]
 }
 
-@test "multiple secrets all masked at once" {
+@test "multiple secrets all redacted at once in --dry-run" {
     run env OPS_RUNTIME=docker \
-        GITHUB_TOKEN=ghp_a ANTHROPIC_API_KEY=sk-ant-b \
-        OPENAI_API_KEY=sk-oai-c GEMINI_API_KEY=g-d \
+        GITHUB_TOKEN=ghp_a1b2c3 ANTHROPIC_API_KEY=sk-ant-xyz \
+        OPENAI_API_KEY=sk-oai-uvw GEMINI_API_KEY=g-def456 \
         "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    # The ops.cmdline.real label must not leak any of the 4 secrets
-    label_part="${output#*ops.cmdline.real=}"
-    [[ "$label_part" != *"ghp_a"* ]]
-    [[ "$label_part" != *"sk-ant-b"* ]]
-    [[ "$label_part" != *"sk-oai-c"* ]]
-    [[ "$label_part" != *"g-d"* ]]
-    # But the container still receives them via --env (before the label)
-    [[ "$output" == *"GITHUB_TOKEN=ghp_a"* ]]
-    [[ "$output" == *"ANTHROPIC_API_KEY=sk-ant-b"* ]]
-    [[ "$output" == *"OPENAI_API_KEY=sk-oai-c"* ]]
-    [[ "$output" == *"GEMINI_API_KEY=g-d"* ]]
+    # Each secret: zero occurrences in cleartext.
+    [ "$(_count ghp_a1b2c3   "$output")" -eq 0 ]
+    [ "$(_count sk-ant-xyz   "$output")" -eq 0 ]
+    [ "$(_count sk-oai-uvw   "$output")" -eq 0 ]
+    [ "$(_count g-def456     "$output")" -eq 0 ]
+    # Redaction placeholders visible for each forwarded --env slot.
+    [[ "$output" == *"GITHUB_TOKEN=REDACTED"* ]]
+    [[ "$output" == *"ANTHROPIC_API_KEY=REDACTED"* ]]
+    [[ "$output" == *"OPENAI_API_KEY=REDACTED"* ]]
+    [[ "$output" == *"GEMINI_API_KEY=REDACTED"* ]]
 }
 
-@test "ops.cmdline.user label is not masked (it's the user's raw invocation, no secrets)" {
-    # User-typed invocation doesn't carry -e flags for tokens (they come from env).
-    # Just verify the label is present and unaffected by the masking regex.
-    run env OPS_RUNTIME=docker GITHUB_TOKEN=ghp_abc "$(ops_sh)" run --dry-run
+@test "user-typed -e GITHUB_TOKEN=... is redacted in --dry-run (no cleartext)" {
+    # Regression guard: the raw user invocation (OPS_ORIG_ARGV) captures every
+    # argv token, including `-e KEY=VAL`. The label masker scrubs the labels;
+    # the --env printer scrubs the dry-run rendering. Cleartext must not show
+    # up in either.
+    # (setup_ops_env unsets GITHUB_TOKEN, so the auto-propagation path adds
+    #  no additional --env for this key.)
+    run env OPS_RUNTIME=docker "$(ops_sh)" \
+        run -e GITHUB_TOKEN=ghp_inline_secret --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"ops.cmdline.user="* ]]
+    [ "$(_count ghp_inline_secret "$output")" -eq 0 ]
+    [[ "$output" == *"GITHUB_TOKEN=REDACTED"* ]]
 }
 
-@test "non-secret env vars are NOT masked" {
+@test "user-typed -e ANTHROPIC_API_KEY=... is redacted in --dry-run (no cleartext)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" \
+        run -e ANTHROPIC_API_KEY=sk-ant-inline --dry-run
+    [ "$status" -eq 0 ]
+    [ "$(_count sk-ant-inline "$output")" -eq 0 ]
+    [[ "$output" == *"ANTHROPIC_API_KEY=REDACTED"* ]]
+}
+
+@test "non-secret env vars are NOT masked in --dry-run or in labels" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run -e FOO=bar_value --dry-run
     [ "$status" -eq 0 ]
-    # Both in --env and in the label, FOO=bar_value is preserved
-    label_part="${output#*ops.cmdline.real=}"
-    [[ "$label_part" == *"FOO=bar_value"* ]]
+    # FOO=bar_value appears at least twice: in the user argv (-e FOO=bar_value)
+    # and in the effective --env FOO=bar_value. Both labels carry it unmasked.
+    [ "$(_count FOO=bar_value "$output")" -ge 2 ]
+    [[ "$output" == *"--env FOO=bar_value"* ]]
 }

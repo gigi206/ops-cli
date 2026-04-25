@@ -125,17 +125,18 @@ EOF
 }
 
 @test "profile uses Dockerfile.<name> convention when OPS_DOCKERFILES absent" {
-    local custom="$BATS_TEST_TMPDIR/Dockerfile.autodetect"
-    echo "FROM scratch" > "$custom"
-    # Put it next to ops.sh so SCRIPT_DIR lookup finds it
-    cp "$custom" "$BATS_TEST_DIRNAME/../Dockerfile.autodetect"
-    trap "rm -f '$BATS_TEST_DIRNAME/../Dockerfile.autodetect'" EXIT
+    # Isolated copy of ops.sh in a tmpdir so the auto-detection path
+    # (SCRIPT_DIR/Dockerfile.<key>) can be exercised without polluting the
+    # real repo with a Dockerfile.autodetect file. BATS_TEST_TMPDIR is
+    # cleaned automatically; no `trap EXIT` needed.
+    local ops_bin; ops_bin=$(isolated_ops)
+    echo "FROM scratch" > "$(dirname "$ops_bin")/Dockerfile.autodetect"
 
     _write_conf <<'EOF'
 declare -A OPS_IMAGES
 OPS_IMAGES[autodetect]="localhost/ops-auto"
 EOF
-    run env OPS_RUNTIME=docker "$(ops_sh)" build -i autodetect
+    run env OPS_RUNTIME=docker "$ops_bin" build -i autodetect
     [ "$status" -eq 0 ]
     grep -qE "build .*Dockerfile.autodetect" "$MOCK_LOG"
 }
@@ -178,12 +179,12 @@ OPS_IMAGES[ml]="localhost/ops-ml"
 declare -A OPS_CONTAINER_NAMES
 OPS_CONTAINER_NAMES[ml]="ml-ctn"
 EOF
-    # A dockerfile next to ops.sh for Dockerfile.ml
-    local df="$BATS_TEST_DIRNAME/../Dockerfile.ml"
-    echo "FROM scratch" > "$df"
-    trap "rm -f '$df'" EXIT
+    # Isolated copy so Dockerfile.ml can live next to an ops.sh without
+    # polluting the repo (see isolated_ops for the rationale).
+    local ops_bin; ops_bin=$(isolated_ops)
+    echo "FROM scratch" > "$(dirname "$ops_bin")/Dockerfile.ml"
 
-    run env OPS_RUNTIME=docker "$(ops_sh)" run -i ml --dry-run
+    run env OPS_RUNTIME=docker "$ops_bin" run -i ml --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"localhost/ops-ml"* ]]
     [[ "$output" == *"--name ml-ctn"* ]]

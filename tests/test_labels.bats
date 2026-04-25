@@ -43,10 +43,12 @@ setup() {
 @test "ops.cmdline.real does not embed itself (no recursion)" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    # real should NOT contain the literal 'ops.cmdline.real=' inside its own value
-    # (counted via grep -o should be at most 1 occurrence)
+    # The `ops.cmdline.real` label must appear exactly once in the dry-run
+    # output — as the `--label ops.cmdline.real=…` argument the wrapper adds.
+    # A stricter assertion than the previous `≤ 2` upper bound, which would
+    # have silently passed under mild recursion.
     count=$(echo "$output" | grep -o 'ops.cmdline.real=' | wc -l)
-    [ "$count" -le 2 ]  # allow at most 2 (once in --label, once if dry-run echoes twice)
+    [ "$count" -eq 1 ]
 }
 
 @test "build_image injects ops.dockerfile label" {

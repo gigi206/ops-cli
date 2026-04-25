@@ -37,10 +37,13 @@ function M.is_safe_local_path(path)
   end
 
   -- Resolve path against cwd and require the result to live inside cwd.
-  local cwd = shell.exec("pwd 2>/dev/null"):gsub("%s+$", "")
+  -- shell.exec can return nil when the subprocess fails to spawn (PATH
+  -- scrubbed, TMPDIR unwritable, etc.). Chaining :gsub on nil would crash
+  -- with "attempt to index a nil value" — coerce to "" first and bail.
+  local cwd = (shell.exec("pwd 2>/dev/null") or ""):gsub("%s+$", "")
   if cwd == "" then return false end
 
-  local realpath = shell.exec("realpath -m " .. shell.shquote(path) .. " 2>/dev/null || echo INVALID")
+  local realpath = (shell.exec("realpath -m " .. shell.shquote(path) .. " 2>/dev/null || echo INVALID") or "")
                     :gsub("%s+$", "")
   if realpath == "" or realpath == "INVALID" then return false end
 
