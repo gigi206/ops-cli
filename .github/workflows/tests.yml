@@ -34,12 +34,17 @@ jobs:
             /var/cache/apt/archives/*.deb
           # Bump the suffix when the install list changes so stale caches
           # do not hide a missing package.
-          key: apt-bats-shellcheck-luacheck-${{ runner.os }}-v2
+          key: apt-bats-shellcheck-luarocks-${{ runner.os }}-v3
 
       - name: Install bats + shellcheck + luacheck
         run: |
+          # luacheck is no longer available in ubuntu-24.04 (noble) main/universe
+          # apt indexes -- it ships only as a luarocks package upstream. Install
+          # luarocks via apt then luacheck via luarocks (the apt path picks the
+          # bats + shellcheck binaries which are still packaged).
           sudo apt-get update
-          sudo apt-get install -y bats shellcheck luacheck
+          sudo apt-get install -y bats shellcheck luarocks
+          sudo luarocks install luacheck
 
       - name: Shellcheck ops.sh + helper scripts (style level)
         # scripts/*.sh ship in the image (google-chrome wrapper, nix wrappers)
@@ -114,7 +119,7 @@ jobs:
         # in Dockerfiles / workflows. Non-blocking (exit-code 0) so a new
         # advisory doesn't freeze the main branch — CI surfaces findings via
         # the workflow log, triage happens out-of-band.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: fs
           scan-ref: .
