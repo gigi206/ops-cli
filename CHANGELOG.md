@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-04-25
+
 ### Security
 - Secret masking extended to the `ops.cmdline.user` label (previously only the `ops.cmdline.real` label was masked). A user who types `ops -e GITHUB_TOKEN=xxx run` no longer leaks the token via `docker inspect <container>`. The masking regex now also covers single- and double-quoted forms (`KEY='val'` / `KEY="val"`), not just bare values.
 - Secret masking gained a **convention fallback** on top of the explicit list: any uppercase variable name ending in `_TOKEN`, `_SECRET`, `_KEY`, `_API_KEY`, `_APIKEY`, `_PASSWORD`, `_PASS`, or `_PWD` is also masked. Catches `MY_DB_PASSWORD`, `SLACK_WEBHOOK_SECRET`, `STRIPE_API_KEY`, etc. without requiring each to be added by hand. False positives on non-secret names with the same suffix are a deliberate trade-off in favour of not leaking anything.
@@ -30,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/helpers.bash::mock_runtime_rich` — unified rich mock consumed by `test_status_visual.bats`, `test_doctor_containers.bats`, `test_update_flow.bats`, and `test_inspect.bats`. Replaces three divergent inline mocks; all knobs (`MOCK_PS_LINE`, `MOCK_PS_LABELED_FULL`, `MOCK_IMG_MISSING`, `MOCK_OLD_ID`/`MOCK_NEW_ID`, `MOCK_CTNS_ON_OLD`, `MOCK_CLI_{USER,REAL}`, `MOCK_IMG_INSPECT_FAIL_ALL`, `MOCK_CTN_INSPECT_FAIL_ALL`) are documented in-line.
 - `MOCK_BUILD_FAIL=1` hook in the basic `mock_runtime` — lets tests drive the `build_image || exit $?` failure path deterministically.
 - `.github/pull_request_template.md` — reminds contributors to run the `image-integration` suite locally (or trigger it manually in the Actions tab) when touching image-level code, since that job does not run on PRs by default.
-- `.github/ISSUE_TEMPLATE/` — structured `bug_report.yml` + `feature_request.yml` + a `config.yml` that disables blank issues and routes security reports to GitHub's private vulnerability advisory flow and questions to *Discussions*.
+- `.github/ISSUE_TEMPLATE/` — structured `bug_report.yml` + `feature_request.yml` + a `config.yml` that disables blank issues.
 - CI: `concurrency:` group keyed on `(workflow, ref)` with `cancel-in-progress: true`. A rapid sequence of PR pushes now cancels the earlier runs instead of piling up behind each other. `main` has its own group so a rebased PR never kills the main-branch build.
 - CI: `shellcheck -S style` now also covers `scripts/*.sh` (the in-image wrappers — `google-chrome`, `_nix-wrapper`, `_nix-cli-wrapper`) alongside `ops.sh`. The same extension applies to the local `bash -n` syntax pass. `mise run lint` mirrors the expanded scope.
 

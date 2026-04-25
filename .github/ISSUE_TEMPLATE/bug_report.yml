@@ -10,10 +10,6 @@ body:
         skim the [README](../blob/main/README.md#troubleshooting) troubleshooting
         section and existing issues to avoid duplicates.
 
-        **Security issues: do not file here.** Use GitHub's
-        [private vulnerability reporting](../security/advisories/new)
-        instead.
-
   - type: input
     id: ops-version
     attributes:

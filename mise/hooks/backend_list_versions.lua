@@ -52,7 +52,7 @@ function PLUGIN:BackendListVersions(ctx)
   local current_os = platform.normalize_os(RUNTIME.osType)
   local current_arch = RUNTIME.archType:lower()
 
-  local success, data, response = nixhub.fetch_metadata(tool)
+  local success, data, _response = nixhub.fetch_metadata(tool)
 
   -- If package not found in nixhub, return empty list
   -- This allows flake reference versions to work (e.g., nix:mytool@gitlab+group/repo#default)
