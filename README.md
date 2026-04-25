@@ -2117,5 +2117,3 @@ hadolint Dockerfile
   see [`.github/workflows/tests.yml`](.github/workflows/tests.yml) for the
   `shellcheck` / `hadolint` / `luacheck` / `bats` / `trivy` jobs you'll need
   to keep green. `mise run ci` reproduces the unit-test path locally.
-- **Security**: private vulnerability reports go through GitHub's
-  [Report a vulnerability](../../security/advisories/new) flow.

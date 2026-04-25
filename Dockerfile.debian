@@ -261,27 +261,11 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
     fi \
  && if [ "$NIX_CLEANUP" = "true" ]; then \
       HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d; \
-    fi \
- && sudo tee /etc/ops-bashrc > /dev/null <<'BASHRC'
-# Keep in sync with Dockerfile (Arch). Rationale documented there.
-source /opt/nix-home/.nix-profile/etc/profile.d/nix.sh
-eval "$(mise env 2>/dev/null)"
-
-if [[ $- == *i* ]]; then
-    [ -r /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
-    alias ls='ls --color=auto'
-    alias ll='ls -lh'
-    alias la='ls -A'
-    alias l='ls -CF'
-    alias grep='grep --color=auto'
-    PS1='\[\e[01;36m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ '
-    eval "$(mise activate bash)"
-    command_not_found_handle() { printf "bash: %s: command not found\n" "$1" >&2; return 127; }
-    if [ -r "$HOME/.bashrc" ] && [ -z "${OPS_BASHRC_DONE:-}" ]; then
-        OPS_BASHRC_DONE=1 . "$HOME/.bashrc"
     fi
-fi
-BASHRC
+
+# Interactive shell init baked outside $HOME (kept in sync with Arch
+# Dockerfile). See scripts/ops-bashrc for the full rationale.
+COPY --chown=root:root --chmod=644 scripts/ops-bashrc /etc/ops-bashrc
 
 # -----------------------------------------------------------------------------
 # 6. google-chrome wrapper — shadows the mise shim via /opt/ops/bin
