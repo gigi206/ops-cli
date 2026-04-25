@@ -34,12 +34,17 @@ jobs:
             /var/cache/apt/archives/*.deb
           # Bump the suffix when the install list changes so stale caches
           # do not hide a missing package.
-          key: apt-bats-shellcheck-luacheck-${{ runner.os }}-v2
+          key: apt-bats-shellcheck-luarocks-${{ runner.os }}-v3
 
       - name: Install bats + shellcheck + luacheck
         run: |
+          # luacheck is no longer available in ubuntu-24.04 (noble) main/universe
+          # apt indexes -- it ships only as a luarocks package upstream. Install
+          # luarocks via apt then luacheck via luarocks (the apt path picks the
+          # bats + shellcheck binaries which are still packaged).
           sudo apt-get update
-          sudo apt-get install -y bats shellcheck luacheck
+          sudo apt-get install -y bats shellcheck luarocks
+          sudo luarocks install luacheck
 
       - name: Shellcheck ops.sh + helper scripts (style level)
         # scripts/*.sh ship in the image (google-chrome wrapper, nix wrappers)
@@ -53,15 +58,10 @@ jobs:
           for f in scripts/*.sh; do bash -n "$f"; done
 
       - name: Luacheck mise/ plugin
-        # --globals PLUGIN RUNTIME: injected by the vfox host at plugin load time.
-        # --no-max-line-length: match the upstream style; we don't enforce width.
-        # --exclude-files types.lua: only EmmyLua meta annotations, luacheck would
-        # otherwise flag the unused ---@class / ---@field directives.
-        run: |
-          luacheck mise/ \
-            --globals PLUGIN RUNTIME \
-            --no-max-line-length \
-            --exclude-files 'mise/types.lua'
+        # All knobs (globals, excluded files, accepted warnings) live in
+        # the repo-root .luacheckrc — keep CI and local `mise run lint`
+        # in lockstep without duplicating flags.
+        run: luacheck mise/
 
       - name: Run bats tests
         run: bats --tap tests/ | tee bats-output.tap
@@ -91,7 +91,7 @@ jobs:
           # SC2028 (hadolint-shellcheck): false positive on the `echo '…'`
           #         lines in the bashrc append block; no escape sequences
           #         are actually present
-          ignore: DL3008,DL3059,DL3004,SC2028
+          ignore: DL3008,DL3059,DL3004,SC1091,SC2028
       - name: hadolint Dockerfile.debian (if present)
         if: hashFiles('Dockerfile.debian') != ''
         uses: hadolint/hadolint-action@v3.1.0
@@ -100,7 +100,7 @@ jobs:
           # Same ignore list as the Arch Dockerfile above — Dockerfile.debian
           # is a parity twin and uses the same `sudo` + `echo alias=…` blocks,
           # so the same DL3004 / SC2028 waivers apply.
-          ignore: DL3008,DL3059,DL3004,SC2028
+          ignore: DL3008,DL3059,DL3004,SC1091,SC2028
 
   trivy-fs:
     name: trivy (filesystem + config)
@@ -114,7 +114,7 @@ jobs:
         # in Dockerfiles / workflows. Non-blocking (exit-code 0) so a new
         # advisory doesn't freeze the main branch — CI surfaces findings via
         # the workflow log, triage happens out-of-band.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           scan-type: fs
           scan-ref: .
@@ -149,33 +149,82 @@ jobs:
       - name: Prepare systemd user session (nerdctl)
         if: matrix.runtime == 'nerdctl'
         run: |
-          # `loginctl enable-linger` keeps the user's systemd instance alive
-          # without an interactive login — required so `systemctl --user`
-          # can manage containerd.service from this non-interactive step.
-          # We surface the failure explicitly (no `|| true`) so a regression
-          # in the runner's systemd stack is visible rather than cascading
-          # into a confusing "containerd.service not found" later on.
-          if ! sudo loginctl enable-linger "$USER"; then
-            echo "::warning::loginctl enable-linger failed — systemctl --user may not work in this runner" >&2
-            # We still proceed; some images run systemd-per-user differently.
+          # Rootless containerd prereqs that ubuntu-latest doesn't ship by
+          # default. Without these `containerd-rootless-setuptool.sh install`
+          # bails out half-way and leaves no containerd.service unit behind,
+          # which is what produced "Unit containerd.service not found" in
+          # earlier runs.
+          #   uidmap            -> newuidmap/newgidmap (subuid/subgid mapping)
+          #   slirp4netns       -> rootless network stack
+          #   fuse-overlayfs    -> rootless snapshotter
+          #   dbus-user-session -> per-user DBus + `systemctl --user`
+          sudo apt-get update
+          sudo apt-get install -y uidmap slirp4netns fuse-overlayfs dbus-user-session
+          # Ubuntu 24.04 (noble) ships AppArmor with
+          # `kernel.apparmor_restrict_unprivileged_userns=1` by default,
+          # which blocks `unshare(CLONE_NEWUSER)` from non-root processes.
+          # rootlesskit needs that syscall to fork its child PID-1 -- without
+          # the override the install fails with
+          # "fork/exec /proc/self/exe: operation not permitted".
+          # Same remedy for the older `unprivileged_userns_clone` knob on
+          # kernels that still expose it.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          # Make sure the runner user has subuid/subgid ranges (rootlesskit
+          # needs at least 65536 IDs). ubuntu-latest *usually* ships these,
+          # but we add them defensively so a future image change doesn't
+          # silently re-introduce the failure.
+          if ! grep -q "^$USER:" /etc/subuid; then
+            echo "$USER:100000:65536" | sudo tee -a /etc/subuid >/dev/null
           fi
-          # Ensure XDG_RUNTIME_DIR exists so `systemctl --user` works in the
-          # non-interactive shell of the workflow step.
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-          sudo mkdir -p "$XDG_RUNTIME_DIR"
-          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          if ! grep -q "^$USER:" /etc/subgid; then
+            echo "$USER:100000:65536" | sudo tee -a /etc/subgid >/dev/null
+          fi
+          # enable-linger keeps the user's systemd instance alive between
+          # workflow steps (each step is a fresh non-interactive shell).
+          # Surface the failure explicitly: a silent `|| true` previously
+          # cascaded into a confusing "Unit not found" three steps later.
+          sudo loginctl enable-linger "$USER"
+          # XDG_RUNTIME_DIR must exist *and* be exported in every subsequent
+          # step; persist it via $GITHUB_ENV so `Install nerdctl` and `Build
+          # image` inherit the same value as this step.
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          # `loginctl enable-linger` only takes effect on the *next* login --
+          # force-start the user manager now so `systemctl --user` works in
+          # this step (and the units installed below survive into the next).
+          sudo systemctl start "user@$(id -u).service"
+          # Wait for the user systemd instance to actually accept commands
+          # (DBus listener takes a beat to come up after user@.service starts).
+          for _ in $(seq 1 30); do
+            systemctl --user show-environment >/dev/null 2>&1 && break
+            sleep 1
+          done
+          systemctl --user show-environment >/dev/null
 
       - name: Install nerdctl via ops.sh
         if: matrix.runtime == 'nerdctl'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          # Compute XDG_RUNTIME_DIR dynamically rather than hardcoding the UID
-          # (ubuntu-latest's runner UID has drifted in the past — pin to id -u).
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
           # Non-interactive install: pipe Y so the "Overwrite?" prompt is accepted.
+          # ops.sh now propagates `containerd-rootless-setuptool.sh install`
+          # failures, so a missing prereq fails the step instead of silently
+          # leaving the system without a containerd.service unit.
           yes Y | OPS_RUNTIME=nerdctl ./ops.sh nerdctl install
-          systemctl --user start containerd.service || true
+          # daemon-reload picks up the unit file freshly written under
+          # ~/.config/systemd/user/ (the install step created it but did
+          # not necessarily reload this user manager).
+          systemctl --user daemon-reload
+          systemctl --user start containerd.service
+          # Wait for the rootless containerd socket so the build step can
+          # attach to it without racing the daemon startup.
+          for _ in $(seq 1 30); do
+            [ -S "$XDG_RUNTIME_DIR/containerd-rootless/containerd.sock" ] && break
+            sleep 1
+          done
+          systemctl --user is-active containerd.service
 
       - name: Build image (${{ matrix.runtime }})
         env:
@@ -211,15 +260,55 @@ jobs:
           fi
           "$bin" image inspect localhost/ops-ci-smoke --format '{{index .Config.Labels "ops.dockerfile"}}' | grep -q 'Dockerfile.cismoke'
 
+  image_changes:
+    name: detect image-affecting changes
+    # Lightweight gate for image-integration on PRs: skip the 15-min Arch
+    # build when nothing under Dockerfile* / mise/ / scripts/ / the workflow
+    # itself moved, but force-run it when those paths *do* change so a
+    # Dockerfile / Nix regression can't slip through review.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            image:
+              - 'Dockerfile'
+              - 'Dockerfile.*'
+              - 'mise/**'
+              - 'scripts/**'
+              - 'ops.sh'
+              - '.github/workflows/tests.yml'
+
   image-integration:
     name: image integration (Arch)
-    # Only runs on pushes to main and manual triggers -- building the real
-    # Arch image pulls Nix + full mise baseline (~15 min) and we don't want
-    # to block every PR on that. To run it on a PR, push to main or use the
-    # "Run workflow" button in the Actions tab.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Runs on:
+    #   - push to main + workflow_dispatch (full pre-merge + manual coverage)
+    #   - pull_request when the PR touches an image input (Dockerfile*,
+    #     mise/, scripts/, ops.sh, this workflow). The full Arch build is
+    #     ~15 min so we skip it on doc/test-only PRs but enforce it whenever
+    #     a Dockerfile/Nix regression is actually possible.
+    #
+    # `always()` is required because image_changes is skipped on push /
+    # workflow_dispatch events (it only runs on pull_request); without
+    # `always()`, GitHub propagates the skip into this job too. We then
+    # gate explicitly on bats/hadolint success and on the appropriate
+    # event_name + paths-filter combination.
+    if: |
+      always()
+      && needs.bats.result == 'success'
+      && needs.hadolint.result == 'success'
+      && (
+        github.event_name == 'push'
+        || github.event_name == 'workflow_dispatch'
+        || (github.event_name == 'pull_request' && needs.image_changes.result == 'success' && needs.image_changes.outputs.image == 'true')
+      )
     runs-on: ubuntu-latest
-    needs: [bats, hadolint]
+    needs: [bats, hadolint, image_changes]
     steps:
       - uses: actions/checkout@v4
 

@@ -319,41 +319,15 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
     fi \
  && if [ "$NIX_CLEANUP" = "true" ]; then \
       HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d; \
-    fi \
- && sudo tee /etc/ops-bashrc > /dev/null <<'BASHRC'
-# ops-cli interactive shell init. Baked at /etc/ops-bashrc (not $HOME/.bashrc)
-# because ops.sh bind-mounts the host $HOME by default, which would shadow any
-# $HOME/.bashrc shipped in the image. Entrypoints in ops.sh pass this file via
-# `bash --rcfile /etc/ops-bashrc` for interactive sessions; the same file is
-# `source`d at the top of `bash -c` agent commands so sub-processes (claude,
-# vim, ...) inherit the mise+flake env.
-
-# Always (interactive + sourced in non-interactive agent wrappers):
-# nix profile + mise env applied once, so PATH / PYTHONPATH / ... from the
-# workdir's flake.nix devShell (if any) are visible to every child process.
-source /opt/nix-home/.nix-profile/etc/profile.d/nix.sh
-eval "$(mise env 2>/dev/null)"
-
-# Interactive-only niceties. Guarded on $- so sourcing this file from a
-# `bash -c` wrapper does not waste time setting a PS1 or installing the
-# mise prompt hook for a non-interactive shell.
-if [[ $- == *i* ]]; then
-    [ -r /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
-    alias ls='ls --color=auto'
-    alias ll='ls -lh'
-    alias la='ls -A'
-    alias l='ls -CF'
-    alias grep='grep --color=auto'
-    PS1='\[\e[01;36m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ '
-    eval "$(mise activate bash)"
-    command_not_found_handle() { printf "bash: %s: command not found\n" "$1" >&2; return 127; }
-    # Chain to a user-provided $HOME/.bashrc (bind-mounted from the host)
-    # exactly once, so personal aliases / functions / vars still load.
-    if [ -r "$HOME/.bashrc" ] && [ -z "${OPS_BASHRC_DONE:-}" ]; then
-        OPS_BASHRC_DONE=1 . "$HOME/.bashrc"
     fi
-fi
-BASHRC
+
+# Bake the interactive shell init OUTSIDE $HOME so it survives the host
+# bind-mount of $HOME at runtime. ops.sh launches `bash --rcfile
+# /etc/ops-bashrc` for interactive sessions and `source`s the same file at
+# the top of `bash -c` agent wrappers, so claude / gemini / opencode / codex
+# / --update / --install all see PATH / PYTHONPATH / ... from the workdir's
+# flake.nix devShell.
+COPY --chown=root:root --chmod=644 scripts/ops-bashrc /etc/ops-bashrc
 
 # -----------------------------------------------------------------------------
 # 6. google-chrome wrapper (shadows the mise shim via /opt/ops/bin)

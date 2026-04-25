@@ -723,7 +723,15 @@ cmd_install() {
 
     echo "Configuring rootless containerd service..."
     export PATH="/usr/bin:$install_dir/bin:$PATH"
-    "$install_dir/bin/containerd-rootless-setuptool.sh" install
+    # containerd-rootless-setuptool.sh fails fast if any prereq is missing
+    # (uidmap, slirp4netns, fuse-overlayfs, dbus-user-session, a working
+    # `systemctl --user`). Surface that exit status — the previous swallow
+    # left ops users with a half-installed rootless stack and a confusing
+    # "Unit containerd.service not found" the next time `ops build` ran.
+    if ! "$install_dir/bin/containerd-rootless-setuptool.sh" install; then
+        echo "Error: rootless containerd setup failed (missing uidmap / slirp4netns / fuse-overlayfs / dbus-user-session, or systemctl --user is unavailable)." >&2
+        exit 1
+    fi
     systemctl --user disable containerd.service
     echo "Service installed and disabled at boot."
     echo "To start: systemctl --user start containerd.service"
@@ -1723,7 +1731,7 @@ _ensure_mise_plugin_symlink() {
     case "$kind" in
         symlink)
             # Already migrated. Set the marker so next run short-circuits.
-            mkdir -p "$state_dir" && touch "$marker" 2>/dev/null || true
+            { mkdir -p "$state_dir" && touch "$marker"; } 2>/dev/null || true
             ;;
         absent)
             # Volume is empty (freshly created, or just wiped with
@@ -1747,7 +1755,7 @@ _ensure_mise_plugin_symlink() {
                 rm -rf /data/plugins/nix && \
                 mkdir -p /data/plugins && \
                 ln -s /opt/ops/mise-plugin/nix /data/plugins/nix' >/dev/null 2>&1; then
-                mkdir -p "$state_dir" && touch "$marker" 2>/dev/null || true
+                { mkdir -p "$state_dir" && touch "$marker"; } 2>/dev/null || true
             fi
             ;;
     esac
