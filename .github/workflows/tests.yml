@@ -24,11 +24,11 @@ jobs:
     name: bats + shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache apt packages
         id: apt-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             /var/cache/apt/archives/*.deb
@@ -68,7 +68,7 @@ jobs:
 
       - name: Upload bats TAP log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bats-tap-log
           path: bats-output.tap
@@ -78,9 +78,9 @@ jobs:
     name: hadolint Dockerfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: hadolint Dockerfile
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: Dockerfile
           # DL3008: apt pin — intentional for pacman base image, not applicable
@@ -94,7 +94,7 @@ jobs:
           ignore: DL3008,DL3059,DL3004,SC2028
       - name: hadolint Dockerfile.debian (if present)
         if: hashFiles('Dockerfile.debian') != ''
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: Dockerfile.debian
           # Same ignore list as the Arch Dockerfile above — Dockerfile.debian
@@ -108,13 +108,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run trivy filesystem scan
         # Scans the working tree for CVEs in pinned dependencies + misconfigs
         # in Dockerfiles / workflows. Non-blocking (exit-code 0) so a new
         # advisory doesn't freeze the main branch — CI surfaces findings via
         # the workflow log, triage happens out-of-band.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -132,7 +132,7 @@ jobs:
       matrix:
         runtime: [docker, podman, nerdctl]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install docker
         if: matrix.runtime == 'docker'
@@ -221,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [bats, hadolint]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install bats
         run: |
