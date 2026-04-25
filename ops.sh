@@ -1723,7 +1723,7 @@ _ensure_mise_plugin_symlink() {
     case "$kind" in
         symlink)
             # Already migrated. Set the marker so next run short-circuits.
-            mkdir -p "$state_dir" && touch "$marker" 2>/dev/null || true
+            { mkdir -p "$state_dir" && touch "$marker"; } 2>/dev/null || true
             ;;
         absent)
             # Volume is empty (freshly created, or just wiped with
@@ -1747,7 +1747,7 @@ _ensure_mise_plugin_symlink() {
                 rm -rf /data/plugins/nix && \
                 mkdir -p /data/plugins && \
                 ln -s /opt/ops/mise-plugin/nix /data/plugins/nix' >/dev/null 2>&1; then
-                mkdir -p "$state_dir" && touch "$marker" 2>/dev/null || true
+                { mkdir -p "$state_dir" && touch "$marker"; } 2>/dev/null || true
             fi
             ;;
     esac

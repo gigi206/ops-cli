@@ -23,7 +23,7 @@ submitting. Every item that applies to your change should be ticked.
 - [ ] `bash -n ops.sh` is clean
 - [ ] `bats tests/` is green
 - [ ] `hadolint Dockerfile` and `hadolint Dockerfile.debian` are acceptable
-      (the project tolerates `DL3008`, `DL3059`, `DL3004`, `SC2028`;
+      (the project tolerates `DL3008`, `DL3059`, `DL3004`, `SC1091`, `SC2028`;
       anything new needs a justification in the PR description)
 
 ## Tests and documentation

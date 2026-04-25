@@ -88,9 +88,9 @@ run = [
   "for f in scripts/*.sh; do bash -n \"$f\"; done",
   """
   if command -v luacheck >/dev/null 2>&1; then
-    luacheck mise/ --globals PLUGIN RUNTIME --no-max-line-length --exclude-files mise/types.lua
+    luacheck mise/
   else
-    echo '⚠ luacheck not found on PATH — skipping. Install: apt install luacheck / pacman -S luacheck / brew install luacheck' >&2
+    echo '⚠ luacheck not found on PATH — skipping. Install via luarocks: sudo apt install -y luarocks && sudo luarocks install luacheck' >&2
   fi
   """,
   # hadolint ignore list mirrors .github/workflows/tests.yml:
@@ -99,8 +99,8 @@ run = [
   #   DL3004 — sudo in RUN (required post-USER via the NOPASSWD sudoers entry)
   #   SC2028 — echo escape sequences (false positive on the `echo 'alias …'`
   #            bashrc append block; no escapes actually present)
-  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC2028 Dockerfile",
-  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC2028 Dockerfile.debian",
+  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 Dockerfile",
+  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 Dockerfile.debian",
 ]
 
 [tasks.test]

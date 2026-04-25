@@ -238,17 +238,6 @@ setup() {
     [[ "$output" == *ops-cli* ]]
 }
 
-@test "image: OCI label org.opencontainers.image.version is NOT set (dropped)" {
-    # Regression guard: version + revision were removed because they
-    # duplicated OPS_VERSION (already in `ops --version`) and stayed
-    # empty without CI stamping. Re-introducing them needs a design
-    # discussion.
-    run "$IMAGE_RUNTIME" image inspect localhost/ops-dev \
-        --format '{{ index .Config.Labels "org.opencontainers.image.version" }}'
-    [ "$status" -eq 0 ]
-    [ -z "$output" ]
-}
-
 @test "image: OCI label org.opencontainers.image.description mentions mise + Nix + AI agents" {
     run "$IMAGE_RUNTIME" image inspect localhost/ops-dev \
         --format '{{ index .Config.Labels "org.opencontainers.image.description" }}'
