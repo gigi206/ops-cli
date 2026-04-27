@@ -9,9 +9,99 @@
 # Always (interactive + sourced in non-interactive agent wrappers):
 # nix profile + mise env applied once, so PATH / PYTHONPATH / ... from the
 # workdir's flake.nix devShell (if any) are visible to every child process.
+#
+# `mise hook-env` instead of `mise env`: hook-env emits a strict superset of
+# the env exports (PATH, mise.toml [env] vars, plugin MiseEnv outputs) and
+# additionally sets __MISE_DIFF / __MISE_SESSION used to skip redundant
+# work on subsequent prompts. `mise env` runs a full toolset version-resolve
+# pass on every invocation, which on projects pinning a `ruby = "3.x"` (or
+# any tool whose backend doesn't honour fetch_remote_versions_cache) easily
+# costs 10+ s — entirely redundant when `mise activate bash` further down
+# already calls hook-env via _mise_hook.
 # shellcheck disable=SC1091
 source /opt/nix-home/.nix-profile/etc/profile.d/nix.sh
-eval "$(mise env 2>/dev/null)"
+
+# Shell-level cache for `mise hook-env` output. Cold-start mise hook-env
+# costs ~10-12 s (toolset resolve, plugin init, config parse, lockfile
+# reads) even when nothing has changed -- mise's in-process cache only
+# helps subsequent calls *within the same process*, and every container
+# `--rm` boots a fresh process. We cache the generated shell exports on
+# disk and source them directly; regenerate only when a config file
+# (mise.toml, mise.local.toml, flake.lock, /etc/mise/config.toml) has
+# changed since the last run.
+__ops_mise_cache="${PWD}/.mise-nix/shell-env.cache"
+__ops_mise_cache_dir="$(dirname "$__ops_mise_cache")"
+mkdir -p "$__ops_mise_cache_dir" 2>/dev/null
+[ -f "$__ops_mise_cache_dir/.gitignore" ] || \
+    printf '*\n' > "$__ops_mise_cache_dir/.gitignore" 2>/dev/null
+
+# Pre-export the nix plugin's allow-untracked toggle by grepping it out
+# of mise.local.toml (when present) BEFORE any mise invocation. Done on
+# every source (warm and cold paths), not just on cache miss: the
+# generated cache does not surface MISE_NIX_ALLOW_UNTRACKED itself
+# (mise's hook-env diff treats already-set vars as no-ops), so on a
+# warm-path source the var would otherwise stay unset — and any later
+# `mise <cmd>` (e.g. the agent wrappers' `command -v $bin || mise use -g …`
+# slow path, or a manual `mise install`) re-runs the nix plugin's MiseEnv
+# hook, which then trips the "flake.nix not tracked" diagnostic. Cost:
+# one `[ -f ]` + one `grep -q`, both <1 ms. Pattern is loose enough to
+# match `MISE_NIX_ALLOW_UNTRACKED = "1"`, `MISE_NIX_ALLOW_UNTRACKED="1"`,
+# etc., but anchored to the variable name to avoid false positives.
+if [ -f "${PWD}/mise.local.toml" ] && \
+   grep -qE '^[[:space:]]*MISE_NIX_ALLOW_UNTRACKED[[:space:]]*=[[:space:]]*"?1' \
+        "${PWD}/mise.local.toml" 2>/dev/null; then
+    export MISE_NIX_ALLOW_UNTRACKED=1
+fi
+
+__ops_needs_refresh=0
+[ -f "$__ops_mise_cache" ] || __ops_needs_refresh=1
+for __ops_cfg in \
+    "${PWD}/mise.toml" "${PWD}/mise.local.toml" \
+    "${PWD}/flake.lock" "${PWD}/flake.nix" \
+    /etc/mise/config.toml /opt/mise/data/config/config.toml
+do
+    [ -f "$__ops_cfg" ] && [ "$__ops_cfg" -nt "$__ops_mise_cache" ] \
+        && __ops_needs_refresh=1
+done
+
+if [ "$__ops_needs_refresh" = "1" ]; then
+    mise hook-env -s bash 2>/dev/null > "$__ops_mise_cache.tmp" \
+        && mv -f "$__ops_mise_cache.tmp" "$__ops_mise_cache"
+fi
+# shellcheck disable=SC1090
+[ -f "$__ops_mise_cache" ] && . "$__ops_mise_cache"
+
+# `mise hook-env` exports MISE_NIX_PATH for the path handler but does NOT
+# fold it into PATH itself -- mise activate's _mise_hook does that on the
+# fly. Since we bypass mise activate at every shell start, prepend the
+# nix-store segments manually so binaries from the flake's devShell
+# (django-admin, python3, …) resolve.
+if [ -n "${MISE_NIX_PATH:-}" ] && [[ ":$PATH:" != *":${MISE_NIX_PATH%%:*}:"* ]]; then
+    PATH="${MISE_NIX_PATH}:${PATH}"
+    export PATH
+fi
+unset __ops_mise_cache __ops_mise_cache_dir __ops_needs_refresh __ops_cfg
+
+# Regenerate the shell-env cache. Called by `_agent_cmd` (ops.sh) after
+# `mise use -g <pkg>` so the freshly installed binary's `bin` dir lands
+# in the cached PATH. Without this hook, the next `./ops.sh run --<agent>`
+# sees `/opt/mise/data/config/config.toml` (just touched by the install)
+# newer than the cache → bashrc re-runs `mise hook-env` (~8 s of cold
+# bootstrap) → user perceives a slow 2nd run before things stabilize.
+# Doing it here amortizes that cost into the install pass that's already
+# running for ~30-50 s, so subsequent runs hit the warm path immediately.
+__ops_refresh_cache() {
+    local cache="${PWD}/.mise-nix/shell-env.cache"
+    mkdir -p "$(dirname "$cache")" 2>/dev/null
+    # `mise hook-env` emits only the diff against $__MISE_DIFF /
+    # $__MISE_SESSION. After the bashrc preamble already sourced the
+    # initial cache, those vars are set, so a second call returns an
+    # empty string — and we'd write an empty cache. Unset both in a
+    # sub-shell so mise re-emits the full env-export block; the outer
+    # shell's DIFF/SESSION stay untouched (sub-shell isolation).
+    (unset __MISE_DIFF __MISE_SESSION; mise hook-env -s bash 2>/dev/null) > "$cache.tmp" \
+        && mv -f "$cache.tmp" "$cache"
+}
 
 # Interactive-only niceties. Guarded on $- so sourcing this file from a
 # `bash -c` wrapper does not waste time setting a PS1 or installing the
@@ -25,7 +115,39 @@ if [[ $- == *i* ]]; then
     alias l='ls -CF'
     alias grep='grep --color=auto'
     PS1='\[\e[01;36m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ '
-    eval "$(mise activate bash)"
+    # No `mise activate bash` here on purpose. Activating mise installs a
+    # PROMPT_COMMAND that runs `mise hook-env` at every prompt, and mise's
+    # cold-start cost (~7 s on this project's toolset) makes the *first*
+    # prompt of every shell painfully slow even when nothing changed.
+    # We keep the cheap parts ourselves: a PROMPT_COMMAND that only
+    # regenerates the shell-env cache when one of the config files has
+    # actually been modified. Trade-off: `cd /some/other/project` will
+    # not auto-pick-up that project's mise.toml — but inside an ops-cli
+    # container we stay in the workdir, and `mise hook-env -s bash | .` /dev/stdin
+    # is always available as a manual fallback.
+    __ops_mise_refresh_if_stale() {
+        local cache="${PWD}/.mise-nix/shell-env.cache"
+        [ -f "$cache" ] || return 0
+        local f
+        for f in "${PWD}/mise.toml" "${PWD}/mise.local.toml" \
+                 "${PWD}/flake.lock" "${PWD}/flake.nix"; do
+            if [ -f "$f" ] && [ "$f" -nt "$cache" ]; then
+                # Regenerate. MISE_NIX_ALLOW_UNTRACKED is already in our
+                # env from the rcfile preamble's grep, so a single pass is
+                # enough.
+                if mise hook-env -s bash 2>/dev/null > "$cache.tmp"; then
+                    mv -f "$cache.tmp" "$cache"
+                    # shellcheck disable=SC1090
+                    . "$cache"
+                    [ -n "${MISE_NIX_PATH:-}" ] && \
+                        [[ ":$PATH:" != *":${MISE_NIX_PATH%%:*}:"* ]] && \
+                        export PATH="${MISE_NIX_PATH}:${PATH}"
+                fi
+                return 0
+            fi
+        done
+    }
+    PROMPT_COMMAND="__ops_mise_refresh_if_stale${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
     command_not_found_handle() { printf "bash: %s: command not found\n" "$1" >&2; return 127; }
     # Chain to a user-provided $HOME/.bashrc (bind-mounted from the host)
     # exactly once, so personal aliases / functions / vars still load.

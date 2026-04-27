@@ -19,15 +19,19 @@ coverage/
 devbox.json
 devbox.lock
 mise.toml
+mise.local.toml
 .editorconfig
 .shellcheckrc
 .gitignore
 
 # Docs not used at runtime
 CHANGELOG.md
-CONTRIBUTING.md
 README.md
 LICENSE
+docs/
+
+# Example overlays (dev-only — actual mise.local.toml is gitignored)
+mise.local.toml.example
 
 # Backups and transient archives
 *.bak

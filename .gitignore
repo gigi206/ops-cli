@@ -5,10 +5,16 @@
 # regressions in case a future test forgets to use the isolated path.
 Dockerfile.autodetect
 Dockerfile.ml
-# Generated inline by `mise run smoke` and by the CI `runtime-build` matrix
-# job (tests.yml). Both attempt to `rm -f` it at the end, but a Ctrl+C or a
-# failed step can leave it behind — gitignored so it never enters a commit.
-Dockerfile.cismoke
+# Stray copies of `Dockerfile.cismoke` at the repo root — historical
+# artefact from when `mise run smoke` and the CI `runtime-build` matrix
+# job both here-doc'd this file inline. The fixture has since moved to
+# `tests/fixtures/Dockerfile.cismoke` (tracked in git, single source of
+# truth for both the local task and the workflow). The leading `/`
+# anchors the ignore to the repo root so the tracked fixture under
+# tests/fixtures/ is NOT ignored — without the anchor, `git add` on a
+# fresh checkout silently skips it and CI fails with "Dockerfile not
+# found: tests/fixtures/Dockerfile.cismoke".
+/Dockerfile.cismoke
 
 # Per-image Dockerfile hash + build locks (guard against the unusual case
 # where $XDG_CACHE_HOME or $OPS_CACHE would land inside the repo tree).

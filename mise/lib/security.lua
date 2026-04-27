@@ -26,11 +26,23 @@ function M.is_safe_local_path(path)
     return false
   end
 
-  -- Block obviously dangerous absolute paths.
+  -- Block obviously dangerous absolute paths. The per-user dotfile list
+  -- targets directories whose contents are credentials or secret material:
+  --   .ssh   — private keys, known_hosts (host pivot)
+  --   .gnupg — GPG keyrings, agent socket
+  --   .aws   — AWS credentials / config (sts tokens)
+  --   .docker — auth.json (registry creds), config.json (proxies)
+  --   .kube  — kubeconfig (cluster admin tokens, client certs)
+  -- Adding a directory here is a defence-in-depth move; the cwd-descendant
+  -- check below is what actually contains a malicious flake, but a flake
+  -- that *escaped* cwd should still not be allowed to reference these.
   local dangerous_patterns = {
     "^/etc/", "^/usr/", "^/bin/", "^/sbin/", "^/boot/", "^/root/",
     "^/home/[^/]+/%.ssh/",
     "^/home/[^/]+/%.gnupg/",
+    "^/home/[^/]+/%.aws/",
+    "^/home/[^/]+/%.docker/",
+    "^/home/[^/]+/%.kube/",
   }
   for _, pattern in ipairs(dangerous_patterns) do
     if path:match(pattern) then return false end

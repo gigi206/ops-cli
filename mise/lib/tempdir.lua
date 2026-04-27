@@ -36,6 +36,25 @@ function M.create_temp_dir(prefix)
   return temp_dir
 end
 
+-- Create a unique temporary FILE (atomic + 0600 perms via mktemp).
+-- Replacement for os.tmpname() which is documented as racy (CWE-377):
+-- the path returned by os.tmpname is predictable + the file is created
+-- with the user's umask, opening a symlink-race window between the name
+-- generation and the first write. mktemp(1) atomically O_EXCL-creates
+-- the file with mode 0600 instead.
+function M.create_temp_file(prefix)
+  prefix = prefix or "mise_temp"
+  local temp_base = os.getenv("TMPDIR") or "/tmp"
+  local safe_prefix = prefix:gsub("[^%w._-]", "_")
+  local template = temp_base .. "/" .. safe_prefix .. "_XXXXXXXX"
+  local out = cmd.exec("mktemp " .. shquote(template))
+  local temp_file = (out or ""):gsub("%s+$", "")
+  if temp_file == "" then
+    error("mktemp failed to create a temporary file under " .. temp_base)
+  end
+  return temp_file
+end
+
 -- Refuse to recursively delete anything outside a short list of temp bases.
 -- Guards against TMPDIR=/ or a prefix injection crafting an absolute path.
 local function is_safe_temp_path(path)
@@ -55,6 +74,10 @@ end
 -- Execute `func(temp_dir)` and remove the directory afterwards — even when
 -- `func` raises. Preserves all return values from `func`.
 function M.with_temp_dir(prefix, func)
+  -- table.unpack lives at `unpack` in Lua 5.1; mirrors the fallback already
+  -- in shell.lua. Without this, running tempdir on a strict-5.1 host raises
+  -- "attempt to call a nil value (field 'unpack')".
+  local unpack_fn = table.unpack or unpack
   local temp_dir = M.create_temp_dir(prefix)
   local results = table.pack(pcall(func, temp_dir))
   if is_safe_temp_path(temp_dir) then
@@ -63,7 +86,7 @@ function M.with_temp_dir(prefix, func)
   if not results[1] then
     error(results[2])
   end
-  return table.unpack(results, 2, results.n)
+  return unpack_fn(results, 2, results.n)
 end
 
 return M

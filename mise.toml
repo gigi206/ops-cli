@@ -29,6 +29,12 @@ min_version = "2024.12.0"
 "aqua:koalaman/shellcheck"     = "latest"   # ops.sh static analysis
 "aqua:hadolint/hadolint"       = "latest"   # Dockerfile linter
 
+# --- Lua interpreter (used by `mise run test-lua`) --------------------------
+# Pure-Lua test harness under tests/lua/ (no busted dependency); see the
+# task definition below. The vfox-lua backend compiles Lua from source on
+# first install (~1 min cold; cached afterwards under ~/.local/share/mise).
+lua                            = "latest"
+
 # NOTE: luacheck is NOT declared here because the aqua registry does not
 # package it (luacheck is a pure-Lua tool distributed via luarocks; upstream
 # publishes source tarballs only, no binary releases aqua/ubi could use).
@@ -99,13 +105,45 @@ run = [
   #   DL3004 — sudo in RUN (required post-USER via the NOPASSWD sudoers entry)
   #   SC2028 — echo escape sequences (false positive on the `echo 'alias …'`
   #            bashrc append block; no escapes actually present)
-  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 Dockerfile",
-  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 Dockerfile.debian",
+  #   SC2086 — intentional word split on ${EXTRA_MISE_TOOLS}
+  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 --ignore SC2086 Dockerfile",
+  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 --ignore SC2086 Dockerfile.debian",
 ]
 
 [tasks.test]
-description = "Run the mocked bats suite (no real runtime needed)"
+description = "Run the full unit-test suite (mocked bats + pure-Lua)"
+# Contributor-facing one-liner: a single command covers both bash and Lua.
+# CI chains the same two steps; `mise run ci` adds lint + README count
+# verification on top.
+depends = ["test-lua"]
 run = "bats --tap tests/"
+
+[tasks.check-test-counts]
+description = "Verify README test counts match reality (use --update to rewrite them)"
+run = "bash scripts/check-test-counts.sh"
+
+[tasks.test-lua]
+description = "Run the pure-Lua unit tests for the mise plugin (no busted required)"
+# The harness under tests/lua/run.lua exercises plugin helpers (shell.shquote,
+# version parsing, flake.is_reference, plugin_matcher). It stubs the native
+# mise modules via package.preload, so any plain `lua5.x` interpreter works.
+#
+# Lua is declared in [tools] above, so `mise install` provides it on PATH as
+# `lua`. The lua5.4 / lua5.3 fallbacks are kept ONLY for contributors who
+# clone the repo and run `mise run test-lua` BEFORE `mise install` finishes
+# — once mise is bootstrapped, the first branch always wins.
+run = """
+if command -v lua >/dev/null 2>&1; then
+  lua tests/lua/run.lua
+elif command -v lua5.4 >/dev/null 2>&1; then
+  lua5.4 tests/lua/run.lua
+elif command -v lua5.3 >/dev/null 2>&1; then
+  lua5.3 tests/lua/run.lua
+else
+  echo "⚠ no lua interpreter on PATH — run 'mise install' (declared in mise.toml [tools]) or use your system package manager (apt install -y lua5.4 / pacman -S lua / brew install lua)" >&2
+  exit 1
+fi
+"""
 
 [tasks.test-image]
 description = "Run the image-integration suite against a locally-built localhost/ops-dev"
@@ -134,26 +172,14 @@ bashcov -- bats tests/
 """
 
 [tasks.ci]
-description = "Full local reproduction of the CI pipeline (lint + test)"
-depends = ["lint", "test"]
+description = "Full local reproduction of the CI pipeline (lint + test-lua + check-test-counts + test)"
+depends = ["lint", "test-lua", "check-test-counts", "test"]
 
 [tasks.smoke]
 description = "Build the CI smoke Dockerfile against the active runtime (exercises build_image end-to-end without pulling the heavy Nix tree)"
-# Mirrors the `runtime-build` matrix job. Picks whatever OPS_RUNTIME resolves
-# to on your machine — same code path, same flags, same hash file layout.
+# Mirrors the `runtime-build` matrix job. The fixture lives at
+# tests/fixtures/Dockerfile.cismoke so this task and CI share the
+# same definition (no inline here-doc to drift).
 run = """
-cat > Dockerfile.cismoke <<'EOF'
-# syntax=docker/dockerfile:1.6
-FROM docker.io/library/alpine:3.19
-ARG USER_UID=1000
-ARG USER_GID=1000
-ARG USER_NAME=ci
-ARG USER_LANG=C
-RUN addgroup -g "$USER_GID" "$USER_NAME" \\
- && adduser -D -u "$USER_UID" -G "$USER_NAME" "$USER_NAME"
-USER ${USER_NAME}
-CMD ["sh"]
-EOF
-OPS_IMAGE=localhost/ops-ci-smoke OPS_DOCKERFILE=Dockerfile.cismoke ./ops.sh build
-rm -f Dockerfile.cismoke
+OPS_IMAGE=localhost/ops-ci-smoke OPS_DOCKERFILE=tests/fixtures/Dockerfile.cismoke ./ops.sh build
 """

@@ -12,6 +12,22 @@ local plugin_matcher = require("plugin_matcher")
 
 local M = {}
 
+-- Escape the five XML predefined entities so values extracted from
+-- `package.json` (displayName, description, categories, …) cannot break
+-- the manifest XML or inject sibling elements. Order matters: `&` must be
+-- replaced first, otherwise the `&amp;` introduced by later substitutions
+-- would themselves be re-escaped.
+local function xml_escape(s)
+  if not s or s == "" then return s or "" end
+  s = tostring(s)
+  s = s:gsub("&", "&amp;")
+  s = s:gsub("<", "&lt;")
+  s = s:gsub(">", "&gt;")
+  s = s:gsub('"', "&quot;")
+  s = s:gsub("'", "&apos;")
+  return s
+end
+
 -- Extension detection
 function M.is_extension(tool_name)
   return plugin_matcher.matches(tool_name,
@@ -90,46 +106,39 @@ end
 
 -- Create required VSIX manifest files
 function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
-  -- Read package.json to extract extension metadata
+  -- Read package.json to extract extension metadata.
+  -- Use io.open instead of `cat` via try_exec: try_exec's first return value
+  -- (the pcall-success boolean) is true even when cat fails, so the previous
+  -- code accepted shell error text as if it were package.json content and
+  -- silently fell back to placeholder defaults.
   local package_json_path = ext_path .. "/package.json"
   local package_json_content = ""
-  local ok, result = shell.try_exec("cat " .. shell.shquote(package_json_path))
-  if ok then
-    package_json_content = result
-  end
-  local package_data = {}
-  
-  if package_json_content then
-    -- Simple JSON parsing for the fields we need
-    package_data.name = package_json_content:match('"name"%s*:%s*"([^"]+)"') or ext_id
-    package_data.displayName = package_json_content:match('"displayName"%s*:%s*"([^"]+)"') or package_data.name
-    package_data.description = package_json_content:match('"description"%s*:%s*"([^"]+)"') or ""
-    package_data.version = package_json_content:match('"version"%s*:%s*"([^"]+)"') or "1.0.0"
-    package_data.publisher = package_json_content:match('"publisher"%s*:%s*"([^"]+)"') or "unknown"
-    package_data.categories = package_json_content:match('"categories"%s*:%s*%[([^%]]+)%]') or ""
-    package_data.keywords = package_json_content:match('"keywords"%s*:%s*%[([^%]]+)%]') or ""
-    package_data.icon = package_json_content:match('"icon"%s*:%s*"([^"]+)"') or ""
-    package_data.license = package_json_content:match('"license"%s*:%s*"([^"]+)"') or ""
-    
-    -- Parse engine version
-    local engines = package_json_content:match('"engines"%s*:%s*{([^}]+)}')
-    if engines then
-      package_data.engine = engines:match('"vscode"%s*:%s*"([^"]+)"') or "^1.74.0"
-    else
-      package_data.engine = "^1.74.0"
+  do
+    local fh = io.open(package_json_path, "r")
+    if fh then
+      package_json_content = fh:read("*a") or ""
+      fh:close()
     end
-  else
-    package_data.name = ext_id
-    package_data.displayName = ext_id
-    package_data.description = ""
-    package_data.version = "1.0.0"
-    package_data.publisher = "unknown"
-    package_data.categories = ""
-    package_data.keywords = ""
-    package_data.icon = ""
-    package_data.license = ""
-    package_data.engine = "^1.74.0"
   end
+
+  -- Simple regex extraction of the fields we need. When package.json is
+  -- missing or doesn't contain a key, every :match returns nil and the
+  -- `or <default>` fallback applies — covers the "no package.json" case
+  -- without an explicit branch (`""` is truthy in Lua so a guarded
+  -- `if package_json_content then` would always be taken anyway).
+  local package_data = {}
+  package_data.name        = package_json_content:match('"name"%s*:%s*"([^"]+)"')        or ext_id
+  package_data.displayName = package_json_content:match('"displayName"%s*:%s*"([^"]+)"') or package_data.name
+  package_data.description = package_json_content:match('"description"%s*:%s*"([^"]+)"') or ""
+  package_data.version     = package_json_content:match('"version"%s*:%s*"([^"]+)"')     or "1.0.0"
+  package_data.publisher   = package_json_content:match('"publisher"%s*:%s*"([^"]+)"')   or "unknown"
+  package_data.categories  = package_json_content:match('"categories"%s*:%s*%[([^%]]+)%]') or ""
+  package_data.keywords    = package_json_content:match('"keywords"%s*:%s*%[([^%]]+)%]')   or ""
+  package_data.icon        = package_json_content:match('"icon"%s*:%s*"([^"]+)"')        or ""
+  package_data.license     = package_json_content:match('"license"%s*:%s*"([^"]+)"')     or ""
+
+  local engines = package_json_content:match('"engines"%s*:%s*{([^}]+)}')
+  package_data.engine = (engines and engines:match('"vscode"%s*:%s*"([^"]+)"')) or "^1.74.0"
   
   -- Create [Content_Types].xml with common file types for VSCode extensions
   local content_types = [[<?xml version="1.0" encoding="utf-8"?>
@@ -155,8 +164,7 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
     -- Look for common icon files
     local common_icons = {"icon.png", "images/icon.png", "media/icon.png", "assets/icon.png"}
     for _, icon_file in ipairs(common_icons) do
-      local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/" .. icon_file))
-      if ok then
+      if shell.path_exists(ext_path .. "/" .. icon_file, "f") then
         icon_path = "extension/" .. icon_file
         break
       end
@@ -166,69 +174,69 @@ function M.create_vsix_manifest(temp_dir, ext_id, ext_path)
   -- Look for license files
   local common_licenses = {"LICENSE", "LICENSE.txt", "LICENSE.md", "license", "license.txt", "license.md"}
   for _, license_file in ipairs(common_licenses) do
-    local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/" .. license_file))
-    if ok then
+    if shell.path_exists(ext_path .. "/" .. license_file, "f") then
       license_path = "extension/" .. license_file
       break
     end
   end
 
-  -- Clean up categories and keywords
-  local categories = package_data.categories:gsub('"', ''):gsub('%s*,%s*', ',')
-  local tags = package_data.keywords:gsub('"', ''):gsub('%s*,%s*', ',')
-  
-  -- Create extension.vsixmanifest
-  local vsix_manifest = string.format([[<?xml version="1.0" encoding="utf-8"?>
-	<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
-		<Metadata>
-			<Identity Language="en-US" Id="%s" Version="%s" Publisher="%s" />
-			<DisplayName>%s</DisplayName>
-			<Description xml:space="preserve">%s</Description>
-			<Tags>%s</Tags>
-			<Categories>%s</Categories>
-			<GalleryFlags>Public</GalleryFlags>
-			
-			<Properties>
-				<Property Id="Microsoft.VisualStudio.Code.Engine" Value="%s" />
-				<Property Id="Microsoft.VisualStudio.Code.ExtensionDependencies" Value="" />
-				<Property Id="Microsoft.VisualStudio.Code.ExtensionPack" Value="" />
-				<Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace" />
-				<Property Id="Microsoft.VisualStudio.Code.LocalizedLanguages" Value="" />
-				
-				<Property Id="Microsoft.VisualStudio.Services.Links.Source" Value="" />
-				<Property Id="Microsoft.VisualStudio.Services.Links.Getstarted" Value="" />
-				<Property Id="Microsoft.VisualStudio.Services.Links.GitHub" Value="" />
-				<Property Id="Microsoft.VisualStudio.Services.Links.Support" Value="" />
-				<Property Id="Microsoft.VisualStudio.Services.Links.Learn" Value="" />
-				<Property Id="Microsoft.VisualStudio.Services.Branding.Color" Value="#F2F2F2" />
-				<Property Id="Microsoft.VisualStudio.Services.Branding.Theme" Value="light" />
-				<Property Id="Microsoft.VisualStudio.Services.GitHubFlavoredMarkdown" Value="true" />
-				<Property Id="Microsoft.VisualStudio.Services.Content.Pricing" Value="Free"/>
+  -- Clean up categories and keywords (strip JSON quoting + collapse spaces
+  -- around commas), then XML-escape so a payload like `"<script>"` in
+  -- package.json cannot break the manifest's `<Categories>` element.
+  local categories = xml_escape(package_data.categories:gsub('"', ''):gsub('%s*,%s*', ','))
+  local tags = xml_escape(package_data.keywords:gsub('"', ''):gsub('%s*,%s*', ','))
 
-				
-				
-			</Properties>%s%s
-		</Metadata>
-		<Installation>
-			<InstallationTarget Id="Microsoft.VisualStudio.Code"/>
-		</Installation>
-		<Dependencies/>
-		<Assets>
-			<Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />%s%s%s
-		</Assets>
-	</PackageManifest>]], 
-    package_data.name, package_data.version, package_data.publisher, package_data.displayName, package_data.description,
-    tags, categories, package_data.engine,
-    license_path ~= "" and string.format('\n\t\t\t<License>%s</License>', license_path) or "",
-    icon_path ~= "" and string.format('\n\t\t\t<Icon>%s</Icon>', icon_path) or "",
-    (function() local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/README.md")); return ok end)() and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />' or "",
-    (function() local ok, _ = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/CHANGELOG.md")); return ok end)() and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true" />' or "",
-    license_path ~= "" and string.format('\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="%s" Addressable="true" />', license_path) or ""
+  -- Load the manifest template once per call. Resolves the path relative
+  -- to this Lua file rather than the cwd so it survives mise's variable
+  -- working directories (`mise install` may run from anywhere).
+  local function template_path()
+    local here = debug.getinfo(1, "S").source:sub(2)  -- strip leading "@"
+    local dir = here:match("^(.*)/[^/]+$") or "."
+    return dir .. "/templates/extension.vsixmanifest.tpl"
+  end
+
+  local tpl
+  do
+    local fh, err = io.open(template_path(), "r")
+    if not fh then error("failed to open VSIX template at " .. template_path() .. ": " .. tostring(err)) end
+    tpl = fh:read("*a") or ""
+    fh:close()
+  end
+
+  -- Create extension.vsixmanifest from the template. The %s slots, in order:
+  --  1-5 : Identity Id / Version / Publisher / DisplayName / Description
+  --  6-7 : Tags, Categories
+  --  8   : Engine version
+  --  9-10: optional <License> / <Icon> blocks (or empty string)
+  --  11-13: optional README / CHANGELOG / License asset blocks
+  -- Every value pulled from `package.json` (id/version/publisher/display
+  -- name/description/engine) is xml_escape'd before insertion to neutralise
+  -- `<`, `>`, `&`, quotes — a malformed extension can't poison the manifest
+  -- and silently break installation.
+  local vsix_manifest = string.format(tpl,
+    xml_escape(package_data.name),
+    xml_escape(package_data.version),
+    xml_escape(package_data.publisher),
+    xml_escape(package_data.displayName),
+    xml_escape(package_data.description),
+    tags, categories,
+    xml_escape(package_data.engine),
+    license_path ~= "" and string.format('\n\t\t\t<License>%s</License>', xml_escape(license_path)) or "",
+    icon_path ~= "" and string.format('\n\t\t\t<Icon>%s</Icon>', xml_escape(icon_path)) or "",
+    shell.path_exists(ext_path .. "/README.md", "f") and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />' or "",
+    shell.path_exists(ext_path .. "/CHANGELOG.md", "f") and '\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true" />' or "",
+    license_path ~= "" and string.format('\n\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="%s" Addressable="true" />', xml_escape(license_path)) or ""
   )
-  
-  -- Add icon asset if found
+
+  -- Inject the icon asset *after* the templated %s slots (it lives inside
+  -- <Assets>, so it can't be a slot at the same level). Lua's gsub treats
+  -- `%` in the replacement string as a capture reference (`%0`..`%9`); a
+  -- literal `%` in icon_path must be doubled to `%%` before passing.
   if icon_path ~= "" then
-    vsix_manifest = vsix_manifest:gsub("</Assets>", string.format('\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="%s" Addressable="true" />\n\t\t</Assets>', icon_path))
+    local repl = string.format(
+      '\t\t\t<Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="%s" Addressable="true" />\n\t\t</Assets>',
+      xml_escape(icon_path)):gsub("%%", "%%%%")
+    vsix_manifest = vsix_manifest:gsub("</Assets>", repl)
   end
   
   do
@@ -248,7 +256,7 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
 
   -- First try the exact extension ID
   local test_path = nix_store_path .. "/share/vscode/extensions/" .. ext_id
-  if shell.try_exec("test -d " .. shell.shquote(test_path)) then
+  if shell.path_exists(test_path, "d") then
     ext_path = test_path
   else
     -- Try to find the actual directory name (case-insensitive).
@@ -280,17 +288,19 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
 
   local vsix_name = (tool_name or ext_id):gsub("%.", "-") .. ".vsix"
 
-  -- Debug: Check if extension path exists and what's in it
-  logger.debug("Extension path: " .. ext_path)
-  local ls_result = shell.try_exec("ls -la " .. shell.shquote(ext_path) .. " 2>&1")
-  if ls_result then
-    logger.debug("Extension directory contents: " .. tostring(ls_result))
+  -- Debug-only diagnostics: gate the whole block on is_debug() so the
+  -- shell sub-processes aren't spawned in non-debug runs (each was a
+  -- noticeable hit on cold installs because cmd.exec forks a sub-shell).
+  if logger.is_debug() then
+    logger.debug("Extension path: " .. ext_path)
+    local ls_result = shell.try_exec("ls -la " .. shell.shquote(ext_path) .. " 2>&1")
+    if ls_result then
+      logger.debug("Extension directory contents: " .. tostring(ls_result))
+    end
+    local pkg_check = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/package.json")
+      .. ' && echo "package.json found at root" || echo "package.json NOT at root"')
+    logger.debug("Package.json check: " .. tostring(pkg_check))
   end
-
-  -- Check if package.json exists directly in the extension path
-  local pkg_check = shell.try_exec("test -f " .. shell.shquote(ext_path .. "/package.json")
-    .. ' && echo "package.json found at root" || echo "package.json NOT at root"')
-  logger.debug("Package.json check: " .. tostring(pkg_check))
 
   -- Create VSIX file with proper structure using temporary directory.
   -- Capture install_ok / install_status in the outer scope: pcall wrapping a
@@ -306,18 +316,19 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
 
       cmd.exec("mkdir -p " .. shell.shquote(file.join_path(temp_dir, "extension")))
       -- Copy extension files, handling different possible structures.
-      -- shquote wraps the bases; the `/*` glob and trailing `/` live outside
-      -- the quoted words so the shell expands them.
+      -- The `/.` suffix on the source forces cp to copy *contents* including
+      -- dotfiles (.vscodeignore, .vscode/, .gitignore — extensions ship them).
+      -- A trailing `/*` glob would expand without dotglob and silently drop them.
       local copy_success = pcall(function()
-        -- Try copying all contents from the extension directory
-        shell.exec("cp -r " .. shell.shquote(ext_path) .. "/* " .. shell.shquote(temp_dir) .. "/extension/")
+        shell.exec("cp -r " .. shell.shquote(ext_path) .. "/. " .. shell.shquote(temp_dir) .. "/extension/")
       end)
 
       if not copy_success then
-        -- Fallback: try copying the directory itself
+        -- Fallback: copy the directory itself, then move its contents (incl. dotfiles).
         copy_success = pcall(function()
           shell.exec("cp -r " .. shell.shquote(ext_path) .. " " .. shell.shquote(temp_dir) .. "/extension_tmp"
-            .. " && mv " .. shell.shquote(temp_dir) .. "/extension_tmp/* " .. shell.shquote(temp_dir) .. "/extension/")
+            .. " && cp -r " .. shell.shquote(temp_dir) .. "/extension_tmp/. " .. shell.shquote(temp_dir) .. "/extension/"
+            .. " && rm -rf " .. shell.shquote(temp_dir) .. "/extension_tmp")
         end)
       end
       if not copy_success then
@@ -326,20 +337,21 @@ function M.create_and_install_vsix(ext_id, nix_store_path, tool_name)
       -- Sanity-check: without package.json the resulting VSIX would be
       -- invalid, so fail loudly rather than producing a silently broken
       -- artifact further down.
-      local pkg_ok = shell.try_exec("test -f " .. shell.shquote(temp_dir .. "/extension/package.json"))
-      if not pkg_ok then
+      if not shell.path_exists(temp_dir .. "/extension/package.json", "f") then
         error("extension copy produced no package.json in " .. temp_dir .. "/extension")
       end
       -- Fix permissions on copied files so they can be deleted
       shell.exec("chmod -R u+w " .. shell.shquote(temp_dir))
 
-      -- Debug: Check what's actually in the temp directory after copy
-      local temp_contents = shell.try_exec("ls -la " .. shell.shquote(temp_dir .. "/extension/") .. " 2>&1 | head -5")
-      logger.debug("Temp extension directory contents: " .. tostring(temp_contents))
-
-      local pkg_in_temp = shell.try_exec("test -f " .. shell.shquote(temp_dir .. "/extension/package.json")
-        .. ' && echo "package.json exists in temp" || echo "package.json MISSING in temp"')
-      logger.debug("Package.json in temp: " .. tostring(pkg_in_temp))
+      -- Debug-only: same rationale as above (don't fork sub-shells when
+      -- the operator hasn't asked for the extra noise).
+      if logger.is_debug() then
+        local temp_contents = shell.try_exec("ls -la " .. shell.shquote(temp_dir .. "/extension/") .. " 2>&1 | head -5")
+        logger.debug("Temp extension directory contents: " .. tostring(temp_contents))
+        local pkg_in_temp = shell.try_exec("test -f " .. shell.shquote(temp_dir .. "/extension/package.json")
+          .. ' && echo "package.json exists in temp" || echo "package.json MISSING in temp"')
+        logger.debug("Package.json in temp: " .. tostring(pkg_in_temp))
+      end
 
       -- Create required VSIX manifest files
       M.create_vsix_manifest(temp_dir, ext_id, ext_path)

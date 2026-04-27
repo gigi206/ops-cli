@@ -4,6 +4,7 @@
 
 -- Platform and system utilities
 local shell = require("shell")
+local logger = require("logger")
 
 local M = {}
 
@@ -185,9 +186,9 @@ function M.verify_build(chosen_path, tool)
   if has_bin_dir then
     local binaries = shell.exec("ls -1 " .. qb .. " 2>/dev/null")
     if binaries and binaries ~= "" then
-      print("Installed binaries: " .. binaries:gsub("\n", ", "))
+      logger.info("Installed binaries: " .. binaries:gsub("\n", ", "))
     else
-      print("Installed package contains a /bin directory but it is empty.")
+      logger.info("Installed package contains a /bin directory but it is empty.")
     end
   end
 end

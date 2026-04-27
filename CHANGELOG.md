@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-04-25
+## [1.1.0] - 2026-04-27
+
+### Fixed
+- **`opencode` TUI hang at cold launch**. `--opencode` could never reach its TUI when launched in a freshly-installed container: opencode painted nothing, the user saw the shell apparently hang, and only `kill`+restart unstuck it. Root cause: opencode 1.14.x is shipped as a Bun single-binary that bundles its native modules into a virtual filesystem (`$bunfs`), and the `file.watcher` binding (`/$bunfs/root/watcher-*.node`) failed to extract to a real path on cold container boot — opencode logged `failed to load watcher binding` and the rendering loop never started. Fix: switched the `--opencode` install target from `github:sst/opencode` (the Bun bundle) to `npm:opencode-ai` (regular Node.js package, same upstream version). The npm distribution resolves native bindings via Node's standard mechanism and never trips the `$bunfs` extraction path. Same UX, no hang. Regression guard in `tests/test_dryrun.bats` (`run --opencode uses npm:opencode-ai (NOT github:sst/opencode)`) keeps the switch from being silently reverted.
+- **`mise ERROR [nix] flake.nix … not tracked by git` lines leaked to stderr at every cold container launch** when a workdir's `mise.local.toml` declared `MISE_NIX_ALLOW_UNTRACKED=1`. Root cause: `/etc/ops-bashrc` only pre-exported `MISE_NIX_ALLOW_UNTRACKED` from `mise.local.toml` on the cache-miss path; warm sources (cache fresh) skipped the export and downstream `mise <cmd>` invocations re-tripped the nix plugin's `MiseEnv` hook before the env var reached the subprocess. The grep+export now runs on every source (cost: one `[ -f ]` + one `grep -q`, both <1 ms), so warm and cold paths both propagate the var consistently. Covered by 12 new tests in `tests/test_ops_bashrc.bats` (3 cache scenarios × pre-export + 2 negative + 3 perf + 2 pattern-tolerance + 2 helper guards) and 1 image-level test in `tests/test_image_integration.bats`.
+
+### Performance
+- **Agent warm-path launch: ~22 s → ~1 s**. `_agent_cmd` (the wrapper that powers `--claude` / `--gemini` / `--opencode` / `--codex`) now resolves the agent binary via `command -v $bin` (PATH lookup, ~0 ms) instead of `mise which $bin` (~5–17 s, full mise toolset + plugin hooks bootstrap on every invocation). The bashrc cache regen post-install (see `__ops_refresh_cache` below) ensures the install dir lands in `PATH` so the warm-path lookup resolves to the real binary, never to the mise shim. The previous `mise which` code was kept around longer than needed because we briefly thought its bootstrap side-effects were load-bearing for opencode — the real culprit was the Bun watcher binding (see Fixed above), so once `--opencode` switched to `npm:opencode-ai` the constraint vanished and the fast `command -v` path became safe again.
+- **Agent 2nd-run cold-after-install: ~8 s → ~1 s**. After `mise use -g <agent>` finishes its install, it bumps the mtime of `/opt/mise/data/config/config.toml`. Without intervention, the next container launch saw `config.toml` newer than the bashrc shell-env cache and triggered a fresh `mise hook-env` cold-start (~8 s) before reaching the agent. The new `__ops_refresh_cache` helper (in `/etc/ops-bashrc`) regenerates `$PWD/.mise-nix/shell-env.cache` immediately after `mise use -g`, amortizing the regen cost into the already-slow install pass and making the very next run hit the warm path. Implementation note: the helper invokes `mise hook-env -s bash` inside a sub-shell that `unset`s `__MISE_DIFF` / `__MISE_SESSION` first, because `hook-env` only emits the diff against those vars — without the unset the cache would be re-written empty.
+
+### Added
+- **Cold-path agent install UX**. When `command -v <agent>` fails (true cold or post-`volume rm`), `_agent_cmd` now prints `==> Installing <agent> (first run, this may take a minute)...` to stderr **before** the install starts, so the user sees something during the silent ~30–60 s download/extract window. The notice fires only on the install branch — warm-path launches stay silent. After the install completes, `clear` is run before `exec`'ing the agent so the TUI starts in a clean terminal (mise's progress spinner, the `gem sources` warning, and the final `tools:` line would otherwise remain in the scrollback above the agent UI). `clear 2>/dev/null || true` keeps the chain alive on minimal images where `clear` is missing — defensive belt.
+- **`__ops_refresh_cache` helper in `/etc/ops-bashrc`**. Called by `_agent_cmd` after every `mise use -g` to regenerate the shell-env cache (see Performance above). Defined unconditionally (outside the `[[ $- == *i* ]]` interactive guard) so non-interactive `bash -c` agent wrappers can call it. 4 new tests in `tests/test_ops_bashrc.bats` (helper defined + helper writes cache) and 2 in `tests/test_image_integration.bats` (image baked has the helper + helper writes a non-empty cache file).
+- **`tests/lua/test_load_env.lua`** — 5 new pure-Lua tests covering `mise/lib/utils.lua::load_env`'s `tracked × allow_untracked` branches matrix (4 cases) plus the `MISE_NIX_HOOK_REENTRY=1` short-circuit. The diagnostic line set ("flake.nix … not tracked by git" + 3 follow-ups including the `git -C … add -fN` fix command and the `MISE_NIX_ALLOW_UNTRACKED=1` bypass) is asserted line-by-line on the only branch that emits it (untracked + no-flag).
+
+### Changed
+- `_agent_cmd` switched from `echo` to `printf '%s\n'` for the rendered command line. The embedded `\033` ANSI escape (used by the install notice) must stay literal so bash inside the container re-evaluates it via the inner `printf`. `echo` happens to behave correctly in practice on bash 5+, but trips shellcheck SC2028 — the rewrite makes intent explicit and lint-clean.
+
+
 
 ### Security
 - Secret masking extended to the `ops.cmdline.user` label (previously only the `ops.cmdline.real` label was masked). A user who types `ops -e GITHUB_TOKEN=xxx run` no longer leaks the token via `docker inspect <container>`. The masking regex now also covers single- and double-quoted forms (`KEY='val'` / `KEY="val"`), not just bare values.
@@ -78,11 +96,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Test parasite files `Dockerfile.autodetect` and `Dockerfile.ml` at the repo root: superseded by the isolated-copy fixture helper.
 
-## [1.0.0]
+### Initial release baseline
 
-Initial tagged version.
+The bullets below describe the content of the initial commit
+(`chore: initial import`) on top of which the changes above were made.
+They are folded into 1.0.0 because no earlier version was ever tagged
+or distributed; Keep a Changelog forbids two `## [1.0.0]` headers in
+the same file.
 
-### Added
+**Added:**
 - `LICENSE` at repository root (Apache-2.0, © 2026 Ghislain LE MEUR).
 - `OPS_VERSION` constant in `ops.sh`; `version` subcommand and `--version` / `-V` flags.
 - `.editorconfig`, `.shellcheckrc`.
@@ -106,11 +128,11 @@ Initial tagged version.
 - `tests/test_image_integration.bats` — integration tests that run against the actually-built `localhost/ops-dev` image (Nix discoverability + GC root, google-chrome hooks, mise config split, `/etc/machine-id`, unfree env flags, wrapper error message). Skips gracefully if Docker or the image is absent.
 - CI job `image-integration` (push to `main` + `workflow_dispatch` only — not PRs, to avoid a 15-min Nix build on every review round). Builds the full Arch image and runs the integration suite.
 
-### Fixed
+**Fixed:**
 - Explicit Nix GC root on `/opt/nix-home/.nix-profile` (resolved to its final store path) is created right before `nix-collect-garbage -d` in both Dockerfiles. The Nix single-user installer's auto gcroot is a 2-level indirect symlink (`gcroots/auto/<hash>` → `profile-1-link` → store path) which was not always honored by the GC in Docker/BuildKit environments with a custom `HOME=/opt/nix-home`. Result was the Nix profile (and `nix` itself) vanishing from the image after build. The direct gcroot bypasses this.
 - `/etc/machine-id` is populated at build time (32-char hex from `/proc/sys/kernel/random/uuid`). Suppresses the `/etc/machine-id contains 0 characters (32 were expected)` warning emitted by Chrome / any DBus-based app on startup.
 
-### Changed
+**Changed:**
 - `cmd_uninstall` validates `OPS_NERDCTL_HOME` against the safe-paths whitelist before any `rm -rf`.
 - `OPS_VOLUMES` is now parsed with `read -ra` (no glob expansion).
 - Global-flag parsing factored into `_parse_global_flags` (removes the duplicated parse block).
@@ -120,5 +142,5 @@ Initial tagged version.
 - `vsix.from_flake` returns a usable `version` field instead of a full flake URL.
 - `bats`: `test_dryrun.bats` unknown-flag assertion now requires both markers (was OR).
 
-### Removed
+**Removed:**
 - `ARG GITHUB_TOKEN` from both Dockerfiles; the token is no longer baked into `/etc/nix/nix.conf`.

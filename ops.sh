@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.0.0"
+OPS_VERSION="1.1.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -278,7 +278,10 @@ current_hash() {
         return 1
     fi
     {
-        sha256sum "$OPS_DOCKERFILE"
+        # `sha256sum < file` (not `sha256sum file`) so the path doesn't enter
+        # the digest — keeps the hash relocation-invariant, matching the
+        # contract _hash_dir already follows for the mise/ + scripts/ trees.
+        sha256sum < "$OPS_DOCKERFILE"
         _hash_dir "$SCRIPT_DIR/mise"
         _hash_dir "$SCRIPT_DIR/scripts"
         # Per-profile build args: only impact the image when `-i <key>`
@@ -446,11 +449,38 @@ build_image() {
     return $ret
 }
 
+# Single source of truth for which environment-variable names hold a secret.
+# Both `_is_secret_key` (dry-run path) and `_ops_secret_alt` (label-mask path)
+# derive their match logic from this single list — keep them in lock-step
+# (a previous version diverged: glob `*KEY` matched MONKEY but the regex
+# `[A-Z][A-Z0-9_]*_KEY` did not, so the same value was redacted in dry-run
+# but leaked in `ops.cmdline.*` labels).
+#
+# Suffixes are matched against `_<SUF>` (with the underscore separator) so
+# real-world identifier patterns are caught (`GITHUB_TOKEN`, `MY_DB_PASSWORD`,
+# `ANTHROPIC_API_KEY`) while non-secret look-alikes are not (`MONKEY`,
+# `WHISKEY`). False positives on names that *do* end in `_KEY` / `_TOKEN`
+# but aren't secrets (e.g. `PUBLIC_KEY`) are an accepted trade-off in
+# favour of never leaking.
+readonly _OPS_SECRET_SUFFIXES='TOKEN KEY SECRET PASSWORD PASSWD PASS PWD APIKEY API_KEY'
+
+# True when $1 is the name of an env-var that should be redacted in any
+# logged output. Bash-glob match against `*_<SUF>` (mirrors the regex used
+# by `_ops_secret_alt`).
+_is_secret_key() {
+    local name="$1" suf
+    for suf in $_OPS_SECRET_SUFFIXES; do
+        case "$name" in
+            *"_$suf") return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Render an argv through `printf '%q '` while redacting secret values in
 # `--env KEY=VALUE` / `-e KEY=VALUE` / `--build-arg KEY=VALUE` pairs whose
-# KEY ends in TOKEN, KEY, SECRET, or PASSWORD (case-sensitive match on the
-# key suffix). Used by every --dry-run path so a shared transcript doesn't
-# leak GITHUB_TOKEN, ANTHROPIC_API_KEY, etc.
+# KEY matches `_is_secret_key`. Used by every --dry-run path so a shared
+# transcript doesn't leak GITHUB_TOKEN, ANTHROPIC_API_KEY, etc.
 _dry_run_print() {
     local arg next key
     while [ $# -gt 0 ]; do
@@ -462,19 +492,14 @@ _dry_run_print() {
                     key="${next%%=*}"
                     # Redact only when the arg is `KEY=VAL` (contains `=`) and
                     # the key name matches the sensitive suffix list.
-                    if [ "$key" != "$next" ]; then
-                        case "$key" in
-                            *TOKEN|*KEY|*SECRET|*PASSWORD|*PASSWD)
-                                # Placeholder uses plain letters so `printf
-                                # '%q'` doesn't shell-escape it (`***` and
-                                # `<redacted>` both get backslash-escaped,
-                                # breaking grep-style assertions on the
-                                # dry-run output).
-                                printf '%q %q ' "$arg" "${key}=REDACTED"
-                                shift 2
-                                continue
-                                ;;
-                        esac
+                    if [ "$key" != "$next" ] && _is_secret_key "$key"; then
+                        # Placeholder uses plain letters so `printf '%q'`
+                        # doesn't shell-escape it (`***` and `<redacted>`
+                        # both get backslash-escaped, breaking grep-style
+                        # assertions on the dry-run output).
+                        printf '%q %q ' "$arg" "${key}=REDACTED"
+                        shift 2
+                        continue
                     fi
                     printf '%q %q ' "$arg" "$next"
                     shift 2
@@ -485,6 +510,21 @@ _dry_run_print() {
         printf '%q ' "$arg"
         shift
     done
+}
+
+# Build the sed alternation (`A|B|C`) for the secret name list. Used by
+# _mask_secrets below so it derives from the same source as _is_secret_key.
+# The two match exactly the same set of names (any uppercase identifier
+# ending in `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_PASS`,
+# `_PWD`, `_APIKEY`, or `_API_KEY`).
+_ops_secret_alt() {
+    local first=1 alt='' suf
+    for suf in $_OPS_SECRET_SUFFIXES; do
+        if [ "$first" = 1 ]; then alt="_${suf}"; first=0
+        else                       alt="$alt|_${suf}"
+        fi
+    done
+    printf '%s' "[A-Z][A-Z0-9_]*($alt)"
 }
 
 show_help() {
@@ -584,7 +624,7 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
       --gemini-mount        Bind-mount ~/.gemini (only meaningful with
                             --no-mount-home)
       --gemini-volume       Use named Docker volume ops-gemini for ~/.gemini
-      --opencode            Run opencode (install github:sst/opencode if missing)
+      --opencode            Run opencode (install npm:opencode-ai if missing)
       --opencode-mount      Bind-mount ~/.local/share/opencode + ~/.config/opencode
                             (only meaningful with --no-mount-home)
       --opencode-volume     Use named Docker volume ops-opencode for
@@ -1138,16 +1178,29 @@ EOF
     read -r answer
     if [[ "$answer" =~ ^[yY]$ ]]; then
         "$RUNTIME_BIN" image prune -f >/dev/null 2>&1 || true
-        "$RUNTIME_BIN" ps -a -f status=exited -f label=ops.container=true --format '{{.ID}}' 2>/dev/null \
-            | xargs -r "$RUNTIME_BIN" rm >/dev/null 2>&1 || true
+        # Avoid `xargs -r` (GNU-only): on BSD/macOS xargs without -r runs the
+        # command once with no args and the runtime errors out. Read into an
+        # array and skip the call when empty.
+        local -a _exited_ids=()
+        while IFS= read -r _id; do
+            [ -n "$_id" ] && _exited_ids+=("$_id")
+        done < <("$RUNTIME_BIN" ps -a -f status=exited -f label=ops.container=true --format '{{.ID}}' 2>/dev/null)
+        if [ ${#_exited_ids[@]} -gt 0 ]; then
+            "$RUNTIME_BIN" rm "${_exited_ids[@]}" >/dev/null 2>&1 || true
+        fi
         echo "Pruned."
     fi
 
     printf "Remove ops volumes? This deletes cached data (nix store, mise tools, ...) [y/N] "
     read -r answer
     if [[ "$answer" =~ ^[yY]$ ]]; then
-        "$RUNTIME_BIN" volume ls --filter label=ops.volume=true --format '{{.Name}}' 2>/dev/null \
-            | xargs -r "$RUNTIME_BIN" volume rm >/dev/null 2>&1 || true
+        local -a _vol_names=()
+        while IFS= read -r _vname; do
+            [ -n "$_vname" ] && _vol_names+=("$_vname")
+        done < <("$RUNTIME_BIN" volume ls --filter label=ops.volume=true --format '{{.Name}}' 2>/dev/null)
+        if [ ${#_vol_names[@]} -gt 0 ]; then
+            "$RUNTIME_BIN" volume rm "${_vol_names[@]}" >/dev/null 2>&1 || true
+        fi
         echo "Volumes removed."
     fi
 }
@@ -1682,9 +1735,46 @@ cmd_self_update() {
 
 _agent_cmd() {
     local bin="$1" pkg="$2"
+    # `command -v` (PATH lookup, ~0 ms) instead of `mise which` (~5–17 s
+    # to boot the full mise toolset + plugin hooks) for the warm-path
+    # check. Once `mise use -g` has populated the install dir, the
+    # bashrc cache regen at the next container start adds it to PATH —
+    # so `command -v $bin` resolves directly to the real binary, not
+    # the mise shim, and we exec it without any mise re-bootstrap.
+    #
+    # Why this is safe now: opencode used to hang at cold launch when
+    # we bypassed the mise shim, because the shim's mise-bootstrap
+    # side effects were load-bearing (extracting the Bun watcher
+    # binding). We worked around it by switching opencode from
+    # `github:sst/opencode` (Bun single-binary) to `npm:opencode-ai`
+    # (regular Node.js package), which doesn't depend on Bun's
+    # virtual-filesystem extraction at all. claude / gemini / codex
+    # are also npm:* packages and never had the issue.
+    #
+    # Cold-path UX:
+    #   - `printf '==> Installing $bin …'` BEFORE the `command -v`
+    #     check so it shows up immediately when the user lands on a
+    #     fresh container — not after a 10 s silent mise-which delay.
+    #     Done in the same `||` arm so it only fires when an install
+    #     actually runs (warm path stays silent).
+    #   - `clear` after install, before `exec`, so the agent's TUI
+    #     starts in a clean terminal (mise's spinner / final `tools:`
+    #     line / `gem sources` warning would otherwise remain in the
+    #     scrollback above the TUI).
+    #   - `clear 2>/dev/null || true` keeps the chain alive if
+    #     terminfo is missing (rare but defensive).
+    # `printf '%s\n'` instead of `echo` so the embedded `\033` ANSI
+    # escape stays literal in the rendered command line (bash inside
+    # the container re-evaluates it via the inner `printf`). echo
+    # would also work but trips shellcheck SC2028.
+    # `__ops_refresh_cache` (defined in /etc/ops-bashrc) regenerates the
+    # bashrc shell-env cache after `mise use -g`. Without it, the next
+    # `./ops.sh run --<agent>` sees the bumped `/opt/mise/data/config/
+    # config.toml` mtime > cache mtime, runs `mise hook-env` for ~8 s,
+    # and the user perceives a slow 2nd run before the cache stabilizes.
     case "$pkg" in
-        npm:*) echo "mise which $bin >/dev/null 2>&1 || { mise use -g node@lts; mise use -g $pkg; }; exec $bin \"\$@\"" ;;
-        *)     echo "mise which $bin >/dev/null 2>&1 || mise use -g $pkg; exec $bin \"\$@\"" ;;
+        npm:*) printf '%s\n' "command -v $bin >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, this may take a minute)...\\033[0m\\n' $bin >&2; mise use -g node@lts; mise use -g $pkg; __ops_refresh_cache; clear 2>/dev/null || true; }; exec $bin \"\$@\"" ;;
+        *)     printf '%s\n' "command -v $bin >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, this may take a minute)...\\033[0m\\n' $bin >&2; mise use -g $pkg; __ops_refresh_cache; clear 2>/dev/null || true; }; exec $bin \"\$@\"" ;;
     esac
 }
 
@@ -1777,6 +1867,31 @@ _mount_if_exists() {
     done
 }
 
+# Agent-flag dispatcher used by cmd_run's argv loop.
+# Recognised flags (X ∈ {claude, gemini, opencode, codex}):
+#   --no-X-mount  → ${X}_agent="off"
+#   --X-mount     → ${X}_agent="mount"
+#   --X-volume    → ${X}_agent="volume"
+# Returns 0 + sets the matching local in the caller's scope (dynamic
+# scoping makes ${X}_agent visible from here), 1 otherwise. Replaces 12
+# repetitive case-branches in cmd_run with a single dispatch line.
+_match_agent_flag() {
+    local flag="$1" agent state
+    case "$flag" in
+        --no-claude-mount|--no-gemini-mount|--no-opencode-mount|--no-codex-mount)
+            agent="${flag#--no-}"; agent="${agent%-mount}"; state="off" ;;
+        --claude-mount|--gemini-mount|--opencode-mount|--codex-mount)
+            agent="${flag#--}";    agent="${agent%-mount}"; state="mount" ;;
+        --claude-volume|--gemini-volume|--opencode-volume|--codex-volume)
+            agent="${flag#--}";    agent="${agent%-volume}"; state="volume" ;;
+        *) return 1 ;;
+    esac
+    # nameref into the caller's locals (claude_agent / gemini_agent / …).
+    local -n _agent_ref="${agent}_agent"
+    _agent_ref="$state"
+    return 0
+}
+
 cmd_run() {
     local extra_volumes=()
     local extra_envs=()
@@ -1835,6 +1950,11 @@ cmd_run() {
     local trust_workdir="${OPS_TRUST_WORKDIR:-1}"
 
     while [ $# -gt 0 ]; do
+        # Per-agent {mount,volume,off} flags share a single dispatcher
+        # (12 case-branches collapsed into one). The helper sets
+        # ${X}_agent via dynamic scoping; if it didn't match, fall through
+        # to the case below.
+        if _match_agent_flag "$1"; then shift; continue; fi
         case "$1" in
             --no-trust-workdir)   trust_workdir=0;         shift ;;
             --no-mount-home)      mount_home=0;            shift ;;
@@ -1842,14 +1962,6 @@ cmd_run() {
             --no-nix-volume)      use_nix_volume=0;        shift ;;
             --no-mise-volume)     use_mise_volume=0;       shift ;;
             --no-wayland)         wayland_auto=0;          shift ;;
-            --no-claude-mount)    claude_agent="off";      shift ;;
-            --no-gemini-mount)    gemini_agent="off";      shift ;;
-            --no-opencode-mount)  opencode_agent="off";    shift ;;
-            --no-codex-mount)     codex_agent="off";       shift ;;
-            --claude-volume)      claude_agent="volume";   shift ;;
-            --gemini-volume)      gemini_agent="volume";   shift ;;
-            --opencode-volume)    opencode_agent="volume"; shift ;;
-            --codex-volume)       codex_agent="volume";    shift ;;
             --isolated-volumes)   isolated_volumes=1;      shift ;;
             -i|--image)        _resolve_image "$2";                         shift 2 ;;
             -n|--name)         OPS_CONTAINER_NAME="$2"; _user_set_n=1;       shift 2 ;;
@@ -1857,7 +1969,11 @@ cmd_run() {
             -u|--uid)          OPS_USER_UID="$2";                           shift 2 ;;
             -g|--gid)          OPS_USER_GID="$2";                           shift 2 ;;
             -l|--lang)         OPS_USER_LANG="$2";                          shift 2 ;;
-            -v|--volume)       extra_volumes+=("$2");                   shift 2 ;;
+            -v|--volume)       case "$2" in
+                                   *:*) extra_volumes+=("$2") ;;
+                                   *)   echo "Error: -v expects SRC:DST[:OPTS] (got '$2'). Volume names must be paired with a destination path." >&2; exit 1 ;;
+                               esac
+                               shift 2 ;;
             -H|--nerdctl-home) OPS_NERDCTL_HOME="$(realpath -m "$2")";
                                export PATH="$OPS_NERDCTL_HOME/bin:$PATH";
                                _resolve_runtime;
@@ -1878,7 +1994,7 @@ cmd_run() {
             --claude-mount)    claude_agent="mount";   shift ;;
             --gemini)          agent_cmd="$(_agent_cmd gemini npm:@google/gemini-cli)"; shift ;;
             --gemini-mount)    gemini_agent="mount";   shift ;;
-            --opencode)        agent_cmd="$(_agent_cmd opencode github:sst/opencode)"; shift ;;
+            --opencode)        agent_cmd="$(_agent_cmd opencode npm:opencode-ai)"; shift ;;
             --opencode-mount)  opencode_agent="mount"; shift ;;
             --codex)           agent_cmd="$(_agent_cmd codex npm:@openai/codex)"; shift ;;
             --codex-mount)     codex_agent="mount";    shift ;;
@@ -1981,13 +2097,27 @@ cmd_run() {
     if [ -n "$running" ]; then
         if [ ${#extra_volumes[@]} -gt 0 ]; then
             local mounted missing=()
-            # Format emits `Source:Destination ` per mount (trailing space). Matching
-            # with a trailing space anchors the comparison to whole entries — bare
-            # `grep -qF "$v"` would accept `/foo/bar:/bar` as containing `/foo` and
-            # wrongly conclude that a different volume was already mounted.
+            # Format emits `Source:Destination ` per mount (trailing space).
+            # The trailing space in `grep -qF "$v_match "` anchors the
+            # comparison to whole entries — without it, `/foo/bar:/bar`
+            # would be matched as containing `/foo` and we'd wrongly
+            # report the volume as already mounted. The runtime does NOT
+            # echo back the third `:opt` segment of `-v src:dst:opt`, so
+            # we strip a whitelisted set of known options below before
+            # matching (whitelisting beats `${v%:*}` because a POSIX path
+            # may legally contain a `:`).
             mounted=$("$RUNTIME_BIN" container inspect "$OPS_CONTAINER_NAME" --format '{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' 2>/dev/null)
             for v in "${extra_volumes[@]}"; do
-                echo "$mounted" | grep -qF "$v " || missing+=("$v")
+                local v_match="$v"
+                case "$v" in
+                    *:ro|*:rw|*:z|*:Z|*:cached|*:delegated|*:consistent|*:U)
+                        v_match="${v%:*}" ;;
+                    *:ro,[a-zA-Z]*|*:rw,[a-zA-Z]*)
+                        # Composite suffix like `:ro,Z` or `:rw,cached` —
+                        # still ends after the trailing `,...`.
+                        v_match="${v%:*}" ;;
+                esac
+                echo "$mounted" | grep -qF "$v_match " || missing+=("$v")
             done
             if [ ${#missing[@]} -gt 0 ]; then
                 echo -e "\033[33m⚠ Container '$OPS_CONTAINER_NAME' is already running — the following volumes cannot be added:\033[0m" >&2
@@ -2155,28 +2285,23 @@ cmd_run() {
     #     (a user who types `ops -e GITHUB_TOKEN=xxx run` would otherwise
     #     leak the token via ops.cmdline.user).
     _mask_secrets() {
-        # Two layers of masking applied to the labels:
-        #   1. Explicit known-secret names (the historical list).
-        #   2. Convention fallback: any variable whose name ends in _TOKEN,
-        #      _SECRET, _KEY, _PASSWORD, _PASS, _PWD, _APIKEY, _API_KEY.
-        # Layer 2 catches MY_DB_PASSWORD, SLACK_WEBHOOK_SECRET, etc. without
-        # requiring each to be added by hand. Non-secret names matching the
-        # suffix (e.g. PUBLIC_KEY) are a deliberate false-positive trade-off
-        # in favour of not leaking anything through the label.
+        # Both _dry_run_print and the labels below derive their secret
+        # detection from `_OPS_SECRET_SUFFIXES` (see top of file) — keep
+        # the two paths symmetric so a value redacted in dry-run is also
+        # redacted in `ops.cmdline.*` labels.
         #
         # Quote forms covered per pattern:
         #   KEY=bare_value         → stops at whitespace
         #   KEY='single quoted'    → consumes up to closing '
         #   KEY="double quoted"    → consumes up to closing "
-        local explicit='GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY'
-        local convention='[A-Z][A-Z0-9_]*(_TOKEN|_SECRET|_KEY|_API_KEY|_APIKEY|_PASSWORD|_PASS|_PWD)'
+        # Non-secret names matching the suffix (e.g. PUBLIC_KEY) are a
+        # deliberate false-positive trade-off in favour of not leaking.
+        local pat
+        pat="$(_ops_secret_alt)"
         sed -E \
-            -e "s/(${explicit})='[^']*'/\\1='***'/g" \
-            -e "s/(${explicit})=\"[^\"]*\"/\\1=\"***\"/g" \
-            -e "s/(${explicit})=[^[:space:]'\"]+/\\1=***/g" \
-            -e "s/(${convention})='[^']*'/\\1='***'/g" \
-            -e "s/(${convention})=\"[^\"]*\"/\\1=\"***\"/g" \
-            -e "s/(${convention})=[^[:space:]'\"]+/\\1=***/g"
+            -e "s/(${pat})='[^']*'/\\1='***'/g" \
+            -e "s/(${pat})=\"[^\"]*\"/\\1=\"***\"/g" \
+            -e "s/(${pat})=[^[:space:]'\"]+/\\1=***/g"
     }
     local real_cli real_cli_masked user_cli_masked
     real_cli="$(_shell_quote "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@")"

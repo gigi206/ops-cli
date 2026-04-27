@@ -60,10 +60,10 @@ function M.install_plugin_from_store(nix_store_path, tool_name)
   shell.exec("mkdir -p " .. shell.shquote(plugins_dir))
 
   -- Check if plugin is already installed and points to same path.
-  -- nix_store_path is used below as a Lua pattern anchor, so we escape its
-  -- `-`, `.`, and other magic characters to avoid false matches.
+  -- shell.escape_pattern() rewrites Lua-pattern magic chars (`-`, `.`, `[`, …)
+  -- so the store path matches literally rather than as alternation/quantifier.
   local ok, current_target = shell.try_exec("readlink " .. shell.shquote(plugin_path) .. " 2>/dev/null")
-  local anchor = nix_store_path:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1") .. "$"
+  local anchor = shell.escape_pattern(nix_store_path) .. "$"
   if ok and current_target and current_target:match(anchor) then
     logger.info("Neovim plugin already installed: " .. plugin_name)
     return "already_installed"

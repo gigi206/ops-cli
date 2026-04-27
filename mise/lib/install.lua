@@ -16,19 +16,48 @@ local M = {}
 -- Register the store path as a Nix GC root so `nix-collect-garbage -d` does
 -- not delete the binaries mise just installed. Without this, symlinks under
 -- ~/.local/share/mise/installs/nix-*/<ver>/ become dangling after GC.
+--
+-- Best-effort: a failed mkdir/ln is logged at warn level (non-fatal). The
+-- silent `try_exec` returns a pcall-success boolean that hides shell exit
+-- codes, so we can't distinguish "succeeded" from "failed-but-ignored"
+-- there. We probe explicitly via shell.path_exists after the ln.
 local function register_gc_root(store_path, install_path)
   local gc_dir = "/nix/var/nix/gcroots/mise"
-  shell.try_exec("mkdir -p " .. shell.shquote(gc_dir) .. " 2>/dev/null")
-  -- Root name = last two install_path segments joined, sanitised
+  local mk_ok = shell.try_exec("mkdir -p " .. shell.shquote(gc_dir) .. " 2>/dev/null")
+  if not mk_ok then
+    logger.warn("Could not create GC root directory " .. gc_dir ..
+                " — installed binaries may be reaped by `nix-collect-garbage -d`.")
+    return
+  end
+  -- Root name = last two install_path segments, sanitised, with a short
+  -- hash of the FULL install_path appended to disambiguate paths that
+  -- sanitise to the same string (e.g. `a/b` and `a-b` both collapse to
+  -- `a-b`). Without the hash suffix two distinct installs can clobber
+  -- each other's GC root via `ln -sfn`, leaving the older path's
+  -- store output candidate for `nix-collect-garbage -d`.
+  --
+  -- Hash is best-effort: if sha256sum is unavailable the suffix stays
+  -- empty and behaviour falls back to the old (collision-prone) form,
+  -- which is no worse than what we had before.
   local segs = install_path:match("([^/]+/[^/]+)$") or install_path
-  local rootname = segs:gsub("/", "-"):gsub("[^%w%-_.]", "_")
-  shell.try_exec("ln -sfn " .. shell.shquote(store_path) .. " " .. shell.shquote(gc_dir .. "/" .. rootname))
-end
-
--- Escape a Lua pattern so magic characters in a store path like
--- `/nix/store/abc-def-1.2.3` (contains `-` and `.`) match literally.
-local function _escape_pattern(s)
-  return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+  local sanitized = segs:gsub("/", "-"):gsub("[^%w%-_.]", "_")
+  local hash_ok, hash_out = shell.try_exec(
+    "printf %s " .. shell.shquote(install_path) ..
+    " | sha256sum 2>/dev/null | cut -c1-8")
+  local hash = ""
+  if hash_ok and type(hash_out) == "string" then
+    hash = (hash_out:match("^[0-9a-f]+") or ""):sub(1, 8)
+  end
+  local rootname = (hash ~= "" and #hash == 8)
+    and (sanitized .. "-" .. hash)
+    or sanitized
+  local root_path = gc_dir .. "/" .. rootname
+  shell.try_exec("ln -sfn " .. shell.shquote(store_path) .. " " .. shell.shquote(root_path))
+  -- Verify the symlink was actually created. `path_exists` checks via test -L.
+  if not shell.path_exists(root_path, "L") and not shell.path_exists(root_path, "e") then
+    logger.warn("GC root not registered at " .. root_path ..
+                " for " .. store_path .. " — `nix-collect-garbage -d` may reap it.")
+  end
 end
 
 -- Standard tool installation via symlink (PVC-optimized)
@@ -38,7 +67,7 @@ function M.standard_tool(nix_store_path, install_path, label)
   -- In containerized environments, check if symlink already exists and is correct
   if shell.is_containerized() then
     local ok, current_target = shell.try_exec("readlink " .. shell.shquote(install_path) .. " 2>/dev/null")
-    if ok and current_target and current_target:match(_escape_pattern(nix_store_path) .. "$") then
+    if ok and current_target and current_target:match(shell.escape_pattern(nix_store_path) .. "$") then
       logger.debug("Symlink already correct: " .. install_path)
       register_gc_root(nix_store_path, install_path)
       return
@@ -63,7 +92,7 @@ function M.flake_with_hash_workaround(nix_store_path, install_path)
   -- In containerized environments, check if target already points correctly to avoid unnecessary I/O
   if shell.is_containerized() then
     local ok, current_target = shell.try_exec("readlink " .. shell.shquote(hash_path) .. " 2>/dev/null")
-    if ok and current_target and current_target:match(_escape_pattern(nix_store_path) .. "$") then
+    if ok and current_target and current_target:match(shell.escape_pattern(nix_store_path) .. "$") then
       logger.debug("Hash symlink already correct: " .. hash_path)
       return
     end

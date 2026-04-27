@@ -44,15 +44,12 @@
 #     .
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# KEEP IN SYNC WITH Dockerfile.debian
+# KEEP IN SYNC WITH Dockerfile.debian — design doc: docs/dockerfile-design.md
 # ─────────────────────────────────────────────────────────────────────────────
-# This Dockerfile and Dockerfile.debian share ~80 % of their structure
-# (ENV, USER setup, Nix install, mise install + tools, bashrc, wrappers).
-# Any change to the Arch image that touches one of those sections MUST be
-# mirrored in Dockerfile.debian (and vice versa). The CI `image-integration`
-# job only exercises the Arch image; silent drift between the two is the
-# most common regression vector. Sections 2, 3, 4, 5, 6 are the
-# high-overlap ones — look for matching numbered headers in the Debian file.
+# Long-form rationale for every section below lives in docs/dockerfile-design.md.
+# The two Dockerfiles share ~80 % of their structure; the design doc is the
+# single source of truth for the *why*. The numbered headers here (1..7)
+# match the section headers in that doc one-for-one.
 
 FROM archlinux:base
 
@@ -114,26 +111,16 @@ LABEL org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.documentation="${SOURCE_URL}"
 
 # -----------------------------------------------------------------------------
-# 1. System packages + locales
+# 1. System packages + locales — see docs/dockerfile-design.md §1
 # -----------------------------------------------------------------------------
-# archlinux:base strips locale data via NoExtract rules in /etc/pacman.conf
-# (usr/share/i18n/* and usr/share/locale/* — only en_* / C / POSIX kept).
-# We drop those rules, then reinstall glibc WITHOUT --needed so all locale
-# source files get re-extracted, allowing locale-gen to compile USER_LANG.
 RUN sed -i '/^NoExtract/d' /etc/pacman.conf \
  && pacman -Syu --noconfirm --needed \
       bash-completion ca-certificates curl sudo which \
- && pacman -S --noconfirm glibc \
+ && pacman -S --noconfirm --overwrite '/usr/share/locale/*' --overwrite '/usr/share/i18n/*' glibc \
  && sed -i "/${USER_LANG}/s/^# *//" /etc/locale.gen \
  && locale-gen \
- && tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id \
- && pacman -Scc --noconfirm \
- && rm -rf /var/cache/pacman/pkg/*
-# /etc/machine-id: Chrome (and anything DBus-based) expects a 32-char hex
-# machine-id. archlinux:base ships an empty file, which triggers a startup
-# warning ("contains 0 characters (32 were expected)"). We populate it at
-# build time from /proc/sys/kernel/random/uuid (stripped of dashes → 32
-# hex chars) so Chrome boots clean.
+ && printf '%s\n' "$(tr -d '-' < /proc/sys/kernel/random/uuid)" > /etc/machine-id \
+ && pacman -Scc --noconfirm
 
 ENV LANG=${USER_LANG} \
     LC_ALL=${USER_LANG} \
@@ -146,59 +133,22 @@ ENV LANG=${USER_LANG} \
     MISE_CACHE_DIR=/opt/mise/cache \
     MISE_CONFIG_DIR=/opt/mise/data/config \
     MISE_STATE_DIR=/opt/mise/state
-# MISE_CONFIG_DIR sits under MISE_DATA_DIR (and thus inside the
-# ops-share-mise volume) so that `mise use -g` run inside the container
-# writes to a persistent path: `ops run --claude`, `mise use -g X`, etc.
-# survive a container recreation.
-# The baseline toolchain baked at build time lives separately in
-# /etc/mise/config.toml (system-wide, image layer, re-baked on each
-# rebuild). Mise reads both locations and merges them additively.
-# Two unfree escape hatches, belt + suspenders:
-#   MISE_NIX_ALLOW_UNFREE=true   custom plugin var, forwarded as
-#                                NIXPKGS_ALLOW_UNFREE=1 when the mise-nix
-#                                plugin invokes `nix build`
-#                                (see mise/lib/platform.lua:get_env_prefix).
-#   NIXPKGS_ALLOW_UNFREE=1       standard Nix var; kicks in when anyone in
-#                                the container runs `nix build` directly
-#                                (e.g. interactive shell, hand-written scripts)
-# Covers unfree nixpkgs packages like google-chrome, vscode, ngrok,
-# terraform, oracle-jdk.
-# Relocating mise + nix-profile out of $HOME (to /opt/mise and /opt/nix-home)
-# means the ops-mise volume and the nix profile symlink survive a $HOME
-# bind-mount (e.g. --with-home / --with-home-volumes).
 
 # -----------------------------------------------------------------------------
-# 2. Non-root user with matching UID/GID
+# 2. Non-root user with matching UID/GID — see docs/dockerfile-design.md §2
 # -----------------------------------------------------------------------------
 RUN groupadd -g "${USER_GID}" "${USER_NAME}" \
  && useradd -m -l -u "${USER_UID}" -g "${USER_GID}" -s /bin/bash "${USER_NAME}" \
  && echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" \
  && chmod 440 "/etc/sudoers.d/${USER_NAME}" \
- && mkdir -m 0755 /nix /opt/mise /opt/nix-home \
- && chown "${USER_NAME}:${USER_NAME}" /nix /opt/mise /opt/nix-home
-# useradd -l: skip writing lastlog/faillog entries for the UID. With a
-# high-numbered UID these files are sparse on disk, but the `useradd` call
-# still dirties a layer with ~4 KB per UID range. -l avoids that and silences
-# hadolint DL3046.
-# /nix is pre-created so the single-user Nix installer can write there as a
-# non-root user. /opt/mise holds the mise binary + data (shims, installs,
-# plugins) outside $HOME so an ops-mise volume on /opt/mise/data survives a
-# --with-home bind-mount. /opt/nix-home is the HOME passed to the Nix
-# installer so .nix-profile and the XDG state dir land outside user $HOME.
+ && mkdir -m 0755 /nix /opt/mise /opt/nix-home /etc/mise \
+ && chown "${USER_NAME}:${USER_NAME}" /nix /opt/mise /opt/nix-home /etc/mise
 
-# Rootless nerdctl limitation: in rootless mode, host UID 1000 maps to container
-# UID 0 (root in the namespace). This USER runs the process as UID 1000 inside
-# the container, which corresponds to UID ~101000 on the host — unable to read
-# or write bind-mounted files owned by host UID 1000 (e.g. ~/.claude, $PWD).
-# Workaround: launch tools needing access to host files with --user 0
-# (container root = host UID 1000) and --env HOME=/home/<user>.
 USER ${USER_NAME}
 WORKDIR /home/${USER_NAME}
 
-# Pre-create XDG-style user dirs so bind-mounts don't create their parent
-# dirs as root:root at runtime, breaking later writes (e.g. uv, opencode).
-# mise-related dirs live under /opt/mise (see ENV above) so they are not
-# pre-created here.
+# Pre-create XDG-style user dirs so bind-mounts don't create their parents
+# as root:root at runtime, breaking later writes (e.g. uv, opencode).
 RUN mkdir -p "$HOME/.local/bin" \
              "$HOME/.local/share" \
              "$HOME/.local/state" \
@@ -206,26 +156,11 @@ RUN mkdir -p "$HOME/.local/bin" \
              "$HOME/.config"
 
 # -----------------------------------------------------------------------------
-# 3. Nix single-user (required by the mise-nix plugin; no daemon possible in
-#    rootless mode)
+# 3. Nix single-user — see docs/dockerfile-design.md §3
 # -----------------------------------------------------------------------------
-# System-wide /etc/nix/nix.conf is read regardless of $HOME ownership, which
-# matters in rootless: /home/$USER is UID 1000 in namespace but we run as UID 0,
-# so Nix warns and falls back to /root — skipping the user's ~/.config/nix/nix.conf.
-# Setting build-users-group empty here keeps nix in single-user mode even then.
-#
-# We run the installer with HOME=/opt/nix-home so the .nix-profile symlink,
-# XDG state dir (.local/state/nix) and bash-profile hooks land under
-# /opt/nix-home/* instead of user $HOME. /opt/nix-home is image-baked (not a
-# volume), so its symlinks resolve to /nix/store paths served by ops-nix at
-# runtime. Experimental features live in /etc/nix/nix.conf (system-wide), so
-# we no longer need a user-level nix.conf.
-# Installer is fetched from the floating /nix/install endpoint (always the
-# latest stable release). Trust relies on HTTPS + the upstream mirror; the
-# installer script itself verifies the binary payload it downloads.
-# No GitHub token is written into /etc/nix/nix.conf: it would persist in the
-# image layer. GITHUB_TOKEN is consumed only transiently by the RUN below
-# that performs `mise use` (via --mount=type=secret), never baked in.
+# Single-user (no daemon, rootless-friendly). HOME=/opt/nix-home so the
+# .nix-profile symlink survives a runtime $HOME bind-mount. GITHUB_TOKEN
+# is NOT baked here — see the secret-mount in §5 below.
 RUN HOME=/opt/nix-home curl -fsSL --retry 3 --max-time 120 \
       -o /tmp/nix-install.sh "https://nixos.org/nix/install" \
  && HOME=/opt/nix-home sh /tmp/nix-install.sh --no-daemon \
@@ -234,19 +169,13 @@ RUN HOME=/opt/nix-home curl -fsSL --retry 3 --max-time 120 \
  && printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' \
       | sudo tee /etc/nix/nix.conf > /dev/null
 
-# Expose nix + mise shims in PATH for every subsequent RUN and for the
-# Lua hooks that mise spawns as sub-processes (which inherit the ENV PATH,
-# not the transient PATH set by `source nix.sh`). Paths are rooted at /opt/*
-# so they remain valid even when $HOME is bind-mounted from the host.
-# /opt/ops/bin is prefixed first so ops-cli wrappers (google-chrome, ...)
-# shadow the mise shims for tools that need container-specific flags.
+# /opt/ops/bin first so ops-cli wrappers (google-chrome, nix CLI) shadow
+# the mise shims; rooted under /opt/* so the PATH survives a $HOME bind-mount.
 ENV PATH=/opt/ops/bin:/opt/nix-home/.nix-profile/bin:/opt/mise/data/shims:/opt/mise/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # -----------------------------------------------------------------------------
-# 4. mise (env-manager — single ~20 MB binary, installed at /opt/mise/bin)
+# 4. mise binary — see docs/dockerfile-design.md §4
 # -----------------------------------------------------------------------------
-# Installer reads MISE_INSTALL_PATH + MISE_*_DIR from ENV above to place the
-# binary at /opt/mise/bin/mise and state/cache/data under /opt/mise/*.
 RUN curl -fsSL --retry 3 --max-time 120 -o /tmp/mise-install.sh https://mise.run \
  && if [ -n "${MISE_INSTALL_SHA256}" ]; then \
       echo "${MISE_INSTALL_SHA256}  /tmp/mise-install.sh" | sha256sum -c -; \
@@ -256,25 +185,10 @@ RUN curl -fsSL --retry 3 --max-time 120 -o /tmp/mise-install.sh https://mise.run
  && chmod 755 /opt/mise/bin/mise
 
 # -----------------------------------------------------------------------------
-# 5. mise tools (merged mise-nix plugin + GitHub/npm backends) + shell setup
+# 5. mise tools + shell setup — see docs/dockerfile-design.md §5
 # -----------------------------------------------------------------------------
-# The local mise-nix plugin is copied into /opt/ops/mise-plugin/nix/ (OUTSIDE
-# $MISE_DATA_DIR), then symlinked into /opt/mise/data/plugins/nix so mise
-# auto-discovers it. Keeping the real files outside the data dir is what
-# allows plugin updates to take effect after a rebuild: ops.sh mounts
-# ops-share-mise:/opt/mise/data at runtime, which masks the image's own
-# /opt/mise/data/plugins/ with the volume's (potentially stale) copy.
-# The symlink in the volume points at the image-baked path, which *is*
-# refreshed on every build, so the plugin never goes stale. ops.sh also
-# runs a one-time migration that replaces a legacy plain-directory
-# `plugins/nix/` in existing volumes with this symlink.
-#
-# Base dev tools are installed in one `mise use -g` pass (nix:* via the
-# plugin, github:* via the built-in backend). node@lts is baked as the base
-# for any npm: agent that ops.sh later installs on demand. bashrc is
-# populated last, with mise activation followed by a fast
-# command_not_found override (mise's default handler runs a network lookup
-# per unknown command, which is slow).
+# Plugin lives at /opt/ops/mise-plugin/nix/ (outside the volume mount point
+# at /opt/mise/data) and is symlinked into the mise plugins dir below.
 COPY --chown=${USER_NAME}:${USER_NAME} mise/ /opt/ops/mise-plugin/nix/
 
 RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400 \
@@ -285,8 +199,6 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
       export NIX_CONFIG="access-tokens = github.com=${github_token}"; \
     fi \
  && unset github_token \
- && sudo mkdir -p /etc/mise \
- && sudo chown "${USER_NAME}:${USER_NAME}" /etc/mise \
  && mkdir -p /opt/mise/data/plugins \
  && ln -sfn /opt/ops/mise-plugin/nix /opt/mise/data/plugins/nix \
  && MISE_CONFIG_DIR=/etc/mise /opt/mise/bin/mise use -g \
@@ -302,6 +214,7 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
  && sudo chmod -R a+rX /etc/mise \
  && mkdir -p /opt/mise/data/config \
  && mkdir -p /nix/var/nix/gcroots/mise \
+ && shopt -s nullglob \
  && for f in /opt/mise/data/installs/nix-*/*; do \
       [ -L "$f" ] || continue; \
       t=$(readlink -f "$f"); \
@@ -311,6 +224,7 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
           ;; \
       esac; \
     done \
+ && shopt -u nullglob \
  && _profile_store="$(readlink -f /opt/nix-home/.nix-profile)" \
  && if [ -n "$_profile_store" ] && [ -e "$_profile_store" ]; then \
       ln -sfn "$_profile_store" /nix/var/nix/gcroots/ops-nix-profile; \
@@ -321,76 +235,33 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
       HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d; \
     fi
 
-# Bake the interactive shell init OUTSIDE $HOME so it survives the host
-# bind-mount of $HOME at runtime. ops.sh launches `bash --rcfile
-# /etc/ops-bashrc` for interactive sessions and `source`s the same file at
-# the top of `bash -c` agent wrappers, so claude / gemini / opencode / codex
-# / --update / --install all see PATH / PYTHONPATH / ... from the workdir's
-# flake.nix devShell.
+# Interactive shell init outside $HOME so it survives the runtime $HOME
+# bind-mount. See docs/dockerfile-design.md §5 ("Bashrc lives at /etc/ops-bashrc").
 COPY --chown=root:root --chmod=644 scripts/ops-bashrc /etc/ops-bashrc
 
 # -----------------------------------------------------------------------------
-# 6. google-chrome wrapper (shadows the mise shim via /opt/ops/bin)
+# 6. google-chrome wrapper + Nix wrappers — see docs/dockerfile-design.md §6
 # -----------------------------------------------------------------------------
-# Copied as /opt/ops/bin/google-chrome. Because /opt/ops/bin is the first
-# entry in PATH (see the ENV above), typing `google-chrome` or any
-# chrome-launcher-based tool (chrome-devtools-mcp, Puppeteer, Lighthouse)
-# picks up this wrapper rather than the mise shim. The wrapper adds the
-# flags required in a rootless container (--no-sandbox,
-# --disable-dev-shm-usage, Wayland ozone when available), then execs the
-# real Nix-provided binary via absolute path to avoid PATH recursion.
-#
-# The wrapper is always present; it short-circuits with a clear message
-# if google-chrome isn't actually installed (i.e. EXTRA_MISE_TOOLS did
-# not include nix:google-chrome at build time).
 COPY --chown=root:root --chmod=755 scripts/google-chrome.sh /opt/ops/bin/google-chrome
-# Reach the wrapper from tools that don't inherit our /opt/ops/bin PATH
-# prefix:
-#   CHROME_PATH is consulted first by chrome-launcher (used by
-#   chrome-devtools-mcp, Puppeteer, Lighthouse, ...).
-#   /usr/bin/google-chrome is the fallback `which` lookup + the path
-#   hard-coded by some tools on Linux.
 ENV CHROME_PATH=/opt/ops/bin/google-chrome \
     PUPPETEER_EXECUTABLE_PATH=/opt/ops/bin/google-chrome
+# Three discoverability hooks (chrome-launcher env, /usr/bin fallback,
+# puppeteer-core hard-coded /opt/google/chrome/chrome). See §6.
 RUN sudo ln -sf /opt/ops/bin/google-chrome /usr/bin/google-chrome \
  && sudo mkdir -p /opt/google/chrome \
  && sudo ln -sf /opt/ops/bin/google-chrome /opt/google/chrome/chrome
 
-# Nix wrappers — force HOME=/opt/nix-home for stateful commands so they
-# act on the container profile, not the host one (which would otherwise
-# be reached via the bind-mounted $HOME). Escape hatch: pass --host.
-#
-# Two scripts:
-#   _nix-wrapper.sh     — always force HOME (legacy binaries are
-#                         wholly stateful)
-#   _nix-cli-wrapper.sh — inspect subcommand and force HOME only for
-#                         `nix profile|channel|registry|upgrade-nix`.
-#                         Other subcommands (`nix build/shell/search/...`)
-#                         pass through so they can share the host-mounted
-#                         ~/.cache/nix/ for a fast build cache.
-#
-# Not wrapped: nix-build, nix-shell, nix-instantiate, nix-prefetch-url
-# (cache-heavy, sharing the host cache is a feature).
+# Nix wrappers force HOME=/opt/nix-home for stateful commands so they target
+# the container profile, not the host one. `--host` escape hatch.
 COPY --chown=root:root --chmod=755 scripts/_nix-wrapper.sh /opt/ops/bin/_nix-wrapper
 COPY --chown=root:root --chmod=755 scripts/_nix-cli-wrapper.sh /opt/ops/bin/nix
 RUN for cmd in nix-env nix-channel nix-store nix-collect-garbage; do \
         sudo ln -sf /opt/ops/bin/_nix-wrapper /opt/ops/bin/"$cmd"; \
     done
-# The extra symlink at /opt/google/chrome/chrome matches the hard-coded
-# path puppeteer-core expects for the Chrome "stable" channel on Linux.
-# chrome-devtools-mcp uses puppeteer-core internally, so without that
-# symlink it fails with `Could not find Google Chrome executable for
-# channel 'stable' at: - /opt/google/chrome/chrome` even if CHROME_PATH,
-# PATH, and /usr/bin/google-chrome are all correct. PUPPETEER_EXECUTABLE_PATH
-# is consulted in addition, as a belt-and-suspenders for non-MCP puppeteer
-# users inside the container.
 
 # -----------------------------------------------------------------------------
-# 7. Entrypoint (PATH is set right after the Nix install above)
+# 7. Entrypoint
 # -----------------------------------------------------------------------------
-# WORKDIR stays at /home/${USER_NAME} (set earlier). ops.sh overrides it per
-# invocation via `--workdir $PWD` (bind-mounted from the host); direct
-# `docker run` users land in $HOME, which is more useful than an empty
-# /workspace that nothing creates anyway.
-
+# WORKDIR stays at /home/${USER_NAME}. ops.sh overrides per-invocation via
+# `--workdir $PWD` (bind-mounted from the host).
 CMD ["bash", "--rcfile", "/etc/ops-bashrc"]
