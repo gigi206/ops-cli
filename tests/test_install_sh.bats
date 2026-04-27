@@ -515,6 +515,48 @@ STUB
 
 # ---- back to install.sh test cases ----------------------------------------
 
+@test "install.sh: wraps logic in main() called via 'main \"\$@\"' at end-of-file" {
+    # Defensive curl|sh pattern: the entire body must be wrapped in
+    # `main() { ... }` and invoked with `main "$@"` at the very end of
+    # the file. POSIX requires the function body to be parsed before
+    # invocation, so a truncated download (network hiccup mid-pipe to
+    # `sh`) fails to parse `main` itself and never executes a partial
+    # install. Without the wrap, we observed `sh: <line>: [tag: not
+    # found` errors when dash streamed prefix lines while the rest of
+    # the file was still in flight.
+    local installer
+    installer="$(installer)"
+    # 1. main() function definition is present, with a body.
+    grep -qE '^main\(\)[[:space:]]*\{' "$installer"
+    # 2. Last non-blank, non-comment line is the invocation.
+    last_real_line=$(grep -vE '^[[:space:]]*(#|$)' "$installer" | tail -n 1)
+    [[ "$last_real_line" == 'main "$@"' ]]
+}
+
+@test "install.sh: parses cleanly when the body is truncated mid-fetch" {
+    # Simulate a curl|sh truncation by piping only the prefix of the file
+    # into sh. Without the main() wrap, dash would try to execute prefix
+    # lines and abort partway through. With the wrap, parsing the
+    # incomplete `main() {` block fails the parser BEFORE any logic
+    # runs — no partial install. Either no output at all (preferred) or
+    # only a parse error mentioning the unfinished function. We don't
+    # assert which: the regression we care about is "no real install
+    # logic executed". Look for lack of "ops-cli installed" /
+    # "updating ops-cli" / "cloning ops-cli" markers.
+    local installer
+    installer="$(installer)"
+    # Cut to ~halfway through the file (well into main()'s body).
+    local size
+    size=$(wc -c < "$installer")
+    local half=$((size / 2))
+    run sh -c "head -c $half '$installer' | sh"
+    # The truncated body must NOT have triggered any real install
+    # action. Any output containing those phrases means logic ran.
+    [[ "$output" != *"ops-cli installed"* ]]
+    [[ "$output" != *"updating ops-cli"* ]]
+    [[ "$output" != *"cloning ops-cli"* ]]
+}
+
 @test "install.sh: bails early when git is missing from \$PATH" {
     # Build a tmpdir containing every standard utility install.sh needs
     # (sh, env, mkdir, printf, ln, awk, sed, grep, sort, tail, dirname,
