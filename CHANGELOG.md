@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`ops self-update [--force] [REF]` subcommand** — top-level wrapper around `install.sh` that updates ops-cli in place. Re-execs `$SCRIPT_DIR/install.sh` with `OPS_INSTALL_DIR=$SCRIPT_DIR` and `OPS_REF=${REF:-}` so all the resolution logic (default ref = latest `vX.Y.Z` tag, idempotent fetch+checkout, in-place upgrade/downgrade, untracked files preserved) lives in one place — no duplicate update code in `ops.sh`. Distinct from `ops nerdctl self-update` (which targets the nerdctl binary) and from `ops update [KEY]` (which rebuilds an image).
+  - **Safety net**: refuses to run when `$SCRIPT_DIR` has uncommitted edits to tracked files, because `install.sh`'s update path runs `git checkout --force` and would silently discard them. Lists the dirty files in the error message so the user sees what would have been lost. Trigger reproduced during dev: a `./ops.sh self-update` from a contributor's clone wiped the in-flight changes that this very subcommand was being added in. Bypass with `--force` (or `-f`) when the dirty state is intentional / disposable. `git status --porcelain --untracked-files=no` is used so untracked files (which `install.sh`'s checkout preserves anyway) are not flagged.
+  - **Other refusal paths**: `$SCRIPT_DIR` is not a git checkout (manual copy of `ops.sh`) or `install.sh` is missing from it (clone predates the installer). Both cases surface a reinstall hint pointing at the canonical `curl|sh` line; `--force` does NOT bypass these — re-cloning is the only safe path.
+  - Coverage: 10 new bats tests in `tests/test_install_sh.bats` covering the help block, the three refusal paths (non-git / missing-install.sh / dirty-tree), the env-var hand-off (`OPS_REF` + `OPS_INSTALL_DIR`), the empty-ref auto-resolve case, the `--force` / `-f` bypass, the `--force REF` argv combo, and rejection of unknown flags.
+
+- **`install.sh` summary now shows the version transition on update**. The summary line was just `ref: v1.2.0 (commit 050c147)`; it now becomes `ref: v1.0.0 → v1.2.0 (commit 050c147)` when the ref actually moved, or `ref: v1.0.0 (already up to date, commit 35cefca)` when the user re-ran the installer on the same ref. Fresh clones keep the original one-ref form (no "from" makes sense on a brand-new install). The entry line gained a `current: <ref>` annotation too, so the destination + origin are visible immediately, before the fetch + checkout actually runs. Implementation: capture `git describe --tags --always` before the checkout (only on the update path), again after, then branch the summary printf on whether they differ. Three new bats tests in `tests/test_install_sh.bats` lock the three formats.
+
 ## [1.2.0] - 2026-04-27
 
 ### Added

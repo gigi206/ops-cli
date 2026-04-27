@@ -152,12 +152,21 @@ fi
 
 # ---- install or update ------------------------------------------------------
 
+# `_from` captures the pre-update HEAD (only set on the update path)
+# so the summary at the bottom can show "v1.0.0 → v1.2.0" instead of
+# just the destination ref. Empty on a fresh clone (no "from" makes
+# sense) and on the bail path (which exits before reaching the
+# summary anyway).
+_from=""
+
 if [ -d "$INSTALL_DIR/.git" ]; then
     # Update path: keep the existing tree, just fast-forward to the
     # requested ref. We do NOT `git clean -fd` — the user may have an
     # `ops.local.toml` or other untracked artefacts they want to keep.
-    printf 'install.sh: updating ops-cli in %s (ref: %s)\n' "$INSTALL_DIR" "$REF"
     cd "$INSTALL_DIR"
+    _from=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
+    printf 'install.sh: updating ops-cli in %s (ref: %s, current: %s)\n' \
+        "$INSTALL_DIR" "$REF" "$_from"
     # Make sure the remote URL is what we expect — handles the case where
     # the user originally cloned from a fork and is now switching to the
     # canonical upstream (or vice-versa, by setting OPS_REPO_URL).
@@ -206,12 +215,28 @@ ln -sf "$INSTALL_DIR/ops.sh" "$BIN_DIR/ops"
 
 # ---- summary ---------------------------------------------------------------
 
+_to=$(git -C "$INSTALL_DIR" describe --tags --always 2>/dev/null || echo unknown)
+
 printf '\n'
 printf 'install.sh: ops-cli installed.\n'
 printf '            tree:    %s\n' "$INSTALL_DIR"
 printf '            binary:  %s -> %s/ops.sh\n' "$BIN_DIR/ops" "$INSTALL_DIR"
-printf '            ref:     %s (commit %s)\n' "$REF" \
-    "$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# Three summary shapes:
+#   - fresh clone:         ref:     v1.2.0 (commit 050c147)
+#   - update, version moved: ref:     v1.0.0 → v1.2.0 (commit 050c147)
+#   - update, no-op:       ref:     v1.2.0 (already up to date, commit 050c147)
+# `git describe --tags --always` returns the exact tag name when HEAD
+# is on a tag, otherwise <tag>-<count>-g<short-sha>; --always falls back
+# to the bare short SHA if no reachable tag exists at all (e.g. brand
+# new repo without releases).
+_short=$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+if [ -z "$_from" ]; then
+    printf '            ref:     %s (commit %s)\n' "$_to" "$_short"
+elif [ "$_from" = "$_to" ]; then
+    printf '            ref:     %s (already up to date, commit %s)\n' "$_to" "$_short"
+else
+    printf '            ref:     %s → %s (commit %s)\n' "$_from" "$_to" "$_short"
+fi
 
 # Warn if BIN_DIR is not on PATH so the user does not silently fall back
 # to a different `ops` (or none at all). `case "$PATH" in *":$BIN_DIR:"*)`

@@ -99,6 +99,43 @@ run_installer() {
     [[ "$target" == "$BATS_TEST_TMPDIR/install/ops.sh" ]]
 }
 
+# ---- summary output formats -----------------------------------------------
+
+# Three shapes the installer's final summary line can take:
+#   - fresh clone:           ref:     <ref> (commit <sha>)
+#   - update, version moved: ref:     <from> → <to> (commit <sha>)
+#   - update, no-op:         ref:     <ref> (already up to date, commit <sha>)
+# These three tests lock the formats so a future refactor of the
+# summary block does not silently drop the from→to indication.
+
+@test "install.sh: fresh clone summary shows just the ref + commit" {
+    run_installer "v1.0.0"
+    assert_success
+    [[ "$output" == *"ref:     v1.0.0 (commit "* ]]
+    [[ "$output" != *"→"* ]]
+    [[ "$output" != *"already up to date"* ]]
+}
+
+@test "install.sh: update summary shows from → to when the ref moved" {
+    run_installer "v1.0.0"
+    assert_success
+    run_installer "v1.1.0"
+    assert_success
+    # The "current: <ref>" annotation on the entry line, plus the
+    # "<from> → <to>" arrow on the summary line, both appear.
+    [[ "$output" == *"current: v1.0.0"* ]]
+    [[ "$output" == *"ref:     v1.0.0 → v1.1.0 (commit "* ]]
+}
+
+@test "install.sh: re-run on the same ref reports 'already up to date'" {
+    run_installer "v1.1.0"
+    assert_success
+    run_installer "v1.1.0"
+    assert_success
+    [[ "$output" == *"already up to date"* ]]
+    [[ "$output" != *"→"* ]]
+}
+
 # ---- update path -----------------------------------------------------------
 
 @test "install.sh: re-run with a different OPS_REF switches in-place (no re-clone)" {
@@ -307,6 +344,173 @@ prepare_install() {
     [ -f "$BATS_TEST_TMPDIR/home/.config/ops/ops.conf" ]
     [[ "$output" == *"Preserved"* ]]
     [[ "$output" == *"ops.conf"* ]]
+}
+
+# ---- ops self-update (top-level wrapper around install.sh) ----------------
+
+# Build a fake ops-cli checkout so we can exercise `ops self-update`
+# without touching the real repo. Each test gets its own fresh
+# checkout under $BATS_TEST_TMPDIR; the stub install.sh inside lets
+# us assert what env vars `cmd_update_self` exports before re-exec.
+
+@test "ops self-update --help prints its dedicated help block" {
+    run env "$(ops_sh)" self-update --help
+    assert_success
+    [[ "$output" == *"self-update"* ]]
+    [[ "$output" == *"REF"* ]]
+    [[ "$output" == *"latest"* ]]
+}
+
+@test "ops self-update refuses when SCRIPT_DIR is not a git checkout" {
+    # Copy ops.sh into a non-git directory. cmd_update_self must
+    # refuse and surface the reinstall hint — never silently try to
+    # repair a manually-copied install.
+    local fake="$BATS_TEST_TMPDIR/non-git"
+    mkdir -p "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    run env "$fake/ops.sh" self-update
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not a git checkout"* ]]
+    [[ "$output" == *"install.sh"* ]]
+}
+
+@test "ops self-update refuses when install.sh is missing from the checkout" {
+    # Synthesize a git checkout that contains ops.sh but no
+    # install.sh — mimics a clone made before the installer existed.
+    local fake="$BATS_TEST_TMPDIR/git-no-installer"
+    mkdir -p "$fake"
+    git -c init.defaultBranch=main init -q "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    run env "$fake/ops.sh" self-update
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"install.sh"* ]]
+    [[ "$output" == *"missing"* ]]
+}
+
+@test "ops self-update re-execs install.sh with OPS_REF and OPS_INSTALL_DIR" {
+    # Stub install.sh that just echoes its env so we can assert what
+    # cmd_update_self handed off. Exec semantics mean the stub's
+    # output IS the test's stdout.
+    local fake="$BATS_TEST_TMPDIR/git-with-stub"
+    mkdir -p "$fake"
+    git -c init.defaultBranch=main init -q "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    cat > "$fake/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "STUB_INSTALL_RAN"
+echo "OPS_REF=${OPS_REF}"
+echo "OPS_INSTALL_DIR=${OPS_INSTALL_DIR}"
+STUB
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update v1.0.0
+    assert_success
+    [[ "$output" == *"STUB_INSTALL_RAN"* ]]
+    [[ "$output" == *"OPS_REF=v1.0.0"* ]]
+    [[ "$output" == *"OPS_INSTALL_DIR=$fake"* ]]
+}
+
+@test "ops self-update with no arg leaves OPS_REF empty (installer auto-resolves)" {
+    local fake="$BATS_TEST_TMPDIR/git-with-stub-noarg"
+    mkdir -p "$fake"
+    git -c init.defaultBranch=main init -q "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    cat > "$fake/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "OPS_REF=[${OPS_REF}]"
+STUB
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update
+    assert_success
+    # OPS_REF must be the empty string (not the literal `${OPS_REF:-}`
+    # nor a default like "main") so install.sh's own auto-resolution
+    # logic kicks in and picks the latest vX.Y.Z tag.
+    [[ "$output" == *"OPS_REF=[]"* ]]
+}
+
+# Helper for the dirty-working-tree tests below: build a fake checkout
+# whose ops.sh is the real one (so cmd_update_self runs), commit it,
+# THEN modify a tracked file so the working tree is dirty.
+make_dirty_checkout() {
+    local dir="$1"
+    mkdir -p "$dir"
+    git -c init.defaultBranch=main init -q "$dir"
+    git -C "$dir" config user.email test@ops.local
+    git -C "$dir" config user.name  test
+    cp "$(ops_sh)" "$dir/ops.sh"
+    chmod +x "$dir/ops.sh"
+    cat > "$dir/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "STUB_INSTALL_RAN"
+STUB
+    chmod +x "$dir/install.sh"
+    git -C "$dir" add ops.sh install.sh
+    git -C "$dir" -c commit.gpgsign=false commit -q -m "init"
+    # Now make the working tree dirty by editing the tracked file.
+    echo "# local edit" >> "$dir/ops.sh"
+}
+
+@test "ops self-update refuses when working tree has uncommitted changes" {
+    # Without --force, the safety net fires: install.sh's
+    # `git checkout --force` would discard the local ops.sh edit.
+    local fake="$BATS_TEST_TMPDIR/dirty-tree"
+    make_dirty_checkout "$fake"
+    run env "$fake/ops.sh" self-update
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"uncommitted changes"* ]]
+    [[ "$output" == *"--force"* ]]
+    [[ "$output" == *"ops.sh"* ]]
+    # The dirty file must still be there, untouched.
+    grep -q "# local edit" "$fake/ops.sh"
+}
+
+@test "ops self-update --force bypasses the dirty-working-tree check" {
+    local fake="$BATS_TEST_TMPDIR/dirty-tree-force"
+    make_dirty_checkout "$fake"
+    run env "$fake/ops.sh" self-update --force
+    assert_success
+    # The stub install.sh ran, meaning the safety net was bypassed.
+    [[ "$output" == *"STUB_INSTALL_RAN"* ]]
+}
+
+@test "ops self-update -f is the short form of --force" {
+    local fake="$BATS_TEST_TMPDIR/dirty-tree-short-f"
+    make_dirty_checkout "$fake"
+    run env "$fake/ops.sh" self-update -f
+    assert_success
+    [[ "$output" == *"STUB_INSTALL_RAN"* ]]
+}
+
+@test "ops self-update --force REF combines flag + ref correctly" {
+    # Order matters: `--force` must precede REF in the argv parser.
+    # The test verifies both are honoured: REF is propagated to the
+    # stub install.sh AND the safety net is bypassed.
+    local fake="$BATS_TEST_TMPDIR/dirty-tree-force-ref"
+    make_dirty_checkout "$fake"
+    cat > "$fake/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "STUB_RAN_WITH_REF=${OPS_REF}"
+STUB
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update --force v1.0.0
+    assert_success
+    [[ "$output" == *"STUB_RAN_WITH_REF=v1.0.0"* ]]
+}
+
+@test "ops self-update rejects unknown flags" {
+    local fake="$BATS_TEST_TMPDIR/unknown-flag"
+    mkdir -p "$fake"
+    git -c init.defaultBranch=main init -q "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    : > "$fake/install.sh"
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update --not-a-real-flag
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unknown flag"* ]]
 }
 
 # ---- back to install.sh test cases ----------------------------------------
