@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-27
+
+### Added
+- **`install.sh` — public curl|sh installer at the repo root**. Single POSIX-sh script (works under `dash` / `busybox sh`, not just `bash`) that clones ops-cli into `~/.local/share/ops-cli` and drops a `ops` symlink in `~/.local/bin`. Idempotent: re-running with a different `OPS_REF` upgrades or downgrades the existing checkout in place via `git fetch origin <ref> && git checkout FETCH_HEAD` — preserves untracked artefacts the user dropped in the tree (e.g. an `ops.local.toml`). Survives a `--depth 1` clone when switching from a tag to a branch (a naive `git checkout main` would fail with "pathspec did not match" because depth-1 only fetched the cloned ref).
+  - **Default ref resolution**: when `OPS_REF` is unset, the script picks the latest `vX.Y.Z` tag from `git ls-remote --tags --refs $OPS_REPO_URL` (sorted via `sort -V` so 1.10.0 ranks above 1.9.0). Falls back to `main` only if the remote has no semver tag or `git ls-remote` errored out (offline, private repo without auth).
+  - **Uninstall mode** (`OPS_UNINSTALL=1`): removes `$OPS_INSTALL_DIR` and the `$OPS_BIN_DIR/ops` symlink. Three safety gates so a misconfigured `OPS_INSTALL_DIR=$HOME` cannot wipe the user's home: (1) the directory must be a git checkout (`.git/` present), (2) it must contain `ops.sh` (this is what makes it look like ops-cli specifically), (3) the `$OPS_BIN_DIR/ops` symlink is only removed if it points back at our `ops.sh` — a foreign symlink is left alone. On non-TTY stdin (curl|sh), the `[y/N]` prompt is replaced by a hard requirement for `OPS_UNINSTALL_FORCE=1`. Preserves `~/.config/ops/ops.conf` and Docker volumes (the apt-style remove vs purge convention) — the final printout tells the user how to clean those separately.
+  - **Env vars**: `OPS_REF` (tag/branch/SHA), `OPS_INSTALL_DIR` (default `~/.local/share/ops-cli`), `OPS_BIN_DIR` (default `~/.local/bin`), `OPS_REPO_URL` (override for forks/mirrors), `OPS_UNINSTALL`, `OPS_UNINSTALL_FORCE`. All optional.
+  - **PATH warning**: if the resolved `$OPS_BIN_DIR` is not on the user's `$PATH`, prints the exact `export PATH=…` line they need to add to their shell rc — no silent failure where `ops: command not found` would surface only after install.
+  - Coverage: 18 new bats tests in `tests/test_install_sh.bats` covering install, in-place update, ref-resolution edge cases (unknown ref, depth-1 → branch), failure modes (missing git, non-git pre-existing dir), uninstall happy/refuse paths, the foreign-symlink safety gate, and config preservation. Tests run offline against a local bare-repo fixture built fresh in `$BATS_TEST_TMPDIR` — no network, deterministic timings.
+
+### Changed
+- **CI: github-actions group bump** (Dependabot PR #5, squash-merged into `main`). `actions/checkout` v4 → v6, `actions/cache` v4 → v5, `actions/upload-artifact` v4 → v7, `hadolint/hadolint-action` v3.1.0 → v3.3.0, `aquasecurity/trivy-action` 0.35.0 → 0.36.0 (SHA pin updated), `dorny/paths-filter` v3 → v4. CI ran green on the rebased PR before merge — no breaking changes from the major bumps surfaced in our usage.
+
 ## [1.1.0] - 2026-04-27
 
 ### Fixed
