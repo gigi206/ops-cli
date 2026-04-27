@@ -544,6 +544,10 @@ Subcommands:
   backup VOL     Stream a volume as tar.gz to stdout  (redirect to a file)
   restore VOL    Restore a volume from a tar.gz on stdin  (redirect from a file)
   update KEY     Rebuild an image and offer to recreate containers on the old version
+  self-update [-f|--force] [REF]
+                 Update ops-cli itself in place (re-execs install.sh).
+                 REF = tag/branch/SHA; default = latest stable tag.
+                 --force bypasses the dirty-working-tree safety check.
   nerdctl CMD    Manage the nerdctl install (see 'nerdctl --help'):
                    install        Download nerdctl-full to \$OPS_NERDCTL_HOME
                    uninstall      Stop containerd.service + remove binaries/data
@@ -1683,6 +1687,106 @@ EOF
     [ "$warn" -gt 0 ] && return 1 || return 0
 }
 
+# Top-level `ops self-update` — updates ops-cli itself by re-execing
+# install.sh in place. Distinct from `ops nerdctl self-update` (which
+# targets the nerdctl binary) and from `ops update [KEY]` (which
+# rebuilds an image).
+#
+# Implemented as a thin re-exec of install.sh so all the resolution
+# logic (default ref = latest vX.Y.Z tag, idempotent fetch+checkout,
+# in-place upgrade/downgrade, untracked files preserved) lives in one
+# place. The caller's OPS_REPO_URL / OPS_BIN_DIR overrides apply
+# automatically if exported.
+#
+# Heads-up: install.sh's update path runs `git checkout --force` on
+# the working tree, which discards local edits to tracked files. Any
+# uncommitted changes the user has in $SCRIPT_DIR will disappear. That
+# is intentional (the install dir is treated as installer-managed) but
+# worth flagging if a contributor runs self-update on their dev clone.
+cmd_update_self() {
+    local force=0
+    # Hand-rolled flag parsing: only --force / -f is accepted before the
+    # optional REF positional. Anything else either matches REF (single
+    # token) or trips the help block. We don't need getopt here.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $(basename "$0") self-update [--force] [REF]
+
+Update the ops-cli installation in place. REF is anything understood by
+git: a tag (e.g. v1.0.0), a branch (main), or a commit SHA. When REF is
+omitted, the latest vX.Y.Z tag is auto-resolved from the configured
+remote (fallback: main).
+
+Re-execs install.sh under the hood, so the same OPS_REPO_URL /
+OPS_BIN_DIR overrides apply if exported beforehand.
+
+Options:
+  -f, --force    Bypass the dirty-working-tree safety check.
+                 Without it, self-update refuses when \$SCRIPT_DIR has
+                 uncommitted changes — those would be silently discarded
+                 by install.sh's \`git checkout --force\` (lesson learned
+                 the hard way during dev). Use this when you really want
+                 a forced reinstall, or when the lingering changes are
+                 known to be disposable.
+
+Warning: even without --force, install.sh discards local edits to
+tracked files (it always checks out with --force). Untracked files are
+always preserved.
+
+Examples:
+  $(basename "$0") self-update              # latest stable tag
+  $(basename "$0") self-update main         # track main
+  $(basename "$0") self-update v1.0.0       # downgrade to v1.0.0
+  $(basename "$0") self-update --force      # skip the dirty-tree check
+EOF
+                return 0
+                ;;
+            -f|--force) force=1; shift ;;
+            --) shift; break ;;
+            -*) echo "self-update: unknown flag: $1" >&2; exit 1 ;;
+            *) break ;;
+        esac
+    done
+    local target_ref="${1:-}"
+
+    if [ ! -d "$SCRIPT_DIR/.git" ]; then
+        echo "self-update: $SCRIPT_DIR is not a git checkout (ops.sh installed manually?)" >&2
+        echo "             Reinstall via:" >&2
+        echo "               curl -fsSL https://raw.githubusercontent.com/gigi206/ops-cli/main/install.sh | sh" >&2
+        exit 1
+    fi
+    if [ ! -x "$SCRIPT_DIR/install.sh" ]; then
+        echo "self-update: $SCRIPT_DIR/install.sh is missing — your checkout predates the installer." >&2
+        echo "             Update manually: git -C \"$SCRIPT_DIR\" pull" >&2
+        exit 1
+    fi
+
+    # Dirty-working-tree safety. install.sh runs `git checkout --force`,
+    # which silently discards staged + unstaged edits to tracked files.
+    # Refuse if the user has any such edits, unless they pass --force.
+    # We use `git status --porcelain` over `git diff --quiet` because
+    # the former also catches staged-but-not-committed changes (which
+    # `git diff` alone misses without `--cached`). Untracked files are
+    # NOT a concern — install.sh's checkout leaves them alone.
+    if [ "$force" -ne 1 ]; then
+        local _dirty
+        _dirty=$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no 2>/dev/null)
+        if [ -n "$_dirty" ]; then
+            echo "self-update: $SCRIPT_DIR has uncommitted changes — refusing." >&2
+            echo "             Without --force, install.sh's \`git checkout --force\`" >&2
+            echo "             would discard them silently. Commit or stash first," >&2
+            echo "             or pass --force to proceed anyway." >&2
+            echo "             Files:" >&2
+            printf '%s\n' "$_dirty" | sed 's/^/               /' >&2
+            exit 1
+        fi
+    fi
+
+    OPS_REF="$target_ref" OPS_INSTALL_DIR="$SCRIPT_DIR" exec sh "$SCRIPT_DIR/install.sh"
+}
+
 cmd_self_update() {
     # Always operates on $OPS_NERDCTL_HOME/bin/nerdctl, regardless of OPS_RUNTIME —
     # the `nerdctl` namespace makes the intent explicit.
@@ -2621,6 +2725,7 @@ case "${1:-}" in
     config)         shift; cmd_config "$@" ;;
     backup)         shift; cmd_backup "$@" ;;
     restore)        shift; cmd_restore "$@" ;;
+    self-update)    shift; cmd_update_self "$@" ;;
     update)         shift; cmd_update "$@" ;;
     build)          shift; cmd_run --build "$@" ;;
     runtime)        shift; cmd_runtime "$@" ;;
