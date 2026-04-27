@@ -12,10 +12,10 @@
 # Variables (all optional):
 #   OPS_REF              tag (vX.Y.Z), branch, or commit SHA to check out.
 #                        Default: the latest vX.Y.Z tag on the remote, or
-#                        `main` if no tag exists / `git ls-remote` is
+#                        'main' if no tag exists / 'git ls-remote' is
 #                        unavailable.
 #   OPS_INSTALL_DIR      where the working tree lives. Default: ~/.local/share/ops-cli
-#   OPS_BIN_DIR          where to drop the `ops` symlink. Default: ~/.local/bin
+#   OPS_BIN_DIR          where to drop the 'ops' symlink. Default: ~/.local/bin
 #   OPS_REPO_URL         git remote (override for forks / mirrors).
 #                        Default: https://github.com/gigi206/ops-cli.git
 #   OPS_UNINSTALL=1      uninstall mode: remove the install dir + symlink.
@@ -31,13 +31,13 @@
 #   curl -fsSL .../install.sh | OPS_UNINSTALL=1 OPS_UNINSTALL_FORCE=1 sh
 #   OPS_UNINSTALL=1 sh ~/.local/share/ops-cli/install.sh   # interactive prompt
 #
-# All logic is wrapped in `main` and the script ends with `main "$@"`. This
+# All logic is wrapped in 'main' and the script ends with 'main "$@"'. This
 # is the standard curl|sh defensive pattern (rustup, oh-my-zsh, …): POSIX
 # requires the entire function body to be parsed before invocation, so a
-# truncated download — e.g. a network hiccup mid-pipe to `sh` — fails to
-# parse `main` itself and never executes a partial install. Without the
+# truncated download — e.g. a network hiccup mid-pipe to 'sh' — fails to
+# parse 'main' itself and never executes a partial install. Without the
 # wrap, dash/sh streaming the script can run prefix lines while the rest
-# is still in flight; we observed `sh: <line>: [tag: not found` errors
+# is still in flight; we observed 'sh: <line>: [tag: not found' errors
 # under exactly this scenario in dev.
 
 main() {
@@ -52,21 +52,21 @@ main() {
 
     # ---- uninstall mode ----------------------------------------------------
     #
-    # Triggered by `OPS_UNINSTALL=1`. Removes the working tree at
+    # Triggered by 'OPS_UNINSTALL=1'. Removes the working tree at
     # $OPS_INSTALL_DIR and the $OPS_BIN_DIR/ops symlink. Preserves
     # $HOME/.config/ops/ (user config) and Docker volumes — those are not
     # install artefacts; the user must clean them explicitly via
-    # `ops clean` BEFORE uninstall, or with `docker volume rm` afterwards.
+    # 'ops clean' BEFORE uninstall, or with 'docker volume rm' afterwards.
     #
-    # Two safety gates so a misconfigured `OPS_INSTALL_DIR=$HOME` does not
-    # `rm -rf` the user's home:
-    #   1. INSTALL_DIR must be a git checkout (`.git/` present).
+    # Two safety gates so a misconfigured 'OPS_INSTALL_DIR=$HOME' does not
+    # 'rm -rf' the user's home:
+    #   1. INSTALL_DIR must be a git checkout ('.git/' present).
     #   2. INSTALL_DIR/ops.sh must exist (this is what makes the checkout
     #      look like ops-cli specifically, not just any random repo the
     #      user happened to point OPS_INSTALL_DIR at).
     #
     # A third gate handles the curl|sh non-interactive case: stdin won't
-    # be a TTY, so `read` cannot prompt — we require OPS_UNINSTALL_FORCE=1
+    # be a TTY, so 'read' cannot prompt — we require OPS_UNINSTALL_FORCE=1
     # to confirm in that scenario, otherwise we abort with a hint.
     if [ "$UNINSTALL" = "1" ]; then
         if [ ! -d "$INSTALL_DIR/.git" ] || [ ! -f "$INSTALL_DIR/ops.sh" ]; then
@@ -94,7 +94,7 @@ main() {
         fi
 
         # Only remove the symlink if it actually points at OUR ops.sh —
-        # avoids clobbering an `ops` from a different install (e.g. system
+        # avoids clobbering an 'ops' from a different install (e.g. system
         # package, second checkout under a different OPS_INSTALL_DIR).
         if [ -L "$BIN_DIR/ops" ]; then
             _target=$(readlink "$BIN_DIR/ops")
@@ -119,7 +119,7 @@ main() {
             printf "  %s\n" "$HOME/.config/ops/ops.conf"
         fi
         printf "  Docker volumes labelled ops.volume=true (mise / nix / agent state).\n"
-        printf "  Run \`ops clean\` BEFORE uninstall to clear them, or after via:\n"
+        printf "  Run 'ops clean' BEFORE uninstall to clear them, or after via:\n"
         printf "    docker volume ls --filter label=ops.volume=true -q | xargs -r docker volume rm\n"
 
         exit 0
@@ -127,30 +127,30 @@ main() {
 
     # ---- prerequisites -----------------------------------------------------
 
-    # `git` is required: we install via clone+checkout (not tarball+curl) so
-    # the user can `git pull` later, and so OPS_REF can transparently
+    # 'git' is required: we install via clone+checkout (not tarball+curl) so
+    # the user can 'git pull' later, and so OPS_REF can transparently
     # reference any branch/tag/SHA understood by git. Bail loudly if git is
     # missing.
     if ! command -v git >/dev/null 2>&1; then
-        # Double-quoted printf format (with escaped `\$`) keeps `$PATH`
+        # Double-quoted printf format (with escaped '\$') keeps '$PATH'
         # literal in the message without tripping shellcheck SC2016 — the
         # warning is correct in general but this is precisely the case where
         # we WANT the dollar sign visible to the user.
         printf "install.sh: git is required but was not found in \$PATH.\n" >&2
-        printf "            Install git first (e.g. \`sudo apt install git\`,\n" >&2
-        printf "            \`brew install git\`, or your distro equivalent).\n" >&2
+        printf "            Install git first (e.g. 'sudo apt install git',\n" >&2
+        printf "            'brew install git', or your distro equivalent).\n" >&2
         exit 1
     fi
 
     # ---- ref resolution ----------------------------------------------------
 
     # Pick the most recent semver-shaped tag (vX.Y.Z[-...]) when the caller
-    # did not pin one. `git ls-remote --tags --refs` skips `^{}` peel
+    # did not pin one. 'git ls-remote --tags --refs' skips '^{}' peel
     # entries (the refs that point to the underlying commit of an annotated
     # tag) so the result is one line per tag — no de-duplication needed.
-    # `sort -V` (version sort) handles 1.10.0 > 1.9.0 correctly; a plain
-    # `sort` would rank 1.10.0 below 1.2.0. If the network is unreachable
-    # or the repo has no tags yet, fall through to `main`.
+    # 'sort -V' (version sort) handles 1.10.0 > 1.9.0 correctly; a plain
+    # 'sort' would rank 1.10.0 below 1.2.0. If the network is unreachable
+    # or the repo has no tags yet, fall through to 'main'.
     if [ -z "$REF" ]; then
         REF=$(git ls-remote --tags --refs "$REPO_URL" 2>/dev/null \
             | awk '{print $2}' \
@@ -163,7 +163,7 @@ main() {
 
     # ---- install or update -------------------------------------------------
 
-    # `_from` captures the pre-update HEAD (only set on the update path)
+    # '_from' captures the pre-update HEAD (only set on the update path)
     # so the summary at the bottom can show "v1.0.0 → v1.2.0" instead of
     # just the destination ref. Empty on a fresh clone (no "from" makes
     # sense) and on the bail path (which exits before reaching the
@@ -172,8 +172,8 @@ main() {
 
     if [ -d "$INSTALL_DIR/.git" ]; then
         # Update path: keep the existing tree, just fast-forward to the
-        # requested ref. We do NOT `git clean -fd` — the user may have an
-        # `ops.local.toml` or other untracked artefacts they want to keep.
+        # requested ref. We do NOT 'git clean -fd' — the user may have an
+        # 'ops.local.toml' or other untracked artefacts they want to keep.
         cd "$INSTALL_DIR"
         _from=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
         printf 'install.sh: updating ops-cli in %s (ref: %s, current: %s)\n' \
@@ -184,19 +184,19 @@ main() {
         git remote set-url origin "$REPO_URL"
         # Fetch the requested ref by name, regardless of whether it is a
         # branch, a lightweight tag, or an annotated tag. Going through
-        # FETCH_HEAD afterwards avoids two failure modes of `git checkout
-        # $REF` on a `--depth 1` clone:
+        # FETCH_HEAD afterwards avoids two failure modes of 'git checkout
+        # $REF' on a '--depth 1' clone:
         #   1. The original clone fetched only one ref (the tag we cloned),
-        #      so `main` does not exist locally as a tracking branch — a
-        #      bare `git checkout main` errors with "pathspec 'main' did
+        #      so 'main' does not exist locally as a tracking branch — a
+        #      bare 'git checkout main' errors with "pathspec 'main' did
         #      not match any file(s) known to git".
-        #   2. `git fetch origin --tags` fetches tags but not arbitrary
+        #   2. 'git fetch origin --tags' fetches tags but not arbitrary
         #      branches; switching from a tag to a branch needed the
-        #      explicit `<remote> <ref>` form.
-        # `--prune-tags` cleans up tags deleted upstream so a re-pushed
+        #      explicit '<remote> <ref>' form.
+        # '--prune-tags' cleans up tags deleted upstream so a re-pushed
         # tag (rare) is not shadowed by the stale local entry.
         git fetch --quiet --tags --prune --prune-tags origin "$REF"
-        # `--force` discards any local edits to tracked files — the
+        # '--force' discards any local edits to tracked files — the
         # working tree is treated as immutable / installer-managed.
         git checkout --quiet --force --detach FETCH_HEAD
     elif [ -e "$INSTALL_DIR" ]; then
@@ -207,7 +207,7 @@ main() {
     else
         printf 'install.sh: cloning ops-cli into %s (ref: %s)\n' "$INSTALL_DIR" "$REF"
         mkdir -p "$(dirname "$INSTALL_DIR")"
-        # `--depth 1 --branch $REF` works for both branch names and
+        # '--depth 1 --branch $REF' works for both branch names and
         # lightweight tags. For an annotated tag, --branch + --depth 1 still
         # resolves the peel, so this branch is fine for any ref shape git
         # understands.
@@ -219,7 +219,7 @@ main() {
     # ---- symlink -----------------------------------------------------------
 
     mkdir -p "$BIN_DIR"
-    # `ln -sf` overwrites an existing symlink/regular file at the target.
+    # 'ln -sf' overwrites an existing symlink/regular file at the target.
     # The previous installer run leaves a working symlink so the overwrite
     # is a no-op; if the user replaced it by hand, we prefer "always reflect
     # the current install" over preserving a stale value.
@@ -237,7 +237,7 @@ main() {
     #   - fresh clone:           ref:     v1.2.0 (commit 050c147)
     #   - update, version moved: ref:     v1.0.0 → v1.2.0 (commit 050c147)
     #   - update, no-op:         ref:     v1.2.0 (already up to date, commit 050c147)
-    # `git describe --tags --always` returns the exact tag name when HEAD
+    # 'git describe --tags --always' returns the exact tag name when HEAD
     # is on a tag, otherwise <tag>-<count>-g<short-sha>; --always falls back
     # to the bare short SHA if no reachable tag exists at all (e.g. brand
     # new repo without releases).
@@ -251,14 +251,14 @@ main() {
     fi
 
     # Warn if BIN_DIR is not on PATH so the user does not silently fall back
-    # to a different `ops` (or none at all). `case "$PATH" in *":$BIN_DIR:"*)`
-    # catches BIN_DIR mid-PATH; the leading/trailing `:` ensures the test
+    # to a different 'ops' (or none at all). 'case "$PATH" in *":$BIN_DIR:"*)'
+    # catches BIN_DIR mid-PATH; the leading/trailing ':' ensures the test
     # matches the exact directory and not e.g. /usr/local/bin matching /usr.
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *)
             printf '\n'
-            # Double-quoted format with `\$PATH` so the literal `$PATH`
+            # Double-quoted format with '\$PATH' so the literal '$PATH'
             # reaches the user. Single-quoted printf would do the same but
             # trips SC2016 on shellcheck 0.9.x (treated as a CI failure on
             # ubuntu-noble apt-installed shellcheck).
