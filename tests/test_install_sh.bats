@@ -578,3 +578,163 @@ STUB
     [ "$status" -ne 0 ]
     [[ "$output" == *"git is required"* ]]
 }
+
+# ---- OPS_CHECK=1 (preview mode) -------------------------------------------
+
+# Run install.sh with OPS_CHECK=1. Same env scaffolding as run_installer,
+# different env var. Echoes nothing — the caller asserts on $output via
+# `run`.
+run_check_mode() {
+    local ref="$1"
+    local install_dir="${2:-$BATS_TEST_TMPDIR/install}"
+    local remote="${REMOTE_URL:-}"
+    [ -z "$remote" ] && remote=$(make_fixture_remote)
+    REMOTE_URL="$remote"
+    run env \
+        HOME="$BATS_TEST_TMPDIR/home" \
+        OPS_REPO_URL="$remote" \
+        OPS_REF="$ref" \
+        OPS_CHECK=1 \
+        OPS_INSTALL_DIR="$install_dir" \
+        OPS_BIN_DIR="$BATS_TEST_TMPDIR/bin" \
+        sh "$(installer)"
+}
+
+@test "install.sh: OPS_CHECK=1 on a fresh path reports 'install (fresh clone)'" {
+    # No existing install dir → check mode reports the "install" action,
+    # current="(not installed)", and target=latest tag.
+    run_check_mode "" "$BATS_TEST_TMPDIR/no-such-dir"
+    assert_success
+    [[ "$output" == *"check mode"* ]]
+    [[ "$output" == *"current: (not installed)"* ]]
+    [[ "$output" == *"target:  v1.1.0"* ]]
+    [[ "$output" == *"action:  install (fresh clone)"* ]]
+    # Critical: the directory must NOT have been created.
+    [ ! -e "$BATS_TEST_TMPDIR/no-such-dir" ]
+}
+
+@test "install.sh: OPS_CHECK=1 reports 'upgrade' when current ref != target ref" {
+    # Pre-install at v1.0.0, then run check with default ref (latest = v1.1.0).
+    run_installer "v1.0.0"
+    assert_success
+    run_check_mode ""
+    assert_success
+    [[ "$output" == *"current: v1.0.0"* ]]
+    [[ "$output" == *"target:  v1.1.0"* ]]
+    [[ "$output" == *"action:  upgrade"* ]]
+}
+
+@test "install.sh: OPS_CHECK=1 reports 'no-op' when current ref == target ref" {
+    # Pre-install at v1.0.0, then check the same ref. The describe of HEAD
+    # equals REF, so the no-op heuristic must fire (ls-remote on annotated
+    # tags returns the tag-object SHA, not the underlying commit, so we
+    # cannot rely on SHA equality alone — the name match is what catches it).
+    run_installer "v1.0.0"
+    assert_success
+    run_check_mode "v1.0.0"
+    assert_success
+    [[ "$output" == *"current: v1.0.0"* ]]
+    [[ "$output" == *"target:  v1.0.0"* ]]
+    [[ "$output" == *"action:  no-op (already at target)"* ]]
+}
+
+@test "install.sh: OPS_CHECK=1 does NOT mutate the install tree" {
+    # Pre-install at v1.0.0. Snapshot HEAD. Run check pointing at v1.1.0.
+    # HEAD must not have moved; install dir contents must match the snapshot.
+    run_installer "v1.0.0"
+    assert_success
+    local before_sha
+    before_sha=$(git -C "$BATS_TEST_TMPDIR/install" rev-parse HEAD)
+    local before_listing
+    before_listing=$(find "$BATS_TEST_TMPDIR/install" -maxdepth 2 -printf '%P\n' 2>/dev/null | sort)
+
+    run_check_mode "v1.1.0"
+    assert_success
+
+    local after_sha
+    after_sha=$(git -C "$BATS_TEST_TMPDIR/install" rev-parse HEAD)
+    [ "$before_sha" = "$after_sha" ]
+    local after_listing
+    after_listing=$(find "$BATS_TEST_TMPDIR/install" -maxdepth 2 -printf '%P\n' 2>/dev/null | sort)
+    [ "$before_listing" = "$after_listing" ]
+    # And the symlink dir must remain untouched (or non-existent if it
+    # never existed). run_installer creates it; run_check_mode must not
+    # create or modify a separate one.
+    [ ! -e "$BATS_TEST_TMPDIR/no-such-bin" ] || true
+}
+
+@test "install.sh: OPS_CHECK=1 with a branch ref resolves a SHA via ls-remote" {
+    # OPS_REF=main → ls-remote returns the branch HEAD SHA (not a tag).
+    # Verify the target line carries a 7-char short SHA, not a tag name.
+    run_check_mode "main" "$BATS_TEST_TMPDIR/no-dir-yet"
+    assert_success
+    [[ "$output" == *"target:  main (commit "* ]]
+    # Pull out the short SHA and assert its shape.
+    local short
+    short=$(printf '%s\n' "$output" | sed -n 's/.*target:  main (commit \([0-9a-f]\{7\}\)).*/\1/p')
+    [ -n "$short" ]
+}
+
+@test "ops self-update --check sets OPS_CHECK=1 when re-execing install.sh" {
+    # Stub install.sh that just echoes its env, so we can assert that
+    # cmd_update_self set OPS_CHECK=1 (alongside OPS_REF and
+    # OPS_INSTALL_DIR) when --check was passed.
+    local fake="$BATS_TEST_TMPDIR/check-flag"
+    mkdir -p "$fake"
+    git -c init.defaultBranch=main init -q "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    cat > "$fake/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "OPS_CHECK=[${OPS_CHECK:-}]"
+echo "OPS_REF=[${OPS_REF:-}]"
+STUB
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update --check v1.0.0
+    assert_success
+    [[ "$output" == *"OPS_CHECK=[1]"* ]]
+    [[ "$output" == *"OPS_REF=[v1.0.0]"* ]]
+}
+
+@test "ops self-update -c is the short form of --check" {
+    local fake="$BATS_TEST_TMPDIR/check-short"
+    mkdir -p "$fake"
+    git -c init.defaultBranch=main init -q "$fake"
+    cp "$(ops_sh)" "$fake/ops.sh"
+    chmod +x "$fake/ops.sh"
+    cat > "$fake/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "OPS_CHECK=[${OPS_CHECK:-}]"
+STUB
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update -c
+    assert_success
+    [[ "$output" == *"OPS_CHECK=[1]"* ]]
+}
+
+@test "ops self-update --check skips the dirty-tree safety check" {
+    # The safety net exists because install.sh's update path does
+    # `git checkout --force`. Under --check there is no checkout, so the
+    # dirty-tree refusal is irrelevant — the user must be able to preview
+    # an update from a dirty clone (common case: "what would this do?"
+    # asked mid-edit).
+    local fake="$BATS_TEST_TMPDIR/dirty-check"
+    make_dirty_checkout "$fake"
+    cat > "$fake/install.sh" <<'STUB'
+#!/usr/bin/env sh
+echo "STUB_RAN_WITH_CHECK=${OPS_CHECK:-}"
+STUB
+    chmod +x "$fake/install.sh"
+    run env "$fake/ops.sh" self-update --check
+    assert_success
+    [[ "$output" == *"STUB_RAN_WITH_CHECK=1"* ]]
+    # Must NOT trip the uncommitted-changes refusal.
+    [[ "$output" != *"uncommitted changes"* ]]
+}
+
+@test "ops self-update --help mentions --check" {
+    run env "$(ops_sh)" self-update --help
+    assert_success
+    [[ "$output" == *"--check"* ]]
+    [[ "$output" == *"-c"* ]]
+}

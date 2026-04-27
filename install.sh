@@ -23,6 +23,9 @@
 #                        Prompts on TTY; in curl|sh use OPS_UNINSTALL_FORCE=1.
 #   OPS_UNINSTALL_FORCE=1  skip the y/N prompt in uninstall mode (required
 #                          when stdin is not a TTY, e.g. curl|sh).
+#   OPS_CHECK=1          check mode: print 'current → target' summary and
+#                        exit 0 without touching the filesystem. Compose with
+#                        OPS_REF to preview a specific tag/branch.
 #
 # Idempotent. Re-running with a different OPS_REF upgrades/downgrades in
 # place: the existing working tree is fetched + checked out, never wiped.
@@ -49,6 +52,7 @@ main() {
     REF="${OPS_REF:-}"
     UNINSTALL="${OPS_UNINSTALL:-0}"
     UNINSTALL_FORCE="${OPS_UNINSTALL_FORCE:-0}"
+    CHECK="${OPS_CHECK:-0}"
 
     # ---- uninstall mode ----------------------------------------------------
     #
@@ -159,6 +163,64 @@ main() {
             | sort -V \
             | tail -n 1) || REF=""
         [ -z "$REF" ] && REF=main
+    fi
+
+    # ---- check mode --------------------------------------------------------
+
+    # 'OPS_CHECK=1' (exposed as 'ops self-update --check') previews what an
+    # update would do without touching the filesystem. We resolve the
+    # current ref (if INSTALL_DIR exists as a git checkout) and the target
+    # ref's commit SHA via 'git ls-remote $REPO_URL $REF', then print a
+    # summary identical in shape to the post-install one — minus any
+    # side-effect: no clone, no fetch, no checkout, no symlink. Exit 0
+    # so check-mode composes cleanly in scripts ('if … --check; then').
+    #
+    # 'git ls-remote' resolves both annotated and lightweight tags, branch
+    # names, and full or short commit SHAs server-side, so we don't need
+    # a local checkout to look the target up. The command emits one line
+    # per matching ref ('<sha>\t<refname>'); we take the first sha and
+    # short it locally.
+    if [ "$CHECK" = "1" ]; then
+        _current="(not installed)"
+        if [ -d "$INSTALL_DIR/.git" ]; then
+            _current=$(git -C "$INSTALL_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)
+        fi
+        _target_sha=$(git ls-remote "$REPO_URL" "$REF" 2>/dev/null | awk 'NR==1 {print $1}')
+        if [ -z "$_target_sha" ]; then
+            # Could be a SHA passed directly that ls-remote does not echo
+            # (it only matches refs, not raw SHAs). We pass it through
+            # without shortening so the user sees what they asked for.
+            _target_sha="$REF"
+        fi
+        _target_short=$(printf '%s' "$_target_sha" | cut -c1-7)
+
+        # Decide the action label. Two signals are checked in order:
+        #   1. The describe of HEAD ($_current, e.g. "v1.0.0") equals
+        #      REF — strong "already at target" signal for tag inputs.
+        #   2. The resolved $_target_sha matches the local HEAD SHA —
+        #      catches branch / SHA inputs. (Tag inputs don't match this
+        #      way: 'git ls-remote $REPO_URL v1.0.0' returns the tag-
+        #      object SHA for annotated tags, not the underlying commit.)
+        # Without a local fetch we can't be 100 % certain — the remote
+        # ref might have moved while we slept — so this is a hint, not
+        # a guarantee.
+        _action="upgrade"
+        [ ! -d "$INSTALL_DIR/.git" ] && _action="install (fresh clone)"
+        if [ -d "$INSTALL_DIR/.git" ]; then
+            _current_sha=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || echo "")
+            if [ "$_current" = "$REF" ]; then
+                _action="no-op (already at target)"
+            elif [ -n "$_current_sha" ] && [ "$_target_sha" = "$_current_sha" ]; then
+                _action="no-op (already at target)"
+            fi
+        fi
+
+        printf 'install.sh: check mode (no changes will be made)\n'
+        printf '            tree:    %s\n' "$INSTALL_DIR"
+        printf '            current: %s\n' "$_current"
+        printf '            target:  %s (commit %s)\n' "$REF" "$_target_short"
+        printf '            action:  %s\n' "$_action"
+        exit 0
     fi
 
     # ---- install or update -------------------------------------------------

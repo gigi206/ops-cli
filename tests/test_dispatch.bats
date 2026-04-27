@@ -59,10 +59,15 @@ setup() {
     [[ "$output" == *"unknown subcommand or alias"* ]]
 }
 
-@test "flat 'self-update' is not a subcommand (belongs to nerdctl namespace)" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" self-update
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"unknown subcommand or alias"* ]]
+@test "flat 'self-update' IS a top-level subcommand (updates ops-cli itself)" {
+    # Distinct from `ops nerdctl self-update` (which targets the nerdctl
+    # binary). Top-level `ops self-update` re-execs install.sh in place.
+    # We invoke `--help` so the test does not actually rewrite the install
+    # tree; the help block is emitted by cmd_update_self before any
+    # filesystem side-effects.
+    run env OPS_RUNTIME=docker "$(ops_sh)" self-update --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"self-update"* ]]
 }
 
 @test "'version' subcommand prints OPS_VERSION without starting the runtime" {
