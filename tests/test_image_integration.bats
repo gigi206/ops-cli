@@ -213,11 +213,17 @@ setup() {
 }
 
 @test "image: OCI label org.opencontainers.image.title is populated" {
-    # Static label (no ARG expansion) — must be present regardless of build-args.
+    # Static label (no ARG expansion) — must be present regardless of
+    # build-args. The Arch Dockerfile uses "ops-dev"; Dockerfile.debian
+    # uses "ops-dev-debian" so the variant is distinguishable in
+    # registries / docker inspect output. Accept either via prefix
+    # match — both image-integration jobs (Arch + Debian) re-tag their
+    # build under `localhost/ops-dev`, so we only see the title label,
+    # not the tag.
     run "$IMAGE_RUNTIME" image inspect localhost/ops-dev \
         --format '{{ index .Config.Labels "org.opencontainers.image.title" }}'
     [ "$status" -eq 0 ]
-    [ "$output" = "ops-dev" ]
+    [[ "$output" == ops-dev* ]]
 }
 
 @test "image: OCI label org.opencontainers.image.licenses is Apache-2.0" {
@@ -295,13 +301,18 @@ setup() {
     [[ "$output" == *"/etc/ops-bashrc"* ]]
 }
 
-@test "image: interactive shell sources mise activate (flake env hook is wired)" {
-    # Launch `bash -i --rcfile /etc/ops-bashrc` and ask it whether the
-    # mise-hook PROMPT_COMMAND function was registered. If it is, the
-    # `eval \"$(mise activate bash)\"` line in /etc/ops-bashrc ran — which
-    # is what makes django-admin etc. appear in an interactive shell when
-    # a workdir declares [env] _.nix = true.
-    run run_in_image 'bash --rcfile /etc/ops-bashrc -ic "declare -F _mise_hook >/dev/null && echo WIRED || echo MISSING"'
+@test "image: interactive shell wires the bashrc PROMPT_COMMAND hook" {
+    # The bashrc deliberately does NOT call `mise activate bash`
+    # (would install a `_mise_hook` PROMPT_COMMAND that runs
+    # `mise hook-env` at every prompt, ~7 s cold-start that makes the
+    # first prompt of every shell painfully slow). Instead, it
+    # installs its own custom prompt hook
+    # `__ops_mise_refresh_if_stale` that only regenerates the
+    # shell-env cache when one of the config files (mise.toml,
+    # mise.local.toml, flake.lock, flake.nix) has been modified
+    # since the last run. Verify that hook is registered as
+    # PROMPT_COMMAND in an interactive shell.
+    run run_in_image 'bash --rcfile /etc/ops-bashrc -ic "declare -F __ops_mise_refresh_if_stale >/dev/null && [[ \$PROMPT_COMMAND == *__ops_mise_refresh_if_stale* ]] && echo WIRED || echo MISSING"'
     [ "$status" -eq 0 ]
     [[ "$output" == *"WIRED"* ]]
 }
@@ -348,6 +359,47 @@ setup() {
     run run_in_image 'bash -c "source /etc/ops-bashrc && command -v mise >/dev/null && echo OK"'
     [ "$status" -eq 0 ]
     [ "$output" = "OK" ]
+}
+
+# The baked /etc/ops-bashrc must contain the MISE_NIX_ALLOW_UNTRACKED
+# pre-export grep — without it, every cold launch from a fresh container
+# leaks `mise ERROR [nix] flake.nix … not tracked by git` lines to
+# stderr (because mise's MiseEnv hook fires before the env var is set
+# from mise.local.toml).
+@test "image: /etc/ops-bashrc contains MISE_NIX_ALLOW_UNTRACKED pre-export" {
+    run run_in_image 'grep -q "export MISE_NIX_ALLOW_UNTRACKED=1" /etc/ops-bashrc \
+        && grep -qE "grep -qE.*MISE_NIX_ALLOW_UNTRACKED" /etc/ops-bashrc \
+        && echo OK'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"OK"* ]]
+}
+
+# The baked /etc/ops-bashrc must define `__ops_refresh_cache` — ops.sh
+# `_agent_cmd` calls it after every `mise use -g`, and a missing helper
+# would make the agent wrapper crash with "command not found" mid-install.
+@test "image: /etc/ops-bashrc defines __ops_refresh_cache helper" {
+    run run_in_image 'bash -c "source /etc/ops-bashrc && declare -F __ops_refresh_cache >/dev/null && echo DEFINED || echo MISSING"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DEFINED"* ]]
+}
+
+# The helper must actually do something — call it and verify the cache
+# file lands at the expected path with non-empty content.
+@test "image: __ops_refresh_cache writes \$PWD/.mise-nix/shell-env.cache" {
+    # `source … 2>/dev/null` (no pipe) so the redirection only filters
+    # stderr without spawning a sub-shell — the function must remain
+    # visible in the outer shell to be callable next.
+    run run_in_image 'bash -c "
+        cd /tmp
+        rm -rf sandbox-refresh && mkdir sandbox-refresh && cd sandbox-refresh
+        printf \"[env]\nMISE_NIX_ALLOW_UNTRACKED = \\\"1\\\"\n\" > mise.toml
+        export MISE_TRUSTED_CONFIG_PATHS=/tmp/sandbox-refresh
+        source /etc/ops-bashrc 2>/dev/null || true
+        __ops_refresh_cache
+        if [ -s .mise-nix/shell-env.cache ]; then echo HAS_CONTENT; else echo EMPTY; fi
+    "'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"HAS_CONTENT"* ]]
 }
 
 @test "image: chrome wrapper emits help message when binary is missing" {

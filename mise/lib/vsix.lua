@@ -23,7 +23,9 @@ function M.from_nixhub(tool, requested_version, current_os, current_arch)
   -- Get platform build info
   local platform_build = release.platforms and release.platforms[1]
   if not platform_build then
-    error("No platform build found for version " .. release.version)
+    error(string.format(
+      "No platform build found for %s@%s on %s/%s (nixhub release lists no compatible platform)",
+      tool, release.version, current_os, current_arch))
   end
 
   -- Build Nix flake reference
@@ -52,7 +54,8 @@ function M.from_nixhub(tool, requested_version, current_os, current_arch)
   end
 
   if #outputs == 0 then
-    error("No outputs returned by nix build")
+    error("No outputs returned by nix build for " .. tool .. "@" .. release.version ..
+          " (flake_ref=" .. flake_ref .. "). The build command was: " .. build_cmd)
   end
 
   return {

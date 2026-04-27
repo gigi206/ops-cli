@@ -48,9 +48,12 @@ function PLUGIN:BackendListVersions(ctx)
   --   return { versions = { requested_version } }
   -- end
 
-  -- Use traditional nixhub.io workflow for regular package names
+  -- Use traditional nixhub.io workflow for regular package names.
+  -- platform.lua documents that RUNTIME.archType may be nil under some
+  -- mise hosts; fall back to the legacy `arch` field, then to an empty
+  -- string. Without the guard the bare `:lower()` call crashes the hook.
   local current_os = platform.normalize_os(RUNTIME.osType)
-  local current_arch = RUNTIME.archType:lower()
+  local current_arch = (RUNTIME.archType or RUNTIME.arch or ""):lower()
 
   local success, data, _response = nixhub.fetch_metadata(tool)
 

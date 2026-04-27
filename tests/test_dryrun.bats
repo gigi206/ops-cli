@@ -50,6 +50,18 @@ setup() {
 # semantic command rather than its quoted rendering.
 _unquote() { printf '%s' "${1//\\ / }"; }
 
+# More aggressive: strip ALL `\X` escapes so assertions can match against
+# the bare semantic command line. Used when the pattern includes shell
+# metachars that printf '%q' escapes too (`|`, `;`, `{`, `}`, `<`, `>`,
+# `&`, `(`, `)`, `*`, `?`). _unquote alone only strips `\ `.
+_unescape() {
+    # `bash -c 'printf %b'` interprets `\\;` etc. but we want a plain
+    # textual strip — Python-style: drop any backslash that precedes a
+    # non-alphanumeric char. Implemented with a sed character class so we
+    # don't depend on bash's parameter expansion edge cases.
+    printf '%s' "$1" | sed 's/\\\([^A-Za-z0-9]\)/\1/g'
+}
+
 @test "run --install alone chains mise install before an interactive bash" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --install --dry-run
     [ "$status" -eq 0 ]
@@ -140,7 +152,159 @@ _unquote() { printf '%s' "${1//\\ / }"; }
     run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"opencode"* ]]
-    [[ "$output" == *"sst/opencode"* ]]
+    [[ "$output" == *"opencode-ai"* ]]
+}
+
+# Regression guard: opencode used to be installed via the Bun
+# single-binary `github:sst/opencode`, which hung the TUI at cold
+# launch (see CHANGELOG / commit history). The fix was to switch to
+# the regular npm package `npm:opencode-ai`. If anyone reverts that
+# switch, this test fails loudly.
+@test "run --opencode uses npm:opencode-ai (NOT github:sst/opencode)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"npm:opencode-ai"* ]]
+    [[ "$norm" != *"github:sst/opencode"* ]]
+}
+
+# Regression guard: _agent_cmd uses `command -v $bin` (PATH lookup, ~0 ms)
+# for the warm-path resolution, NOT `mise which` (which boots the full
+# mise toolset, ~5–17 s, and would re-trigger the nix plugin's MiseEnv
+# hook on every agent launch). Switching opencode from the Bun
+# single-binary to `npm:opencode-ai` removed the constraint that forced
+# us back to `mise which` previously. One @test per agent so a regression
+# on a single branch of _agent_cmd's `case "$pkg" in npm:*) ... ;; *)
+# ... ;; esac` surfaces clearly. `_unescape` strips the printf '%q'
+# backslash-escapes so we match the semantic command line.
+@test "run --claude uses 'command -v claude' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --claude --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"command -v claude"* ]]
+    [[ "$norm" != *"mise which claude"* ]]
+}
+
+@test "run --gemini uses 'command -v gemini' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --gemini --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"command -v gemini"* ]]
+    [[ "$norm" != *"mise which gemini"* ]]
+}
+
+@test "run --opencode uses 'command -v opencode' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"command -v opencode"* ]]
+    [[ "$norm" != *"mise which opencode"* ]]
+}
+
+@test "run --codex uses 'command -v codex' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --codex --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"command -v codex"* ]]
+    [[ "$norm" != *"mise which codex"* ]]
+}
+
+# The fast path skips the slow mise install. The fallback (`|| mise use
+# -g …`) must still be present so a fresh container without the shim
+# falls back to a real install. opencode now uses the npm package
+# `opencode-ai` (was `github:sst/opencode`, the Bun single-binary
+# variant — switched because the bundled Bun watcher binding fails to
+# extract on cold container start, hanging the TUI).
+@test "agent commands keep 'mise use -g' fallback after 'command -v'" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"|| { printf "* ]]
+    [[ "$norm" == *"mise use -g node@lts; mise use -g npm:opencode-ai"* ]]
+}
+
+# UX guard: cold-path install can take ~1 min (download + extract). To
+# avoid the user staring at a silent terminal, _agent_cmd emits an
+# "==> Installing $bin …" notice on stderr BEFORE `mise use -g`. The
+# stderr destination (>&2) keeps the agent's stdout clean for piping.
+@test "agent cold-path install prints an 'Installing …' notice on stderr" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
+    [[ "$norm" == *"' opencode >&2"* ]]
+}
+
+# UX guard: after `mise use -g` writes its install spinner / progress /
+# "tools:" line to the TTY, we `clear` the screen before exec'ing the
+# agent. Without it, the agent's TUI would start with mise's output
+# still in the scrollback above it. `2>/dev/null || true` keeps the
+# chain alive if `clear` is somehow missing (rare, defensive).
+@test "agent cold-path install runs 'clear' before exec" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"; clear 2>/dev/null || true; }"* ]]
+}
+
+# Perf guard: after `mise use -g` bumps /opt/mise/data/config/config.toml,
+# the bashrc cache becomes stale. If we don't regen it inside this same
+# run, the NEXT `./ops.sh run --<agent>` will trigger `mise hook-env`
+# (~8 s cold) before reaching the agent. Calling __ops_refresh_cache
+# (defined in /etc/ops-bashrc) here amortizes that cost into the
+# already-slow cold install.
+@test "agent cold-path install regenerates the bashrc cache via __ops_refresh_cache" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"; __ops_refresh_cache; clear 2>/dev/null"* ]]
+}
+
+@test "agent cold-path: claude (npm) also notices + clears" {
+    # Same UX guard on the npm:* branch of the case.
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --claude --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
+    [[ "$norm" == *"' claude >&2"* ]]
+    [[ "$norm" == *"; clear 2>/dev/null || true; }"* ]]
+}
+
+# Coverage parity: gemini and codex must get the same UX (notif + clear
+# + cache refresh) — otherwise a regression on _agent_cmd's npm:*
+# branch could silently break one agent without the other tests
+# catching it.
+@test "agent cold-path: gemini (npm) notices + clears + refreshes cache" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --gemini --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
+    [[ "$norm" == *"' gemini >&2"* ]]
+    [[ "$norm" == *"; __ops_refresh_cache; clear 2>/dev/null || true; }"* ]]
+}
+
+@test "agent cold-path: codex (npm) notices + clears + refreshes cache" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --codex --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
+    [[ "$norm" == *"' codex >&2"* ]]
+    [[ "$norm" == *"; __ops_refresh_cache; clear 2>/dev/null || true; }"* ]]
+}
+
+# Notice + clear must NOT appear in the warm path (they live inside the
+# `||` arm that only runs when `command -v` fails). Negative test
+# ensures we don't accidentally emit the install banner on every launch.
+@test "agent warm path does NOT print Installing notice" {
+    # The Installing string only appears INSIDE the install branch — the
+    # outer command line still contains it (rendered by --dry-run), but
+    # we can verify the install branch is gated behind `command -v … ||
+    # {`. Concretely: the literal `command -v $bin >/dev/null 2>&1 ||`
+    # precedes the `printf 'Installing'` call.
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"command -v opencode >/dev/null 2>&1 || { printf"* ]]
 }
 
 @test "run --dry-run with explicit command includes it" {

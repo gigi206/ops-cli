@@ -30,6 +30,7 @@
 #   or call the wrapper explicitly (see scripts/_nix-wrapper.sh).
 
 set -eu
+set -o pipefail
 
 # Resolve which command was invoked (via $0's basename).
 name=$(basename "$0")

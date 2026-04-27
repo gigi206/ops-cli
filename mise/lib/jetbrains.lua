@@ -5,9 +5,6 @@
 -- JetBrains plugin detection, management, and installation
 local shell = require("shell")
 local logger = require("logger")
-local tempdir = require("tempdir")
-local cmd = require("cmd")
-local file = require("file")
 local platform = require("platform")
 local plugin_matcher = require("plugin_matcher")
 
@@ -127,7 +124,96 @@ function M.get_plugins_dir(ide_name, version)
   end
 end
 
--- Plugin installation via extracted JAR/ZIP
+-- List all .jar files under `plugin_path`. Returns nil when the find
+-- output is empty / whitespace-only — caller falls back to the dir layout.
+local function list_jars(plugin_path)
+  local ok, out = shell.try_exec("find " .. shell.shquote(plugin_path) .. ' -name "*.jar" -type f')
+  if not ok or not out or not out:match("%S") then
+    return nil
+  end
+  local jars = {}
+  for jar_file in out:gmatch("[^\n]+") do
+    table.insert(jars, jar_file)
+  end
+  return jars
+end
+
+-- Copy a single JAR into plugins_dir, skipping if already there.
+-- Returns (true, name) on success, (false, err) on failure.
+local function install_jar(jar_file, plugins_dir)
+  local jar_name = jar_file:match("([^/]+)$")
+  local target_path = plugins_dir .. "/" .. jar_name
+  if shell.path_exists(target_path, "f") then
+    logger.info("JetBrains plugin JAR already installed: " .. jar_name)
+    return true, jar_name
+  end
+  local copy_ok, copy_result = shell.try_exec(
+    "cp " .. shell.shquote(jar_file) .. " " .. shell.shquote(target_path))
+  if copy_ok then
+    logger.debug("Copied JAR: " .. jar_name)
+    return true, jar_name
+  end
+  logger.fail("Failed to copy JAR: " .. jar_name)
+  logger.debug("Copy error: " .. (copy_result or "unknown error"))
+  return false, copy_result
+end
+
+-- JAR-tree branch: each *.jar lives directly under the plugins_dir.
+-- Returns (ok, status) following the install_plugin contract below.
+local function install_via_jars(plugin_path, plugin_info, plugins_dir)
+  local jars = list_jars(plugin_path)
+  if not jars then
+    return nil, nil  -- caller will try the directory fallback
+  end
+  local jar_list = {}
+  for _, jar_file in ipairs(jars) do
+    local ok, name_or_err = install_jar(jar_file, plugins_dir)
+    if not ok then
+      return false, name_or_err
+    end
+    table.insert(jar_list, name_or_err)
+  end
+  if #jar_list == 0 then
+    return nil, nil
+  end
+  logger.done("JetBrains plugin installed: " .. plugin_info.plugin_id)
+  logger.info("Plugin JARs: " .. table.concat(jar_list, ", "))
+  logger.info("Plugin location: " .. plugins_dir)
+  logger.info("Restart your JetBrains IDE to activate the plugin")
+  return true, "installed"
+end
+
+-- Directory-tree branch: plugin ships as a sub-directory tree (META-INF/,
+-- lib/, etc.) under plugin_install_dir.
+local function install_via_dir(plugin_path, plugin_info, plugin_install_dir)
+  if shell.path_exists(plugin_install_dir, "d") then
+    logger.info("JetBrains plugin already installed: " .. plugin_info.plugin_id)
+    return true, "already_installed"
+  end
+  shell.exec("mkdir -p " .. shell.shquote(plugin_install_dir))
+
+  -- Copy plugin files. The trailing /* and / are shell syntax, not part of
+  -- the quoted path — we shquote the bases and concat the glob/suffix after.
+  local copy_ok, copy_result = shell.try_exec(
+    "cp -r " .. shell.shquote(plugin_path) .. "/* " .. shell.shquote(plugin_install_dir) .. "/")
+  if copy_ok then
+    logger.done("JetBrains plugin installed: " .. plugin_info.plugin_id)
+    logger.info("Plugin location: " .. plugin_install_dir)
+    logger.info("Restart your JetBrains IDE to activate the plugin")
+    return true, "installed"
+  end
+  logger.fail("JetBrains plugin installation failed")
+  logger.debug("Copy error: " .. (copy_result or "unknown error"))
+  -- Clean up failed installation
+  shell.try_exec("rm -rf " .. shell.shquote(plugin_install_dir))
+  return false, copy_result
+end
+
+-- Plugin installation via extracted JAR/ZIP. Two-branch flow:
+--   1. JAR tree    — *.jar files copied flat into plugins_dir
+--   2. Directory   — full sub-tree copied under plugins_dir/<plugin_id>/
+-- The branches are split into helpers above so the orchestration here
+-- stays readable. Returns (ok, status_string).
 function M.install_plugin(plugin_path, plugin_info)
   -- In CI environments, skip actual JetBrains plugin installation since it's experimental
   if os.getenv("CI") or os.getenv("GITHUB_ACTIONS") then
@@ -137,77 +223,20 @@ function M.install_plugin(plugin_path, plugin_info)
   end
 
   local plugins_dir = M.get_plugins_dir(plugin_info.ide, plugin_info.version)
-
-  -- Log OS detection for debugging
   logger.debug("Detected OS: " .. platform.detect_os())
   logger.debug("Plugin directory: " .. plugins_dir)
-
-  -- Create plugins directory if it doesn't exist
   shell.exec("mkdir -p " .. shell.shquote(plugins_dir))
 
-  -- Check if we have JAR files to copy directly to plugins directory
-  local jar_files_ok, jar_files = shell.try_exec("find " .. shell.shquote(plugin_path) .. ' -name "*.jar" -type f')
-  if jar_files_ok and jar_files and jar_files:match("%S") then
-    -- Copy JAR files directly to plugins directory
-    local jar_list = {}
-    for jar_file in jar_files:gmatch("[^\n]+") do
-      local jar_name = jar_file:match("([^/]+)$")
-      local target_path = plugins_dir .. "/" .. jar_name
-
-      -- Check if JAR is already installed
-      if shell.try_exec("test -f " .. shell.shquote(target_path)) then
-        logger.info("JetBrains plugin JAR already installed: " .. jar_name)
-        table.insert(jar_list, jar_name)
-      else
-        local copy_ok, copy_result = shell.try_exec("cp " .. shell.shquote(jar_file) .. " " .. shell.shquote(target_path))
-        if copy_ok then
-          logger.debug("Copied JAR: " .. jar_name)
-          table.insert(jar_list, jar_name)
-        else
-          logger.fail("Failed to copy JAR: " .. jar_name)
-          logger.debug("Copy error: " .. (copy_result or "unknown error"))
-          return false, copy_result
-        end
-      end
-    end
-
-    if #jar_list > 0 then
-      logger.done("JetBrains plugin installed: " .. plugin_info.plugin_id)
-      logger.info("Plugin JARs: " .. table.concat(jar_list, ", "))
-      logger.info("Plugin location: " .. plugins_dir)
-      logger.info("Restart your JetBrains IDE to activate the plugin")
-      return true, "installed"
-    end
+  -- Try the JAR-tree layout first; install_via_jars returns nil when no
+  -- JARs are present, signalling we should fall through to the dir layout.
+  local jar_ok, jar_status = install_via_jars(plugin_path, plugin_info, plugins_dir)
+  if jar_ok ~= nil then
+    return jar_ok, jar_status
   end
 
-  -- Fallback to directory-based installation
+  -- Directory-tree fallback.
   local plugin_install_dir = plugins_dir .. "/" .. plugin_info.plugin_id
-
-  -- Check if plugin is already installed
-  if shell.try_exec("test -d " .. shell.shquote(plugin_install_dir)) then
-    logger.info("JetBrains plugin already installed: " .. plugin_info.plugin_id)
-    return true, "already_installed"
-  end
-
-  -- Create plugin directory
-  shell.exec("mkdir -p " .. shell.shquote(plugin_install_dir))
-
-  -- Copy plugin files. The trailing /* and / are shell syntax, not part of the
-  -- quoted path — we shquote the bases and concat the glob/suffix after.
-  local copy_ok, copy_result = shell.try_exec("cp -r " .. shell.shquote(plugin_path) .. "/* " .. shell.shquote(plugin_install_dir) .. "/")
-
-  if copy_ok then
-    logger.done("JetBrains plugin installed: " .. plugin_info.plugin_id)
-    logger.info("Plugin location: " .. plugin_install_dir)
-    logger.info("Restart your JetBrains IDE to activate the plugin")
-    return true, "installed"
-  else
-    logger.fail("JetBrains plugin installation failed")
-    logger.debug("Copy error: " .. (copy_result or "unknown error"))
-    -- Clean up failed installation
-    shell.try_exec("rm -rf " .. shell.shquote(plugin_install_dir))
-    return false, copy_result
-  end
+  return install_via_dir(plugin_path, plugin_info, plugin_install_dir)
 end
 
 -- Extract and install plugin from Nix store path
@@ -224,14 +253,13 @@ function M.install_from_nix_store(plugin_info, nix_store_path, tool_name)
   }
 
   for _, path in ipairs(possible_paths) do
-    local qp = shell.shquote(path)
-    if shell.try_exec("test -d " .. qp) then
+    if shell.path_exists(path, "d") then
       -- `find | head -1` always exits 0, so the first return value of try_exec
       -- (the pcall success boolean) would be true even when the directory holds
       -- zero .jar files. We must inspect the command's stdout to decide.
-      local _, find_out = shell.try_exec("find " .. qp .. ' -name "*.jar" | head -1')
+      local _, find_out = shell.try_exec("find " .. shell.shquote(path) .. ' -name "*.jar" | head -1')
       local has_jar = type(find_out) == "string" and find_out:match("%S") ~= nil
-      local has_plugin_xml = shell.try_exec("test -f " .. shell.shquote(path .. "/META-INF/plugin.xml"))
+      local has_plugin_xml = shell.path_exists(path .. "/META-INF/plugin.xml", "f")
 
       if has_jar or has_plugin_xml then
         plugin_path = path

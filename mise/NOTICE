@@ -86,6 +86,34 @@ Modifications by Ghislain LE MEUR (2026):
     utils.load_env (single source of user-facing diagnostics).
     hooks/mise_path.lua deliberately discards them so each diagnostic
     appears exactly once per `mise env` invocation.
+  - lib/utils.lua: added a disk cache for `nix print-dev-env` JSON output
+    in <project_root>/.mise-nix/devenv-cache.<key>.json. The key is
+    sha256(flake.lock + every *.nix file + flake_ref + flake_attr + arch),
+    so the cache invalidates whenever any input that affects the resolved
+    devShell changes -- including local imports (`import ./shell.nix`)
+    that flake.lock alone cannot pin. Mise's built-in `cacheable = true`
+    is a no-op under the default `env_cache = false` setting and
+    measurably slower when env_cache is enabled, so the plugin owns its
+    own cache. Eliminates the ~3 s `nix print-dev-env` cost on every
+    shell prompt (i.e. on every `mise hook-env` triggered by a fresh
+    container or `cd` event) once the cache is warm. Atomic writes via
+    mktemp + mv handle the MiseEnv/MisePath cold-start race without
+    needing a flock. The cache loader probes the nix profile gc-root
+    (`<profile_dir>/profile`) before honouring a hit; if `nix store gc`
+    has evicted the profile target, the cache is invalidated automatically
+    and a fresh `nix print-dev-env` is run so the user does not end up
+    with a PATH full of broken /nix/store/* segments. Opt out entirely
+    with MISE_NIX_NO_CACHE=1.
+    On every successful evaluation the plugin also pins the resolved
+    profile under /nix/var/nix/gcroots/per-user/<uid>/mise-nix-<hash>
+    (sha256-of-PROFILE_DIR truncated to 16 chars). This persistent
+    gc-root prevents `nix-collect-garbage` runs (notably the one wired
+    into the ops-cli image build under NIX_CLEANUP=true) from sweeping
+    away the devShell's transitive paths between shells, which would
+    otherwise leave the user with a PATH full of broken /nix/store/*
+    segments after every image rebuild. The hash is per-PROFILE_DIR so
+    multiple workspaces sharing the same nix store volume don't
+    collide.
 
 The combined work is distributed under the Apache License, Version 2.0.
 Files licensed under MIT retain their original copyright and license and must

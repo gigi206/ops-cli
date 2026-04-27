@@ -44,13 +44,11 @@ function M.is_reference(tool)
     if tool:match(pattern) then return true end
   end
 
-  -- Check if it looks like a path that might omit the leading ./ but still be a flake
-  if tool:match("^[%w%-_%.]+#") then -- e.g., "my-flake#package" assuming current dir
-      -- This is ambiguous, could be a regular package name with a hash in it
-      -- For now, we'll keep it as false unless more context is available
-      -- The safest bet is to require a more explicit path or URL prefix.
-  end
-
+  -- Intentionally ambiguous: bare `name#attr` (no `./` prefix, no scheme)
+  -- could be either a relative path flake OR a regular package with `#`
+  -- in its name. We treat it as NOT a flake reference; users who really
+  -- mean a local flake must spell it `./name#attr` (matched by the
+  -- "^%./.*#" pattern above).
   return false
 end
 
@@ -92,19 +90,6 @@ function M.convert_custom_git_prefix(version)
   return version
 end
 
--- Parse Git hosting shortcuts with enhanced ref support
--- Nix natively supports these formats, so we just pass through:
---   github:owner/repo (default branch)
---   github:owner/repo/ref (specific branch/tag)
---   github:owner/repo?ref=X (query param style)
---   gitlab:group/subgroup/project (nested groups)
---   gitlab:group/project?ref=X (query param style)
-function M.parse_git_ref_syntax(flake_url)
-  if not flake_url or type(flake_url) ~= "string" then return flake_url end
-  -- Nix handles all standard flake URL formats natively, just pass through
-  return flake_url
-end
-
 -- Parse flake reference into components with enhanced ref support
 function M.parse_reference(flake_ref)
   -- Handle VSCode install syntax (vscode+install=vscode-extensions.publisher.extension)
@@ -140,9 +125,9 @@ function M.parse_reference(flake_ref)
   -- Convert custom git prefixes to standard nix flake URLs
   flake_url = M.convert_custom_git_prefix(flake_url)
 
-  -- Parse GitHub/GitLab shortcuts with branch/tag/ref support
-  -- Handle formats like: github:owner/repo/branch, github:owner/repo?ref=v1.0.0, etc.
-  flake_url = M.parse_git_ref_syntax(flake_url)
+  -- Note: Nix natively supports all standard flake URL formats
+  -- (github:owner/repo[/ref], github:owner/repo?ref=X, gitlab:..., …)
+  -- so we don't transform those here — they pass through to `nix build`.
 
   -- Normalize GitHub shorthand (owner/repo -> github:owner/repo)
   -- But exclude local paths that start with ./ or ../
@@ -181,9 +166,12 @@ end
 function M.build(flake_ref, version)
   local security = require("security")
 
-  -- Validate that it's actually a flake reference
+  -- Validate that it's actually a flake reference. Quote the offending
+  -- value so users see what they passed (the previous bare error left
+  -- them debugging blind).
   if not M.is_reference(flake_ref) then
-    error("Invalid flake reference")
+    error("Invalid flake reference: " .. tostring(flake_ref) ..
+          " (expected one of: github:owner/repo#attr, gitlab:..., git+https://..., path:..., owner/repo#attr)")
   end
 
   local parsed = M.parse_reference(flake_ref)
@@ -198,8 +186,19 @@ function M.build(flake_ref, version)
   if version and version ~= "latest" and version ~= "local" and version ~= "" then
     -- For git-based flakes, we can specify a revision
     if parsed.url:match("github:") or parsed.url:match("gitlab:") then
-      -- Remove any existing revision (if present) and add the new one
-      local base_url = parsed.url:gsub("/[a-fA-F0-9]+$", ""):gsub("/v?%d+%.%d+%.%d+.*$", "") -- Remove existing hash/tag
+      -- Remove any existing revision (if present) and add the new one.
+      -- Only strip a trailing hex suffix when it looks like a real git
+      -- revision (>= 7 hex chars — git's default abbrev length). The
+      -- previous `[a-fA-F0-9]+$` accepted ANY hex tail, including a
+      -- short subdir name that happened to be hex-only (e.g.
+      -- `github:owner/repo/abc` would lose `abc`). Lua patterns lack
+      -- `{n,}`, so we capture the suffix and check its length manually.
+      local stripped = parsed.url
+      local before, hex = stripped:match("^(.-)/(%x+)$")
+      if before and hex and #hex >= 7 then
+        stripped = before
+      end
+      local base_url = stripped:gsub("/v?%d+%.%d+%.%d+.*$", "") -- Remove existing semver tag
       build_ref = base_url .. "/" .. version .. "#" .. parsed.attribute
     elseif parsed.url:match("git%+") then
       -- For git+ URLs, we need to add ?ref= or ?rev= parameter

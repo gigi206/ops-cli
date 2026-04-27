@@ -36,14 +36,20 @@ jobs:
           # do not hide a missing package.
           key: apt-bats-shellcheck-luarocks-${{ runner.os }}-v3
 
-      - name: Install bats + shellcheck + luacheck
+      - name: Install bats + shellcheck + luacheck + lua
         run: |
           # luacheck is no longer available in ubuntu-24.04 (noble) main/universe
           # apt indexes -- it ships only as a luarocks package upstream. Install
           # luarocks via apt then luacheck via luarocks (the apt path picks the
           # bats + shellcheck binaries which are still packaged).
+          # lua5.4 is needed to run the unit-test harness under tests/lua/
+          # (no busted dependency — pure-Lua harness, see tests/lua/run.lua).
+          # NOTE: lua is also declared in mise.toml [tools] for local
+          # development convenience (`mise install` picks it up). The apt
+          # path is kept here for CI speed: ubuntu-latest's apt cache hits
+          # in seconds, vs ~1 min to compile lua via vfox-lua from source.
           sudo apt-get update
-          sudo apt-get install -y bats shellcheck luarocks
+          sudo apt-get install -y bats shellcheck luarocks lua5.4
           sudo luarocks install luacheck
 
       - name: Shellcheck ops.sh + helper scripts (style level)
@@ -56,12 +62,29 @@ jobs:
         run: |
           bash -n ops.sh
           for f in scripts/*.sh; do bash -n "$f"; done
+          # ops-bashrc has no .sh extension (sourced by `bash --rcfile`)
+          # so the glob above misses it. Check it explicitly so syntax
+          # errors in the in-image rcfile don't slip through.
+          bash -n scripts/ops-bashrc
 
       - name: Luacheck mise/ plugin
         # All knobs (globals, excluded files, accepted warnings) live in
         # the repo-root .luacheckrc — keep CI and local `mise run lint`
         # in lockstep without duplicating flags.
         run: luacheck mise/
+
+      - name: Run Lua unit tests
+        # Pure-Lua tests for plugin helpers (shell.shquote, version parsing,
+        # flake.is_reference, plugin_matcher). The harness stubs mise's
+        # native modules via package.preload, so a vanilla `lua5.4` is
+        # enough — no busted/luarocks dependency.
+        run: lua5.4 tests/lua/run.lua
+
+      - name: Verify README test counts
+        # Fails the build when a contributor adds/removes a @test without
+        # updating the README. Run with `bash scripts/check-test-counts.sh
+        # --update` locally to fix the drift.
+        run: bash scripts/check-test-counts.sh
 
       - name: Run bats tests
         run: bats --tap tests/ | tee bats-output.tap
@@ -91,16 +114,18 @@ jobs:
           # SC2028 (hadolint-shellcheck): false positive on the `echo '…'`
           #         lines in the bashrc append block; no escape sequences
           #         are actually present
-          ignore: DL3008,DL3059,DL3004,SC1091,SC2028
-      - name: hadolint Dockerfile.debian (if present)
-        if: hashFiles('Dockerfile.debian') != ''
+          # SC2086: intentional word-split on `${EXTRA_MISE_TOOLS}` so the
+          #         space-separated list expands into multiple `mise use`
+          #         arguments (annotated inline as `# shellcheck disable=SC2086`).
+          ignore: DL3008,DL3059,DL3004,SC1091,SC2028,SC2086
+      - name: hadolint Dockerfile.debian
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile.debian
           # Same ignore list as the Arch Dockerfile above — Dockerfile.debian
-          # is a parity twin and uses the same `sudo` + `echo alias=…` blocks,
-          # so the same DL3004 / SC2028 waivers apply.
-          ignore: DL3008,DL3059,DL3004,SC1091,SC2028
+          # is a parity twin and uses the same `sudo` + `echo alias=…` +
+          # word-split blocks.
+          ignore: DL3008,DL3059,DL3004,SC1091,SC2028,SC2086
 
   trivy-fs:
     name: trivy (filesystem + config)
@@ -114,7 +139,10 @@ jobs:
         # in Dockerfiles / workflows. Non-blocking (exit-code 0) so a new
         # advisory doesn't freeze the main branch — CI surfaces findings via
         # the workflow log, triage happens out-of-band.
-        uses: aquasecurity/trivy-action@0.35.0
+        # Pinned by commit SHA (security action — a hostile tag could
+        # publish a poisoned scanner), with the human-readable tag in the
+        # comment for review at update time.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           scan-type: fs
           scan-ref: .
@@ -122,6 +150,46 @@ jobs:
           ignore-unfixed: true
           exit-code: '0'
           format: table
+
+  sbom:
+    name: SBOM (syft → CycloneDX + SPDX)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (CycloneDX JSON)
+        # syft scans the working tree for declared / installed dependencies and
+        # emits a Software Bill of Materials. We publish two formats:
+        #   * CycloneDX 1.5 JSON  — broadly consumed by Dependency-Track,
+        #     GitHub native ingestion, OWASP tooling.
+        #   * SPDX 2.3 JSON       — Linux Foundation / SPDX consumers.
+        # Non-blocking job (no scan-side gate); the artifact lets downstream
+        # consumers diff supply-chain composition between releases.
+        # Pinned by commit SHA: the previous `@v0` floating-major tag would
+        # silently accept a hostile retag. Human-readable version in the
+        # comment for review at update time.
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom-cyclonedx.json
+          upload-artifact: false
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom-spdx.json
+          upload-artifact: false
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+          retention-days: 90
 
   runtime-build:
     name: build smoke (${{ matrix.runtime }})
@@ -234,23 +302,11 @@ jobs:
           # (the actual Nix build still runs; only the GC is skipped)
         run: |
           # Minimal smoke: parse + tag the Dockerfile without pulling the
-          # entire Nix tree. We run `build` with a tiny base to validate the
-          # full pipeline of ops.sh (flags, lock, hash, labels) against every
-          # runtime — not the heavy Arch image itself (which would take 30min+).
-          cat > Dockerfile.cismoke <<'EOF'
-          # syntax=docker/dockerfile:1.6
-          FROM docker.io/library/alpine:3.19
-          ARG USER_UID=1000
-          ARG USER_GID=1000
-          ARG USER_NAME=ci
-          ARG USER_LANG=C
-          RUN addgroup -g "$USER_GID" "$USER_NAME" \
-           && adduser -D -u "$USER_UID" -G "$USER_NAME" "$USER_NAME"
-          USER ${USER_NAME}
-          CMD ["sh"]
-          EOF
+          # entire Nix tree. The fixture lives at tests/fixtures/Dockerfile.cismoke
+          # so the same definition is used by the local `mise run smoke` task
+          # (no inline here-doc to keep in sync).
           OPS_IMAGE=localhost/ops-ci-smoke \
-          OPS_DOCKERFILE=Dockerfile.cismoke \
+          OPS_DOCKERFILE=tests/fixtures/Dockerfile.cismoke \
             ./ops.sh build
           # Sanity: the image must exist and carry the ops.dockerfile label
           if [ "$OPS_RUNTIME" = "nerdctl" ]; then
@@ -322,6 +378,42 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         # NIX_CLEANUP=true (default) is important here: the GC root fix is
         # only exercised when nix-collect-garbage -d actually runs.
+        run: ./ops.sh build
+
+      - name: Run integration tests against the built image
+        run: bats --tap tests/test_image_integration.bats
+
+  image-integration-debian:
+    name: image integration (Debian)
+    # Mirrors `image-integration` but for Dockerfile.debian. Without this,
+    # the Debian variant only got hadolint coverage — every parity break
+    # (forgotten RUN, ENV, wrapper) would slip through silently. We tag
+    # the Debian build under the same `localhost/ops-dev` name so the
+    # tests/test_image_integration.bats helpers (`require_ops_image`,
+    # `run_in_image`) work without modification.
+    if: |
+      always()
+      && needs.bats.result == 'success'
+      && needs.hadolint.result == 'success'
+      && (
+        github.event_name == 'push'
+        || github.event_name == 'workflow_dispatch'
+        || (github.event_name == 'pull_request' && needs.image_changes.result == 'success' && needs.image_changes.outputs.image == 'true')
+      )
+    runs-on: ubuntu-latest
+    needs: [bats, hadolint, image_changes]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+
+      - name: Build localhost/ops-dev (full Debian image, tagged as ops-dev)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPS_DOCKERFILE: Dockerfile.debian
         run: ./ops.sh build
 
       - name: Run integration tests against the built image

@@ -62,3 +62,22 @@ setup() {
     # Mock emits sha256:dangling as the ID
     [[ "$output" == *"sha256:dang"* ]] || [[ "$output" == *"dangling"* ]]
 }
+
+@test "clean interactive: answering 'n' to both prompts performs no destructive ops" {
+    # Two [y/N] prompts: dangling+containers, then volumes. Both bare 'n'
+    # (trailing newline) — equivalent to bare Enter (default = no).
+    run bash -c "printf 'n\nn\n' | env OPS_RUNTIME=docker '$(ops_sh)' clean"
+    [ "$status" -eq 0 ]
+    # No prune, rm or volume rm should have been recorded by the mock
+    ! grep -qE 'image prune|^rm |volume rm' "$MOCK_LOG"
+}
+
+@test "clean interactive: empty 'y' on the images prompt prunes images only" {
+    # 'y' to dangling/containers prompt, 'n' to volumes — only the first
+    # branch should fire. Asserts the volume-removal path stays untouched.
+    run bash -c "printf 'y\nn\n' | env OPS_RUNTIME=docker '$(ops_sh)' clean"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Pruned."* ]]
+    refute_output_contains "Volumes removed."
+    ! grep -qE '^volume rm' "$MOCK_LOG"
+}

@@ -1,0 +1,15 @@
+# Per-contributor mise overlay. Copy to mise.local.toml (gitignored) to
+# activate. Read automatically by mise on top of the committed mise.toml.
+#
+# The most common use case is to test the mise-nix plugin (the one shipped
+# in mise/) against a local flake.nix without committing either file. With
+# `_.nix = true`, every shell mise spawns inside this repo loads the
+# devShell outputs from the workdir's flake.nix (PATH, PYTHONPATH, …).
+#
+# MISE_NIX_ALLOW_UNTRACKED=1 lets the plugin read flake.nix via the path:
+# fetcher instead of git+file:, so the file can stay 100% untracked.
+# Drop that line to enforce the strict git-tracked requirement.
+
+[env]
+MISE_NIX_ALLOW_UNTRACKED = "1"
+_.nix = true
