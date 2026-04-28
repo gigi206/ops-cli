@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.3.0"
+OPS_VERSION="1.4.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -32,6 +32,24 @@ readonly OPS_VERSION
 # - default: assigned later by :- fallbacks in this script
 declare -A _OPS_ORIGIN=()
 for _v in $(compgen -v 2>/dev/null | grep '^OPS_' || true); do _OPS_ORIGIN[$_v]='env'; done
+unset _v
+
+# Snapshot every UPPER_CASE env var BEFORE sourcing ops.conf so
+# `config secret add NAME --from-env` reads the caller's intent rather
+# than the value the config file reinjects via `export NAME=…`. Without
+# this, the second `secret add` would silently re-write the OLD value
+# back over the new one (the source step already restored $NAME from
+# the previous secret line). The cost is a few-kB associative array per
+# invocation; negligible vs the rest of ops startup.
+declare -A _PRE_SOURCE_ENV=()
+for _v in $(compgen -v 2>/dev/null | grep -E '^[A-Z_][A-Z0-9_]*$' || true); do
+    # `${!_v:-}` is mandatory under `set -u`: indirect expansion on a
+    # variable that has been listed by `compgen -v` but transitioned to
+    # unset between the listing and the lookup (rare race, but observed
+    # under bats with helpers that aggressively unset env vars during
+    # setup) would otherwise trip "unbound variable" and abort startup.
+    _PRE_SOURCE_ENV[$_v]="${!_v:-}"
+done
 unset _v
 
 _CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ops/ops.conf"
@@ -1210,25 +1228,568 @@ EOF
     fi
 }
 
+# ===========================================================================
+#  cmd_config helpers — managed edits to ~/.config/ops/ops.conf
+# ===========================================================================
+#
+# Programmatic, idempotent edits to ops.conf for /ops-setup and other tooling
+# that need to manage the config file without re-implementing the parser.
+# Three contracts:
+#   - Atomicity: every write goes through mktemp + mv on the same filesystem,
+#     so concurrent readers never observe a half-written file.
+#   - Idempotency: running the same `set/unset/alias add/remove` twice is a
+#     no-op on the second invocation.
+#   - Preservation: comments, blank lines, and key ordering are kept; only
+#     the targeted line is modified. Falls back to append when absent.
+
+# Keys that are bash arrays — handled via dedicated `config alias add/remove`
+# (or `config images …` if/when that lands). Scalar set/unset on these is
+# rejected because the argv shape doesn't match (`OPS_ALIASES[k]=v` ≠
+# `OPS_ALIASES=v`).
+_OPS_CONFIG_ARRAY_KEYS=" OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES "
+
+# Validate a key for `config set/get/unset`. Returns 0 if writable as a
+# scalar; emits a stderr diagnostic + non-zero otherwise.
+_cfg_validate_scalar_key() {
+    local key="${1:-}"
+    if [ -z "$key" ]; then
+        echo "Error: config set/get/unset requires a KEY (got empty)" >&2
+        return 1
+    fi
+    if ! [[ "$key" =~ ^OPS_[A-Z][A-Z0-9_]*$ ]]; then
+        echo "Error: invalid key '$key' (must match ^OPS_[A-Z][A-Z0-9_]*\$)" >&2
+        return 1
+    fi
+    case "$_OPS_CONFIG_ARRAY_KEYS" in
+        *" $key "*)
+            echo "Error: '$key' is an array — use 'config alias' (or edit ops.conf directly for OPS_IMAGES/OPS_DOCKERFILES/OPS_CONTAINER_NAMES/OPS_BUILD_ARGS)" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Validate a value for `config set`. Refuses newlines (would break the
+# line-based ops.conf parser).
+_cfg_validate_value() {
+    local val="${1-}"
+    if [[ "$val" == *$'\n'* ]] || [[ "$val" == *$'\r'* ]]; then
+        echo "Error: value contains a newline (not supported in ops.conf)" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Validate an alias name. Refuses reserved subcommand names and any non-
+# identifier shape — both would be unreachable through `_expand_alias`.
+_cfg_validate_alias_name() {
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        echo "Error: alias name required" >&2
+        return 1
+    fi
+    if ! [[ "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+        echo "Error: invalid alias name '$name' (must match ^[a-zA-Z][a-zA-Z0-9_-]*\$)" >&2
+        return 1
+    fi
+    case "$_OPS_RESERVED" in
+        *" $name "*)
+            echo "Error: '$name' is a reserved subcommand name" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Ensure $_CONFIG_FILE exists with safe perms. Creates parent directory and
+# a minimal seed header on first call. Idempotent — existing file untouched
+# (only its perms are tightened to 600).
+_cfg_ensure_file() {
+    local dir
+    dir=$(dirname "$_CONFIG_FILE")
+    [ -d "$dir" ] || mkdir -p "$dir"
+    if [ ! -f "$_CONFIG_FILE" ]; then
+        cat > "$_CONFIG_FILE" <<'EOF'
+# ops configuration file — sourced by ops.sh at startup.
+# Managed by `ops config set/unset/alias`. Manual edits are preserved.
+# Reference: https://github.com/gigi206/ops-cli
+EOF
+    fi
+    chmod 600 "$_CONFIG_FILE" 2>/dev/null || true
+}
+
+# Atomic in-place rewrite of $_CONFIG_FILE. Body is read from stdin and
+# becomes the new file contents on success. mktemp + mv on the same
+# filesystem guarantees readers see either the old or new file, never
+# a torn half.
+_cfg_atomic_replace() {
+    _cfg_ensure_file
+    local tmp
+    tmp=$(mktemp "${_CONFIG_FILE}.XXXXXX") || {
+        echo "Error: cannot create temp file next to $_CONFIG_FILE" >&2
+        return 3
+    }
+    cat > "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$_CONFIG_FILE"
+}
+
+# Quote a value for safe round-trip through `source` (double-quote with
+# embedded \ and " escaped).
+_cfg_shellquote() {
+    local val="${1-}"
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    printf '"%s"' "$val"
+}
+
+# Strip surrounding "..." from a literal value read out of ops.conf.
+_cfg_unquote() {
+    local val="${1-}"
+    if [[ "$val" =~ ^\".*\"$ ]]; then
+        val="${val#\"}"
+        val="${val%\"}"
+        val="${val//\\\"/\"}"
+        val="${val//\\\\/\\}"
+    fi
+    printf '%s' "$val"
+}
+
+# Read the literal value of `KEY=...` from ops.conf. Strips surrounding
+# double-quotes if present. Echoes nothing and returns 1 if absent.
+_cfg_read_scalar() {
+    local key="$1"
+    [ -f "$_CONFIG_FILE" ] || return 1
+    local line
+    line=$(grep -E "^[[:space:]]*${key}=" "$_CONFIG_FILE" | tail -1)
+    [ -z "$line" ] && return 1
+    local val="${line#*=}"
+    _cfg_unquote "$val"
+}
+
+# Idempotent set: replace existing `KEY=…` line if present, append
+# `KEY="value"` to the end of the file otherwise. Always double-quotes so
+# values with spaces/$ round-trip safely through `source`.
+_cfg_set_scalar() {
+    local key="$1" val="$2"
+    _cfg_ensure_file
+    local quoted
+    quoted=$(_cfg_shellquote "$val")
+
+    if grep -qE "^[[:space:]]*${key}=" "$_CONFIG_FILE"; then
+        local current
+        if current=$(_cfg_read_scalar "$key"); then
+            if [ "$current" = "$val" ]; then
+                return 0
+            fi
+        fi
+        awk -v key="$key" -v new="${key}=${quoted}" '
+            $0 ~ "^[[:space:]]*"key"=" {
+                if (!done) { print new; done=1 }
+                next
+            }
+            { print }
+            END { if (!done) print new }
+        ' "$_CONFIG_FILE" | _cfg_atomic_replace
+    else
+        printf '%s=%s\n' "$key" "$quoted" >> "$_CONFIG_FILE"
+    fi
+    return 0
+}
+
+# Remove every `KEY=...` line from ops.conf. Idempotent when absent.
+_cfg_unset_scalar() {
+    local key="$1"
+    [ -f "$_CONFIG_FILE" ] || return 0
+    if ! grep -qE "^[[:space:]]*${key}=" "$_CONFIG_FILE"; then
+        return 0
+    fi
+    awk -v key="$key" '$0 !~ "^[[:space:]]*"key"=" { print }' "$_CONFIG_FILE" \
+        | _cfg_atomic_replace
+}
+
+# Add or update `OPS_ALIASES[name]="argv"`. Adds the surrounding
+# `declare -A OPS_ALIASES` block if missing. Idempotent when name already
+# maps to the same value.
+#
+# The match is intentionally done via awk's substr() rather than regex `~`
+# because POSIX awk's behaviour on bracketed escapes (`\[`) is unspecified
+# (gawk treats it as a literal `[`, mawk/BSD awk may treat it as backslash
+# followed by an opening character class). substr is unambiguous across
+# every awk implementation.
+_cfg_alias_set() {
+    local name="$1" argv="$2"
+    _cfg_ensure_file
+    local quoted target
+    quoted=$(_cfg_shellquote "$argv")
+    target="OPS_ALIASES[${name}]="
+
+    local has_decl=0
+    if grep -qE '^[[:space:]]*declare[[:space:]]+-A[[:space:]]+OPS_ALIASES' "$_CONFIG_FILE"; then
+        has_decl=1
+    fi
+
+    if grep -qF "$target" "$_CONFIG_FILE"; then
+        local current_line current_val
+        current_line=$(grep -F "$target" "$_CONFIG_FILE" | tail -1)
+        current_val=$(_cfg_unquote "${current_line#*=}")
+        if [ "$current_val" = "$argv" ]; then
+            return 0
+        fi
+        awk -v target="$target" -v new="${target}${quoted}" '
+            {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                if (substr(line, 1, length(target)) == target) {
+                    if (!done) { print new; done=1 }
+                    next
+                }
+                print
+            }
+            END { if (!done) print new }
+        ' "$_CONFIG_FILE" | _cfg_atomic_replace
+        return 0
+    fi
+
+    {
+        cat "$_CONFIG_FILE"
+        if [ "$has_decl" = 0 ]; then
+            printf '\n# Aliases (managed by `ops config alias`)\ndeclare -A OPS_ALIASES\n'
+        fi
+        printf 'OPS_ALIASES[%s]=%s\n' "$name" "$quoted"
+    } | _cfg_atomic_replace
+    return 0
+}
+
+# Remove `OPS_ALIASES[name]=…`. Idempotent when absent. Same substr
+# rationale as _cfg_alias_set above.
+_cfg_alias_unset() {
+    local name="$1"
+    [ -f "$_CONFIG_FILE" ] || return 0
+    local target="OPS_ALIASES[${name}]="
+    if ! grep -qF "$target" "$_CONFIG_FILE"; then
+        return 0
+    fi
+    awk -v target="$target" '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (substr(line, 1, length(target)) != target) {
+                print
+            }
+        }
+    ' "$_CONFIG_FILE" | _cfg_atomic_replace
+}
+
+# Validate a secret key name. Stricter than _cfg_validate_scalar_key (which
+# requires the OPS_ prefix): secrets cover both OPS_* knobs and
+# auto-propagated host vars (GITHUB_TOKEN, ANTHROPIC_API_KEY, …) so any
+# upper-case shell identifier is accepted.
+_cfg_validate_secret_key() {
+    local key="${1:-}"
+    if [ -z "$key" ]; then
+        echo "Error: secret key required" >&2
+        return 1
+    fi
+    if ! [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+        echo "Error: invalid secret key '$key' (must match ^[A-Z_][A-Z0-9_]*\$)" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Read the literal value of `export KEY=...` from ops.conf. Used internally
+# for idempotency checks; never echoed via the user-facing list command.
+_cfg_read_secret() {
+    local key="$1"
+    [ -f "$_CONFIG_FILE" ] || return 1
+    local line
+    line=$(grep -E "^[[:space:]]*export[[:space:]]+${key}=" "$_CONFIG_FILE" | tail -1)
+    [ -z "$line" ] && return 1
+    local val="${line#*=}"
+    _cfg_unquote "$val"
+}
+
+# Add or update `export KEY="value"` in ops.conf. Idempotent when the same
+# value is already stored. chmod 600 is enforced after every mutation.
+_cfg_secret_set() {
+    local key="$1" val="$2"
+    _cfg_ensure_file
+    local quoted target
+    quoted=$(_cfg_shellquote "$val")
+    target="export ${key}="
+
+    if grep -qE "^[[:space:]]*export[[:space:]]+${key}=" "$_CONFIG_FILE"; then
+        local current
+        if current=$(_cfg_read_secret "$key"); then
+            if [ "$current" = "$val" ]; then
+                chmod 600 "$_CONFIG_FILE" 2>/dev/null || true
+                return 0
+            fi
+        fi
+        awk -v target="$target" -v new="export ${key}=${quoted}" '
+            {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                if (substr(line, 1, length(target)) == target) {
+                    if (!done) { print new; done=1 }
+                    next
+                }
+                print
+            }
+            END { if (!done) print new }
+        ' "$_CONFIG_FILE" | _cfg_atomic_replace
+    else
+        printf 'export %s=%s\n' "$key" "$quoted" >> "$_CONFIG_FILE"
+    fi
+    chmod 600 "$_CONFIG_FILE" 2>/dev/null || true
+}
+
+# Remove every `export KEY=...` line. Idempotent when absent.
+_cfg_secret_unset() {
+    local key="$1"
+    [ -f "$_CONFIG_FILE" ] || return 0
+    local target="export ${key}="
+    if ! grep -qF "$target" "$_CONFIG_FILE"; then
+        return 0
+    fi
+    awk -v target="$target" '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (substr(line, 1, length(target)) != target) {
+                print
+            }
+        }
+    ' "$_CONFIG_FILE" | _cfg_atomic_replace
+}
+
+# List every `export KEY` line, names only — values must NEVER be emitted.
+# Output is sorted + de-duplicated to keep the snapshot stable when
+# secrets were re-set (which leaves the line in place but the order
+# may shift if the user manually edited the file in between).
+_cfg_secret_list() {
+    [ -f "$_CONFIG_FILE" ] || return 0
+    grep -oE '^[[:space:]]*export[[:space:]]+[A-Z_][A-Z0-9_]*' "$_CONFIG_FILE" \
+        | awk '{print $NF}' \
+        | sort -u
+}
+
 cmd_config() {
     case "${1:-}" in
         -h|--help)
             cat <<EOF
-Usage: $(basename "$0") config
+Usage: $(basename "$0") config [SUBCOMMAND]
 
-Dump the effective OPS_* configuration with origin tagging:
+Without a subcommand, dump the effective OPS_* configuration with origin
+tagging:
   [env]     defined before ops.sh sourced the config file
   [config]  defined by \$_CONFIG_FILE
   [default] assigned by a :- fallback in ops.sh
 
-Two sections:
+Two sections in the dump:
   Scalars   — every OPS_* simple variable with its resolved value + origin
   Arrays    — OPS_IMAGES / OPS_DOCKERFILES / OPS_CONTAINER_NAMES /
-              OPS_BUILD_ARGS / OPS_ALIASES / OPS_VOLUMES, each key/value pair
+              OPS_BUILD_ARGS / OPS_ALIASES / OPS_VOLUMES
 
-No flags. 'config' does not start the runtime — it's safe to call in scripts.
+Subcommands (managed edits to \$_CONFIG_FILE — atomic, idempotent,
+preserve comments and ordering):
+  set KEY VALUE              Set or replace OPS_KEY="VALUE"
+  get KEY                    Read OPS_KEY's literal value from ops.conf
+                             (exit 1 if unset)
+  unset KEY                  Remove OPS_KEY from ops.conf
+  alias add NAME 'argv...'   Add or replace OPS_ALIASES[NAME]="argv..."
+  alias remove NAME          Remove OPS_ALIASES[NAME]
+  secret add NAME [--from-env|--from-stdin|--from-prompt]
+                             Add 'export NAME="..."' (chmod 600 enforced)
+  secret list                Print secret names (values are never shown)
+  secret remove NAME         Remove the secret entry
+
+Examples:
+  ops config set OPS_RUNTIME docker
+  ops config set OPS_DEFAULT_RUN_FLAGS "--no-rm --no-wayland"
+  ops config get OPS_RUNTIME
+  ops config unset OPS_RUNTIME
+  ops config alias add cc 'run --claude'
+  ops config alias remove cc
+  ops config secret add GITHUB_TOKEN --from-env
+  ops config secret list
+  ops config secret remove GITHUB_TOKEN
+
+Edits create the file (chmod 600) and the parent directory if missing.
+'config' (no subcommand) does not start the runtime — safe in scripts.
 EOF
             return 0
+            ;;
+        set)
+            shift
+            local _set_key _set_val
+            _set_key="${1:-}"
+            _set_val="${2-}"
+            if [ $# -lt 2 ]; then
+                echo "Error: 'config set' requires KEY VALUE" >&2
+                return 1
+            fi
+            _cfg_validate_scalar_key "$_set_key" || return 1
+            _cfg_validate_value "$_set_val" || return 1
+            _cfg_set_scalar "$_set_key" "$_set_val"
+            return 0
+            ;;
+        get)
+            shift
+            local _get_key="${1:-}"
+            _cfg_validate_scalar_key "$_get_key" || return 1
+            local _get_val
+            if _get_val=$(_cfg_read_scalar "$_get_key"); then
+                printf '%s\n' "$_get_val"
+                return 0
+            fi
+            echo "Error: $_get_key is not set in $_CONFIG_FILE" >&2
+            return 1
+            ;;
+        unset)
+            shift
+            local _u_key="${1:-}"
+            _cfg_validate_scalar_key "$_u_key" || return 1
+            _cfg_unset_scalar "$_u_key"
+            return 0
+            ;;
+        alias)
+            shift
+            local _a_action="${1:-}"
+            case "$_a_action" in
+                add)
+                    shift
+                    if [ $# -lt 2 ]; then
+                        echo "Error: 'config alias add' requires NAME ARGV" >&2
+                        return 1
+                    fi
+                    local _a_name="${1:-}" _a_argv="${2-}"
+                    _cfg_validate_alias_name "$_a_name" || return 1
+                    if [ -z "$_a_argv" ]; then
+                        echo "Error: alias argv must be non-empty" >&2
+                        return 1
+                    fi
+                    _cfg_alias_set "$_a_name" "$_a_argv"
+                    return 0
+                    ;;
+                remove|rm)
+                    shift
+                    local _ar_name="${1:-}"
+                    _cfg_validate_alias_name "$_ar_name" || return 1
+                    _cfg_alias_unset "$_ar_name"
+                    return 0
+                    ;;
+                ""|-h|--help)
+                    cat <<EOF
+Usage: $(basename "$0") config alias <add|remove> NAME ['argv...']
+
+  add NAME 'argv...'  Add or replace OPS_ALIASES[NAME]="argv..."
+  remove NAME         Remove OPS_ALIASES[NAME] (idempotent)
+
+Reserved names (built-in subcommands) are rejected. Valid name shape:
+  ^[a-zA-Z][a-zA-Z0-9_-]*\$
+EOF
+                    return 0
+                    ;;
+                *)
+                    echo "Error: 'config alias' subcommand: 'add' or 'remove' (got '$_a_action')" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        secret)
+            shift
+            local _s_action="${1:-}"
+            case "$_s_action" in
+                add)
+                    shift
+                    local _s_name="${1:-}"
+                    _cfg_validate_secret_key "$_s_name" || return 1
+                    shift || true
+                    # Source mode: env var, stdin, or interactive (default).
+                    # Interactive uses `read -rs` which only works on a TTY;
+                    # tests should rely on --from-env or --from-stdin.
+                    local _s_source="prompt"
+                    case "${1:-}" in
+                        --from-env)    _s_source="env" ;;
+                        --from-stdin)  _s_source="stdin" ;;
+                        --from-prompt|"") _s_source="prompt" ;;
+                        *)
+                            echo "Error: unknown 'config secret add' option '$1'" >&2
+                            return 1
+                            ;;
+                    esac
+                    local _s_value=""
+                    case "$_s_source" in
+                        env)
+                            # Read from the pre-source snapshot so we don't
+                            # silently echo back the value ops.conf already
+                            # carries (which would defeat `add` entirely
+                            # when the user intends to ROTATE the secret).
+                            if [ -n "${_PRE_SOURCE_ENV[$_s_name]+set}" ] && [ -n "${_PRE_SOURCE_ENV[$_s_name]}" ]; then
+                                _s_value="${_PRE_SOURCE_ENV[$_s_name]}"
+                            elif [ -n "${!_s_name:-}" ]; then
+                                _s_value="${!_s_name}"
+                            else
+                                echo "Error: $_s_name is not set in the environment (run 'export $_s_name=...' first, or use --from-stdin)" >&2
+                                return 1
+                            fi
+                            ;;
+                        stdin)
+                            IFS= read -r _s_value || true
+                            ;;
+                        prompt)
+                            printf 'Enter value for %s (input hidden): ' "$_s_name" >&2
+                            IFS= read -rs _s_value
+                            printf '\n' >&2
+                            ;;
+                    esac
+                    if [ -z "$_s_value" ]; then
+                        echo "Error: empty secret value rejected" >&2
+                        return 1
+                    fi
+                    _cfg_validate_value "$_s_value" || return 1
+                    _cfg_secret_set "$_s_name" "$_s_value"
+                    return 0
+                    ;;
+                remove|rm)
+                    shift
+                    local _sr_name="${1:-}"
+                    _cfg_validate_secret_key "$_sr_name" || return 1
+                    _cfg_secret_unset "$_sr_name"
+                    return 0
+                    ;;
+                list|ls)
+                    _cfg_secret_list
+                    return 0
+                    ;;
+                ""|-h|--help)
+                    cat <<EOF
+Usage: $(basename "$0") config secret <add|list|remove> [NAME] [SOURCE]
+
+  add NAME [--from-env|--from-stdin|--from-prompt]
+        Add or replace 'export NAME="value"' in \$_CONFIG_FILE.
+        Default source: interactive prompt with hidden input.
+        --from-env reads \$NAME from the calling shell.
+        --from-stdin reads one line from stdin (newline-terminated).
+
+  list  Print every secret NAME in alphabetic order. Values are NEVER
+        emitted — list is safe to pipe to logs or share publicly.
+
+  remove NAME
+        Remove 'export NAME=...' from the config file (idempotent).
+
+The config file is chmod 600 after every mutation. Empty values are
+rejected (use 'config unset' if you want to delete the entry).
+EOF
+                    return 0
+                    ;;
+                *)
+                    echo "Error: 'config secret' subcommand: 'add', 'list', or 'remove' (got '$_s_action')" >&2
+                    return 1
+                    ;;
+            esac
             ;;
     esac
     echo -e "\033[1;34m=== Config file ===\033[0m"
@@ -1558,10 +2119,12 @@ EOF
 }
 
 cmd_doctor() {
-    case "${1:-}" in
-        -h|--help)
-            cat <<EOF
-Usage: $(basename "$0") doctor
+    local fix=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $(basename "$0") doctor [--fix]
 
 Validate OPS_IMAGES ↔ Dockerfile ↔ image label ↔ container coherence.
 Intended as a pre-build scripting hook (see Exit codes below):
@@ -1578,25 +2141,43 @@ Checks performed:
   Containers labelled ops.container=true — orphans (image gone), image
              mismatches (container image != OPS_IMAGES[key])
 
+Options:
+  --fix      After the diagnostic, print the concrete commands you should
+             run to address each warning. Suggestions only — nothing is
+             executed automatically (auto-execution would risk destructive
+             actions like 'rm' on the wrong container).
+
 Exit codes:
   0    no warnings
   1    at least one warning
 
-No flags. Doctor queries the runtime (image/container inspect) so it needs
-a working runtime context (unlike 'config' which doesn't).
+Doctor queries the runtime (image/container inspect) so it needs a
+working runtime context (unlike 'config' which doesn't).
 EOF
-            return 0
-            ;;
-    esac
+                return 0
+                ;;
+            --fix) fix=1; shift ;;
+            *) echo "Error: unknown 'doctor' option '$1'" >&2; return 1 ;;
+        esac
+    done
     local ok=0 warn=0 k ref declared_df labeled_df declared_abs
+    # Suggested fixes collected by _doc_warn's optional 2nd arg. Displayed
+    # under "Suggested fixes" at the end of the diagnostic when --fix is
+    # passed; ignored otherwise (so the legacy invocation stays terse).
+    local -a _fix_suggestions=()
     _doc_ok()   { printf '    \033[32m✓\033[0m %s\n' "$1"; ok=$((ok+1)); }
-    _doc_warn() { printf '    \033[33m⚠\033[0m %s\n' "$1"; warn=$((warn+1)); }
+    _doc_warn() {
+        printf '    \033[33m⚠\033[0m %s\n' "$1"
+        warn=$((warn+1))
+        [ -n "${2:-}" ] && _fix_suggestions+=("$2")
+    }
 
     echo -e "\033[1;34m=== Config ===\033[0m"
     if [ -f "$_CONFIG_FILE" ]; then
         _doc_ok "config file: $_CONFIG_FILE"
     else
-        _doc_warn "config file missing: $_CONFIG_FILE"
+        _doc_warn "config file missing: $_CONFIG_FILE" \
+                  "$(basename "$0") config set OPS_RUNTIME auto"
     fi
 
     echo -e "\n\033[1;34m=== OPS_IMAGES ===\033[0m"
@@ -1632,7 +2213,8 @@ EOF
                     _doc_warn "image has no ops.dockerfile label (rebuild to stamp it)"
                 fi
             else
-                _doc_warn "image not built: $ref (run: $(basename "$0") -i $k build)"
+                _doc_warn "image not built: $ref (run: $(basename "$0") -i $k build)" \
+                          "$(basename "$0") -i $k build"
             fi
         done
     else
@@ -1666,7 +2248,8 @@ EOF
         any_ctn=1
         # Orphan: the image referenced by the container no longer exists
         if ! "$RUNTIME_BIN" image inspect "$ctn_img" >/dev/null 2>&1; then
-            _doc_warn "container '$ctn': image '$ctn_img' no longer exists (orphan)"
+            _doc_warn "container '$ctn': image '$ctn_img' no longer exists (orphan)" \
+                      "$(basename "$0") runtime rm -f $ctn"
             continue
         fi
         # Image mismatch: container name matches an OPS_IMAGES key but runs
@@ -1684,6 +2267,21 @@ EOF
 
     echo -e "\n\033[1;34m=== Summary ===\033[0m"
     printf "  \033[32m%d OK\033[0m  \033[33m%d warning(s)\033[0m\n" "$ok" "$warn"
+
+    # `--fix` mode: surface the concrete commands the user can run to
+    # resolve each warning. Auto-execution is intentionally NOT done — a
+    # blanket `ops clean` or `runtime rm -f` triggered by --fix could nuke
+    # working containers if the diagnostic mis-classified them. Suggesting
+    # the commands keeps the user as the final authority.
+    if [ "$fix" = 1 ] && [ ${#_fix_suggestions[@]} -gt 0 ]; then
+        echo -e "\n\033[1;34m=== Suggested fixes ===\033[0m"
+        local _f
+        for _f in "${_fix_suggestions[@]}"; do
+            printf '    \033[36m$\033[0m %s\n' "$_f"
+        done
+        echo -e "    \033[2m(suggestions only — review and run manually)\033[0m"
+    fi
+
     unset -f _doc_ok _doc_warn
     [ "$warn" -gt 0 ] && return 1 || return 0
 }
@@ -1855,6 +2453,37 @@ cmd_self_update() {
     cmd_install
 }
 
+# Emits extra argv tokens to inject AFTER consuming `--<agent>` from the
+# user's argv. Two sources, both optional:
+#
+#   1. OPS_ISOLATION_PRESET=volume|fully-isolated
+#      → auto-add `--<agent>-volume` so the agent's credentials live in
+#        the named Docker volume `ops-<agent>` instead of the host's
+#        ~/.<agent>. Skipped when the user already pinned the per-agent
+#        mode via --<agent>-mount / --<agent>-volume / --no-<agent>-mount
+#        (which sets <agent>_agent ≠ "auto").
+#
+#   2. OPS_AGENT_FLAGS[<agent>]="--no-rm --install"
+#      → user-defined flags appended to every `--<agent>` invocation.
+#
+# Output is whitespace-delimited (one token per word). The caller does
+# `set -- $(_agent_run_extras claude) "$@"` so the new tokens land at
+# the head of the remaining argv and are parsed by the next loop turn.
+_agent_run_extras() {
+    local agent="$1"
+    case "${OPS_ISOLATION_PRESET:-host}" in
+        volume|fully-isolated)
+            local var="${agent}_agent"
+            if [ "${!var:-auto}" = "auto" ]; then
+                printf '%s\n' "--${agent}-volume"
+            fi
+            ;;
+    esac
+    if declare -p OPS_AGENT_FLAGS >/dev/null 2>&1 && [ -n "${OPS_AGENT_FLAGS[$agent]:-}" ]; then
+        printf '%s\n' "${OPS_AGENT_FLAGS[$agent]}"
+    fi
+}
+
 _agent_cmd() {
     local bin="$1" pkg="$2"
     # `command -v` (PATH lookup, ~0 ms) instead of `mise which` (~5–17 s
@@ -2017,16 +2646,16 @@ _match_agent_flag() {
 cmd_run() {
     local extra_volumes=()
     local extra_envs=()
-    # Propagate GITHUB_TOKEN if set on host: mise/nix use it to lift
-    # GitHub API rate limits (60→5000 req/h) at runtime — same reason we bake
-    # it into /etc/nix/nix.conf at build time.
-    [ -n "${GITHUB_TOKEN:-}" ]      && extra_envs+=(--env "GITHUB_TOKEN=$GITHUB_TOKEN")
-    # Auto-propagate agent API keys so the CLI agents (claude/gemini/codex)
-    # can authenticate without an explicit --xxx-mount flag. Silent no-op
-    # when unset on the host.
-    [ -n "${ANTHROPIC_API_KEY:-}" ] && extra_envs+=(--env "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
-    [ -n "${OPENAI_API_KEY:-}" ]    && extra_envs+=(--env "OPENAI_API_KEY=$OPENAI_API_KEY")
-    [ -n "${GEMINI_API_KEY:-}" ]    && extra_envs+=(--env "GEMINI_API_KEY=$GEMINI_API_KEY")
+    # Auto-propagate host secrets (GitHub PAT for rate-limited builds, agent
+    # API keys for authenticated --claude/--gemini/--codex without an
+    # explicit --xxx-mount flag). The list lives in _OPS_AUTO_PROPAGATED_ENVS
+    # near _OPS_RESERVED — one source of truth, also consumed by `cmd_env`.
+    # Silent no-op when the var is unset.
+    local _ev
+    for _ev in "${_OPS_AUTO_PROPAGATED_ENVS[@]}"; do
+        [ -n "${!_ev:-}" ] && extra_envs+=(--env "${_ev}=${!_ev}")
+    done
+    unset _ev
     local extra_ports=()
     local build_extra_args=()
     local do_build=""
@@ -2070,6 +2699,32 @@ cmd_run() {
     # ops.conf). The CLI flag --no-trust-workdir is the per-invocation
     # opt-out; set OPS_TRUST_WORKDIR=0 to opt out globally.
     local trust_workdir="${OPS_TRUST_WORKDIR:-1}"
+    # Scratch buffer for agent flag extras emitted by _agent_run_extras.
+    # Reused across each --<agent> branch in the parsing loop below.
+    local _extras=""
+
+    # OPS_ISOLATION_PRESET (host|volume|isolated|fully-isolated): a coarse-
+    # grained dial that maps to per-agent state + mount_home. Per-agent
+    # auto-volume happens in _agent_run_extras when each --<agent> flag is
+    # parsed; the global mount_home=0 toggle for {isolated, fully-isolated}
+    # happens here so it's stable regardless of argv order.
+    case "${OPS_ISOLATION_PRESET:-host}" in
+        host|volume) ;;
+        isolated|fully-isolated) mount_home=0 ;;
+        *)
+            echo "Error: invalid OPS_ISOLATION_PRESET '${OPS_ISOLATION_PRESET:-}' (valid: host, volume, isolated, fully-isolated)" >&2
+            exit 1
+            ;;
+    esac
+
+    # OPS_DEFAULT_RUN_FLAGS — global flags injected before the user's argv
+    # so the user keeps the last word (their flags appear later in argv,
+    # and the parser is "last write wins" for most state). Field-split is
+    # intentional: ops.conf entries are token sequences, not single args.
+    if [ -n "${OPS_DEFAULT_RUN_FLAGS:-}" ]; then
+        # shellcheck disable=SC2086  # intentional word split: tokens from config
+        set -- $OPS_DEFAULT_RUN_FLAGS "$@"
+    fi
 
     while [ $# -gt 0 ]; do
         # Per-agent {mount,volume,off} flags share a single dispatcher
@@ -2112,13 +2767,37 @@ cmd_run() {
                 echo -e "\033[1;34m==> nix cleanup...\033[0m"      && HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d
                 echo -e "\033[1;32m==> done\033[0m"
             '; shift ;;
-            --claude)          agent_cmd="$(_agent_cmd claude npm:@anthropic-ai/claude-code)"; shift ;;
+            --claude)
+                agent_cmd="$(_agent_cmd claude npm:@anthropic-ai/claude-code)"
+                shift
+                _extras=$(_agent_run_extras claude)
+                # shellcheck disable=SC2086  # intentional word split for tokens
+                [ -n "$_extras" ] && set -- $_extras "$@"
+                ;;
             --claude-mount)    claude_agent="mount";   shift ;;
-            --gemini)          agent_cmd="$(_agent_cmd gemini npm:@google/gemini-cli)"; shift ;;
+            --gemini)
+                agent_cmd="$(_agent_cmd gemini npm:@google/gemini-cli)"
+                shift
+                _extras=$(_agent_run_extras gemini)
+                # shellcheck disable=SC2086
+                [ -n "$_extras" ] && set -- $_extras "$@"
+                ;;
             --gemini-mount)    gemini_agent="mount";   shift ;;
-            --opencode)        agent_cmd="$(_agent_cmd opencode npm:opencode-ai)"; shift ;;
+            --opencode)
+                agent_cmd="$(_agent_cmd opencode npm:opencode-ai)"
+                shift
+                _extras=$(_agent_run_extras opencode)
+                # shellcheck disable=SC2086
+                [ -n "$_extras" ] && set -- $_extras "$@"
+                ;;
             --opencode-mount)  opencode_agent="mount"; shift ;;
-            --codex)           agent_cmd="$(_agent_cmd codex npm:@openai/codex)"; shift ;;
+            --codex)
+                agent_cmd="$(_agent_cmd codex npm:@openai/codex)"
+                shift
+                _extras=$(_agent_run_extras codex)
+                # shellcheck disable=SC2086
+                [ -n "$_extras" ] && set -- $_extras "$@"
+                ;;
             --codex-mount)     codex_agent="mount";    shift ;;
             --dry-run)         dry_run=1; shift ;;
             --env-file)        extra_envs+=(--env-file "$2"); shift 2 ;;
@@ -2574,6 +3253,140 @@ EOF
     echo "Define aliases in: $_CONFIG_FILE"
 }
 
+# `ops env` — surface the env vars that ops auto-propagates into the
+# container at run time. Intentionally name-only: values are never echoed
+# (a TUI screenshot of `ops env` should be safe to share). Useful when
+# debugging "why is ANTHROPIC_API_KEY not reaching claude in the
+# container?" — checks both the live shell and the ops.conf snapshot
+# (host vars set after `source` of ops.conf may differ from what the
+# pre-source snapshot captured).
+cmd_env() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") env
+
+Dump the environment variables that ops propagates into the container at
+run time. Auto-propagated vars (sourced from the calling shell or from
+ops.conf via 'config secret add'):
+
+EOF
+            local _hv
+            for _hv in "${_OPS_AUTO_PROPAGATED_ENVS[@]}"; do
+                printf '  %-18s %s\n' "$_hv" "${_OPS_AUTO_PROPAGATED_DESC[$_hv]:-}"
+            done
+            cat <<EOF
+
+Output: NAME [set|unset] (origin: shell|config|both). Values are NEVER
+printed — \`ops env\` is safe to paste into a screenshot or log.
+EOF
+            return 0
+            ;;
+    esac
+    echo -e "\033[1;34m=== Auto-propagated env vars ===\033[0m"
+    local var live_set status origin color
+    for var in "${_OPS_AUTO_PROPAGATED_ENVS[@]}"; do
+        live_set=0
+        [ -n "${!var:-}" ] && live_set=1
+        if [ -n "${_PRE_SOURCE_ENV[$var]+set}" ] && [ -n "${_PRE_SOURCE_ENV[$var]}" ]; then
+            # Distinguish shell-set (pre-source) from config-set: if the
+            # pre-source snapshot already had it, the shell exported it
+            # and ops.conf MAY have re-exported the same value — but the
+            # source of truth is the shell.
+            if [ "$live_set" = 1 ] && [ "${!var}" = "${_PRE_SOURCE_ENV[$var]}" ]; then
+                origin="shell"
+            else
+                origin="both"
+            fi
+        elif [ "$live_set" = 1 ]; then
+            # Set after ops.conf was sourced → must come from config.
+            origin="config"
+        else
+            origin="-"
+        fi
+        if [ "$live_set" = 1 ]; then
+            color='\033[32m'
+            status='set'
+        else
+            color='\033[33m'
+            status='unset'
+        fi
+        printf '  %-22s '"$color"'[%s]\033[0m  origin: %s\n' "$var" "$status" "$origin"
+    done
+}
+
+# `ops volume list` — listing of ops-labelled volumes (label ops.volume=true).
+# Subcommand kept narrow on purpose: deeper plumbing belongs to
+# `ops runtime volume …` (raw runtime proxy). The point of `ops volume`
+# is to give users a curated view that matches ops semantics (per-agent
+# volumes, ops-share-* defaults, isolated volumes).
+cmd_volume() {
+    local sub="${1:-}"
+    case "$sub" in
+        list|ls)
+            shift
+            local agents_only=0
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --agent|--agents) agents_only=1; shift ;;
+                    -h|--help)
+                        cat <<EOF
+Usage: $(basename "$0") volume list [--agent]
+
+List ops-managed Docker volumes (filter: label=ops.volume=true).
+
+  --agent  Only show per-agent credential volumes (ops-claude,
+           ops-gemini, ops-opencode, ops-codex).
+
+Without --agent, all ops-* volumes are listed (including the shared
+ops-share-nix / ops-share-mise defaults and any per-container volumes
+created by --isolated-volumes).
+EOF
+                        return 0
+                        ;;
+                    *)
+                        echo "Error: unknown 'volume list' option '$1'" >&2
+                        return 1
+                        ;;
+                esac
+            done
+            local name
+            while IFS= read -r name; do
+                [ -z "$name" ] && continue
+                if [ "$agents_only" = 1 ]; then
+                    case "$name" in
+                        ops-claude|ops-gemini|ops-opencode|ops-codex)
+                            printf '%s\n' "$name"
+                            ;;
+                    esac
+                else
+                    printf '%s\n' "$name"
+                fi
+            done < <("$RUNTIME_BIN" volume ls --filter label=ops.volume=true --format '{{.Name}}' 2>/dev/null)
+            return 0
+            ;;
+        ""|-h|--help)
+            cat <<EOF
+Usage: $(basename "$0") volume <subcommand>
+
+Inspect ops-managed volumes (filter: label=ops.volume=true).
+
+Subcommands:
+  list [--agent]   List ops volumes (optionally restricted to per-agent
+                   credential volumes: ops-claude, ops-gemini, …)
+
+Raw operations (rm, inspect, etc.) are not exposed here yet — use
+'ops runtime volume <cmd>' for the full runtime CLI.
+EOF
+            return 0
+            ;;
+        *)
+            echo "Error: unknown volume subcommand '$sub' (try 'list')" >&2
+            return 1
+            ;;
+    esac
+}
+
 # Dispatcher for the `nerdctl` namespace — groups the nerdctl-specific
 # lifecycle commands (install / uninstall / self-update) under a single
 # subcommand. Keeps `ops install` out of the flat namespace, which was
@@ -2609,7 +3422,25 @@ EOF
 
 # Reserved subcommand names — aliases with these names are ignored so they
 # can't shadow built-in commands.
-_OPS_RESERVED=" nerdctl build runtime status info logs log clean run help -h --help alias aliases image images doctor inspect config backup restore update version --version -V "
+_OPS_RESERVED=" nerdctl build runtime status info logs log clean run help -h --help alias aliases image images doctor inspect config backup restore update version --version -V env volume "
+
+# Single source of truth for env vars that ops auto-propagates host →
+# container at run time. cmd_run iterates this to emit `--env KEY=VAL`
+# args, cmd_env reads it for the diagnostic, and `ops env --help` reads
+# the parallel _OPS_AUTO_PROPAGATED_DESC for the prose enumeration.
+# Adding a new auto-propagated secret is a two-line change (name + desc)
+# at this single location — no drift between code and help text.
+#
+# Indexed array (not associative) because we need iteration order to
+# match between the diagnostic output and the help block. Bash 4
+# associative array iteration is implementation-defined.
+_OPS_AUTO_PROPAGATED_ENVS=(GITHUB_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY)
+declare -A _OPS_AUTO_PROPAGATED_DESC=(
+    [GITHUB_TOKEN]="Lifts GitHub API rate limit during builds"
+    [ANTHROPIC_API_KEY]="Used by --claude"
+    [OPENAI_API_KEY]="Used by --codex"
+    [GEMINI_API_KEY]="Used by --gemini"
+)
 
 # Expand a user-defined alias ($1 = name). Echoes the expanded argv to stdout
 # and returns 0 if the name matches a string or function alias; returns 1 if
@@ -2753,6 +3584,8 @@ case "${1:-}" in
     run)            shift; cmd_run "$@" ;;
     alias|aliases)  shift; cmd_aliases "$@" ;;
     image|images)   shift; cmd_images "$@" ;;
+    env)            shift; cmd_env "$@" ;;
+    volume|volumes) shift; cmd_volume "$@" ;;
     help|-h|--help) show_help; exit 0 ;;
     version|--version|-V) echo "ops $OPS_VERSION"; exit 0 ;;
     "")             cmd_run ;;
