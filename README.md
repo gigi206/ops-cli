@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml)
 
-Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, semgrep, ripgrep, jq, ast-grep, gh).
+Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, google-chrome, ripgrep, jq, ast-grep, gh). Add more (terraform, ngrok, …) via `ops config set 'OPS_BUILD_ARGS[<key>]' 'EXTRA_MISE_TOOLS=…'`.
 
 The goal: a single entry point (`ops.sh`) to build, run, debug and update the environment, regardless of the underlying container runtime.
 
@@ -391,12 +391,12 @@ OPS_VOLUMES="/data:/data /mnt/shared:/mnt/shared"
 
 # Per-image --build-arg overrides (see "Build-time tools" section below).
 # Keys must match OPS_IMAGES keys. Value is "KEY=VALUE" (or "K1=V1;K2=V2").
-# Most common use: override EXTRA_MISE_TOOLS to add/remove tools baked
-# into the image (google-chrome, ngrok, terraform, ...).
+# Most common use: add tools on top of the baseline via EXTRA_MISE_TOOLS
+# (terraform, ngrok, …). The baseline already ships google-chrome, git,
+# gh, ripgrep, jq, ast-grep, node@lts.
 # declare -A OPS_BUILD_ARGS=(
-#   [arch]="EXTRA_MISE_TOOLS=nix:google-chrome nix:ngrok"
-#   [arch-min]="EXTRA_MISE_TOOLS="          # disable default google-chrome
-#   [deb]="EXTRA_MISE_TOOLS=nix:chromium"
+#   [arch]="EXTRA_MISE_TOOLS=nix:terraform"
+#   [arch-full]="EXTRA_MISE_TOOLS=nix:terraform nix:ngrok"
 # )
 
 # Container user (defaults = host user)
@@ -422,54 +422,57 @@ GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 
 ### Build-time tools (`EXTRA_MISE_TOOLS` / `OPS_BUILD_ARGS`)
 
-The image baseline (`mise use -g nix:git nix:semgrep github:cli/cli ...`) is always installed. On top of it, the Dockerfile accepts an `EXTRA_MISE_TOOLS` build-arg — a **whitespace-separated list of mise tool specs** — whose default is:
+The **image baseline** is always installed and not configurable from the user side:
 
-```dockerfile
-ARG EXTRA_MISE_TOOLS="nix:google-chrome"
+```bash
+mise use -g \
+    nix:git nix:google-chrome \
+    github:cli/cli github:BurntSushi/ripgrep \
+    github:jqlang/jq github:ast-grep/ast-grep \
+    node@lts
 ```
 
-This default installs **Google Chrome** (~300 MB) so the [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) server works out of the box. Google Chrome is one of the two browsers officially supported by the MCP (the other being Chrome for Testing).
-
-> **Why not `chrome-for-testing`?** It is not packaged in nixpkgs at the moment — only `chromium`, `ungoogled-chromium` and `google-chrome` are. If `chrome-for-testing` lands upstream later, you can switch via `OPS_BUILD_ARGS`.
-
-> **Why not `chromium`?** The MCP docs state "Other Chromium-based browsers may work, but this is not guaranteed." — so we pick an officially supported browser by default. If you prefer chromium (open-source, no unfree flag needed), override: `OPS_BUILD_ARGS[<key>]="EXTRA_MISE_TOOLS=nix:chromium"`.
+That baseline includes **Google Chrome** (~300 MB) so the [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) server works out of the box. Chrome is one of the two browsers officially supported by the MCP (the other being Chrome for Testing, which isn't yet in nixpkgs).
 
 > **Unfree flag** — `google-chrome` is unfree. The Dockerfile already sets both `NIXPKGS_ALLOW_UNFREE=1` (standard Nix var) and `MISE_NIX_ALLOW_UNFREE=true` (mise-nix plugin escape hatch, auto-forwarded to `NIXPKGS_ALLOW_UNFREE=1` when the plugin calls `nix build`). No extra setup needed.
 
-**To opt out** (e.g. you never use Chrome/Puppeteer/Playwright in the container), explicitly set `EXTRA_MISE_TOOLS=""`:
+On top of the baseline, the Dockerfile accepts an `EXTRA_MISE_TOOLS` build-arg — a **whitespace-separated list of mise tool specs** — whose default is **empty**. The layer is **purely additive**: anything you list here is installed on top of the baseline, and `EXTRA_MISE_TOOLS=""` does NOT remove baseline tools.
 
-```bash
-# Ad-hoc, single build
-./ops.sh build --build-arg EXTRA_MISE_TOOLS=""
-
-# Permanent, per-profile (via ops.conf)
-declare -A OPS_IMAGES=(
-  [arch]="localhost/ops-dev"
-  [arch-min]="localhost/ops-dev-min"   # no chrome, leaner image
-)
-declare -A OPS_BUILD_ARGS=(
-  [arch-min]="EXTRA_MISE_TOOLS="
-)
-# ./ops.sh -i arch-min build       → no chrome
-# ./ops.sh -i arch build           → google-chrome (default)
+```dockerfile
+ARG EXTRA_MISE_TOOLS=""
 ```
 
-**To add more tools**, list them whitespace-separated:
+**To add tools** (terraform, ngrok, additional browsers, …), set them per profile via `ops config`:
+
+```bash
+# All profiles
+ops config set 'OPS_BUILD_ARGS[default]' \
+  'EXTRA_MISE_TOOLS=nix:terraform'
+
+# Per profile
+ops config set 'OPS_BUILD_ARGS[arch]'      'EXTRA_MISE_TOOLS=nix:terraform'
+ops config set 'OPS_BUILD_ARGS[arch-full]' 'EXTRA_MISE_TOOLS=nix:terraform nix:ngrok'
+ops config set 'OPS_BUILD_ARGS[deb]'       'EXTRA_MISE_TOOLS=nix:chromium'   # second browser
+
+ops -i arch build       # → baseline + nix:terraform
+ops -i arch-full build  # → baseline + terraform + ngrok
+```
+
+Or directly in `ops.conf`:
 
 ```bash
 declare -A OPS_BUILD_ARGS=(
-  [arch]="EXTRA_MISE_TOOLS=nix:google-chrome nix:ngrok"
-  [arch-full]="EXTRA_MISE_TOOLS=nix:chromium nix:terraform nix:ngrok"
+  [arch]="EXTRA_MISE_TOOLS=nix:terraform"
+  [arch-full]="EXTRA_MISE_TOOLS=nix:terraform nix:ngrok"
 )
 ```
 
 **Semantics of `OPS_BUILD_ARGS`:**
 
 - Associative array keyed by `OPS_IMAGES` key (same keys as `OPS_IMAGES` / `OPS_DOCKERFILES` / `OPS_CONTAINER_NAMES`).
-- Value is one `KEY=VALUE` pair, or several separated by `;` (e.g. `"EXTRA_MISE_TOOLS=nix:chromium;NIX_CLEANUP=false"`).
+- Value is one `KEY=VALUE` pair, or several separated by `;` (e.g. `"EXTRA_MISE_TOOLS=nix:terraform;NIX_CLEANUP=false"`).
 - Applied **only** when `-i <key>` matches an `OPS_IMAGES` key. When `-i` points to a raw image ref, no per-profile args are injected.
 - Propagated to `docker build` / `podman build` / `nerdctl build` via `--build-arg`.
-- The default value in the Dockerfile (`nix:google-chrome`) applies **only when no override is set**. An empty override (`EXTRA_MISE_TOOLS=`) explicitly disables it.
 
 **Applicable build-args** (declared in `Dockerfile` / `Dockerfile.debian`): `EXTRA_MISE_TOOLS`, `NIX_CLEANUP`, `MISE_INSTALL_SHA256`, `USER_UID`, `USER_GID`, `USER_NAME`, `USER_LANG`, `SOURCE_URL` (auto-forwarded from `$OPS_SOURCE_URL`).
 
@@ -1184,7 +1187,7 @@ Now `claude-ml` drops you into an ML-ready container with Claude already launche
 
 ## GUI apps (Chrome, Wayland)
 
-`ops.sh` auto-forwards the **Wayland** socket when the host runs Wayland — GUI apps like Chrome (baked into the image via `nix:google-chrome`, see [Build-time tools](#build-time-tools-extra_mise_tools--ops_build_args)) can render on the host compositor without any extra setup.
+`ops.sh` auto-forwards the **Wayland** socket when the host runs Wayland — GUI apps like Chrome (in the image baseline, see [Build-time tools](#build-time-tools-extra_mise_tools--ops_build_args)) can render on the host compositor without any extra setup.
 
 ### Prerequisites
 

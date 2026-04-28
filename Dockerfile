@@ -2,10 +2,14 @@
 #
 # ops-dev — Arch-based dev container image used by ops.sh.
 # Ships: mise + Nix (packages via the merged mise-nix plugin, flake.nix env
-# activation) + base dev tools (git, semgrep, gh, ripgrep, jq, ast-grep,
-# node@lts). CLI agents (claude-code, gemini-cli, opencode, codex) are NOT
-# baked — they are installed on demand by ops.sh when you pass --claude /
-# --gemini / --opencode / --codex, and persist in the ops-share-mise volume.
+# activation) + base dev tools (git, google-chrome, gh, ripgrep, jq,
+# ast-grep, node@lts). CLI agents (claude-code, gemini-cli, opencode,
+# codex) are NOT baked — they are installed on demand by ops.sh when you
+# pass --claude / --gemini / --opencode / --codex, and persist in the
+# ops-share-mise volume.
+# Add extra tools (terraform, ngrok, …) via:
+#   ops config set 'OPS_BUILD_ARGS[default]' \
+#     'EXTRA_MISE_TOOLS=nix:terraform'
 # mise handles both Nix package installation (nix:pkg@ver) and flake.nix
 # dev-shell activation; no other package manager is involved.
 #
@@ -20,12 +24,11 @@
 #                                                              ~200 MB off the image)
 #   EXTRA_MISE_TOOLS="nix:<pkg> ..."                           extra tools baked into the image
 #                                                              on top of the baseline set.
-#                                                              Default: nix:google-chrome
-#                                                              (needed by chrome-devtools MCP,
-#                                                              officially supported browser).
-#                                                              Set to "" to skip — saves ~300 MB.
+#                                                              Default: empty — purely additive.
 #                                                              Configure per profile via
-#                                                              OPS_BUILD_ARGS in ops.conf.
+#                                                              OPS_BUILD_ARGS in ops.conf, e.g.
+#                                                              OPS_BUILD_ARGS[default]=
+#                                                                "EXTRA_MISE_TOOLS=nix:terraform"
 #
 # Build secret (passed only in-process, never baked into image layers):
 #   --secret id=github_token,env=GITHUB_TOKEN                  classic PAT, no scope — lifts
@@ -81,17 +84,13 @@ ARG NIX_CLEANUP=true
 ARG MISE_INSTALL_SHA256=
 
 # Extra tools installed on top of the baseline `mise use -g` set. Value is a
-# whitespace-separated list of mise tool specs (e.g. "nix:chromium nix:ngrok").
-# Default installs Google Chrome via nixhub so the chrome-devtools MCP server
-# works out of the box (officially supported browser per the MCP docs). Pass
-# --build-arg EXTRA_MISE_TOOLS="" to skip (saves ~300 MB), or set
-# OPS_BUILD_ARGS[<image-key>]="EXTRA_MISE_TOOLS=..." in ops.conf to override
-# per profile. `chrome-for-testing` is intentionally NOT used: it is not
-# packaged in nixpkgs at the moment (only `chromium`, `ungoogled-chromium`
-# and `google-chrome` are). `google-chrome` is unfree; the ENV block above
-# already sets NIXPKGS_ALLOW_UNFREE=1 + MISE_NIX_ALLOW_UNFREE=true so the
-# build goes through without extra flags.
-ARG EXTRA_MISE_TOOLS="nix:google-chrome"
+# whitespace-separated list of mise tool specs (e.g. "nix:terraform nix:ngrok").
+# Empty by default — the layer is purely additive. The image baseline already
+# ships google-chrome (so `chrome-devtools-mcp` works out of the box), git,
+# gh, ripgrep, jq, ast-grep, node@lts; EXTRA_MISE_TOOLS is for everything
+# else the user wants without patching the Dockerfile. Configure per profile
+# via OPS_BUILD_ARGS[<image-key>]="EXTRA_MISE_TOOLS=..." in ops.conf.
+ARG EXTRA_MISE_TOOLS=""
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md).
 # Only SOURCE_URL is exposed: it lets `docker inspect` consumers walk back to
@@ -202,7 +201,7 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
  && mkdir -p /opt/mise/data/plugins \
  && ln -sfn /opt/ops/mise-plugin/nix /opt/mise/data/plugins/nix \
  && MISE_CONFIG_DIR=/etc/mise /opt/mise/bin/mise use -g \
-      nix:git nix:semgrep \
+      nix:git nix:google-chrome \
       github:cli/cli github:BurntSushi/ripgrep \
       github:jqlang/jq github:ast-grep/ast-grep \
       node@lts \
