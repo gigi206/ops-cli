@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.5.0"
+OPS_VERSION="1.6.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -3370,6 +3370,53 @@ EOF
         fi
         printf '  %-22s '"$color"'[%s]\033[0m  origin: %s\n' "$var" "$status" "$origin"
     done
+
+    # Custom exports — anything in ops.conf via `export NAME=…` that is NOT
+    # in the auto-propagated list. Users routinely add their own tokens
+    # (e.g. MISTRAL_API_KEY, HUGGINGFACE_TOKEN) via `config secret add`,
+    # and they need to know whether ops run forwards them. Spoiler: it
+    # doesn't. The auto-propagation list is intentionally narrow (one
+    # entry per officially-supported agent + GITHUB_TOKEN); adding a
+    # custom one means either passing it ad-hoc with `-e KEY=VAL` /
+    # `--env-file`, or contributing the name upstream so ops run picks
+    # it up automatically.
+    if [ -f "$_CONFIG_FILE" ]; then
+        # Stream the sorted unique list of `export NAME` from ops.conf
+        # into the loop directly via process substitution — avoids an
+        # intermediate variable + word-splitting (SC2086 under shellcheck
+        # `-S style` 0.9.0 in CI).
+        local cv first=1 is_auto
+        while IFS= read -r cv; do
+            [ -z "$cv" ] && continue
+            is_auto=0
+            for var in "${_OPS_AUTO_PROPAGATED_ENVS[@]}"; do
+                [ "$cv" = "$var" ] && { is_auto=1; break; }
+            done
+            [ "$is_auto" = 1 ] && continue
+            if [ "$first" = 1 ]; then
+                echo -e "\n\033[1;34m=== Custom config exports (NOT auto-propagated to container) ===\033[0m"
+                first=0
+            fi
+            live_set=0
+            [ -n "${!cv:-}" ] && live_set=1
+            if [ "$live_set" = 1 ]; then
+                color='\033[32m'
+                status='set'
+            else
+                color='\033[33m'
+                status='unset'
+            fi
+            printf '  %-22s '"$color"'[%s]\033[0m  origin: config\n' "$cv" "$status"
+        done < <(grep -oE '^[[:space:]]*export[[:space:]]+[A-Z_][A-Z0-9_]*' "$_CONFIG_FILE" 2>/dev/null \
+            | awk '{print $NF}' \
+            | sort -u)
+        if [ "$first" = 0 ]; then
+            echo -e "\n  \033[2mThese are exported when ops.conf is sourced, but \`ops run\` does NOT\033[0m"
+            echo -e "  \033[2mforward them to the container. Pass them with \`-e KEY=VAL\` or\033[0m"
+            echo -e "  \033[2m\`--env-file FILE\` at run time, or open an upstream issue if you want\033[0m"
+            echo -e "  \033[2manother var added to the auto-propagated list.\033[0m"
+        fi
+    fi
 }
 
 # `ops volume list` — listing of ops-labelled volumes (label ops.volume=true).
