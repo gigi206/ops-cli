@@ -75,7 +75,10 @@ setup() {
 @test "clean interactive: empty 'y' on the images prompt prunes images only" {
     # 'y' to dangling/containers prompt, 'n' to volumes — only the first
     # branch should fire. Asserts the volume-removal path stays untouched.
-    run bash -c "printf 'y\nn\n' | env OPS_RUNTIME=docker '$(ops_sh)' clean"
+    # MOCK_DANGLING=1 makes the mock emit a dangling image so count_img > 0
+    # and the images/containers prompt is actually shown (post-1.7.0 the
+    # prompt is skipped when there's nothing to act on).
+    run bash -c "printf 'y\nn\n' | env OPS_RUNTIME=docker MOCK_DANGLING=1 '$(ops_sh)' clean"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Pruned."* ]]
     refute_output_contains "Volumes removed."

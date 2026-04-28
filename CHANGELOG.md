@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-04-28
+
+### Fixed
+- **`ops info` no longer mis-renders dangling images labelled `ops.dockerfile`.** When a build leaves the previous image untagged (typical after `ops build` overwrites a tag), the runtime reports it as `<none>:<none>`. Pre-1.7.0 `cmd_info` then ran `image inspect <none>:<none>` (which fails, no such ref) and rendered the row with a red ✗ + `(not built)` label — wrong on both counts: the image *does* exist, and the user can't act on a row that gives them no actionable identifier. After 1.7.0 the discovery query now asks for `'{{.Repository}}:{{.Tag}}|{{.ID}}'` so the short-ID is available; `<none>:<none>` is rewritten to `<dangling>:<short-id>` (e.g. `<dangling>:abc123def456`); a new `ops_image_inspect_keys` map remembers the full sha256 so the subsequent `image inspect` targets the dangling image directly and the row gets its real size, date and `ops.dockerfile` label. Net result: a green ✓ row with the actionable ID for a `docker rmi` / `ops clean`. Regression guard: 4 tests in `tests/test_cmd_info_dangling.bats` (rendering shape, ✓-not-✗ marker, dockerfile label + size present, no raw `<none>:<none>` leak).
+
+### Changed
+- **`ops clean` now keeps `ops-share-*` volumes by default.** The `ops-share-nix` and `ops-share-mise` volumes are cross-container caches that often hold hours of nix-store / mise-tool downloads. Previously `clean` listed them in the volumes prompt alongside per-container volumes — a single `y` answered for ALL of them and silently nuked the cache, which several users reported as a footgun. Post-1.7.0 they're moved to a dedicated `Skipped (shared cache; pass --include-shared to drop)` sub-section under the volumes header, the summary line shows the split (`ops volumes (to prune): N` + `ops volumes (kept): M`), and the prompt only counts the to-prune list. Drop them deliberately with `clean --include-shared`. **Behaviour change**: any caller that previously relied on `ops clean` to nuke `ops-share-*` must now pass `--include-shared` explicitly.
+- **`ops clean` gained `--no-volumes` / `--volumes-only` flags.** `--no-volumes` skips the volumes section + prompt entirely (script-friendly: prune dangling images and stopped ops containers without ever risking a volume rm). `--volumes-only` does the inverse — useful when you've just finished a debugging session and want to drop the per-container volumes left behind without re-listing every dangling image. The two flags are mutually exclusive (returns 2 with a diagnostic). `--dry-run` continues to compose with all of them.
+- **`ops clean` interactive prompts now show the count of items at risk.** `Prune N dangling image(s) and M stopped ops container(s)? [y/N]` and `Remove K ops volume(s)? This deletes cached data (nix store, mise tools, ...) [y/N]` instead of bare yes/no questions. The prompt is also skipped entirely when its category is empty (no spurious `Prune 0 …?` question), which removes a no-op key-press from every routine `ops clean` run.
+- **`ops clean` rejects unknown options** with a clear `Error: unknown option '--bogus' (see 'clean --help')` + exit 2. Previously unknown args were silently shifted off and ignored, masking typos like `--vol-only` (which a user would expect to act like `--volumes-only`).
+
+  Coverage for all four `ops clean` items: 10 new tests in `tests/test_cmd_clean_flags.bats` (default keep-shared, summary split, `--include-shared`, `--no-volumes`, `--volumes-only`, mutual-exclusion error, unknown-flag rejection, prompt count format, prompt cached-data warning, `--help` mentions all flags). The 9 existing tests in `tests/test_clean_labels.bats` remain green (the only adjustment was making the "empty 'y' on the images prompt prunes images only" test set `MOCK_DANGLING=1`, since the prompt is now skipped when there's nothing to prune).
+
 ## [1.6.0] - 2026-04-28
 
 ### Added
