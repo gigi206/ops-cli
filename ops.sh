@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.4.0"
+OPS_VERSION="1.5.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -1242,31 +1242,58 @@ EOF
 #   - Preservation: comments, blank lines, and key ordering are kept; only
 #     the targeted line is modified. Falls back to append when absent.
 
-# Keys that are bash arrays — handled via dedicated `config alias add/remove`
-# (or `config images …` if/when that lands). Scalar set/unset on these is
-# rejected because the argv shape doesn't match (`OPS_ALIASES[k]=v` ≠
-# `OPS_ALIASES=v`).
-_OPS_CONFIG_ARRAY_KEYS=" OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES "
+# Bash array names — when used WITHOUT a bracketed index, the scalar
+# set/unset path is refused because the argv shape doesn't match (the
+# user almost certainly meant a per-entry update, not "replace the whole
+# array as a string"). With a bracketed index (e.g. `OPS_ALIASES[k]`)
+# the same key IS accepted because that's a single-entry update which
+# fits the same value-replace logic as a scalar.
+_OPS_CONFIG_ARRAY_KEYS=" OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES OPS_AGENT_FLAGS "
 
-# Validate a key for `config set/get/unset`. Returns 0 if writable as a
-# scalar; emits a stderr diagnostic + non-zero otherwise.
+# Validate a key for `config set/get/unset`. Two accepted shapes:
+#   1. Scalar:  OPS_FOO        (matches ^OPS_[A-Z][A-Z0-9_]*$)
+#   2. Bracketed entry: OPS_ARRAY[index]   (the index can be any
+#      [a-zA-Z0-9_-]+ — covers profile names like `arch-min`, agent
+#      names like `claude`, image keys like `arch_v2`, etc.).
+#
+# The bracketed form is needed for direct edits to `OPS_AGENT_FLAGS[<agent>]`,
+# `OPS_IMAGES[<key>]`, etc. without going through dedicated subcommands —
+# it lets `/ops-setup` and other automation drive the config file with
+# one consistent verb instead of growing a per-array helper for every
+# new associative array we ship.
 _cfg_validate_scalar_key() {
     local key="${1:-}"
     if [ -z "$key" ]; then
         echo "Error: config set/get/unset requires a KEY (got empty)" >&2
         return 1
     fi
-    if ! [[ "$key" =~ ^OPS_[A-Z][A-Z0-9_]*$ ]]; then
-        echo "Error: invalid key '$key' (must match ^OPS_[A-Z][A-Z0-9_]*\$)" >&2
-        return 1
+    # Scalar form, no brackets
+    if [[ "$key" =~ ^OPS_[A-Z][A-Z0-9_]*$ ]]; then
+        case "$_OPS_CONFIG_ARRAY_KEYS" in
+            *" $key "*)
+                echo "Error: '$key' is an array — use 'config set ${key}[<index>] <value>' (per-entry) or 'config alias' for OPS_ALIASES" >&2
+                return 1
+                ;;
+        esac
+        return 0
     fi
-    case "$_OPS_CONFIG_ARRAY_KEYS" in
-        *" $key "*)
-            echo "Error: '$key' is an array — use 'config alias' (or edit ops.conf directly for OPS_IMAGES/OPS_DOCKERFILES/OPS_CONTAINER_NAMES/OPS_BUILD_ARGS)" >&2
-            return 1
-            ;;
-    esac
-    return 0
+    # Bracketed form: OPS_BASE[index]
+    if [[ "$key" =~ ^OPS_[A-Z][A-Z0-9_]*\[[a-zA-Z0-9_-]+\]$ ]]; then
+        return 0
+    fi
+    echo "Error: invalid key '$key' (must match ^OPS_[A-Z][A-Z0-9_]*\$ or ^OPS_[A-Z][A-Z0-9_]*\\[[a-zA-Z0-9_-]+\\]\$)" >&2
+    return 1
+}
+
+# Extract the base array name from a bracketed key (`OPS_ALIASES[cc]` →
+# `OPS_ALIASES`). Returns empty + non-zero when the key is a plain scalar.
+_cfg_array_base() {
+    local key="$1"
+    if [[ "$key" == *\[*\]* ]]; then
+        printf '%s' "${key%%\[*}"
+        return 0
+    fi
+    return 1
 }
 
 # Validate a value for `config set`. Refuses newlines (would break the
@@ -1357,12 +1384,35 @@ _cfg_unquote() {
 
 # Read the literal value of `KEY=...` from ops.conf. Strips surrounding
 # double-quotes if present. Echoes nothing and returns 1 if absent.
+#
+# `grep -F` (fixed string) is used so bracketed keys like
+# `OPS_ALIASES[cc]` work without escaping `[` (it would otherwise open a
+# regex character class). The `target` we look for is `KEY=`, anchored
+# manually below: a leading-whitespace tolerance is implemented in the
+# scan rather than via regex, which keeps the implementation portable to
+# any awk variant.
 _cfg_read_scalar() {
     local key="$1"
     [ -f "$_CONFIG_FILE" ] || return 1
+    local target="${key}="
     local line
-    line=$(grep -E "^[[:space:]]*${key}=" "$_CONFIG_FILE" | tail -1)
+    # awk pass: skip leading whitespace, then keep lines that begin with
+    # `target` literally. tail -1 picks the last assignment if the user
+    # has manual duplicates (last-one-wins per shell semantics).
+    line=$(awk -v target="$target" '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (substr(line, 1, length(target)) == target) {
+                print
+            }
+        }
+    ' "$_CONFIG_FILE" | tail -1)
     [ -z "$line" ] && return 1
+    # Strip leading whitespace on the captured line (if any) before
+    # extracting the value, so `${line#*=}` lines up with the user's
+    # actual data even when the line was indented.
+    line="${line#"${line%%[![:space:]]*}"}"
     local val="${line#*=}"
     _cfg_unquote "$val"
 }
@@ -1370,73 +1420,38 @@ _cfg_read_scalar() {
 # Idempotent set: replace existing `KEY=…` line if present, append
 # `KEY="value"` to the end of the file otherwise. Always double-quotes so
 # values with spaces/$ round-trip safely through `source`.
+#
+# When KEY is bracketed (e.g. `OPS_ALIASES[cc]`), bootstraps the
+# corresponding `declare -A <BASE>` line at end-of-file when absent —
+# bash needs the declaration before the indexed assignment, otherwise
+# `OPS_ALIASES[cc]=…` is silently misparsed as a string-indexed access
+# on what bash thinks is an indexed array.
 _cfg_set_scalar() {
     local key="$1" val="$2"
     _cfg_ensure_file
-    local quoted
+    local quoted target base
     quoted=$(_cfg_shellquote "$val")
+    target="${key}="
+    base=$(_cfg_array_base "$key" || true)
 
-    if grep -qE "^[[:space:]]*${key}=" "$_CONFIG_FILE"; then
+    # Existing line check via awk (substr — POSIX-safe over bracket chars).
+    local has_line
+    has_line=$(awk -v target="$target" '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (substr(line, 1, length(target)) == target) { print "yes"; exit }
+        }
+    ' "$_CONFIG_FILE")
+
+    if [ "$has_line" = "yes" ]; then
         local current
         if current=$(_cfg_read_scalar "$key"); then
             if [ "$current" = "$val" ]; then
                 return 0
             fi
         fi
-        awk -v key="$key" -v new="${key}=${quoted}" '
-            $0 ~ "^[[:space:]]*"key"=" {
-                if (!done) { print new; done=1 }
-                next
-            }
-            { print }
-            END { if (!done) print new }
-        ' "$_CONFIG_FILE" | _cfg_atomic_replace
-    else
-        printf '%s=%s\n' "$key" "$quoted" >> "$_CONFIG_FILE"
-    fi
-    return 0
-}
-
-# Remove every `KEY=...` line from ops.conf. Idempotent when absent.
-_cfg_unset_scalar() {
-    local key="$1"
-    [ -f "$_CONFIG_FILE" ] || return 0
-    if ! grep -qE "^[[:space:]]*${key}=" "$_CONFIG_FILE"; then
-        return 0
-    fi
-    awk -v key="$key" '$0 !~ "^[[:space:]]*"key"=" { print }' "$_CONFIG_FILE" \
-        | _cfg_atomic_replace
-}
-
-# Add or update `OPS_ALIASES[name]="argv"`. Adds the surrounding
-# `declare -A OPS_ALIASES` block if missing. Idempotent when name already
-# maps to the same value.
-#
-# The match is intentionally done via awk's substr() rather than regex `~`
-# because POSIX awk's behaviour on bracketed escapes (`\[`) is unspecified
-# (gawk treats it as a literal `[`, mawk/BSD awk may treat it as backslash
-# followed by an opening character class). substr is unambiguous across
-# every awk implementation.
-_cfg_alias_set() {
-    local name="$1" argv="$2"
-    _cfg_ensure_file
-    local quoted target
-    quoted=$(_cfg_shellquote "$argv")
-    target="OPS_ALIASES[${name}]="
-
-    local has_decl=0
-    if grep -qE '^[[:space:]]*declare[[:space:]]+-A[[:space:]]+OPS_ALIASES' "$_CONFIG_FILE"; then
-        has_decl=1
-    fi
-
-    if grep -qF "$target" "$_CONFIG_FILE"; then
-        local current_line current_val
-        current_line=$(grep -F "$target" "$_CONFIG_FILE" | tail -1)
-        current_val=$(_cfg_unquote "${current_line#*=}")
-        if [ "$current_val" = "$argv" ]; then
-            return 0
-        fi
-        awk -v target="$target" -v new="${target}${quoted}" '
+        awk -v target="$target" -v new="${key}=${quoted}" '
             {
                 line=$0
                 sub(/^[[:space:]]+/, "", line)
@@ -1451,25 +1466,39 @@ _cfg_alias_set() {
         return 0
     fi
 
-    {
-        cat "$_CONFIG_FILE"
-        if [ "$has_decl" = 0 ]; then
-            printf '\n# Aliases (managed by `ops config alias`)\ndeclare -A OPS_ALIASES\n'
-        fi
-        printf 'OPS_ALIASES[%s]=%s\n' "$name" "$quoted"
-    } | _cfg_atomic_replace
+    # New entry. For bracketed keys, ensure `declare -A <base>` exists in
+    # the file before the indexed assignment. Append both at end-of-file
+    # (the source order in ops.conf still places declare before the
+    # bracketed line because we add them in that order in the heredoc).
+    if [ -n "$base" ] \
+       && ! grep -qE "^[[:space:]]*declare[[:space:]]+-A[[:space:]]+${base}([[:space:]]|$)" "$_CONFIG_FILE"; then
+        {
+            printf '\n# Associative array (managed by `ops config`)\n'
+            printf 'declare -A %s\n' "$base"
+            printf '%s=%s\n' "$key" "$quoted"
+        } >> "$_CONFIG_FILE"
+    else
+        printf '%s=%s\n' "$key" "$quoted" >> "$_CONFIG_FILE"
+    fi
     return 0
 }
 
-# Remove `OPS_ALIASES[name]=…`. Idempotent when absent. Same substr
-# rationale as _cfg_alias_set above.
-_cfg_alias_unset() {
-    local name="$1"
+# Remove every line whose left-hand side matches `KEY=`. Idempotent when
+# absent. The match uses substr() so it handles bracketed keys without
+# escaping the `[`.
+_cfg_unset_scalar() {
+    local key="$1"
     [ -f "$_CONFIG_FILE" ] || return 0
-    local target="OPS_ALIASES[${name}]="
-    if ! grep -qF "$target" "$_CONFIG_FILE"; then
-        return 0
-    fi
+    local target="${key}="
+    local has_line
+    has_line=$(awk -v target="$target" '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (substr(line, 1, length(target)) == target) { print "yes"; exit }
+        }
+    ' "$_CONFIG_FILE")
+    [ "$has_line" != "yes" ] && return 0
     awk -v target="$target" '
         {
             line=$0
@@ -1479,6 +1508,24 @@ _cfg_alias_unset() {
             }
         }
     ' "$_CONFIG_FILE" | _cfg_atomic_replace
+}
+
+# Add or update `OPS_ALIASES[name]="argv"`. Thin wrapper around the
+# generalized scalar setter — the bracketed-key path of _cfg_set_scalar
+# handles the `declare -A OPS_ALIASES` bootstrap, the substr-based line
+# match, and idempotency. Kept as its own function so the cmd_config
+# `alias add NAME ARGV` dispatcher can reuse it cleanly without the
+# caller having to compose `OPS_ALIASES[<name>]` itself.
+_cfg_alias_set() {
+    local name="$1" argv="$2"
+    _cfg_set_scalar "OPS_ALIASES[${name}]" "$argv"
+}
+
+# Remove `OPS_ALIASES[name]=…`. Thin wrapper around the generalized
+# scalar unsetter; same substr-based match handles the bracketed key.
+_cfg_alias_unset() {
+    local name="$1"
+    _cfg_unset_scalar "OPS_ALIASES[${name}]"
 }
 
 # Validate a secret key name. Stricter than _cfg_validate_scalar_key (which
@@ -1594,12 +1641,19 @@ Two sections in the dump:
 
 Subcommands (managed edits to \$_CONFIG_FILE — atomic, idempotent,
 preserve comments and ordering):
-  set KEY VALUE              Set or replace OPS_KEY="VALUE"
-  get KEY                    Read OPS_KEY's literal value from ops.conf
-                             (exit 1 if unset)
-  unset KEY                  Remove OPS_KEY from ops.conf
-  alias add NAME 'argv...'   Add or replace OPS_ALIASES[NAME]="argv..."
-  alias remove NAME          Remove OPS_ALIASES[NAME]
+  set KEY VALUE              Set or replace OPS_KEY="VALUE". KEY accepts
+                             both scalars (OPS_RUNTIME) and bracketed
+                             entries (OPS_AGENT_FLAGS[claude],
+                             OPS_IMAGES[debian]). Bracketed keys auto-
+                             bootstrap 'declare -A <BASE>' when missing.
+  get KEY                    Read KEY's literal value from ops.conf
+                             (exit 1 if unset). KEY accepts the same
+                             two shapes as 'set'.
+  unset KEY                  Remove KEY from ops.conf. Bracketed form
+                             removes only that entry; the surrounding
+                             'declare -A' line is left untouched.
+  alias add NAME 'argv...'   Shortcut for 'set OPS_ALIASES[NAME] argv...'
+  alias remove NAME          Shortcut for 'unset OPS_ALIASES[NAME]'
   secret add NAME [--from-env|--from-stdin|--from-prompt]
                              Add 'export NAME="..."' (chmod 600 enforced)
   secret list                Print secret names (values are never shown)
@@ -1608,8 +1662,11 @@ preserve comments and ordering):
 Examples:
   ops config set OPS_RUNTIME docker
   ops config set OPS_DEFAULT_RUN_FLAGS "--no-rm --no-wayland"
+  ops config set 'OPS_AGENT_FLAGS[claude]' "--claude-volume --install"
+  ops config set 'OPS_IMAGES[debian]' "localhost/ops-dev-debian"
   ops config get OPS_RUNTIME
-  ops config unset OPS_RUNTIME
+  ops config get 'OPS_AGENT_FLAGS[claude]'
+  ops config unset 'OPS_AGENT_FLAGS[claude]'
   ops config alias add cc 'run --claude'
   ops config alias remove cc
   ops config secret add GITHUB_TOKEN --from-env

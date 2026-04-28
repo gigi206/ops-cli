@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-04-28
+
+### Added
+- **`ops config set/get/unset` accepts bracketed associative-array keys** (e.g. `OPS_AGENT_FLAGS[claude]`, `OPS_IMAGES[debian]`, `OPS_BUILD_ARGS[arch]`). The validator's regex was widened from `^OPS_[A-Z][A-Z0-9_]*$` to a two-shape grammar: pure-scalar (`OPS_FOO`) or single-entry-of-array (`OPS_FOO[index]`). The bracketed path auto-bootstraps the surrounding `declare -A <BASE>` line when the file doesn't yet have it — bash needs the declaration before the indexed assignment, otherwise the source step would silently misparse `OPS_FOO[bar]=…` as a string-indexed access on what bash thinks is an indexed array (numeric-only indices, `bar` would coerce to `0`). Coverage: 20 tests in `tests/test_cmd_config_bracketed.bats` covering bootstrap, idempotency, in-place update, multi-entry coexistence, hyphenated indices (`OPS_IMAGES[arch-min]`), end-to-end source-roundtrip, and the four malformed-key rejection paths (bare array name, empty index `OPS_FOO[]`, dangling bracket `OPS_FOO[`, nested brackets `OPS_FOO[a[b]]`).
+
+  Concretely: this removes the only known case where the `/ops-setup` automation skill had to bypass `ops config set` and write to `ops.conf` via direct `Edit` (the `OPS_AGENT_FLAGS[<agent>]` path it uses to wire per-agent default isolation flags). Post-1.5.0, `/ops-setup` can dispatch every config-file mutation through `ops config` for atomicity + chmod 600 + idempotency without per-array helper code.
+
+### Changed
+- **`_cfg_alias_set` / `_cfg_alias_unset` are now thin wrappers around `_cfg_set_scalar` / `_cfg_unset_scalar`** with a bracketed key (`OPS_ALIASES[<name>]`). Eliminates the ~50 lines of duplicate idempotency / declare-A bootstrap / awk substr-match logic that was sitting in the alias path before this release. Internal-only refactor — external behaviour is unchanged. The `cmd_config alias add NAME ARGV` dispatch surface is preserved as-is, so anyone who scripted against it (the `/ops-setup` skill, in particular) doesn't notice. Regression guard: the existing 56 `tests/test_cmd_config_set.bats` + `tests/test_cmd_config_secret.bats` cases all stay green after the wrapper swap.
+- **`_cfg_read_scalar` / `_cfg_set_scalar` / `_cfg_unset_scalar` now use `awk`'s `substr()` instead of `~ regex` for the line-match step**. Same POSIX-portability reason that already drove `_cfg_alias_set` to substr in 1.4.0: bracketed keys would otherwise need `\[` escaping, and gawk vs mawk vs BSD awk disagree on whether `\[` is a literal `[` or a backslash followed by an opening character class. Using substr() is unambiguous across every awk variant in CI's matrix.
+- **`OPS_AGENT_FLAGS` is now in `_OPS_CONFIG_ARRAY_KEYS`** so the validator's bare-name rejection (`config set OPS_AGENT_FLAGS "anything"` → "is an array — use 'config set OPS_AGENT_FLAGS[<index>]'") includes a clear, actionable diagnostic pointing at the bracketed form. Same treatment as the four other associative arrays already in that list.
+
 ## [1.4.0] - 2026-04-28
 
 ### Added
