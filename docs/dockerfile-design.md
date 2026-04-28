@@ -205,7 +205,7 @@ additively. Splitting baseline (image-baked) from user-additions
 (volume-backed) is what makes `mise use -g` survive a container
 recreation:
 
-- **Baseline** (`/etc/mise/config.toml`) — `mise use -g nix:git nix:semgrep
+- **Baseline** (`/etc/mise/config.toml`) — `mise use -g nix:git nix:google-chrome
   github:cli/cli …` writes here at build time, gets re-baked on every
   rebuild.
 - **User additions** (`/opt/mise/data/config/config.toml`) — `mise use -g
@@ -219,10 +219,10 @@ producing "orphan" entries in `mise ls` and breaking `claude` /
 
 ### `EXTRA_MISE_TOOLS` word-splitting
 
-`EXTRA_MISE_TOOLS` is a whitespace-separated list (default
-`"nix:google-chrome"`). We deliberately word-split it inside the `RUN`
+`EXTRA_MISE_TOOLS` is a whitespace-separated list (default empty). We
+deliberately word-split it inside the `RUN`
 (`shellcheck disable=SC2086`) so values like
-`"nix:chromium nix:ngrok"` work. A user-controlled list **is** a minor
+`"nix:terraform nix:ngrok"` work. A user-controlled list **is** a minor
 shell-injection surface, but the value comes from `OPS_BUILD_ARGS` /
 `--build-arg` — same trust as the rest of the Dockerfile.
 

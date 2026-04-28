@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-04-28
+
+### Removed
+- **`semgrep` is no longer in the image baseline.** Pre-1.8.0 the Dockerfile baked `nix:semgrep` into the system-wide `mise use -g …` line at build time, so every `ops run` had `semgrep` on PATH whether the user wanted it or not. Post-1.8.0 it's gone from the baseline and not in the default `EXTRA_MISE_TOOLS` either — users who want it back add it via `OPS_BUILD_ARGS`. Rationale: the baseline should ship the strict minimum that every container needs (git, browser for chrome-devtools-mcp, AI-agent runtime); domain tooling belongs in user-controlled `EXTRA_MISE_TOOLS` so the image stays small for users who don't run that tool category. Migration: `ops config set 'OPS_BUILD_ARGS[<image-key>]' 'EXTRA_MISE_TOOLS=nix:semgrep'` then `ops -i <image-key> build` to restore.
+
+### Changed
+- **`google-chrome` moved into the image baseline.** It used to live in the *default value* of `EXTRA_MISE_TOOLS` (`ARG EXTRA_MISE_TOOLS="nix:google-chrome"`), which had a footgun: any `OPS_BUILD_ARGS[<key>]="EXTRA_MISE_TOOLS=…"` override silently dropped chrome unless the user remembered to re-list it. After 1.8.0 chrome is hardcoded in the baseline `mise use -g` block (next to `nix:git`, `github:cli/cli`, etc.), so it's always present and `EXTRA_MISE_TOOLS` overrides become **purely additive** — list what you want on top of the baseline, no risk of dropping something you didn't intend to. The behavioural promise "chrome works out of the box for `chrome-devtools-mcp`" stays identical; only the implementation shape changed.
+- **`ARG EXTRA_MISE_TOOLS=""` is now the default** (was `"nix:google-chrome"`). Combined with the chrome → baseline move above, the new contract is: baseline = always there, untouchable from `OPS_BUILD_ARGS`; `EXTRA_MISE_TOOLS` = pure addition layer, empty by default. Means `ops config set 'OPS_BUILD_ARGS[<key>]' 'EXTRA_MISE_TOOLS=nix:terraform'` adds terraform without losing anything else, where pre-1.8.0 you had to remember `'EXTRA_MISE_TOOLS=nix:google-chrome nix:terraform'`.
+- **`scripts/google-chrome.sh` wrapper error message updated.** When the Chrome binary is missing (e.g. `ops-share-mise` volume reset before mise had time to repopulate it), the wrapper used to say "rebuild with `--build-arg EXTRA_MISE_TOOLS=nix:google-chrome`" — accurate pre-1.8.0, but obsolete now that chrome is in the baseline. The new message tells the user to rebuild the image, and points at `OPS_BUILD_ARGS` for users who want a different browser instead (e.g. `EXTRA_MISE_TOOLS=nix:chromium`).
+
+  Coverage: `tests/test_image_integration.bats:86` (baseline assertion) flipped from `[[ "$output" == *"nix:semgrep"* ]]` to `[[ "$output" != *"nix:semgrep"* ]]` (semgrep absent; chrome still asserted present); `tests/test_image_integration.bats:416` updated to match the new wrapper error string (`image baseline ships google-chrome`). README's "Build-time tools" section (`README.md:423`+) was rewritten end-to-end to describe the new baseline / additive-EXTRA_MISE_TOOLS contract; line 5 (TL;DR), line 1190 (GUI/Wayland section's chrome reference), and `docs/dockerfile-design.md:208` + `:222` were updated for the same reason.
+
 ## [1.7.0] - 2026-04-28
 
 ### Fixed

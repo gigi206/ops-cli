@@ -38,13 +38,12 @@ if [ ! -x "$CHROME_BIN" ]; then
     cat >&2 <<'MSG'
 google-chrome: not installed in this container.
 
-To install it, rebuild the image with:
-  ./ops.sh build --build-arg EXTRA_MISE_TOOLS=nix:google-chrome
+The image baseline ships google-chrome — if it's missing here, the
+ops-share-mise volume was likely reset. Rebuild the image to repopulate it:
+  ./ops.sh build
 
-Or declare it per-profile in ~/.config/ops/ops.conf:
-  declare -A OPS_BUILD_ARGS=(
-    [<image-key>]="EXTRA_MISE_TOOLS=nix:google-chrome"
-  )
+To pin a different browser instead, override via ops.conf:
+  ops config set 'OPS_BUILD_ARGS[<image-key>]' 'EXTRA_MISE_TOOLS=nix:chromium'
 
 See the README section "Build-time tools" for details.
 MSG
