@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-04-28
+
+### Added
+- **`ops env` now lists custom exports from ops.conf** in a dedicated `Custom config exports (NOT auto-propagated to container)` section. Previously the command only showed the four hardcoded auto-propagated vars (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`); any extra `export X=…` line the user added via `ops config secret add` (e.g. `MISTRAL_API_KEY` for a non-officially-supported agent) was invisible to `ops env`. The new section parses ops.conf for every `^export NAME=` line, filters out the auto-propagated ones to avoid duplication, and renders each remaining entry with `[set]/[unset]` status + `origin: config`. A trailing footnote spells out the contract: these vars are exported when ops.conf is sourced (so they're visible in the calling shell), but `cmd_run` does NOT automatically forward them to the container — the user must pass them via `-e KEY=VAL` / `--env-file` at run time, or open an upstream issue to add the name to `_OPS_AUTO_PROPAGATED_ENVS`. Coverage: 5 new tests in `tests/test_cmd_env.bats` (custom section render, NOT-auto-propagated explanation present, no section when ops.conf has no extras, no duplication of auto-propagated names, live-env [set] detection).
+
+  Use case: the user runs `ops config secret add MISTRAL_API_KEY --from-env` to store a key for a third-party agent they wired manually via `--env-file`, then later wonders "did ops env capture it?". Before 1.6.0: silent no, the var was just absent from `ops env`'s output. After: explicit yes, with the caveat that they still need to forward it themselves at run time.
+
 ## [1.5.0] - 2026-04-28
 
 ### Added
