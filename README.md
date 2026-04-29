@@ -28,6 +28,7 @@ The goal: a single entry point (`ops.sh`) to build, run, debug and update the en
 - [Images (Arch / Debian)](#images-arch--debian)
 - [Named images (profiles)](#named-images-profiles)
 - [Runtime selection](#runtime-selection)
+- [Nested containers (running containers from inside ops)](#nested-containers-running-containers-from-inside-ops)
 
 **Inside the container**
 - [Nix tooling (mise-nix plugin)](#nix-tooling-mise-nix-plugin)
@@ -988,6 +989,37 @@ Uses `$OPS_NERDCTL_HOME/bin/nerdctl` (default `~/.local/share/ops/nerdctl/bin/ne
 OPS_RUNTIME=podman ./ops.sh status      # one-shot
 echo "OPS_RUNTIME=podman" >> ~/.config/ops/ops.conf   # persistent
 ```
+
+---
+
+## Nested containers (running containers from inside ops)
+
+When you need to run a container from **inside** an ops shell (testing a Dockerfile, `docker compose`, Testcontainers, devcontainers CLI, …), the supported pattern is to mount the host's container engine socket. We do **not** ship a systemd-based image with `dockerd` inside — full design rationale and the three concrete recipes are in [`docs/nested-containers.md`](docs/nested-containers.md).
+
+| Host runtime | CLI inside | Bind-mounts | User | Caps | Verdict |
+|---|---|---|---|---|---|
+| **podman rootless** | `docker` (compat) | 1 (socket) | non-root | none | **recommended** |
+| docker rootful | `docker` | 1 (socket) + `--group-add` | non-root | none | OK for trusted dev |
+| containerd + nerdctl | `nerdctl` (host path) | 5 dirs | root | `SYS_ADMIN, NET_ADMIN` + AppArmor unconfined | discouraged ([upstream](https://github.com/containerd/nerdctl/discussions/2484)) |
+
+Quick start for the recommended path (host has `systemctl --user enable --now podman.socket`):
+
+```bash
+# One-time: add the docker CLI to your image (~70 MB)
+ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:docker-client'
+ops update default
+
+# One-shot run with the socket mounted (no ops.conf change)
+PODMAN_SOCK="/run/user/$(id -u)/podman/podman.sock"
+ops -v "$PODMAN_SOCK:$PODMAN_SOCK" \
+    -e "DOCKER_HOST=unix://$PODMAN_SOCK" \
+    shell
+
+# inside
+docker run --rm hello-world
+```
+
+To persist as a one-keystroke alias (`ops podman`), drop a function alias in `ops.conf` — see the [`ops.conf` examples for all three runtimes](docs/nested-containers.md#opsconf-examples-three-runtimes-side-by-side). The full doc also covers the `docker.sock` variant, the nerdctl recipe (and why to avoid it), and volume-path / network gotchas.
 
 ---
 
