@@ -205,9 +205,12 @@ additively. Splitting baseline (image-baked) from user-additions
 (volume-backed) is what makes `mise use -g` survive a container
 recreation:
 
-- **Baseline** (`/etc/mise/config.toml`) — `mise use -g nix:git nix:google-chrome
-  github:cli/cli …` writes here at build time, gets re-baked on every
-  rebuild.
+- **Baseline** (`/etc/mise/config.toml`) — `mise use -g nix:git
+  github:cli/cli github:BurntSushi/ripgrep github:jqlang/jq
+  github:ast-grep/ast-grep node@lts` writes here at build time, gets
+  re-baked on every rebuild. `google-chrome` is NOT in the baseline (see
+  README "Build-time tools" — it's opt-in via `EXTRA_MISE_TOOLS` so the
+  default image stays lean).
 - **User additions** (`/opt/mise/data/config/config.toml`) — `mise use -g
   X` from inside a running container writes here, persists in
   `ops-share-mise`.

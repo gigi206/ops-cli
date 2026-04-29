@@ -52,3 +52,53 @@ setup() {
     [ "$status" -eq 0 ]
     [[ "$output" != *"Dockerfile changed"* ]]
 }
+
+# OPS_BUILD_ARGS cache invalidation. current_hash() folds OPS_BUILD_ARGS[<key>]
+# (with `default` as the unkeyed-build fallback) into the digest, so any mutation
+# must trigger the "Dockerfile changed" warning on the next non-build invocation.
+# Mirrors the `OPS_BUILD_ARGS[default]: applies to unkeyed build` propagation
+# test in test_build_flags.bats — without this guard, the cache could go stale
+# silently when the user adds or edits OPS_BUILD_ARGS[default].
+
+@test "warning when OPS_BUILD_ARGS[default] is added after build" {
+    # Initial build with no config → hash captures empty build-args.
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+
+    # User adds OPS_BUILD_ARGS[default] post-build — current_hash must now
+    # differ from the stored hash, triggering the rebuild-needed warning.
+    cat > "$cfg" <<'EOF'
+declare -A OPS_BUILD_ARGS=( [default]="EXTRA_MISE_TOOLS=nix:google-chrome" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Dockerfile changed"* ]]
+}
+
+@test "warning when OPS_BUILD_ARGS[default] is mutated after build" {
+    # Build with config A.
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_BUILD_ARGS=( [default]="EXTRA_MISE_TOOLS=nix:terraform" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+
+    # Mutate to config B — same shape, different value. current_hash must
+    # detect the change (this is the regression guard for the current_hash()
+    # mirror of the build_image() fix; without the mirror, the hash would
+    # ignore OPS_BUILD_ARGS[default] and the cache would go stale).
+    cat > "$cfg" <<'EOF'
+declare -A OPS_BUILD_ARGS=( [default]="EXTRA_MISE_TOOLS=nix:ngrok" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Dockerfile changed"* ]]
+}

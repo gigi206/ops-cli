@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.8.0"
+OPS_VERSION="1.9.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -302,13 +302,17 @@ current_hash() {
         sha256sum < "$OPS_DOCKERFILE"
         _hash_dir "$SCRIPT_DIR/mise"
         _hash_dir "$SCRIPT_DIR/scripts"
-        # Per-profile build args: only impact the image when `-i <key>`
-        # matches a declared OPS_IMAGES key (same condition used by
-        # build_image when it translates OPS_BUILD_ARGS into --build-arg).
-        if [ -n "${_OPS_IMAGE_KEY:-}" ] \
-           && declare -p OPS_BUILD_ARGS >/dev/null 2>&1 \
-           && [ -n "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]:-}" ]; then
-            printf 'build-args: %s\n' "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]}"
+        # Per-profile build args: when `-i <key>` matches a declared OPS_IMAGES
+        # key, OPS_BUILD_ARGS[<key>] applies. For unkeyed builds (no `-i`, or
+        # `-i` pointing at a raw image ref), the fallback key is `default` —
+        # so OPS_BUILD_ARGS[default] applies to unkeyed builds without the
+        # user having to register a matching OPS_IMAGES[default] entry.
+        # Same condition used by build_image when it translates OPS_BUILD_ARGS
+        # into --build-arg.
+        local _build_args_key="${_OPS_IMAGE_KEY:-default}"
+        if declare -p OPS_BUILD_ARGS >/dev/null 2>&1 \
+           && [ -n "${OPS_BUILD_ARGS[$_build_args_key]:-}" ]; then
+            printf 'build-args: %s\n' "${OPS_BUILD_ARGS[$_build_args_key]}"
         fi
     } | sha256sum | cut -d' ' -f1
 }
@@ -405,18 +409,26 @@ build_image() {
     # string of `KEY=VALUE` pairs separated by `;` (a single pair is the
     # common case). Allows e.g. overriding EXTRA_MISE_TOOLS per image:
     #   declare -A OPS_BUILD_ARGS=(
+    #     [default]="EXTRA_MISE_TOOLS=nix:google-chrome"
     #     [arch-chrome]="EXTRA_MISE_TOOLS=nix:google-chrome-for-testing"
     #     [arch-min]="EXTRA_MISE_TOOLS="
     #   )
+    # The lookup key is `_OPS_IMAGE_KEY` (set by `_resolve_image()` when
+    # `-i <key>` matches an OPS_IMAGES entry) with `default` as the fallback
+    # for unkeyed builds. This means `OPS_BUILD_ARGS[default]` applies to
+    # `ops build` (no `-i`), matching the natural reading of "default" — and
+    # keying off `default` does NOT require declaring `OPS_IMAGES[default]`,
+    # since the unkeyed build's image name comes from `OPS_IMAGE` (default
+    # `localhost/ops-dev`) rather than from an OPS_IMAGES profile.
+    local _build_args_key="${_OPS_IMAGE_KEY:-default}"
     local -a profile_build_args=()
-    if [ -n "${_OPS_IMAGE_KEY:-}" ] \
-       && declare -p OPS_BUILD_ARGS >/dev/null 2>&1 \
-       && [ -n "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]:-}" ]; then
+    if declare -p OPS_BUILD_ARGS >/dev/null 2>&1 \
+       && [ -n "${OPS_BUILD_ARGS[$_build_args_key]:-}" ]; then
         local _pair
         local -a _profile_pairs=()
         # IFS=';' splits into KEY=VALUE chunks; `read -ra` avoids globbing
         # and preserves internal whitespace within each value.
-        IFS=';' read -ra _profile_pairs <<< "${OPS_BUILD_ARGS[$_OPS_IMAGE_KEY]}"
+        IFS=';' read -ra _profile_pairs <<< "${OPS_BUILD_ARGS[$_build_args_key]}"
         for _pair in "${_profile_pairs[@]}"; do
             # Trim surrounding whitespace so `;  FOO=bar` works.
             _pair="${_pair#"${_pair%%[![:space:]]*}"}"

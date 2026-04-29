@@ -2,14 +2,15 @@
 #
 # ops-dev — Arch-based dev container image used by ops.sh.
 # Ships: mise + Nix (packages via the merged mise-nix plugin, flake.nix env
-# activation) + base dev tools (git, google-chrome, gh, ripgrep, jq,
-# ast-grep, node@lts). CLI agents (claude-code, gemini-cli, opencode,
-# codex) are NOT baked — they are installed on demand by ops.sh when you
-# pass --claude / --gemini / --opencode / --codex, and persist in the
-# ops-share-mise volume.
-# Add extra tools (terraform, ngrok, …) via:
+# activation) + base dev tools (git, gh, ripgrep, jq, ast-grep, node@lts).
+# google-chrome is NOT in the baseline — opt-in via EXTRA_MISE_TOOLS (see
+# the "Build-time tools" section in README for the chrome-devtools-mcp setup
+# example). CLI agents (claude-code, gemini-cli, opencode, codex) are NOT
+# baked — they are installed on demand by ops.sh when you pass --claude /
+# --gemini / --opencode / --codex, and persist in the ops-share-mise volume.
+# Add extra tools (terraform, ngrok, google-chrome, …) via:
 #   ops config set 'OPS_BUILD_ARGS[default]' \
-#     'EXTRA_MISE_TOOLS=nix:terraform'
+#     'EXTRA_MISE_TOOLS=nix:terraform nix:google-chrome'
 # mise handles both Nix package installation (nix:pkg@ver) and flake.nix
 # dev-shell activation; no other package manager is involved.
 #
@@ -85,11 +86,17 @@ ARG MISE_INSTALL_SHA256=
 
 # Extra tools installed on top of the baseline `mise use -g` set. Value is a
 # whitespace-separated list of mise tool specs (e.g. "nix:terraform nix:ngrok").
-# Empty by default — the layer is purely additive. The image baseline already
-# ships google-chrome (so `chrome-devtools-mcp` works out of the box), git,
-# gh, ripgrep, jq, ast-grep, node@lts; EXTRA_MISE_TOOLS is for everything
-# else the user wants without patching the Dockerfile. Configure per profile
-# via OPS_BUILD_ARGS[<image-key>]="EXTRA_MISE_TOOLS=..." in ops.conf.
+# Empty by default — the layer is purely additive. The image baseline ships
+# git, gh, ripgrep, jq, ast-grep, node@lts; google-chrome is NOT baked (it's
+# ~300 MB and only needed for chrome-devtools-mcp / Puppeteer / Lighthouse
+# users). To opt in:
+#   ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:google-chrome'
+#   ops update default
+# OPS_BUILD_ARGS[default] applies to unkeyed builds without requiring an
+# OPS_IMAGES[default] registration — the lookup falls through to `default`
+# automatically. For per-profile setups (multiple images side-by-side), use
+# OPS_BUILD_ARGS[<key>] paired with OPS_IMAGES[<key>]. See the
+# "Build-time tools" section in README for the full recipe.
 ARG EXTRA_MISE_TOOLS=""
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md).
@@ -201,7 +208,7 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
  && mkdir -p /opt/mise/data/plugins \
  && ln -sfn /opt/ops/mise-plugin/nix /opt/mise/data/plugins/nix \
  && MISE_CONFIG_DIR=/etc/mise /opt/mise/bin/mise use -g \
-      nix:git nix:google-chrome \
+      nix:git \
       github:cli/cli github:BurntSushi/ripgrep \
       github:jqlang/jq github:ast-grep/ast-grep \
       node@lts \
