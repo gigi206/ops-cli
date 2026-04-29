@@ -38,14 +38,23 @@ if [ ! -x "$CHROME_BIN" ]; then
     cat >&2 <<'MSG'
 google-chrome: not installed in this container.
 
-The image baseline ships google-chrome — if it's missing here, the
-ops-share-mise volume was likely reset. Rebuild the image to repopulate it:
-  ./ops.sh build
+google-chrome is not part of the image baseline (it's ~300 MB and only
+needed for chrome-devtools-mcp / Puppeteer / Lighthouse users). To opt
+in and rebuild the default image:
 
-To pin a different browser instead, override via ops.conf:
-  ops config set 'OPS_BUILD_ARGS[<image-key>]' 'EXTRA_MISE_TOOLS=nix:chromium'
+  ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:google-chrome'
+  ops update default
 
-See the README section "Build-time tools" for details.
+To pin a different browser instead (chromium is free and lighter, but
+lacks proprietary codecs):
+
+  ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:chromium'
+  ops update default
+
+For a chrome-equipped image side-by-side with a lean default, use a
+named profile (`ops -i chrome run` for browser work, `ops run` for the
+rest) — see the README section "Build-time tools" → "Adding
+google-chrome (or another browser)" for that recipe.
 MSG
     exit 127
 fi

@@ -198,3 +198,83 @@ EOF
     [ "$status" -eq 0 ]
     ! grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS' "$MOCK_LOG"
 }
+
+# OPS_BUILD_ARGS[default]: applies to unkeyed builds without requiring an
+# OPS_IMAGES[default] registration. The lookup key for an unkeyed build is
+# `default`, which matches the natural reading of the array key name.
+
+@test "OPS_BUILD_ARGS[default]: applies to unkeyed build (no -i flag)" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_BUILD_ARGS=( [default]="EXTRA_MISE_TOOLS=nix:google-chrome" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:google-chrome' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS[default]: works without an OPS_IMAGES[default] entry (no pairing required)" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    # Intentionally NO OPS_IMAGES declaration — the unkeyed build path must
+    # still pick up OPS_BUILD_ARGS[default]. This is the regression test for
+    # the silent-ignore footgun where setting OPS_BUILD_ARGS[default] alone
+    # used to be a no-op.
+    cat > "$cfg" <<'EOF'
+declare -A OPS_BUILD_ARGS=( [default]="EXTRA_MISE_TOOLS=nix:terraform" )
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" build
+    [ "$status" -eq 0 ]
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:terraform' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS[default]: explicit -i <key> overrides the default fallback" {
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [arch-chrome]="localhost/ops-chrome" )
+declare -A OPS_BUILD_ARGS=(
+  [default]="EXTRA_MISE_TOOLS=nix:terraform"
+  [arch-chrome]="EXTRA_MISE_TOOLS=nix:google-chrome"
+)
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i arch-chrome build
+    [ "$status" -eq 0 ]
+    # arch-chrome wins; default is NOT applied (per-profile is not "merged"
+    # with default — the lookup picks one key, not both).
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:google-chrome' "$MOCK_LOG"
+    ! grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:terraform' "$MOCK_LOG"
+}
+
+@test "OPS_BUILD_ARGS[default]: applies as fallback when -i points to a raw image ref" {
+    # Pendant of "ignored when -i points to a raw image ref (no key)" but with
+    # OPS_BUILD_ARGS[default] configured: a raw-ref `-i` doesn't set
+    # _OPS_IMAGE_KEY, so the lookup falls through to `default` and the
+    # build-arg propagates. Locks the post-fix behavior — pre-fix, the raw-ref
+    # path skipped OPS_BUILD_ARGS entirely regardless of `[default]`.
+    mock_runtime docker
+    local cfg="$BATS_TEST_TMPDIR/.config/ops/ops.conf"
+    mkdir -p "$(dirname "$cfg")"
+    cat > "$cfg" <<'EOF'
+declare -A OPS_IMAGES=( [arch]="localhost/ops-dev" )
+declare -A OPS_BUILD_ARGS=(
+  [default]="EXTRA_MISE_TOOLS=nix:terraform"
+  [arch]="EXTRA_MISE_TOOLS=nix:chromium"
+)
+EOF
+    run env OPS_RUNTIME=docker XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/.config" \
+        "$(ops_sh)" -i localhost/some-other build
+    [ "$status" -eq 0 ]
+    # Raw ref → no profile match → fallback is `default` → terraform applies.
+    grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:terraform' "$MOCK_LOG"
+    # The `arch` per-profile entry must NOT leak in — only `default` is the
+    # fallback, never another arbitrary key.
+    ! grep -qE 'build .*--build-arg EXTRA_MISE_TOOLS=nix:chromium' "$MOCK_LOG"
+}

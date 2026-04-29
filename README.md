@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml)
 
-Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, google-chrome, ripgrep, jq, ast-grep, gh). Add more (terraform, ngrok, …) via `ops config set 'OPS_BUILD_ARGS[<key>]' 'EXTRA_MISE_TOOLS=…'`.
+Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, ripgrep, jq, ast-grep, gh). Add more (google-chrome, terraform, ngrok, …) via `ops config set 'OPS_BUILD_ARGS[<key>]' 'EXTRA_MISE_TOOLS=…'`.
 
 The goal: a single entry point (`ops.sh`) to build, run, debug and update the environment, regardless of the underlying container runtime.
 
@@ -426,15 +426,13 @@ The **image baseline** is always installed and not configurable from the user si
 
 ```bash
 mise use -g \
-    nix:git nix:google-chrome \
+    nix:git \
     github:cli/cli github:BurntSushi/ripgrep \
     github:jqlang/jq github:ast-grep/ast-grep \
     node@lts
 ```
 
-That baseline includes **Google Chrome** (~300 MB) so the [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) server works out of the box. Chrome is one of the two browsers officially supported by the MCP (the other being Chrome for Testing, which isn't yet in nixpkgs).
-
-> **Unfree flag** — `google-chrome` is unfree. The Dockerfile already sets both `NIXPKGS_ALLOW_UNFREE=1` (standard Nix var) and `MISE_NIX_ALLOW_UNFREE=true` (mise-nix plugin escape hatch, auto-forwarded to `NIXPKGS_ALLOW_UNFREE=1` when the plugin calls `nix build`). No extra setup needed.
+That baseline is intentionally minimal — `git`, `gh`, `ripgrep`, `jq`, `ast-grep`, `node@lts`. **No browser** is bundled by default: `google-chrome` (~300 MB) and `chromium` are opt-in via `EXTRA_MISE_TOOLS` so users who don't need `chrome-devtools-mcp` / Puppeteer / Lighthouse don't pay the size + unfree-license cost. See the **[Adding google-chrome (or another browser)](#adding-google-chrome-or-another-browser)** sub-section below for the exact recipe.
 
 On top of the baseline, the Dockerfile accepts an `EXTRA_MISE_TOOLS` build-arg — a **whitespace-separated list of mise tool specs** — whose default is **empty**. The layer is **purely additive**: anything you list here is installed on top of the baseline, and `EXTRA_MISE_TOOLS=""` does NOT remove baseline tools.
 
@@ -442,25 +440,47 @@ On top of the baseline, the Dockerfile accepts an `EXTRA_MISE_TOOLS` build-arg �
 ARG EXTRA_MISE_TOOLS=""
 ```
 
-**To add tools** (terraform, ngrok, additional browsers, …), set them per profile via `ops config`:
+**To add tools** (google-chrome, terraform, ngrok, additional browsers, …), there are two patterns:
+
+**Simple — apply to the default image** (most common case):
 
 ```bash
-# All profiles
-ops config set 'OPS_BUILD_ARGS[default]' \
-  'EXTRA_MISE_TOOLS=nix:terraform'
+# Single line, no OPS_IMAGES needed. Applies to `ops build` (no -i flag).
+ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:terraform'
 
-# Per profile
-ops config set 'OPS_BUILD_ARGS[arch]'      'EXTRA_MISE_TOOLS=nix:terraform'
-ops config set 'OPS_BUILD_ARGS[arch-full]' 'EXTRA_MISE_TOOLS=nix:terraform nix:ngrok'
-ops config set 'OPS_BUILD_ARGS[deb]'       'EXTRA_MISE_TOOLS=nix:chromium'   # second browser
+ops update default       # rebuild the default image with terraform baked in
+ops run --opencode       # run as usual; terraform is on PATH
+```
 
-ops -i arch build       # → baseline + nix:terraform
-ops -i arch-full build  # → baseline + terraform + ngrok
+**Per-profile — multiple images side-by-side** (when you want different builds for different workloads):
+
+```bash
+ops config set 'OPS_IMAGES[arch]'           'localhost/ops-dev-arch'
+ops config set 'OPS_BUILD_ARGS[arch]'       'EXTRA_MISE_TOOLS=nix:terraform'
+
+ops config set 'OPS_IMAGES[arch-full]'      'localhost/ops-dev-arch-full'
+ops config set 'OPS_BUILD_ARGS[arch-full]'  'EXTRA_MISE_TOOLS=nix:terraform nix:ngrok'
+
+ops config set 'OPS_IMAGES[deb]'            'localhost/ops-dev-deb'
+ops config set 'OPS_BUILD_ARGS[deb]'        'EXTRA_MISE_TOOLS=nix:chromium'   # browser
+
+ops -i arch      build    # → baseline + nix:terraform
+ops -i arch-full build    # → baseline + terraform + ngrok
+ops -i deb       build    # → baseline + chromium
 ```
 
 Or directly in `ops.conf`:
 
 ```bash
+declare -A OPS_BUILD_ARGS=(
+  [default]="EXTRA_MISE_TOOLS=nix:terraform"
+)
+
+# Or for the per-profile pattern:
+declare -A OPS_IMAGES=(
+  [arch]="localhost/ops-dev-arch"
+  [arch-full]="localhost/ops-dev-arch-full"
+)
 declare -A OPS_BUILD_ARGS=(
   [arch]="EXTRA_MISE_TOOLS=nix:terraform"
   [arch-full]="EXTRA_MISE_TOOLS=nix:terraform nix:ngrok"
@@ -469,12 +489,48 @@ declare -A OPS_BUILD_ARGS=(
 
 **Semantics of `OPS_BUILD_ARGS`:**
 
-- Associative array keyed by `OPS_IMAGES` key (same keys as `OPS_IMAGES` / `OPS_DOCKERFILES` / `OPS_CONTAINER_NAMES`).
+- Associative array. The lookup key for a given build is the active image profile key (`-i <key>` matching an `OPS_IMAGES` entry) with **`default`** as the fallback for unkeyed builds (`ops build` with no `-i`, or `-i` pointing at a raw image ref).
 - Value is one `KEY=VALUE` pair, or several separated by `;` (e.g. `"EXTRA_MISE_TOOLS=nix:terraform;NIX_CLEANUP=false"`).
-- Applied **only** when `-i <key>` matches an `OPS_IMAGES` key. When `-i` points to a raw image ref, no per-profile args are injected.
+- `OPS_BUILD_ARGS[default]` does NOT require an `OPS_IMAGES[default]` registration — the unkeyed build's image name comes from `OPS_IMAGE` (default `localhost/ops-dev`), and the lookup key falls through to `default` automatically.
+- Per-profile entries (`OPS_BUILD_ARGS[arch]`, `[arch-chrome]`, …) DO require the matching `OPS_IMAGES[<key>]` to be declared — otherwise `-i <key>` is treated as a raw image ref, no profile is selected, and the lookup falls back to `default` (which is probably not what you wanted).
+- The lookup picks **one** key, not both. `OPS_BUILD_ARGS[default]` is NOT merged with `OPS_BUILD_ARGS[arch]` when you `-i arch build` — the per-profile entry wins exclusively.
 - Propagated to `docker build` / `podman build` / `nerdctl build` via `--build-arg`.
 
 **Applicable build-args** (declared in `Dockerfile` / `Dockerfile.debian`): `EXTRA_MISE_TOOLS`, `NIX_CLEANUP`, `MISE_INSTALL_SHA256`, `USER_UID`, `USER_GID`, `USER_NAME`, `USER_LANG`, `SOURCE_URL` (auto-forwarded from `$OPS_SOURCE_URL`).
+
+#### Adding google-chrome (or another browser)
+
+For users of [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp), Puppeteer, or Lighthouse, the simplest setup is to bake Chrome into the default image:
+
+```bash
+ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:google-chrome'
+ops update default       # rebuild with chrome baked in
+ops run --opencode       # or --claude / --gemini / --codex
+```
+
+Inside the resulting container, `google-chrome` is on PATH (via the `/opt/ops/bin/google-chrome` wrapper that already ships in the image). Tools that auto-detect Chrome (`chrome-devtools-mcp`, Puppeteer's `executablePath` resolution, Lighthouse) pick it up through three redundant hooks: the `CHROME_PATH` and `PUPPETEER_EXECUTABLE_PATH` env vars, the `/usr/bin/google-chrome` symlink, and the `/opt/google/chrome/chrome` symlink.
+
+> **Unfree flag** — `google-chrome` is unfree. The Dockerfile already sets both `NIXPKGS_ALLOW_UNFREE=1` (standard Nix var) and `MISE_NIX_ALLOW_UNFREE=true` (mise-nix plugin escape hatch, auto-forwarded to `NIXPKGS_ALLOW_UNFREE=1` when the plugin calls `nix build`). No extra setup needed.
+
+For a free / lighter alternative, use `nix:chromium` instead:
+
+```bash
+ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:chromium'
+ops update default
+```
+
+Note: `chromium` is `chrome-devtools-mcp`-compatible but lacks the proprietary codecs (DRM, AAC, H.264 patent-encumbered profile); for typical dev / browser-automation use this rarely matters.
+
+If you want to keep your default image lean **and** have a chrome-equipped image side-by-side (so you can `ops run` for non-browser work and `ops -i chrome run` for browser-automation work), use a separate profile:
+
+```bash
+ops config set 'OPS_IMAGES[chrome]'      'localhost/ops-dev-chrome'
+ops config set 'OPS_BUILD_ARGS[chrome]'  'EXTRA_MISE_TOOLS=nix:google-chrome'
+ops -i chrome build
+ops -i chrome run --opencode
+```
+
+The trade-off: the `[default]` recipe is one line and bakes chrome into every container; the per-profile recipe keeps the default lean and adds ~300 MB only when you opt into the chrome profile.
 
 ### Precedence
 
@@ -1187,7 +1243,7 @@ Now `claude-ml` drops you into an ML-ready container with Claude already launche
 
 ## GUI apps (Chrome, Wayland)
 
-`ops.sh` auto-forwards the **Wayland** socket when the host runs Wayland — GUI apps like Chrome (in the image baseline, see [Build-time tools](#build-time-tools-extra_mise_tools--ops_build_args)) can render on the host compositor without any extra setup.
+`ops.sh` auto-forwards the **Wayland** socket when the host runs Wayland — GUI apps like Chrome (when added via [Build-time tools](#adding-google-chrome-or-another-browser); not in the default baseline) can render on the host compositor without any extra setup.
 
 ### Prerequisites
 
@@ -1985,10 +2041,10 @@ tests/
 ├── test_dryrun.bats               — 42 tests: run flag parsing
 ├── test_flags.bats                — 26 tests: -u/-g/-l/-H/-e/-p/--env-file/no-*-volume/api-key masking/…
 ├── test_config.bats               —  5 tests: ops.conf loading + precedence
-├── test_hash.bats                 —  5 tests: per-image hash + dockerfile_changed
+├── test_hash.bats                 —  7 tests: per-image hash + dockerfile_changed (incl. OPS_BUILD_ARGS[default] cache invalidation)
 ├── test_container_state.bats      —  6 tests: running/stopped/logs/status
 ├── test_image_state.bats          —  5 tests: build trigger, volume warning
-├── test_build_flags.bats          — 17 tests: --network host, --allow, build-args (incl. OCI VERSION/SOURCE_URL/REVISION forwarding)
+├── test_build_flags.bats          — 21 tests: --network host, --allow, build-args (incl. OCI VERSION/SOURCE_URL/REVISION forwarding)
 ├── test_install.bats              — 10 tests: full install/uninstall/self-update
 ├── test_aliases.bats              — 14 tests: string + function aliases, reserved names
 ├── test_images.bats               — 14 tests: OPS_IMAGES profiles, -n/-f override, smart -i
@@ -2009,7 +2065,7 @@ tests/
 ├── test_unit_helpers.bats         — 14 tests: direct unit tests for _human_bytes, _shell_quote (via OPS_SOURCE_ONLY)
 ├── test_label_masking.bats        —  8 tests: secret masking in BOTH ops.cmdline.user and ops.cmdline.real labels (GITHUB_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)
 ├── test_regressions.bats          — 14 tests: build arg leak fix (#18), --user-name remap (#24), PWD⊂HOME (#23), clean interactive (#20), rootless cache reset (#17), isolated agent volumes, install-path safety, start-fail re-dispatch (#19), and more
-├── test_image_integration.bats    — 40 integration tests against the actually-built localhost/ops-dev image (Nix GC root, chrome hooks, mise config split, machine-id, unfree flags, OCI labels, …). Skips if Docker or the image is absent.
+├── test_image_integration.bats    — 39 integration tests against the actually-built localhost/ops-dev image (Nix GC root, chrome hooks, mise config split, machine-id, unfree flags, OCI labels, …). Skips if Docker or the image is absent.
 ├── test_subcommand_help.bats      — 18 tests: per-subcommand --help output (doctor/inspect/config/clean/status/logs/backup/restore/update/aliases/images/runtime). Ensures `-h|--help` is intercepted before arg parsing and exits 0.
 ├── test_secret_symmetry.bats      —  8 tests: regression guard ensuring `_dry_run_print` (dry-run) and `_mask_secrets` (labels) agree on what is a secret (e.g. MY_DB_PASSWORD redacted everywhere; MONKEY treated as non-secret in both paths).
 ├── test_match_agent_flag.bats     —  8 tests: per-agent flag dispatcher `_match_agent_flag` — `--{claude,gemini,opencode,codex}-{mount,volume}` + `--no-X-mount` collapsed into one nameref-based handler.
@@ -2048,7 +2104,7 @@ CI runs this job (`image-integration`) automatically on pushes to `main` and via
 | Backup / restore (TTY guards, alpine tar, ensure_volume) | **100%** |
 | Per-image hash + rebuild detection | **100%** |
 
-**596 tests across 45 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
+**601 tests across 45 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
 
 A pure-Lua unit-test harness lives under `tests/lua/` (run via `mise run test-lua` or `lua5.4 tests/lua/run.lua`). It exercises the plugin helpers that don't need mise's native modules — `shell.shquote`, `version.parse_version`, `flake.is_reference`, `plugin_matcher.matches`, `tempdir.with_temp_dir`, `security.is_safe_local_path`, `jetbrains.extract_plugin_info`. The harness stubs the native modules via `package.preload` so any vanilla `lua5.x` interpreter is enough; busted is not required.
 

@@ -71,23 +71,13 @@ setup() {
     [ "$output" = "/opt/ops/bin/google-chrome" ]
 }
 
-@test "image: google-chrome --version starts Chrome successfully" {
-    run run_in_image 'google-chrome --version'
-    [ "$status" -eq 0 ]
-    [[ "$output" == "Google Chrome "* ]]
-}
-
 # ---- mise config split (baseline in /etc/mise, user in /opt/mise/data) -----
 
 @test "image: baseline config in /etc/mise/config.toml contains expected tools" {
     run run_in_image 'cat /etc/mise/config.toml'
     [ "$status" -eq 0 ]
     [[ "$output" == *"nix:git"* ]]
-    [[ "$output" == *"nix:google-chrome"* ]]
     [[ "$output" == *"node"* ]]
-    # semgrep is no longer in the baseline (v1.8.0+); add it back via:
-    # ops config set 'OPS_BUILD_ARGS[<image-key>]' 'EXTRA_MISE_TOOLS=nix:semgrep'
-    [[ "$output" != *"nix:semgrep"* ]]
 }
 
 @test "image: /etc/mise is root-owned, read-only for users" {
@@ -415,5 +405,5 @@ setup() {
         exit $rc'
     [ "$status" -eq 127 ]
     [[ "$output" == *"not installed in this container"* ]]
-    [[ "$output" == *"image baseline ships google-chrome"* ]]
+    [[ "$output" == *"google-chrome is not part of the image baseline"* ]]
 }
