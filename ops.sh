@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.9.0"
+OPS_VERSION="1.10.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -598,13 +598,17 @@ Global flags (may appear before the subcommand, apply to all):
   -n, --name NAME           Container name           (default: $OPS_CONTAINER_NAME)
   -i, --image NAME          Image — raw ref or key of OPS_IMAGES (default: $OPS_IMAGE)
   -f, --dockerfile PATH     Dockerfile path          (default: $OPS_DOCKERFILE)
+  -r, --runtime NAME        Runtime override (auto/docker/podman/nerdctl)
+                            — equivalent to OPS_RUNTIME=NAME for this invocation
+                            (default: $OPS_RUNTIME)
   -H, --nerdctl-home PATH   nerdctl directory        (default: ~/.local/share/ops/nerdctl)
   Example: $(basename "$0") -n web logs -f
 
 $(basename "$0") run [OPTIONS] [COMMAND...]
   -i, --image NAME          Image to use             (default: $OPS_IMAGE)
   -n, --name NAME           Container name           (default: $OPS_CONTAINER_NAME)
-  -u, --uid UID             UID inside container     (default: $(id -u))
+  -r, --runtime NAME        Runtime override         (default: $OPS_RUNTIME)
+  -u, --uid|--user UID[:GID] UID (or UID:GID) inside container (default: $(id -u))
   -g, --gid GID             GID inside container     (default: $(id -g))
   -l, --lang LOCALE         Container locale         (default: ${LANG:-en_US.UTF-8})
   -v, --volume SRC:DST      Extra volume             (repeatable)
@@ -614,6 +618,16 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
   -H, --nerdctl-home PATH   nerdctl directory        (default: ~/.local/share/ops/nerdctl)
       --no-rm               Keep container on exit   (default: removed)
       --dry-run             Print the runtime command instead of executing it
+      --group-add GID       Forward --group-add to the runtime    (repeatable)
+      --cap-add CAP         Forward --cap-add to the runtime      (repeatable)
+      --cap-drop CAP        Forward --cap-drop to the runtime     (repeatable)
+      --security-opt OPT    Forward --security-opt to the runtime (repeatable)
+      --device DEV          Forward --device to the runtime       (repeatable)
+      --privileged          Forward --privileged to the runtime
+                            (the six flags above are runtime-creation passthroughs;
+                            forwarded verbatim to docker/podman/nerdctl run.
+                            Used by the nested-container function aliases —
+                            see docs/nested-containers.md.)
   -h, --help                Show this help and exit
   -b, --build               Build the image (honors --no-cache)
       --no-cache            Invalidate build cache (requires --build)
@@ -2804,6 +2818,12 @@ _match_agent_flag() {
 cmd_run() {
     local extra_volumes=()
     local extra_envs=()
+    # Runtime-passthrough flags collected from the user's argv. Used by
+    # nested-container function aliases (see docs/nested-containers.md) and
+    # by power users who need to set runtime-level options ops doesn't
+    # natively model. Forwarded verbatim to `<runtime> run` BEFORE the image
+    # ref so docker/podman/nerdctl parse them as flags, not as command argv.
+    local extra_runtime_flags=()
     # Auto-propagate host secrets (GitHub PAT for rate-limited builds, agent
     # API keys for authenticated --claude/--gemini/--codex without an
     # explicit --xxx-mount flag). The list lives in _OPS_AUTO_PROPAGATED_ENVS
@@ -2901,8 +2921,37 @@ cmd_run() {
             -i|--image)        _resolve_image "$2";                         shift 2 ;;
             -n|--name)         OPS_CONTAINER_NAME="$2"; _user_set_n=1;       shift 2 ;;
             -f|--dockerfile)   OPS_DOCKERFILE="$2"; _user_set_f=1;           shift 2 ;;
-            -u|--uid)          OPS_USER_UID="$2";                           shift 2 ;;
+            -r|--runtime)      OPS_RUNTIME="$2"; export OPS_RUNTIME; _resolve_runtime; shift 2 ;;
+            -u|--uid|--user)
+                # Accept either `UID` (current short form) or `UID:GID`
+                # (the docker / podman / nerdctl idiom — used by the
+                # nested-container `containerd` alias which needs --user 0:0
+                # to enter the container as root). When `:` is present,
+                # split into UID and GID; otherwise leave GID untouched
+                # (caller can set it via -g).
+                if [[ "$2" == *:* ]]; then
+                    OPS_USER_UID="${2%%:*}"
+                    OPS_USER_GID="${2##*:}"
+                else
+                    OPS_USER_UID="$2"
+                fi
+                shift 2 ;;
             -g|--gid)          OPS_USER_GID="$2";                           shift 2 ;;
+            # Runtime passthrough — explicit list of flags forwarded
+            # verbatim to `<runtime> run`. We don't generic-passthrough
+            # unknown `--flag` tokens because that would break the existing
+            # contract where the first unknown flag terminates parsing
+            # (the user's COMMAND must be reachable). Adding flags here
+            # is the supported way to extend the surface — see
+            # docs/nested-containers.md for the use case that motivated
+            # this set (`--group-add` for rootful docker socket access,
+            # `--cap-add` / `--security-opt` for the containerd recipe).
+            --group-add)       extra_runtime_flags+=("--group-add" "$2");    shift 2 ;;
+            --cap-add)         extra_runtime_flags+=("--cap-add" "$2");      shift 2 ;;
+            --cap-drop)        extra_runtime_flags+=("--cap-drop" "$2");     shift 2 ;;
+            --security-opt)    extra_runtime_flags+=("--security-opt" "$2"); shift 2 ;;
+            --device)          extra_runtime_flags+=("--device" "$2");       shift 2 ;;
+            --privileged)      extra_runtime_flags+=("--privileged");        shift ;;
             -l|--lang)         OPS_USER_LANG="$2";                          shift 2 ;;
             -v|--volume)       case "$2" in
                                    *:*) extra_volumes+=("$2") ;;
@@ -3054,7 +3103,39 @@ cmd_run() {
     fi
 
     if [ -n "$running" ]; then
-        if [ ${#extra_volumes[@]} -gt 0 ]; then
+        # Runtime-creation flags (--group-add, --cap-add, --cap-drop,
+        # --security-opt, --device, --privileged, --user UID:GID) cannot be
+        # applied to a running container — they're only honored at create
+        # time. Same UX as the "missing volumes" branch below: if the user
+        # passed any of these AND the container exists, prompt to recreate.
+        # (We don't try to detect whether the running container ALREADY has
+        # the same caps — `docker inspect` exposes them but cap-add and
+        # security-opt aren't normalized to the same string the user typed,
+        # so a strict equality check would re-prompt unnecessarily. Honest
+        # over-prompt beats silent drop here.)
+        if [ ${#extra_runtime_flags[@]} -gt 0 ]; then
+            echo -e "\033[33m⚠ Container '$OPS_CONTAINER_NAME' is already running — runtime-creation flags cannot be applied to it:\033[0m" >&2
+            local _rt_idx=0
+            while [ "$_rt_idx" -lt "${#extra_runtime_flags[@]}" ]; do
+                local _f="${extra_runtime_flags[$_rt_idx]}"
+                if [ "$_f" = "--privileged" ]; then
+                    echo -e "\033[33m    $_f\033[0m" >&2
+                    _rt_idx=$((_rt_idx + 1))
+                else
+                    echo -e "\033[33m    $_f ${extra_runtime_flags[$((_rt_idx + 1))]}\033[0m" >&2
+                    _rt_idx=$((_rt_idx + 2))
+                fi
+            done
+            unset _rt_idx _f
+            echo -e "\033[33m  Tip: use -n <name> to create a separate container without removing this one.\033[0m" >&2
+            printf "\033[33mRemove and recreate the container? \033[1m[Y/n]\033[0m " >&2
+            read -r answer
+            if [[ ! "$answer" =~ ^[nN]$ ]]; then
+                "$RUNTIME_BIN" rm -f "$OPS_CONTAINER_NAME" >/dev/null
+                running=""
+            fi
+        fi
+        if [ -n "$running" ] && [ ${#extra_volumes[@]} -gt 0 ]; then
             local mounted missing=()
             # Format emits `Source:Destination ` per mount (trailing space).
             # The trailing space in `grep -qF "$v_match "` anchors the
@@ -3233,6 +3314,7 @@ cmd_run() {
     fi
     args+=("${extra_envs[@]}")
     [ ${#extra_ports[@]} -gt 0 ] && args+=("${extra_ports[@]}")
+    [ ${#extra_runtime_flags[@]} -gt 0 ] && args+=("${extra_runtime_flags[@]}")
 
     # Build real-CLI snapshot BEFORE injecting cmdline labels (avoids recursive embedding).
     # Mask sensitive env values (tokens / API keys) in BOTH labels so they are
@@ -3688,6 +3770,14 @@ _parse_global_flags() {
             -n|--name)          OPS_CONTAINER_NAME="$2"; _user_set_n=1; shift 2 ;;
             -i|--image)         _resolve_image "$2";                    shift 2 ;;
             -f|--dockerfile)    OPS_DOCKERFILE="$2"; _user_set_f=1;     shift 2 ;;
+            -r|--runtime)       OPS_RUNTIME="$2"; export OPS_RUNTIME
+                                # Re-resolve so RUNTIME_BIN points at the
+                                # newly-picked runtime; also resets the
+                                # rootless cache (handled inside
+                                # _resolve_runtime). Validation happens
+                                # there too — invalid values exit 1.
+                                _resolve_runtime
+                                shift 2 ;;
             -H|--nerdctl-home)  OPS_NERDCTL_HOME="$(realpath -m "$2")"
                                 export PATH="$OPS_NERDCTL_HOME/bin:$PATH"
                                 _resolve_runtime
