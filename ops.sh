@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.10.0"
+OPS_VERSION="1.10.1"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -3104,25 +3104,72 @@ cmd_run() {
 
     if [ -n "$running" ]; then
         # Runtime-creation flags (--group-add, --cap-add, --cap-drop,
-        # --security-opt, --device, --privileged, --user UID:GID) cannot be
-        # applied to a running container — they're only honored at create
-        # time. Same UX as the "missing volumes" branch below: if the user
-        # passed any of these AND the container exists, prompt to recreate.
-        # (We don't try to detect whether the running container ALREADY has
-        # the same caps — `docker inspect` exposes them but cap-add and
-        # security-opt aren't normalized to the same string the user typed,
-        # so a strict equality check would re-prompt unnecessarily. Honest
-        # over-prompt beats silent drop here.)
+        # --security-opt, --device, --privileged) cannot be applied to a
+        # running container — they're only honored at create time. We
+        # filter out values that are ALREADY applied to the running
+        # container before prompting, so the common case of a user
+        # alias re-injecting the same flag on every invocation
+        # (e.g. `ops_alias_docker` echoing `--group-add 145`) doesn't
+        # trigger a recreate prompt every time. Comparison is exact
+        # against `inspect` output for the trivially-comparable subset:
+        # --group-add (GIDs / names), --device (host path; ignores
+        # container-side path and perms which would over-match anyway),
+        # and --privileged (boolean). --cap-add / --cap-drop /
+        # --security-opt skip filtering because docker normalizes them
+        # differently from user input (NET_ADMIN ↔ cap_net_admin,
+        # apparmor= prefix presence/absence) — strict equality there
+        # would still over-prompt, so we keep the honest over-prompt
+        # rather than risk a silent drop.
+        local -a missing_runtime_flags=()
         if [ ${#extra_runtime_flags[@]} -gt 0 ]; then
-            echo -e "\033[33m⚠ Container '$OPS_CONTAINER_NAME' is already running — runtime-creation flags cannot be applied to it:\033[0m" >&2
+            local _inspect_combined _existing_groupadd _existing_devices _existing_privileged
+            _inspect_combined=$("$RUNTIME_BIN" container inspect "$OPS_CONTAINER_NAME" \
+                --format '{{range .HostConfig.GroupAdd}}{{.}} {{end}}|{{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}|{{.HostConfig.Privileged}}' \
+                2>/dev/null)
+            IFS='|' read -r _existing_groupadd _existing_devices _existing_privileged <<< "$_inspect_combined"
             local _rt_idx=0
             while [ "$_rt_idx" -lt "${#extra_runtime_flags[@]}" ]; do
                 local _f="${extra_runtime_flags[$_rt_idx]}"
+                case "$_f" in
+                    --privileged)
+                        if [ "$_existing_privileged" != "true" ]; then
+                            missing_runtime_flags+=("--privileged")
+                        fi
+                        _rt_idx=$((_rt_idx + 1))
+                        ;;
+                    --group-add)
+                        local _v="${extra_runtime_flags[$((_rt_idx + 1))]}"
+                        if ! grep -qF -- "$_v " <<< "$_existing_groupadd "; then
+                            missing_runtime_flags+=("--group-add" "$_v")
+                        fi
+                        _rt_idx=$((_rt_idx + 2))
+                        ;;
+                    --device)
+                        local _v="${extra_runtime_flags[$((_rt_idx + 1))]}"
+                        local _host_path="${_v%%:*}"
+                        if ! grep -qF -- "$_host_path " <<< "$_existing_devices "; then
+                            missing_runtime_flags+=("--device" "$_v")
+                        fi
+                        _rt_idx=$((_rt_idx + 2))
+                        ;;
+                    *)
+                        missing_runtime_flags+=("$_f" "${extra_runtime_flags[$((_rt_idx + 1))]}")
+                        _rt_idx=$((_rt_idx + 2))
+                        ;;
+                esac
+            done
+            unset _rt_idx _f _v _host_path _inspect_combined _existing_groupadd _existing_devices _existing_privileged
+        fi
+        if [ ${#missing_runtime_flags[@]} -gt 0 ]; then
+            echo -e "\033[33m⚠ Container '$OPS_CONTAINER_NAME' is already running — runtime-creation flags cannot be applied to it:\033[0m" >&2
+            local _rt_idx=0
+            while [ "$_rt_idx" -lt "${#missing_runtime_flags[@]}" ]; do
+                local _f="${missing_runtime_flags[$_rt_idx]}"
                 if [ "$_f" = "--privileged" ]; then
                     echo -e "\033[33m    $_f\033[0m" >&2
                     _rt_idx=$((_rt_idx + 1))
                 else
-                    echo -e "\033[33m    $_f ${extra_runtime_flags[$((_rt_idx + 1))]}\033[0m" >&2
+                    echo -e "\033[33m    $_f ${missing_runtime_flags[$((_rt_idx + 1))]}\033[0m" >&2
                     _rt_idx=$((_rt_idx + 2))
                 fi
             done

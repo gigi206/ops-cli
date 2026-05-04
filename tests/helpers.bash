@@ -114,6 +114,9 @@ setup_mocks() {
 #   MOCK_CONTAINER_EXISTS   ps -a returns OPS_CONTAINER_NAME (1/0); default 0
 #   MOCK_DANGLING            image ls -f dangling=true emits a line (1/0); default 0
 #   MOCK_CONTAINER_MOUNTS   comma-separated list reported by container inspect
+#   MOCK_CONTAINER_GROUPADD  space-separated GIDs/names for HostConfig.GroupAdd
+#   MOCK_CONTAINER_DEVICES   space-separated host paths for HostConfig.Devices
+#   MOCK_CONTAINER_PRIVILEGED  "true"/"false" for HostConfig.Privileged (default false)
 #
 # For richer scenarios (status/doctor/update with container+image state),
 # use mock_runtime_rich instead — see its block below for the full env var
@@ -171,7 +174,18 @@ case "$1" in
             inspect)
                 # If container "exists" per mock, return something.
                 if [ "${MOCK_CONTAINER_EXISTS:-0}" = "1" ] || [ "${MOCK_CONTAINER_RUNNING:-0}" = "1" ]; then
-                    echo "${MOCK_CONTAINER_MOUNTS:-}"
+                    # The runtime-creation flag filter inspects
+                    # HostConfig.{GroupAdd,Devices,Privileged} as a single
+                    # `|`-separated combined value — recognise that
+                    # template and emit the matching mock fields.
+                    if [[ "$*" == *'.HostConfig.GroupAdd'* ]]; then
+                        printf '%s|%s|%s\n' \
+                            "${MOCK_CONTAINER_GROUPADD:-}" \
+                            "${MOCK_CONTAINER_DEVICES:-}" \
+                            "${MOCK_CONTAINER_PRIVILEGED:-false}"
+                    else
+                        echo "${MOCK_CONTAINER_MOUNTS:-}"
+                    fi
                 else
                     exit 1
                 fi
