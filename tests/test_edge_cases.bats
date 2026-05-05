@@ -123,8 +123,11 @@ setup() {
 @test "empty invocation (no args) still starts bash in container" {
     run env OPS_RUNTIME=docker "$(ops_sh)"
     [ "$status" -eq 0 ]
-    # Mock docker run is invoked with bash as command
-    grep -qE '^run .*bash' "$MOCK_LOG"
+    # Shepherd lifecycle (≥1.11): `docker run` creates the container with
+    # `tail -f /dev/null` as PID 1 — the bash session lives in the
+    # subsequent `docker exec`, not in `run`.
+    grep -qE '^run -d --init' "$MOCK_LOG"
+    grep -qE '^exec -it .*bash' "$MOCK_LOG"
 }
 
 @test "OPS_VOLUMES empty is accepted without crashing" {

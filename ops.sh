@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.10.1"
+OPS_VERSION="1.10.2"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -2815,6 +2815,75 @@ _match_agent_flag() {
     return 0
 }
 
+# Multi-session lifecycle helpers (shepherd pattern).
+#
+# Background: prior to v1.11 each `ops run` was the PID 1 of a `--rm`
+# container. Two parallel sessions therefore shared one PID 1, and quitting
+# the first session removed the container — killing every other `docker
+# exec` attached to it. The shepherd pattern fixes that by making PID 1
+# a long-lived placeholder (`tail -f /dev/null` under tini) and turning
+# every interactive session — including the very first one — into a
+# `docker exec`. Quitting any single session no longer affects the
+# others; the container is removed only when the LAST session exits
+# (and only when the user did not pass `--no-rm`).
+#
+# Sessions register a per-host-PID marker file inside the container at
+# /tmp/ops-sessions/. The host-side trap removes it on exit and, for
+# ephemeral containers, calls `docker rm -f` once the directory is empty.
+# A SIGKILL that bypasses the trap leaves the marker behind; the next
+# session's entry sweep removes any marker whose host PID is no longer
+# alive (kill -0), so the directory eventually drains.
+_ops_register_session() {
+    local name="$1" sid="$2"
+    "$RUNTIME_BIN" exec "$name" sh -c \
+        "mkdir -p /tmp/ops-sessions && touch /tmp/ops-sessions/$sid" \
+        >/dev/null 2>&1 || true
+}
+
+_ops_sweep_orphan_sessions() {
+    # Drop markers whose host PID is no longer alive (i.e. a previous
+    # session was SIGKILL'd before its trap could clean up). The PID
+    # check is host-side: the marker name encodes the host PID, the
+    # container itself can't see the host process table.
+    #
+    # `[ -d /proc/$pid ]` is preferred over `kill -0`: kill -0 returns
+    # EPERM (and exits non-zero) when the target PID belongs to a
+    # different user (e.g. root-owned init or another user's session),
+    # which would mis-classify a still-alive marker as orphaned. The
+    # /proc check only requires the directory to exist — it succeeds
+    # for any visible PID regardless of the caller's UID. ops-cli is
+    # Linux-only so /proc is guaranteed.
+    local name="$1" markers m pid
+    markers=$("$RUNTIME_BIN" exec "$name" sh -c \
+        'ls /tmp/ops-sessions 2>/dev/null' 2>/dev/null || true)
+    for m in $markers; do
+        case "$m" in
+            ops-session-*) pid="${m#ops-session-}" ;;
+            *) continue ;;
+        esac
+        if [ ! -d "/proc/$pid" ]; then
+            "$RUNTIME_BIN" exec "$name" \
+                rm -f "/tmp/ops-sessions/$m" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+_ops_cleanup_session() {
+    # Run from a host-side EXIT trap: drop the session's marker, then —
+    # for ephemeral containers — remove the container if the marker
+    # directory is now empty (i.e. we were the last session).
+    local name="$1" sid="$2" eph="$3" count
+    "$RUNTIME_BIN" exec "$name" \
+        rm -f "/tmp/ops-sessions/$sid" >/dev/null 2>&1 || true
+    [ "$eph" = 1 ] || return 0
+    count=$("$RUNTIME_BIN" exec "$name" sh -c \
+        'ls /tmp/ops-sessions 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+    count=$(printf '%s' "$count" | tr -d '[:space:]')
+    if [ "${count:-0}" = 0 ]; then
+        "$RUNTIME_BIN" rm -f "$name" >/dev/null 2>&1 || true
+    fi
+}
+
 cmd_run() {
     local extra_volumes=()
     local extra_envs=()
@@ -3235,6 +3304,30 @@ cmd_run() {
                 echo
                 exit 0
             fi
+            # Detect whether the running container was created with the
+            # shepherd pattern (ops ≥ 1.11). Pre-1.11 containers do not
+            # carry the `ops.shepherd=1` label and have a real user-cmd
+            # PID 1 — for those we keep the legacy `exec` (no marker
+            # bookkeeping, no post-exit cleanup) so an in-flight upgrade
+            # doesn't disturb already-running sessions.
+            local _has_shepherd
+            _has_shepherd=$("$RUNTIME_BIN" container inspect \
+                --format '{{ index .Config.Labels "ops.shepherd" }}' \
+                "$OPS_CONTAINER_NAME" 2>/dev/null || true)
+            if [ "$_has_shepherd" = "1" ]; then
+                local _sid="ops-session-$$"
+                _ops_sweep_orphan_sessions "$OPS_CONTAINER_NAME"
+                _ops_register_session "$OPS_CONTAINER_NAME" "$_sid"
+                # shellcheck disable=SC2064  # expand $OPS_CONTAINER_NAME / $_sid / $ephemeral now
+                # Chain the global `cleanup` trap (set near `ops.sh:219`) so we don't
+    # silently disable its stop_buildkitd + TMP_INSTALL_DIR scrub.
+    trap "_ops_cleanup_session '$OPS_CONTAINER_NAME' '$_sid' '$ephemeral'; cleanup" EXIT
+                "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" \
+                    --env "HOME=$HOME_IN_CTN" \
+                    --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" \
+                    "${trust_env[@]}" "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
+                exit $?
+            fi
             exec "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" --env "HOME=$HOME_IN_CTN" --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" "${trust_env[@]}" "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
         fi
     fi
@@ -3314,28 +3407,40 @@ cmd_run() {
     _apply_agent_state "$opencode_agent" opencode "$HOME_IN_CTN/.local/share/opencode"     "$HOME/.local/share/opencode" "$HOME/.config/opencode"
     _apply_agent_state "$codex_agent"    codex    "$HOME_IN_CTN/.codex"                    "$HOME/.codex"
 
-    # Build args incrementally so --rm can be conditionally included.
-    # (Using ${ephemeral:+--rm} with ephemeral=0 still expands because '0' is
-    # a non-empty string — bash :+ tests for non-empty, not truthy.)
-    local args=(run -it)
+    # Build args for the shepherd PID 1 (the long-lived placeholder
+    # process that keeps the container alive across multiple sessions).
+    # Per-session settings — workdir, user, TERM/COLORTERM, mise trust —
+    # move to `docker exec` because they vary per session.
+    # `--init` injects tini as PID 1 (which then runs `tail -f /dev/null`
+    # at PID 2) so that orphan children are reaped instead of accumulating
+    # as zombies in `docker top` output.
+    #
+    # Why `tail -f /dev/null` and not `sleep infinity`: `sleep infinity`
+    # is a GNU/BSD-modern extension and is NOT supported by BusyBox
+    # `sleep` (Alpine, distroless, scratch+busybox images all reject
+    # the literal `infinity` argument). Users may run ops against any
+    # image declared in `OPS_IMAGES`, including Alpine-based ones, so
+    # we pick the portable POSIX idiom — `tail -f` blocking on /dev/null
+    # works on every libc/coreutils variant we ship to. The cost is one
+    # extra fd plus a blocking poll(2), which is dwarfed by tini's own
+    # supervision overhead.
+    local args=(run -d --init)
+    # `--rm` is included to avoid leaving an "exited" husk behind if the
+    # shepherd is ever killed externally; the normal teardown path goes
+    # through `docker rm -f` from _ops_cleanup_session, so `--rm` is
+    # cosmetic during the session lifetime but matters for crash safety.
     [ "$ephemeral" = 1 ] && args+=(--rm)
     args+=(
         --name "$OPS_CONTAINER_NAME"
         --hostname "$OPS_CONTAINER_NAME"
         --label "ops.container=true"
+        --label "ops.shepherd=1"
         # rootless: container UID 0 maps to the host user → R/W access to bind-mounted files
         # rootful:  container UID matches host UID directly → same effect, different mechanism
         --user "$user_arg"
         --env "HOME=$HOME_IN_CTN"
-        --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}"
-        --workdir "$PWD"
         --volume "$PWD:$PWD"
     )
-    # trust_workdir=1 (default) auto-trusts mise.toml in the bind-mounted
-    # workdir — the usual "mise Trust them?" prompt is suppressed. Disable
-    # with --no-trust-workdir / OPS_TRUST_WORKDIR=0 before running against
-    # an untrusted repo.
-    [ "$trust_workdir" = 1 ] && args+=(--env "MISE_TRUSTED_CONFIG_PATHS=$PWD")
     for v in "${extra_volumes[@]}"; do
         args+=(--volume "$v")
     done
@@ -3392,20 +3497,57 @@ cmd_run() {
             -e "s/(${pat})=[^[:space:]'\"]+/\\1=***/g"
     }
     local real_cli real_cli_masked user_cli_masked
-    real_cli="$(_shell_quote "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@")"
+    real_cli="$(_shell_quote "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" tail -f /dev/null)"
     real_cli_masked=$(printf '%s' "$real_cli" | _mask_secrets)
     user_cli_masked=$(printf '%s' "$OPS_ORIG_ARGV" | _mask_secrets)
     unset -f _mask_secrets
     args+=(--label "ops.cmdline.user=$user_cli_masked")
     args+=(--label "ops.cmdline.real=$real_cli_masked")
 
+    # Per-session attach args (workdir, user, TERM/COLORTERM, mise trust).
+    # trust_workdir=1 (default) auto-trusts mise.toml in the bind-mounted
+    # workdir — the usual "mise Trust them?" prompt is suppressed. Disable
+    # with --no-trust-workdir / OPS_TRUST_WORKDIR=0 before running against
+    # an untrusted repo.
+    local -a trust_env=()
+    [ "$trust_workdir" = 1 ] && trust_env=(--env "MISE_TRUSTED_CONFIG_PATHS=$PWD")
+
     if [ "$dry_run" = 1 ]; then
-        _dry_run_print "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@"
+        # Two commands describe the new lifecycle: the detached shepherd
+        # creation, then the interactive `exec` that attaches the user
+        # session. Both must appear so users can reproduce the flow.
+        _dry_run_print "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" tail -f /dev/null
+        echo
+        _dry_run_print "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" \
+            --env "HOME=$HOME_IN_CTN" \
+            --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" \
+            "${trust_env[@]}" "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
         echo
         exit 0
     fi
 
-    "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" "$@" 2> >(grep -v "already exists" >&2)
+    # Create the shepherd in detached mode. Output the container ID into
+    # /dev/null (we don't need it — we already know the name) and filter
+    # the harmless "image already exists" warning that some runtimes emit
+    # on first pull when the layer is shared with another image.
+    if ! "$RUNTIME_BIN" "${args[@]}" "$OPS_IMAGE" tail -f /dev/null \
+            > /dev/null 2> >(grep -v "already exists" >&2); then
+        exit 1
+    fi
+
+    # First interactive session in the freshly-created shepherd. Mirrors
+    # the join path above so a SIGKILL on this PID doesn't strand the
+    # container: the next `ops run` sweeps the orphan marker.
+    local _sid="ops-session-$$"
+    _ops_register_session "$OPS_CONTAINER_NAME" "$_sid"
+    # shellcheck disable=SC2064  # expand $OPS_CONTAINER_NAME / $_sid / $ephemeral now
+    # Chain the global `cleanup` trap (set near `ops.sh:219`) so we don't
+    # silently disable its stop_buildkitd + TMP_INSTALL_DIR scrub.
+    trap "_ops_cleanup_session '$OPS_CONTAINER_NAME' '$_sid' '$ephemeral'; cleanup" EXIT
+    "$RUNTIME_BIN" exec -it --workdir "$PWD" --user "$user_arg" \
+        --env "HOME=$HOME_IN_CTN" \
+        --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" \
+        "${trust_env[@]}" "${extra_envs[@]}" "$OPS_CONTAINER_NAME" "$@"
     exit $?
 }
 
