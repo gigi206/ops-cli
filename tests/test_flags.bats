@@ -57,8 +57,11 @@ setup() {
 @test "run --no-rm omits --rm" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --no-rm --dry-run
     [ "$status" -eq 0 ]
-    # The args should contain `run -it` but no `--rm`
-    [[ "$output" == *"run -it"* ]]
+    # Shepherd lifecycle (≥1.11): the container is created via `run -d`
+    # (detached `tail -f /dev/null` PID 1) and the user session attaches
+    # via `exec -it`. `--no-rm` must drop `--rm` from the run line.
+    [[ "$output" == *"run -d"* ]]
+    [[ "$output" == *"exec -it"* ]]
     [[ "$output" != *"--rm"* ]]
 }
 
