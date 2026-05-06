@@ -18,8 +18,20 @@
 # any tool whose backend doesn't honour fetch_remote_versions_cache) easily
 # costs 10+ s — entirely redundant when `mise activate bash` further down
 # already calls hook-env via _mise_hook.
+# Tolerate a missing nix profile silently. The profile is normally
+# materialised by §3 of the Dockerfile, but a build run with
+# NIX_CLEANUP=true followed by a re-run of mise tools (which can re-
+# trigger nix-collect-garbage on a stale profile symlink) sometimes
+# leaves the .nix-profile path dangling. The bashrc is sourced on every
+# session entry, so a `source nonexistent` produces a noisy "No such
+# file or directory" line on each --opencode / --opencode-desktop /
+# bash launch. Silent skip keeps PATH/mise activation working — nix
+# itself is rarely needed inside an interactive session anyway (the
+# `nix` wrapper at /opt/ops/bin/nix re-shells into HOME=/opt/nix-home
+# when it is).
 # shellcheck disable=SC1091
-source /opt/nix-home/.nix-profile/etc/profile.d/nix.sh
+[ -r /opt/nix-home/.nix-profile/etc/profile.d/nix.sh ] && \
+    . /opt/nix-home/.nix-profile/etc/profile.d/nix.sh
 
 # Shell-level cache for `mise hook-env` output. Cold-start mise hook-env
 # costs ~10-12 s (toolset resolve, plugin init, config parse, lockfile

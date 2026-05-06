@@ -30,6 +30,11 @@
 #                                                              OPS_BUILD_ARGS in ops.conf, e.g.
 #                                                              OPS_BUILD_ARGS[default]=
 #                                                                "EXTRA_MISE_TOOLS=nix:terraform"
+#   OPS_DESKTOP_DEPS=true|false                                Opt-in Electron GUI runtime libs
+#                                                              (gtk3 / nss / nspr / mesa /
+#                                                              alsa-lib / libcups). Required only
+#                                                              for `ops run --opencode-desktop`.
+#                                                              Default: false. Adds ~80–120 MB.
 #
 # Build secret (passed only in-process, never baked into image layers):
 #   --secret id=github_token,env=GITHUB_TOKEN                  classic PAT, no scope — lifts
@@ -99,6 +104,22 @@ ARG MISE_INSTALL_SHA256=
 # "Build-time tools" section in README for the full recipe.
 ARG EXTRA_MISE_TOOLS=""
 
+# Opt-in runtime libs for the Electron GUI variant of opencode
+# (`ops run --opencode-desktop`). The flag downloads upstream's prebuilt
+# AppImage which embeds Chromium and pulls in a Linux-desktop-shaped set
+# of system libs at runtime (libnspr4, libnss3, libgtk-3, libasound,
+# libcups, libgbm + transitives). These are NOT in the headless baseline
+# — same opt-in philosophy as EXTRA_MISE_TOOLS=nix:google-chrome above.
+# Adds ~80–120 MB to the image when enabled. Off by default: zero impact
+# on users who only use --claude / --gemini / --opencode (terminal TUIs).
+# Enable per-profile via OPS_BUILD_ARGS:
+#   ops config set 'OPS_BUILD_ARGS[default]' 'OPS_DESKTOP_DEPS=true'
+#   ops update default
+# The conditional install layer below is fully cacheable: a build with
+# OPS_DESKTOP_DEPS=false (default) bakes a ~50-byte "skipped" marker; a
+# build with OPS_DESKTOP_DEPS=true rebuilds only that layer onward.
+ARG OPS_DESKTOP_DEPS=false
+
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md).
 # Only SOURCE_URL is exposed: it lets `docker inspect` consumers walk back to
 # the project's homepage. `version` was dropped because it duplicated
@@ -127,6 +148,25 @@ RUN sed -i '/^NoExtract/d' /etc/pacman.conf \
  && locale-gen \
  && printf '%s\n' "$(tr -d '-' < /proc/sys/kernel/random/uuid)" > /etc/machine-id \
  && pacman -Scc --noconfirm
+
+# 1b. (Opt-in) Electron / Chromium runtime libs for --opencode-desktop.
+# `gtk3` is a meta dep that pulls pango / cairo / atk / at-spi2 / libxkbcommon
+# / libxcomposite / libxdamage / libxfixes / libxrandr / libxext / libx11 /
+# libxcb in transitive — covers ~15 of the 21 .so DT_NEEDED entries on the
+# Electron AppImage. The remaining five (`nss` for libnss3 / libnssutil3 /
+# libsmime3, `nspr` for libnspr4, `mesa` for libgbm.so.1, `alsa-lib` for
+# libasound.so.2, `libcups` for libcups.so.2) are listed explicitly. Tested
+# against the v1.14.39 AppImage published by sst/opencode (Electron + bundled
+# Chromium); the set is stable across point releases — Electron's runtime
+# requirements only churn between major Electron versions. Keep this list
+# in sync with Dockerfile.debian §1b.
+RUN if [ "$OPS_DESKTOP_DEPS" = "true" ]; then \
+      pacman -Sy --noconfirm --needed \
+        gtk3 nss nspr alsa-lib libcups mesa \
+      && pacman -Scc --noconfirm; \
+    else \
+      echo "OPS_DESKTOP_DEPS=false — Electron GUI libs not installed (--opencode-desktop will fail)"; \
+    fi
 
 ENV LANG=${USER_LANG} \
     LC_ALL=${USER_LANG} \

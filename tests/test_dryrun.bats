@@ -155,6 +155,42 @@ _unescape() {
     [[ "$output" == *"opencode-ai"* ]]
 }
 
+# Electron GUI variant: pulled as a prebuilt AppImage from upstream's
+# GitHub releases via mise's `github:` backend with asset_pattern. The
+# dry-run must show:
+#   - the `github:sst/opencode[asset_pattern=…AppImage]` install token
+#     (regression guard if anyone swaps to npm: / nix: / aqua: again),
+#   - `--appimage-extract-and-run` on the exec line (without it the
+#     AppImage hits `dlopen libfuse.so.2` and refuses to start in the
+#     fuse-less container),
+#   - `--no-sandbox` on the exec line (without it Chromium FATALs at
+#     startup because chrome-sandbox can't be SUID-root in a non-
+#     privileged container — see the comment block in cmd_run for the
+#     full rationale; this assertion locks in the workaround so a
+#     well-meaning revert ("we don't need --no-sandbox, do we?") fails
+#     loudly here),
+#   - `exec opencode-desktop.AppImage` (mise's github: backend keeps the
+#     asset filename verbatim as both on-disk and shim name).
+@test "run --opencode-desktop pulls Electron AppImage via github backend" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode-desktop --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]"* ]]
+    [[ "$norm" == *"--appimage-extract-and-run"* ]]
+    [[ "$norm" == *"--no-sandbox"* ]]
+    [[ "$norm" == *"--ozone-platform=wayland"* ]]
+    [[ "$norm" == *"--enable-features=UseOzonePlatform"* ]]
+    [[ "$norm" == *"exec opencode-desktop.AppImage"* ]]
+}
+
+@test "run --opencode-desktop uses 'command -v opencode-desktop.AppImage' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode-desktop --dry-run
+    [ "$status" -eq 0 ]
+    norm="$(_unescape "$output")"
+    [[ "$norm" == *"command -v opencode-desktop.AppImage"* ]]
+    [[ "$norm" != *"mise which opencode-desktop"* ]]
+}
+
 # Regression guard: opencode used to be installed via the Bun
 # single-binary `github:sst/opencode`, which hung the TUI at cold
 # launch (see CHANGELOG / commit history). The fix was to switch to

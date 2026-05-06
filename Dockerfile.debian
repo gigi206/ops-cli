@@ -13,6 +13,8 @@
 #   USER_UID, USER_GID, USER_NAME, USER_LANG, NIX_CLEANUP,
 #   MISE_INSTALL_SHA256,
 #   EXTRA_MISE_TOOLS (default: empty — purely additive on top of baseline)
+#   OPS_DESKTOP_DEPS (default: false — opt-in Electron runtime libs for
+#                     `ops run --opencode-desktop`; adds ~80–120 MB)
 #
 # Build secret (passed only in-process, never baked into image layers):
 #   --secret id=github_token,env=GITHUB_TOKEN                  classic PAT, no scope — lifts
@@ -78,6 +80,15 @@ ARG MISE_INSTALL_SHA256=
 # "Build-time tools" section in README for the full recipe.
 ARG EXTRA_MISE_TOOLS=""
 
+# Opt-in runtime libs for the Electron GUI variant of opencode
+# (`ops run --opencode-desktop`). See the matching ARG block in the Arch
+# Dockerfile for the rationale; the Debian package set differs because
+# of upstream naming and the time_t transition (libasound2t64 instead of
+# libasound2 on Debian testing). Off by default.
+#   ops config set 'OPS_BUILD_ARGS[default]' 'OPS_DESKTOP_DEPS=true'
+#   ops update default
+ARG OPS_DESKTOP_DEPS=false
+
 # OCI metadata ARG — mirrors the Arch Dockerfile. Only SOURCE_URL kept;
 # version/revision were dropped because they duplicate OPS_VERSION and
 # stay empty without CI stamping (see Arch Dockerfile for the rationale).
@@ -100,6 +111,25 @@ RUN apt-get update \
  && locale-gen \
  && printf '%s\n' "$(tr -d '-' < /proc/sys/kernel/random/uuid)" > /etc/machine-id \
  && rm -rf /var/lib/apt/lists/*
+
+# 1b. (Opt-in) Electron / Chromium runtime libs for --opencode-desktop.
+# `libgtk-3-0` is a meta dep that pulls pango / cairo / atk / at-spi2 /
+# libxkbcommon / libxcomposite / libxdamage / libxfixes / libxrandr /
+# libxext / libx11 / libxcb in transitive — covers ~15 of the 21 .so
+# DT_NEEDED entries on the Electron AppImage. The remaining five
+# (libnss3, libnspr4, libgbm1 from `mesa`, libasound2t64, libcups2) are
+# listed explicitly. `libasound2t64` is the time_t-transitioned successor
+# of `libasound2` in Debian testing/trixie; on older Debian (bookworm)
+# the package is still `libasound2`. Tested against the v1.14.39 AppImage
+# from sst/opencode. Keep this list in sync with the Arch Dockerfile §1b.
+RUN if [ "$OPS_DESKTOP_DEPS" = "true" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends \
+        libgtk-3-0 libnss3 libnspr4 libasound2t64 libcups2 libgbm1 \
+      && rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "OPS_DESKTOP_DEPS=false — Electron GUI libs not installed (--opencode-desktop will fail)"; \
+    fi
 
 ENV LANG=${USER_LANG} \
     LC_ALL=${USER_LANG} \
