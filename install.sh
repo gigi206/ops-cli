@@ -46,6 +46,26 @@
 main() {
     set -eu
 
+    # ERR trap: when 'set -e' aborts on a failing command, the script
+    # currently exits silently with no indication of WHICH command failed.
+    # Users seeing only the partial output ("install.sh: updating …") and
+    # then unrelated noise from their shell post-command hooks (mise
+    # activate, direnv, starship) easily mistake the noise for the failure
+    # itself. We trap EXIT and check $? so the last-command lineage is
+    # visible. POSIX sh has no ERR trap, hence using EXIT + $? gating.
+    _ops_install_step="initialising"
+    _ops_install_done=0
+    _ops_install_exit_handler() {
+        _rc=$?
+        if [ "$_ops_install_done" != "1" ] && [ "$_rc" -ne 0 ]; then
+            printf '\ninstall.sh: aborted (exit %s) during step: %s\n' \
+                "$_rc" "$_ops_install_step" >&2
+            printf "install.sh: re-run with 'sh -x %s/install.sh' for verbose tracing.\n" \
+                "${OPS_INSTALL_DIR:-$HOME/.local/share/ops-cli}" >&2
+        fi
+    }
+    trap _ops_install_exit_handler EXIT
+
     REPO_URL="${OPS_REPO_URL:-https://github.com/gigi206/ops-cli.git}"
     INSTALL_DIR="${OPS_INSTALL_DIR:-$HOME/.local/share/ops-cli}"
     BIN_DIR="${OPS_BIN_DIR:-$HOME/.local/bin}"
@@ -236,13 +256,16 @@ main() {
         # Update path: keep the existing tree, just fast-forward to the
         # requested ref. We do NOT 'git clean -fd' — the user may have an
         # 'ops.local.toml' or other untracked artefacts they want to keep.
+        _ops_install_step="cd to install dir"
         cd "$INSTALL_DIR"
+        _ops_install_step="describing current HEAD"
         _from=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
         printf 'install.sh: updating ops-cli in %s (ref: %s, current: %s)\n' \
             "$INSTALL_DIR" "$REF" "$_from"
         # Make sure the remote URL is what we expect — handles the case
         # where the user originally cloned from a fork and is now switching
         # to the canonical upstream (or vice-versa, by setting OPS_REPO_URL).
+        _ops_install_step="setting remote URL to $REPO_URL"
         git remote set-url origin "$REPO_URL"
         # Fetch the requested ref by name, regardless of whether it is a
         # branch, a lightweight tag, or an annotated tag. Going through
@@ -256,10 +279,20 @@ main() {
         #      branches; switching from a tag to a branch needed the
         #      explicit '<remote> <ref>' form.
         # '--prune-tags' cleans up tags deleted upstream so a re-pushed
-        # tag (rare) is not shadowed by the stale local entry.
-        git fetch --quiet --tags --prune --prune-tags origin "$REF"
+        # tag (rare) is not shadowed by the stale local entry. '--force'
+        # accepts a server-side tag rewrite (force-pushed annotated tag)
+        # silently — without it the fetch prints "[rejected] vX.Y.Z (would
+        # clobber existing tag)" on stderr and, while exit code stays 0
+        # locally, the LOCAL tag stays stale and would shadow the new
+        # commit on a 'git checkout vX.Y.Z'. We deliberately consume that
+        # rewrite when ops-cli's own release process amends a cut commit
+        # to fix a CI bug (rare but happens; see git_amend pattern in
+        # the project's CLAUDE.md).
+        _ops_install_step="git fetch $REF (force, tags+prune)"
+        git fetch --quiet --force --tags --prune --prune-tags origin "$REF"
         # '--force' discards any local edits to tracked files — the
         # working tree is treated as immutable / installer-managed.
+        _ops_install_step="git checkout FETCH_HEAD"
         git checkout --quiet --force --detach FETCH_HEAD
     elif [ -e "$INSTALL_DIR" ]; then
         printf 'install.sh: %s exists but is not a git checkout. Refusing\n' "$INSTALL_DIR" >&2
@@ -268,23 +301,28 @@ main() {
         exit 1
     else
         printf 'install.sh: cloning ops-cli into %s (ref: %s)\n' "$INSTALL_DIR" "$REF"
+        _ops_install_step="creating parent dir of $INSTALL_DIR"
         mkdir -p "$(dirname "$INSTALL_DIR")"
         # '--depth 1 --branch $REF' works for both branch names and
         # lightweight tags. For an annotated tag, --branch + --depth 1 still
         # resolves the peel, so this branch is fine for any ref shape git
         # understands.
+        _ops_install_step="git clone --depth 1 --branch $REF"
         git clone --quiet --depth 1 --branch "$REF" "$REPO_URL" "$INSTALL_DIR"
     fi
 
+    _ops_install_step="chmod +x ops.sh"
     chmod +x "$INSTALL_DIR/ops.sh"
 
     # ---- symlink -----------------------------------------------------------
 
+    _ops_install_step="creating $BIN_DIR"
     mkdir -p "$BIN_DIR"
     # 'ln -sf' overwrites an existing symlink/regular file at the target.
     # The previous installer run leaves a working symlink so the overwrite
     # is a no-op; if the user replaced it by hand, we prefer "always reflect
     # the current install" over preserving a stale value.
+    _ops_install_step="symlinking $BIN_DIR/ops -> $INSTALL_DIR/ops.sh"
     ln -sf "$INSTALL_DIR/ops.sh" "$BIN_DIR/ops"
 
     # ---- summary -----------------------------------------------------------
@@ -329,6 +367,19 @@ main() {
             printf "              export PATH=\"%s:\$PATH\"\n" "$BIN_DIR" >&2
             ;;
     esac
+
+    # Final marker. _ops_install_done flips on so the EXIT trap above does
+    # NOT print the "aborted at step: …" warning when the script exits 0.
+    # The marker also gives users a clear visual end-of-output: any
+    # subsequent error lines they see in their terminal (mise post-cmd
+    # hooks, direnv reload, starship prompt errors, …) are coming from
+    # their shell environment, NOT from install.sh. Pre-this-change,
+    # users seeing "install.sh: …updating" followed by unrelated noise
+    # often concluded "self-update is broken" when it had finished
+    # successfully — see the troubleshooting note in the matching
+    # CHANGELOG entry.
+    _ops_install_done=1
+    printf '\ninstall.sh: done.\n'
 }
 
 main "$@"

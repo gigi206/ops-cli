@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-05-06
+
+### Fixed
+- **`install.sh` (and therefore `ops self-update`) silently failed to update past a tag that had been force-pushed server-side.** The bug surfaced as `ops self-update` printing only the opening line `install.sh: updating ops-cli in … (ref: vX.Y.Z, current: vY.Y.Y)` and nothing else — no summary, no `done.` marker, no error — and the local checkout staying on the old commit. Root cause: `git fetch --tags --prune --prune-tags` (without `--force`) refuses to overwrite a local tag whose server-side commit changed (e.g. when the maintainer amended a tagged release commit to fix CI). It prints `! [rejected] vY.Y.Y -> vY.Y.Y (would clobber existing tag)` on stderr but stays at exit 0 — so `set -eu` did not trip, yet the FETCH_HEAD update happened against a tag that was held back. We added `--force` to the fetch so an upstream-rewritten tag is consumed silently, matching the operational reality of how this project's release process works (see CLAUDE.md `chore: cut vX.Y.Z` block: a CI-fix amend + force-push of an annotated tag is the documented pattern).
+
+### Added
+- **Step-by-step instrumentation in `install.sh` so a future silent abort cannot mislead users.** The script now sets a `_ops_install_step` label before each milestone (`describing current HEAD`, `git fetch …`, `git checkout FETCH_HEAD`, `chmod +x ops.sh`, `symlinking …`) and an `EXIT` trap reports the active label if `set -eu` triggered exit on a non-zero status. So the previous `(silence)` failure mode now produces lines like `install.sh: aborted (exit 128) during step: git fetch vY.Y.Y (force, tags+prune)` plus a hint to re-run with `sh -x`.
+- **`install.sh: done.` final marker.** Users seeing post-install noise from their shell hooks (mise activate scanning a `.mise.local.toml`, direnv reload, starship's `cmd_duration` slow-cmd warning, …) used to mistake that noise for an install failure and report bogus "self-update is broken" when it had finished cleanly. The explicit `done.` line draws a clear boundary: anything below it is from the user's shell environment, not from us. The trap above also flips a sentinel before exit so a successful run stays silent (no false-positive "aborted" message on a normal exit-0 path).
+
+### Changed
+- `cmd_update_self` (`ops self-update`) re-execs `sh install.sh` exactly as before — no behavior change in the wrapper. All the robustness improvements live in `install.sh` and apply equally to the documented `curl -fsSL .../install.sh | sh` bootstrap path used for fresh installs.
+
 ## [1.13.0] - 2026-05-06
 
 ### Performance
