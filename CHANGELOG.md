@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-05-06
+
+### Fixed
+- **`ops run --claude` (and the other npm-backed agents) could die with `_: line 1: exec: claude: not found` immediately after the cold-path install.** Cause: `command -v claude` on the cold path returns 1 (the shim has not been written yet), and bash records the negative lookup in its hash table. After `mise use -g npm:@anthropic-ai/claude-code` writes `/opt/mise/data/shims/claude`, the PATH itself is unchanged (the shims directory is already on `$PATH` from the image's `ENV PATH=…`), but the SUBSEQUENT `exec claude "$@"` skips the PATH walk because bash trusts the cached "not found" entry — so the exec dies before claude ever runs. We now run `hash -r` between the install block and the `exec` to invalidate the cache. Sub-millisecond cost on the warm path (no-op there); fixes the cold path entirely. Same fix applies symmetrically to `--gemini`, `--opencode`, and `--codex` because they share the same `_agent_cmd` template.
+
 ## [1.13.1] - 2026-05-06
 
 ### Fixed
