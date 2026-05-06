@@ -82,6 +82,67 @@ setup() {
     [[ "$output" == *"ops-codex:"* ]]
 }
 
+# ---- opencode-desktop (Electron GUI) ------------------------------------
+# Design decision: --opencode-desktop deliberately reuses the SAME state
+# volume as --opencode (~/.local/share/opencode + ~/.config/opencode) so
+# sessions stay coherent between the terminal CLI and the desktop app.
+# The dispatcher therefore must NOT mint a separate `ops-opencode-desktop`
+# volume — if anyone splits the state in the future this test fires.
+@test "--opencode-desktop --opencode-volume reuses ops-opencode (no ops-opencode-desktop volume)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" \
+        run --no-mount-home --opencode-volume --opencode-desktop --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ops-opencode:"* ]]
+    [[ "$output" != *"ops-opencode-desktop:"* ]]
+}
+
+# Theme detection (light/dark) + dconf access in the Electron GUI need
+# the host's D-Bus session bus inside the container. The flag flips
+# `dbus_session_auto=1` in cmd_run, which the auto-forward block down
+# below translates into a `--volume` of the bus socket and an `--env
+# DBUS_SESSION_BUS_ADDRESS=…`. Without this, the GUI is stuck on the
+# light theme and the startup is polluted with dconf-CRITICAL spam.
+# We test under DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/test-bus with a
+# real socket file so the `[ -S … ]` precondition passes; the assertion
+# checks the resulting --env line in the dry-run.
+@test "--opencode-desktop forwards DBUS_SESSION_BUS_ADDRESS when a session bus exists" {
+    socket="$BATS_TEST_TMPDIR/test-bus"
+    # bats provides BATS_TEST_TMPDIR; fall back to mktemp for older bats.
+    [ -z "$socket" ] && socket="$(mktemp -u)"
+    # Create a real Unix socket so the `[ -S … ]` test passes.
+    python3 -c "import socket as s; sock = s.socket(s.AF_UNIX); sock.bind('$socket')" 2>/dev/null \
+        || perl -MIO::Socket::UNIX -e "IO::Socket::UNIX->new(Local => '$socket', Type => SOCK_STREAM, Listen => 1) or die" 2>/dev/null \
+        || skip "no python3 / perl available to create a test socket"
+    run env OPS_RUNTIME=docker \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$socket" \
+        XDG_CURRENT_DESKTOP="ubuntu:GNOME" \
+        "$(ops_sh)" run --opencode-desktop --dry-run
+    rm -f "$socket"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DBUS_SESSION_BUS_ADDRESS=unix:path=$socket"* ]]
+    [[ "$output" == *"$socket:$socket"* ]]
+    [[ "$output" == *"XDG_CURRENT_DESKTOP=ubuntu:GNOME"* ]]
+}
+
+# Negative side: plain `ops run` (no --opencode-desktop) must NOT
+# auto-mount the session bus. The bus exposes notifications, secrets,
+# screen recording portal — surface we don't want in shells that
+# didn't ask for the GUI flow.
+@test "plain run does NOT forward DBUS_SESSION_BUS_ADDRESS" {
+    socket="$BATS_TEST_TMPDIR/test-bus"
+    [ -z "$socket" ] && socket="$(mktemp -u)"
+    python3 -c "import socket as s; sock = s.socket(s.AF_UNIX); sock.bind('$socket')" 2>/dev/null \
+        || perl -MIO::Socket::UNIX -e "IO::Socket::UNIX->new(Local => '$socket', Type => SOCK_STREAM, Listen => 1) or die" 2>/dev/null \
+        || skip "no python3 / perl available to create a test socket"
+    run env OPS_RUNTIME=docker \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$socket" \
+        "$(ops_sh)" run --dry-run
+    rm -f "$socket"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"DBUS_SESSION_BUS_ADDRESS"* ]]
+    [[ "$output" != *"$socket:$socket"* ]]
+}
+
 # ---- multiple agents at once -------------------------------------------
 
 @test "--claude-volume + --gemini-volume both injected" {

@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.10.2"
+OPS_VERSION="1.11.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -634,8 +634,9 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
       --install             Run \`mise install\` (from the workdir's mise.toml)
                             before the real command. Stand-alone gives you
                             an interactive bash after install; combinable
-                            with --claude / --gemini / --opencode / --codex
-                            and with an explicit command after \`--\`.
+                            with --claude / --gemini / --opencode /
+                            --opencode-desktop / --codex and with an explicit
+                            command after \`--\`.
       --nix-cleanup         Run nix-collect-garbage -d inside the container
       --update              Update mise and nix store inside the container
       --no-mount-home       Do not bind-mount host \$HOME (default: mounted).
@@ -676,6 +677,14 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
                             --no-mount-home)
       --gemini-volume       Use named Docker volume ops-gemini for ~/.gemini
       --opencode            Run opencode (install npm:opencode-ai if missing)
+      --opencode-desktop    Run opencode-desktop GUI (Electron AppImage from
+                            sst/opencode releases, ~150 MB; uses
+                            --appimage-extract-and-run, no FUSE needed).
+                            Shares the ops-opencode state with --opencode;
+                            needs Wayland on the host (auto-forwarded
+                            unless --no-wayland) AND an image built with
+                            OPS_DESKTOP_DEPS=true (gtk3 / nss / mesa /
+                            alsa runtime libs — opt-in, see Dockerfile).
       --opencode-mount      Bind-mount ~/.local/share/opencode + ~/.config/opencode
                             (only meaningful with --no-mount-home)
       --opencode-volume     Use named Docker volume ops-opencode for
@@ -2940,6 +2949,21 @@ cmd_run() {
     # missing). --no-wayland disables this. X11 is NOT auto-forwarded —
     # wire it manually via -v /tmp/.X11-unix and -e DISPLAY if you need it.
     local wayland_auto=1
+    # Auto-forward the host D-Bus session bus for full-fat GUI agents
+    # (currently only --opencode-desktop). Electron/Chromium reads the
+    # `org.freedesktop.portal.Settings` interface over this bus to get
+    # the user's color-scheme (light/dark) preference, and gsettings /
+    # dconf clients connect here for GTK theme resolution. Without it
+    # the GUI is stuck on the light theme regardless of the host setting,
+    # plus the startup is polluted by `dconf-CRITICAL: unable to create
+    # directory /run/user/<uid>/dconf` spam (because dconf can't reach
+    # the bus). Off by default — flipped on by individual agent branches
+    # in the parser below. Trade-off: forwarding the session bus exposes
+    # the entire host session API to the container (notifications,
+    # secret service, screen recording portal, …); it's worth it for the
+    # GUI agents the user explicitly opted into via the dedicated flag,
+    # not for plain `ops run` shells.
+    local dbus_session_auto=0
     # trust_workdir=1 injects MISE_TRUSTED_CONFIG_PATHS=$PWD so mise activates
     # any mise.toml found in the bind-mounted workdir without prompting.
     # Defaults to OPS_TRUST_WORKDIR (1 unless the user exported 0 in
@@ -3061,6 +3085,106 @@ cmd_run() {
             --gemini-mount)    gemini_agent="mount";   shift ;;
             --opencode)
                 agent_cmd="$(_agent_cmd opencode npm:opencode-ai)"
+                shift
+                _extras=$(_agent_run_extras opencode)
+                # shellcheck disable=SC2086
+                [ -n "$_extras" ] && set -- $_extras "$@"
+                ;;
+            --opencode-desktop)
+                # Electron GUI variant of opencode. We pull the prebuilt
+                # AppImage that upstream publishes on every GitHub release
+                # (sst/opencode), via mise's `github:` backend with an
+                # asset_pattern filter — this avoids the 15-min Tauri Rust
+                # rebuild that nixpkgs would otherwise force on every cold
+                # cache (and which produces an outdated Tauri build anyway,
+                # because upstream switched to Electron mid-1.x).
+                #
+                # Three things this branch deliberately does differently
+                # from `_agent_cmd`, which is why we inline the bash-c
+                # snippet instead of calling that helper:
+                #
+                # 1. The mise tool spec uses bracket options
+                #    (`[asset_pattern=…]`) which are bash glob characters.
+                #    We single-quote the spec inside the emitted command
+                #    so `bash -c` doesn't try to expand them as a pattern
+                #    against the cwd.
+                #
+                # 2. The shimmed binary keeps the `.AppImage` suffix
+                #    (mise's `github:` backend uses the asset filename as
+                #    the on-disk and shim name; we accepted it rather than
+                #    fighting mise to rename it).
+                #
+                # 3. AppImages need libfuse2 to mount themselves at run
+                #    time. The container ships without fuse, so we use
+                #    `--appimage-extract-and-run`: AppImageKit unpacks the
+                #    embedded squashfs into /tmp on each launch and execs
+                #    the binary from there — no FUSE needed, no Dockerfile
+                #    patch. Cost: ~1–2s extra at startup. The /tmp dirs
+                #    accumulate (`appimage_extracted_<hash>`), but /tmp is
+                #    a tmpfs that goes away with the container, so the
+                #    leak is bounded by container lifetime.
+                #
+                # Image-level prerequisite: the Electron AppImage links
+                # against ~21 system libs (libnspr4, libnss3, libgtk-3,
+                # libgbm, libasound, libcups, plus the X11/at-spi/cairo/
+                # pango set pulled transitively by gtk3). The headless
+                # baseline does NOT ship them — opt in by rebuilding with
+                # OPS_DESKTOP_DEPS=true (see Dockerfile §1b). Without it
+                # the AppImage exits with `error while loading shared
+                # libraries: libnspr4.so` and similar; we don't pre-flight
+                # the check here because the user already gets a clear
+                # ld.so error pointing at the missing lib.
+                #
+                # `--no-sandbox`: Chromium's setuid sandbox helper
+                # (`chrome-sandbox` inside the AppImage) requires
+                # `chown root:root + chmod 4755` to work, which the
+                # unprivileged container user cannot grant — the helper
+                # then FATALs with "The SUID sandbox helper binary was
+                # found, but is not configured correctly. Rather than run
+                # without sandboxing I'm aborting now". Passing
+                # `--no-sandbox` to Electron is the canonical workaround
+                # for Electron-in-container (Puppeteer / Playwright /
+                # every Electron CI image does this). Trade-off accepted:
+                # the container boundary is the security perimeter we
+                # already trust, the Chromium internal sandbox is
+                # redundant in that context. The flag goes BEFORE `"$@"`
+                # so user-supplied trailing args still flow through.
+                #
+                # `--ozone-platform=wayland --enable-features=UseOzonePlatform`:
+                # Electron's default Ozone backend on Linux is X11, even
+                # when WAYLAND_DISPLAY is set. ops.sh forwards the Wayland
+                # socket (see the auto-forward block ~150 lines down) but
+                # does NOT forward an X11 display, so the bare AppImage
+                # exits with `Missing X server or $DISPLAY / The platform
+                # failed to initialize. Exiting.`. We initially tried
+                # `--ozone-platform-hint=auto` (the cleanest choice on
+                # paper) but Chromium kept loading the X11 backend on the
+                # opencode-desktop v1.14.39 Electron build — observed
+                # empirically: `[ERROR:ozone_platform_x11.cc:256] Missing
+                # X server` despite both --ozone-platform-hint=auto AND
+                # WAYLAND_DISPLAY/XDG_RUNTIME_DIR/socket bind-mount being
+                # present in the dry-run. Switching to the explicit
+                # `--ozone-platform=wayland` plus `--enable-features=
+                # UseOzonePlatform` (the older, pre-hint incantation) is
+                # what actually pins Chromium to the Wayland Ozone
+                # backend on this version. Trade-off: a hypothetical X11
+                # user would now need to override the flag manually
+                # (`./ops.sh run --opencode-desktop -- --ozone-platform=x11`,
+                # since trailing args after `--` flow through to the
+                # binary). Acceptable — we prioritise the common case.
+                #
+                # Shared state with the terminal CLI: same _agent_run_extras
+                # call as `--opencode` so `--opencode-mount` / -volume /
+                # --no-opencode-mount continue to drive
+                # ~/.local/share/opencode + ~/.config/opencode for both
+                # frontends. Sessions stay coherent.
+                agent_cmd="command -v opencode-desktop.AppImage >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, ~150 MB download)...\\033[0m\\n' opencode-desktop >&2; mise use -g 'github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]'; __ops_refresh_cache; clear 2>/dev/null || true; }; exec opencode-desktop.AppImage --appimage-extract-and-run --no-sandbox --ozone-platform=wayland --enable-features=UseOzonePlatform \"\$@\""
+                # Theme detection (light/dark) + dconf access need the
+                # host's D-Bus session bus inside the container. Set the
+                # flag here; the actual --volume + --env wiring happens
+                # in the auto-forward block alongside the Wayland one
+                # so the dry-run output is grouped logically.
+                dbus_session_auto=1
                 shift
                 _extras=$(_agent_run_extras opencode)
                 # shellcheck disable=SC2086
@@ -3463,6 +3587,63 @@ cmd_run() {
         args+=(--volume "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY")
         args+=(--env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
         args+=(--env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+    fi
+    # Auto-forward the D-Bus session bus + desktop env vars when an
+    # agent flag opted in (currently --opencode-desktop sets
+    # dbus_session_auto=1; see the dedicated comment block at the top of
+    # cmd_run for the security rationale). Strips the "unix:path=" prefix
+    # that systemd-style addresses use so the bind-mount source/dest
+    # stays a plain filesystem path. Silent no-op when the host isn't
+    # exporting DBUS_SESSION_BUS_ADDRESS or the socket is missing.
+    if [ "$dbus_session_auto" = 1 ] && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        local _dbus_socket="${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+        if [ -S "$_dbus_socket" ]; then
+            args+=(--volume "$_dbus_socket:$_dbus_socket")
+            args+=(--env "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
+        fi
+        # XDG_CURRENT_DESKTOP / DESKTOP_SESSION are read by xdg-desktop-portal
+        # to pick the correct portal backend (gnome / kde / hyprland / …);
+        # without them the portal call may answer with stale defaults
+        # ('default' instead of 'prefer-dark') even with the bus connected.
+        [ -n "${XDG_CURRENT_DESKTOP:-}" ] && args+=(--env "XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP")
+        [ -n "${DESKTOP_SESSION:-}" ]     && args+=(--env "DESKTOP_SESSION=$DESKTOP_SESSION")
+        # GTK theme + color-scheme forwarding. We CANNOT rely on the portal
+        # call from inside the container on Ubuntu hosts: AppArmor (the
+        # `unconfined` profile that ships with snapd-shipped portals
+        # since 24.04) actively blocks D-Bus method_call from a sender
+        # that cannot be peer-authenticated through the snap chain — the
+        # error is `An AppArmor policy prevents this sender from sending
+        # this message`, observed empirically on Ubuntu 25.04. We
+        # therefore READ the value on the host via `dconf read` (the raw
+        # GVariant store, which IS accurate even when `gsettings get`
+        # returns the schema default — observed during this feature's
+        # development: gsettings said 'default'/'Yaru' while the user's
+        # shell was visibly dark and dconf correctly read 'prefer-dark').
+        #
+        # The theme NAME is deliberately NOT forwarded verbatim
+        # (e.g. GTK_THEME=Yaru-dark would fail: the container ships only
+        # Adwaita, the GTK default — Yaru theme assets are not in the
+        # base image, so libgtk silently falls back to Adwaita-light).
+        # Instead, we set GTK_THEME=Adwaita:dark when the host signals
+        # `prefer-dark`. The `:dark` suffix is GTK 3+ syntax that pins
+        # the dark variant of the named theme — Adwaita has both light
+        # and dark variants bundled, so this ALWAYS resolves to a real
+        # theme on the on-disk side, which lets libgtk set
+        # `gtk-application-prefer-dark-theme` to true. Electron's
+        # `nativeTheme.shouldUseDarkColors` reads that GtkSetting and
+        # the result reaches the renderer's `prefers-color-scheme` CSS
+        # media query — which is what the opencode-desktop UI keys off.
+        # Visual result: not pixel-identical to the user's host theme,
+        # but unambiguously dark vs light. The trade-off is documented
+        # in the bind-mount table because it's a deliberate compromise
+        # between purity (true Yaru) and reliability (always works).
+        local _host_color_scheme=""
+        if command -v dconf >/dev/null 2>&1; then
+            _host_color_scheme="$(dconf read /org/gnome/desktop/interface/color-scheme 2>/dev/null | tr -d "'")"
+        fi
+        if [ "$_host_color_scheme" = "prefer-dark" ]; then
+            args+=(--env "GTK_THEME=Adwaita:dark")
+        fi
     fi
     args+=("${extra_envs[@]}")
     [ ${#extra_ports[@]} -gt 0 ] && args+=("${extra_ports[@]}")
