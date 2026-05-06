@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.12.0"
+OPS_VERSION="1.13.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -3115,14 +3115,54 @@ cmd_run() {
                 #    fighting mise to rename it).
                 #
                 # 3. AppImages need libfuse2 to mount themselves at run
-                #    time. The container ships without fuse, so we use
-                #    `--appimage-extract-and-run`: AppImageKit unpacks the
-                #    embedded squashfs into /tmp on each launch and execs
-                #    the binary from there — no FUSE needed, no Dockerfile
-                #    patch. Cost: ~1–2s extra at startup. The /tmp dirs
-                #    accumulate (`appimage_extracted_<hash>`), but /tmp is
-                #    a tmpfs that goes away with the container, so the
-                #    leak is bounded by container lifetime.
+                #    time, plus CAP_SYS_ADMIN + /dev/fuse exposed to the
+                #    container. We refuse all three on isolation grounds
+                #    (SYS_ADMIN ≈ root inside the namespace; widens the
+                #    container escape surface considerably). Instead we
+                #    EXTRACT the AppImage's embedded squashfs once, cache
+                #    the extracted tree at $HOME/.cache/opencode-desktop/
+                #    <fingerprint>/squashfs-root/, and exec the bundled
+                #    AppRun from there on every launch.
+                #
+                #    The earlier approach was `--appimage-extract-and-run`
+                #    on every launch — that costs ~1–2 s of squashfs
+                #    extraction per `ops run` AND ~150 MB of /tmp tmpfs
+                #    write churn per launch (tmpfs is RAM-backed, the
+                #    write is "free" but the I/O is real). Caching the
+                #    extraction sidesteps both costs at the price of one
+                #    extra step in this branch and ~150 MB of disk inside
+                #    $HOME/.cache (bind-mounted from the host by default,
+                #    so the cache survives `--rm` containers naturally).
+                #
+                #    Cache invalidation rides on a sha256-truncated hash
+                #    of the resolved AppImage path that mise hands back.
+                #    When `mise upgrade` rotates the asset to a newer
+                #    version, the path changes (mise installs side-by-
+                #    side under /opt/mise/data/installs/...), the hash
+                #    changes, the cached squashfs-root is missed, and we
+                #    re-extract. We `rm -rf` the entire cache parent dir
+                #    before extracting so an old cache cannot accumulate
+                #    — disk usage stays bounded to ~150 MB total. We
+                #    resolve the path through `mise which`, which works
+                #    against the shim and the bracket-options syntax in
+                #    one shot; `command -v` would only return the shim
+                #    script itself, whose `readlink -f` does NOT chase
+                #    through to the AppImage.
+                #
+                #    APPDIR pre-set on the exec line: opencode-desktop
+                #    ships a custom AppRun bash wrapper (NOT the standard
+                #    AppImageKit AppRun) that, when APPDIR is unset, tries
+                #    to deduce it by walking up from $0 until it finds
+                #    "$1" as a regular file. With our flags ("--no-sandbox"
+                #    is $1), the walk never matches anything, APPDIR ends
+                #    up empty, and BIN resolves to /@opencode-aidesktop —
+                #    a path under root that does not exist, so AppRun
+                #    bails with "/@opencode-aidesktop: No such file".
+                #    Pre-setting APPDIR=$extracted skips the broken auto-
+                #    detect entirely; AppRun then exports PATH/
+                #    LD_LIBRARY_PATH/XDG_DATA_DIRS/GSETTINGS_SCHEMA_DIR
+                #    relative to the cache and execs $APPDIR/@opencode-
+                #    aidesktop with our flags.
                 #
                 # Image-level prerequisite: the Electron AppImage links
                 # against ~21 system libs (libnspr4, libnss3, libgtk-3,
@@ -3178,7 +3218,25 @@ cmd_run() {
                 # --no-opencode-mount continue to drive
                 # ~/.local/share/opencode + ~/.config/opencode for both
                 # frontends. Sessions stay coherent.
-                agent_cmd="command -v opencode-desktop.AppImage >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, ~150 MB download)...\\033[0m\\n' opencode-desktop >&2; mise use -g 'github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]'; __ops_refresh_cache; clear 2>/dev/null || true; }; exec opencode-desktop.AppImage --appimage-extract-and-run --no-sandbox --ozone-platform=wayland --enable-features=UseOzonePlatform \"\$@\""
+                agent_cmd="
+target=\$(mise which opencode-desktop.AppImage 2>/dev/null)
+if [ -z \"\$target\" ]; then
+    printf '\\033[1;34m==> Installing %s (first run, ~150 MB download)...\\033[0m\\n' opencode-desktop >&2
+    mise use -g 'github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]'
+    __ops_refresh_cache
+    target=\$(mise which opencode-desktop.AppImage)
+    clear 2>/dev/null || true
+fi
+fp=\$(printf '%s' \"\$target\" | sha256sum | cut -c1-16)
+extracted=\"\$HOME/.cache/opencode-desktop/\$fp/squashfs-root\"
+if [ ! -x \"\$extracted/AppRun\" ]; then
+    printf '\\033[1;34m==> Extracting opencode-desktop (one-time, cached for next launches)...\\033[0m\\n' >&2
+    rm -rf \"\$HOME/.cache/opencode-desktop\"
+    mkdir -p \"\$(dirname \"\$extracted\")\"
+    (cd \"\$(dirname \"\$extracted\")\" && \"\$target\" --appimage-extract >/dev/null)
+fi
+APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform=wayland --enable-features=UseOzonePlatform \"\$@\"
+"
                 # Theme detection (light/dark) + dconf access need the
                 # host's D-Bus session bus inside the container. Set the
                 # flag here; the actual --volume + --env wiring happens

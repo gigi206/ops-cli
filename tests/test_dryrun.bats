@@ -160,35 +160,47 @@ _unescape() {
 # dry-run must show:
 #   - the `github:sst/opencode[asset_pattern=…AppImage]` install token
 #     (regression guard if anyone swaps to npm: / nix: / aqua: again),
-#   - `--appimage-extract-and-run` on the exec line (without it the
-#     AppImage hits `dlopen libfuse.so.2` and refuses to start in the
-#     fuse-less container),
+#   - `--appimage-extract` (NOT `--appimage-extract-and-run`) — we cache
+#     the squashfs-root under $HOME/.cache/opencode-desktop/ so the
+#     extraction cost is paid once per upstream version, not per launch.
+#     Switching back to extract-and-run would re-introduce ~1–2 s of
+#     squashfs decompression on every `ops run`.
 #   - `--no-sandbox` on the exec line (without it Chromium FATALs at
 #     startup because chrome-sandbox can't be SUID-root in a non-
 #     privileged container — see the comment block in cmd_run for the
 #     full rationale; this assertion locks in the workaround so a
 #     well-meaning revert ("we don't need --no-sandbox, do we?") fails
 #     loudly here),
-#   - `exec opencode-desktop.AppImage` (mise's github: backend keeps the
-#     asset filename verbatim as both on-disk and shim name).
+#   - `exec "$extracted/AppRun"` from the cache directory (NOT directly
+#     `opencode-desktop.AppImage`) — we exec the AppRun bundled inside
+#     the extracted squashfs-root, which gives instant startup on the
+#     warm path.
 @test "run --opencode-desktop pulls Electron AppImage via github backend" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode-desktop --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]"* ]]
-    [[ "$norm" == *"--appimage-extract-and-run"* ]]
+    [[ "$norm" == *"--appimage-extract"* ]]
+    [[ "$norm" != *"--appimage-extract-and-run"* ]]
     [[ "$norm" == *"--no-sandbox"* ]]
     [[ "$norm" == *"--ozone-platform=wayland"* ]]
     [[ "$norm" == *"--enable-features=UseOzonePlatform"* ]]
-    [[ "$norm" == *"exec opencode-desktop.AppImage"* ]]
+    [[ "$norm" == *'APPDIR="$extracted" exec "$extracted/AppRun"'* ]]
 }
 
-@test "run --opencode-desktop uses 'command -v opencode-desktop.AppImage' (not 'mise which')" {
+@test "run --opencode-desktop caches the extracted squashfs under \$HOME/.cache/opencode-desktop/" {
+    # Regression guard: the cache path uses a sha256-truncated fingerprint
+    # of the resolved AppImage path so that `mise upgrade` (which moves the
+    # asset side-by-side under /opt/mise/data/installs/...) naturally
+    # invalidates the cache without manual purge. Anything that drops the
+    # fingerprint and falls back to a single static path would mean a stale
+    # squashfs-root keeping the old version alive after an upgrade.
     run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode-desktop --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
-    [[ "$norm" == *"command -v opencode-desktop.AppImage"* ]]
-    [[ "$norm" != *"mise which opencode-desktop"* ]]
+    [[ "$norm" == *'$HOME/.cache/opencode-desktop/$fp/squashfs-root'* ]]
+    [[ "$norm" == *"sha256sum"* ]]
+    [[ "$norm" == *"mise which opencode-desktop.AppImage"* ]]
 }
 
 # Regression guard: opencode used to be installed via the Bun
