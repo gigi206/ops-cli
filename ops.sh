@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.13.1"
+OPS_VERSION="1.13.2"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -2704,9 +2704,20 @@ _agent_cmd() {
     # `./ops.sh run --<agent>` sees the bumped `/opt/mise/data/config/
     # config.toml` mtime > cache mtime, runs `mise hook-env` for ~8 s,
     # and the user perceives a slow 2nd run before the cache stabilizes.
+    # `hash -r` after the install block: when `command -v $bin` fails on
+    # the cold path, bash records the negative lookup in its hash table —
+    # so the subsequent `exec $bin` would skip the PATH walk entirely and
+    # die with `exec: $bin: not found` even after `mise use -g` has just
+    # written /opt/mise/data/shims/$bin. The PATH itself is unchanged
+    # (the shims dir is already there, baked in $ENV PATH at image build
+    # time), so all we need is to invalidate bash's lookup cache. We
+    # always run it, even on the warm path where it's a no-op, because
+    # the cost is sub-millisecond and putting it inside the `||` block
+    # would leave a stale negative entry if a previous shell session in
+    # the same bashrc PROMPT chain had already cached the lookup.
     case "$pkg" in
-        npm:*) printf '%s\n' "command -v $bin >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, this may take a minute)...\\033[0m\\n' $bin >&2; mise use -g node@lts; mise use -g $pkg; __ops_refresh_cache; clear 2>/dev/null || true; }; exec $bin \"\$@\"" ;;
-        *)     printf '%s\n' "command -v $bin >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, this may take a minute)...\\033[0m\\n' $bin >&2; mise use -g $pkg; __ops_refresh_cache; clear 2>/dev/null || true; }; exec $bin \"\$@\"" ;;
+        npm:*) printf '%s\n' "command -v $bin >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, this may take a minute)...\\033[0m\\n' $bin >&2; mise use -g node@lts; mise use -g $pkg; __ops_refresh_cache; clear 2>/dev/null || true; }; hash -r; exec $bin \"\$@\"" ;;
+        *)     printf '%s\n' "command -v $bin >/dev/null 2>&1 || { printf '\\033[1;34m==> Installing %s (first run, this may take a minute)...\\033[0m\\n' $bin >&2; mise use -g $pkg; __ops_refresh_cache; clear 2>/dev/null || true; }; hash -r; exec $bin \"\$@\"" ;;
     esac
 }
 
