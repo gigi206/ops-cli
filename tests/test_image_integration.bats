@@ -21,9 +21,42 @@ setup() {
 @test "image: nix binary is discoverable via PATH and reports a version" {
     run run_in_image 'which nix && nix --version'
     [ "$status" -eq 0 ]
-    # /opt/ops/bin/nix is our CLI wrapper; it delegates to the real binary
-    # under /opt/nix-home/.nix-profile/bin/nix transparently for --version.
+    # /opt/ops/bin/nix is our CLI wrapper; it delegates to the static
+    # binary under /opt/ops/lib/nix-static (image-resident, never masked
+    # by the runtime /nix volume mount). See Dockerfile §3b.
     [[ "$output" == */opt/ops/bin/nix* ]]
+    [[ "$output" == *"nix (Nix) "* ]]
+}
+
+@test "image: nix-static is fully static (no dynamic deps)" {
+    # Regression guard for the volume <-> image desync class of bug:
+    # the binary that wrappers delegate to MUST be statically linked so
+    # it remains usable when the /nix volume masks an image baked store.
+    # We use `ldd` (always present in any libc system) rather than `file`
+    # (not installed by default in the Debian variant of the image, only
+    # in the Arch one — using `file` would silently fail on Debian).
+    # ldd on a statically-linked binary exits non-zero with a locale-
+    # dependent message ("not a dynamic executable" / "n'est pas un
+    # exécutable dynamique"); on a dynamic binary it exits 0 and lists
+    # entries of the form "=> /path/to/libfoo.so". The locale-agnostic
+    # invariant is therefore "no '=> /' line in ldd output".
+    run run_in_image 'ldd /opt/ops/lib/nix-static 2>&1 || true'
+    [[ "$output" != *"=> /"* ]]
+}
+
+@test "image: nix-static survives a stale /nix store (volume desync simulation)" {
+    # Simulate the failure mode that gave rise to nix-static: a /nix
+    # store missing the dynamic nix path the user profile points at. We
+    # rename the bootstrap nix store path out of the way and verify
+    # /opt/ops/bin/nix still works end-to-end.
+    run run_in_image '
+        target=$(readlink -f /opt/nix-home/.nix-profile/bin/nix 2>/dev/null || true)
+        [ -n "$target" ] && [ -e "$target" ] && sudo mv "$target" "${target}.disabled" || true
+        nix --version
+        # restore so other tests are not affected
+        [ -n "$target" ] && [ -e "${target}.disabled" ] && sudo mv "${target}.disabled" "$target" || true
+    '
+    [ "$status" -eq 0 ]
     [[ "$output" == *"nix (Nix) "* ]]
 }
 

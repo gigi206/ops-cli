@@ -215,6 +215,46 @@ RUN HOME=/opt/nix-home curl -fsSL --retry 3 --max-time 120 \
  && printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' \
       | sudo tee /etc/nix/nix.conf > /dev/null
 
+# 3b. nix-static — image-baked binary that lives OUTSIDE the runtime /nix
+# volume mount point. Eliminates the entire class of bug where the user
+# profile's /opt/nix-home/.nix-profile/bin/nix symlink points at a /nix/store/
+# path that is masked at runtime by an out-of-sync ops-share-nix volume.
+#
+# Mechanism: the bootstrap nix above (dynamic, lives in /nix/store) is used
+# ONLY at build time to download the prebuilt nixpkgs#pkgsStatic.nix from
+# cache.nixos.org (~25s on warm cache). The resulting fully-static, musl-
+# linked nix binary is copied to /opt/ops/lib/nix-static. nix dispatches on
+# argv[0], so a single binary serves nix / nix-env / nix-store / nix-channel
+# / nix-collect-garbage / nix-build / nix-instantiate / nix-shell via a
+# symlink farm in /opt/ops/lib/.
+#
+# At runtime, /opt/ops/bin (which is first in PATH) holds the existing
+# wrappers (_nix-cli-wrapper.sh and _nix-wrapper.sh) that delegate to
+# /opt/ops/lib/<cmd> — both image-resident, both unmaskable by the /nix
+# volume. The bootstrap nix in /nix/store is no longer referenced from any
+# image path; if NIX_CLEANUP=true at the end of §5 it gets garbage-collected
+# along with other build-only deps. Tools installed via mise:* below land at
+# /nix/store/<hash>/... as before — they're content-addressable so they
+# coexist transparently between rebuilds and across the volume.
+# PATH ENV is defined further down (ENV PATH=...), so call the bootstrap
+# nix by absolute path here. Sourcing nix.sh exports NIX_PROFILES etc.
+# but not PATH (it assumes PATH already has /opt/nix-home/.nix-profile/bin).
+RUN . /opt/nix-home/.nix-profile/etc/profile.d/nix.sh \
+ && /opt/nix-home/.nix-profile/bin/nix build \
+        --extra-experimental-features "nix-command flakes" \
+        --no-link --print-out-paths \
+        "nixpkgs#pkgsStatic.nix" > /tmp/nix-static-paths \
+ && nix_static_path=$(tail -1 /tmp/nix-static-paths) \
+ && sudo mkdir -p /opt/ops/lib \
+ && sudo install -m 0755 -o root -g root \
+      "$nix_static_path/bin/nix" /opt/ops/lib/nix-static \
+ && for cmd in nix nix-env nix-store nix-channel nix-collect-garbage \
+               nix-build nix-instantiate nix-shell nix-prefetch-url; do \
+      sudo ln -sf nix-static /opt/ops/lib/"$cmd"; \
+    done \
+ && rm -f /tmp/nix-static-paths \
+ && /opt/ops/lib/nix-static --version
+
 # /opt/ops/bin first so ops-cli wrappers (google-chrome, nix CLI) shadow
 # the mise shims; rooted under /opt/* so the PATH survives a $HOME bind-mount.
 ENV PATH=/opt/ops/bin:/opt/nix-home/.nix-profile/bin:/opt/mise/data/shims:/opt/mise/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -278,7 +318,7 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
       echo "ERROR: cannot resolve /opt/nix-home/.nix-profile to a store path" >&2; exit 1; \
     fi \
  && if [ "$NIX_CLEANUP" = "true" ]; then \
-      HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d; \
+      HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d; \
     fi
 
 # Interactive shell init outside $HOME so it survives the runtime $HOME

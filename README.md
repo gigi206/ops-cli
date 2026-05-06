@@ -2098,7 +2098,7 @@ tests/
 ├── test_unit_helpers.bats         — 14 tests: direct unit tests for _human_bytes, _shell_quote (via OPS_SOURCE_ONLY)
 ├── test_label_masking.bats        —  8 tests: secret masking in BOTH ops.cmdline.user and ops.cmdline.real labels (GITHUB_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)
 ├── test_regressions.bats          — 14 tests: build arg leak fix (#18), --user-name remap (#24), PWD⊂HOME (#23), clean interactive (#20), rootless cache reset (#17), isolated agent volumes, install-path safety, start-fail re-dispatch (#19), and more
-├── test_image_integration.bats    — 39 integration tests against the actually-built localhost/ops-dev image (Nix GC root, chrome hooks, mise config split, machine-id, unfree flags, OCI labels, …). Skips if Docker or the image is absent.
+├── test_image_integration.bats    — 41 integration tests against the actually-built localhost/ops-dev image (Nix GC root, chrome hooks, mise config split, machine-id, unfree flags, OCI labels, …). Skips if Docker or the image is absent.
 ├── test_subcommand_help.bats      — 18 tests: per-subcommand --help output (doctor/inspect/config/clean/status/logs/backup/restore/update/aliases/images/runtime). Ensures `-h|--help` is intercepted before arg parsing and exits 0.
 ├── test_secret_symmetry.bats      —  8 tests: regression guard ensuring `_dry_run_print` (dry-run) and `_mask_secrets` (labels) agree on what is a secret (e.g. MY_DB_PASSWORD redacted everywhere; MONKEY treated as non-secret in both paths).
 ├── test_match_agent_flag.bats     —  8 tests: per-agent flag dispatcher `_match_agent_flag` — `--{claude,gemini,opencode,codex}-{mount,volume}` + `--no-X-mount` collapsed into one nameref-based handler.
@@ -2137,7 +2137,7 @@ CI runs this job (`image-integration`) automatically on pushes to `main` and via
 | Backup / restore (TTY guards, alpine tar, ensure_volume) | **100%** |
 | Per-image hash + rebuild detection | **100%** |
 
-**639 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
+**641 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
 
 A pure-Lua unit-test harness lives under `tests/lua/` (run via `mise run test-lua` or `lua5.4 tests/lua/run.lua`). It exercises the plugin helpers that don't need mise's native modules — `shell.shquote`, `version.parse_version`, `flake.is_reference`, `plugin_matcher.matches`, `tempdir.with_temp_dir`, `security.is_safe_local_path`, `jetbrains.extract_plugin_info`. The harness stubs the native modules via `package.preload` so any vanilla `lua5.x` interpreter is enough; busted is not required.
 
