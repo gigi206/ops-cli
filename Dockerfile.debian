@@ -175,6 +175,28 @@ RUN HOME=/opt/nix-home curl -fsSL --retry 3 --max-time 120 \
  && printf 'experimental-features = nix-command flakes\nbuild-users-group =\n' \
       | sudo tee /etc/nix/nix.conf > /dev/null
 
+# 3b. nix-static — image-baked binary outside the runtime /nix volume mount
+# point. Mirror of Dockerfile §3b; see that file for the full rationale on
+# why this dissolves the ops-share-nix volume <-> image desync class of bug.
+# PATH ENV is defined further down (ENV PATH=...), so call the bootstrap
+# nix by absolute path here. Sourcing nix.sh exports NIX_PROFILES etc.
+# but not PATH (it assumes PATH already has /opt/nix-home/.nix-profile/bin).
+RUN . /opt/nix-home/.nix-profile/etc/profile.d/nix.sh \
+ && /opt/nix-home/.nix-profile/bin/nix build \
+        --extra-experimental-features "nix-command flakes" \
+        --no-link --print-out-paths \
+        "nixpkgs#pkgsStatic.nix" > /tmp/nix-static-paths \
+ && nix_static_path=$(tail -1 /tmp/nix-static-paths) \
+ && sudo mkdir -p /opt/ops/lib \
+ && sudo install -m 0755 -o root -g root \
+      "$nix_static_path/bin/nix" /opt/ops/lib/nix-static \
+ && for cmd in nix nix-env nix-store nix-channel nix-collect-garbage \
+               nix-build nix-instantiate nix-shell nix-prefetch-url; do \
+      sudo ln -sf nix-static /opt/ops/lib/"$cmd"; \
+    done \
+ && rm -f /tmp/nix-static-paths \
+ && /opt/ops/lib/nix-static --version
+
 # /opt/ops/bin first so wrappers shadow the mise shims; rooted under /opt/*
 # so the PATH survives a $HOME bind-mount.
 ENV PATH=/opt/ops/bin:/opt/nix-home/.nix-profile/bin:/opt/mise/data/shims:/opt/mise/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -238,7 +260,7 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
       echo "ERROR: cannot resolve /opt/nix-home/.nix-profile to a store path" >&2; exit 1; \
     fi \
  && if [ "$NIX_CLEANUP" = "true" ]; then \
-      HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d; \
+      HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d; \
     fi
 
 # Interactive shell init outside $HOME (see docs/dockerfile-design.md §5).

@@ -27,10 +27,21 @@
 set -eu
 set -o pipefail
 
-REAL=/opt/nix-home/.nix-profile/bin/nix
+# Points at the image-baked static nix binary in /opt/ops/lib/, NOT the
+# dynamic one in /nix/store. Rationale: /nix is a runtime volume mount
+# that can mask the image's /nix/store contents when the volume was
+# created against a different image — /opt/ops/lib/ is image-resident
+# and never masked. See Dockerfile §3b.
+#
+# We point at the `nix` SYMLINK (which targets nix-static) so that after
+# `exec`, the binary sees argv[0] = ".../nix" and its busybox-style
+# dispatch keeps `--version` reporting "nix (Nix) X.Y.Z" rather than
+# "nix-static (Nix) X.Y.Z" (which would surprise downstream tooling
+# that greps the version output).
+REAL=/opt/ops/lib/nix
 
 if [ ! -x "$REAL" ]; then
-    echo "nix: Nix binary not found at $REAL" >&2
+    echo "nix: static binary missing at $REAL — rebuild the image" >&2
     exit 127
 fi
 

@@ -32,12 +32,16 @@
 set -eu
 set -o pipefail
 
-# Resolve which command was invoked (via $0's basename).
+# Resolve which command was invoked (via $0's basename), then dispatch
+# to the image-baked nix-static binary. /opt/ops/lib/ holds a symlink farm
+# (nix-env -> nix-static, nix-store -> nix-static, ...) so a single static
+# binary serves every legacy command via argv[0]. See Dockerfile §3b for
+# why this lives outside /nix/store (which is masked by the runtime volume).
 name=$(basename "$0")
-real=/opt/nix-home/.nix-profile/bin/"$name"
+real=/opt/ops/lib/"$name"
 
 if [ ! -x "$real" ]; then
-    echo "$name: Nix binary not found at $real" >&2
+    echo "$name: static binary missing at $real — rebuild the image" >&2
     exit 127
 fi
 

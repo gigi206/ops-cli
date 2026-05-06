@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.11.0"
+OPS_VERSION="1.12.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -3060,11 +3060,11 @@ cmd_run() {
             --install)         do_install=1;                            shift ;;
             --no-cache)        build_extra_args+=(--no-cache);          shift ;;
             --no-rm)           ephemeral=0;                             shift ;;
-            --nix-cleanup)     agent_cmd='HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d'; shift ;;
+            --nix-cleanup)     agent_cmd='HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d'; shift ;;
             --update)          agent_cmd='
                 echo -e "\033[1;34m==> mise self-update...\033[0m" && mise self-update --yes
                 echo -e "\033[1;34m==> mise upgrade...\033[0m"     && mise upgrade --yes
-                echo -e "\033[1;34m==> nix cleanup...\033[0m"      && HOME=/opt/nix-home /opt/nix-home/.nix-profile/bin/nix-collect-garbage -d
+                echo -e "\033[1;34m==> nix cleanup...\033[0m"      && HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d
                 echo -e "\033[1;32m==> done\033[0m"
             '; shift ;;
             --claude)
