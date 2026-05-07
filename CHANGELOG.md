@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-05-07
+
+### Fixed
+- **`ops run --update` looped on `mise self-update` forever — every invocation re-downloaded the same ~29 MiB tarball and announced "Updated mise to vX.Y.Z" without the bump ever sticking.** Root cause is a layering mismatch: the mise binary lives at `/opt/mise/bin/mise` (image layer, baked by Dockerfile §4 from `https://mise.run`), while the volume `ops-share-mise` mounts only `/opt/mise/data` (tools, shims, plugins, cache). `mise self-update --yes` rewrites the binary in place, but the ephemeral container's `--rm` discards the writable layer on exit, so the next `ops run --update` starts again from the image-baked version and detects the same "new" upstream release. We considered three fixes — forcing `--no-rm` on `--update` (fragile across `ops clean`), extending the volume to `/opt/mise/bin` (breaks the "binary comes from the image" invariant and would require a migration of every existing `ops-share-mise` volume), or removing `mise self-update` from the agent_cmd entirely. The third option landed: the new `--update` runs only `mise upgrade --yes` (which writes under `/opt/mise/data/installs/...` and DOES persist via the volume) followed by `nix-collect-garbage -d`. Bumping the mise binary itself now requires `ops build`, which re-fetches `https://mise.run` (always serves latest) — documented in the rewritten `--update` help block in `ops.sh:641-646` and in an inline comment block at `ops.sh:3081-3093` so a future contributor cannot reintroduce the loop without first reading why it was removed. Regression guard: `tests/test_edge_cases.bats` `--update sets agent_cmd running mise upgrade + nix cleanup (no self-update)` now asserts the `mise self-update` substring is ABSENT from the dry-run output (the previous test asserted it was present — that assertion was inverted alongside this fix).
+
 ## [1.13.2] - 2026-05-06
 
 ### Fixed

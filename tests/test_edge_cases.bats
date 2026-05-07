@@ -197,12 +197,19 @@ EOF
     [[ "$output" == *"nix-collect-garbage"* ]]
 }
 
-@test "--update sets agent_cmd running mise + nix cleanup" {
+@test "--update sets agent_cmd running mise upgrade + nix cleanup (no self-update)" {
+    # `mise self-update` was removed deliberately: the mise binary lives in
+    # the image layer at /opt/mise/bin/mise, the ephemeral container's --rm
+    # wipes any in-place rewrite, and the next run starts again from the
+    # baked version — so self-update would loop forever (image stays on
+    # the old version, mise advertises the new release every run). To bump
+    # the binary, rebuild the image. Regression guard: the negative
+    # assertion below blocks any reintroduction of `mise self-update`.
     run env OPS_RUNTIME=docker "$(ops_sh)" run --update --dry-run
     [ "$status" -eq 0 ]
-    [[ "$output" == *"mise self-update"* ]]
     [[ "$output" == *"mise upgrade"* ]]
     [[ "$output" == *"nix-collect-garbage"* ]]
+    ! [[ "$output" == *"mise self-update"* ]]
 }
 
 @test "-h inside run triggers help and exits" {
