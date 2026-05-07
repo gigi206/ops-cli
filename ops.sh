@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.13.2"
+OPS_VERSION="1.13.3"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -638,7 +638,12 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
                             --opencode-desktop / --codex and with an explicit
                             command after \`--\`.
       --nix-cleanup         Run nix-collect-garbage -d inside the container
-      --update              Update mise and nix store inside the container
+      --update              Run \`mise upgrade\` + nix-collect-garbage inside
+                            the container. Does NOT self-update the mise
+                            binary itself — that lives in the image layer
+                            and is wiped by --rm. To bump the mise binary,
+                            re-run \`$(basename "$0") build\` (the Dockerfile
+                            installs the latest mise from https://mise.run).
       --no-mount-home       Do not bind-mount host \$HOME (default: mounted).
                             Agent volume bind-mounts (~/.claude, ~/.gemini,
                             ~/.local/share/opencode, ~/.codex) become active
@@ -3072,10 +3077,22 @@ cmd_run() {
             --no-cache)        build_extra_args+=(--no-cache);          shift ;;
             --no-rm)           ephemeral=0;                             shift ;;
             --nix-cleanup)     agent_cmd='HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d'; shift ;;
+            # Deliberately no `mise self-update` here. The mise binary
+            # lives at /opt/mise/bin/mise (image layer); the ephemeral
+            # container's --rm wipes any in-place rewrite, so a self-
+            # update would loop forever (image stays on the baked
+            # version, mise advertises the new release every run). To
+            # bump the binary, rebuild the image: `ops build` re-fetches
+            # https://mise.run, which always serves latest. The `mise
+            # upgrade` call below DOES persist — it writes under
+            # /opt/mise/data, which is volume-mounted (ops-share-mise).
+            # The agent_cmd string itself is kept short on purpose: it
+            # is echoed verbatim by --dry-run and asserted on by
+            # tests/test_edge_cases.bats (negative match on "mise self-
+            # update" — keep this comment OUTSIDE the string).
             --update)          agent_cmd='
-                echo -e "\033[1;34m==> mise self-update...\033[0m" && mise self-update --yes
-                echo -e "\033[1;34m==> mise upgrade...\033[0m"     && mise upgrade --yes
-                echo -e "\033[1;34m==> nix cleanup...\033[0m"      && HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d
+                echo -e "\033[1;34m==> mise upgrade...\033[0m" && mise upgrade --yes
+                echo -e "\033[1;34m==> nix cleanup...\033[0m"  && HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d
                 echo -e "\033[1;32m==> done\033[0m"
             '; shift ;;
             --claude)
