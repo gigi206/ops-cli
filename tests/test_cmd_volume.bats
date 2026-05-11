@@ -38,9 +38,9 @@ EOF
     assert_output_contains "ops-claude"
 }
 
-@test "volume list --agent restricts to per-agent credential volumes" {
+@test "volume list --app restricts to per-app credential volumes" {
     run env OPS_RUNTIME=docker MOCK_VOLUME_LIST="ops-share-nix,ops-share-mise,ops-claude,ops-gemini,ops-codex" \
-        "$(ops_sh)" volume list --agent
+        "$(ops_sh)" volume list --app
     assert_success
     assert_output_contains "ops-claude"
     assert_output_contains "ops-gemini"
@@ -49,9 +49,9 @@ EOF
     refute_output_contains "ops-share-mise"
 }
 
-@test "volume list --agents (alias) works the same way" {
+@test "volume list --apps (alias) works the same way" {
     run env OPS_RUNTIME=docker MOCK_VOLUME_LIST="ops-claude,ops-share-nix" \
-        "$(ops_sh)" volume list --agents
+        "$(ops_sh)" volume list --apps
     assert_success
     assert_output_contains "ops-claude"
     refute_output_contains "ops-share-nix"
@@ -67,7 +67,7 @@ EOF
     run env OPS_RUNTIME=docker "$(ops_sh)" volume
     assert_success
     assert_output_contains "list"
-    assert_output_contains "--agent"
+    assert_output_contains "--app"
 }
 
 @test "volume bogus subcommand errors" {

@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.13.3"
+OPS_VERSION="1.14.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -634,8 +634,7 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
       --install             Run \`mise install\` (from the workdir's mise.toml)
                             before the real command. Stand-alone gives you
                             an interactive bash after install; combinable
-                            with --claude / --gemini / --opencode /
-                            --opencode-desktop / --codex and with an explicit
+                            with --app <name> and with an explicit
                             command after \`--\`.
       --nix-cleanup         Run nix-collect-garbage -d inside the container
       --update              Run \`mise upgrade\` + nix-collect-garbage inside
@@ -645,7 +644,7 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
                             re-run \`$(basename "$0") build\` (the Dockerfile
                             installs the latest mise from https://mise.run).
       --no-mount-home       Do not bind-mount host \$HOME (default: mounted).
-                            Agent volume bind-mounts (~/.claude, ~/.gemini,
+                            App volume bind-mounts (~/.claude, ~/.gemini,
                             ~/.local/share/opencode, ~/.codex) become active
                             when this flag is used.
       --no-mount-volume     Do not mount the mise and nix volumes
@@ -663,41 +662,13 @@ $(basename "$0") run [OPTIONS] [COMMAND...]
       --no-wayland          Disable the auto Wayland socket forward (enabled
                             by default when \$WAYLAND_DISPLAY is set on the
                             host). X11 is not auto-forwarded (deprecated).
-      --no-claude-mount     Do not bind-mount ~/.claude (only meaningful with
-                            --no-mount-home)
-      --no-gemini-mount     Do not bind-mount ~/.gemini (only meaningful with
-                            --no-mount-home)
-      --no-opencode-mount   Do not bind-mount ~/.local/share/opencode (only
-                            meaningful with --no-mount-home)
-      --no-codex-mount      Do not bind-mount ~/.codex (only meaningful with
-                            --no-mount-home)
-      --claude              Run claude (install if missing)
-      --claude-mount        Bind-mount ~/.claude + ~/.claude.json (only
-                            meaningful with --no-mount-home)
-      --claude-volume       Use named Docker volume ops-claude for
-                            ~/.claude (isolated from host — works with or
-                            without --no-mount-home)
-      --gemini              Run gemini (install if missing)
-      --gemini-mount        Bind-mount ~/.gemini (only meaningful with
-                            --no-mount-home)
-      --gemini-volume       Use named Docker volume ops-gemini for ~/.gemini
-      --opencode            Run opencode (install npm:opencode-ai if missing)
-      --opencode-desktop    Run opencode-desktop GUI (Electron AppImage from
-                            sst/opencode releases, ~150 MB; uses
-                            --appimage-extract-and-run, no FUSE needed).
-                            Shares the ops-opencode state with --opencode;
-                            needs Wayland on the host (auto-forwarded
-                            unless --no-wayland) AND an image built with
-                            OPS_DESKTOP_DEPS=true (gtk3 / nss / mesa /
-                            alsa runtime libs — opt-in, see Dockerfile).
-      --opencode-mount      Bind-mount ~/.local/share/opencode + ~/.config/opencode
-                            (only meaningful with --no-mount-home)
-      --opencode-volume     Use named Docker volume ops-opencode for
-                            ~/.local/share/opencode
-      --codex               Run codex (install @openai/codex if missing)
-      --codex-mount         Bind-mount ~/.codex (only meaningful with
-                            --no-mount-home)
-      --codex-volume        Use named Docker volume ops-codex for ~/.codex
+      --app <name>        Run an AI CLI app inside the container (install
+                            if missing). Known apps: claude (Anthropic),
+                            gemini (Google), opencode (SST), opencode-desktop
+                            (Electron GUI, needs Wayland + OPS_DESKTOP_DEPS),
+                            codex (OpenAI). Per-app mount/volume options:
+                            --<app>-mount (bind-mount config), --<app>-volume
+                            (named Docker volume), --no-<app>-mount (disable).
   -h, --help                Show this help
 
   Auto-propagated host env vars (when set): ANTHROPIC_API_KEY,
@@ -1377,15 +1348,15 @@ EOF
 # array as a string"). With a bracketed index (e.g. `OPS_ALIASES[k]`)
 # the same key IS accepted because that's a single-entry update which
 # fits the same value-replace logic as a scalar.
-_OPS_CONFIG_ARRAY_KEYS=" OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES OPS_AGENT_FLAGS "
+_OPS_CONFIG_ARRAY_KEYS=" OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES OPS_APP_FLAGS "
 
 # Validate a key for `config set/get/unset`. Two accepted shapes:
 #   1. Scalar:  OPS_FOO        (matches ^OPS_[A-Z][A-Z0-9_]*$)
 #   2. Bracketed entry: OPS_ARRAY[index]   (the index can be any
-#      [a-zA-Z0-9_-]+ — covers profile names like `arch-min`, agent
+#      [a-zA-Z0-9_-]+ — covers profile names like `arch-min`, app
 #      names like `claude`, image keys like `arch_v2`, etc.).
 #
-# The bracketed form is needed for direct edits to `OPS_AGENT_FLAGS[<agent>]`,
+# The bracketed form is needed for direct edits to `OPS_APP_FLAGS[<app>]`,
 # `OPS_IMAGES[<key>]`, etc. without going through dedicated subcommands —
 # it lets `/ops-setup` and other automation drive the config file with
 # one consistent verb instead of growing a per-array helper for every
@@ -1772,7 +1743,7 @@ Subcommands (managed edits to \$_CONFIG_FILE — atomic, idempotent,
 preserve comments and ordering):
   set KEY VALUE              Set or replace OPS_KEY="VALUE". KEY accepts
                              both scalars (OPS_RUNTIME) and bracketed
-                             entries (OPS_AGENT_FLAGS[claude],
+                             entries (OPS_APP_FLAGS[claude],
                              OPS_IMAGES[debian]). Bracketed keys auto-
                              bootstrap 'declare -A <BASE>' when missing.
   get KEY                    Read KEY's literal value from ops.conf
@@ -1791,12 +1762,12 @@ preserve comments and ordering):
 Examples:
   ops config set OPS_RUNTIME docker
   ops config set OPS_DEFAULT_RUN_FLAGS "--no-rm --no-wayland"
-  ops config set 'OPS_AGENT_FLAGS[claude]' "--claude-volume --install"
+  ops config set 'OPS_APP_FLAGS[claude]' "--claude-volume --install"
   ops config set 'OPS_IMAGES[debian]' "localhost/ops-dev-debian"
   ops config get OPS_RUNTIME
-  ops config get 'OPS_AGENT_FLAGS[claude]'
-  ops config unset 'OPS_AGENT_FLAGS[claude]'
-  ops config alias add cc 'run --claude'
+  ops config get 'OPS_APP_FLAGS[claude]'
+  ops config unset 'OPS_APP_FLAGS[claude]'
+  ops config alias add cc 'run --app claude'
   ops config alias remove cc
   ops config secret add GITHUB_TOKEN --from-env
   ops config secret list
@@ -2011,7 +1982,7 @@ EOF
 
     echo -e "\n\033[1;34m=== Arrays ===\033[0m"
     local any_array=0
-    for v in OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES OPS_VOLUMES; do
+    for v in OPS_IMAGES OPS_DOCKERFILES OPS_CONTAINER_NAMES OPS_BUILD_ARGS OPS_ALIASES OPS_APP_FLAGS OPS_VOLUMES; do
         if declare -p "$v" >/dev/null 2>&1; then
             any_array=1
             origin="${_OPS_ORIGIN[$v]:-config}"
@@ -2639,38 +2610,40 @@ cmd_self_update() {
     cmd_install
 }
 
-# Emits extra argv tokens to inject AFTER consuming `--<agent>` from the
+# Emits extra argv tokens to inject AFTER consuming `--<app>` from the
 # user's argv. Two sources, both optional:
 #
 #   1. OPS_ISOLATION_PRESET=volume|fully-isolated
-#      → auto-add `--<agent>-volume` so the agent's credentials live in
-#        the named Docker volume `ops-<agent>` instead of the host's
-#        ~/.<agent>. Skipped when the user already pinned the per-agent
-#        mode via --<agent>-mount / --<agent>-volume / --no-<agent>-mount
-#        (which sets <agent>_agent ≠ "auto").
+#      → auto-add `--<app>-volume` so the app's credentials live in
+#        the named Docker volume `ops-<app>` instead of the host's
+#        ~/.<app>. Skipped when the user already pinned the per-app
+#        mode via --<app>-mount / --<app>-volume / --no-<app>-mount
+#        (which sets _app_state[$app] ≠ "auto").
 #
-#   2. OPS_AGENT_FLAGS[<agent>]="--no-rm --install"
-#      → user-defined flags appended to every `--<agent>` invocation.
+#   2. OPS_APP_FLAGS[<app>]="--no-rm --install"
+#      → user-defined flags appended to every `--app <name>` invocation.
 #
 # Output is whitespace-delimited (one token per word). The caller does
-# `set -- $(_agent_run_extras claude) "$@"` so the new tokens land at
+# `set -- $(_app_run_extras claude) "$@"` so the new tokens land at
 # the head of the remaining argv and are parsed by the next loop turn.
-_agent_run_extras() {
-    local agent="$1"
+# opencode-desktop is normalised to opencode for state lookup, matching
+# the parser-side normalisation in _match_app_flag.
+_app_run_extras() {
+    local app="$1" state_key="$1"
+    [ "$state_key" = "opencode-desktop" ] && state_key="opencode"
     case "${OPS_ISOLATION_PRESET:-host}" in
         volume|fully-isolated)
-            local var="${agent}_agent"
-            if [ "${!var:-auto}" = "auto" ]; then
-                printf '%s\n' "--${agent}-volume"
+            if [ "${_app_state[$state_key]:-auto}" = "auto" ]; then
+                printf '%s\n' "--${state_key}-volume"
             fi
             ;;
     esac
-    if declare -p OPS_AGENT_FLAGS >/dev/null 2>&1 && [ -n "${OPS_AGENT_FLAGS[$agent]:-}" ]; then
-        printf '%s\n' "${OPS_AGENT_FLAGS[$agent]}"
+    if declare -p OPS_APP_FLAGS >/dev/null 2>&1 && [ -n "${OPS_APP_FLAGS[$app]:-}" ]; then
+        printf '%s\n' "${OPS_APP_FLAGS[$app]}"
     fi
 }
 
-_agent_cmd() {
+_app_cmd() {
     local bin="$1" pkg="$2"
     # `command -v` (PATH lookup, ~0 ms) instead of `mise which` (~5–17 s
     # to boot the full mise toolset + plugin hooks) for the warm-path
@@ -2694,7 +2667,7 @@ _agent_cmd() {
     #     fresh container — not after a 10 s silent mise-which delay.
     #     Done in the same `||` arm so it only fires when an install
     #     actually runs (warm path stays silent).
-    #   - `clear` after install, before `exec`, so the agent's TUI
+    #   - `clear` after install, before `exec`, so the app's TUI
     #     starts in a clean terminal (mise's spinner / final `tools:`
     #     line / `gem sources` warning would otherwise remain in the
     #     scrollback above the TUI).
@@ -2706,7 +2679,7 @@ _agent_cmd() {
     # would also work but trips shellcheck SC2028.
     # `__ops_refresh_cache` (defined in /etc/ops-bashrc) regenerates the
     # bashrc shell-env cache after `mise use -g`. Without it, the next
-    # `./ops.sh run --<agent>` sees the bumped `/opt/mise/data/config/
+    # `./ops.sh run --<app>` sees the bumped `/opt/mise/data/config/
     # config.toml` mtime > cache mtime, runs `mise hook-env` for ~8 s,
     # and the user perceives a slow 2nd run before the cache stabilizes.
     # `hash -r` after the install block: when `command -v $bin` fails on
@@ -2815,28 +2788,37 @@ _mount_if_exists() {
     done
 }
 
-# Agent-flag dispatcher used by cmd_run's argv loop.
-# Recognised flags (X ∈ {claude, gemini, opencode, codex}):
-#   --no-X-mount  → ${X}_agent="off"
-#   --X-mount     → ${X}_agent="mount"
-#   --X-volume    → ${X}_agent="volume"
-# Returns 0 + sets the matching local in the caller's scope (dynamic
-# scoping makes ${X}_agent visible from here), 1 otherwise. Replaces 12
-# repetitive case-branches in cmd_run with a single dispatch line.
-_match_agent_flag() {
-    local flag="$1" agent state
+# Generic app-mount/volume flag parser used by cmd_run's argv loop.
+#   --no-<app>-mount  -> state="off"
+#   --<app>-mount     -> state="mount"
+#   --<app>-volume    -> state="volume"
+# Echoes "app|state" on match, returns 0; returns 1 if no match or
+# if the extracted app name is unknown.
+#
+# opencode-desktop is normalized to opencode: the GUI variant shares the
+# exact same config dirs as the terminal CLI (~/.local/share/opencode +
+# ~/.config/opencode), so --opencode-desktop-{mount,volume,no-mount}
+# behave as aliases for --opencode-{mount,volume,no-mount}. This also
+# prevents the double-mount that would happen if both apps were
+# applied separately in _apply_app_state.
+_match_app_flag() {
+    local flag="$1" app state
     case "$flag" in
-        --no-claude-mount|--no-gemini-mount|--no-opencode-mount|--no-codex-mount)
-            agent="${flag#--no-}"; agent="${agent%-mount}"; state="off" ;;
-        --claude-mount|--gemini-mount|--opencode-mount|--codex-mount)
-            agent="${flag#--}";    agent="${agent%-mount}"; state="mount" ;;
-        --claude-volume|--gemini-volume|--opencode-volume|--codex-volume)
-            agent="${flag#--}";    agent="${agent%-volume}"; state="volume" ;;
+        --no-*-mount)
+            app="${flag#--no-}"; app="${app%-mount}"; state="off" ;;
+        --*-mount)
+            app="${flag#--}";    app="${app%-mount}"; state="mount" ;;
+        --*-volume)
+            app="${flag#--}";    app="${app%-volume}"; state="volume" ;;
         *) return 1 ;;
     esac
-    # nameref into the caller's locals (claude_agent / gemini_agent / …).
-    local -n _agent_ref="${agent}_agent"
-    _agent_ref="$state"
+    # opencode-desktop shares state with opencode (same config dirs).
+    [ "$app" = "opencode-desktop" ] && app="opencode"
+    # Reject unknown apps.
+    if [ -z "${_OPS_APPS[$app]:-}" ]; then
+        return 1
+    fi
+    printf '%s|%s' "$app" "$state"
     return 0
 }
 
@@ -2918,9 +2900,9 @@ cmd_run() {
     # natively model. Forwarded verbatim to `<runtime> run` BEFORE the image
     # ref so docker/podman/nerdctl parse them as flags, not as command argv.
     local extra_runtime_flags=()
-    # Auto-propagate host secrets (GitHub PAT for rate-limited builds, agent
-    # API keys for authenticated --claude/--gemini/--codex without an
-    # explicit --xxx-mount flag). The list lives in _OPS_AUTO_PROPAGATED_ENVS
+    # Auto-propagate host secrets (GitHub PAT for rate-limited builds, app
+    # API keys for authenticated --app claude/gemini/codex without an
+    # explicit --<app>-mount flag). The list lives in _OPS_AUTO_PROPAGATED_ENVS
     # near _OPS_RESERVED — one source of truth, also consumed by `cmd_env`.
     # Silent no-op when the var is unset.
     local _ev
@@ -2933,28 +2915,25 @@ cmd_run() {
     local do_build=""
     local do_install=0
     local ephemeral=1
-    local agent_cmd=""
+    local app_cmd=""
     local dry_run=0
     # Defaults: bind-mount host $HOME into the container AND mount the
-    # shared mise/nix volumes. Agent config directories (~/.claude, ~/.gemini,
+    # shared mise/nix volumes. App config directories (~/.claude, ~/.gemini,
     # ~/.local/share/opencode, ~/.codex) are reachable transitively via the
     # $HOME bind-mount — no explicit bind-mount or named volume needed.
-    # Per-agent state (claude_agent/gemini_agent/...) controls the override:
-    # --no-mount-home → explicit bind-mount, --$agent-volume → named volume.
+    # Per-app state (_app_state[claude]/_app_state[gemini]/...) controls
+    # the override: --no-mount-home → explicit bind-mount, --$app-volume → named volume.
     local mount_home=1
     local mount_volume=1
     local use_nix_volume=1
     local use_mise_volume=1
-    # Per-agent tri-state: "auto" | "mount" | "volume" | "off".
+    # Per-app tri-state: "auto" | "mount" | "volume" | "off".
     #   auto   — visible via $HOME bind-mount (mount_home=1), or auto
-    #            bind-mount of ~/.${agent} if it exists (mount_home=0)
-    #   mount  — explicit bind-mount from host (--${agent}-mount)
-    #   volume — named Docker volume ops-${agent} (--${agent}-volume)
-    #   off    — disabled (--no-${agent}-mount)
-    local claude_agent="auto"
-    local gemini_agent="auto"
-    local opencode_agent="auto"
-    local codex_agent="auto"
+    #            bind-mount of ~/.${app} if it exists (mount_home=0)
+    #   mount  — explicit bind-mount from host (--${app}-mount)
+    #   volume — named Docker volume ops-${app} (--${app}-volume)
+    #   off    — disabled (--no-${app}-mount)
+    declare -A _app_state=()
     # Shared by default (one nix store / mise data dir for all containers).
     # --isolated-volumes switches to per-container volumes
     # ($OPS_CONTAINER_NAME-nix, $OPS_CONTAINER_NAME-mise).
@@ -2965,19 +2944,19 @@ cmd_run() {
     # missing). --no-wayland disables this. X11 is NOT auto-forwarded —
     # wire it manually via -v /tmp/.X11-unix and -e DISPLAY if you need it.
     local wayland_auto=1
-    # Auto-forward the host D-Bus session bus for full-fat GUI agents
-    # (currently only --opencode-desktop). Electron/Chromium reads the
+    # Auto-forward the host D-Bus session bus for full-fat GUI apps
+    # (currently only --app opencode-desktop). Electron/Chromium reads the
     # `org.freedesktop.portal.Settings` interface over this bus to get
     # the user's color-scheme (light/dark) preference, and gsettings /
     # dconf clients connect here for GTK theme resolution. Without it
     # the GUI is stuck on the light theme regardless of the host setting,
     # plus the startup is polluted by `dconf-CRITICAL: unable to create
     # directory /run/user/<uid>/dconf` spam (because dconf can't reach
-    # the bus). Off by default — flipped on by individual agent branches
+    # the bus). Off by default — flipped on by individual app branches
     # in the parser below. Trade-off: forwarding the session bus exposes
     # the entire host session API to the container (notifications,
     # secret service, screen recording portal, …); it's worth it for the
-    # GUI agents the user explicitly opted into via the dedicated flag,
+    # GUI apps the user explicitly opted into via the dedicated flag,
     # not for plain `ops run` shells.
     local dbus_session_auto=0
     # trust_workdir=1 injects MISE_TRUSTED_CONFIG_PATHS=$PWD so mise activates
@@ -2986,13 +2965,13 @@ cmd_run() {
     # ops.conf). The CLI flag --no-trust-workdir is the per-invocation
     # opt-out; set OPS_TRUST_WORKDIR=0 to opt out globally.
     local trust_workdir="${OPS_TRUST_WORKDIR:-1}"
-    # Scratch buffer for agent flag extras emitted by _agent_run_extras.
-    # Reused across each --<agent> branch in the parsing loop below.
+    # Scratch buffer for app flag extras emitted by _app_run_extras.
+    # Reused across each --<app> branch in the parsing loop below.
     local _extras=""
 
     # OPS_ISOLATION_PRESET (host|volume|isolated|fully-isolated): a coarse-
-    # grained dial that maps to per-agent state + mount_home. Per-agent
-    # auto-volume happens in _agent_run_extras when each --<agent> flag is
+    # grained dial that maps to per-app state + mount_home. Per-app
+    # auto-volume happens in _app_run_extras when each --<app> flag is
     # parsed; the global mount_home=0 toggle for {isolated, fully-isolated}
     # happens here so it's stable regardless of argv order.
     case "${OPS_ISOLATION_PRESET:-host}" in
@@ -3013,12 +2992,16 @@ cmd_run() {
         set -- $OPS_DEFAULT_RUN_FLAGS "$@"
     fi
 
+    local _match_result _app_name _app_state_val
     while [ $# -gt 0 ]; do
-        # Per-agent {mount,volume,off} flags share a single dispatcher
-        # (12 case-branches collapsed into one). The helper sets
-        # ${X}_agent via dynamic scoping; if it didn't match, fall through
-        # to the case below.
-        if _match_agent_flag "$1"; then shift; continue; fi
+        # Per-app {mount,volume,off} flags share a single dispatcher
+        # (12 case-branches collapsed into one). The helper echoes
+        # "app|state" on match, which we decode into _app_state[].
+        if _match_result=$(_match_app_flag "$1"); then
+            IFS='|' read -r _app_name _app_state_val <<< "$_match_result"
+            _app_state["$_app_name"]="$_app_state_val"
+            shift; continue
+        fi
         case "$1" in
             --no-trust-workdir)   trust_workdir=0;         shift ;;
             --no-mount-home)      mount_home=0;            shift ;;
@@ -3076,7 +3059,7 @@ cmd_run() {
             --install)         do_install=1;                            shift ;;
             --no-cache)        build_extra_args+=(--no-cache);          shift ;;
             --no-rm)           ephemeral=0;                             shift ;;
-            --nix-cleanup)     agent_cmd='HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d'; shift ;;
+            --nix-cleanup)     app_cmd='HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d'; shift ;;
             # Deliberately no `mise self-update` here. The mise binary
             # lives at /opt/mise/bin/mise (image layer); the ephemeral
             # container's --rm wipes any in-place rewrite, so a self-
@@ -3086,170 +3069,32 @@ cmd_run() {
             # https://mise.run, which always serves latest. The `mise
             # upgrade` call below DOES persist — it writes under
             # /opt/mise/data, which is volume-mounted (ops-share-mise).
-            # The agent_cmd string itself is kept short on purpose: it
+            # The app_cmd string itself is kept short on purpose: it
             # is echoed verbatim by --dry-run and asserted on by
             # tests/test_edge_cases.bats (negative match on "mise self-
             # update" — keep this comment OUTSIDE the string).
-            --update)          agent_cmd='
+            --update)          app_cmd='
                 echo -e "\033[1;34m==> mise upgrade...\033[0m" && mise upgrade --yes
                 echo -e "\033[1;34m==> nix cleanup...\033[0m"  && HOME=/opt/nix-home /opt/ops/lib/nix-collect-garbage -d
                 echo -e "\033[1;32m==> done\033[0m"
             '; shift ;;
-            --claude)
-                agent_cmd="$(_agent_cmd claude npm:@anthropic-ai/claude-code)"
-                shift
-                _extras=$(_agent_run_extras claude)
-                # shellcheck disable=SC2086  # intentional word split for tokens
-                [ -n "$_extras" ] && set -- $_extras "$@"
-                ;;
-            --claude-mount)    claude_agent="mount";   shift ;;
-            --gemini)
-                agent_cmd="$(_agent_cmd gemini npm:@google/gemini-cli)"
-                shift
-                _extras=$(_agent_run_extras gemini)
-                # shellcheck disable=SC2086
-                [ -n "$_extras" ] && set -- $_extras "$@"
-                ;;
-            --gemini-mount)    gemini_agent="mount";   shift ;;
-            --opencode)
-                agent_cmd="$(_agent_cmd opencode npm:opencode-ai)"
-                shift
-                _extras=$(_agent_run_extras opencode)
-                # shellcheck disable=SC2086
-                [ -n "$_extras" ] && set -- $_extras "$@"
-                ;;
-            --opencode-desktop)
-                # Electron GUI variant of opencode. We pull the prebuilt
-                # AppImage that upstream publishes on every GitHub release
-                # (sst/opencode), via mise's `github:` backend with an
-                # asset_pattern filter — this avoids the 15-min Tauri Rust
-                # rebuild that nixpkgs would otherwise force on every cold
-                # cache (and which produces an outdated Tauri build anyway,
-                # because upstream switched to Electron mid-1.x).
-                #
-                # Three things this branch deliberately does differently
-                # from `_agent_cmd`, which is why we inline the bash-c
-                # snippet instead of calling that helper:
-                #
-                # 1. The mise tool spec uses bracket options
-                #    (`[asset_pattern=…]`) which are bash glob characters.
-                #    We single-quote the spec inside the emitted command
-                #    so `bash -c` doesn't try to expand them as a pattern
-                #    against the cwd.
-                #
-                # 2. The shimmed binary keeps the `.AppImage` suffix
-                #    (mise's `github:` backend uses the asset filename as
-                #    the on-disk and shim name; we accepted it rather than
-                #    fighting mise to rename it).
-                #
-                # 3. AppImages need libfuse2 to mount themselves at run
-                #    time, plus CAP_SYS_ADMIN + /dev/fuse exposed to the
-                #    container. We refuse all three on isolation grounds
-                #    (SYS_ADMIN ≈ root inside the namespace; widens the
-                #    container escape surface considerably). Instead we
-                #    EXTRACT the AppImage's embedded squashfs once, cache
-                #    the extracted tree at $HOME/.cache/opencode-desktop/
-                #    <fingerprint>/squashfs-root/, and exec the bundled
-                #    AppRun from there on every launch.
-                #
-                #    The earlier approach was `--appimage-extract-and-run`
-                #    on every launch — that costs ~1–2 s of squashfs
-                #    extraction per `ops run` AND ~150 MB of /tmp tmpfs
-                #    write churn per launch (tmpfs is RAM-backed, the
-                #    write is "free" but the I/O is real). Caching the
-                #    extraction sidesteps both costs at the price of one
-                #    extra step in this branch and ~150 MB of disk inside
-                #    $HOME/.cache (bind-mounted from the host by default,
-                #    so the cache survives `--rm` containers naturally).
-                #
-                #    Cache invalidation rides on a sha256-truncated hash
-                #    of the resolved AppImage path that mise hands back.
-                #    When `mise upgrade` rotates the asset to a newer
-                #    version, the path changes (mise installs side-by-
-                #    side under /opt/mise/data/installs/...), the hash
-                #    changes, the cached squashfs-root is missed, and we
-                #    re-extract. We `rm -rf` the entire cache parent dir
-                #    before extracting so an old cache cannot accumulate
-                #    — disk usage stays bounded to ~150 MB total. We
-                #    resolve the path through `mise which`, which works
-                #    against the shim and the bracket-options syntax in
-                #    one shot; `command -v` would only return the shim
-                #    script itself, whose `readlink -f` does NOT chase
-                #    through to the AppImage.
-                #
-                #    APPDIR pre-set on the exec line: opencode-desktop
-                #    ships a custom AppRun bash wrapper (NOT the standard
-                #    AppImageKit AppRun) that, when APPDIR is unset, tries
-                #    to deduce it by walking up from $0 until it finds
-                #    "$1" as a regular file. With our flags ("--no-sandbox"
-                #    is $1), the walk never matches anything, APPDIR ends
-                #    up empty, and BIN resolves to /@opencode-aidesktop —
-                #    a path under root that does not exist, so AppRun
-                #    bails with "/@opencode-aidesktop: No such file".
-                #    Pre-setting APPDIR=$extracted skips the broken auto-
-                #    detect entirely; AppRun then exports PATH/
-                #    LD_LIBRARY_PATH/XDG_DATA_DIRS/GSETTINGS_SCHEMA_DIR
-                #    relative to the cache and execs $APPDIR/@opencode-
-                #    aidesktop with our flags.
-                #
-                # Image-level prerequisite: the Electron AppImage links
-                # against ~21 system libs (libnspr4, libnss3, libgtk-3,
-                # libgbm, libasound, libcups, plus the X11/at-spi/cairo/
-                # pango set pulled transitively by gtk3). The headless
-                # baseline does NOT ship them — opt in by rebuilding with
-                # OPS_DESKTOP_DEPS=true (see Dockerfile §1b). Without it
-                # the AppImage exits with `error while loading shared
-                # libraries: libnspr4.so` and similar; we don't pre-flight
-                # the check here because the user already gets a clear
-                # ld.so error pointing at the missing lib.
-                #
-                # `--no-sandbox`: Chromium's setuid sandbox helper
-                # (`chrome-sandbox` inside the AppImage) requires
-                # `chown root:root + chmod 4755` to work, which the
-                # unprivileged container user cannot grant — the helper
-                # then FATALs with "The SUID sandbox helper binary was
-                # found, but is not configured correctly. Rather than run
-                # without sandboxing I'm aborting now". Passing
-                # `--no-sandbox` to Electron is the canonical workaround
-                # for Electron-in-container (Puppeteer / Playwright /
-                # every Electron CI image does this). Trade-off accepted:
-                # the container boundary is the security perimeter we
-                # already trust, the Chromium internal sandbox is
-                # redundant in that context. The flag goes BEFORE `"$@"`
-                # so user-supplied trailing args still flow through.
-                #
-                # `--ozone-platform=wayland --enable-features=UseOzonePlatform`:
-                # Electron's default Ozone backend on Linux is X11, even
-                # when WAYLAND_DISPLAY is set. ops.sh forwards the Wayland
-                # socket (see the auto-forward block ~150 lines down) but
-                # does NOT forward an X11 display, so the bare AppImage
-                # exits with `Missing X server or $DISPLAY / The platform
-                # failed to initialize. Exiting.`. We initially tried
-                # `--ozone-platform-hint=auto` (the cleanest choice on
-                # paper) but Chromium kept loading the X11 backend on the
-                # opencode-desktop v1.14.39 Electron build — observed
-                # empirically: `[ERROR:ozone_platform_x11.cc:256] Missing
-                # X server` despite both --ozone-platform-hint=auto AND
-                # WAYLAND_DISPLAY/XDG_RUNTIME_DIR/socket bind-mount being
-                # present in the dry-run. Switching to the explicit
-                # `--ozone-platform=wayland` plus `--enable-features=
-                # UseOzonePlatform` (the older, pre-hint incantation) is
-                # what actually pins Chromium to the Wayland Ozone
-                # backend on this version. Trade-off: a hypothetical X11
-                # user would now need to override the flag manually
-                # (`./ops.sh run --opencode-desktop -- --ozone-platform=x11`,
-                # since trailing args after `--` flow through to the
-                # binary). Acceptable — we prioritise the common case.
-                #
-                # Shared state with the terminal CLI: same _agent_run_extras
-                # call as `--opencode` so `--opencode-mount` / -volume /
-                # --no-opencode-mount continue to drive
-                # ~/.local/share/opencode + ~/.config/opencode for both
-                # frontends. Sessions stay coherent.
-                agent_cmd="
+            --app)
+                # Generic app launcher. Name is the next argv token.
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --app requires an app name. Known: ${!_OPS_APPS[*]} opencode-desktop" >&2
+                    exit 1
+                fi
+                local _bin _pkg
+                _app_name="$2"
+                if [ -n "${_OPS_APPS[$_app_name]:-}" ]; then
+                    IFS='|' read -r _bin _pkg <<< "${_OPS_APPS[$_app_name]}"
+                    app_cmd="$(_app_cmd "$_bin" "$_pkg")"
+                elif [ "$_app_name" = "opencode-desktop" ]; then
+                    # Electron GUI -- extracted AppImage, Wayland Ozone.
+                    app_cmd="\
 target=\$(mise which opencode-desktop.AppImage 2>/dev/null)
 if [ -z \"\$target\" ]; then
-    printf '\\033[1;34m==> Installing %s (first run, ~150 MB download)...\\033[0m\\n' opencode-desktop >&2
+    printf '\033[1;34m==> Installing %s (first run, ~150 MB download)...\033[0m\n' opencode-desktop >&2
     mise use -g 'github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]'
     __ops_refresh_cache
     target=\$(mise which opencode-desktop.AppImage)
@@ -3258,33 +3103,31 @@ fi
 fp=\$(printf '%s' \"\$target\" | sha256sum | cut -c1-16)
 extracted=\"\$HOME/.cache/opencode-desktop/\$fp/squashfs-root\"
 if [ ! -x \"\$extracted/AppRun\" ]; then
-    printf '\\033[1;34m==> Extracting opencode-desktop (one-time, cached for next launches)...\\033[0m\\n' >&2
+    printf '\033[1;34m==> Extracting opencode-desktop (one-time, cached for next launches)...\033[0m\n' >&2
     rm -rf \"\$HOME/.cache/opencode-desktop\"
     mkdir -p \"\$(dirname \"\$extracted\")\"
     (cd \"\$(dirname \"\$extracted\")\" && \"\$target\" --appimage-extract >/dev/null)
 fi
 APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform=wayland --enable-features=UseOzonePlatform \"\$@\"
 "
-                # Theme detection (light/dark) + dconf access need the
-                # host's D-Bus session bus inside the container. Set the
-                # flag here; the actual --volume + --env wiring happens
-                # in the auto-forward block alongside the Wayland one
-                # so the dry-run output is grouped logically.
-                dbus_session_auto=1
-                shift
-                _extras=$(_agent_run_extras opencode)
-                # shellcheck disable=SC2086
+                    dbus_session_auto=1
+                else
+                    echo "Error: unknown app '$_app_name'. Known: ${!_OPS_APPS[*]} opencode-desktop" >&2
+                    exit 1
+                fi
+                shift 2
+                _extras=$(_app_run_extras "$_app_name")
+                # shellcheck disable=SC2086  # intentional word split for tokens
                 [ -n "$_extras" ] && set -- $_extras "$@"
                 ;;
-            --opencode-mount)  opencode_agent="mount"; shift ;;
-            --codex)
-                agent_cmd="$(_agent_cmd codex npm:@openai/codex)"
-                shift
-                _extras=$(_agent_run_extras codex)
-                # shellcheck disable=SC2086
-                [ -n "$_extras" ] && set -- $_extras "$@"
-                ;;
-            --codex-mount)     codex_agent="mount";    shift ;;
+            # Deprecated per-app launch flags (v1.14.0) — retained for
+            # backwards compatibility, rewrite themselves as --app <name>
+            # so the canonical dispatcher above handles all the logic.
+            --claude)           set -- --app claude "$@";           continue ;;
+            --gemini)           set -- --app gemini "$@";           continue ;;
+            --opencode)         set -- --app opencode "$@";         continue ;;
+            --opencode-desktop) set -- --app opencode-desktop "$@"; continue ;;
+            --codex)            set -- --app codex "$@";            continue ;;
             --dry-run)         dry_run=1; shift ;;
             --env-file)        extra_envs+=(--env-file "$2"); shift 2 ;;
             -e|--env)          extra_envs+=(--env "$2"); shift 2 ;;
@@ -3298,22 +3141,22 @@ APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform
 
     # --install: run `mise install` (from the workdir's mise.toml) before the
     # real command. Three cases, depending on what else was asked:
-    #   1. an agent_cmd is already set (e.g. --claude / --update)
-    #        → chain: `mise install && (agent_cmd)`
+    #   1. an app_cmd is already set (e.g. --app claude / --update)
+    #        → chain: `mise install && (app_cmd)`
     #   2. an explicit command was given after `--`
     #        → chain: `mise install && exec "$@"`
     #   3. no command at all (plain `ops run --install`)
     #        → chain: `mise install && exec bash`  (interactive shell after install)
-    # The `set -- bash -c "$agent_cmd" _ "$@"` line below then hands it off to
+    # The `set -- bash -c "$app_cmd" _ "$@"` line below then hands it off to
     # the container in a single exec-friendly form.
     if [ "$do_install" = 1 ]; then
-        if [ -n "$agent_cmd" ]; then
-            agent_cmd="mise install --yes && { $agent_cmd; }"
+        if [ -n "$app_cmd" ]; then
+            app_cmd="mise install --yes && { $app_cmd; }"
         elif [ $# -gt 0 ]; then
             # shellcheck disable=SC2016  # "$@" is evaluated INSIDE the container's bash -c
-            agent_cmd='mise install --yes && exec "$@"'
+            app_cmd='mise install --yes && exec "$@"'
         else
-            agent_cmd="mise install --yes && exec bash --rcfile /etc/ops-bashrc"
+            app_cmd="mise install --yes && exec bash --rcfile /etc/ops-bashrc"
         fi
     fi
 
@@ -3321,7 +3164,7 @@ APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform
     # --update, --nix-cleanup, or a user-supplied `--` command with --install)
     # inherit PATH/PYTHONPATH/... from the workdir's mise.toml + flake.nix.
     # The rcfile is idempotent (guarded on $- and OPS_BASHRC_DONE).
-    [ -n "$agent_cmd" ] && set -- bash -c "source /etc/ops-bashrc; $agent_cmd" _ "$@"
+    [ -n "$app_cmd" ] && set -- bash -c "source /etc/ops-bashrc; $app_cmd" _ "$@"
 
     # Compute --user AFTER flag parsing so -u/-g CLI overrides take effect.
     local user_arg
@@ -3543,7 +3386,7 @@ APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform
     fi
 
     # Apply high-level flags.
-    # mount_home=1 bind-mounts host $HOME into the container. Agent configs
+    # mount_home=1 bind-mounts host $HOME into the container. App configs
     # become visible transitively via the bind-mount.
     if [ "$mount_home" = 1 ]; then
         extra_volumes+=("$HOME:$HOME_IN_CTN")
@@ -3579,43 +3422,60 @@ APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform
         extra_volumes+=("$SCRIPT_DIR/mise:/opt/ops/mise-plugin/nix:ro")
     fi
 
-    # Per-agent state machine (auto / mount / volume / off).
+    # Per-app state machine (auto / mount / volume / off).
     # First path after primary_dest is the "primary" source dir — its
     # container-side mapping (primary_dest) is also where the named volume
     # is attached when "volume" state is selected.
     # Relies on dynamic scoping: inherits mount_home + extra_volumes from
     # cmd_run (same pattern as _mount_if_exists).
-    _apply_agent_state() {
-        local state="$1" agent="$2" primary_dest="$3"
+    _apply_app_state() {
+        local state="$1" app="$2" primary_dest="$3"
         shift 3
         local paths=("$@")
-        local agent_vol="ops-${agent}"
-        # --isolated-volumes: agent configs are per-container too, matching the
-        # mise/nix volume naming (${OPS_CONTAINER_NAME}-${agent}).
-        [ "$isolated_volumes" = 1 ] && agent_vol="${OPS_CONTAINER_NAME}-${agent}"
+        local app_vol="ops-${app}"
+        # --isolated-volumes: app configs are per-container too, matching the
+        # mise/nix volume naming (${OPS_CONTAINER_NAME}-${app}).
+        [ "$isolated_volumes" = 1 ] && app_vol="${OPS_CONTAINER_NAME}-${app}"
         case "$state" in
             auto)
-                # mount_home=1: agent config visible via $HOME bind-mount.
-                # mount_home=0: auto bind-mount ~/.<agent> if it exists.
+                # mount_home=1: app config visible via $HOME bind-mount.
+                # mount_home=0: auto bind-mount ~/.<app> if it exists.
                 [ "$mount_home" = 0 ] && _mount_if_exists "${paths[@]}"
                 ;;
             mount)
                 _mount_if_exists "${paths[@]}"
                 [ "$mount_home" = 1 ] && \
-                    echo "Warning: --${agent}-mount is redundant when \$HOME is bind-mounted (default). Pass --no-mount-home to make it meaningful." >&2
+                    echo "Warning: --${app}-mount is redundant when \$HOME is bind-mounted (default). Pass --no-mount-home to make it meaningful." >&2
                 ;;
             volume)
-                ensure_volume "$agent_vol"
-                extra_volumes+=("${agent_vol}:${primary_dest}")
+                ensure_volume "$app_vol"
+                extra_volumes+=("${app_vol}:${primary_dest}")
                 ;;
             off)
                 ;;
         esac
     }
-    _apply_agent_state "$claude_agent"   claude   "$HOME_IN_CTN/.claude"                   "$HOME/.claude" "$HOME/.claude.json"
-    _apply_agent_state "$gemini_agent"   gemini   "$HOME_IN_CTN/.gemini"                   "$HOME/.gemini"
-    _apply_agent_state "$opencode_agent" opencode "$HOME_IN_CTN/.local/share/opencode"     "$HOME/.local/share/opencode" "$HOME/.config/opencode"
-    _apply_agent_state "$codex_agent"    codex    "$HOME_IN_CTN/.codex"                    "$HOME/.codex"
+    # Iterate over all known apps to apply mount/volume/off state from
+    # the _app_state array. opencode-desktop is intentionally NOT in
+    # the loop: it shares the opencode config dirs, and iterating both
+    # would emit duplicate --volume entries (Docker rejects them).
+    local _state _paths _primary _rest _hp
+    local -a _host_paths _parts
+    for _app_name in "${!_OPS_APPS[@]}"; do
+        _state="${_app_state[$_app_name]:-auto}"
+        if ! _paths=$(_app_config_paths "$_app_name"); then
+            continue
+        fi
+        _primary="${_paths%%|*}"
+        _rest="${_paths#*|}"
+        _host_paths=()
+        while IFS='|' read -ra _parts; do
+            for _hp in "${_parts[@]}"; do
+                [ -n "$_hp" ] && _host_paths+=("$_hp")
+            done
+        done <<< "$_rest"
+        _apply_app_state "$_state" "$_app_name" "$_primary" "${_host_paths[@]}"
+    done
 
     # Build args for the shepherd PID 1 (the long-lived placeholder
     # process that keeps the container alive across multiple sessions).
@@ -3675,7 +3535,7 @@ APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform
         args+=(--env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
     fi
     # Auto-forward the D-Bus session bus + desktop env vars when an
-    # agent flag opted in (currently --opencode-desktop sets
+    # app flag opted in (currently --opencode-desktop sets
     # dbus_session_auto=1; see the dedicated comment block at the top of
     # cmd_run for the security rationale). Strips the "unix:path=" prefix
     # that systemd-style addresses use so the bind-mount source/dest
@@ -3908,12 +3768,12 @@ List user-defined aliases from \$_CONFIG_FILE. Two forms are supported:
 
   String aliases (OPS_ALIASES associative array):
     declare -A OPS_ALIASES=(
-      [ml]="run -i localhost/ml-dev -v /data:/data --claude"
+      [ml]="run -i localhost/ml-dev -v /data:/data --app claude"
       [web]="run -p 3000:3000 -p 5173:5173"
     )
 
   Function aliases (ops_alias_<name>, must echo the argv):
-    ops_alias_dev() { echo run -i arch --claude; }
+    ops_alias_dev() { echo run -i arch --app claude; }
 
 Reserved names are ignored: built-in subcommands cannot be shadowed
 (run, build, runtime, status, info, logs, log, clean, nerdctl, doctor,
@@ -4015,7 +3875,7 @@ EOF
     # (e.g. MISTRAL_API_KEY, HUGGINGFACE_TOKEN) via `config secret add`,
     # and they need to know whether ops run forwards them. Spoiler: it
     # doesn't. The auto-propagation list is intentionally narrow (one
-    # entry per officially-supported agent + GITHUB_TOKEN); adding a
+    # entry per officially-supported app + GITHUB_TOKEN); adding a
     # custom one means either passing it ad-hoc with `-e KEY=VAL` /
     # `--env-file`, or contributing the name upstream so ops run picks
     # it up automatically.
@@ -4061,27 +3921,27 @@ EOF
 # `ops volume list` — listing of ops-labelled volumes (label ops.volume=true).
 # Subcommand kept narrow on purpose: deeper plumbing belongs to
 # `ops runtime volume …` (raw runtime proxy). The point of `ops volume`
-# is to give users a curated view that matches ops semantics (per-agent
+# is to give users a curated view that matches ops semantics (per-app
 # volumes, ops-share-* defaults, isolated volumes).
 cmd_volume() {
     local sub="${1:-}"
     case "$sub" in
         list|ls)
             shift
-            local agents_only=0
+            local apps_only=0
             while [ $# -gt 0 ]; do
                 case "$1" in
-                    --agent|--agents) agents_only=1; shift ;;
+                    --app|--apps) apps_only=1; shift ;;
                     -h|--help)
                         cat <<EOF
-Usage: $(basename "$0") volume list [--agent]
+Usage: $(basename "$0") volume list [--app]
 
 List ops-managed Docker volumes (filter: label=ops.volume=true).
 
-  --agent  Only show per-agent credential volumes (ops-claude,
+  --app  Only show per-app credential volumes (ops-claude,
            ops-gemini, ops-opencode, ops-codex).
 
-Without --agent, all ops-* volumes are listed (including the shared
+Without --app, all ops-* volumes are listed (including the shared
 ops-share-nix / ops-share-mise defaults and any per-container volumes
 created by --isolated-volumes).
 EOF
@@ -4096,7 +3956,7 @@ EOF
             local name
             while IFS= read -r name; do
                 [ -z "$name" ] && continue
-                if [ "$agents_only" = 1 ]; then
+                if [ "$apps_only" = 1 ]; then
                     case "$name" in
                         ops-claude|ops-gemini|ops-opencode|ops-codex)
                             printf '%s\n' "$name"
@@ -4115,7 +3975,7 @@ Usage: $(basename "$0") volume <subcommand>
 Inspect ops-managed volumes (filter: label=ops.volume=true).
 
 Subcommands:
-  list [--agent]   List ops volumes (optionally restricted to per-agent
+  list [--app]   List ops volumes (optionally restricted to per-app
                    credential volumes: ops-claude, ops-gemini, …)
 
 Raw operations (rm, inspect, etc.) are not exposed here yet — use
@@ -4177,12 +4037,35 @@ _OPS_RESERVED=" nerdctl build runtime status info logs log clean run help -h --h
 # Indexed array (not associative) because we need iteration order to
 # match between the diagnostic output and the help block. Bash 4
 # associative array iteration is implementation-defined.
+# App registry: name | binary|npm_package
+# Used by --app <name> to install and run apps on demand.
+declare -A _OPS_APPS=(
+    [claude]="claude|npm:@anthropic-ai/claude-code"
+    [gemini]="gemini|npm:@google/gemini-cli"
+    [opencode]="opencode|npm:opencode-ai"
+    [codex]="codex|npm:@openai/codex"
+)
+
+# Resolve config paths for an app (container-side primary + host sources).
+# opencode-desktop is not handled here: _match_app_flag normalizes it
+# to opencode upstream so the GUI variant shares state with the CLI.
+_app_config_paths() {
+    local app="$1" ctn_home="$HOME_IN_CTN" host_home="$HOME"
+    case "$app" in
+        claude)   printf '%s' "$ctn_home/.claude|$host_home/.claude|$host_home/.claude.json" ;;
+        gemini)   printf '%s' "$ctn_home/.gemini|$host_home/.gemini" ;;
+        opencode) printf '%s' "$ctn_home/.local/share/opencode|$host_home/.local/share/opencode|$host_home/.config/opencode" ;;
+        codex)    printf '%s' "$ctn_home/.codex|$host_home/.codex" ;;
+        *)        return 1 ;;
+    esac
+}
+
 _OPS_AUTO_PROPAGATED_ENVS=(GITHUB_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY)
 declare -A _OPS_AUTO_PROPAGATED_DESC=(
     [GITHUB_TOKEN]="Lifts GitHub API rate limit during builds"
-    [ANTHROPIC_API_KEY]="Used by --claude"
-    [OPENAI_API_KEY]="Used by --codex"
-    [GEMINI_API_KEY]="Used by --gemini"
+    [ANTHROPIC_API_KEY]="Used by --app claude"
+    [OPENAI_API_KEY]="Used by --app codex"
+    [GEMINI_API_KEY]="Used by --app gemini"
 )
 
 # Expand a user-defined alias ($1 = name). Echoes the expanded argv to stdout
@@ -4218,7 +4101,7 @@ _OPS_IMAGE_KEY=""
 # Parse the leading -n / -i / -f / -H global flags and leave the remaining
 # args in the array _parsed_args. Called once on the main argv and a second
 # time after alias expansion (aliases may prepend global flags like
-# OPS_ALIASES[cc]="-i arch run --claude").
+# OPS_ALIASES[cc]="-i arch run --app claude").
 _parse_global_flags() {
     _parsed_args=()
     while [ $# -gt 0 ]; do
@@ -4311,7 +4194,7 @@ fi
 if _alias_expansion=$(_expand_alias "${1:-}"); then
     shift
     # Re-parse global flags: the alias may have prepended -i / -n / -f / -H
-    # (e.g., OPS_ALIASES[cc]="-i arch run --claude"). Without this pass
+    # (e.g., OPS_ALIASES[cc]="-i arch run --app claude"). Without this pass
     # those flags land in the subcommand dispatcher as unknown args.
     # shellcheck disable=SC2086  # intentional word split: alias tokens come from OPS_ALIASES
     _parse_global_flags $_alias_expansion "$@"

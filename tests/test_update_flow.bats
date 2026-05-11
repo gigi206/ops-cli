@@ -14,7 +14,7 @@ setup() {
     ensure_dockerfile
     # Default cmdline.user label for all tests in this file (cmd_update reads
     # it to emit the `relaunch:` hint).
-    export MOCK_CLI_USER="./ops.sh run --claude"
+    export MOCK_CLI_USER="./ops.sh run --app claude"
 }
 
 @test "update: image unchanged (same ID) reports no-op" {

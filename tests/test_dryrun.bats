@@ -69,8 +69,8 @@ _unescape() {
     [[ "$norm" == *"mise install --yes "*"exec bash"* ]]
 }
 
-@test "run --install combined with --claude chains before the agent command" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --install --claude --dry-run
+@test "run --install combined with --app claude chains before the app command" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --install --app claude --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unquote "$output")"
     [[ "$norm" == *"mise install --yes "* ]]
@@ -126,30 +126,30 @@ _unescape() {
     [[ "$output" == *"/host/path:/ctn/path"* ]]
 }
 
-@test "run --claude builds agent command" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --claude --dry-run
+@test "run --app claude builds app command" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"mise"* ]]
     [[ "$output" == *"claude"* ]]
     [[ "$output" == *"@anthropic-ai/claude-code"* ]]
 }
 
-@test "run --codex builds agent command" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --codex --dry-run
+@test "run --app codex builds app command" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app codex --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"codex"* ]]
     [[ "$output" == *"@openai/codex"* ]]
 }
 
-@test "run --gemini builds agent command" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --gemini --dry-run
+@test "run --app gemini builds app command" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app gemini --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"gemini"* ]]
     [[ "$output" == *"@google/gemini-cli"* ]]
 }
 
-@test "run --opencode builds agent command" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+@test "run --app opencode builds app command" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"opencode"* ]]
     [[ "$output" == *"opencode-ai"* ]]
@@ -175,8 +175,8 @@ _unescape() {
 #     `opencode-desktop.AppImage`) — we exec the AppRun bundled inside
 #     the extracted squashfs-root, which gives instant startup on the
 #     warm path.
-@test "run --opencode-desktop pulls Electron AppImage via github backend" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode-desktop --dry-run
+@test "run --app opencode-desktop pulls Electron AppImage via github backend" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode-desktop --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]"* ]]
@@ -188,14 +188,14 @@ _unescape() {
     [[ "$norm" == *'APPDIR="$extracted" exec "$extracted/AppRun"'* ]]
 }
 
-@test "run --opencode-desktop caches the extracted squashfs under \$HOME/.cache/opencode-desktop/" {
+@test "run --app opencode-desktop caches the extracted squashfs under \$HOME/.cache/opencode-desktop/" {
     # Regression guard: the cache path uses a sha256-truncated fingerprint
     # of the resolved AppImage path so that `mise upgrade` (which moves the
     # asset side-by-side under /opt/mise/data/installs/...) naturally
     # invalidates the cache without manual purge. Anything that drops the
     # fingerprint and falls back to a single static path would mean a stale
     # squashfs-root keeping the old version alive after an upgrade.
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode-desktop --dry-run
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode-desktop --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *'$HOME/.cache/opencode-desktop/$fp/squashfs-root'* ]]
@@ -208,49 +208,49 @@ _unescape() {
 # launch (see CHANGELOG / commit history). The fix was to switch to
 # the regular npm package `npm:opencode-ai`. If anyone reverts that
 # switch, this test fails loudly.
-@test "run --opencode uses npm:opencode-ai (NOT github:sst/opencode)" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+@test "run --app opencode uses npm:opencode-ai (NOT github:sst/opencode)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"npm:opencode-ai"* ]]
     [[ "$norm" != *"github:sst/opencode"* ]]
 }
 
-# Regression guard: _agent_cmd uses `command -v $bin` (PATH lookup, ~0 ms)
+# Regression guard: _app_cmd uses `command -v $bin` (PATH lookup, ~0 ms)
 # for the warm-path resolution, NOT `mise which` (which boots the full
 # mise toolset, ~5–17 s, and would re-trigger the nix plugin's MiseEnv
-# hook on every agent launch). Switching opencode from the Bun
+# hook on every app launch). Switching opencode from the Bun
 # single-binary to `npm:opencode-ai` removed the constraint that forced
-# us back to `mise which` previously. One @test per agent so a regression
-# on a single branch of _agent_cmd's `case "$pkg" in npm:*) ... ;; *)
+# us back to `mise which` previously. One @test per app so a regression
+# on a single branch of _app_cmd's `case "$pkg" in npm:*) ... ;; *)
 # ... ;; esac` surfaces clearly. `_unescape` strips the printf '%q'
 # backslash-escapes so we match the semantic command line.
-@test "run --claude uses 'command -v claude' (not 'mise which')" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --claude --dry-run
+@test "run --app claude uses 'command -v claude' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"command -v claude"* ]]
     [[ "$norm" != *"mise which claude"* ]]
 }
 
-@test "run --gemini uses 'command -v gemini' (not 'mise which')" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --gemini --dry-run
+@test "run --app gemini uses 'command -v gemini' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app gemini --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"command -v gemini"* ]]
     [[ "$norm" != *"mise which gemini"* ]]
 }
 
-@test "run --opencode uses 'command -v opencode' (not 'mise which')" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+@test "run --app opencode uses 'command -v opencode' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"command -v opencode"* ]]
     [[ "$norm" != *"mise which opencode"* ]]
 }
 
-@test "run --codex uses 'command -v codex' (not 'mise which')" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --codex --dry-run
+@test "run --app codex uses 'command -v codex' (not 'mise which')" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app codex --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"command -v codex"* ]]
@@ -263,8 +263,8 @@ _unescape() {
 # `opencode-ai` (was `github:sst/opencode`, the Bun single-binary
 # variant — switched because the bundled Bun watcher binding fails to
 # extract on cold container start, hanging the TUI).
-@test "agent commands keep 'mise use -g' fallback after 'command -v'" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+@test "app commands keep 'mise use -g' fallback after 'command -v'" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"|| { printf "* ]]
@@ -272,11 +272,11 @@ _unescape() {
 }
 
 # UX guard: cold-path install can take ~1 min (download + extract). To
-# avoid the user staring at a silent terminal, _agent_cmd emits an
+# avoid the user staring at a silent terminal, _app_cmd emits an
 # "==> Installing $bin …" notice on stderr BEFORE `mise use -g`. The
-# stderr destination (>&2) keeps the agent's stdout clean for piping.
-@test "agent cold-path install prints an 'Installing …' notice on stderr" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+# stderr destination (>&2) keeps the app's stdout clean for piping.
+@test "app cold-path install prints an 'Installing …' notice on stderr" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
@@ -285,11 +285,11 @@ _unescape() {
 
 # UX guard: after `mise use -g` writes its install spinner / progress /
 # "tools:" line to the TTY, we `clear` the screen before exec'ing the
-# agent. Without it, the agent's TUI would start with mise's output
+# app. Without it, the app's TUI would start with mise's output
 # still in the scrollback above it. `2>/dev/null || true` keeps the
 # chain alive if `clear` is somehow missing (rare, defensive).
-@test "agent cold-path install runs 'clear' before exec" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+@test "app cold-path install runs 'clear' before exec" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"; clear 2>/dev/null || true; }"* ]]
@@ -297,20 +297,20 @@ _unescape() {
 
 # Perf guard: after `mise use -g` bumps /opt/mise/data/config/config.toml,
 # the bashrc cache becomes stale. If we don't regen it inside this same
-# run, the NEXT `./ops.sh run --<agent>` will trigger `mise hook-env`
-# (~8 s cold) before reaching the agent. Calling __ops_refresh_cache
+# run, the NEXT `./ops.sh run --<app>` will trigger `mise hook-env`
+# (~8 s cold) before reaching the app. Calling __ops_refresh_cache
 # (defined in /etc/ops-bashrc) here amortizes that cost into the
 # already-slow cold install.
-@test "agent cold-path install regenerates the bashrc cache via __ops_refresh_cache" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+@test "app cold-path install regenerates the bashrc cache via __ops_refresh_cache" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"; __ops_refresh_cache; clear 2>/dev/null"* ]]
 }
 
-@test "agent cold-path: claude (npm) also notices + clears" {
+@test "app cold-path: claude (npm) also notices + clears" {
     # Same UX guard on the npm:* branch of the case.
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --claude --dry-run
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
@@ -319,11 +319,11 @@ _unescape() {
 }
 
 # Coverage parity: gemini and codex must get the same UX (notif + clear
-# + cache refresh) — otherwise a regression on _agent_cmd's npm:*
-# branch could silently break one agent without the other tests
+# + cache refresh) — otherwise a regression on _app_cmd's npm:*
+# branch could silently break one app without the other tests
 # catching it.
-@test "agent cold-path: gemini (npm) notices + clears + refreshes cache" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --gemini --dry-run
+@test "app cold-path: gemini (npm) notices + clears + refreshes cache" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app gemini --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
@@ -331,8 +331,8 @@ _unescape() {
     [[ "$norm" == *"; __ops_refresh_cache; clear 2>/dev/null || true; }"* ]]
 }
 
-@test "agent cold-path: codex (npm) notices + clears + refreshes cache" {
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --codex --dry-run
+@test "app cold-path: codex (npm) notices + clears + refreshes cache" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app codex --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"Installing %s (first run, this may take a minute)"* ]]
@@ -343,13 +343,13 @@ _unescape() {
 # Notice + clear must NOT appear in the warm path (they live inside the
 # `||` arm that only runs when `command -v` fails). Negative test
 # ensures we don't accidentally emit the install banner on every launch.
-@test "agent warm path does NOT print Installing notice" {
+@test "app warm path does NOT print Installing notice" {
     # The Installing string only appears INSIDE the install branch — the
     # outer command line still contains it (rendered by --dry-run), but
     # we can verify the install branch is gated behind `command -v … ||
     # {`. Concretely: the literal `command -v $bin >/dev/null 2>&1 ||`
     # precedes the `printf 'Installing'` call.
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --opencode --dry-run
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app opencode --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unescape "$output")"
     [[ "$norm" == *"command -v opencode >/dev/null 2>&1 || { printf"* ]]
@@ -404,13 +404,13 @@ _unescape() {
     [[ "$norm" == *"exec bash --rcfile /etc/ops-bashrc"* ]]
 }
 
-@test "run --claude wraps agent_cmd with source /etc/ops-bashrc" {
-    # Agent wrappers (claude/gemini/opencode/codex/update/nix-cleanup) run via
+@test "run --app claude wraps app_cmd with source /etc/ops-bashrc" {
+    # App wrappers (claude/gemini/opencode/codex/update/nix-cleanup) run via
     # `bash -c`, which is non-interactive and therefore ignores --rcfile. We
-    # source /etc/ops-bashrc explicitly at the top of agent_cmd so the agent
+    # source /etc/ops-bashrc explicitly at the top of app_cmd so the app
     # inherits PATH / PYTHONPATH / ... from mise env (mise-nix plugin picks
     # up the workdir's flake.nix devShell when [env] _.nix = true is set).
-    run env OPS_RUNTIME=docker "$(ops_sh)" run --claude --dry-run
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --dry-run
     [ "$status" -eq 0 ]
     norm="$(_unquote "$output")"
     [[ "$norm" == *"source /etc/ops-bashrc"* ]]
@@ -418,7 +418,7 @@ _unescape() {
 }
 
 @test "run --install -- CMD wraps with source /etc/ops-bashrc" {
-    # --install without an agent flag but WITH a user command after `--`
+    # --install without an app flag but WITH a user command after `--`
     # still goes through the bash -c wrapper, so the same source prefix
     # applies and the user's CMD inherits the flake env.
     run env OPS_RUNTIME=docker "$(ops_sh)" run --install --dry-run -- pytest -k smoke
@@ -429,8 +429,8 @@ _unescape() {
     [[ "$norm" == *"pytest"* ]]
 }
 
-@test "run -- CMD without agent_cmd bypasses the bash -c wrapper" {
-    # Bare `run -- CMD` (no --install, no agent flag) forwards "$@" directly
+@test "run -- CMD without app_cmd bypasses the bash -c wrapper" {
+    # Bare `run -- CMD` (no --install, no app flag) forwards "$@" directly
     # to the container runtime. No bash -c wrapper is built, therefore no
     # /etc/ops-bashrc source prefix is injected — the Dockerfile's ENV PATH
     # already covers the baseline mise + nix shims, and flake activation is

@@ -10,16 +10,16 @@ setup() {
     mock_runtime docker
 }
 
-@test "default run disables named agent volumes (overlap with HOME bind-mount)" {
+@test "default run disables named app volumes (overlap with HOME bind-mount)" {
     mkdir -p "$HOME/.claude"
     run env OPS_RUNTIME=docker "$(ops_sh)" run --dry-run
     [ "$status" -eq 0 ]
-    # mount_home=1 by default → agent bind-mounts of ~/.claude etc. are
+    # mount_home=1 by default → app bind-mounts of ~/.claude etc. are
     # skipped (redundant with the $HOME bind-mount)
     [[ "$output" != *"$HOME/.claude:"* ]]
 }
 
-# Agent-volume tests run with --no-mount-home so the agent bind-mount logic
+# App-volume tests run with --no-mount-home so the app bind-mount logic
 # is actually exercised (otherwise the $HOME bind-mount would make those
 # bind-mounts redundant and auto-disabled).
 
@@ -191,13 +191,13 @@ EOF
     [[ "$output" == *"Runtime: nerdctl"* ]]
 }
 
-@test "--nix-cleanup sets agent_cmd for nix GC" {
+@test "--nix-cleanup sets app_cmd for nix GC" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --nix-cleanup --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"nix-collect-garbage"* ]]
 }
 
-@test "--update sets agent_cmd running mise upgrade + nix cleanup (no self-update)" {
+@test "--update sets app_cmd running mise upgrade + nix cleanup (no self-update)" {
     # `mise self-update` was removed deliberately: the mise binary lives in
     # the image layer at /opt/mise/bin/mise, the ephemeral container's --rm
     # wipes any in-place rewrite, and the next run starts again from the

@@ -5,9 +5,10 @@
 # activation) + base dev tools (git, gh, ripgrep, jq, ast-grep, node@lts).
 # google-chrome is NOT in the baseline — opt-in via EXTRA_MISE_TOOLS (see
 # the "Build-time tools" section in README for the chrome-devtools-mcp setup
-# example). CLI agents (claude-code, gemini-cli, opencode, codex) are NOT
-# baked — they are installed on demand by ops.sh when you pass --claude /
-# --gemini / --opencode / --codex, and persist in the ops-share-mise volume.
+# example). CLI apps (claude-code, gemini-cli, opencode, codex) are NOT
+# baked — they are installed on demand by ops.sh when you pass --app claude /
+# --app gemini / --app opencode / --app codex, and persist in the
+# ops-share-mise volume.
 # Add extra tools (terraform, ngrok, google-chrome, …) via:
 #   ops config set 'OPS_BUILD_ARGS[default]' \
 #     'EXTRA_MISE_TOOLS=nix:terraform nix:google-chrome'
@@ -33,7 +34,7 @@
 #   OPS_DESKTOP_DEPS=true|false                                Opt-in Electron GUI runtime libs
 #                                                              (gtk3 / nss / nspr / mesa /
 #                                                              alsa-lib / libcups). Required only
-#                                                              for `ops run --opencode-desktop`.
+#                                                              for `--app opencode-desktop`.
 #                                                              Default: false. Adds ~80–120 MB.
 #
 # Build secret (passed only in-process, never baked into image layers):
@@ -65,16 +66,6 @@ FROM archlinux:base
 # Enable `pipefail` for every RUN so piped commands fail loudly instead of
 # silently ignoring the producer's exit code (hadolint DL4006).
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-# Standard OCI labels — read by Docker Hub / GHCR / Podman Desktop / `image
-# inspect`. `ops.dockerfile` (set at build time by ops.sh, not here) carries
-# the wrapper-specific info; these annotations cover the registry-standard
-# fields. Values with ${VAR} come from ARGs declared below FROM so BuildKit
-# substitutes them at build time without affecting the image layers.
-LABEL org.opencontainers.image.title="ops-dev" \
-      org.opencontainers.image.description="Containerized development environment with mise + Nix + AI CLI agents (Claude Code, Gemini, OpenCode, Codex). Arch Linux base." \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.authors="Ghislain LE MEUR"
 
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -119,23 +110,6 @@ ARG EXTRA_MISE_TOOLS=""
 # OPS_DESKTOP_DEPS=false (default) bakes a ~50-byte "skipped" marker; a
 # build with OPS_DESKTOP_DEPS=true rebuilds only that layer onward.
 ARG OPS_DESKTOP_DEPS=false
-
-# OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md).
-# Only SOURCE_URL is exposed: it lets `docker inspect` consumers walk back to
-# the project's homepage. `version` was dropped because it duplicated
-# OPS_VERSION (already returned by `ops --version`) and `revision` because it
-# was empty unless CI explicitly stamped it. Override SOURCE_URL at build
-# time with --build-arg for forks / vendor builds, or set OPS_SOURCE_URL=""
-# to suppress the labels entirely.
-ARG SOURCE_URL="https://github.com/gigi206/ops-cli"
-
-# Second LABEL block: references the ARG above (required to be declared
-# BEFORE any LABEL that expands ${VAR}). Empty ARG results in empty label
-# values — acceptable per the OCI spec, and trivially filtered out by
-# consumers.
-LABEL org.opencontainers.image.source="${SOURCE_URL}" \
-      org.opencontainers.image.url="${SOURCE_URL}" \
-      org.opencontainers.image.documentation="${SOURCE_URL}"
 
 # -----------------------------------------------------------------------------
 # 1. System packages + locales — see docs/dockerfile-design.md §1
@@ -344,6 +318,28 @@ COPY --chown=root:root --chmod=755 scripts/_nix-cli-wrapper.sh /opt/ops/bin/nix
 RUN for cmd in nix-env nix-channel nix-store nix-collect-garbage; do \
         sudo ln -sf /opt/ops/bin/_nix-wrapper /opt/ops/bin/"$cmd"; \
     done
+
+# -----------------------------------------------------------------------------
+# OCI image metadata — placed last to keep the build cache warm
+# -----------------------------------------------------------------------------
+# Every LABEL is its own cache layer, and changing a single LABEL value —
+# even a purely textual edit to the description — invalidates the cache of
+# every instruction that follows. Keeping the labels at the very end means
+# doc-only releases (renames, wording fixes, source-URL changes for a fork)
+# rebuild only the ~0-byte LABEL layer and reuse the costly mise/Nix install
+# layers above. `ops.dockerfile` (set at build time by ops.sh, not here)
+# carries the wrapper-specific info; these annotations cover the registry-
+# standard fields. Override SOURCE_URL via `--build-arg` for forks / vendor
+# builds, or set OPS_SOURCE_URL="" to suppress the source/url/documentation
+# labels.
+ARG SOURCE_URL="https://github.com/gigi206/ops-cli"
+LABEL org.opencontainers.image.title="ops-dev" \
+      org.opencontainers.image.description="Containerized development environment with mise + Nix + AI CLI apps (Claude Code, Gemini, OpenCode, Codex). Arch Linux base." \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.authors="Ghislain LE MEUR" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.url="${SOURCE_URL}" \
+      org.opencontainers.image.documentation="${SOURCE_URL}"
 
 # -----------------------------------------------------------------------------
 # 7. Entrypoint

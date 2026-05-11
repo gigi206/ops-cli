@@ -193,30 +193,30 @@ EOF
 
 @test "config alias add creates declare -A + entry on fresh file" {
     [ ! -f "$OPS_CONF" ]
-    run "$(ops_sh)" config alias add cc 'run --claude'
+    run "$(ops_sh)" config alias add cc 'run --app claude'
     assert_success
     grep -qE '^[[:space:]]*declare[[:space:]]+-A[[:space:]]+OPS_ALIASES' "$OPS_CONF"
-    grep -q '^OPS_ALIASES\[cc\]="run --claude"$' "$OPS_CONF"
+    grep -q '^OPS_ALIASES\[cc\]="run --app claude"$' "$OPS_CONF"
 }
 
 @test "config alias add does not duplicate declare -A on existing config" {
     cat > "$OPS_CONF" <<'EOF'
 declare -A OPS_ALIASES
-OPS_ALIASES[cc]="run --claude"
+OPS_ALIASES[cc]="run --app claude"
 EOF
-    run "$(ops_sh)" config alias add gg 'run --gemini'
+    run "$(ops_sh)" config alias add gg 'run --app gemini'
     assert_success
     [ "$(grep -c 'declare -A OPS_ALIASES' "$OPS_CONF")" = "1" ]
-    grep -q '^OPS_ALIASES\[cc\]="run --claude"$' "$OPS_CONF"
-    grep -q '^OPS_ALIASES\[gg\]="run --gemini"$' "$OPS_CONF"
+    grep -q '^OPS_ALIASES\[cc\]="run --app claude"$' "$OPS_CONF"
+    grep -q '^OPS_ALIASES\[gg\]="run --app gemini"$' "$OPS_CONF"
 }
 
 @test "config alias add is idempotent — same name+argv no-op" {
-    "$(ops_sh)" config alias add cc 'run --claude'
+    "$(ops_sh)" config alias add cc 'run --app claude'
     local hash1
     hash1=$(sha256sum "$OPS_CONF" | cut -d' ' -f1)
     sleep 0.1
-    run "$(ops_sh)" config alias add cc 'run --claude'
+    run "$(ops_sh)" config alias add cc 'run --app claude'
     assert_success
     local hash2
     hash2=$(sha256sum "$OPS_CONF" | cut -d' ' -f1)
@@ -224,10 +224,10 @@ EOF
 }
 
 @test "config alias add replaces existing entry with new argv" {
-    "$(ops_sh)" config alias add cc 'run --claude'
-    run "$(ops_sh)" config alias add cc 'run --claude --no-rm'
+    "$(ops_sh)" config alias add cc 'run --app claude'
+    run "$(ops_sh)" config alias add cc 'run --app claude --no-rm'
     assert_success
-    grep -q '^OPS_ALIASES\[cc\]="run --claude --no-rm"$' "$OPS_CONF"
+    grep -q '^OPS_ALIASES\[cc\]="run --app claude --no-rm"$' "$OPS_CONF"
     [ "$(grep -c '^OPS_ALIASES\[cc\]=' "$OPS_CONF")" = "1" ]
 }
 
@@ -258,26 +258,26 @@ EOF
 # ---- config alias remove -----------------------------------------------------
 
 @test "config alias remove deletes the entry" {
-    "$(ops_sh)" config alias add cc 'run --claude'
+    "$(ops_sh)" config alias add cc 'run --app claude'
     run "$(ops_sh)" config alias remove cc
     assert_success
     ! grep -q '^OPS_ALIASES\[cc\]=' "$OPS_CONF"
 }
 
 @test "config alias remove is idempotent" {
-    "$(ops_sh)" config alias add cc 'run --claude'
+    "$(ops_sh)" config alias add cc 'run --app claude'
     "$(ops_sh)" config alias remove cc
     run "$(ops_sh)" config alias remove cc
     assert_success
 }
 
 @test "config alias remove preserves other entries" {
-    "$(ops_sh)" config alias add cc 'run --claude'
-    "$(ops_sh)" config alias add gg 'run --gemini'
+    "$(ops_sh)" config alias add cc 'run --app claude'
+    "$(ops_sh)" config alias add gg 'run --app gemini'
     run "$(ops_sh)" config alias remove cc
     assert_success
     ! grep -q '^OPS_ALIASES\[cc\]=' "$OPS_CONF"
-    grep -q '^OPS_ALIASES\[gg\]="run --gemini"$' "$OPS_CONF"
+    grep -q '^OPS_ALIASES\[gg\]="run --app gemini"$' "$OPS_CONF"
 }
 
 @test "config alias remove on nonexistent file succeeds" {

@@ -3,10 +3,10 @@
 # - #18: build with trailing cmd args must not inject them into `docker build`
 # - #22: `run -- --` passes the second -- as a container arg
 # - #23: PWD under HOME must not duplicate/crash the bind-mount set
-# - #24: OPS_USER_NAME ≠ invoking user remaps agent bind-mount destinations
+# - #24: OPS_USER_NAME ≠ invoking user remaps app bind-mount destinations
 # - #20: cmd_clean interactive y-path invokes prune/rm
 # - #17: -H change during the same invocation picks up rootless re-detection
-# - isolated-volumes extension to agent configs
+# - isolated-volumes extension to app configs
 
 load helpers
 
@@ -98,11 +98,11 @@ EOF
     [[ "$output" == *"Runtime: nerdctl"* ]]
 }
 
-@test "#6 (code): --isolated-volumes also isolates agent volumes" {
+@test "#6 (code): --isolated-volumes also isolates app volumes" {
     run env OPS_RUNTIME=docker OPS_CONTAINER_NAME=myctn \
         "$(ops_sh)" run --isolated-volumes --claude-volume --dry-run
     [ "$status" -eq 0 ]
-    # With isolation, the agent volume is named ${OPS_CONTAINER_NAME}-${agent}
+    # With isolation, the app volume is named ${OPS_CONTAINER_NAME}-${app}
     [[ "$output" == *"myctn-claude:"* ]]
     # Default shared name must NOT be used
     [[ "$output" != *"ops-claude:"* ]]

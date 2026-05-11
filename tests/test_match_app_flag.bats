@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
-# Per-agent flag dispatcher (`_match_agent_flag`): the helper that collapsed
+# Per-app flag dispatcher (`_match_app_flag`): the helper that collapsed
 # the 12 case-branches of `--{claude,gemini,opencode,codex}-{mount,volume}`
-# / `--no-X-mount` into a single nameref-based dispatch. Tests assert the
-# observable effect of each flag combination through the --dry-run path.
+# / `--no-X-mount` into a single generic parser that consults `_OPS_APPS`.
+# Tests assert the observable effect of each flag combination through the
+# --dry-run path.
 #
 # We rely on visible side-effects in the dry-run rendering:
 #   --no-X-mount → off    : NO ops-X named volume, NO bind-mount of ~/.X
@@ -83,14 +84,16 @@ setup() {
 }
 
 # ---- opencode-desktop (Electron GUI) ------------------------------------
-# Design decision: --opencode-desktop deliberately reuses the SAME state
-# volume as --opencode (~/.local/share/opencode + ~/.config/opencode) so
-# sessions stay coherent between the terminal CLI and the desktop app.
-# The dispatcher therefore must NOT mint a separate `ops-opencode-desktop`
-# volume — if anyone splits the state in the future this test fires.
-@test "--opencode-desktop --opencode-volume reuses ops-opencode (no ops-opencode-desktop volume)" {
+# Design decision: --app opencode-desktop deliberately reuses the SAME
+# state volume as --app opencode (~/.local/share/opencode + ~/.config/
+# opencode) so sessions stay coherent between the terminal CLI and the
+# desktop app. The dispatcher therefore must NOT mint a separate
+# `ops-opencode-desktop` volume — if anyone splits the state in the
+# future this test fires. The normalisation lives in `_match_app_flag`
+# (opencode-desktop → opencode) so a single _app_state entry is set.
+@test "--app opencode-desktop --opencode-volume reuses ops-opencode (no ops-opencode-desktop volume)" {
     run env OPS_RUNTIME=docker "$(ops_sh)" \
-        run --no-mount-home --opencode-volume --opencode-desktop --dry-run
+        run --no-mount-home --opencode-volume --app opencode-desktop --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"ops-opencode:"* ]]
     [[ "$output" != *"ops-opencode-desktop:"* ]]
@@ -105,7 +108,7 @@ setup() {
 # We test under DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/test-bus with a
 # real socket file so the `[ -S … ]` precondition passes; the assertion
 # checks the resulting --env line in the dry-run.
-@test "--opencode-desktop forwards DBUS_SESSION_BUS_ADDRESS when a session bus exists" {
+@test "--app opencode-desktop forwards DBUS_SESSION_BUS_ADDRESS when a session bus exists" {
     socket="$BATS_TEST_TMPDIR/test-bus"
     # bats provides BATS_TEST_TMPDIR; fall back to mktemp for older bats.
     [ -z "$socket" ] && socket="$(mktemp -u)"
@@ -116,7 +119,7 @@ setup() {
     run env OPS_RUNTIME=docker \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$socket" \
         XDG_CURRENT_DESKTOP="ubuntu:GNOME" \
-        "$(ops_sh)" run --opencode-desktop --dry-run
+        "$(ops_sh)" run --app opencode-desktop --dry-run
     rm -f "$socket"
     [ "$status" -eq 0 ]
     [[ "$output" == *"DBUS_SESSION_BUS_ADDRESS=unix:path=$socket"* ]]
@@ -124,7 +127,7 @@ setup() {
     [[ "$output" == *"XDG_CURRENT_DESKTOP=ubuntu:GNOME"* ]]
 }
 
-# Negative side: plain `ops run` (no --opencode-desktop) must NOT
+# Negative side: plain `ops run` (no --app opencode-desktop) must NOT
 # auto-mount the session bus. The bus exposes notifications, secrets,
 # screen recording portal — surface we don't want in shells that
 # didn't ask for the GUI flow.
@@ -143,7 +146,7 @@ setup() {
     [[ "$output" != *"$socket:$socket"* ]]
 }
 
-# ---- multiple agents at once -------------------------------------------
+# ---- multiple apps at once -------------------------------------------
 
 @test "--claude-volume + --gemini-volume both injected" {
     run env OPS_RUNTIME=docker "$(ops_sh)" \

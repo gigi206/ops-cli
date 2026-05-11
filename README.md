@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml)
 
-Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI agents (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, ripgrep, jq, ast-grep, gh). Add more (google-chrome, terraform, ngrok, …) via `ops config set 'OPS_BUILD_ARGS[<key>]' 'EXTRA_MISE_TOOLS=…'`.
+Shell wrapper around **docker / podman / nerdctl** that provides a ready-to-use development container, with AI apps (Claude Code, Gemini, OpenCode, Codex), mise + Nix (via the mise-nix plugin), and standard tooling (git, ripgrep, jq, ast-grep, gh). Add more (google-chrome, terraform, ngrok, …) via `ops config set 'OPS_BUILD_ARGS[<key>]' 'EXTRA_MISE_TOOLS=…'`.
 
 The goal: a single entry point (`ops.sh`) to build, run, debug and update the environment, regardless of the underlying container runtime.
 
@@ -32,7 +32,7 @@ The goal: a single entry point (`ops.sh`) to build, run, debug and update the en
 
 **Inside the container**
 - [Nix tooling (mise-nix plugin)](#nix-tooling-mise-nix-plugin)
-- [AI CLI agents](#ai-cli-agents)
+- [AI CLI apps](#ai-cli-apps)
 - [Named volumes `ops-*`](#named-volumes-ops-)
 - [Labels](#labels)
 
@@ -97,22 +97,22 @@ In `~/.bashrc` or `~/.zshrc`:
 # The wrapper itself
 alias ops='~/Documents/ops-cli/ops.sh'
 
-# One alias per AI agent — type `claude` instead of `ops run --claude`
-alias claude='ops run --claude'
-alias gemini='ops run --gemini'
-alias opencode='ops run --opencode'
-alias codex='ops run --codex'
+# One alias per AI app — type `claude` instead of `ops run --app claude`
+alias claude='ops run --app claude'
+alias gemini='ops run --app gemini'
+alias opencode='ops run --app opencode'
+alias codex='ops run --app codex'
 ```
 
 Reload the shell (`exec $SHELL`), then:
 
 ```bash
-claude                    # → ops run --claude → container with Claude Code
-gemini -p "summarize"     # extra args flow through to the agent
-claude --no-rm            # flags before the agent args still parse as ops flags
+claude                    # → ops run --app claude → container with Claude Code
+gemini -p "summarize"     # extra args flow through to the app
+claude --no-rm            # flags before the app args still parse as ops flags
 ```
 
-See [AI CLI agents → Shell shortcuts](#shell-shortcuts) for the full alias matrix (shell alias vs ops alias) and trade-offs.
+See [AI CLI apps → Shell shortcuts](#shell-shortcuts) for the full alias matrix (shell alias vs ops alias) and trade-offs.
 
 ### Step 4 — (optional) persistent config
 
@@ -142,7 +142,7 @@ Downloads nerdctl-full, verifies the SHA256, extracts it into `~/.local/share/op
 ./ops.sh                        # enter the dev container (auto-build if the image is missing)
 ./ops.sh run -- uname -a        # run `uname -a` inside the container
 ./ops.sh build                  # (re-)build the image
-./ops.sh --claude               # launch Claude Code in the container
+./ops.sh --app claude         # launch Claude Code in the container
 ./ops.sh status                 # status: image, container, volumes, services
 ./ops.sh clean                  # purge dangling images + stopped containers + ops-* volumes
 ```
@@ -159,10 +159,10 @@ Downloads nerdctl-full, verifies the SHA256, extracts it into `~/.local/share/op
 | `runtime ARGS...` | Proxy directly to the runtime binary (e.g. `ops.sh runtime ps -a`) |
 | `status` \| `info` | Show the state: services, images (default + profiles + labelled), labelled volumes, containers (name, image, coloured state, cmd, ops cli, real cli, mounts) |
 | `inspect KEY` | Detailed info for an `OPS_IMAGES` key, a container name, or a raw image reference |
-| `config` | Dumps the effective config (all `OPS_*` scalars + arrays) with origin (env/config/default). With a subcommand, performs managed edits to `ops.conf`: `config set/get/unset KEY [VALUE]` for scalars OR bracketed entries (`OPS_AGENT_FLAGS[claude]`, `OPS_IMAGES[debian]`, …); `config alias add/remove NAME [argv...]` for `OPS_ALIASES[]`; `config secret add/list/remove NAME` for tokens (chmod 600 enforced; values never echoed by `list`). All edits are atomic (mktemp + mv) and idempotent; bracketed keys auto-bootstrap `declare -A <BASE>` when missing. |
+| `config` | Dumps the effective config (all `OPS_*` scalars + arrays) with origin (env/config/default). With a subcommand, performs managed edits to `ops.conf`: `config set/get/unset KEY [VALUE]` for scalars OR bracketed entries (`OPS_APP_FLAGS[claude]`, `OPS_IMAGES[debian]`, …); `config alias add/remove NAME [argv...]` for `OPS_ALIASES[]`; `config secret add/list/remove NAME` for tokens (chmod 600 enforced; values never echoed by `list`). All edits are atomic (mktemp + mv) and idempotent; bracketed keys auto-bootstrap `declare -A <BASE>` when missing. |
 | `doctor [--fix]` | Validates config consistency: `OPS_IMAGES`/dockerfiles/`ops.dockerfile` labels, dangling entries, orphan containers (missing image) and mismatches (container on an image ≠ its profile's). Non-zero return code if warnings. `--fix` adds a `Suggested fixes` section with the concrete commands to address each warning (suggestions only — nothing is auto-executed). |
 | `env` | Dumps the four auto-propagated env vars (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) with `[set]`/`[unset]` status and `origin: shell\|config\|both`. Values are never printed — output is safe to share. |
-| `volume list [--agent]` | Lists ops-managed volumes (filter `label=ops.volume=true`). `--agent` restricts to per-agent credential volumes (`ops-claude`, `ops-gemini`, `ops-opencode`, `ops-codex`). |
+| `volume list [--app]` | Lists ops-managed volumes (filter `label=ops.volume=true`). `--app` restricts to per-app credential volumes (`ops-claude`, `ops-gemini`, `ops-opencode`, `ops-codex`). |
 | `update [KEY]` | Builds (or rebuilds) an image — same post-build flow as `build` (diff image IDs, offer to recreate containers on the previous layer). The only difference: `update KEY` pre-resolves `KEY` against `OPS_IMAGES` **before** the build, while `build` uses the active `-i`/default image. Without a key, `update` behaves exactly like `build` on the default image. |
 | `backup VOL > file.tar.gz` | Streams a volume as tar.gz to stdout (redirection required) |
 | `restore VOL < file.tar.gz` | Restores a volume from a tar.gz on stdin (creates the volume with the `ops.volume=true` label if missing) |
@@ -209,7 +209,7 @@ runtime:            docker (/usr/bin/docker)
 === Containers ===
   ops-dev              localhost/ops-dev  (Up 2 hours)
     cmd:      bash
-    ops cli:  ./ops.sh run --claude
+    ops cli:  ./ops.sh run --app claude
     real cli: /usr/bin/docker run -it --rm --name ops-dev ...
     bind    /home/you                                  → /home/you
     volume  ops-share-nix                              → /nix
@@ -238,7 +238,7 @@ runtime:            docker (/usr/bin/docker)
     rust                 = localhost/ops-rust
 
   OPS_ALIASES [config]
-    dev                  = -i arch run --claude
+    dev                  = -i arch run --app claude
 ```
 
 **`ops doctor`** — validates the config before a build; returns non-zero if any warning:
@@ -283,7 +283,7 @@ runtime:            docker (/usr/bin/docker)
   image:      localhost/ops-ml
   state:      Up 30 minutes
   cmd:        bash
-  ops cli:    ./ops.sh -i ml --claude
+  ops cli:    ./ops.sh -i ml --app claude
 
 === Mounts ===
     bind    /home/you                                  → /home/you
@@ -327,9 +327,9 @@ runtime:            docker (/usr/bin/docker)
 | `-e, --env KEY=VAL` | Extra environment variable (repeatable) |
 | `--env-file FILE` | Reads env vars from a file |
 | `-p, --port HOST:CTN` | Publishes a port (repeatable) |
-| `--no-mount-home` | Do not bind-mount host `$HOME` (default: mounted). When active, per-agent auto bind-mounts of `~/.claude`, `~/.gemini`, `~/.local/share/opencode`, `~/.codex` kick in **only if the host path exists** — giving an ephemeral `$HOME` while preserving agent credentials. Use `--no-<agent>-mount` to opt out of a specific agent. |
+| `--no-mount-home` | Do not bind-mount host `$HOME` (default: mounted). When active, per-app auto bind-mounts of `~/.claude`, `~/.gemini`, `~/.local/share/opencode`, `~/.codex` kick in **only if the host path exists** — giving an ephemeral `$HOME` while preserving app credentials. Use `--no-<app>-mount` to opt out of a specific app. |
 | `--no-mount-volume` | Do not mount the mise and nix volumes (shortcut for `--no-nix-volume --no-mise-volume`) |
-| `--isolated-volumes` | Use per-container named volumes (`$OPS_CONTAINER_NAME-nix`, `$OPS_CONTAINER_NAME-mise`, and — when `--<agent>-volume` is also set — `$OPS_CONTAINER_NAME-claude` / `-gemini` / `-opencode` / `-codex`) instead of the shared `ops-share-*` / `ops-<agent>` defaults |
+| `--isolated-volumes` | Use per-container named volumes (`$OPS_CONTAINER_NAME-nix`, `$OPS_CONTAINER_NAME-mise`, and — when `--<app>-volume` is also set — `$OPS_CONTAINER_NAME-claude` / `-gemini` / `-opencode` / `-codex`) instead of the shared `ops-share-*` / `ops-<app>` defaults |
 
 ### `ops-*` volumes (selective opt-out)
 
@@ -341,7 +341,7 @@ runtime:            docker (/usr/bin/docker)
 | `--no-gemini-mount` | Do not bind-mount `~/.gemini` (only meaningful with `--no-mount-home`) |
 | `--no-opencode-mount` | Do not bind-mount `~/.local/share/opencode` (only meaningful with `--no-mount-home`) |
 | `--no-codex-mount` | Do not bind-mount `~/.codex` (only meaningful with `--no-mount-home`) |
-| `--claude-volume` / `--gemini-volume` / `--opencode-volume` / `--codex-volume` | Use a named volume (`ops-<agent>` by default, or `$OPS_CONTAINER_NAME-<agent>` with `--isolated-volumes`) for the agent config instead of a bind-mount — isolates the container's agent auth from the host's |
+| `--claude-volume` / `--gemini-volume` / `--opencode-volume` / `--codex-volume` | Use a named volume (`ops-<app>` by default, or `$OPS_CONTAINER_NAME-<app>` with `--isolated-volumes`) for the app config instead of a bind-mount — isolates the container's app auth from the host's |
 
 ### Build
 
@@ -350,9 +350,9 @@ runtime:            docker (/usr/bin/docker)
 | `-b, --build` | Triggers a build as part of `run` then exits — the container command (after `--`) is ignored. Use the top-level `build` subcommand for clarity. |
 | `--no-cache` | Invalidates the cache — requires `--build`. Standalone `run --no-cache` is rejected with a clear error. |
 
-### AI agents
+### AI apps
 
-See the [AI CLI agents](#ai-cli-agents) section below.
+See the [AI CLI apps](#ai-cli-apps) section below.
 
 ### Misc
 
@@ -449,8 +449,8 @@ ARG EXTRA_MISE_TOOLS=""
 # Single line, no OPS_IMAGES needed. Applies to `ops build` (no -i flag).
 ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:terraform'
 
-ops update default       # rebuild the default image with terraform baked in
-ops run --opencode       # run as usual; terraform is on PATH
+ops update default          # rebuild the default image with terraform baked in
+ops run --app opencode    # run as usual; terraform is on PATH
 ```
 
 **Per-profile — multiple images side-by-side** (when you want different builds for different workloads):
@@ -505,8 +505,8 @@ For users of [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-de
 
 ```bash
 ops config set 'OPS_BUILD_ARGS[default]' 'EXTRA_MISE_TOOLS=nix:google-chrome'
-ops update default       # rebuild with chrome baked in
-ops run --opencode       # or --claude / --gemini / --codex
+ops update default          # rebuild with chrome baked in
+ops run --app opencode    # or --app claude / --app gemini / --app codex
 ```
 
 Inside the resulting container, `google-chrome` is on PATH (via the `/opt/ops/bin/google-chrome` wrapper that already ships in the image). Tools that auto-detect Chrome (`chrome-devtools-mcp`, Puppeteer's `executablePath` resolution, Lighthouse) pick it up through three redundant hooks: the `CHROME_PATH` and `PUPPETEER_EXECUTABLE_PATH` env vars, the `/usr/bin/google-chrome` symlink, and the `/opt/google/chrome/chrome` symlink.
@@ -528,7 +528,7 @@ If you want to keep your default image lean **and** have a chrome-equipped image
 ops config set 'OPS_IMAGES[chrome]'      'localhost/ops-dev-chrome'
 ops config set 'OPS_BUILD_ARGS[chrome]'  'EXTRA_MISE_TOOLS=nix:google-chrome'
 ops -i chrome build
-ops -i chrome run --opencode
+ops -i chrome run --app opencode
 ```
 
 The trade-off: the `[default]` recipe is one line and bakes chrome into every container; the per-profile recipe keeps the default lean and adds ~300 MB only when you opt into the chrome profile.
@@ -564,8 +564,8 @@ Run `ops config` to see every variable tagged with its origin (`[env]` / `[confi
 | `OPS_SOURCE_URL` | `https://github.com/gigi206/ops-cli` | Forwarded as `--build-arg SOURCE_URL=…`; populates the `org.opencontainers.image.source` / `url` / `documentation` labels. Fork or vendor build: export `OPS_SOURCE_URL=""` to blank it, or set your own URL. |
 | `OPS_DEV_PLUGIN_MOUNT` | `0` | When `1`, bind-mounts the repo's `mise/` directory read-only over the image-baked plugin path (`/opt/ops/mise-plugin/nix`) so contributors can iterate on the Lua plugin without rebuilding the image. |
 | `OPS_DEFAULT_RUN_FLAGS` | _(empty)_ | Whitespace-delimited flags injected at the head of every `ops run` argv (e.g. `"--no-rm --no-wayland"` to keep containers persistent and skip Wayland forwarding). User-supplied CLI flags appear later in argv and win on "last write" state machines (`ephemeral`, `wayland_auto`, …). Intended for ops.conf — saves having to repeat the same flags across multiple aliases. |
-| `OPS_ISOLATION_PRESET` | `host` | Coarse-grained isolation dial. `host` keeps HOME mounted (legacy default — agents read host config). `volume` keeps HOME mounted but routes per-agent credentials through named Docker volumes (`ops-claude`, `ops-gemini`, …). `isolated` flips `mount_home=0` so agents only see their own bind-mount slice of HOME. `fully-isolated` combines `mount_home=0` with per-agent volumes for a hermetic container. `volume`/`fully-isolated` defer to per-agent CLI flags — if the user passed `--claude-mount`, the preset does not override. Invalid values exit 1 with a clear diagnostic. |
-| `OPS_AGENT_FLAGS[<agent>]` | _(unset)_ | Bash associative array. Keys are `claude`, `gemini`, `opencode`, `codex`. Value = whitespace-delimited flags injected into argv when `--<agent>` is consumed (e.g. `OPS_AGENT_FLAGS[claude]="--claude-volume --install"` makes every `--claude` invocation use the named volume + run `mise install` first). Lets users wire per-agent defaults once instead of duplicating flags across aliases. Declare with `declare -A OPS_AGENT_FLAGS` in ops.conf. |
+| `OPS_ISOLATION_PRESET` | `host` | Coarse-grained isolation dial. `host` keeps HOME mounted (legacy default — apps read host config). `volume` keeps HOME mounted but routes per-app credentials through named Docker volumes (`ops-claude`, `ops-gemini`, …). `isolated` flips `mount_home=0` so apps only see their own bind-mount slice of HOME. `fully-isolated` combines `mount_home=0` with per-app volumes for a hermetic container. `volume`/`fully-isolated` defer to per-app CLI flags — if the user passed `--claude-mount`, the preset does not override. Invalid values exit 1 with a clear diagnostic. |
+| `OPS_APP_FLAGS[<app>]` | _(unset)_ | Bash associative array. Keys are `claude`, `gemini`, `opencode`, `codex`. Value = whitespace-delimited flags injected into argv when `--app <name>` is consumed (e.g. `OPS_APP_FLAGS[claude]="--claude-volume --install"` makes every `--app claude` invocation use the named volume + run `mise install` first). Lets users wire per-app defaults once instead of duplicating flags across aliases. Declare with `declare -A OPS_APP_FLAGS` in ops.conf. |
 
 ### External variables (no prefix)
 
@@ -614,7 +614,7 @@ fi
 
 ## Custom aliases
 
-`ops.conf` can define **shortcuts** for recurring invocations (image + volumes + agent + ports in a single keystroke). Two forms coexist.
+`ops.conf` can define **shortcuts** for recurring invocations (image + volumes + app + ports in a single keystroke). Two forms coexist.
 
 ### Form 1 — **string** aliases (simple, frozen)
 
@@ -622,7 +622,7 @@ fi
 # ~/.config/ops/ops.conf
 declare -A OPS_ALIASES
 
-OPS_ALIASES[ml]="run -i localhost/ml-dev -v /datasets:/data --claude"
+OPS_ALIASES[ml]="run -i localhost/ml-dev -v /datasets:/data --app claude"
 OPS_ALIASES[web]="run -p 3000:3000 -p 5173:5173"
 OPS_ALIASES[rust]="run -- cargo build --release"
 OPS_ALIASES[update-all]="run --update"
@@ -630,7 +630,7 @@ OPS_ALIASES[update-all]="run --update"
 
 Usage:
 ```bash
-ops ml                       # → ops run -i localhost/ml-dev -v /datasets:/data --claude
+ops ml                       # → ops run -i localhost/ml-dev -v /datasets:/data --app claude
 ops ml --no-rm               # → extra args are appended automatically
 ops web                      # → ops run -p 3000:3000 -p 5173:5173
 ```
@@ -648,7 +648,7 @@ For anything that needs dynamic logic (env vars read at call time, conditionals,
 
 # Simple: reads $CUDA at invocation time
 ops_alias_gpu() {
-    echo run -i ml-dev -e "CUDA_VISIBLE_DEVICES=${CUDA:-0}" --claude
+    echo run -i ml-dev -e "CUDA_VISIBLE_DEVICES=${CUDA:-0}" --app claude
 }
 
 # With conditional logic
@@ -727,7 +727,7 @@ GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 
 # String aliases
 declare -A OPS_ALIASES
-OPS_ALIASES[ds]="run -i data-science-img -v /datasets:/data -e CUDA_VISIBLE_DEVICES=0 --claude"
+OPS_ALIASES[ds]="run -i data-science-img -v /datasets:/data -e CUDA_VISIBLE_DEVICES=0 --app claude"
 OPS_ALIASES[clean-all]="clean"
 OPS_ALIASES[quick]="run"
 
@@ -765,7 +765,7 @@ ops benchmark                # runs ./benchmark.sh (default)
 
 ### Debian (optional — `Dockerfile.debian`)
 
-An alternative base for environments where Arch's rolling-release model is undesirable (reproducible pinning, stable LTS base). **Same tooling stack** as the main `Dockerfile` — mise + Nix via the merged mise-nix plugin, same CLI agents, same `/opt/mise` and `/opt/nix-home` layout. Only the base OS (Debian testing vs Arch) and its package manager (apt vs pacman) differ.
+An alternative base for environments where Arch's rolling-release model is undesirable (reproducible pinning, stable LTS base). **Same tooling stack** as the main `Dockerfile` — mise + Nix via the merged mise-nix plugin, same CLI apps, same `/opt/mise` and `/opt/nix-home` layout. Only the base OS (Debian testing vs Arch) and its package manager (apt vs pacman) differ.
 
 Three equivalent ways to build and run it — pick the one that fits your workflow:
 
@@ -800,7 +800,7 @@ Then:
 ```bash
 ops -i deb build            # builds using Dockerfile.debian → localhost/ops-deb
 ops -i deb                  # enter the ops-deb container
-ops -i deb --claude         # Claude inside the Debian container
+ops -i deb --app claude   # Claude inside the Debian container
 ops doctor                  # verify the deb profile is coherent
 ```
 
@@ -876,7 +876,7 @@ OPS_CONTAINER_NAMES[ml]="ml-dev"
 ops -i ml                       # enter the ml-dev container (ops-ml image + Dockerfile.ml)
 ops -i ml build                 # (re)build the ml image via Dockerfile.ml
 ops -i go                       # enter "go" (ops-go image, no OPS_CONTAINER_NAMES → key)
-ops -i rust --claude            # rust + claude
+ops -i rust --app claude      # rust + claude
 ops -i alpine:latest            # raw image (not a declared profile) → OPS_IMAGE=alpine:latest
 ops images                      # list declared profiles
 ```
@@ -902,10 +902,10 @@ declare -A OPS_IMAGES
 OPS_IMAGES[ml]="localhost/ops-ml"
 
 declare -A OPS_ALIASES
-OPS_ALIASES[ml-claude]="-i ml run --claude"    # alias triggers the profile
+OPS_ALIASES[ml-claude]="-i ml run --app claude"  # alias triggers the profile
 ```
 
-Usage: `ops ml-claude` → expands to `-i ml run --claude` → profile `ml` is resolved and claude is launched.
+Usage: `ops ml-claude` → expands to `-i ml run --app claude` → profile `ml` is resolved and claude is launched.
 
 ### Listing
 
@@ -945,8 +945,8 @@ OPS_CONTAINER_NAMES[arch]="ops-dev"   # default
 
 # Aliases for frequent combinations
 declare -A OPS_ALIASES
-OPS_ALIASES[dev]="-i arch run --claude"
-OPS_ALIASES[ml-gpu]="-i ml run -e CUDA_VISIBLE_DEVICES=0 --claude"
+OPS_ALIASES[dev]="-i arch run --app claude"
+OPS_ALIASES[ml-gpu]="-i ml run -e CUDA_VISIBLE_DEVICES=0 --app claude"
 ```
 
 Invocations:
@@ -1164,56 +1164,79 @@ _.nix = true      # Python + deps come from flake.nix
 
 ---
 
-## AI CLI agents
+## AI CLI apps
 
-Four pre-integrated AI agents, installed on demand via `mise` (Node.js + npm).
+Pre-integrated AI apps, installed on demand via `mise` (Node.js + npm). The
+generic `--app <name>` flag replaces the old per-app flags (`--claude`,
+`--gemini`, `--opencode`, `--codex`) with a single entry point.
 
-| Flag | Backend ref | Bind-mount variant (only useful with `--no-mount-home`) | Config paths exposed |
+| App name | Backend ref | Config paths exposed | Notes |
 |---|---|---|---|
-| `--claude` | `@anthropic-ai/claude-code` | `--claude-mount` | `~/.claude`, `~/.claude.json` |
-| `--gemini` | `@google/gemini-cli` | `--gemini-mount` | `~/.gemini` |
-| `--opencode` | `npm:opencode-ai` | `--opencode-mount` | `~/.local/share/opencode`, `~/.config/opencode` |
-| `--opencode-desktop` | `github:sst/opencode[asset_pattern=opencode-desktop-linux-x86_64.AppImage]` (Electron AppImage, launched via `--appimage-extract-and-run` so no FUSE needed; needs `WAYLAND_DISPLAY` on the host AND an image rebuilt with `OPS_DESKTOP_DEPS=true` for the GTK / NSS / Mesa runtime libs — see [Build-time tools](#build-time-tools)) | shares `--opencode-mount` | `~/.local/share/opencode`, `~/.config/opencode` (same as `--opencode`) |
-| `--codex` | `@openai/codex` | `--codex-mount` | `~/.codex` |
+| `claude` | `@anthropic-ai/claude-code` | `~/.claude`, `~/.claude.json` | Official Anthropic CLI |
+| `gemini` | `@google/gemini-cli` | `~/.gemini` | Google Gemini CLI |
+| `opencode` | `npm:opencode-ai` | `~/.local/share/opencode`, `~/.config/opencode` | Terminal TUI (SST) |
+| `opencode-desktop` | `github:sst/opencode[asset_pattern=…]` (Electron AppImage) | same as `opencode` | GUI variant; needs Wayland + `OPS_DESKTOP_DEPS=true` |
+| `codex` | `@openai/codex` | `~/.codex` | OpenAI Codex CLI |
 
-`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GEMINI_API_KEY` are auto-propagated into the container when set on the host — no flag required. All four are masked in **both** the `ops.cmdline.user` and `ops.cmdline.real` labels (see [Labels → Security](#%E2%9A%A0-security-secret-exposure)), so inlining them via `-e KEY=VAL` on the ops command line does not leak them via `docker inspect`.
+`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GEMINI_API_KEY`
+are auto-propagated into the container when set on the host — no flag required.
+All four are masked in **both** the `ops.cmdline.user` and `ops.cmdline.real`
+labels (see [Labels → Security](#%E2%9A%A0-security-secret-exposure)), so
+inlining them via `-e KEY=VAL` on the ops command line does not leak them via
+`docker inspect`.
 
-### `--foo` vs `--foo-mount`
+### Per-app mount/volume variants
 
-- `--foo`: installs (if missing) and runs the agent. With the default `$HOME` bind-mount, your host config at `~/.foo` is already visible inside the container, so this is usually all you need.
-- `--foo-mount`: explicitly bind-mounts the agent's config directory. Redundant with the default `$HOME` bind-mount — only useful when combined with `--no-mount-home` (ephemeral `$HOME` but keep the agent's auth).
+Each app's config directory can be controlled via generic flags that use
+the app name as a suffix:
+
+- `--<app>-mount`: explicitly bind-mount the config directory from the host.
+  Redundant with the default `$HOME` bind-mount — only useful when combined
+  with `--no-mount-home` (ephemeral `$HOME` but keep the app's auth).
+- `--<app>-volume`: use a named Docker volume `ops-<app>` for the config
+  directory (isolated from host, works with or without `--no-mount-home`).
+- `--no-<app>-mount`: disable config directory propagation entirely.
+
+For example: `--app claude --claude-volume` uses a named volume for
+Claude's credentials. See [Configuration patterns](#configuration-patterns)
+for `OPS_APP_FLAGS` to set these persistently.
 
 ### Examples
 
 ```bash
-./ops.sh --claude                    # launches Claude with your credentials
-./ops.sh --codex "help me debug"     # Codex with a direct prompt
-./ops.sh --gemini -p "explain this"      # args passed to gemini after the break
+./ops.sh --app claude                    # launches Claude with your credentials
+./ops.sh --app codex "help me debug"     # Codex with a direct prompt
+./ops.sh --app gemini -p "explain this"  # args passed to gemini after the break
+./ops.sh --app opencode-desktop          # Electron GUI (needs Wayland)
 ```
 
 ### Manual install inside the container
 
-Agents are **not** baked into the image by default — `--claude/--gemini/--opencode/--codex` trigger a `mise use -g` on the fly (persistent thanks to the `ops-share-mise` volume).
+Apps are **not** baked into the image by default — `--app <name>`
+triggers a `mise use -g` on the fly (persistent thanks to the
+`ops-share-mise` volume).
 
 ### Shell shortcuts
 
-Two idiomatic ways to shorten `ops run --<agent>` into a single word. **Pick one per agent** — use both if you want different shortcuts (e.g. `cc` in shell, `ops claude-gpu` in ops.conf for a GPU variant).
+Two idiomatic ways to shorten `ops --app <name>` into a single word.
+**Pick one per app** — use both if you want different shortcuts
+(e.g. `cc` in shell, `ops claude-gpu` in ops.conf for a GPU variant).
 
 #### Option A — shell aliases (in `~/.bashrc` / `~/.zshrc`)
 
 ```bash
-alias claude='ops run --claude'
-alias gemini='ops run --gemini'
-alias opencode='ops run --opencode'
-alias codex='ops run --codex'
+alias claude='ops run --app claude'
+alias gemini='ops run --app gemini'
+alias opencode='ops run --app opencode'
+alias codex='ops run --app codex'
 ```
 
 Usage:
 
 ```bash
 claude                        # bare invocation
-claude --no-rm                # ops flags work (consumed before the agent)
-claude -- --help              # args after -- flow to the agent CLI
+claude --no-rm                # ops flags work (consumed before the app)
+claude -- --help              # args after -- flow to the app CLI
 gemini -p "summarize README"
 ```
 
@@ -1224,21 +1247,21 @@ gemini -p "summarize README"
 
 ```bash
 declare -A OPS_ALIASES
-OPS_ALIASES[cc]="run --claude"
-OPS_ALIASES[gg]="run --gemini"
-OPS_ALIASES[oc]="run --opencode"
-OPS_ALIASES[cx]="run --codex"
+OPS_ALIASES[cc]="run --app claude"
+OPS_ALIASES[gg]="run --app gemini"
+OPS_ALIASES[oc]="run --app opencode"
+OPS_ALIASES[cx]="run --app codex"
 ```
 
 Usage:
 
 ```bash
-ops cc                        # → ops run --claude
+ops cc                        # → ops run --app claude
 ops cc --no-rm                # extra args appended
 ops gg -- -p "summarize"
 ```
 
-**Pros**: portable (travels with `ops.conf`), composable with profiles (`OPS_ALIASES[claude-ml]="-i ml run --claude"`), inspectable via `ops aliases`.
+**Pros**: portable (travels with `ops.conf`), composable with profiles (`OPS_ALIASES[claude-ml]="-i ml run --app claude"`), inspectable via `ops aliases`.
 **Cons**: slightly longer invocation (`ops cc` vs `cc`).
 
 #### Option C — combined (both layers)
@@ -1247,24 +1270,24 @@ Shell alias that targets an ops alias — best of both:
 
 ```bash
 # ~/.config/ops/ops.conf
-OPS_ALIASES[claude]="run --claude"
+OPS_ALIASES[claude]="run --app claude"
 # But `claude` is also an ops-reserved subcommand? No — `claude` is NOT in _OPS_RESERVED,
 # so an alias named "claude" works fine.
 
 # ~/.bashrc
-alias claude='ops claude'       # typing "claude" → "ops claude" → "run --claude"
+alias claude='ops claude'       # typing "claude" → "ops claude" → "run --app claude"
 ```
 
 #### Variants with profiles
 
-Combine shell alias + named image profile for context-aware agents:
+Combine shell alias + named image profile for context-aware apps:
 
 ```bash
 # ops.conf
 declare -A OPS_IMAGES
 OPS_IMAGES[ml]="localhost/ops-ml"
 declare -A OPS_ALIASES
-OPS_ALIASES[claude-ml]="-i ml run --claude"   # ML image + Claude
+OPS_ALIASES[claude-ml]="-i ml run --app claude"   # ML image + Claude
 
 # ~/.bashrc
 alias claude-ml='ops claude-ml'
@@ -1410,7 +1433,7 @@ Created on demand, persistent between container launches. Tracked by the **label
 
 Pass `--isolated-volumes` to swap these for per-container volumes: `$OPS_CONTAINER_NAME-nix` and `$OPS_CONTAINER_NAME-mise` (e.g. `ops-dev-nix`, `ops-dev-mise`). Useful when multiple containers need independent tool versions.
 
-**Bind-mounts** (not named volumes) for the agents:
+**Bind-mounts** (not named volumes) for the apps:
 
 | Host source | Container destination | Mounted when |
 |---|---|---|
@@ -1528,7 +1551,7 @@ chmod +x ops.sh
 ```bash
 cd ~/my-project
 ops                             # shell in the container, mapped onto $PWD
-ops --claude                # or directly Claude Code with your session
+ops --app claude              # or directly Claude Code with your session
 ops run -- git status           # one-shot command
 ```
 
@@ -1577,7 +1600,7 @@ ops logs ops-dev                # container logs (stripped of ANSI with `ops log
 Useful when debugging flag interactions or writing a new alias:
 
 ```bash
-ops run --claude --dry-run                   # see what --claude expands to
+ops run --app claude --dry-run             # see what --app claude expands to
 ops -i ml -n tmp run --isolated-volumes --dry-run   # inspect a profile + isolation
 ops run --build --dry-run                    # print the `docker build …` cmdline
                                               # without starting the build or buildkitd
@@ -1656,12 +1679,12 @@ ops runtime rm -f sandbox
 ops runtime volume rm sandbox-nix sandbox-mise
 ```
 
-### Hermetic agent auth — `--<agent>-volume`
+### Hermetic app auth — `--<app>-volume`
 
 Keep the container's Claude/Gemini session separate from the host's:
 
 ```bash
-ops run --no-mount-home --claude-volume --claude
+ops run --no-mount-home --claude-volume --app claude
 # Auth prompt appears on first use; stored in the `ops-claude` named volume.
 # Next run reuses it without touching ~/.claude on the host.
 ```
@@ -1701,39 +1724,39 @@ For a reproducible setup, add a `.devcontainer/devcontainer.json` at the project
 }
 ```
 
-### Agent mount / volume matrix
+### App mount / volume matrix
 
-The four agents (`claude`, `gemini`, `opencode`, `codex`) all share the same flag pattern. Illustrated with `claude`:
+The four apps (`claude`, `gemini`, `opencode`, `codex`) all share the same flag pattern. Illustrated with `claude`:
 
 ```bash
 # 1. Default — $HOME bind-mount → ~/.claude on host visible in container
-ops --claude
+ops --app claude
 
 # 2. Explicit bind-mount, redundant unless $HOME is NOT mounted
-ops run --no-mount-home --claude-mount --claude
+ops run --no-mount-home --claude-mount --app claude
 
 # 3. Named volume (isolated from host) — survives container recreation
-ops --claude-volume --claude                 # volume: ops-claude
-ops -n test --isolated-volumes --claude-volume --claude    # volume: test-claude
+ops --claude-volume --app claude                 # volume: ops-claude
+ops -n test --isolated-volumes --claude-volume --app claude    # volume: test-claude
 
 # 4. Opt out entirely (no config visible inside)
-ops run --no-mount-home --no-claude-mount --claude
+ops run --no-mount-home --no-claude-mount --app claude
 ```
 
-Replace `claude` with `gemini` / `opencode` / `codex` for the other agents — the four sets are symmetric. The full 16-cell matrix, one example per cell:
+Replace `claude` with `gemini` / `opencode` / `codex` for the other apps — the four sets are symmetric. The full 16-cell matrix, one example per cell:
 
 ```bash
 # Named volume
-ops --claude-volume --claude
-ops --gemini-volume --gemini
-ops --opencode-volume --opencode
-ops --codex-volume --codex
+ops --claude-volume --app claude
+ops --gemini-volume --app gemini
+ops --opencode-volume --app opencode
+ops --codex-volume --app codex
 
 # Explicit bind-mount (meaningful only with --no-mount-home)
-ops run --no-mount-home --claude-mount --claude
-ops run --no-mount-home --gemini-mount --gemini
-ops run --no-mount-home --opencode-mount --opencode
-ops run --no-mount-home --codex-mount --codex
+ops run --no-mount-home --claude-mount --app claude
+ops run --no-mount-home --gemini-mount --app gemini
+ops run --no-mount-home --opencode-mount --app opencode
+ops run --no-mount-home --codex-mount --app codex
 
 # Opt out (only meaningful with --no-mount-home)
 ops run --no-mount-home --no-claude-mount
@@ -1957,7 +1980,7 @@ Expected: `-H/--nerdctl-home` only makes sense for nerdctl. Drop the flag when u
 
 - Compose/devcontainer require a specific stack (docker daemon, VSCode, ...)
 - ops also handles runtime install (rootless nerdctl auto), systemd services, buildkitd
-- Native integration of AI agents with persisted sessions
+- Native integration of AI apps with persisted sessions
 - Runtime-agnostic: same interface whether you are on docker, podman, or nerdctl
 
 ### Where are the Dockerfile hashes stored?
@@ -1978,7 +2001,7 @@ Yes:
 OPS_IMAGE=python:3.12 ops --no-rm
 ```
 
-But `ops-*` volumes and the AI agents will not work because the image has neither mise, nor Nix, nor the mise-nix plugin installed. Prefer building your own Dockerfile on top of our `Dockerfile` (which inherits the whole setup).
+But `ops-*` volumes and the AI apps will not work because the image has neither mise, nor Nix, nor the mise-nix plugin installed. Prefer building your own Dockerfile on top of our `Dockerfile` (which inherits the whole setup).
 
 ### How do I test Dockerfile changes without breaking the current image?
 
@@ -2097,11 +2120,11 @@ tests/
 ├── test_doctor_containers.bats    —  5 tests: doctor Containers — orphan, image mismatch, OK match
 ├── test_unit_helpers.bats         — 14 tests: direct unit tests for _human_bytes, _shell_quote (via OPS_SOURCE_ONLY)
 ├── test_label_masking.bats        —  8 tests: secret masking in BOTH ops.cmdline.user and ops.cmdline.real labels (GITHUB_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)
-├── test_regressions.bats          — 14 tests: build arg leak fix (#18), --user-name remap (#24), PWD⊂HOME (#23), clean interactive (#20), rootless cache reset (#17), isolated agent volumes, install-path safety, start-fail re-dispatch (#19), and more
+├── test_regressions.bats          — 14 tests: build arg leak fix (#18), --user-name remap (#24), PWD⊂HOME (#23), clean interactive (#20), rootless cache reset (#17), isolated app volumes, install-path safety, start-fail re-dispatch (#19), and more
 ├── test_image_integration.bats    — 41 integration tests against the actually-built localhost/ops-dev image (Nix GC root, chrome hooks, mise config split, machine-id, unfree flags, OCI labels, …). Skips if Docker or the image is absent.
 ├── test_subcommand_help.bats      — 18 tests: per-subcommand --help output (doctor/inspect/config/clean/status/logs/backup/restore/update/aliases/images/runtime). Ensures `-h|--help` is intercepted before arg parsing and exits 0.
 ├── test_secret_symmetry.bats      —  8 tests: regression guard ensuring `_dry_run_print` (dry-run) and `_mask_secrets` (labels) agree on what is a secret (e.g. MY_DB_PASSWORD redacted everywhere; MONKEY treated as non-secret in both paths).
-├── test_match_agent_flag.bats     —  8 tests: per-agent flag dispatcher `_match_agent_flag` — `--{claude,gemini,opencode,codex}-{mount,volume}` + `--no-X-mount` collapsed into one nameref-based handler.
+├── test_match_app_flag.bats     —  8 tests: per-app flag dispatcher `_match_app_flag` — `--{claude,gemini,opencode,codex}-{mount,volume}` + `--no-X-mount` collapsed into one nameref-based handler.
 └── test_volume_validation.bats    —  5 tests: `-v / --volume SRC:DST` arg-shape validation (rejects bare values that lack `:`).
 ```
 
@@ -2126,7 +2149,7 @@ CI runs this job (`image-integration`) automatically on pushes to `main` and via
 | Config file loading + precedence (env > config) | **100%** |
 | `config` subcommand (origin tracking env/config/default) | **100%** |
 | `run` flags (all documented flags are tested) | **~95%** |
-| Agents (claude/gemini/opencode/codex + -mount) | **100%** |
+| Apps (claude/gemini/opencode/codex + -mount) | **100%** |
 | `nerdctl install` / `nerdctl uninstall` / `nerdctl self-update` (happy path + errors + namespace dispatch) | **~95%** |
 | Build args (docker/podman/nerdctl) | **~90%** |
 | Labels (`ops.dockerfile` / `ops.container` / `ops.cmdline.*` / `ops.volume`) | **100%** |
@@ -2137,7 +2160,7 @@ CI runs this job (`image-integration`) automatically on pushes to `main` and via
 | Backup / restore (TTY guards, alpine tar, ensure_volume) | **100%** |
 | Per-image hash + rebuild detection | **100%** |
 
-**641 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
+**642 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
 
 A pure-Lua unit-test harness lives under `tests/lua/` (run via `mise run test-lua` or `lua5.4 tests/lua/run.lua`). It exercises the plugin helpers that don't need mise's native modules — `shell.shquote`, `version.parse_version`, `flake.is_reference`, `plugin_matcher.matches`, `tempdir.with_temp_dir`, `security.is_safe_local_path`, `jetbrains.extract_plugin_info`. The harness stubs the native modules via `package.preload` so any vanilla `lua5.x` interpreter is enough; busted is not required.
 
