@@ -83,7 +83,7 @@ MOCK_MISE
 _source_and_print_var() {
     local sandbox="$1"
     local stub_path="$2"
-    # `bash -c` runs non-interactively, mirroring the agent_cmd path.
+    # `bash -c` runs non-interactively, mirroring the app_cmd path.
     # We export a minimal PATH that prefers our stub `mise` over the
     # system one, plus the standard utilities the bashrc needs.
     PATH="$stub_path:/usr/bin:/bin" \
@@ -236,7 +236,7 @@ MISE_NIX_ALLOW_UNTRACKED="1"
 
 # ---- __ops_refresh_cache helper ------------------------------------
 
-# Called by ops.sh `_agent_cmd` after `mise use -g` to refresh the
+# Called by ops.sh `_app_cmd` after `mise use -g` to refresh the
 # shell-env cache so the next container run skips the ~8 s mise hook-env
 # pass. Must be defined and must regenerate $PWD/.mise-nix/shell-env.cache
 # from the output of `mise hook-env -s bash`.

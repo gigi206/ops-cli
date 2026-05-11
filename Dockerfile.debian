@@ -4,9 +4,9 @@
 # main Dockerfile: mise + Nix with the merged mise-nix plugin, base dev tools
 # (git, gh, ripgrep, jq, ast-grep, node@lts). google-chrome is NOT baked —
 # opt-in via EXTRA_MISE_TOOLS (see the "Build-time tools" section in README).
-# CLI agents (claude-code, gemini-cli, opencode, codex) are NOT baked — they are
-# installed on demand by ops.sh when you pass --claude / --gemini /
-# --opencode / --codex, and persist in the ops-share-mise volume. Only the
+# example). CLI apps (claude-code, gemini-cli, opencode, codex) are NOT baked — they are
+# installed on demand by ops.sh when you pass --app claude / --app gemini /
+# --app opencode / --app codex, and persist in the ops-share-mise volume. Only the
 # base OS and its package manager differ from the Arch image.
 #
 # Build args (identical to the Arch Dockerfile — see its header for details):
@@ -46,13 +46,6 @@ FROM debian:testing-slim
 # silently ignoring the producer's exit code (hadolint DL4006).
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Standard OCI labels — see the Arch Dockerfile for rationale. The Debian
-# variant differs only in the `title` / `description` fields.
-LABEL org.opencontainers.image.title="ops-dev-debian" \
-      org.opencontainers.image.description="Containerized development environment with mise + Nix + AI CLI agents (Claude Code, Gemini, OpenCode, Codex). Debian testing-slim base." \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.authors="Ghislain LE MEUR"
-
 ARG DEBIAN_FRONTEND=noninteractive
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -88,15 +81,6 @@ ARG EXTRA_MISE_TOOLS=""
 #   ops config set 'OPS_BUILD_ARGS[default]' 'OPS_DESKTOP_DEPS=true'
 #   ops update default
 ARG OPS_DESKTOP_DEPS=false
-
-# OCI metadata ARG — mirrors the Arch Dockerfile. Only SOURCE_URL kept;
-# version/revision were dropped because they duplicate OPS_VERSION and
-# stay empty without CI stamping (see Arch Dockerfile for the rationale).
-ARG SOURCE_URL="https://github.com/gigi206/ops-cli"
-
-LABEL org.opencontainers.image.source="${SOURCE_URL}" \
-      org.opencontainers.image.url="${SOURCE_URL}" \
-      org.opencontainers.image.documentation="${SOURCE_URL}"
 
 # -----------------------------------------------------------------------------
 # 1. System packages + locales — see docs/dockerfile-design.md §1
@@ -281,6 +265,20 @@ COPY --chown=root:root --chmod=755 scripts/_nix-cli-wrapper.sh /opt/ops/bin/nix
 RUN for cmd in nix-env nix-channel nix-store nix-collect-garbage; do \
         sudo ln -sf /opt/ops/bin/_nix-wrapper /opt/ops/bin/"$cmd"; \
     done
+
+# -----------------------------------------------------------------------------
+# OCI image metadata — placed last to keep the build cache warm
+# -----------------------------------------------------------------------------
+# See the Arch Dockerfile for the rationale. The Debian variant differs only
+# in the `title` / `description` fields.
+ARG SOURCE_URL="https://github.com/gigi206/ops-cli"
+LABEL org.opencontainers.image.title="ops-dev-debian" \
+      org.opencontainers.image.description="Containerized development environment with mise + Nix + AI CLI apps (Claude Code, Gemini, OpenCode, Codex). Debian testing-slim base." \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.authors="Ghislain LE MEUR" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.url="${SOURCE_URL}" \
+      org.opencontainers.image.documentation="${SOURCE_URL}"
 
 # -----------------------------------------------------------------------------
 # 7. Entrypoint

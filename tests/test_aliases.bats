@@ -21,7 +21,7 @@ _write_conf() {
 @test "string alias expands to run command" {
     _write_conf <<'EOF'
 declare -A OPS_ALIASES
-OPS_ALIASES[ml]="run -i ml-dev -v /data:/data --claude"
+OPS_ALIASES[ml]="run -i ml-dev -v /data:/data --app claude"
 EOF
     run env OPS_RUNTIME=docker "$(ops_sh)" ml --dry-run
     [ "$status" -eq 0 ]

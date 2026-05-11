@@ -72,6 +72,23 @@ EOF
     [[ "$output" == *"alpha"* ]]
 }
 
+# Regression guard: OPS_APP_FLAGS is a user-facing assoc array (set via
+# `ops config set 'OPS_APP_FLAGS[<app>]' ...`) and must render in the
+# `=== Arrays ===` section like its siblings. The display loop in
+# cmd_config previously omitted it, so a config-set + config round-trip
+# left users wondering whether the value had actually persisted.
+@test "config shows Arrays section when OPS_APP_FLAGS defined" {
+    _write_conf <<'EOF'
+declare -A OPS_APP_FLAGS
+OPS_APP_FLAGS[claude]="--claude-volume --install"
+EOF
+    run env OPS_RUNTIME=docker "$(ops_sh)" config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"OPS_APP_FLAGS"* ]]
+    [[ "$output" == *"claude"* ]]
+    [[ "$output" == *"--claude-volume --install"* ]]
+}
+
 @test "config with no arrays still produces valid output" {
     _write_conf <<'EOF'
 # no arrays

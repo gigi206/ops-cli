@@ -269,7 +269,7 @@ setup() {
     [[ "$output" == *ops-cli* ]]
 }
 
-@test "image: OCI label org.opencontainers.image.description mentions mise + Nix + AI agents" {
+@test "image: OCI label org.opencontainers.image.description mentions mise + Nix + AI apps" {
     run "$IMAGE_RUNTIME" image inspect localhost/ops-dev \
         --format '{{ index .Config.Labels "org.opencontainers.image.description" }}'
     [ "$status" -eq 0 ]
@@ -377,7 +377,7 @@ setup() {
 }
 
 @test "image: non-interactive source of /etc/ops-bashrc applies mise env" {
-    # Agents (claude, gemini, ...) run via `bash -c`, non-interactive. ops.sh
+    # Apps (claude, gemini, ...) run via `bash -c`, non-interactive. ops.sh
     # prepends `source /etc/ops-bashrc` so they still inherit PATH/... from
     # `mise env`. Verify the always-on block (nix profile + mise env) runs
     # even when the interactive guard is false.
@@ -400,8 +400,8 @@ setup() {
 }
 
 # The baked /etc/ops-bashrc must define `__ops_refresh_cache` — ops.sh
-# `_agent_cmd` calls it after every `mise use -g`, and a missing helper
-# would make the agent wrapper crash with "command not found" mid-install.
+# `_app_cmd` calls it after every `mise use -g`, and a missing helper
+# would make the app wrapper crash with "command not found" mid-install.
 @test "image: /etc/ops-bashrc defines __ops_refresh_cache helper" {
     run run_in_image 'bash -c "source /etc/ops-bashrc && declare -F __ops_refresh_cache >/dev/null && echo DEFINED || echo MISSING"'
     [ "$status" -eq 0 ]

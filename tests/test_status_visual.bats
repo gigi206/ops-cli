@@ -58,11 +58,11 @@ setup() {
     mock_runtime_rich docker
     export MOCK_PS_LINE="mycontainer|localhost/test-img|Up|bash"
     export MOCK_PS_LABELED="mycontainer"
-    export MOCK_CLI_USER="./ops.sh run --claude"
+    export MOCK_CLI_USER="./ops.sh run --app claude"
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
     [[ "$output" == *"ops cli:"* ]]
-    [[ "$output" == *"./ops.sh run --claude"* ]]
+    [[ "$output" == *"./ops.sh run --app claude"* ]]
 }
 
 @test "status: real cli: line appears when label is set" {
