@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-05-12
+
+### Changed
+- **Auto runtime detection now prefers podman over docker.** When `OPS_RUNTIME=auto` (the default) and both `podman` and `docker` are present on `PATH`, ops-cli now resolves to podman first instead of docker. The new precedence is **podman > docker > nerdctl**, vs. the previous `docker > podman > nerdctl`. Rationale: rootless podman avoids the host-root daemon surface of rootful docker — picking the safer engine by default when both are installed is the right behaviour for a wrapper that routinely launches agent containers with mounted host paths. The change is concentrated in `ops.sh`'s `_resolve_runtime()` (lines 96-110: the documenting comment block and the `for r in podman docker nerdctl` loop) and the user-facing `Runtime:` help line (`ops.sh:595`). Documentation updated in `README.md:64` (the "supported runtimes" section) and `README.md:971` (the `auto` subsection of the `OPS_RUNTIME` reference). Regression coverage lives in `tests/test_runtime.bats`: the previous "auto resolves to docker when docker is first available" test was renamed and flipped to "auto resolves to podman when both docker and podman are available" with the assertion inverted (line 12-22), and a new "auto resolves to docker when podman is absent" test was added to cover the docker-fallback path now that docker is no longer the priority (line 24-30). The pre-existing "auto resolves to podman when docker is absent" test passes unchanged (line 32-38). **Compatibility note for scripts that did not set `OPS_RUNTIME`**: on hosts that have both engines installed, ops-cli now transparently binds to podman instead of docker, which means a different storage driver, different network namespaces, and an image cache scoped to the podman daemon rather than the docker daemon. Scripts that rely on docker semantics should pin `OPS_RUNTIME=docker` (in `~/.config/ops/ops.conf` or per-invocation via `-r docker`) to preserve the v1.15.x default. Hosts with only docker or only podman installed see no behaviour change.
+
 ## [1.15.1] - 2026-05-12
 
 ### Fixed

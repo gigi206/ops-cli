@@ -61,7 +61,7 @@ The goal: a single entry point (`ops.sh`) to build, run, debug and update the en
 - System tooling always used by `ops.sh`: `curl`, `tar`, `sha256sum`, `awk`, `sed`, `grep`, `realpath` (any `coreutils`-shipped build).
 - `nerdctl`-specific extras (only needed when `OPS_RUNTIME=nerdctl`): `systemctl --user` (manages `containerd.service` / auto-start / `self-update`), `mktemp`, `uname` — all required by `nerdctl install`.
 
-The script auto-detects the available runtime in this order: **docker > podman > nerdctl**.
+The script auto-detects the available runtime in this order: **podman > docker > nerdctl**. Podman comes first because rootless podman avoids the host-root daemon surface of rootful docker — the safer engine by default when both are installed. Override with `OPS_RUNTIME=docker` (or `-r docker`) if you need the docker socket explicitly.
 
 ---
 
@@ -968,7 +968,7 @@ Three possible values for `OPS_RUNTIME`:
 
 ### `auto` (default)
 
-Detects in order: **docker > podman > nerdctl**. If none is available, falls back to `nerdctl` to trigger the auto-install prompt.
+Detects in order: **podman > docker > nerdctl**. Podman is preferred because rootless podman avoids the host-root daemon surface of rootful docker. If none is available, falls back to `nerdctl` to trigger the auto-install prompt.
 
 ### `docker` / `podman`
 
@@ -2096,7 +2096,7 @@ Runtime paths (per user):
 tests/
 ├── helpers.bash                   — runtime mocks + system tool stubs + setup helpers
 ├── test_dispatch.bats             — 17 tests: subcommands, runtime proxy, clean, version/--version/-V
-├── test_runtime.bats              — 11 tests: auto-detection, rootless/rootful, invalid
+├── test_runtime.bats              — 12 tests: auto-detection, rootless/rootful, invalid
 ├── test_dryrun.bats               — 44 tests: run flag parsing
 ├── test_flags.bats                — 26 tests: -u/-g/-l/-H/-e/-p/--env-file/no-*-volume/api-key masking/…
 ├── test_config.bats               —  5 tests: ops.conf loading + precedence
@@ -2163,7 +2163,7 @@ CI runs this job (`image-integration`) automatically on pushes to `main` and via
 | Backup / restore (TTY guards, alpine tar, ensure_volume) | **100%** |
 | Per-image hash + rebuild detection | **100%** |
 
-**645 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
+**646 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
 
 A pure-Lua unit-test harness lives under `tests/lua/` (run via `mise run test-lua` or `lua5.4 tests/lua/run.lua`). It exercises the plugin helpers that don't need mise's native modules — `shell.shquote`, `version.parse_version`, `flake.is_reference`, `plugin_matcher.matches`, `tempdir.with_temp_dir`, `security.is_safe_local_path`, `jetbrains.extract_plugin_info`. The harness stubs the native modules via `package.preload` so any vanilla `lua5.x` interpreter is enough; busted is not required.
 

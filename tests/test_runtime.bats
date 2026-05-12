@@ -9,10 +9,21 @@ setup() {
     ensure_dockerfile
 }
 
-@test "auto resolves to docker when docker is first available" {
+@test "auto resolves to podman when both docker and podman are available" {
+    # Priority order is podman > docker > nerdctl — podman wins by default
+    # because rootless podman avoids the host-root daemon surface of rootful
+    # docker. Users who specifically want docker set OPS_RUNTIME=docker.
     mock_runtime docker
     mock_runtime podman
     run env OPS_RUNTIME=auto "$(ops_sh)" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Runtime: podman"* ]]
+}
+
+@test "auto resolves to docker when podman is absent" {
+    mock_runtime docker
+    # Isolated PATH excludes host /usr/bin/podman while keeping coreutils.
+    run env OPS_RUNTIME=auto PATH="$MOCK_DIR:$(isolated_path)" "$(ops_sh)" help
     [ "$status" -eq 0 ]
     [[ "$output" == *"Runtime: docker"* ]]
 }
