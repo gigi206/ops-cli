@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.15.1"
+OPS_VERSION="1.16.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -94,15 +94,18 @@ OPS_RUNTIME="${OPS_RUNTIME:-auto}"
 RUNTIME_BIN=""
 
 # Resolves OPS_RUNTIME to a concrete runtime (docker/podman/nerdctl) and
-# sets RUNTIME_BIN to the binary path. Auto order: docker > podman > nerdctl.
-# If auto finds nothing, falls back to nerdctl so the auto-install prompt kicks in.
+# sets RUNTIME_BIN to the binary path. Auto order: podman > docker > nerdctl.
+# Podman comes first because rootless podman avoids the host-root daemon
+# surface of rootful docker — picking the safer engine by default when both
+# are installed. If auto finds nothing, falls back to nerdctl so the
+# auto-install prompt kicks in.
 _resolve_runtime() {
     # Reset rootless cache: a change of RUNTIME_BIN invalidates it (e.g. when
     # -H switches OPS_RUNTIME from docker to nerdctl mid-run).
     _IS_ROOTLESS_CACHE=""
     case "$OPS_RUNTIME" in
         auto)
-            for r in docker podman nerdctl; do
+            for r in podman docker nerdctl; do
                 case "$r" in
                     nerdctl) [ -x "$OPS_NERDCTL_HOME/bin/nerdctl" ] && { OPS_RUNTIME=$r; break; } ;;
                     *)       command -v "$r" >/dev/null 2>&1       && { OPS_RUNTIME=$r; break; } ;;
@@ -592,7 +595,7 @@ Subcommands:
   version        Print the ops version (alias: --version / -V)
 
 Config: $_CONFIG_FILE (sourced on startup, sets default env vars)
-Runtime: $OPS_RUNTIME (set OPS_RUNTIME=auto|docker|podman|nerdctl; auto picks docker > podman > nerdctl)
+Runtime: $OPS_RUNTIME (set OPS_RUNTIME=auto|docker|podman|nerdctl; auto picks podman > docker > nerdctl)
 
 Global flags (may appear before the subcommand, apply to all):
   -n, --name NAME           Container name           (default: $OPS_CONTAINER_NAME)
