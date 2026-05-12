@@ -220,7 +220,7 @@ runtime:            docker (/usr/bin/docker)
 
 ```
 === Config file ===
-  /home/you/.config/ops/ops.conf (loaded)
+  /home/you/.config/ops/ops.conf (loaded, origin: default)
 
 === Scalars ===
   OPS_BUILDKITD_TIMEOUT            = 10                                       [default]
@@ -373,6 +373,17 @@ See the [AI CLI apps](#ai-cli-apps) section below.
 ### `ops.conf`
 
 Sourced at startup: **`~/.config/ops/ops.conf`** (respects `$XDG_CONFIG_HOME`). The file is a regular bash script — you can put any shell logic there (e.g. loading secrets via `pass`, `gopass`, or a project `.env`).
+
+**Overriding the config path** (precedence: CLI > env > default):
+
+```bash
+ops -c ~/work/ops.conf doctor              # short flag
+ops --config ~/work/ops.conf doctor        # long flag
+ops --config=/etc/ops/team.conf doctor     # equals form
+OPS_CONFIG=~/work/ops.conf ops doctor      # environment variable
+```
+
+`-c` / `--config` is a **global flag**: it must appear before the subcommand. The pre-parser stops at the first non-global token, so `ops self-update -c REF` (where `-c` is the `self-update --check` shortcut) keeps its own meaning. An explicit override (CLI or env) that points to a non-existent file is rejected; the default path is allowed to be missing for first-time installs. The ownership / world-writable safety checks (refuse to source files not owned by the current user, or world-writable) apply to whichever path is resolved. `ops config` and `ops doctor` report the resolved path along with its origin (`cli` / `env` / `default`).
 
 Full example:
 
@@ -2163,7 +2174,7 @@ CI runs this job (`image-integration`) automatically on pushes to `main` and via
 | Backup / restore (TTY guards, alpine tar, ensure_volume) | **100%** |
 | Per-image hash + rebuild detection | **100%** |
 
-**646 tests across 48 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
+**667 tests across 49 files.** The "coverage" column above is an eyeballed estimate based on which documented subcommands and flags are exercised; no coverage tool is run in CI (see `mise run coverage` for an opt-in local report, with caveats).
 
 A pure-Lua unit-test harness lives under `tests/lua/` (run via `mise run test-lua` or `lua5.4 tests/lua/run.lua`). It exercises the plugin helpers that don't need mise's native modules — `shell.shquote`, `version.parse_version`, `flake.is_reference`, `plugin_matcher.matches`, `tempdir.with_temp_dir`, `security.is_safe_local_path`, `jetbrains.extract_plugin_info`. The harness stubs the native modules via `package.preload` so any vanilla `lua5.x` interpreter is enough; busted is not required.
 

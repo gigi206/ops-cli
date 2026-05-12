@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.16.0"
+OPS_VERSION="1.17.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -52,7 +52,82 @@ for _v in $(compgen -v 2>/dev/null | grep -E '^[A-Z_][A-Z0-9_]*$' || true); do
 done
 unset _v
 
-_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ops/ops.conf"
+# CLI / env override for the config path — parsed BEFORE sourcing ops.conf so
+# the override is honoured at load time. Precedence: -c / --config CLI flag >
+# OPS_CONFIG env var > XDG_CONFIG_HOME default (~/.config/ops/ops.conf).
+#
+# The pre-parse only consumes -c / --config from the GLOBAL flag position
+# (before the subcommand). It mirrors _parse_global_flags by stopping at the
+# first token that isn't a known global flag — so `ops self-update -c REF`
+# (where -c is the subcommand's --check shortcut) and any other subcommand's
+# own -c flag stay untouched. Strips the consumed tokens from $@ so downstream
+# code never sees -c / --config again.
+_CONFIG_FILE_ORIGIN="default"
+_CONFIG_FILE_CLI=""
+_pre_parse_config_args=()
+while [ $# -gt 0 ]; do
+    case "${1:-}" in
+        -c|--config)
+            if [ $# -lt 2 ] || [ -z "${2-}" ]; then
+                echo "Error: $1 requires a non-empty path argument" >&2
+                exit 1
+            fi
+            _CONFIG_FILE_CLI="$2"
+            _CONFIG_FILE_ORIGIN="cli"
+            shift 2
+            ;;
+        --config=*)
+            _CONFIG_FILE_CLI="${1#--config=}"
+            if [ -z "$_CONFIG_FILE_CLI" ]; then
+                echo "Error: --config= requires a non-empty path" >&2
+                exit 1
+            fi
+            _CONFIG_FILE_ORIGIN="cli"
+            shift
+            ;;
+        -n|--name|-i|--image|-f|--dockerfile|-r|--runtime|-H|--nerdctl-home)
+            # Known global flag that takes a value — preserve it (will be
+            # re-parsed by _parse_global_flags later) and keep scanning for -c.
+            _pre_parse_config_args+=("$1")
+            if [ $# -ge 2 ]; then
+                _pre_parse_config_args+=("$2")
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        *)
+            # First non-global-flag token (subcommand, alias, --, end of argv).
+            break
+            ;;
+    esac
+done
+_pre_parse_config_args+=("$@")
+set -- "${_pre_parse_config_args[@]}"
+unset _pre_parse_config_args
+
+if [ -n "$_CONFIG_FILE_CLI" ]; then
+    _CONFIG_FILE="$_CONFIG_FILE_CLI"
+elif [ -n "${OPS_CONFIG:-}" ]; then
+    _CONFIG_FILE="$OPS_CONFIG"
+    _CONFIG_FILE_ORIGIN="env"
+else
+    _CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ops/ops.conf"
+fi
+unset _CONFIG_FILE_CLI
+
+# Visibility for explicit overrides that resolve to a missing file: emit a
+# warning so a typo (`--config ~/typoed.cnf`) doesn't silently fall through to
+# defaults. Suppressed for `config` / `help` / `version` subcommands — the
+# user is either intentionally creating the file (`config set`) or already
+# inspecting state via output that surfaces the missing flag itself.
+if [ "$_CONFIG_FILE_ORIGIN" != "default" ] && [ ! -f "$_CONFIG_FILE" ]; then
+    case "${1:-}" in
+        config|help|-h|--help|version|--version|-V) : ;;
+        *) echo "Warning: config file not found: $_CONFIG_FILE (origin: $_CONFIG_FILE_ORIGIN); using defaults" >&2 ;;
+    esac
+fi
+
 # Defence-in-depth: `source` executes arbitrary code, so refuse to load the
 # config when it's writable by someone other than the current user (covers the
 # world- / group-writable footgun where a shared $HOME lets an attacker drop
@@ -594,10 +669,13 @@ Subcommands:
   help           Show this help
   version        Print the ops version (alias: --version / -V)
 
-Config: $_CONFIG_FILE (sourced on startup, sets default env vars)
+Config: $_CONFIG_FILE [$_CONFIG_FILE_ORIGIN] (sourced on startup, sets default env vars)
 Runtime: $OPS_RUNTIME (set OPS_RUNTIME=auto|docker|podman|nerdctl; auto picks podman > docker > nerdctl)
 
 Global flags (may appear before the subcommand, apply to all):
+  -c, --config PATH         Config file path — overrides \$OPS_CONFIG and the
+                            default \$XDG_CONFIG_HOME/ops/ops.conf. Errors out
+                            if PATH does not exist. (default: $_CONFIG_FILE)
   -n, --name NAME           Container name           (default: $OPS_CONTAINER_NAME)
   -i, --image NAME          Image — raw ref or key of OPS_IMAGES (default: $OPS_IMAGE)
   -f, --dockerfile PATH     Dockerfile path          (default: $OPS_DOCKERFILE)
@@ -606,6 +684,7 @@ Global flags (may appear before the subcommand, apply to all):
                             (default: $OPS_RUNTIME)
   -H, --nerdctl-home PATH   nerdctl directory        (default: ~/.local/share/ops/nerdctl)
   Example: $(basename "$0") -n web logs -f
+  Example: $(basename "$0") --config ~/work/ops.conf doctor
 
 $(basename "$0") run [OPTIONS] [COMMAND...]
   -i, --image NAME          Image to use             (default: $OPS_IMAGE)
@@ -930,9 +1009,9 @@ EOF
     # --- Services (top: runtime + daemons) ---
     echo -e "\033[1;34m=== Services ===\033[0m"
     if [ -f "$_CONFIG_FILE" ]; then
-        echo -e "config:             $_CONFIG_FILE \033[32m(loaded)\033[0m"
+        echo -e "config:             $_CONFIG_FILE \033[32m(loaded, origin: $_CONFIG_FILE_ORIGIN)\033[0m"
     else
-        echo -e "config:             $_CONFIG_FILE \033[33m(missing)\033[0m"
+        echo -e "config:             $_CONFIG_FILE \033[33m(missing, origin: $_CONFIG_FILE_ORIGIN)\033[0m"
     fi
     echo "runtime:            $OPS_RUNTIME ($RUNTIME_BIN)"
     if [ "$OPS_RUNTIME" = "nerdctl" ]; then
@@ -1758,6 +1837,14 @@ tagging:
   [config]  defined by \$_CONFIG_FILE
   [default] assigned by a :- fallback in ops.sh
 
+The config file path itself comes from (in precedence order):
+  -c, --config PATH      CLI flag (highest priority)
+  \$OPS_CONFIG             environment variable
+  \$XDG_CONFIG_HOME/ops/ops.conf   default
+
+The Config file header reports the resolved path and its origin
+(cli / env / default).
+
 Two sections in the dump:
   Scalars   — every OPS_* simple variable with its resolved value + origin
   Arrays    — OPS_IMAGES / OPS_DOCKERFILES / OPS_CONTAINER_NAMES /
@@ -1975,9 +2062,9 @@ EOF
     esac
     echo -e "\033[1;34m=== Config file ===\033[0m"
     if [ -f "$_CONFIG_FILE" ]; then
-        echo -e "  $_CONFIG_FILE \033[32m(loaded)\033[0m"
+        echo -e "  $_CONFIG_FILE \033[32m(loaded, origin: $_CONFIG_FILE_ORIGIN)\033[0m"
     else
-        echo -e "  $_CONFIG_FILE \033[33m(missing)\033[0m"
+        echo -e "  $_CONFIG_FILE \033[33m(missing, origin: $_CONFIG_FILE_ORIGIN)\033[0m"
     fi
 
     # Mark any OPS_* var currently set that wasn't env or config as default.
@@ -2355,9 +2442,9 @@ EOF
 
     echo -e "\033[1;34m=== Config ===\033[0m"
     if [ -f "$_CONFIG_FILE" ]; then
-        _doc_ok "config file: $_CONFIG_FILE"
+        _doc_ok "config file: $_CONFIG_FILE (origin: $_CONFIG_FILE_ORIGIN)"
     else
-        _doc_warn "config file missing: $_CONFIG_FILE" \
+        _doc_warn "config file missing: $_CONFIG_FILE (origin: $_CONFIG_FILE_ORIGIN)" \
                   "$(basename "$0") config set OPS_RUNTIME auto"
     fi
 
@@ -4146,6 +4233,13 @@ _parse_global_flags() {
                                 _resolve_runtime
                                 [ "$OPS_RUNTIME" != "nerdctl" ] && echo "Warning: -H has no effect with OPS_RUNTIME=$OPS_RUNTIME" >&2
                                 shift 2 ;;
+            -c|--config)        # Top-level -c is consumed by the pre-parse at the top of ops.sh,
+                                # so this branch only fires when an alias injects -c. Config is
+                                # already sourced at this point; warn and discard.
+                                echo "Warning: -c / --config inside an alias is ignored — config already loaded from $_CONFIG_FILE" >&2
+                                if [ $# -ge 2 ]; then shift 2; else shift; fi ;;
+            --config=*)         echo "Warning: --config inside an alias is ignored — config already loaded from $_CONFIG_FILE" >&2
+                                shift ;;
             *) break ;;
         esac
     done
