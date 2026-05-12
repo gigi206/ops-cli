@@ -125,7 +125,9 @@ ENV LANG=${USER_LANG} \
     MISE_DATA_DIR=/opt/mise/data \
     MISE_CACHE_DIR=/opt/mise/cache \
     MISE_CONFIG_DIR=/opt/mise/data/config \
-    MISE_STATE_DIR=/opt/mise/state
+    MISE_STATE_DIR=/opt/mise/state \
+    MISE_JOBS=2 \
+    MISE_FETCH_REMOTE_VERSIONS_TIMEOUT=120s
 
 # -----------------------------------------------------------------------------
 # 2. Non-root user with matching UID/GID — see docs/dockerfile-design.md §2
