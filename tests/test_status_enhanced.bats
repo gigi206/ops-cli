@@ -27,9 +27,11 @@ setup() {
     run env OPS_RUNTIME=docker "$(ops_sh)" status
     [ "$status" -eq 0 ]
     # The "config:" label is always emitted; the value is followed by either
-    # "(loaded)" or "(missing)" depending on whether ops.conf exists.
+    # "(loaded, origin: …)" or "(missing, origin: …)" depending on whether
+    # ops.conf exists. The "origin:" suffix arrived with -c / --config /
+    # OPS_CONFIG support so the user can audit which level resolved the path.
     [[ "$output" == *"config:"* ]]
-    [[ "$output" == *"(loaded)"* ]] || [[ "$output" == *"(missing)"* ]]
+    [[ "$output" == *"(loaded, origin:"* ]] || [[ "$output" == *"(missing, origin:"* ]]
 }
 
 @test "status shows Images section" {
