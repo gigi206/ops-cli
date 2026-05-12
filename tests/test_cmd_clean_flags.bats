@@ -123,10 +123,36 @@ MOCK_EOF
     assert_output_contains '=== ops volumes'
 }
 
+# ---- --images-only -----------------------------------------------------------
+
+@test "clean --dry-run --images-only hides containers+volumes sections" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" clean --dry-run --images-only
+    assert_success
+    assert_output_contains '=== Dangling images'
+    refute_output_contains '=== Stopped ops containers'
+    refute_output_contains '=== ops volumes'
+    # Summary line for containers is gone, image line stays.
+    refute_output_contains 'stopped ops containers:'
+    assert_output_contains 'dangling images:'
+}
+
+@test "clean --images-only prompt mentions images only" {
+    run bash -c "echo 'n' | env OPS_RUNTIME=docker $(ops_sh) clean --images-only"
+    assert_success
+    assert_output_contains 'Prune 1 dangling image(s)?'
+    refute_output_contains 'stopped ops container'
+}
+
 # ---- error: mutually exclusive flags -----------------------------------------
 
 @test "clean --no-volumes and --volumes-only are mutually exclusive" {
     run env OPS_RUNTIME=docker "$(ops_sh)" clean --no-volumes --volumes-only
+    assert_failure
+    assert_output_contains 'mutually exclusive'
+}
+
+@test "clean --images-only and --volumes-only are mutually exclusive" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" clean --images-only --volumes-only
     assert_failure
     assert_output_contains 'mutually exclusive'
 }
@@ -167,6 +193,7 @@ n' | env OPS_RUNTIME=docker $(ops_sh) clean"
     assert_success
     assert_output_contains '--no-volumes'
     assert_output_contains '--volumes-only'
+    assert_output_contains '--images-only'
     assert_output_contains '--include-shared'
     assert_output_contains 'ops-share-*'
     assert_output_contains 'SKIPPED by default'

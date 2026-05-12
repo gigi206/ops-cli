@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-05-12
+
+### Added
+- **`ops clean --images-only` to prune only dangling images.** Previously the only way to narrow `cmd_clean` (`ops.sh:1161`) was `--no-volumes` (which still removes stopped ops containers) or `--volumes-only` (which skips images entirely) — there was no flag to ask "just the `<none>:<none>` images, leave my stopped containers alone." Users hitting the dangling-image case after a rebuild had to either accept the container prune or invoke `podman image prune -f` outside ops. The new `--images-only` mirrors `--volumes-only`: it hides the Stopped containers + ops volumes sections, drops the container line from the Summary, and reshapes the interactive prompt to "Prune N dangling image(s)?" (no second clause). Internally it implies `--no-volumes` and gates the `ps -a … rm` block with `img_only=0`, so the container-removal code path is unreachable under the flag. Mutually exclusive with `--volumes-only` (same error format as the existing `--no-volumes`/`--volumes-only` guard). Regression guards: `tests/test_cmd_clean_flags.bats::clean --dry-run --images-only hides containers+volumes sections`, `::clean --images-only prompt mentions images only`, and `::clean --images-only and --volumes-only are mutually exclusive` — three tests covering display, prompt copy, and the exclusion error path.
+
 ## [1.14.0] - 2026-05-11
 
 ### Fixed

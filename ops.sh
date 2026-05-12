@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.14.0"
+OPS_VERSION="1.15.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -567,7 +567,7 @@ Subcommands:
   runtime CMD    Proxy directly to the runtime binary (currently: $OPS_RUNTIME)
   status|info    Show image, container, volumes and services state
   logs|log [NAME] [-s|--strip] [FLAGS]  Tail container logs (--strip removes ANSI escapes)
-  clean [--dry-run] [--no-volumes|--volumes-only] [--include-shared]
+  clean [--dry-run] [--no-volumes|--volumes-only|--images-only] [--include-shared]
                  Prune dangling images, stopped ops containers, ops volumes
                  (ops-share-* volumes are SKIPPED unless --include-shared)
   doctor         Validate config: OPS_IMAGES refs, dockerfiles, image labels
@@ -1162,7 +1162,7 @@ cmd_clean() {
     case "${1:-}" in
         -h|--help)
             cat <<EOF
-Usage: $(basename "$0") clean [--dry-run] [--no-volumes|--volumes-only] [--include-shared]
+Usage: $(basename "$0") clean [--dry-run] [--no-volumes|--volumes-only|--images-only] [--include-shared]
 
 Prune ops-tracked resources. Strictly filtered by labels — containers and
 volumes created outside ops.sh are preserved:
@@ -1184,6 +1184,7 @@ Options:
   --dry-run             Show what would be removed, exit without prompting or deleting
   --no-volumes          Skip the volumes prompt entirely (keep all volumes)
   --volumes-only        Only act on volumes — skip the images+containers prompt
+  --images-only         Only act on dangling images — skip stopped containers and volumes
   --include-shared      Include ops-share-* volumes in the volumes prompt
                         (default: skip them to protect cached state)
   -h, --help            Show this help
@@ -1192,18 +1193,20 @@ Examples:
   $(basename "$0") clean                              # interactive, keeps ops-share-*
   $(basename "$0") clean --dry-run                    # preview only
   $(basename "$0") clean --no-volumes                 # only dangling images + stopped containers
+  $(basename "$0") clean --images-only                # only dangling images
   $(basename "$0") clean --include-shared             # also prompt to drop ops-share-nix etc
 EOF
             return 0
             ;;
     esac
 
-    local dry=0 no_vol=0 vol_only=0 include_shared=0
+    local dry=0 no_vol=0 vol_only=0 img_only=0 include_shared=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --dry-run)        dry=1 ;;
             --no-volumes)     no_vol=1 ;;
             --volumes-only)   vol_only=1 ;;
+            --images-only)    img_only=1 ;;
             --include-shared) include_shared=1 ;;
             *) echo "Error: unknown option '$1' (see 'clean --help')" >&2; return 2 ;;
         esac
@@ -1212,6 +1215,16 @@ EOF
     if [ "$no_vol" = 1 ] && [ "$vol_only" = 1 ]; then
         echo "Error: --no-volumes and --volumes-only are mutually exclusive" >&2
         return 2
+    fi
+    if [ "$img_only" = 1 ] && [ "$vol_only" = 1 ]; then
+        echo "Error: --images-only and --volumes-only are mutually exclusive" >&2
+        return 2
+    fi
+    # --images-only narrows --no-volumes further (also drops the stopped-containers
+    # section). Set no_vol implicitly so the rest of the function only needs to
+    # branch on img_only for the containers half.
+    if [ "$img_only" = 1 ]; then
+        no_vol=1
     fi
 
     local count_img=0 count_ctn=0 count_vol=0 count_shared=0
@@ -1231,14 +1244,16 @@ EOF
         done < <("$RUNTIME_BIN" image ls -f dangling=true --format '{{.ID}}|{{.Size}}' 2>/dev/null || true)
         [ "$count_img" = 0 ] && echo "  (none)"
 
-        echo -e "\n\033[1;34m=== Stopped ops containers (label=ops.container=true) ===\033[0m"
-        local ctn_id ctn_name
-        while IFS='|' read -r ctn_id ctn_name; do
-            [ -z "$ctn_id" ] && continue
-            printf '  \033[31m✗\033[0m  %-14s  %s\n' "${ctn_id:0:12}" "$ctn_name"
-            count_ctn=$((count_ctn+1))
-        done < <("$RUNTIME_BIN" ps -a -f status=exited -f label=ops.container=true --format '{{.ID}}|{{.Names}}' 2>/dev/null || true)
-        [ "$count_ctn" = 0 ] && echo "  (none)"
+        if [ "$img_only" = 0 ]; then
+            echo -e "\n\033[1;34m=== Stopped ops containers (label=ops.container=true) ===\033[0m"
+            local ctn_id ctn_name
+            while IFS='|' read -r ctn_id ctn_name; do
+                [ -z "$ctn_id" ] && continue
+                printf '  \033[31m✗\033[0m  %-14s  %s\n' "${ctn_id:0:12}" "$ctn_name"
+                count_ctn=$((count_ctn+1))
+            done < <("$RUNTIME_BIN" ps -a -f status=exited -f label=ops.container=true --format '{{.ID}}|{{.Names}}' 2>/dev/null || true)
+            [ "$count_ctn" = 0 ] && echo "  (none)"
+        fi
     fi
 
     # Volumes section: split into "to prune" and "shared (kept)" lists.
@@ -1279,7 +1294,7 @@ EOF
 
     echo -e "\n\033[1;34m=== Summary ===\033[0m"
     [ "$vol_only" = 0 ] && printf '  dangling images:        %d\n' "$count_img"
-    [ "$vol_only" = 0 ] && printf '  stopped ops containers: %d\n' "$count_ctn"
+    [ "$vol_only" = 0 ] && [ "$img_only" = 0 ] && printf '  stopped ops containers: %d\n' "$count_ctn"
     if [ "$no_vol" = 0 ]; then
         printf '  ops volumes (to prune): %d\n' "$count_vol"
         [ "$count_shared" -gt 0 ] && printf '  ops volumes (kept):     %d  \033[2m(use --include-shared)\033[0m\n' "$count_shared"
@@ -1291,20 +1306,26 @@ EOF
     fi
 
     if [ "$vol_only" = 0 ] && [ $((count_img + count_ctn)) -gt 0 ]; then
-        printf "\nPrune %d dangling image(s) and %d stopped ops container(s)? [y/N] " \
-            "$count_img" "$count_ctn"
+        if [ "$img_only" = 1 ]; then
+            printf "\nPrune %d dangling image(s)? [y/N] " "$count_img"
+        else
+            printf "\nPrune %d dangling image(s) and %d stopped ops container(s)? [y/N] " \
+                "$count_img" "$count_ctn"
+        fi
         read -r answer
         if [[ "$answer" =~ ^[yY]$ ]]; then
             "$RUNTIME_BIN" image prune -f >/dev/null 2>&1 || true
-            # Avoid `xargs -r` (GNU-only): on BSD/macOS xargs without -r runs the
-            # command once with no args and the runtime errors out. Read into an
-            # array and skip the call when empty.
-            local -a _exited_ids=()
-            while IFS= read -r _id; do
-                [ -n "$_id" ] && _exited_ids+=("$_id")
-            done < <("$RUNTIME_BIN" ps -a -f status=exited -f label=ops.container=true --format '{{.ID}}' 2>/dev/null)
-            if [ ${#_exited_ids[@]} -gt 0 ]; then
-                "$RUNTIME_BIN" rm "${_exited_ids[@]}" >/dev/null 2>&1 || true
+            if [ "$img_only" = 0 ]; then
+                # Avoid `xargs -r` (GNU-only): on BSD/macOS xargs without -r runs the
+                # command once with no args and the runtime errors out. Read into an
+                # array and skip the call when empty.
+                local -a _exited_ids=()
+                while IFS= read -r _id; do
+                    [ -n "$_id" ] && _exited_ids+=("$_id")
+                done < <("$RUNTIME_BIN" ps -a -f status=exited -f label=ops.container=true --format '{{.ID}}' 2>/dev/null)
+                if [ ${#_exited_ids[@]} -gt 0 ]; then
+                    "$RUNTIME_BIN" rm "${_exited_ids[@]}" >/dev/null 2>&1 || true
+                fi
             fi
             echo "Pruned."
         fi
