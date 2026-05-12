@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.1] - 2026-05-12
+
+### Fixed
+- **Image build no longer times out on heavy `nix:*` packages.** Starting around mise 2026.5.x, the default `MISE_FETCH_REMOTE_VERSIONS_TIMEOUT=20s` (defined in `mise`'s `settings.toml`, applied by `src/backend/vfox.rs` around the `BackendListVersions` call) became too tight for the nix-backend resolution path: `nix:google-chrome` (and intermittently `nix:docker-client`, `nix:docker-compose`, `nix:semgrep`) would fail with `timed out after 20.00s` during the Dockerfile's `mise use -g … ${EXTRA_MISE_TOOLS}` step. The 20s timeout cuts off `BackendListVersions` — the Lua hook that lists available versions before install — and heavy nix packages take longer than 20s to resolve when the parallel `MISE_JOBS=8` queue is saturated by the baseline tools that just landed (`nix:git`, `node`, `cli/cli`, `ripgrep`, `jq`, `ast-grep`). v1.15.0's `Verify Image Integration (Debian)` CI job failed for exactly this reason. The fix lives in `Dockerfile` lines 148-156 and `Dockerfile.debian` lines 118-129: `MISE_JOBS=2` reduces queue contention so each heavy resolution gets bandwidth, and `MISE_FETCH_REMOTE_VERSIONS_TIMEOUT=120s` extends the per-resolution budget far past the worst-case `BackendListVersions` runtime observed locally (~45s for `nix:docker-client` cold-cache). Validated by an end-to-end `ops build` against `Dockerfile` (Arch base) finishing through the Nix layer with all four `EXTRA_MISE_TOOLS` packages installed — the previous build aborted at step 11/17 with three timeout errors.
+
 ## [1.15.0] - 2026-05-12
 
 ### Added
