@@ -134,6 +134,56 @@ _unescape() {
     [[ "$output" == *"@anthropic-ai/claude-code"* ]]
 }
 
+@test "run --app claude auto-injects IS_SANDBOX=1 (claude code --dangerously-skip-permissions bypass)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--env IS_SANDBOX=1"* ]]
+}
+
+@test "run without --app claude does NOT inject IS_SANDBOX (scoped to claude only)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"IS_SANDBOX"* ]]
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app gemini --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"IS_SANDBOX"* ]]
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app codex --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"IS_SANDBOX"* ]]
+}
+
+@test "run --app claude IS_SANDBOX opt-out wins regardless of argv order (--env BEFORE --app)" {
+    # Pre-parser argv ordering must not let ops's auto-inject clobber a user opt-out.
+    # docker / podman / nerdctl use "last --env wins", so an argv-time inject placed
+    # AFTER a user `--env IS_SANDBOX=` would silently re-enable the sandbox flag.
+    # The implementation injects POST-parser with a pre-check on extra_envs, so
+    # both orderings must show user value only (no IS_SANDBOX=1 token).
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --env IS_SANDBOX= --app claude --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"IS_SANDBOX=1"* ]]
+    [[ "$output" == *"IS_SANDBOX="* ]]
+}
+
+@test "run --app claude IS_SANDBOX opt-out wins regardless of argv order (--env AFTER --app)" {
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --env IS_SANDBOX= --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"IS_SANDBOX=1"* ]]
+    [[ "$output" == *"IS_SANDBOX="* ]]
+}
+
+@test "run --app claude user-supplied IS_SANDBOX=anyvalue suppresses the auto-inject" {
+    # Any user-set IS_SANDBOX (=1, =0, =foo) takes precedence — the pre-check
+    # matches IS_SANDBOX=* as a prefix, so we never double-inject.
+    run env OPS_RUNTIME=docker "$(ops_sh)" run --app claude --env IS_SANDBOX=custom --dry-run
+    [ "$status" -eq 0 ]
+    # Exactly one IS_SANDBOX occurrence per cmdline (dry-run prints the cmd twice).
+    local count
+    count=$(printf '%s\n' "$output" | grep -oc -- 'IS_SANDBOX=custom')
+    # Each cmdline print contributes 1 → 2 total, AND no IS_SANDBOX=1 should appear.
+    [[ "$output" != *"IS_SANDBOX=1"* ]]
+    [ "$count" -ge 1 ]
+}
+
 @test "run --app codex builds app command" {
     run env OPS_RUNTIME=docker "$(ops_sh)" run --app codex --dry-run
     [ "$status" -eq 0 ]
