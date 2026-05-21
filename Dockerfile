@@ -276,7 +276,6 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
  && sudo chmod -R a+rX /etc/mise \
  && mkdir -p /opt/mise/data/config \
  && mkdir -p /nix/var/nix/gcroots/mise \
- && shopt -s nullglob \
  && for f in /opt/mise/data/installs/nix-*/*; do \
       [ -L "$f" ] || continue; \
       t=$(readlink -f "$f"); \
@@ -286,7 +285,6 @@ RUN --mount=type=secret,id=github_token,required=false,uid=${USER_UID},mode=0400
           ;; \
       esac; \
     done \
- && shopt -u nullglob \
  && _profile_store="$(readlink -f /opt/nix-home/.nix-profile)" \
  && if [ -n "$_profile_store" ] && [ -e "$_profile_store" ]; then \
       ln -sfn "$_profile_store" /nix/var/nix/gcroots/ops-nix-profile; \

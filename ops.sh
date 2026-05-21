@@ -23,7 +23,7 @@ fi
 # release; CHANGELOG.md should carry the matching entry. Dockerfile and
 # Dockerfile.debian declare `ARG VERSION=<same>` as the fallback for direct
 # `docker build .` invocations — keep the three in lockstep.
-OPS_VERSION="1.17.0"
+OPS_VERSION="1.18.0"
 readonly OPS_VERSION
 
 # Snapshot OPS_* vars at entry so cmd_config can report each var's origin:
@@ -3249,6 +3249,29 @@ APPDIR=\"\$extracted\" exec \"\$extracted/AppRun\" --no-sandbox --ozone-platform
                                break ;;
         esac
     done
+
+    # IS_SANDBOX=1 is Claude Code's (undocumented) opt-out for the root/sudo
+    # guard that otherwise refuses --dangerously-skip-permissions
+    # (anthropics/claude-code#9184). Rootless ops always lands as UID 0 inside
+    # the container, so the guard would fire on every
+    # `ops run --app claude -- --dangerously-skip-permissions`. The container
+    # itself is the sandbox here, so the assertion is honest.
+    # Injected POST-parser (not inside the --app) branch) so the user's own
+    # `--env IS_SANDBOX=...` always wins regardless of argv ordering — docker
+    # /podman/nerdctl use "last --env wins" and an argv-time inject would clobber
+    # a user opt-out placed BEFORE --app claude. The pre-check on extra_envs
+    # makes the injection unconditionally skipped when the user already set it
+    # (any value, including empty for opt-out).
+    if [ "${_app_name:-}" = "claude" ]; then
+        local _has_sandbox_env=0 _e
+        # `${arr[@]+"${arr[@]}"}` is the nounset-safe empty-array expansion —
+        # bare `"${extra_envs[@]}"` errors under `set -u` when the array is
+        # empty (e.g. no auto-propagated host secrets, no -e flags).
+        for _e in ${extra_envs[@]+"${extra_envs[@]}"}; do
+            case "$_e" in IS_SANDBOX=*) _has_sandbox_env=1; break ;; esac
+        done
+        [ "$_has_sandbox_env" = 0 ] && extra_envs+=(--env "IS_SANDBOX=1")
+    fi
 
     # --install: run `mise install` (from the workdir's mise.toml) before the
     # real command. Three cases, depending on what else was asked:
