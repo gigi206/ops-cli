@@ -1,149 +1,147 @@
-# `ops` (bwrap) — squelette d'architecture
+# `ops` (bwrap) — architecture skeleton
 
-> Blueprint du nouvel `ops` (substrat bubblewrap + nix daemonless). Synthétise la
-> faisabilité ([`bwrap-spike-2026-06-14.md`](bwrap-spike-2026-06-14.md)) et le
-> modèle de menace + décisions
-> ([`bwrap-threat-model-and-binds.md`](bwrap-threat-model-and-binds.md)) en
-> modules Rust, surface CLI et ordre des milestones.
+> Blueprint for the new `ops` (bubblewrap substrate + daemonless nix). Synthesizes
+> the feasibility study ([`bwrap-spike-2026-06-14.md`](bwrap-spike-2026-06-14.md)) and the
+> threat model + decisions
+> ([`bwrap-threat-model-and-binds.md`](bwrap-threat-model-and-binds.md)) into
+> Rust modules, CLI surface, and milestone ordering.
 
-## 1. Le pipeline (vue d'ensemble)
+## 1. The pipeline (overview)
 
 ```
-  config (global + projet)
-        │   ← trust gate (hash de contenu, modèle direnv ; non-fiable ⇒ champs sécu ignorés)
+  config (global + project)
+        │   ← trust gate (content hash, direnv model; untrusted ⇒ security fields ignored)
         ▼
-  résolution des outils  ── mise + nix (daemonless, sandbox=false, nixpkgs épinglé)
+  tool resolution  ── mise + nix (daemonless, sandbox=false, pinned nixpkgs)
         │
         ▼
   ┌──────────────────────────────────────────────┐
-  │   SandboxSpec   (LE point d'audit unique)      │   ← le moteur de policy (mode A/B) le produit
+  │   SandboxSpec   (THE single audit point)       │   ← the policy engine (mode A/B) produces it
   └──────────────────────────────────────────────┘
         │
         ▼
-  assembleur bwrap  (binds + env + FHS + namespaces + réseau)  →  argv  (fonction PURE du Spec)
+  bwrap assembler  (binds + env + FHS + namespaces + network)  →  argv  (PURE function of the Spec)
         │
         ▼
-  launch : exec bwrap, remise du TTY
+  launch: exec bwrap, hand over the TTY
 ```
 
-**Clé de voûte : `SandboxSpec`.** Une struct **déclarative et pure** qui décrit
-tout ce que le sandbox expose (binds, env, store, namespaces, trous, cmd). Tout
-l'amont la **produit** ; l'assembleur la **consomme**. Invariant de sécurité :
-**seul le constructeur de Spec ajoute de l'exposition ; la génération d'argv est
-une fonction pure du Spec.** ⇒ la revue de sécurité a **une seule surface** à
-auditer.
+**Keystone: `SandboxSpec`.** A **declarative and pure** struct that describes
+everything the sandbox exposes (binds, env, store, namespaces, holes, cmd). The
+entire upstream **produces** it; the assembler **consumes** it. Security invariant:
+**only the Spec constructor adds exposure; argv generation is a pure function of
+the Spec.** ⇒ the security review has **a single surface** to audit.
 
-## 2. Modules Rust
+## 2. Rust modules
 
-| Module | Rôle | Réutilise l'actuel ? |
+| Module | Role | Reuses current code? |
 |---|---|---|
-| `cli/` | surface clap + dispatch | adapte `src/cli.rs` |
-| `config/` | parse + layering global/projet (schéma symétrique), validation | **adapte** la machinerie de layering existante |
-| `trust/` | trust gate : **hash des champs sécu**, store des hash validés, re-prompt sur changement (direnv) ; gating des champs sécu d'un projet non-fiable | **étend** `src/trust.rs` |
-| `store/` | provisionne le **store user-owned daemonless** (nix statique relocalisé) + gère le layout base/overlay, invocation nix daemonless (`NIX_REMOTE=`, `sandbox=false`). ⚠️ **mécanisme PROVISOIRE — voir §7.4** | neuf |
-| `provision/` | résout outils/paquets déclarés → chemins du store via **mise+nix** ; pont mise-nix ; **épinglage nixpkgs** pour non-fiables | **adapte** le pont mise-nix (lua) |
-| `sandbox/` | **le cœur** — assemble le `SandboxSpec` puis l'argv bwrap | neuf |
-| ↳ `sandbox/spec.rs` | la struct `SandboxSpec` + ses invariants | neuf |
-| ↳ `sandbox/policy.rs` | mode A/B × trust → quels trous ouverts (la matrice du §5 du modèle de menace) | neuf |
-| ↳ `sandbox/binds.rs` | zones 0/1/2 ; canonicalisation TOCTOU ; `/etc/passwd`+`group` **synthétiques** ; userland FHS (loader+libs) | neuf |
-| ↳ `sandbox/env.rs` | zone env : `--clearenv` + allowlist + injection de secrets (config fiable only) | neuf |
-| ↳ `sandbox/net.rs` | policy réseau (share/unshare ; hook allowlist futur) | neuf |
-| ↳ `sandbox/argv.rs` | construction finale de l'argv bwrap (pure) | neuf |
-| ↳ `sandbox/launch.rs` | exec bwrap + remise du TTY (modèle exec-replace) | adapte `src/run/` |
-| `session/` | **registre de sessions** (pas de daemon → registre sur disque) : liste des sandboxes actifs, « 2ᵉ terminal dans le même env », **GC** des `$HOME`/overlays per-projet | neuf (remplace `status.rs`/`clean.rs`) |
-| `app/` | définitions d'apps (claude/gemini/…) : quel outil, **quels secrets requis** (déclarés fiable), quel mode | **adapte** `src/app/` + `apps.toml` |
-| `doctor/` | prérequis (**userns** !), santé du store, version nix | **réoriente** `src/doctor.rs` |
-| `platform/ term/ util/ download/` | inchangés (download sert à récupérer le nix statique / assets) | garde |
+| `cli/` | clap surface + dispatch | adapts `src/cli.rs` |
+| `config/` | parse + global/project layering (symmetric schema), validation | **adapts** the existing layering machinery |
+| `trust/` | trust gate: **hashing of security fields**, store of validated hashes, re-prompt on change (direnv); gating of security fields for an untrusted project | **extends** `src/trust.rs` |
+| `store/` | provisions the **user-owned daemonless store** (relocated static nix) + manages the base/overlay layout, daemonless nix invocation (`NIX_REMOTE=`, `sandbox=false`). ⚠️ **PROVISIONAL mechanism — see §7.4** | new |
+| `provision/` | resolves declared tools/packages → store paths via **mise+nix**; mise-nix bridge; **nixpkgs pinning** for untrusted | **adapts** the mise-nix bridge (lua) |
+| `sandbox/` | **the core** — assembles the `SandboxSpec` then the bwrap argv | new |
+| ↳ `sandbox/spec.rs` | the `SandboxSpec` struct + its invariants | new |
+| ↳ `sandbox/policy.rs` | mode A/B × trust → which holes are open (the matrix from §5 of the threat model) | new |
+| ↳ `sandbox/binds.rs` | zones 0/1/2; TOCTOU canonicalization; **synthetic** `/etc/passwd`+`group`; FHS userland (loader+libs) | new |
+| ↳ `sandbox/env.rs` | env zone: `--clearenv` + allowlist + secret injection (trusted config only) | new |
+| ↳ `sandbox/net.rs` | network policy (share/unshare; future allowlist hook) | new |
+| ↳ `sandbox/argv.rs` | final construction of the bwrap argv (pure) | new |
+| ↳ `sandbox/launch.rs` | exec bwrap + hand over the TTY (exec-replace model) | adapts `src/run/` |
+| `session/` | **session registry** (no daemon → on-disk registry): list of active sandboxes, "2nd terminal in the same env", **GC** of per-project `$HOME`/overlays | new (replaces `status.rs`/`clean.rs`) |
+| `app/` | app definitions (claude/gemini/…): which tool, **which secrets required** (declared trusted), which mode | **adapts** `src/app/` + `apps.toml` |
+| `doctor/` | prerequisites (**userns**!), store health, nix version | **reorients** `src/doctor.rs` |
+| `platform/ term/ util/ download/` | unchanged (download serves to fetch the static nix / assets) | keep |
 
-**Disparaissent** : `src/build.rs` (build d'image), `src/nerdctl.rs`, le wrapping
-runtime OCI ; `clean.rs` + `status.rs` → fusionnés dans le module **`session/`**
-(GC des overlays/`$HOME` + liste des sessions).
+**Disappearing**: `src/build.rs` (image build), `src/nerdctl.rs`, the OCI
+runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** module
+(GC of overlays/`$HOME` + session listing).
 
-## 3. La struct centrale (esquisse)
+## 3. The central struct (sketch)
 
 ```rust
 struct SandboxSpec {
-    mode:       ActorMode,        // Interactive (A) | Agent (B, défaut)
-    trust:      TrustTier,        // Untrusted (défaut) | Trusted
+    mode:       ActorMode,        // Interactive (A) | Agent (B, default)
+    trust:      TrustTier,        // Untrusted (default) | Trusted
     workdir:    PathBuf,
-    binds:      Vec<Bind>,        // { src, dest, Ro|Rw } — la seule source d'exposition FS
-    store:      StoreLayout,      // { base_ro, overlay_upper_par_projet }
-    env:        EnvPolicy,        // { clearenv: true, allowlist, secrets_injectés }
-    fhs:        FhsUserland,      // { loader, lib_paths } — userland 100% nix
-    net:        NetPolicy,        // Shared{blocks} | Isolated | Allowlist(futur)
-    namespaces: NsPolicy,         // pid: REQUIS, user, ipc, uts, mount…
+    binds:      Vec<Bind>,        // { src, dest, Ro|Rw } — the only source of FS exposure
+    store:      StoreLayout,      // { base_ro, per_project_overlay_upper }
+    env:        EnvPolicy,        // { clearenv: true, allowlist, injected_secrets }
+    fhs:        FhsUserland,      // { loader, lib_paths } — 100% nix userland
+    net:        NetPolicy,        // Shared{blocks} | Isolated | Allowlist(future)
+    namespaces: NsPolicy,         // pid: REQUIRED, user, ipc, uts, mount…
     holes:      Holes,            // { gui: None|Wayland|X11, ssh_agent, container_socket }
     cmd:        Vec<String>,
 }
 ```
 
-Invariants vérifiés à la construction : `namespaces.pid == true` ; aucun bind
-hors racine-projet/store/synthétique pour `Untrusted` ; `env.clearenv == true` ;
-`holes.container_socket == false` si `mode == Agent`.
+Invariants checked at construction: `namespaces.pid == true`; no bind outside the
+project-root/store/synthetic for `Untrusted`; `env.clearenv == true`;
+`holes.container_socket == false` if `mode == Agent`.
 
-## 4. Surface CLI
+## 4. CLI surface
 
-| Commande | Effet | Mode |
+| Command | Effect | Mode |
 |---|---|---|
-| `ops shell` | shell de dev interactif dans le sandbox du projet | A |
-| `ops run -- <cmd>` | exécute une commande dans le sandbox | A |
-| `ops app <name>` | lance une app packagée (claude/gemini/…) ; le mode est **déclaré par l'app** | B (défaut) |
-| `ops install <pkg>` | installe un outil dans le projet (in-sandbox, overlay) | — |
-| `ops trust` / `ops untrust` | gère le trust (hash de contenu, re-validation) | — |
-| `ops config …` | voit/édite la config layered | — |
-| `ops doctor` | vérifie prérequis (**userns**), santé store | — |
-| `ops self-update` | maj du binaire | — |
+| `ops shell` | interactive dev shell in the project sandbox | A |
+| `ops run -- <cmd>` | runs a command in the sandbox | A |
+| `ops app <name>` | launches a packaged app (claude/gemini/…); the mode is **declared by the app** | B (default) |
+| `ops install <pkg>` | installs a tool in the project (in-sandbox, overlay) | — |
+| `ops trust` / `ops untrust` | manages trust (content hash, re-validation) | — |
+| `ops config …` | views/edits the layered config | — |
+| `ops doctor` | checks prerequisites (**userns**), store health | — |
+| `ops self-update` | updates the binary | — |
 
-## 5. Ordre des milestones (le DAG)
+## 5. Milestone ordering (the DAG)
 
-| M | Titre | Contenu | Livrable |
+| M | Title | Content | Deliverable |
 |---|---|---|---|
-| **M0** | Prérequis + bootstrap store | `ops doctor` : **userns absent → hard-fail avec remédiation, JAMAIS de fallback silencieux** (proot = aucune frontière sécu) ; provisionne le store daemonless ; **valider le chemin EXACT du design : base ro + overlay upper + install daemonless + cohérence de la db SQLite nix à travers l'overlay** (≠ ce que le spike a prouvé, qui était un store *plat*) | spike productisé **+ dé-risquage du store (§7.4)** |
-| **M1** | Sandbox minimal | `SandboxSpec` + `binds.rs` (zones 0/1/2) + userland FHS + `--clearenv` + `--unshare-pid` + same-uid + **`session/` (registre, 2ᵉ terminal)** ; `ops shell` isole l'hôte | shell utilisable, Mode A |
-| **M2** | Config + trust | layering global/projet ; trust gate hash-de-contenu (direnv) ; gating des champs non-fiables | `.ops.toml` pilote le sandbox **sûrement** |
-| **M3** | Provisioning d'outils | pont mise+nix ; paquets déclaratifs ; install in-sandbox → overlay per-projet ; nixpkgs épinglé | outils reproductibles |
-| **M4** | Apps + **Mode B** | définitions d'apps ; moteur de policy (A/B × trust → trous) ; injection de secret least-privilege. ⚠️ **livre le flagship avec le trou de confidentialité OUVERT jusqu'à M6** (clé API injectée + réseau ouvert = exfiltration possible, cf. §1 du modèle de menace). Option à valider : avancer ici les 2 blocks quasi-gratuits (`169.254.169.254`+localhost) + egress allowlist opt-in (tu as dit réseau en dernier) | **`ops app claude` = le différenciateur, confidentialité-ouverte** |
-| **M5** | Trous de parité + GC | GUI (Wayland) ; socket conteneur **Mode A only** ; ssh-agent ; **GC des overlays/`$HOME` per-projet** (`session/`) | commodités opt-in + housekeeping |
-| **M6** | **Policy réseau / allowlist** | couche netns + filtrage (nono/greywall) ; blocks métadonnées/localhost → allowlist | **ferme le trou de confidentialité — DERNIER** |
-| **M7** | Durcissement (plus tard) | tier subuid ; ACL fichier Landlock ; limites cgroups/DoS | tiers opt-in |
+| **M0** | Prerequisites + store bootstrap | `ops doctor`: **userns absent → hard-fail with remediation, NEVER a silent fallback** (proot = no security boundary); provisions the daemonless store; **validate the EXACT design path: base ro + overlay upper + daemonless install + consistency of the nix SQLite db across the overlay** (≠ what the spike proved, which was a *flat* store) | productized spike **+ store de-risking (§7.4)** |
+| **M1** | Minimal sandbox | `SandboxSpec` + `binds.rs` (zones 0/1/2) + FHS userland + `--clearenv` + `--unshare-pid` + same-uid + **`session/` (registry, 2nd terminal)**; `ops shell` isolates the host. Also: **`doctor`** — replace the userns *proxy* probe with a real bwrap smoke run through this argv builder (turns "looks like it'll work" into "verified") | usable shell, Mode A |
+| **M2** | Config + trust | global/project layering; content-hash trust gate (direnv); gating of untrusted fields | `.ops.toml` drives the sandbox **safely** |
+| **M3** | Tool provisioning | mise+nix bridge; declarative packages; in-sandbox install → per-project overlay; pinned nixpkgs | reproducible tools |
+| **M4** | Apps + **Mode B** | app definitions; policy engine (A/B × trust → holes); least-privilege secret injection. ⚠️ **ships the flagship with the confidentiality hole OPEN until M6** (injected API key + open network = possible exfiltration, cf. §1 of the threat model). Option to validate: bring forward here the 2 near-free blocks (`169.254.169.254`+localhost) + opt-in egress allowlist (you said network last) | **`ops app claude` = the differentiator, confidentiality-open** |
+| **M5** | Parity holes + GC | GUI (Wayland); container socket **Mode A only**; ssh-agent; **GC of per-project overlays/`$HOME`** (`session/`) | opt-in conveniences + housekeeping |
+| **M6** | **Network policy / allowlist** | netns layer + filtering (nono/greywall); metadata/localhost blocks → allowlist | **closes the confidentiality hole — LAST** |
+| **M7** | Hardening (later) | subuid tier; Landlock file ACL; cgroups/DoS limits | opt-in tiers |
 
-Logique : **M1** livre vite un truc utilisable ; **M4** livre le différenciateur ;
-**M6** ferme la confidentialité en dernier (décision actée).
+Rationale: **M1** quickly delivers something usable; **M4** delivers the
+differentiator; **M6** closes confidentiality last (decision made).
 
-## 6. Invariants transverses
-- **`SandboxSpec` = surface d'audit unique** ; argv = fonction pure du Spec.
-- **Default-deny** partout (FS, env, réseau plus tard).
-- **`--unshare-pid` toujours** (le same-uid n'est sûr qu'avec).
-- **Config non-fiable ne touche jamais les champs sécu.**
-- **Installs in-sandbox uniquement** ; store de base ro ; overlay per-projet (⚠️ provisoire, cf. §7.4).
+## 6. Cross-cutting invariants
+- **`SandboxSpec` = single audit surface**; argv = pure function of the Spec.
+- **Default-deny** everywhere (FS, env, network later).
+- **`--unshare-pid` always** (same-uid is only safe with it).
+- **Untrusted config never touches the security fields.**
+- **In-sandbox installs only**; base store ro; per-project overlay (⚠️ provisional, cf. §7.4).
 
-## 7. Questions de design encore ouvertes (à trancher avec l'utilisateur)
-1. **Modèle de nouns de config.** [[noun-inheritance-model]] verrouille
-   `image → container → app` — **périmé** (plus d'image ni de conteneur).
-   Remplacement probable : `profile`(userland/outils de base) → `sandbox`(runtime :
-   binds/env/net/mode) → `app`. À redéfinir.
-2. **Verbe CLI pour les agents.** `ops app <x>` avec mode déclaré par l'app
-   (proposé) vs un `ops agent <x>` explicite qui rend la posture B visible.
-3. **Comment ops embarque nix.** Binaire nix statique **embarqué** dans l'asset
-   ops, ou **téléchargé** au bootstrap (closure de base depuis un cache binaire /
-   cachix) ? Impacte la taille de l'asset et le premier `ops doctor`.
-4. **⚠️ Mécanisme du store — PROVISOIRE (seul point pouvant forcer un changement
-   structurel).** Le spike a prouvé un **store plat user-owned** bindé sur `/nix`
-   — **pas** le design « base ro + overlay upper per-projet + install daemonless +
-   cohérence de la db SQLite nix à travers l'overlay ». Ce chemin exact est **non
-   testé** → à dé-risquer en **M0**. Et un **trilemme** non résolu :
+## 7. Design questions still open (to settle with the user)
+1. **Config noun model.** [[noun-inheritance-model]] locks
+   `image → container → app` — **obsolete** (no more image or container).
+   Likely replacement: `profile`(userland/base tools) → `sandbox`(runtime:
+   binds/env/net/mode) → `app`. To be redefined.
+2. **CLI verb for agents.** `ops app <x>` with mode declared by the app
+   (proposed) vs an explicit `ops agent <x>` that makes posture B visible.
+3. **How ops embeds nix.** Static nix binary **embedded** in the ops asset,
+   or **downloaded** at bootstrap (base closure from a binary cache /
+   cachix)? Impacts the asset size and the first `ops doctor`.
+4. **⚠️ Store mechanism — PROVISIONAL (the only point that could force a
+   structural change).** The spike proved a **flat user-owned store** bound on `/nix`
+   — **not** the "base ro + per-project overlay upper + daemonless install +
+   consistency of the nix SQLite db across the overlay" design. This exact path is **not
+   tested** → to be de-risked in **M0**. And an unresolved **trilemma**:
 
-   | Mécanisme | dedup disque | isolation per-projet (anti-poison) | multi-session |
+   | Mechanism | disk dedup | per-project isolation (anti-poison) | multi-session |
    |---|---|---|---|
-   | store plat partagé | ✓ | ✗ | ✓ (locks db nix) |
-   | store plat per-projet | ✗ (574 Mo × N) | ✓ | ✓ |
-   | **overlay base+upper (le design)** | ✓ | ✓ | **✗** |
+   | shared flat store | ✓ | ✗ | ✓ (nix db locks) |
+   | per-project flat store | ✗ (574 MB × N) | ✓ | ✓ |
+   | **base+upper overlay (the design)** | ✓ | ✓ | **✗** |
 
-   L'overlay achète dedup+isolation mais **casse le multi-session** : overlayfs ne
-   supporte pas le même `upperdir` monté par 2 montages concurrents — or 2 sessions
-   du même projet **doivent** partager l'upper. Ironie : le store **plat prouvé**
-   gère la concurrence seul via les locks de la db nix. Piste (spike, pas
-   décision) : la **vérif de signature nix** couvre déjà le poisoning pour les
-   chemins **substitués du cache** (seuls les chemins **construits localement** en
-   `sandbox=false` sont non signés) → pourrait **rouvrir l'option store plat
-   partagé**.
+   The overlay buys dedup+isolation but **breaks multi-session**: overlayfs does
+   not support the same `upperdir` mounted by 2 concurrent mounts — yet 2 sessions
+   of the same project **must** share the upper. The irony: the **proven flat**
+   store handles concurrency on its own via the nix db locks. Lead (spike, not
+   decision): **nix signature verification** already covers poisoning for
+   **cache-substituted** paths (only **locally built** paths under
+   `sandbox=false` are unsigned) → could **reopen the shared flat store option**.

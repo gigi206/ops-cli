@@ -1,127 +1,127 @@
-# Spike — `ops` sur bubblewrap + nix daemonless (2026-06-14)
+# Spike — `ops` on bubblewrap + daemonless nix (2026-06-14)
 
-> **But du spike.** Décider si `ops` peut abandonner les conteneurs OCI
-> (docker/podman/nerdctl) au profit d'un **lanceur de bac à sable
-> bubblewrap + nix single-user (sans daemon)**, dont le différenciateur est :
-> lancer des outils — dont des **agents IA encapsulés** — qui installent
-> toutes les dépendances d'un projet **sans muter l'OS hôte**. À terme :
-> contrôle d'accès fichier/réseau façon nono.sh / greywall.io (Landlock).
+> **Goal of the spike.** Decide whether `ops` can drop OCI containers
+> (docker/podman/nerdctl) in favor of a **bubblewrap sandbox launcher +
+> single-user (daemonless) nix**, whose differentiator is:
+> running tools — including **encapsulated AI agents** — that install
+> all of a project's dependencies **without mutating the host OS**. Eventually:
+> file/network access control in the style of nono.sh / greywall.io (Landlock).
 >
-> Réponse courte : **oui, c'est faisable, et le différenciateur est prouvé en
-> live.** Restent deux décisions de design (FHS hermétique, trust orienté
-> sécurité) et un prérequis dur (user namespaces non-privilégiés).
+> Short answer: **yes, it is feasible, and the differentiator is proven
+> live.** Two design decisions remain (hermetic FHS, security-oriented trust)
+> plus one hard prerequisite (unprivileged user namespaces).
 
-## Machine de test
+## Test machine
 
 | | |
 |---|---|
 | OS | Ubuntu 26.04 LTS (resolute) |
-| Noyau | 7.0.0-22-generic x86_64 |
-| `kernel.apparmor_restrict_unprivileged_userns` | `0` (non restreint) |
+| Kernel | 7.0.0-22-generic x86_64 |
+| `kernel.apparmor_restrict_unprivileged_userns` | `0` (unrestricted) |
 | `kernel.unprivileged_userns_clone` | `1` |
-| Outils présents | `bwrap`, `nix` 2.34.5, `mise`, `nix-user-chroot`, `slirp4netns`, `newuidmap/newgidmap`, `podman`, `docker`, `fusermount3` |
-| Absents | `proot`, `nix-portable` |
+| Tools present | `bwrap`, `nix` 2.34.5, `mise`, `nix-user-chroot`, `slirp4netns`, `newuidmap/newgidmap`, `podman`, `docker`, `fusermount3` |
+| Absent | `proot`, `nix-portable` |
 
-## Gate A — user namespaces non-privilégiés (le prérequis qui décide de tout)
+## Gate A — unprivileged user namespaces (the prerequisite that decides everything)
 
 ```bash
 sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
 unshare --user --map-root-user echo ok      # doit réussir SANS root
 ```
 
-Sur cette machine : **VERT** (`unshare --user` rend `uid=0` sans root, exit 0).
+On this machine: **GREEN** (`unshare --user` yields `uid=0` without root, exit 0).
 
-⚠️ **Mais le défaut Ubuntu 24.04+ stock est `…restrict… = 1` (restreint).** Sans
-userns non-privilégié, le seul fallback est **proot**, qui est de l'émulation
-ptrace : **aucune frontière de sécurité** (contournable). Pour un produit de bac
-à sable, « pas de userns » ne signifie pas « plus lent », mais **pas de
-produit**. À traiter comme exigence dure, pas comme préférence. Contournements
-possibles (chacun = un setup root unique) : flip du sysctl documenté, profil
-AppArmor dédié, ou `bwrap` setuid.
+⚠️ **But the stock Ubuntu 24.04+ default is `…restrict… = 1` (restricted).** Without
+unprivileged userns, the only fallback is **proot**, which is ptrace
+emulation: **no security boundary** (bypassable). For a sandbox product,
+"no userns" does not mean "slower," it means **no
+product**. Treat it as a hard requirement, not a preference. Possible
+workarounds (each = a one-time root setup): documented sysctl flip,
+dedicated AppArmor profile, or setuid `bwrap`.
 
-## Matrice de faisabilité (tout testé en live)
+## Feasibility matrix (everything tested live)
 
-| Capacité ops actuelle | Verdict | Preuve |
+| Current ops capability | Verdict | Evidence |
 |---|---|---|
-| Sandbox non-privilégié | ✅ | `unshare --user` / `bwrap` OK sans root |
-| Isolation hôte (`$HOME`, `~/.ssh`, `/etc/shadow`) | ✅ | tous invisibles dans le sandbox |
-| Montage projet en lecture/écriture | ✅ | écriture OK |
-| **UID/GID hôte préservé** | ✅ **gain** | `uid=1000` → **fini la danse `USER_UID` du build d'image** |
-| `$HOME` propre au sandbox | ✅ | isolé de l'hôte, écrivable |
-| Réseau on/off | ✅ | `--share-net` joignable ; sans → coupé |
-| **Conteneurs imbriqués** | ✅ | docker CLI → socket podman hôte (client 28.4 / serveur 5.7), `docker ps` OK |
-| GUI (Chrome/Wayland/X) | ✅ | sockets `wayland-0`, `X0`, `bus` présents et bindables |
-| nix lit/exécute dans le sandbox | ✅ | `nix 2.34.5` tourne |
-| **Install nix daemonless** (différenciateur) | ✅ **prouvé** | install dans store **user-owned `gigi:gigi`** sans daemon, puis exec sous bwrap → « Bonjour, le monde ! » |
-| mise + nix env | ✅\* | install-from-cache OK ; build-from-source → voir fork #1 |
-| Config layering `.ops.toml` global+projet | ✅ | logique pure ops, indépendante du substrat |
-| Multi-session | ✅ **plus simple** | état dans les dossiers ; 2 process bwrap ; plus de `run_attach`/lock |
-| FHS hermétique (userland 100 % nix) | ✅ **prouvé** | node officiel (étranger à nix) tourne en userland 100 % nix via loader+libs du store ; voir spike dédié plus bas |
+| Unprivileged sandbox | ✅ | `unshare --user` / `bwrap` OK without root |
+| Host isolation (`$HOME`, `~/.ssh`, `/etc/shadow`) | ✅ | all invisible inside the sandbox |
+| Read/write project mount | ✅ | write OK |
+| **Host UID/GID preserved** | ✅ **win** | `uid=1000` → **no more `USER_UID` dance in the image build** |
+| Sandbox-private `$HOME` | ✅ | isolated from the host, writable |
+| Network on/off | ✅ | `--share-net` reachable; without → cut off |
+| **Nested containers** | ✅ | docker CLI → host podman socket (client 28.4 / server 5.7), `docker ps` OK |
+| GUI (Chrome/Wayland/X) | ✅ | `wayland-0`, `X0`, `bus` sockets present and bindable |
+| nix reads/executes inside the sandbox | ✅ | `nix 2.34.5` runs |
+| **Daemonless nix install** (differentiator) | ✅ **proven** | install into a **user-owned `gigi:gigi`** store without a daemon, then exec under bwrap → "Bonjour, le monde !" |
+| mise + nix env | ✅\* | install-from-cache OK; build-from-source → see fork #1 |
+| `.ops.toml` config layering global+project | ✅ | pure ops logic, independent of the substrate |
+| Multi-session | ✅ **simpler** | state in directories; 2 bwrap processes; no more `run_attach`/lock |
+| Hermetic FHS (100% nix userland) | ✅ **proven** | official node (foreign to nix) runs in a 100% nix userland via the store's loader+libs; see the dedicated spike below |
 
-## Les 3 décisions de design (vrai boulot, pas du portage)
+## The 3 design decisions (real work, not porting)
 
-### Fork #1 — build-from-source nix exige `sandbox = false`
+### Fork #1 — build-from-source nix requires `sandbox = false`
 
-Le **userns imbriqué échoue** dans bwrap :
+The **nested userns fails** inside bwrap:
 
 ```
 unshare: échec d'écriture /proc/self/uid_map: Opération non permise
 ```
 
-Or le `nix build` de l'hôte tourne avec `sandbox = true`, ce qui crée un userns
-de build → **échoue à l'intérieur de bwrap**. L'install-depuis-le-cache
-(substitution) n'en a pas besoin → OK. Le build-from-source, si : il faut
-**`sandbox = false`** (l'approche de nix-portable).
+Now, the host's `nix build` runs with `sandbox = true`, which creates a build
+userns → **fails inside bwrap**. Install-from-cache
+(substitution) does not need it → OK. Build-from-source does: it requires
+**`sandbox = false`** (the nix-portable approach).
 
-⚠️ `mise install` == `nix build` : le plugin mise-nix shelle vers
-`nix_build_cmd` (`mise/lib/platform.lua`). Même contrainte, pas un risque
-moindre.
+⚠️ `mise install` == `nix build`: the mise-nix plugin shells out to
+`nix_build_cmd` (`mise/lib/platform.lua`). Same constraint, not a lesser
+risk.
 
-### Fork #2 — FHS : userland hôte (facile, non-reproductible) vs nix (hermétique)
+### Fork #2 — FHS: host userland (easy, non-reproducible) vs nix (hermetic)
 
-Le `python3` qui a tourné dans le sandbox marchait parce qu'on bindait le
-`/usr` **de l'hôte** en read-only. Ça marche, **mais ça couple le sandbox à la
-glibc/userland de l'hôte** → perte de reproductibilité (libs Debian sur Debian,
-Arch sur Arch), une régression vs l'image Arch/Debian *contrôlée*
-d'aujourd'hui. Le chemin hermétique = userland 100 % nix +
-`buildFHSEnv`/`nix-ld`. **C'est l'objet du spike dédié ci-dessous.**
+The `python3` that ran in the sandbox worked because we bound the
+**host's** `/usr` read-only. It works, **but it couples the sandbox to the
+host's glibc/userland** → loss of reproducibility (Debian libs on Debian,
+Arch on Arch), a regression versus today's *controlled* Arch/Debian
+image. The hermetic path = 100% nix userland +
+`buildFHSEnv`/`nix-ld`. **This is the subject of the dedicated spike below.**
 
-### Fork #3 — ops provisionne SON store, pas celui de l'hôte
+### Fork #3 — ops provisions ITS store, not the host's
 
-Overlayer le `/nix` **multi-user** de l'hôte ne donne **pas** un store
-écrivable : il reste `root:nixbld 1775` → nix bascule en mode daemon → socket
-mort → échec. Le modèle qui marche = **store user-owned dès le départ**
-(`~/.local/share/ops/nix` bindé sur `/nix`, nix statique embarqué,
-`sandbox=false`) — c'est le modèle **nix-portable**. Le `nix-daemon` hôte
-(socket-activé, trouvé actif) n'est pas réutilisable, et tant mieux : ops apporte
-le sien.
+Overlaying the host's **multi-user** `/nix` does **not** yield a writable
+store: it stays `root:nixbld 1775` → nix switches to daemon mode → dead
+socket → failure. The model that works = a **user-owned store from the start**
+(`~/.local/share/ops/nix` bound onto `/nix`, embedded static nix,
+`sandbox=false`) — this is the **nix-portable** model. The host's `nix-daemon`
+(socket-activated, found active) is not reusable, and that's just as well: ops brings
+its own.
 
-## Bornage honnête de « sans impacter l'OS hôte »
+## Honest bounding of "without impacting the host OS"
 
-Le store d'ops **écrit sur le disque hôte** (`hello` a tiré 574 Mo : source
-nixpkgs + closure). La frontière exacte n'est pas « n'écrit rien » mais **aucune
-mutation de l'état système hôte / des autres projets / des secrets**. Le store
-partagé en lecture seule reste vrai et propre.
+ops's store **writes to the host disk** (`hello` pulled in 574 MB: nixpkgs
+source + closure). The exact boundary is not "writes nothing" but **no
+mutation of host system state / other projects / secrets**. The read-only
+shared store remains true and clean.
 
-## Impact sur le code actuel
+## Impact on the current code
 
-- **Disparaît** : `src/build.rs` (~60 K, build d'image), `src/nerdctl.rs`
-  (~39 K), tout le wrapping runtime OCI, et le bug « shared volumes mask rebuilt
-  tools » (un seul store, plus de double couche image/volume).
-- **Devient un composant neuf** : le **trust gate repensé en sécurité-first**
-  — un `.ops.toml` de projet non-fiable configure le sandbox dans lequel tourne
-  l'agent → vecteur d'évasion à modéliser.
-- **Reste** : config layering `.ops.toml` (global+projet), surface CLI/apps,
-  plugin mise-nix.
+- **Goes away**: `src/build.rs` (~60 K, image build), `src/nerdctl.rs`
+  (~39 K), all OCI runtime wrapping, and the "shared volumes mask rebuilt
+  tools" bug (a single store, no more dual image/volume layer).
+- **Becomes a new component**: the **trust gate redesigned security-first**
+  — an untrusted project `.ops.toml` configures the sandbox in which the
+  agent runs → an evasion vector to model.
+- **Stays**: `.ops.toml` config layering (global+project), CLI/apps surface,
+  mise-nix plugin.
 
-Classe de référence : **nono.sh / greywall.io / landrun**, pas flox/devbox/devenv
-(ces derniers ne sandboxent pas — c'est précisément le trou qu'ops comble).
+Reference class: **nono.sh / greywall.io / landrun**, not flox/devbox/devenv
+(the latter do not sandbox — that's precisely the gap ops fills).
 
 ---
 
-## Appendice — commandes reproductibles
+## Appendix — reproducible commands
 
-### Sandbox de base + isolation + réseau + FHS-hôte + nix
+### Base sandbox + isolation + network + host-FHS + nix
 
 ```bash
 PROJ=$(mktemp -d); SHOME=$(mktemp -d); printf 'hello\n' > "$PROJ/README"
@@ -138,7 +138,7 @@ bwrap \
   /usr/bin/bash -c 'id; ls /home/gigi 2>&1; getent hosts github.com'
 ```
 
-### Install nix daemonless dans un store user-owned + exécution relocalisée
+### Daemonless nix install into a user-owned store + relocated execution
 
 ```bash
 STORE="$HOME/ops-spike-store"; mkdir -p "$STORE"
@@ -155,7 +155,7 @@ bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
 chmod -R u+w "$STORE" && rm -rf "$STORE"
 ```
 
-### Conteneurs imbriqués via le socket podman bindé
+### Nested containers via the bound podman socket
 
 ```bash
 bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
@@ -166,38 +166,38 @@ bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
   /usr/bin/bash -c 'docker version --format "{{.Server.Version}}"; docker ps'
 ```
 
-## Spike FHS hermétique — résultat : ✅ un binaire étranger tourne en userland 100 % nix
+## Hermetic FHS spike — result: ✅ a foreign binary runs in a 100% nix userland
 
-Le fork #2 demandait : un binaire prébuilt **étranger à nix** peut-il tourner
-dans un userland **100 % nix** (sans binder le `/usr` de l'hôte) ? Réponse :
-**oui.**
+Fork #2 asked: can a prebuilt binary **foreign to nix** run
+in a **100% nix** userland (without binding the host's `/usr`)? Answer:
+**yes.**
 
-**Artefact étranger** : node **v26.3.0** officiel (nodejs.org) — ELF dynamique,
-interpréteur `/lib64/ld-linux-x86-64.so.2`, `NEEDED` : `libc`, `libm`, `libdl`,
-`libpthread`, `libstdc++`, `libgcc_s`, `libatomic`, `ld-linux`. C'est exactement
-le type de binaire qu'un agent tire via npm/pip (manylinux) — et ce dont
-claude-code a besoin.
+**Foreign artifact**: official node **v26.3.0** (nodejs.org) — dynamic ELF,
+interpreter `/lib64/ld-linux-x86-64.so.2`, `NEEDED`: `libc`, `libm`, `libdl`,
+`libpthread`, `libstdc++`, `libgcc_s`, `libatomic`, `ld-linux`. This is exactly
+the kind of binary an agent pulls via npm/pip (manylinux) — and what
+claude-code needs.
 
-**Contraste :**
+**Contrast:**
 
-| Test | Setup | Résultat |
+| Test | Setup | Result |
 |---|---|---|
-| (a) échec attendu | nix pur, **pas de loader**, pas de `/usr` hôte | `execvp: No such file or directory` (loader `/lib64/ld-linux` absent) |
-| (b1) | userland 100 % nix (loader `glibc.out` + `LD_LIBRARY_PATH` = libs nix), **aucun `/usr` hôte** | `node --version` → `v26.3.0` |
-| (b2) | idem, init V8 complet (exerce libstdc++/libatomic/libgcc_s) | `V8 14.6.202.34-node.20 | 2+2= 4` |
-| (b3) | idem, outil JS réel | `npm --version` → `11.16.0` |
+| (a) expected failure | pure nix, **no loader**, no host `/usr` | `execvp: No such file or directory` (loader `/lib64/ld-linux` absent) |
+| (b1) | 100% nix userland (`glibc.out` loader + `LD_LIBRARY_PATH` = nix libs), **no host `/usr`** | `node --version` → `v26.3.0` |
+| (b2) | same, full V8 init (exercises libstdc++/libatomic/libgcc_s) | `V8 14.6.202.34-node.20 | 2+2= 4` |
+| (b3) | same, real JS tool | `npm --version` → `11.16.0` |
 
-**Conclusion : le chemin hermétique est viable.** Le mécanisme = fournir le
-loader + les libs C/C++ depuis le store nix. La **reproductibilité est
-préservée** : les libs sont identiques quelle que soit la distrib hôte (plus de
-couplage à la glibc de l'hôte). `buildFHSEnv` (nixpkgs) automatise exactement ce
-layout, en montant en plus un `/usr` complet — et il utilise lui-même bwrap.
+**Conclusion: the hermetic path is viable.** The mechanism = provide the
+loader + the C/C++ libs from the nix store. **Reproducibility is
+preserved**: the libs are identical regardless of host distro (no more
+coupling to the host's glibc). `buildFHSEnv` (nixpkgs) automates exactly this
+layout, additionally mounting a full `/usr` — and it itself uses bwrap.
 
-**Nuance honnête** : ce test minimal couvre les binaires **auto-suffisants**
-(loader + libs). Pour des charges d'agent plus lourdes (scripts postinstall
-lançant `/bin/sh`/`gcc`, lecture de `/etc/...`), utiliser le layout `/usr`
-complet de `buildFHSEnv` plutôt que le `LD_LIBRARY_PATH` minimal. Mais le point
-dur — loader + runtime C++ pour un binaire non-nix — est prouvé.
+**Honest nuance**: this minimal test covers **self-sufficient** binaries
+(loader + libs). For heavier agent workloads (postinstall scripts
+spawning `/bin/sh`/`gcc`, reading `/etc/...`), use the full `/usr`
+layout of `buildFHSEnv` rather than the minimal `LD_LIBRARY_PATH`. But the
+hard point — loader + C++ runtime for a non-nix binary — is proven.
 
 ```bash
 # ingrédients du userland hermétique
@@ -211,11 +211,12 @@ bwrap --ro-bind /nix /nix --bind /tmp /tmp \
   /chemin/vers/node -e 'console.log(process.versions.v8)'
 ```
 
-## Verdict global du spike
+## Overall spike verdict
 
-Tout ce qu'`ops` fait aujourd'hui est faisable en bwrap + nix daemonless, **y
-compris le FHS hermétique reproductible**. Les forks #1 (sandbox=false) et #2
-(FHS hermétique) sont **tranchés et validés**. Reste à concevoir : le store
-user-owned embarqué (#3, modèle nix-portable) et le **trust gate sécurité-first**.
-Le seul prérequis non maîtrisé par ops est l'**userns non-privilégié** sur les
-hôtes cibles (défaut restreint sur Ubuntu 24.04+ stock).
+Everything `ops` does today is feasible on bwrap + daemonless nix, **including
+reproducible hermetic FHS**. Forks #1 (sandbox=false) and #2
+(hermetic FHS) are **settled and validated**. Still to be designed: the
+embedded user-owned store (#3, nix-portable model) and the **security-first
+trust gate**.
+The only prerequisite not under ops's control is **unprivileged userns** on the
+target hosts (restricted by default on stock Ubuntu 24.04+).

@@ -1,212 +1,211 @@
-# `ops` (bwrap) — modèle de menace & layout des binds
+# `ops` (bwrap) — threat model & bind layout
 
-> Document de design qui **pilote tout le reste** du nouvel `ops` (substrat
-> bubblewrap + nix daemonless ; faisabilité validée dans
-> [`bwrap-spike-2026-06-14.md`](bwrap-spike-2026-06-14.md)). Le layout des
-> montages, de l'environnement et du réseau découle directement du modèle de
-> menace ci-dessous.
+> Design document that **drives everything else** in the new `ops` (bubblewrap
+> substrate + daemonless nix; feasibility validated in
+> [`bwrap-spike-2026-06-14.md`](bwrap-spike-2026-06-14.md)). The layout of
+> mounts, environment, and network follows directly from the threat model
+> below.
 
-## 0. La colonne vertébrale : DEUX modes d'acteur
+## 0. The backbone: TWO actor modes
 
-Toutes les décisions « trou par trou » (réseau, GUI, conteneurs imbriqués,
-ssh-agent) se contredisent tant qu'on raisonne sur **un** acteur flou. On les
-sépare ; c'est l'axe structurant :
+All the "hole by hole" decisions (network, GUI, nested containers,
+ssh-agent) contradict each other as long as we reason about **one** fuzzy
+actor. We separate them; this is the structuring axis:
 
-| | **Mode A — shell de dev interactif** | **Mode B — agent autonome** |
+| | **Mode A — interactive dev shell** | **Mode B — autonomous agent** |
 |---|---|---|
-| Qui pilote | L'**utilisateur** | Les **actions de l'agent** (LLM) |
-| Confiance | Semi-fiable (risque surtout pour soi) | **Non fiable** (prompt-injection, dép. empoisonnée) |
-| GUI / ssh-agent / conteneurs imbriqués | Commodités | **Canaux d'évasion / exfiltration** |
+| Who drives | The **user** | The **agent's actions** (LLM) |
+| Trust | Semi-trusted (risk mostly to oneself) | **Untrusted** (prompt-injection, poisoned dependency) |
+| GUI / ssh-agent / nested containers | Conveniences | **Escape / exfiltration channels** |
 
-**Le différenciateur annoncé d'ops = Mode B.** → **Mode B est la posture par
-défaut ; Mode A est un opt-in explicite.** Chaque défaut « trou dangereux »
-tombe de cet axe au lieu d'être débattu un par un.
+**ops's announced differentiator = Mode B.** → **Mode B is the default
+posture; Mode A is an explicit opt-in.** Each "dangerous hole" default
+falls out of this axis instead of being debated one by one.
 
-## 1. Modèle de menace
+## 1. Threat model
 
-### Actifs à protéger
-- **Secrets** : `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`, `~/.netrc`,
-  cookies navigateur, tokens d'apps, **socket ssh-agent** (`$SSH_AUTH_SOCK`),
-  et **variables d'environnement** porteuses de secrets (`ANTHROPIC_API_KEY`,
+### Assets to protect
+- **Secrets**: `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`, `~/.netrc`,
+  browser cookies, app tokens, **ssh-agent socket** (`$SSH_AUTH_SOCK`),
+  and **environment variables** carrying secrets (`ANTHROPIC_API_KEY`,
   `GITHUB_TOKEN`, `AWS_*`…).
-- **Intégrité de l'hôte** : écrire hors du projet (rc shells → persistance,
-  système, autres projets).
-- **Autres projets** présents sur la machine.
-- **Position réseau** : exfiltration ; pivot vers `169.254.169.254` (métadonnées
-  cloud), `localhost` (bases/serveurs de dev), LAN.
-- **Identité de l'utilisateur** : agir en son nom (git push signé, comptes).
+- **Host integrity**: writing outside the project (shell rc files → persistence,
+  system, other projects).
+- **Other projects** present on the machine.
+- **Network position**: exfiltration; pivot to `169.254.169.254` (cloud
+  metadata), `localhost` (dev databases/servers), LAN.
+- **User identity**: acting on their behalf (signed git push, accounts).
 
-### Adversaires
-1. **Agent IA dévoyé / prompt-injecté** (page web, README, dép. piégée).
-2. **Dépendance malveillante** (postinstall npm/pip, supply chain).
-3. **Projet non fiable** lui-même : son `.ops.toml`, ses Makefile/hooks/devshell
-   sont **contrôlés par l'attaquant** dès qu'on `cd` dans un repo cloné.
+### Adversaries
+1. **Rogue / prompt-injected AI agent** (web page, README, booby-trapped dependency).
+2. **Malicious dependency** (npm/pip postinstall, supply chain).
+3. **Untrusted project** itself: its `.ops.toml`, its Makefiles/hooks/devshell
+   are **attacker-controlled** the moment you `cd` into a cloned repo.
 
-### Frontières de confiance
-1. Hôte ↔ sandbox (la frontière bwrap — la principale).
-2. Config **fiable** (`~/.config/ops/ops.toml`, écrite par l'utilisateur) ↔
-   config **projet non fiable** (`.ops.toml` d'un repo quelconque).
-3. `ops` le lanceur (fiable, tourne sur l'hôte) ↔ tout l'intérieur du sandbox.
+### Trust boundaries
+1. Host ↔ sandbox (the bwrap boundary — the main one).
+2. **Trusted** config (`~/.config/ops/ops.toml`, written by the user) ↔
+   **untrusted** project config (`.ops.toml` of an arbitrary repo).
+3. `ops` the launcher (trusted, runs on the host) ↔ everything inside the sandbox.
 
-### Capacités supposées de l'attaquant (dans le sandbox)
-- **Exécution de code arbitraire sous l'uid de l'hôte** (le sandbox tourne en
-  `uid=1000`, prouvé). ⇒ **pas de barrière uid à l'intérieur** : ce qui est
-  visible est compromis. **Le layout des binds EST le contrôle de sécurité.**
-- ⇒ **« read-only » protège l'intégrité, PAS la confidentialité.** Un secret
-  monté en ro reste **lisible**. Donc **un secret doit être ABSENT, pas ro.**
-- Lit toutes les variables d'environnement transmises.
+### Assumed attacker capabilities (inside the sandbox)
+- **Arbitrary code execution under the host's uid** (the sandbox runs as
+  `uid=1000`, proven). ⇒ **no uid barrier inside**: whatever is visible is
+  compromised. **The bind layout IS the security control.**
+- ⇒ **"read-only" protects integrity, NOT confidentiality.** A secret
+  mounted read-only is still **readable**. So **a secret must be ABSENT, not read-only.**
+- Reads all environment variables passed through.
 
-### Hors périmètre (déclaré)
-- 0day noyau sur les namespaces/userns (bwrap == sécurité des namespaces
-  noyau ; le noyau est dans la TCB).
-- Canaux auxiliaires (timing, Spectre).
-- DoS / épuisement de ressources (fork bomb, remplissage disque) — atténué plus
-  tard (cgroups), pas une garantie v1.
-- L'utilisateur qui sabote volontairement son propre sandbox (mais ops rend le
-  chemin sûr **par défaut** et le chemin dangereux **explicite et bruyant**).
+### Out of scope (declared)
+- Kernel 0day on namespaces/userns (bwrap == namespace security of the
+  kernel; the kernel is in the TCB).
+- Side channels (timing, Spectre).
+- DoS / resource exhaustion (fork bomb, disk filling) — mitigated
+  later (cgroups), not a v1 guarantee.
+- The user deliberately sabotaging their own sandbox (but ops makes the safe
+  path **the default** and the dangerous path **explicit and noisy**).
 
-### ⚠️ Limite de confidentialité à énoncer d'emblée
-Le cas d'usage phare (claude-code) exige **à la fois** sa clé API **et** le
-réseau vers `api.anthropic.com`. Avec un **réseau ouvert par défaut**, un agent
-prompt-injecté peut **exfiltrer n'importe quel secret du sandbox vers
-n'importe où**. Donc : **tant que l'allowlist réseau (le travail « nono/greywall
-plus tard ») n'existe pas, il n'y a PAS de garantie de confidentialité en v1.**
-Bloquer `169.254.169.254` + `localhost` est **nécessaire mais loin d'être
-suffisant**. La garantie honnête v1 : *« aucune mutation de l'état système hôte
-/ des autres projets / des secrets, et pas d'exfiltration une fois l'allowlist
-réseau livrée. »*
+### ⚠️ Confidentiality limit to state up front
+The flagship use case (claude-code) requires **both** its API key **and** the
+network to `api.anthropic.com`. With an **open network by default**, a
+prompt-injected agent can **exfiltrate any sandbox secret to
+anywhere**. So: **as long as the network allowlist (the "nono/greywall
+later" work) does not exist, there is NO confidentiality guarantee in v1.**
+Blocking `169.254.169.254` + `localhost` is **necessary but far from
+sufficient**. The honest v1 guarantee: *"no mutation of the host system state
+/ other projects / secrets, and no exfiltration once the network allowlist
+ships."*
 
-## 2. Les zones — système de fichiers (default-deny)
+## 2. The zones — file system (default-deny)
 
-On part de **rien** (pas de `--bind / /`). Seul l'explicite existe.
+We start from **nothing** (no `--bind / /`). Only the explicit exists.
 
-### Zone 0 — Caché (deny par défaut)
-Absents par construction : `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`,
-`~/.netrc`, profils navigateur, `$SSH_AUTH_SOCK`, `/root`, les autres projets,
-le `$HOME` de l'hôte, l'essentiel de `/etc`.
+### Zone 0 — Hidden (deny by default)
+Absent by construction: `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`,
+`~/.netrc`, browser profiles, `$SSH_AUTH_SOCK`, `/root`, the other projects,
+the host's `$HOME`, most of `/etc`.
 
-### Zone 1 — Lecture seule partagée (intégrité, non-secret)
-| Montage | Source | Pourquoi |
+### Zone 1 — Shared read-only (integrity, non-secret)
+| Mount | Source | Why |
 |---|---|---|
-| `/nix` (base) | **store de base fiable d'ops** (ro lower) | append-only, sans secret ; ro = l'agent ne peut pas trafiquer les binaires installés |
-| loader FHS | `nixpkgs#glibc.out` → `/lib64/ld-linux-…` | userland 100 % nix (FHS hermétique, cf. spike) |
-| `/etc/passwd`, `/etc/group` | **SYNTHÉTIQUES** (sandbox-user + nobody) | résolution uid/gid **sans** fuiter les comptes de l'hôte |
-| `/etc/ssl/certs`, `/etc/resolv.conf` | hôte, ro | TLS / DNS (si réseau autorisé) |
-| `/dev` | `--dev` minimal (pas le `/dev` hôte) | null/zero/urandom/tty seulement |
+| `/nix` (base) | **ops's trusted base store** (ro lower) | append-only, secret-free; ro = the agent cannot tamper with installed binaries |
+| FHS loader | `nixpkgs#glibc.out` → `/lib64/ld-linux-…` | 100% nix userland (hermetic FHS, cf. spike) |
+| `/etc/passwd`, `/etc/group` | **SYNTHETIC** (sandbox-user + nobody) | uid/gid resolution **without** leaking the host's accounts |
+| `/etc/ssl/certs`, `/etc/resolv.conf` | host, ro | TLS / DNS (if network allowed) |
+| `/dev` | minimal `--dev` (not the host `/dev`) | null/zero/urandom/tty only |
 
-Jamais : `/etc/shadow`, `/etc/passwd` **de l'hôte**.
+Never: `/etc/shadow`, the **host's** `/etc/passwd`.
 
-### Zone 2 — Inscriptible (la surface de travail)
-| Montage | Source | Notes |
+### Zone 2 — Writable (the work surface)
+| Mount | Source | Notes |
 |---|---|---|
-| projet | dir projet hôte, **rw** | bind au **même chemin absolu** que sur l'hôte (compat. outils) ; le code n'est pas un secret |
-| `$HOME` sandbox | `…/ops/projects/<id>/home`, **rw** | **PAS** le `$HOME` hôte ; caches outils, config de l'agent |
-| `/tmp` | tmpfs frais | éphémère, privé |
-| store (upper) | overlay per-projet, **rw** | cf. §3 |
+| project | host project dir, **rw** | bound at the **same absolute path** as on the host (tool compat); code is not a secret |
+| sandbox `$HOME` | `…/ops/projects/<id>/home`, **rw** | **NOT** the host `$HOME`; tool caches, agent config |
+| `/tmp` | fresh tmpfs | ephemeral, private |
+| store (upper) | per-project overlay, **rw** | cf. §3 |
 
-## 3. Le modèle de store (corrigé)
+## 3. The store model (corrected)
 
-⚠️ **Le nix de stock est *input-addressed*, pas content-addressed** (la CA est
-expérimentale). En mode single-user daemonless, le dir du store **et**
-`/nix/var/nix/db` sont **possédés par l'utilisateur** → un agent same-uid du
-projet A peut **trojaniser** un chemin du store ou la db que le projet B (ou la
-prochaine session) consomme. « La CA borne le poisoning » est **faux** ici.
+⚠️ **Stock nix is *input-addressed*, not content-addressed** (CA is
+experimental). In single-user daemonless mode, the store dir **and**
+`/nix/var/nix/db` are **owned by the user** → a same-uid agent of project A
+can **trojanize** a store path or the db that project B (or the next
+session) consumes. "CA bounds the poisoning" is **false** here.
 
-**Modèle retenu** (avec l'overlay déjà prouvé au spike) :
+**Retained model** (with the overlay already proven at the spike):
 
 ```
-  store de BASE fiable   →  --overlay-src  (ro lower, peuplé UNIQUEMENT par ops côté hôte)
-  upper per-projet (rw)  →  --overlay      (les installs de l'agent atterrissent ici, isolées)
-  /nix dans le sandbox   =  union des deux
+  trusted BASE store     →  --overlay-src  (ro lower, populated ONLY by ops on the host side)
+  per-project upper (rw) →  --overlay      (the agent's installs land here, isolated)
+  /nix in the sandbox    =  union of the two
 ```
 
-L'agent installe dans **son upper** ; la base partagée reste digne de confiance ;
-aucun projet ne contamine un autre.
+The agent installs into **its upper**; the shared base stays trustworthy;
+no project contaminates another.
 
-## 4. Les zones — environnement (2ᵉ layout, même rigueur)
+## 4. The zones — environment (2nd layout, same rigor)
 
-**Prouvé : bwrap N'efface PAS l'env par défaut** (`SPIKE_SECRET` a fuité à
-travers). ⇒ **défaut = `--clearenv` + allowlist d'injection explicite**, exactement
-le même default-deny que le système de fichiers. `PATH`, `HOME`, `TERM`, `LANG`
-reconstruits ; les secrets (`ANTHROPIC_API_KEY`…) **injectés un par un**,
-déclarés **uniquement en config fiable**, jamais hérités en masse, jamais depuis
-la config projet.
+**Proven: bwrap does NOT clear the env by default** (`SPIKE_SECRET` leaked
+through). ⇒ **default = `--clearenv` + explicit injection allowlist**, exactly
+the same default-deny as the file system. `PATH`, `HOME`, `TERM`, `LANG`
+rebuilt; secrets (`ANTHROPIC_API_KEY`…) **injected one by one**,
+declared **only in trusted config**, never inherited en masse, never from
+project config.
 
-## 5. Les trous délibérés (défaut selon le mode d'acteur)
+## 5. The deliberate holes (default per actor mode)
 
-| Trou | Mode B (agent, défaut) | Mode A (interactif, opt-in) |
+| Hole | Mode B (agent, default) | Mode A (interactive, opt-in) |
 |---|---|---|
-| **Réseau** | ouvert v1 **mais** bloquer `169.254.169.254` + `localhost` ; **but cible = allowlist** (Landlock/netns) | idem / plus large |
-| **GUI** | **off** ; si requis, Wayland (mieux isolé) jamais X11 (un client X keylogge/screenshot les autres fenêtres) | opt-in, Wayland préféré |
-| **Conteneurs imbriqués (socket podman)** | **DROPPÉ** — le socket = **équivalent root sur l'hôte** (lancer un conteneur avec `/` bind-monté). Pas « gaté » : **absent**. Un proxy-broker filtrant est du **travail futur**, pas une case v1. | gaté + confirmation |
-| **ssh-agent** (`$SSH_AUTH_SOCK`) | **off** (donne TOUTES tes clés pour la durée de vie) | opt-in scoped |
-| **Injection de secret** | least-privilege, déclarée en config **fiable** seulement | idem |
-| **Persistance des creds d'un outil** (ex. creds propres de claude-code) | un dir de creds **dédié, persistant, isolé**, monté **pour cet outil seul** — jamais tout `~/.config` | idem |
+| **Network** | open in v1 **but** block `169.254.169.254` + `localhost`; **target goal = allowlist** (Landlock/netns) | same / broader |
+| **GUI** | **off**; if required, Wayland (better isolated) never X11 (an X client keylogs/screenshots the other windows) | opt-in, Wayland preferred |
+| **Nested containers (podman socket)** | **DROPPED** — the socket = **root-equivalent on the host** (launch a container with `/` bind-mounted). Not "gated": **absent**. A filtering proxy-broker is **future work**, not a v1 checkbox. | gated + confirmation |
+| **ssh-agent** (`$SSH_AUTH_SOCK`) | **off** (hands over ALL your keys for their lifetime) | scoped opt-in |
+| **Secret injection** | least-privilege, declared in **trusted** config only | same |
+| **A tool's credential persistence** (e.g. claude-code's own creds) | a **dedicated, persistent, isolated** creds dir, mounted **for that tool alone** — never all of `~/.config` | same |
 
-## 6. Le trust gate (sécurité-first) — DÉCIDÉ (option a)
+## 6. The trust gate (security-first) — DECIDED (option a)
 
-**Décision (2026-06-14) : le trust gate EST la validation.** Faire `ops trust`,
-c'est valider le contenu ; un projet fiable voit donc sa config honorée
-**intégralement** — schéma symétrique [[config-layering-symmetric]] **réaffirmé**,
-le trust gate reste la **seule** frontière.
+**Decision (2026-06-14): the trust gate IS the validation.** Doing `ops trust`
+means validating the content; a trusted project therefore has its config
+honored **in full** — symmetric schema [[config-layering-symmetric]] **reaffirmed**,
+the trust gate remains the **only** boundary.
 
-- **Projet non fiable** (défaut pour tout repo non béni) — son `.ops.toml`
-  **peut** : choisir les outils/paquets à installer **dans** le sandbox (depuis
-  le **nixpkgs épinglé seulement**), le workdir, l'env projet non-secret. Il
-  **ne peut PAS** : ajouter des binds, exposer un chemin hôte, élargir le réseau,
-  activer GUI/socket-conteneur/ssh-agent, lancer des hooks côté hôte, injecter
-  des secrets, changer le userland, pointer vers des flakes/substituters
-  distants. Ces champs sont **ignorés avec avertissement**.
-- **Projet fiable** (`ops trust`) : config honorée **intégralement**, à l'égal
-  de la config globale.
-- **Config globale** (fiable, sur l'hôte) : toujours honorée.
+- **Untrusted project** (default for any unblessed repo) — its `.ops.toml`
+  **may**: choose which tools/packages to install **inside** the sandbox (from
+  **the pinned nixpkgs only**), the workdir, the non-secret project env. It
+  **may NOT**: add binds, expose a host path, broaden the network,
+  enable GUI/container-socket/ssh-agent, run host-side hooks, inject
+  secrets, change the userland, point to remote flakes/substituters.
+  These fields are **ignored with a warning**.
+- **Trusted project** (`ops trust`): config honored **in full**, on par
+  with the global config.
+- **Global config** (trusted, on the host): always honored.
 
-> ✅ **Garde-fou — trust lié au contenu (modèle direnv).** Pour que « trust =
-> contenu validé » reste **vrai dans le temps** : `ops trust` enregistre un
-> **hash** des champs sécurité de la config. Tout changement ultérieur (ex. après
-> `git pull`) **re-déclenche la validation** avant application — exactement comme
-> `direnv allow` se ré-arme à l'édition de `.envrc`. Sans ça, un `.ops.toml`
-> fiable qui gagne `bind ~/.ssh` au prochain pull l'obtiendrait en silence.
+> ✅ **Safeguard — content-bound trust (direnv model).** For "trust =
+> validated content" to stay **true over time**: `ops trust` records a
+> **hash** of the config's security fields. Any later change (e.g. after
+> `git pull`) **re-triggers validation** before application — exactly like
+> `direnv allow` re-arms when `.envrc` is edited. Without it, a trusted
+> `.ops.toml` that gains `bind ~/.ssh` on the next pull would get it silently.
 
-## 7. Supply chain (couplé au fork « install brokeré vs in-sandbox »)
-- URL de flake arbitraire = **exécution de code** (l'éval d'un flake peut être
-  impure). Restreindre les paquets non fiables au **nixpkgs épinglé**, pas des
-  URLs.
-- Bloquer aussi `substituters` / `extra-substituters` / `trusted-public-keys`
-  d'une config non fiable : **un cache binaire malveillant sert du trojan pour
-  tout**, pire qu'un flake.
-- Couplage : si les installs sont **brokerés côté hôte**, une URL malveillante =
-  exécution **sur l'hôte** (grave) ; si **in-sandbox**, c'est **contenu** mais
-  alimente le vecteur de poisoning du store (§3). Les deux forks se décident
-  ensemble.
+## 7. Supply chain (coupled to the "brokered install vs in-sandbox" fork)
+- Arbitrary flake URL = **code execution** (a flake's eval can be
+  impure). Restrict untrusted packages to **the pinned nixpkgs**, not URLs.
+- Also block `substituters` / `extra-substituters` / `trusted-public-keys`
+  from an untrusted config: **a malicious binary cache serves a trojan for
+  everything**, worse than a flake.
+- Coupling: if installs are **brokered on the host side**, a malicious URL =
+  execution **on the host** (severe); if **in-sandbox**, it's **content** but
+  feeds the store poisoning vector (§3). Both forks are decided
+  together.
 
-## 8. TOCTOU sur les sources de bind
-bwrap résout les **sources** de bind dans le namespace **hôte**, avant le pivot.
-Si un chemin de bind dérive d'une entrée contrôlée par le projet, un symlink
-`./data → ~/.ssh` fait binder le vrai `~/.ssh`. ⇒ **canonicaliser + confiner les
-sources de bind à la racine du projet.** (Les symlinks **internes** au projet
-sont sûrs : ils se résolvent **dans** le sandbox — ça tue une fausse inquiétude
-courante.)
+## 8. TOCTOU on bind sources
+bwrap resolves bind **sources** in the **host** namespace, before the pivot.
+If a bind path derives from a project-controlled input, a symlink
+`./data → ~/.ssh` makes it bind the real `~/.ssh`. ⇒ **canonicalize + confine
+bind sources to the project root.** (Symlinks **internal** to the project
+are safe: they resolve **inside** the sandbox — this kills a common false
+worry.)
 
-## 9. Prérequis durs (pas des préférences)
-- **User namespaces non-privilégiés** (sinon : pas de produit ; cf. spike).
-- **`--unshare-pid`** : le modèle same-uid n'est sûr **que** grâce à l'isolation
-  pidns + userns. C'est une **exigence**, pas un défaut.
-- **`--clearenv`** + allowlist (prouvé nécessaire).
-- Mapping **same-uid** par défaut (écriture directe de `uid_map`, sans helper).
-  Le « durcissement subuid » réintroduit les helpers **setuid**
-  `newuidmap`/`newgidmap` → va à l'encontre du pitch 100 % non-privilégié ; à
-  réserver à un tier de durcissement opt-in.
+## 9. Hard prerequisites (not preferences)
+- **Unprivileged user namespaces** (otherwise: no product; cf. spike).
+- **`--unshare-pid`**: the same-uid model is safe **only** thanks to the
+  pidns + userns isolation. This is a **requirement**, not a default.
+- **`--clearenv`** + allowlist (proven necessary).
+- **same-uid** mapping by default (direct write of `uid_map`, no helper).
+  The "subuid hardening" reintroduces the **setuid** helpers
+  `newuidmap`/`newgidmap` → runs against the 100% unprivileged pitch; to be
+  reserved for an opt-in hardening tier.
 
-## 10. Décisions (tranchées 2026-06-14)
-1. **Schéma symétrique réaffirmé** : le trust gate est la validation ; projet
-   fiable = config honorée intégralement, avec **trust lié au hash du contenu**
-   (re-validation à chaque changement, modèle direnv). Cf. §6.
-2. **Réseau : traité tout à la fin.** Ouvert par défaut d'ici là. ⇒ **la limite
-   de confidentialité (§1) tient jusque-là, et c'est accepté.** Les deux blocages
-   quasi-gratuits (`169.254.169.254`, `localhost`) peuvent arriver tôt ;
-   l'allowlist complète (couche nono/greywall) est la **dernière** étape.
-3. **Installs in-sandbox** (option a) + store base ro + overlay per-projet +
-   nixpkgs épinglé pour les non-fiables. Aucun code attaquant ne tourne sur l'hôte.
-4. **same-uid par défaut** ; `--unshare-pid` exigé ; subuid = durcissement
-   opt-in ultérieur.
+## 10. Decisions (settled 2026-06-14)
+1. **Symmetric schema reaffirmed**: the trust gate is the validation; a trusted
+   project = config honored in full, with **content-hash-bound trust**
+   (re-validation on every change, direnv model). Cf. §6.
+2. **Network: handled at the very end.** Open by default until then. ⇒ **the
+   confidentiality limit (§1) holds until then, and that is accepted.** The two
+   near-free blocks (`169.254.169.254`, `localhost`) can come early;
+   the full allowlist (nono/greywall layer) is the **last** step.
+3. **In-sandbox installs** (option a) + ro base store + per-project overlay +
+   pinned nixpkgs for the untrusted. No attacker code runs on the host.
+4. **same-uid by default**; `--unshare-pid` required; subuid = later opt-in
+   hardening.

@@ -65,5 +65,11 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 - Code comments are **self-contained**: no references to a process ("Task N",
   "M1", "SEC-002"), to `ops.sh`/the container code, or "matches X". Reword to
   stand alone.
+- **Always write the cleanest possible code**, following coding and security
+  best practices: least privilege, fail-closed, validate inputs, no unsafe
+  shortcuts. The security model above is the baseline, not the ceiling.
+- **Every increment ships with tests** (unit + integration, green), is then
+  **reviewed by the advisor**, and finally **validated with the user** before
+  moving to the next — incremental, collaborative cadence, no barreling ahead.
 - **Current status: M0 in progress** — `ops doctor` (the userns gate) is in
   place; the store module awaits resolution of the trilemma (architecture §7.4).
