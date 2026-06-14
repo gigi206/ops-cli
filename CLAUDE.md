@@ -28,6 +28,7 @@ flox/devbox/devenv (mere env managers that isolate nothing).
 1. [`docs/bwrap-spike-2026-06-14.md`](docs/bwrap-spike-2026-06-14.md) — feasibility, proven live.
 2. [`docs/bwrap-threat-model-and-binds.md`](docs/bwrap-threat-model-and-binds.md) — threat model + bind layout + decisions.
 3. [`docs/bwrap-architecture.md`](docs/bwrap-architecture.md) — Rust modules, CLI surface, milestones (M0→M7).
+4. [`docs/bwrap-security-stack.md`](docs/bwrap-security-stack.md) — the enforcement building blocks (bwrap/seccomp/Landlock/cgroups) and when each lands.
 
 ## Security model (the essentials)
 
