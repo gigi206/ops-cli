@@ -83,8 +83,16 @@ fn doctor() -> ExitCode {
 /// Search `$PATH` for an executable file with the given name.
 fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
+    find_in_dirs(name, std::env::split_paths(&path))
+}
+
+/// Pure core of [`find_on_path`]: the first directory whose `name` entry is
+/// executable. Split out so it can be tested without mutating the process `PATH`.
+fn find_in_dirs(
+    name: &str,
+    dirs: impl Iterator<Item = std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    dirs.map(|dir| dir.join(name))
         .find(|cand| is_executable(cand))
 }
 
@@ -96,6 +104,7 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// Outcome of probing unprivileged user-namespace support.
+#[derive(Debug, PartialEq, Eq)]
 enum Userns {
     /// A capability-bearing user namespace can be created — bwrap will work.
     Ok,
@@ -108,6 +117,18 @@ enum Userns {
     CapStripped,
 }
 
+/// Map the probe child's exit status to an outcome. Kept separate from the
+/// unsafe fork machinery so this policy is unit-testable: the child exits `1`
+/// when the user namespace cannot be created, `2` when it is created but lacks
+/// the capabilities to nest a mount namespace, and `0` when both succeed.
+fn classify_probe_exit(code: i32) -> Userns {
+    match code {
+        0 => Userns::Ok,
+        2 => Userns::CapStripped,
+        _ => Userns::Unsupported,
+    }
+}
+
 /// Ground-truth probe in a forked child: create a user namespace, then create a
 /// mount namespace inside it. The second step needs `CAP_SYS_ADMIN` in the new
 /// userns, so it succeeds only when the namespace is capability-bearing — which
@@ -115,7 +136,7 @@ enum Userns {
 /// namespaces untouched; only a real attempt is decisive (sysctls can lie).
 fn probe_userns() -> Userns {
     // SAFETY: the child path touches only async-signal-safe calls (`unshare`,
-    // `_exit`) before exiting; the parent only reaps it.
+    // `_exit`) before exiting; the parent only reaps it and classifies.
     unsafe {
         match libc::fork() {
             0 => {
@@ -133,11 +154,7 @@ fn probe_userns() -> Userns {
                 if libc::waitpid(pid, &mut status, 0) == -1 || !libc::WIFEXITED(status) {
                     return Userns::Unsupported;
                 }
-                match libc::WEXITSTATUS(status) {
-                    0 => Userns::Ok,
-                    2 => Userns::CapStripped,
-                    _ => Userns::Unsupported,
-                }
+                classify_probe_exit(libc::WEXITSTATUS(status))
             }
         }
     }
@@ -147,4 +164,75 @@ fn read_sysctl(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A fresh, unique temp directory per call (no external test-helper deps).
+    fn tmpdir() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut d = std::env::temp_dir();
+        d.push(format!("ops-doctor-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_exec(path: &Path) {
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn is_executable_reads_mode_bits() {
+        let dir = tmpdir();
+        let exe = dir.join("runme");
+        write_exec(&exe);
+        assert!(is_executable(&exe));
+
+        let plain = dir.join("data");
+        std::fs::write(&plain, b"x").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&plain));
+
+        assert!(!is_executable(&dir.join("missing")));
+    }
+
+    #[test]
+    fn find_in_dirs_picks_first_executable_match() {
+        let a = tmpdir();
+        let b = tmpdir();
+        let tool = b.join("tool");
+        write_exec(&tool);
+
+        // present only in `b`, and executable
+        let found = find_in_dirs("tool", [a.clone(), b.clone()].into_iter());
+        assert_eq!(found.as_deref(), Some(tool.as_path()));
+
+        // absent everywhere
+        assert!(find_in_dirs("absent", [a, b].into_iter()).is_none());
+    }
+
+    #[test]
+    fn read_sysctl_trims_value_and_handles_absence() {
+        let dir = tmpdir();
+        let f = dir.join("val");
+        std::fs::write(&f, b"1\n").unwrap();
+        assert_eq!(read_sysctl(f.to_str().unwrap()).as_deref(), Some("1"));
+        assert_eq!(read_sysctl(dir.join("nope").to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn classify_probe_exit_maps_status_to_outcome() {
+        assert_eq!(classify_probe_exit(0), Userns::Ok);
+        assert_eq!(classify_probe_exit(2), Userns::CapStripped);
+        assert_eq!(classify_probe_exit(1), Userns::Unsupported);
+        assert_eq!(classify_probe_exit(42), Userns::Unsupported);
+    }
 }
