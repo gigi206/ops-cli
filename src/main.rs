@@ -175,13 +175,30 @@ mod tests {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    /// A fresh, unique temp directory per call (no external test-helper deps).
-    fn tmpdir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
-        d.push(format!("ops-doctor-test-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// A unique temp directory that removes itself on drop, so tests leave
+    /// nothing behind (cleanup runs on panic-unwind too, not just success).
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut d = std::env::temp_dir();
+            d.push(format!("ops-doctor-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            TmpDir(d)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn write_exec(path: &Path) {
@@ -191,7 +208,7 @@ mod tests {
 
     #[test]
     fn is_executable_reads_mode_bits() {
-        let dir = tmpdir();
+        let dir = TmpDir::new();
         let exe = dir.join("runme");
         write_exec(&exe);
         assert!(is_executable(&exe));
@@ -206,22 +223,23 @@ mod tests {
 
     #[test]
     fn find_in_dirs_picks_first_executable_match() {
-        let a = tmpdir();
-        let b = tmpdir();
+        let a = TmpDir::new();
+        let b = TmpDir::new();
         let tool = b.join("tool");
         write_exec(&tool);
 
+        let dirs = [a.path().to_path_buf(), b.path().to_path_buf()];
         // present only in `b`, and executable
-        let found = find_in_dirs("tool", [a.clone(), b.clone()].into_iter());
+        let found = find_in_dirs("tool", dirs.iter().cloned());
         assert_eq!(found.as_deref(), Some(tool.as_path()));
 
         // absent everywhere
-        assert!(find_in_dirs("absent", [a, b].into_iter()).is_none());
+        assert!(find_in_dirs("absent", dirs.into_iter()).is_none());
     }
 
     #[test]
     fn read_sysctl_trims_value_and_handles_absence() {
-        let dir = tmpdir();
+        let dir = TmpDir::new();
         let f = dir.join("val");
         std::fs::write(&f, b"1\n").unwrap();
         assert_eq!(read_sysctl(f.to_str().unwrap()).as_deref(), Some("1"));
