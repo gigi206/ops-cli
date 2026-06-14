@@ -68,3 +68,9 @@ mise.local.toml
 *.swo
 *~
 .DS_Store
+
+# Rust build output (the bwrap-rewrite crate)
+/target
+
+# Local AI-tool project dir (symlinks into $HOME; never committed)
+.antigravitycli/
