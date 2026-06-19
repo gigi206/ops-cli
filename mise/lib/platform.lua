@@ -162,9 +162,12 @@ function M.choose_store_path_with_bin(outputs)
   return candidates[1].path, candidates[1].has_bin
 end
 
--- Check if Nix is available in PATH
+-- Check if Nix is available in PATH. Uses `command -v` (a POSIX shell builtin)
+-- rather than the `which` binary: a hermetic sandbox may carry only a minimal
+-- userland (shell + coreutils + nix) with no standalone `which`, where
+-- `command -v` still resolves nix correctly.
 function M.check_nix_available()
-  local result = shell.exec("which nix 2>/dev/null || echo MISSING")
+  local result = shell.exec("command -v nix 2>/dev/null || echo MISSING")
   if result:match("MISSING") then
     error("Nix is not installed or not in PATH. Please install Nix first.")
   end

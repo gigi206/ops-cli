@@ -73,6 +73,23 @@ Carve-out: **do not block `recvfrom`** (breaks toolchains like cargo/clippy that
 use socketpair-based subprocess plumbing). The filter is x86_64/aarch64 only
 (other arches: deny by default or `unimplemented`).
 
+⚠️ **Open-cage tension — this denylist will break in-cage `nix` builds unless
+reconciled.** The cage carries a writable per-project store and `nix` itself, so a
+Mode-B agent self-equips by running `nix build`/`mise install` *inside* the cage.
+nix's own build sandbox creates **nested** namespaces and mounts — it needs exactly
+the `unshare`/`clone(CLONE_NEWUSER|CLONE_NEWNS)`, `mount`, `pivot_root`, and the new
+mount API this list denies, plus `seccomp()` itself (for nix's `filter-syscalls`).
+With no syscall filter yet, those all succeed and in-cage builds work with nix's
+*compiled defaults* (no ops config). Once this denylist lands it must either (a)
+**allowlist** that set for the build-sandbox path, or (b) have ops force nix's
+`sandbox = false` + `filter-syscalls = false` (via `NIX_CONFIG`, set by ops — note
+`NIX_CONFIG` is on the untrusted-only env denylist, so a project cannot smuggle it).
+Option (b) trades nix's *inner* isolation for the cage's *outer* filter; that is the
+right tradeoff (the cage is the boundary), but it must be a **conscious** choice made
+here, not rediscovered as a mystery "cannot set up build sandbox" failure. The open
+cage *wants* the agent to manipulate namespaces; this denylist *wants* to block that
+as an escape vector — they meet exactly on the in-cage builder.
+
 **Implementation**: compile the filter with **`seccompiler`** (pure Rust, as
 Codex does) — no libseccomp / kafel C dependency, which keeps the static-musl
 binary self-contained. (nsjail's **kafel** policy language is a nicer authoring
@@ -188,6 +205,7 @@ not zero-setup; **degrade gracefully** if delegation is absent.
 | **M5 / later** | cgroups v2 DoS limits; the nested-ns re-isolation (`apply-seccomp`) pattern — see the §6 caveat (needs caps retained through inner setup) |
 | **M6** | network egress: `--unshare-net` + **pasta** uplink + filtering proxy (hostname allowlist) + **the credential-injection proxy** (§6) + optional Landlock-net TCP; the near-free `169.254.169.254` + `localhost` blocks can land earlier |
 | **M7** | subuid hardening tier |
+| **end / observability** | an **egress audit log + web consultation UI** (greywall-style): record every proxy decision — *allowed* as well as *denied*, each with its `X-Ops-Egress-Reason` category, the host/port/path, and the originating launch/session — and a small web view to review them. **Deferred to end-of-project**: it is observability, never on the enforcement path (a logging failure must not affect a verdict), and it must record **no secret** — echo only the host/port and category, never the injected credential or a request body. The egress proxy is the natural emission point: it already computes the verdict and the 6.2e category, which *is* the log taxonomy. |
 
 ## Sources
 

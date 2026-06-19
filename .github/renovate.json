@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "semanticCommits": "enabled",
+  "labels": ["dependencies"],
+  "schedule": ["before 9am on monday"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 9am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Rust crates: keep Cargo.lock current; a major stands on its own PR so a breaking bump is never hidden in a batch.",
+      "matchManagers": ["cargo"],
+      "addLabels": ["rust"],
+      "semanticCommitType": "deps"
+    },
+    {
+      "description": "Batch the low-risk GitHub Actions bumps into a single weekly PR (one CI run, readable queue).",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "addLabels": ["ci"],
+      "semanticCommitType": "ci"
+    },
+    {
+      "description": "Batch base-image digest/tag bumps into a single weekly PR.",
+      "matchManagers": ["dockerfile"],
+      "groupName": "docker base images",
+      "addLabels": ["docker"],
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "docker"
+    }
+  ]
+}
