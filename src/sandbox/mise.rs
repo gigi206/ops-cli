@@ -65,21 +65,31 @@ struct ProjectBind {
     dest: PathBuf,
 }
 
-/// Provision the mise engine into ops's store against `nixpkgs` (the **global**
-/// channel reference — see the module note on why mise does not follow a project
-/// pin) and return the logical path to its binary (`/nix/store/…/bin/mise`, which
-/// resolves once the store is bound at `/nix`). The output is rooted per channel
-/// revision under `<data>/gcroots/mise/<rev>/`, so every project on the global
-/// channel shares one engine and a rolled channel roots its own beside it.
-pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<PathBuf> {
+/// Provision the mise engine into ops's store against `engine_ref` (the **dedicated
+/// engine channel** — see the module note on why mise does not follow a project pin, and
+/// [`crate::store::LockTarget::engine`] on why it has its own lock) and return its logical
+/// store **root** (`/nix/store/…`, which resolves once the store is bound at `/nix`). The
+/// output is rooted per engine revision under `<data>/gcroots/mise/<rev>/`, so every
+/// project on that engine revision shares one engine and a rolled engine roots its own
+/// beside it. Callers derive the `mise` binary with [`bin`] (to exec) or its `bin`
+/// directory (for `PATH`) from this root.
+pub(crate) fn provision_engine(
+    nix: &Path,
+    layout: &Layout,
+    engine_ref: &str,
+) -> io::Result<PathBuf> {
     let gcroot = layout
         .data_dir()
         .join("gcroots")
         .join("mise")
-        .join(store::revision_of(nixpkgs))
+        .join(store::revision_of(engine_ref))
         .join(MISE_ATTR);
-    let output = store::provision(nix, layout, &gcroot, nixpkgs, MISE_ATTR, MISE_BIN)?;
-    Ok(output.join(MISE_BIN))
+    store::provision(nix, layout, &gcroot, engine_ref, MISE_ATTR, MISE_BIN)
+}
+
+/// The `mise` binary within an engine store root provisioned by [`provision_engine`].
+pub(crate) fn bin(root: &Path) -> PathBuf {
+    root.join(MISE_BIN)
 }
 
 /// A bubblewrap command that runs the provisioned `mise_bin` with `args`, hermetic
@@ -599,7 +609,7 @@ mod run_tests {
             .expect("resolve the global channel");
 
         // the engine is provisioned into ops's own store, never the host's mise
-        let mise_bin = provision(&nix, &layout, &nixpkgs).expect("provision mise");
+        let mise_bin = bin(&provision_engine(&nix, &layout, &nixpkgs).expect("provision mise"));
         assert!(
             mise_bin.starts_with("/nix/store") && mise_bin.ends_with("bin/mise"),
             "not a logical mise path: {}",
@@ -685,7 +695,7 @@ mod run_tests {
         let nixpkgs = store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve the global channel");
-        let mise_bin = provision(&nix, &layout, &nixpkgs).expect("provision mise");
+        let mise_bin = bin(&provision_engine(&nix, &layout, &nixpkgs).expect("provision mise"));
 
         // a project whose authorized same-directory files declare `[env]`: the
         // canonical `.mise.toml` and the local override `mise.local.toml` (both in the

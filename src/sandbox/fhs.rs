@@ -29,10 +29,17 @@ const NIX_LD_SHIM: &str = "libexec/nix-ld";
 /// Provision the base hermetic userland into ops's store and report its paths.
 /// The launcher resolves the userland before assembling a spec; on a project's
 /// first launch this fetches the base closure from the binary cache. `nixpkgs` is
-/// the pinned reference, resolved once by the caller so it is shared with the
-/// project's own package provisioning (and so a future channel override is plumbed
-/// in a single place).
-pub(crate) fn resolve_userland(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<Userland> {
+/// the pinned reference for the OS substrate (glibc, gcc, bash, coreutils, nix-ld,
+/// nix, socat), resolved once by the caller so it is shared with the project's own
+/// package provisioning (and so a future channel override is plumbed in a single
+/// place). `engine_ref` is the **separately-locked** reference for mise alone (see
+/// below) — usually the same revision, but advanced on its own by `ops upgrade mise`.
+pub(crate) fn resolve_userland(
+    nix: &Path,
+    layout: &Layout,
+    nixpkgs: &str,
+    engine_ref: &str,
+) -> io::Result<Userland> {
     // The base userland is shared by every launch on the same revision, so its
     // gcroots are keyed by revision (not per-project): one physical copy per channel
     // serves all projects on it, while a project pinned to a different channel roots
@@ -78,9 +85,16 @@ pub(crate) fn resolve_userland(nix: &Path, layout: &Layout, nixpkgs: &str) -> io
     // mise, the dev-tool front-end an agent drives to self-equip a project's
     // `nix:` toolchain (`mise install nix:<pkg>`) into the project's own writable
     // store. Carried in every cage — an agent may self-equip from any launch, not
-    // only the dedicated passthrough — and provisioned against the same channel as
-    // the rest of the cage, so it shares the base glibc (the one-channel rule).
-    let mise = realise("mise", "bin/mise", "mise")?;
+    // only the dedicated passthrough. Unlike the rest of the base, mise is provisioned
+    // against its OWN engine reference and gcrooted under the mise tree (not the base),
+    // so `ops upgrade mise` rolls the engine while `ops upgrade nix` leaves it put. This
+    // is safe to run on a different revision than the base because the cage exposes no
+    // global `LD_LIBRARY_PATH`: mise finds its own glibc by RPATH, like any cross-channel
+    // nix tool. One consequence, recorded consciously: where the in-cage mise once
+    // followed a project's channel pin, it now follows the (global) engine channel — an
+    // improvement (a current engine even on a project pinned to an old base), at the cost
+    // of a project pin's seed carrying both the base glibc and the engine's.
+    let mise = super::mise::provision_engine(nix, layout, engine_ref)?;
     // socat is the in-cage egress forwarder: under a network allowlist a wrapper runs
     // `socat TCP-LISTEN:…,fork UNIX-CONNECT:<bound socket>` so the cage's loopback bridges
     // to the host filtering proxy over the bound Unix socket (Model B). It is nix-built, so
@@ -150,7 +164,9 @@ mod resolve_tests {
         let nixpkgs = crate::store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve nixpkgs");
-        let u = resolve_userland(&nix, &layout, &nixpkgs).expect("resolve userland");
+        // engine == base here (the decoupling is exercised by the launcher and its own
+        // tests); this check is about the userland being usable from ops's store.
+        let u = resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs).expect("resolve userland");
 
         // the base roots are logical store paths, each backed by ops's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure

@@ -29,6 +29,13 @@ const NIXPKGS_FLAKE_PREFIX: &str = "github:NixOS/nixpkgs/";
 /// forward, never an ops binary update.
 const NIXPKGS_LOCK: &str = "nixpkgs.lock";
 
+/// The file (under the data directory) recording the mise engine's resolved source +
+/// revision — a dedicated lock so an explicit `ops upgrade mise` advances the engine
+/// independently of the base channel (`nixpkgs.lock`). The engine tracks the global
+/// channel source, but pinning it here on its own means rolling the base never bumps the
+/// engine, and rolling the engine never bumps the base.
+const MISE_ENGINE_LOCK: &str = "mise-engine.lock";
+
 /// On-disk layout of the user-owned store, rooted at ops's private data
 /// directory. Pure path derivation — holds no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,13 +206,24 @@ impl LockTarget {
     /// The global channel target: a global-config override or the default rolling
     /// channel, pinned in the shared data-dir lock.
     pub(crate) fn global(layout: &Layout, override_source: Option<&str>) -> Self {
-        let (source, origin) = match override_source {
-            Some(s) => (s.to_string(), Origin::Global),
-            None => (DEFAULT_SOURCE.to_string(), Origin::Default),
-        };
+        let (source, origin) = global_source(override_source);
         Self {
             source,
             lock_path: global_lock_path(layout),
+            origin,
+        }
+    }
+
+    /// The mise engine target: it tracks the **global** channel source (a global override
+    /// applies; a project pin never does — the engine runs in its own relocated-store view,
+    /// free of the one-channel rule that binds the base to its pin), but pins it in a
+    /// dedicated lock so `ops upgrade mise` advances the engine independently of the base
+    /// channel that `ops upgrade nix` rolls.
+    pub(crate) fn engine(layout: &Layout, override_source: Option<&str>) -> Self {
+        let (source, origin) = global_source(override_source);
+        Self {
+            source,
+            lock_path: engine_lock_path(layout),
             origin,
         }
     }
@@ -251,9 +269,25 @@ impl LockTarget {
     }
 }
 
+/// The (source, origin) the global channel resolves to: a global-config override, else
+/// the default rolling channel. Shared by the global channel and the mise engine — they
+/// track the same source but pin it in separate locks.
+fn global_source(override_source: Option<&str>) -> (String, Origin) {
+    match override_source {
+        Some(s) => (s.to_string(), Origin::Global),
+        None => (DEFAULT_SOURCE.to_string(), Origin::Default),
+    }
+}
+
 /// The shared data-dir lock pinning the global channel's revision.
 fn global_lock_path(layout: &Layout) -> PathBuf {
     layout.data_dir().join(NIXPKGS_LOCK)
+}
+
+/// The dedicated data-dir lock pinning the mise engine's revision, independent of the
+/// global channel lock so the two roll forward separately.
+fn engine_lock_path(layout: &Layout) -> PathBuf {
+    layout.data_dir().join(MISE_ENGINE_LOCK)
 }
 
 /// A project's own lock, under its runtime tree, pinning a trusted pin's revision.
@@ -270,6 +304,47 @@ fn project_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
 /// project. `None` when nothing has been resolved yet. Pure file read.
 pub(crate) fn read_global_lock(layout: &Layout) -> Option<(String, String)> {
     read_lock(&global_lock_path(layout))
+}
+
+/// Resolve the mise engine reference, seeding its dedicated lock from the global channel
+/// lock on first use. Used in place of [`LockTarget::engine`]'s plain `resolve` so two
+/// properties hold across this feature's introduction:
+///
+/// - **A binary update never moves the engine.** Every install that predates the engine
+///   lock has `nixpkgs.lock` but no `mise-engine.lock`; a plain resolve would hit the
+///   network and re-pin `nixos-unstable` to its *current* revision, bumping the in-cage
+///   mise on a mere binary update — exactly what the seeded-not-baked model forbids.
+/// - **The first launch still works offline.** That fresh resolution would otherwise fail
+///   with no network, where the base (resolved from its own lock) does not.
+///
+/// So when the engine lock is absent, the engine is seeded from the global channel lock
+/// when that records the same source — no nix, the engine starting on exactly the
+/// revision the base is already on. The launcher resolves the base before the engine, so
+/// even a fresh install has `nixpkgs.lock` written by then and base == engine from the
+/// start; they diverge only on an explicit `ops upgrade mise`. Only when neither lock has
+/// the source (a pinned-only user who has never resolved the global channel) does it
+/// resolve fresh, which then needs nix.
+pub(crate) fn resolve_engine_ref(
+    nix: &Path,
+    layout: &Layout,
+    global_override: Option<&str>,
+) -> io::Result<String> {
+    let engine = LockTarget::engine(layout, global_override);
+    // The engine's own lock already pins this source: reuse it (no nix), like any launch.
+    if let Some(rev) = engine.locked_revision() {
+        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{rev}"));
+    }
+    // First use of the engine lock: seed it from the global channel lock when that records
+    // the same source, so the engine starts where the base already is — no network, and a
+    // binary update never bumps it.
+    if let Some(rev) = LockTarget::global(layout, global_override).locked_revision() {
+        ensure(layout)?;
+        write_lock(&engine.lock_path, &engine.source, &rev)?;
+        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{rev}"));
+    }
+    // Neither lock pins this source yet: a genuine first resolution (needs nix), recorded
+    // in the engine's own lock so later launches reuse it.
+    engine.resolve(nix, layout)
 }
 
 /// Whether a source is itself a fixed 40-hex revision (a frozen pin that an upgrade
@@ -762,6 +837,24 @@ mod tests {
             proj.lock_path,
             PathBuf::from("/data/ops/projects/abc/nixpkgs.lock")
         );
+
+        // the engine tracks the same source as the global channel (default, or a global
+        // override) but pins it in its OWN lock — never the shared nixpkgs.lock — so the
+        // two roll forward independently.
+        let engine = LockTarget::engine(&layout, None);
+        assert_eq!(engine.source(), DEFAULT_SOURCE);
+        assert_eq!(engine.origin(), Origin::Default);
+        assert_eq!(
+            engine.lock_path,
+            PathBuf::from("/data/ops/mise-engine.lock")
+        );
+        let engine_over = LockTarget::engine(&layout, Some("nixos-23.11"));
+        assert_eq!(engine_over.source(), "nixos-23.11");
+        assert_eq!(engine_over.origin(), Origin::Global);
+        assert_eq!(
+            engine_over.lock_path,
+            PathBuf::from("/data/ops/mise-engine.lock")
+        );
     }
 
     #[test]
@@ -867,6 +960,50 @@ mod tests {
             "a source switch has no comparable previous"
         );
         assert_eq!(up.revision, REV);
+    }
+
+    #[test]
+    fn engine_seeds_from_the_global_lock_so_a_binary_update_never_moves_it() {
+        // The migration path: an established install has nixpkgs.lock but no engine lock.
+        // The engine must seed its revision FROM the global lock — no nix, no version
+        // bump — so a mere binary update never advances the in-cage mise, and the first
+        // launch still works offline. Proven with a bogus nix: if the engine resolved
+        // fresh instead of seeding, it would invoke nix and the call would fail.
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("ops"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        std::fs::write(
+            layout.data_dir().join(NIXPKGS_LOCK),
+            format!("nixos-unstable\n{REV}\n"),
+        )
+        .unwrap();
+        // no mise-engine.lock yet
+        assert!(!layout.data_dir().join(MISE_ENGINE_LOCK).exists());
+
+        let got = resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None)
+            .expect("engine seeds from the global lock with no nix");
+        assert_eq!(got, format!("{NIXPKGS_FLAKE_PREFIX}{REV}"));
+        // it recorded the seed in the engine's own lock, so later launches reuse it
+        assert_eq!(
+            read_lock(&engine_lock_path(&layout)),
+            Some(("nixos-unstable".to_string(), REV.to_string()))
+        );
+        // a second resolution now reuses the engine lock directly (still no nix)
+        assert_eq!(
+            resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None).unwrap(),
+            format!("{NIXPKGS_FLAKE_PREFIX}{REV}")
+        );
+    }
+
+    #[test]
+    fn engine_with_no_lock_anywhere_resolves_fresh_and_so_needs_nix() {
+        // A pinned-only user who has never resolved the global channel has neither lock for
+        // this source: the engine has nothing to seed from, so it resolves fresh — which
+        // needs nix (here a bogus one, so it fails, proving no spurious seed happened).
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("ops"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        assert!(resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None).is_err());
     }
 
     #[test]

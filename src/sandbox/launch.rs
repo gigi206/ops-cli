@@ -55,11 +55,15 @@ struct Prepared {
     cwd: PathBuf,
     cfg: crate::config::Resolved,
     /// The effective reference for this launch: a project pin when one is set,
-    /// otherwise the global channel. Drives the base userland and the project's
-    /// tools. **Not** the reference for the mise engine — mise tracks the global
-    /// channel (it runs in its own store view, free of the one-channel rule), so
-    /// provisioning it must resolve the global target separately, never reuse this.
+    /// otherwise the global channel. Drives the base userland (its OS substrate) and
+    /// the project's tools. **Not** the reference for the mise engine — see `engine`.
     nixpkgs: String,
+    /// The reference for the mise engine, from its dedicated lock (it tracks the global
+    /// channel but rolls independently via `ops upgrade mise`). mise runs in its own
+    /// store view, free of the one-channel rule, so it may sit on a different revision
+    /// than `nixpkgs`. Drives both the in-cage mise (the base userland) and the
+    /// host-side `[env]` driver.
+    engine_ref: String,
     userland: Userland,
 }
 
@@ -213,7 +217,21 @@ fn prepare() -> Result<Prepared, ExitCode> {
                 return Err(ExitCode::FAILURE);
             }
         };
-    let userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs) {
+    // The mise engine resolves against its own dedicated lock (the global channel source,
+    // rolled independently by `ops upgrade mise`), never this launch's possibly-pinned
+    // base reference. Resolved *after* the base so its lock can be seeded from the base's
+    // on first use (no network, and a binary update never bumps the engine — see
+    // `resolve_engine_ref`). Threaded to both mise consumers: the in-cage engine (the base
+    // userland) and the host-side `[env]` driver.
+    let engine_ref =
+        match crate::store::resolve_engine_ref(&nix, &layout, cfg.nixpkgs_global.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ops: cannot resolve the mise engine channel: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+    let userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &engine_ref) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("ops: cannot resolve the sandbox userland: {e}");
@@ -228,6 +246,7 @@ fn prepare() -> Result<Prepared, ExitCode> {
         cwd,
         cfg,
         nixpkgs,
+        engine_ref,
         userland,
     })
 }
@@ -435,9 +454,9 @@ fn collect_roots(
 /// the project declares no mise file, or it is withheld — an untrusted or changed
 /// mise file only warns (its `[env]` is held back, like its security fields).
 ///
-/// mise is provisioned via nix and driven from ops's store against the **global**
-/// channel — never this launch's possibly-pinned reference (mise runs in its own
-/// store view, free of the one-channel rule; see [`Prepared::nixpkgs`]). The files
+/// mise is provisioned via nix and driven from ops's store against the **engine**
+/// channel — never this launch's possibly-pinned base reference (mise runs in its own
+/// store view, free of the one-channel rule; see [`Prepared::engine_ref`]). The files
 /// it reads are materialized from the bytes trust validated, outside any writable
 /// mount, so it sees exactly the authorized, hashed inputs. A trusted `[env]` that
 /// cannot be resolved is fatal, like a declared tool that fails to realise.
@@ -454,17 +473,13 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
         return Ok(Vec::new());
     }
 
-    let mise_ref =
-        crate::store::LockTarget::global(&prep.layout, prep.cfg.nixpkgs_global.as_deref())
-            .resolve(&prep.nix, &prep.layout)
-            .map_err(|e| {
-                eprintln!("ops: cannot resolve the global channel for mise: {e}");
-                ExitCode::FAILURE
-            })?;
-    let mise_bin = super::mise::provision(&prep.nix, &prep.layout, &mise_ref).map_err(|e| {
-        eprintln!("ops: cannot provision the mise engine: {e}");
-        ExitCode::FAILURE
-    })?;
+    // The same engine reference the in-cage mise uses, already resolved in `prepare`.
+    let mise_root = super::mise::provision_engine(&prep.nix, &prep.layout, &prep.engine_ref)
+        .map_err(|e| {
+            eprintln!("ops: cannot provision the mise engine: {e}");
+            ExitCode::FAILURE
+        })?;
+    let mise_bin = super::mise::bin(&mise_root);
     // Stage the authorized files in a per-project directory that sits outside every
     // writable mount (a sibling of the writable home, like the synthetic identity).
     let id = binds::project_runtime_id(&prep.cwd).map_err(|e| {

@@ -22,6 +22,6 @@ mod smoke;
 mod spec;
 
 pub(crate) use launch::{effective_lock_target, run, run_mise, shell};
-pub(crate) use nixhub::parse_nix_tools;
+pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 pub(crate) use proxy::nix_cache_hosts;
 pub(crate) use smoke::run as smoke;

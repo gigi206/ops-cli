@@ -73,9 +73,9 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **reviewed by the advisor**, and finally **validated with the user** before
   moving to the next — incremental, collaborative cadence, no barreling ahead.
 - **Current status: M2 done; M3 in progress (M3.1 + M3.2a + M3.2c + M3.2d done;
-  M3.2b SKIPPED; M3.3 in progress — M3.3a + M3.3b + M3.3c done; M3.3d in progress
+  M3.2b SKIPPED; M3.3 done — M3.3a + M3.3b + M3.3c done; M3.3d done
   — M3.3d.1 (nix-ld) + M3.3d.2a (widen the honored mise files) done; M3.3d.2b
-  (`[tools]` driver) in progress — the nixhub resolver + host-side provisioning of
+  (`[tools]` driver) done — the nixhub resolver + host-side provisioning of
   declared `nix:` tools landed (trusted-only); the per-project writable store layer
   shipped and is **WIRED — the cage's `/nix` is a read-write bind of the
   per-project store by default (the Mode-B posture inversion, 2b.3.2b.1)**;
@@ -91,7 +91,11 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (`mise use [-g] nix:<pkg>`) is auto-on-PATH in later launches: the mise shims dir on
   PATH for `ops run` (mise's documented non-interactive mechanism) and `mise activate`
   via a synthetic `--rcfile` for `ops shell` (its interactive mechanism), proven e2e +
-  pty + a network smoke**; and **the network increment (M6 / "network last") is under
+  pty + a network smoke**; and **`ops upgrade mise` shipped (M3.3d.3) — floating `nix:`
+  tool pins roll + prune against nixhub (`tools.lock`), and the mise engine rides its own
+  `mise-engine.lock` decoupled from the base channel (`ops upgrade nix` no longer moves the
+  engine; migration-safe seeding from `nixpkgs.lock` keeps a binary update from moving
+  versions)**; and **the network increment (M6 / "network last") is under
   way: its safe first slice shipped — a trusted-only `network = "none"` posture (the
   `NetPolicy::Isolated` an empty netns) gated like `binds`/`nixpkgs`, plus a live
   P-vs-B spike that LOCKED the egress architecture on **Model B** (deny-by-construction,
@@ -361,6 +365,41 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   two-launch run, confirm base tools survive activate, and correct the stale records);
   proven live (fresh `ops run -- jq` via the shim, pty `ops shell` via activate's real
   bin).
+  **M3.3d.3 — `ops upgrade mise` (the explicit roll-forward for mise, DONE)**
+  (`src/sandbox/nixhub.rs` + `mise.rs` + `fhs.rs` + `launch.rs` + `store.rs` + `main.rs`):
+  the deliberate way a project's mise toolchain advances — versions still never move on an
+  ops binary update (the seeded-not-baked contract), only on an explicit `ops upgrade`. Two
+  halves. **(a) tools.lock roll + prune (3d.3a)** — `nixhub::upgrade_tools` re-resolves each
+  **floating** `nix:` pin (`latest`/`stable`/a prefix like `20`) against nixhub → its newest
+  commit and rewrites the per-project `tools.lock`; a tool whose request is an **exact**
+  version is left untouched (already pinned). It also **prunes** lock entries whose tool has
+  left the config (closing the monotonic-growth residual noted at 2b.1-wire — a
+  removed-then-readded tool no longer reuses a stale pin). Trust-gated like the launch path;
+  an untrusted project rolls nothing. **(b) a dedicated engine lock (3d.3b)** — the mise
+  **engine** now tracks its own `<data>/mise-engine.lock`, independent of the base channel
+  (`nixpkgs.lock`), so `ops upgrade mise` advances the engine **without** bumping the base
+  (glibc/gcc/`[packages]`) of non-pinned projects, and `ops upgrade nix` no longer touches the
+  engine. Running the in-cage mise on a revision ≠ base is safe because the cage exposes **no
+  global `LD_LIBRARY_PATH`** — the engine resolves its own glibc by RUNPATH, exactly like a
+  cross-channel `nix:` tool (the nix-ld property). Both engine consumers — the in-cage mise
+  seeded into the per-project store, and the host-side `[env]` mise — ride the **one** engine
+  lock via `mise::provision_engine` (gcroot keyed by the engine rev; callers derive `bin`).
+  `store::resolve_engine_ref` is the **migration-safe** resolver (an advisor-caught blocker):
+  reuse the engine lock if present (no nix); else **seed it from `nixpkgs.lock`** when the
+  source matches (no nix — so an established install with a base lock but no engine lock never
+  re-resolves at the network on its first post-update launch, never carries two glibcs, and
+  works offline); else resolve fresh. `ops config` gains an `engine: <source> @ <rev>
+  (<origin>)` line beside `nixpkgs:`; `ops upgrade [all|nix|mise]` — `mise` rolls engine +
+  tools, `nix` rolls the base channel, `all` rolls all three, each reported by the
+  parameterized `channel_upgrade_summary`. **480 tests green** (engine-lock construction + 2
+  nix-free migration discriminants + a deterministic "two commands, two locks" decoupling test
+  are net new over 3d.3a's roll/prune tests), fmt/clippy clean, advisor-reviewed (plan AND
+  impl — it caught the migration blocker, fixed by `resolve_engine_ref` + the discriminant
+  test). Proven live (engine `rolled forward … → 567a49d`; decoupling both directions —
+  `upgrade mise` leaves `nixpkgs.lock` intact, `upgrade nix` leaves `mise-engine.lock`
+  byte-identical; `ops config` showing the two locks at distinct revs). **Honest scope:** a
+  real `ops run` with `engine_ref ≠ base` was not re-run live (a 2nd full base provision is
+  minutes) — covered structurally by the nix-ld smoke + the migration unit test.
   **M6.0 — the network slice + the P-vs-B architecture lock** (`src/config/` +
   `src/sandbox/launch.rs` + `ops config`): the network increment ("network last")
   opened with its **cheapest, decision-independent slice** — a trusted-only

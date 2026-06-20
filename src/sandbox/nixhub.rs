@@ -280,13 +280,158 @@ pub(crate) fn provision(
     })
 }
 
+/// The outcome of re-resolving one declared tool — or pruning a stale entry, or noting a
+/// token ops does not handle — during an explicit tools roll. Pure data, so the report is
+/// rendered and unit-tested without touching nix or the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolUpgrade {
+    /// A request that resolves to the version it was already at — an exact pin (which can
+    /// never roll, so the network is skipped), or a floating request whose newest build
+    /// is unchanged.
+    Unchanged {
+        pkg: String,
+        request: String,
+        version: String,
+    },
+    /// A floating request (`latest`/`stable`/a prefix) that rolled to a newer version.
+    Rolled {
+        pkg: String,
+        request: String,
+        from: String,
+        to: String,
+    },
+    /// A request with no prior lock entry, resolved and pinned for the first time.
+    Pinned {
+        pkg: String,
+        request: String,
+        version: String,
+    },
+    /// A re-resolution that failed; the prior pin (if any) is kept and the roll reports a
+    /// non-zero exit. `kept` is the surviving version, `None` when there was no prior pin.
+    Failed {
+        pkg: String,
+        request: String,
+        error: String,
+        kept: Option<String>,
+    },
+    /// A lock entry for a tool no longer declared on this system, dropped from the lock.
+    Pruned { pkg: String, request: String },
+    /// A declared token ops does not roll — a non-`nix:` backend, or a malformed `nix:`
+    /// token — reported so it is never a silent omission.
+    Ignored { token: String },
+}
+
+/// Re-resolve a trusted project's declared `nix:` tools against nixhub and rewrite the
+/// per-project resolution lock — the explicit roll-forward `ops upgrade mise` performs.
+/// Only the lock is rewritten; the new pins are realised on the next launch, exactly as a
+/// channel roll downloads its base on the next launch.
+///
+/// A request that is an exact version already locked to itself can never roll (nixhub maps
+/// a version to a fixed commit, and an exact match always wins), so its network query is
+/// skipped. Every other request — an alias (`latest`/`stable`), a prefix (`20` → `20.x`),
+/// or an as-yet-unlocked tool — is re-resolved. Best-effort: a tool that fails to resolve
+/// keeps its prior pin and is reported, and the roll continues (the caller exits non-zero).
+///
+/// Stale entries are pruned: a lock entry whose `(pkg, request)` is no longer declared is
+/// dropped — but only for the current `system`, so a data directory shared across machines
+/// never loses another host's still-valid pins. The caller invokes this only for a trusted
+/// project (an untrusted one's tools are never locked).
+pub(crate) fn upgrade_tools(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    files: &[(String, Vec<u8>)],
+    system: &str,
+) -> io::Result<Vec<ToolUpgrade>> {
+    let declared = parse_nix_tools(files);
+    let id = super::binds::project_runtime_id(project)?;
+    let lock_path = layout
+        .data_dir()
+        .join("projects")
+        .join(&id)
+        .join(TOOLS_LOCK);
+    let mut lock = ResolutionLock::read(&lock_path);
+    let mut outcomes = Vec::new();
+
+    for tool in &declared.nix {
+        let existing = lock.get(&tool.pkg, &tool.version, system);
+        // An exact concrete request already resolved to itself is frozen — skip the query.
+        if let Some(pin) = &existing {
+            if pin.version == tool.version {
+                outcomes.push(ToolUpgrade::Unchanged {
+                    pkg: tool.pkg.clone(),
+                    request: tool.version.clone(),
+                    version: pin.version.clone(),
+                });
+                continue;
+            }
+        }
+        match resolve(nix, layout, tool, system) {
+            Ok(pin) => {
+                let outcome = match &existing {
+                    None => ToolUpgrade::Pinned {
+                        pkg: tool.pkg.clone(),
+                        request: tool.version.clone(),
+                        version: pin.version.clone(),
+                    },
+                    Some(old) if old.commit == pin.commit => ToolUpgrade::Unchanged {
+                        pkg: tool.pkg.clone(),
+                        request: tool.version.clone(),
+                        version: pin.version.clone(),
+                    },
+                    Some(old) => ToolUpgrade::Rolled {
+                        pkg: tool.pkg.clone(),
+                        request: tool.version.clone(),
+                        from: old.version.clone(),
+                        to: pin.version.clone(),
+                    },
+                };
+                lock.insert(&tool.pkg, &tool.version, system, &pin);
+                outcomes.push(outcome);
+            }
+            Err(e) => outcomes.push(ToolUpgrade::Failed {
+                pkg: tool.pkg.clone(),
+                request: tool.version.clone(),
+                error: e.to_string(),
+                kept: existing.map(|p| p.version),
+            }),
+        }
+    }
+
+    // Prune entries for this system whose request is no longer declared. Other-system
+    // entries are left untouched so a shared data dir keeps the other host's valid pins.
+    let declared_keys: HashSet<(&str, &str)> = declared
+        .nix
+        .iter()
+        .map(|t| (t.pkg.as_str(), t.version.as_str()))
+        .collect();
+    let stale: Vec<(String, String, String)> = lock
+        .entries
+        .keys()
+        .filter(|(pkg, req, sys)| {
+            sys == system && !declared_keys.contains(&(pkg.as_str(), req.as_str()))
+        })
+        .cloned()
+        .collect();
+    for (pkg, request, sys) in stale {
+        lock.entries.remove(&(pkg.clone(), request.clone(), sys));
+        outcomes.push(ToolUpgrade::Pruned { pkg, request });
+    }
+
+    for token in declared.other {
+        outcomes.push(ToolUpgrade::Ignored { token });
+    }
+
+    lock.write(&lock_path)?;
+    Ok(outcomes)
+}
+
 /// A per-project cache of `(pkg, version, system) -> Pin`: a tool is resolved against
 /// nixhub once and reused on later launches. The version request is part of the key, so
-/// changing it re-resolves; a future explicit upgrade re-seeds entries. The system is in
-/// the key too, since a release's pin is platform-specific. Entries are **not pruned**
-/// when a tool leaves the config — the lock grows monotonically, so a removed-then-readded
-/// tool reuses its prior pin; reconciling stale entries is left to an explicit upgrade or
-/// store housekeeping.
+/// changing it re-resolves. The system is in the key too, since a release's pin is
+/// platform-specific. The lock grows as tools are added; an explicit roll
+/// ([`upgrade_tools`]) prunes entries whose tool has left the config and re-resolves the
+/// floating pins.
 struct ResolutionLock {
     entries: BTreeMap<(String, String, String), Pin>,
 }
@@ -836,5 +981,116 @@ mod resolve_tests {
             .map(|dir| dir.flatten().any(|e| e.path().join("tools.lock").is_file()))
             .unwrap_or(false);
         assert!(locked, "the tool resolution was not written to a lock");
+    }
+
+    #[test]
+    fn upgrade_tools_classifies_prunes_and_is_best_effort() {
+        use crate::store::Layout;
+        use crate::testutil::TmpDir;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let system = current_system();
+
+        // Seed the per-project lock the same way the launcher would, then drive an
+        // upgrade. A non-existent nix makes every re-resolution fail, so each branch is
+        // exercised offline: the exact-locked tool skips the query, the floating ones take
+        // the best-effort path keeping their prior pin, and the stale entry is pruned.
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let lock_path = layout
+            .data_dir()
+            .join("projects")
+            .join(&id)
+            .join(TOOLS_LOCK);
+        let commit = "a".repeat(40);
+        let pin = |v: &str| Pin {
+            commit: commit.clone(),
+            attr: "x".to_string(),
+            version: v.to_string(),
+        };
+        let mut seed = ResolutionLock::read(Path::new("/nonexistent-seed"));
+        seed.insert("jq", "1.7.1", &system, &pin("1.7.1")); // exact-locked → Unchanged, no query
+        seed.insert("ripgrep", "latest", &system, &pin("14.1.0")); // floating-locked → Failed, kept
+        seed.insert("oldtool", "1.0", &system, &pin("1.0")); // not declared → Pruned
+        seed.insert("jq", "1.7.1", "x999-other", &pin("1.7.1")); // other system → kept silently
+        seed.write(&lock_path).expect("seed the lock");
+
+        let mise_files = vec![(
+            ".mise.toml".to_string(),
+            "[tools]\n\
+             \"nix:jq\" = \"1.7.1\"\n\
+             \"nix:ripgrep\" = \"latest\"\n\
+             \"nix:newtool\" = \"latest\"\n\
+             node = \"18\"\n"
+                .as_bytes()
+                .to_vec(),
+        )];
+
+        let bogus_nix = Path::new("/nonexistent/ops-test-nix");
+        let outcomes = upgrade_tools(bogus_nix, &layout, project.path(), &mise_files, &system)
+            .expect("upgrade_tools rewrites the lock");
+
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ToolUpgrade::Unchanged { pkg, .. } if pkg == "jq")),
+            "an exact-locked tool is unchanged without a query: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                ToolUpgrade::Failed { pkg, kept: Some(v), .. } if pkg == "ripgrep" && v == "14.1.0"
+            )),
+            "a floating-locked tool that fails to re-resolve keeps its pin: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                ToolUpgrade::Failed { pkg, kept: None, .. } if pkg == "newtool"
+            )),
+            "an unlocked tool that fails to re-resolve is reported with no pin: {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ToolUpgrade::Pruned { pkg, .. } if pkg == "oldtool")),
+            "an undeclared entry on this system is pruned: {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ToolUpgrade::Ignored { token } if token == "node")),
+            "a non-nix: backend is reported, never silently dropped: {outcomes:?}"
+        );
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| matches!(o, ToolUpgrade::Pruned { pkg, .. } if pkg == "jq")),
+            "the other-system entry must not be pruned: {outcomes:?}"
+        );
+
+        // The persisted lock reflects the same decisions.
+        let after = ResolutionLock::read(&lock_path);
+        assert!(
+            after.get("jq", "1.7.1", &system).is_some(),
+            "the declared current-system tool stays"
+        );
+        assert!(
+            after.get("jq", "1.7.1", "x999-other").is_some(),
+            "another host's still-valid pin is preserved"
+        );
+        assert!(
+            after.get("ripgrep", "latest", &system).is_some(),
+            "a failed re-resolution keeps the prior pin (best effort)"
+        );
+        assert!(
+            after.get("oldtool", "1.0", &system).is_none(),
+            "the stale entry was pruned from the lock"
+        );
+        assert!(
+            after.get("newtool", "latest", &system).is_none(),
+            "a tool that never resolved is not written to the lock"
+        );
     }
 }

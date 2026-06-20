@@ -58,7 +58,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
                  test net <url> | plugins <list|info|install|rm|store> | ps | trust [path] | \
-                 untrust [path] | config | upgrade [all|nix]>"
+                 untrust [path] | config | upgrade [all|nix|mise]>"
             );
             ExitCode::from(2)
         }
@@ -494,6 +494,10 @@ fn config_cmd() -> ExitCode {
     // (a stale per-project lock is never surfaced). Shown without resolving anything
     // (no nix, no network): an unlocked source simply omits the revision.
     println!("  {}", nixpkgs_line(&cwd, &resolved));
+    // The mise engine's own channel and locked revision, from its dedicated lock — shown
+    // so the decoupling from the base channel is visible: `ops upgrade mise` advances this
+    // without moving `nixpkgs`, and `ops upgrade nix` the reverse.
+    println!("  {}", engine_line(&resolved));
     // The network posture — a security field, gated like the binds: an untrusted
     // project's choice never reaches here. `shared` keeps the host network (the
     // default, no confidentiality guarantee yet); `none` cuts it off entirely; an
@@ -1334,28 +1338,52 @@ fn nixpkgs_line(cwd: &Path, resolved: &config::Resolved) -> String {
     format!("nixpkgs: {source}  ({origin})")
 }
 
-/// `ops upgrade [all|nix]`: roll the nixpkgs channel forward. It re-resolves the
-/// source the current directory tracks — a trusted project pin, else the global
-/// channel — and rewrites that lock, so tool and base versions advance only here,
-/// never on an ops binary update. It needs nix (to resolve) but not the sandbox
-/// boundary: it only rewrites a lock, so it does not gate on user namespaces.
+/// The `ops config` mise-engine line: the engine's source (the global channel — a project
+/// pin never moves it) and the revision its dedicated lock is currently pinned to, when
+/// one has been resolved. Shown so the engine's independence from the base channel is
+/// visible. Best-effort, like [`nixpkgs_line`]: if the data directory cannot be resolved,
+/// it falls back to the source and origin alone. Resolves nothing (no nix, no network).
+fn engine_line(resolved: &config::Resolved) -> String {
+    if let Some(layout) = store::Layout::from_env() {
+        let target = store::LockTarget::engine(&layout, resolved.nixpkgs_global.as_deref());
+        let origin = target.origin().label();
+        return match target.locked_revision() {
+            Some(rev) => format!(
+                "engine: {} @ {}  ({origin})",
+                target.source(),
+                short_rev(&rev)
+            ),
+            None => format!("engine: {}  ({origin})", target.source()),
+        };
+    }
+    let (source, origin) = match &resolved.nixpkgs_global {
+        Some(g) => (g.as_str(), "global"),
+        None => ("nixos-unstable", "default"),
+    };
+    format!("engine: {source}  ({origin})")
+}
+
+/// `ops upgrade [all|nix|mise]`: roll managed channels forward by re-resolving and
+/// rewriting their locks, so versions advance only here, never on an ops binary update.
+/// `nix` rolls the nixpkgs channel the current directory tracks (a trusted project pin,
+/// else the global channel) — base and native `[packages]`. `mise` rolls the mise engine
+/// (its own dedicated lock) and the project's `nix:` tools. `all` rolls every one. It
+/// needs nix (to resolve) but not the sandbox boundary: it only rewrites locks, so it
+/// does not gate on user namespaces.
 fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // Parse the target before touching anything, so a typo fails cleanly. `all` covers
-    // every managed channel; today that is just nix (mise provisioning lands later).
-    match args.first().and_then(|s| s.to_str()).unwrap_or("all") {
-        "all" | "nix" => {}
-        "mise" => {
-            eprintln!("ops: upgrading mise is not yet available.");
-            return ExitCode::from(2);
-        }
+    // every managed channel: the nixpkgs channel (base + native `[packages]`) and the
+    // project's `nix:` mise tools.
+    let what = match args.first().and_then(|s| s.to_str()).unwrap_or("all") {
+        w @ ("all" | "nix" | "mise") => w,
         other => {
-            eprintln!("ops: unknown upgrade target '{other}' (known: all, nix)");
+            eprintln!("ops: unknown upgrade target '{other}' (known: all, nix, mise)");
             return ExitCode::from(2);
         }
-    }
+    };
 
     let Some(nix) = store::resolve_nix() else {
-        eprintln!("ops: nix not found — cannot upgrade the channel. See `ops doctor`.");
+        eprintln!("ops: nix not found — cannot upgrade. See `ops doctor`.");
         return ExitCode::FAILURE;
     };
     let Some(layout) = store::Layout::from_env() else {
@@ -1378,38 +1406,181 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         eprintln!("ops: warning: {warning}");
     }
 
-    let target = match sandbox::effective_lock_target(&cwd, &layout, &cfg) {
+    // `all` rolls every managed channel and reports the worst exit — a tool that fails to
+    // re-resolve must not be masked by a clean roll elsewhere. `mise` rolls two distinct
+    // things: the engine (host-global, in every cage, so it rolls regardless of any
+    // project's trust) and the project's `nix:` tools (trusted-only). Rolling them as two
+    // separate, unconditional calls keeps the engine's trust-independence structural
+    // rather than dependent on the tools path not early-returning.
+    let mut ok = true;
+    if matches!(what, "nix" | "all") {
+        ok &= upgrade_nix_channel(&nix, &layout, &cwd, &cfg);
+    }
+    if matches!(what, "mise" | "all") {
+        ok &= upgrade_mise_engine(&nix, &layout, &cfg);
+        ok &= upgrade_mise_tools(&nix, &layout, &cwd, &cfg);
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else
+/// the global channel — forcing a fresh resolution and rewriting that lock. Returns
+/// whether it succeeded; the base and `[packages]` download on the next launch.
+fn upgrade_nix_channel(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+) -> bool {
+    let target = match sandbox::effective_lock_target(cwd, layout, cfg) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("ops: cannot resolve the channel target: {e}");
-            return ExitCode::FAILURE;
+            return false;
         }
     };
-    let upgrade = match target.refresh(&nix, &layout) {
+    let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("ops: cannot upgrade the nixpkgs channel: {e}");
-            return ExitCode::FAILURE;
+            return false;
         }
     };
-
-    for line in upgrade_summary(target.origin().label(), &upgrade) {
+    for line in channel_upgrade_summary(
+        "ops upgrade — nix channel",
+        "channel",
+        "the new base and tools download",
+        target.origin().label(),
+        &upgrade,
+    ) {
         println!("{line}");
     }
-    ExitCode::SUCCESS
+    true
 }
 
-/// The human-readable summary of an upgrade: the channel, then what changed — a first
-/// resolution, an unchanged channel, a fixed revision that cannot roll, or a
-/// roll-forward. Pure, so every outcome is unit-tested without invoking nix.
-fn upgrade_summary(origin: &str, up: &store::Upgrade) -> Vec<String> {
+/// Roll the mise engine: force a fresh resolution of its dedicated lock (the global
+/// channel source, in `mise-engine.lock`) and rewrite it, so the engine advances
+/// independently of the base channel that `ops upgrade nix` rolls. Host-global and
+/// present in every cage, so it rolls regardless of any project's trust — unlike the
+/// project's `nix:` tools. Returns whether it succeeded; the new engine is provisioned
+/// on the next launch.
+fn upgrade_mise_engine(nix: &Path, layout: &store::Layout, cfg: &config::Resolved) -> bool {
+    let target = store::LockTarget::engine(layout, cfg.nixpkgs_global.as_deref());
+    let upgrade = match target.refresh(nix, layout) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("ops: cannot upgrade the mise engine: {e}");
+            return false;
+        }
+    };
+    for line in channel_upgrade_summary(
+        "ops upgrade — mise engine",
+        "engine",
+        "the new engine is provisioned",
+        target.origin().label(),
+        &upgrade,
+    ) {
+        println!("{line}");
+    }
+    true
+}
+
+/// Roll the project's `nix:` mise tools: re-resolve the floating pins against nixhub and
+/// prune stale entries, rewriting the per-project resolution lock. Returns whether it
+/// succeeded — a tool that fails to re-resolve keeps its prior pin and makes this `false`,
+/// but never aborts the others. Trusted-only, mirroring how the tools are provisioned: an
+/// untrusted project's tools are never locked, so there is nothing to roll.
+fn upgrade_mise_tools(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+) -> bool {
+    let Some(mise) = &cfg.mise else {
+        for line in upgrade_tools_summary(&[]) {
+            println!("{line}");
+        }
+        return true;
+    };
+    if mise.state != trust::TrustState::Trusted {
+        eprintln!(
+            "ops: warning: mise file {} withheld ({}): its nix: tools are not rolled",
+            mise.name,
+            config::untrusted_reason(mise.state)
+        );
+        return true;
+    }
+    let outcomes =
+        match sandbox::upgrade_tools(nix, layout, cwd, &mise.files, &sandbox::current_system()) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("ops: cannot roll the mise tools: {e}");
+                return false;
+            }
+        };
+    for line in upgrade_tools_summary(&outcomes) {
+        println!("{line}");
+    }
+    !outcomes
+        .iter()
+        .any(|o| matches!(o, sandbox::ToolUpgrade::Failed { .. }))
+}
+
+/// The human-readable summary of a mise tools roll: one line per declared tool (rolled,
+/// unchanged, newly pinned, or failed), the entries pruned, and any token ops does not
+/// handle. Pure, so every outcome is unit-tested without invoking nix.
+fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade]) -> Vec<String> {
+    use sandbox::ToolUpgrade::*;
+    let mut lines = vec!["ops upgrade — mise tools".to_string()];
+    if outcomes.is_empty() {
+        lines.push("  no nix: tools to roll.".to_string());
+        return lines;
+    }
+    for outcome in outcomes {
+        lines.push(match outcome {
+            Unchanged { pkg, version, .. } => format!("  nix:{pkg}: {version} — unchanged."),
+            Rolled { pkg, from, to, .. } => format!("  nix:{pkg}: {from} → {to} — rolled forward."),
+            Pinned { pkg, version, .. } => format!("  nix:{pkg}: {version} — newly pinned."),
+            Failed {
+                pkg, error, kept, ..
+            } => match kept {
+                Some(v) => format!("  nix:{pkg}: re-resolve failed, kept {v} — {error}"),
+                None => format!("  nix:{pkg}: re-resolve failed — {error}"),
+            },
+            Pruned { pkg, request } => {
+                format!("  nix:{pkg} ({request}): removed from the lock (no longer declared).")
+            }
+            Ignored { token } => {
+                format!("  {token}: not a nix: tool — left to mise, not rolled.")
+            }
+        });
+    }
+    lines
+}
+
+/// The human-readable summary of a channel-style roll (the nix channel or the mise
+/// engine): the `heading`, the source under its `item` word (channel/engine) and where it
+/// came from, then what changed — a first resolution, an unchanged channel, a fixed
+/// revision that cannot roll, or a roll-forward — naming what `downloads`/re-provisions on
+/// the next launch. Pure, so every outcome is unit-tested without invoking nix.
+fn channel_upgrade_summary(
+    heading: &str,
+    item: &str,
+    downloads: &str,
+    origin: &str,
+    up: &store::Upgrade,
+) -> Vec<String> {
     let mut lines = vec![
-        "ops upgrade — nix channel".to_string(),
-        format!("  channel: {}  ({origin})", up.source),
+        heading.to_string(),
+        format!("  {item}: {}  ({origin})", up.source),
     ];
     let outcome = match &up.previous {
         None => format!(
-            "  resolved to {} (first pin) — the new base and tools download on the next launch.",
+            "  resolved to {} (first pin) — {downloads} on the next launch.",
             short_rev(&up.revision)
         ),
         Some(prev) if prev == &up.revision && store::is_pinned_revision(&up.source) => format!(
@@ -1421,7 +1592,7 @@ fn upgrade_summary(origin: &str, up: &store::Upgrade) -> Vec<String> {
             short_rev(&up.revision)
         ),
         Some(prev) => format!(
-            "  rolled forward {} → {} — the new base and tools download on the next launch.",
+            "  rolled forward {} → {} — {downloads} on the next launch.",
             short_rev(prev),
             short_rev(&up.revision)
         ),
@@ -1571,7 +1742,16 @@ mod tests {
     fn upgrade_summary_distinguishes_the_outcomes() {
         let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
         let newer = "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c";
-        let text = |up| upgrade_summary("default", &up).join("\n");
+        let text = |up| {
+            channel_upgrade_summary(
+                "ops upgrade — nix channel",
+                "channel",
+                "the new base and tools download",
+                "default",
+                &up,
+            )
+            .join("\n")
+        };
 
         // a first resolution
         assert!(text(store::Upgrade {
@@ -1605,5 +1785,156 @@ mod tests {
         });
         assert!(rolled.contains("rolled forward"));
         assert!(rolled.contains("9ae611a") && rolled.contains("1c1c1c1"));
+
+        // the same renderer, parameterised for the mise engine: a distinct heading, the
+        // `engine` item word, and the engine-specific "provisioned" tail — so the two
+        // roll commands read differently.
+        let engine = channel_upgrade_summary(
+            "ops upgrade — mise engine",
+            "engine",
+            "the new engine is provisioned",
+            "default",
+            &store::Upgrade {
+                source: "nixos-unstable".into(),
+                previous: Some(rev.into()),
+                revision: newer.into(),
+            },
+        )
+        .join("\n");
+        assert!(engine.contains("mise engine"));
+        assert!(engine.contains("engine: nixos-unstable"));
+        assert!(engine.contains("the new engine is provisioned"));
+        assert!(!engine.contains("base and tools"));
+    }
+
+    #[test]
+    fn upgrade_mise_and_upgrade_nix_roll_separate_locks() {
+        // The decoupling guarantee at the file level: rolling the engine must leave the
+        // base channel lock byte-identical, and rolling the base must leave the engine
+        // lock byte-identical. Proven deterministically with revision sources, which
+        // resolve without nix — so a bogus nix path is never invoked. The roll mechanics
+        // are already covered by store.rs's `refresh*` tests (which `LockTarget::engine`
+        // reuses verbatim); what is net-new here is that the two commands write two
+        // distinct files.
+        let bogus_nix = Path::new("/nonexistent-nix");
+        let rev_a = "a".repeat(40);
+        let rev_b = "b".repeat(40);
+        let cfg = |global: &str| config::Resolved {
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            nixpkgs_global: Some(global.to_string()),
+            nixpkgs_project: None,
+            mise: None,
+            network: config::NetworkPolicy::default(),
+            secrets: vec![],
+            warnings: vec![],
+        };
+
+        let data = TmpDir::new();
+        let layout = store::Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let nix_lock = layout.data_dir().join("nixpkgs.lock");
+        let engine_lock = layout.data_dir().join("mise-engine.lock");
+
+        // seed both locks at REV_A (same global override, so each resolves REV_A with no nix)
+        assert!(upgrade_mise_engine(bogus_nix, &layout, &cfg(&rev_a)));
+        assert!(upgrade_nix_channel(
+            bogus_nix,
+            &layout,
+            data.path(),
+            &cfg(&rev_a)
+        ));
+        let nix_seed = std::fs::read(&nix_lock).unwrap();
+
+        // roll ONLY the engine to REV_B: the base lock is untouched, the engine advanced
+        assert!(upgrade_mise_engine(bogus_nix, &layout, &cfg(&rev_b)));
+        assert_eq!(
+            std::fs::read(&nix_lock).unwrap(),
+            nix_seed,
+            "upgrade mise must not touch nixpkgs.lock"
+        );
+        assert!(
+            std::fs::read_to_string(&engine_lock)
+                .unwrap()
+                .contains(&rev_b),
+            "the engine lock advanced to REV_B"
+        );
+
+        // re-seed the engine at REV_A, then roll ONLY the base to REV_B: now the engine
+        // lock is untouched and the base advanced
+        assert!(upgrade_mise_engine(bogus_nix, &layout, &cfg(&rev_a)));
+        let engine_reseed = std::fs::read(&engine_lock).unwrap();
+        assert!(upgrade_nix_channel(
+            bogus_nix,
+            &layout,
+            data.path(),
+            &cfg(&rev_b)
+        ));
+        assert_eq!(
+            std::fs::read(&engine_lock).unwrap(),
+            engine_reseed,
+            "upgrade nix must not touch mise-engine.lock"
+        );
+        assert!(
+            std::fs::read_to_string(&nix_lock).unwrap().contains(&rev_b),
+            "the base lock advanced to REV_B"
+        );
+    }
+
+    #[test]
+    fn upgrade_tools_summary_distinguishes_the_outcomes() {
+        use sandbox::ToolUpgrade::*;
+
+        // an empty roll (no nix: tools, or no mise file) says so plainly
+        let empty = upgrade_tools_summary(&[]).join("\n");
+        assert!(empty.contains("no nix: tools"));
+
+        let text = upgrade_tools_summary(&[
+            Unchanged {
+                pkg: "jq".into(),
+                request: "1.7.1".into(),
+                version: "1.7.1".into(),
+            },
+            Rolled {
+                pkg: "ripgrep".into(),
+                request: "latest".into(),
+                from: "14.1.0".into(),
+                to: "14.1.1".into(),
+            },
+            Pinned {
+                pkg: "nodejs".into(),
+                request: "20".into(),
+                version: "20.11.0".into(),
+            },
+            Failed {
+                pkg: "fd".into(),
+                request: "latest".into(),
+                error: "nixhub unreachable".into(),
+                kept: Some("9.0.0".into()),
+            },
+            Failed {
+                pkg: "bat".into(),
+                request: "latest".into(),
+                error: "nixhub unreachable".into(),
+                kept: None,
+            },
+            Pruned {
+                pkg: "oldtool".into(),
+                request: "1.0".into(),
+            },
+            Ignored {
+                token: "node".into(),
+            },
+        ])
+        .join("\n");
+
+        assert!(text.contains("nix:jq: 1.7.1 — unchanged"));
+        assert!(text.contains("nix:ripgrep: 14.1.0 → 14.1.1 — rolled forward"));
+        assert!(text.contains("nix:nodejs: 20.11.0 — newly pinned"));
+        assert!(text.contains("nix:fd: re-resolve failed, kept 9.0.0"));
+        assert!(text.contains("nix:bat: re-resolve failed — nixhub unreachable"));
+        assert!(text.contains("nix:oldtool (1.0): removed from the lock"));
+        assert!(text.contains("node: not a nix: tool"));
     }
 }

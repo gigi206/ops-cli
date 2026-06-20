@@ -1092,8 +1092,8 @@ mod smoke {
         let nixpkgs = crate::store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve nixpkgs");
-        let userland =
-            super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs).expect("resolve userland");
+        let userland = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+            .expect("resolve userland");
 
         let project = TmpDir::new();
         std::fs::write(project.path().join("README"), b"hi").unwrap();
@@ -1178,7 +1178,7 @@ mod smoke {
         let base_ref = crate::store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve base channel");
-        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref)
+        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
             .expect("resolve userland");
         // both halves consume the shared store read-only (the userland is what is under
         // test); the writable per-project store is the launcher's concern.
@@ -1339,7 +1339,7 @@ mod smoke {
         let base_ref = crate::store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve base channel");
-        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref)
+        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
             .expect("resolve userland");
         let jq = crate::store::provision(
             &nix,
@@ -1500,7 +1500,7 @@ mod smoke {
             .expect("resolve base channel");
         // the base userland now carries nix among its roots, so seeding the base closure
         // brings nix and its closure into the per-project store.
-        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref)
+        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
             .expect("resolve userland");
         // jq: realised into the shared store but NOT a seeded root — the discriminant's
         // non-seeded dependency.
@@ -1703,7 +1703,7 @@ mod smoke {
             .expect("resolve base channel");
         // the base userland carries mise, so seeding the base closure brings mise and
         // its closure into the per-project store — the agent reaches it by name.
-        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref)
+        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
             .expect("resolve userland");
 
         let project = TmpDir::new();
@@ -1834,7 +1834,7 @@ mod smoke {
         let base_ref = crate::store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve base channel");
-        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref)
+        let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
             .expect("resolve userland");
 
         let project = TmpDir::new();
