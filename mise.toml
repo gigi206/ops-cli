@@ -74,6 +74,14 @@ lua                            = "latest"
 ruby           = "3.3"
 "gem:bashcov"  = "latest"
 
+# --- musl static-link toolchain (the shipping binary is a static musl build;
+# some dependencies carry C/asm, so the musl target needs a musl-targeting C
+# compiler). zig provides a self-contained musl cross-cc and cargo-zigbuild
+# wires it into cargo — no system musl-gcc package required. Build with:
+#   mise exec -- cargo zigbuild --release --target x86_64-unknown-linux-musl
+zig                             = "latest"
+"ubi:rust-cross/cargo-zigbuild" = "latest"
+
 
 
 # ============================================================================
