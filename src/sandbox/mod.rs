@@ -17,6 +17,7 @@ mod nixhub;
 mod packages;
 mod projectstore;
 mod proxy;
+mod resolver;
 mod smoke;
 mod spec;
 

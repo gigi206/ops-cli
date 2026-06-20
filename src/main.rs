@@ -10,15 +10,18 @@
 mod allowlist;
 mod config;
 mod pathfind;
+mod plugin_store;
+mod plugins;
 mod sandbox;
 mod session;
 mod store;
+mod stores;
 #[cfg(test)]
 mod testutil;
 mod trust;
 
-use std::ffi::OsString;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -43,17 +46,19 @@ fn main() -> ExitCode {
         }
         Some("mise") => sandbox::run_mise(args.collect()),
         Some("test") => test_cmd(args.collect()),
+        Some("plugins") => plugins_cmd(args.collect()),
         Some(other) => {
             eprintln!(
-                "ops: unknown command '{other}' \
-                 (known: doctor, shell, run, mise, test, ps, trust, untrust, config, upgrade)"
+                "ops: unknown command '{other}' (known: doctor, shell, run, mise, test, \
+                 plugins, ps, trust, untrust, config, upgrade)"
             );
             ExitCode::from(2)
         }
         None => {
             eprintln!(
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
-                 test net <url> | ps | trust [path] | untrust [path] | config | upgrade [all|nix]>"
+                 test net <url> | plugins <list|info|install|rm|store> | ps | trust [path] | \
+                 untrust [path] | config | upgrade [all|nix]>"
             );
             ExitCode::from(2)
         }
@@ -120,6 +125,16 @@ fn doctor() -> ExitCode {
             println!("  [FAIL] nix               not found on PATH");
             remediation.push("install nix (the store engine ops drives daemonlessly)");
         }
+    }
+
+    // git fetches a remote plugin store (`ops plugins store add`). It is not on the launch
+    // path — a sandbox runs without it — so its absence is a feature gap reported for
+    // context, never a boundary failure that blocks `ops run`.
+    match store::resolve_git() {
+        Some(git) => println!("  [ ok ] git               {}", git.display()),
+        None => println!(
+            "  [warn] git               not found on PATH — needed only for `ops plugins store`"
+        ),
     }
 
     // Where the user-owned store lives, and which channel revision it is pinned to.
@@ -522,7 +537,7 @@ fn config_cmd() -> ExitCode {
                 s.header,
                 s.to,
                 s.shape.describe(),
-                s.source.describe()
+                s.describe_sources()
             );
         }
     }
@@ -605,6 +620,690 @@ fn net_test(args: &[OsString]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+    }
+}
+
+/// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
+/// — it reads `<data>/plugins`, not a project's `.ops.toml`. A read-only diagnostic for now;
+/// installation and the signed plugin store are later increments, so the dispatch only knows the
+/// inspection verbs and names them on anything else (no inert stubs).
+fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("list") => plugins_list(),
+        Some("info") => plugins_info(args.get(1).and_then(|a| a.to_str())),
+        Some("install") => plugins_install(args.get(1)),
+        Some("rm") => plugins_remove(args.get(1).and_then(|a| a.to_str())),
+        Some("store") => plugins_store(&args[1..]),
+        Some(other) => {
+            eprintln!(
+                "ops: unknown plugins subcommand '{other}' (known: list, info, install, rm, store)"
+            );
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!(
+                "ops: usage: ops plugins <list | info <scheme> | install <name | dir> | \
+                 rm <name> | store <list | add | update | install | info | rm>>"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Resolve the registry of installed resolver plugins from the data directory, or report why it
+/// could not be located. Shared by `list` and `info`; the load warnings are returned so the
+/// caller can surface them (the diagnostic for a plugin that was discovered but dropped).
+fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
+    let layout = store::Layout::from_env()?;
+    let mut warnings = Vec::new();
+    let registry = plugins::PluginRegistry::load(&layout.plugins_dir(), &mut warnings);
+    Some((registry, warnings))
+}
+
+/// `ops plugins list`: the reserved built-in schemes (never claimable by a plugin) and every
+/// installed resolver plugin — its scheme, name, version, network grant, and one-line
+/// description. A plugin whose executable would be refused at launch (not owner-only, not a
+/// regular file) is flagged here, using the very check the runner enforces, so the gap between
+/// "discovered" and "runnable" is visible. Discovery warnings (a malformed manifest, an ambiguous
+/// scheme) go to stderr. No nix, no network, no launch.
+fn plugins_list() -> ExitCode {
+    let Some((registry, warnings)) = load_plugin_registry() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+
+    println!(
+        "built-in schemes (always resolve, never a plugin): {}",
+        plugins::builtin_schemes().join(", ")
+    );
+    if registry.is_empty() {
+        println!("installed resolver plugins: (none)");
+    } else {
+        println!("installed resolver plugins:");
+        for p in registry.resolvers() {
+            let net = if p.sandbox.network {
+                "network"
+            } else {
+                "no-network"
+            };
+            print!("  {}://  {}", p.scheme, p.name);
+            if let Some(v) = &p.version {
+                print!("  v{v}");
+            }
+            print!("  {net}");
+            if let Err(why) = p.check_exec() {
+                print!("  [not runnable: {why}]");
+            }
+            println!();
+            if let Some(desc) = &p.description {
+                println!("    {desc}");
+            }
+        }
+        println!("(remove one with: ops plugins rm <name>)");
+    }
+    println!("(browse the built-in store with: ops plugins store list)");
+    for w in &warnings {
+        eprintln!("ops: warning: {w}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `ops plugins install <name | dir>`: place a resolver plugin into the data dir, where it becomes
+/// trusted by location. A bare `name` installs a plugin from the built-in store (bundled in the
+/// binary); a path-like argument (`./dir`, `/abs/dir`) copies a local directory. A deliberate user
+/// act (an agent in the cage cannot run it); either way the staged copy is validated exactly as the
+/// launcher will and refused, fail-closed, on any flaw. No fetch, no network, no signature.
+fn plugins_install(source: Option<&OsString>) -> ExitCode {
+    let Some(source) = source else {
+        eprintln!("ops: usage: ops plugins install <name | dir>");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    // The rule is syntactic, not based on what exists on disk, so the command's meaning never
+    // depends on the current directory's contents: a path-like argument is a local directory, a
+    // bare token is a built-in store name.
+    let result = if is_path_like(source) {
+        plugins::install(&layout, Path::new(source))
+    } else if let Some(name) = source.to_str() {
+        plugins::install_embedded(&layout, name)
+    } else {
+        eprintln!("ops: a built-in plugin name must be valid UTF-8 (use ./<dir> for a local path)");
+        return ExitCode::from(2);
+    };
+    match result {
+        Ok(installed) => {
+            println!(
+                "installed '{}' ({}://) — remove with: ops plugins rm {}",
+                installed.name, installed.scheme, installed.name
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("ops: cannot install plugin: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Whether an install argument names a local path rather than a built-in store plugin: it begins
+/// with `.` (`./dir`, `../dir`) or contains a `/` (`/abs/dir`, `sub/dir`). A bare `name` is looked
+/// up in the built-in store. Syntactic by design — the dispatch must not depend on the cwd.
+fn is_path_like(arg: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = arg.as_bytes();
+    bytes.first() == Some(&b'.') || bytes.contains(&b'/')
+}
+
+/// `ops plugins store <subcommand>`: the plugin stores. `list` shows the built-in (embedded)
+/// store and every configured remote store; `add` configures and fetches a remote signed store
+/// (a git repository whose catalogue is verified against a public key); `update` re-fetches one
+/// or all configured stores (re-verifying against the pinned key and refusing a revision that
+/// would roll back); `install` installs a plugin a configured store lists; `info` details one
+/// configured store; `rm` removes one.
+fn plugins_store(args: &[OsString]) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("list") => plugins_store_list(),
+        Some("add") => plugins_store_add(&args[1..]),
+        Some("publish") => plugins_store_publish(&args[1..]),
+        Some("update") => plugins_store_update(&args[1..]),
+        Some("install") => plugins_store_install(&args[1..]),
+        Some("info") => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
+        Some("rm") => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
+        Some(other) => {
+            eprintln!(
+                "ops: unknown plugins store subcommand '{other}' \
+                 (known: list, add, publish, update, install, info, rm)"
+            );
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!(
+                "ops: usage: ops plugins store <list | add --name <n> --url <git-url> \
+                 (--key <hex|@file> | --trust) | publish <dir> --key <key-file> [--rev <n>] | \
+                 update [name] | install <store> <plugin> | info <name> | rm <name>>"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)`: configure a
+/// remote signed plugin store and fetch it for the first time. The repository is cloned, its
+/// catalogue verified, and the verified result cached under the data directory. A deliberate user
+/// act (an agent in the cage cannot run it). The store's trust anchor comes from exactly one of two
+/// mutually exclusive flags: `--key` pins a public key the user obtained out of band (the strong
+/// form), while `--trust` accepts the key the store ships on first use (weaker — no first-fetch
+/// authenticity; the pinned key's fingerprint is printed for out-of-band verification). One of the
+/// two is required: a store with no verifying key would be unsigned, refused fail-closed.
+fn plugins_store_add(args: &[OsString]) -> ExitCode {
+    const USAGE: &str =
+        "ops: usage: ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)";
+    let (mut name, mut url, mut key) = (None, None, None);
+    let mut trust = false;
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match flag.to_str() {
+            Some("--name") => name = it.next().and_then(|v| v.to_str()),
+            Some("--url") => url = it.next().and_then(|v| v.to_str()),
+            Some("--key") => key = it.next().and_then(|v| v.to_str()),
+            Some("--trust") => trust = true,
+            other => {
+                eprintln!(
+                    "ops: unexpected argument '{}'",
+                    other.unwrap_or("(non-UTF-8)")
+                );
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(name), Some(url)) = (name, url) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+
+    // The trust anchor is exactly one of --key (pin a known key) or --trust (accept the shipped one).
+    if key.is_some() && trust {
+        eprintln!(
+            "ops: --key and --trust are mutually exclusive: --key pins a key you supply, \
+             --trust accepts the key the store ships"
+        );
+        return ExitCode::from(2);
+    }
+    if key.is_none() && !trust {
+        eprintln!(
+            "ops: supply --key <hex|@file> to pin a known key, or --trust to accept the key the \
+             store ships on first use"
+        );
+        return ExitCode::from(2);
+    }
+
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let Some(git) = store::resolve_git() else {
+        eprintln!("ops: git is not on PATH — a remote plugin store is a git repository");
+        return ExitCode::FAILURE;
+    };
+
+    let result = match key {
+        Some(key) => {
+            let pubkey = match stores::parse_pubkey_arg(key) {
+                Ok(k) => k,
+                Err(why) => {
+                    eprintln!("ops: invalid --key: {why}");
+                    return ExitCode::from(2);
+                }
+            };
+            stores::add(&layout, name, url, pubkey, &git)
+        }
+        None => stores::add_tofu(&layout, name, url, &git),
+    };
+
+    match result {
+        Ok(added) => {
+            // Trust on first use pinned a key ops could not pre-verify: surface it loudly on stderr
+            // (so it is never silently swallowed in a scripted run) with the full key for an
+            // out-of-band comparison, while the configured-store report goes to stdout.
+            if added.tofu {
+                eprintln!("⚠ trust-on-first-use: pinned the key this store ships, unverified");
+                eprintln!("  pinned key: {}", plugin_store::to_hex(&added.pubkey));
+                eprintln!(
+                    "  verify it out of band; re-shown by `ops plugins store info {}`",
+                    added.name
+                );
+            }
+            let cat = &added.catalogue;
+            println!(
+                "configured store '{}' (rev {}, {} plugin{}):",
+                added.name,
+                cat.rev,
+                cat.plugins.len(),
+                if cat.plugins.len() == 1 { "" } else { "s" }
+            );
+            for (pname, entry) in &cat.plugins {
+                print!("  {pname}  ({}://)", entry.scheme);
+                if !entry.version.is_empty() {
+                    print!("  v{}", entry.version);
+                }
+                println!();
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("ops: cannot add store: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops plugins store publish <dir> --key <key-file> [--rev <n>]`: sign a directory of resolver
+/// plugins into a store. It writes a `catalogue.toml` (pinning each plugin by a content digest), a
+/// detached signature, the store's `pubkey`, and a `.gitattributes`; the operator then commits and
+/// hosts the result. The producing counterpart of `store add` — an operator tool, never reachable
+/// from a cage. The signing key is reused if the file exists (so the store keeps its identity
+/// across publishes) or generated and persisted owner-only on first use; it is the store's secret
+/// and never leaves the operator's host.
+fn plugins_store_publish(args: &[OsString]) -> ExitCode {
+    const USAGE: &str = "ops: usage: ops plugins store publish <dir> --key <key-file> [--rev <n>]";
+    let mut dir: Option<&OsStr> = None;
+    let mut key: Option<&OsStr> = None;
+    let mut rev: Option<u64> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--key") => key = it.next().map(|v| v.as_os_str()),
+            Some("--rev") => {
+                let Some(value) = it.next().and_then(|v| v.to_str()) else {
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                };
+                match value.parse::<u64>() {
+                    Ok(n) => rev = Some(n),
+                    Err(_) => {
+                        eprintln!("ops: --rev must be a non-negative integer");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            Some(flag) if flag.starts_with('-') => {
+                eprintln!("ops: unexpected argument '{flag}'");
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+            // Anything else (including a non-UTF-8 path) is the positional directory.
+            _ => {
+                if dir.is_some() {
+                    eprintln!("ops: publish takes a single directory");
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+                dir = Some(arg.as_os_str());
+            }
+        }
+    }
+    let (Some(dir), Some(key)) = (dir, key) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+
+    match stores::publish(Path::new(dir), Path::new(key), rev) {
+        Ok(published) => {
+            // The key file just written or reused is the store's identity; warn loudly so it is
+            // never treated as a throwaway. The public key, on stdout, is what consumers pin.
+            eprintln!(
+                "⚠ keep the signing key `{}` secret — it is this store's identity",
+                Path::new(key).display()
+            );
+            let pubkey = plugin_store::to_hex(&published.pubkey);
+            println!(
+                "published store at rev {} ({} plugin{}):",
+                published.rev,
+                published.plugins.len(),
+                if published.plugins.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            for (name, scheme) in &published.plugins {
+                println!("  {name}  ({scheme}://)");
+            }
+            println!("pubkey: {pubkey}");
+            println!(
+                "commit and host the directory, then consumers add it with: \
+                 ops plugins store add --name <n> --url <git-url> --key {pubkey}"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("ops: cannot publish store: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops plugins store update [name]`: re-fetch one configured remote store, or every configured
+/// store when no name is given. Each re-fetch re-verifies the catalogue against the store's
+/// pinned key (a compromised remote cannot rotate it) and refuses a revision that would roll
+/// back, replacing the cache atomically. A deliberate user act. When updating all stores, a
+/// failure on one is reported and the rest still run, with a non-zero exit if any failed.
+fn plugins_store_update(args: &[OsString]) -> ExitCode {
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let Some(git) = store::resolve_git() else {
+        eprintln!("ops: git is not on PATH — a remote plugin store is a git repository");
+        return ExitCode::FAILURE;
+    };
+
+    let names: Vec<String> = match args.first() {
+        Some(arg) => {
+            let Some(name) = arg.to_str() else {
+                eprintln!("ops: a store name must be valid UTF-8");
+                return ExitCode::from(2);
+            };
+            vec![name.to_string()]
+        }
+        None => {
+            let all = stores::list(&layout);
+            if all.is_empty() {
+                println!(
+                    "no remote stores are configured \
+                     (add one with: ops plugins store add --name <n> --url <git-url> --key <hex>)"
+                );
+                return ExitCode::SUCCESS;
+            }
+            all
+        }
+    };
+
+    let mut failed = false;
+    for name in &names {
+        match stores::update(&layout, name, &git) {
+            Ok(u) => {
+                let n = u.catalogue.plugins.len();
+                let plural = if n == 1 { "" } else { "s" };
+                if u.new_rev > u.old_rev {
+                    println!(
+                        "updated store '{}' (rev {} → {}, {n} plugin{plural})",
+                        u.name, u.old_rev, u.new_rev
+                    );
+                } else {
+                    println!(
+                        "store '{}' is already at revision {} ({n} plugin{plural})",
+                        u.name, u.new_rev
+                    );
+                }
+            }
+            Err(why) => {
+                eprintln!("ops: cannot update store '{name}': {why}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `ops plugins store install <store> <plugin>`: install a resolver plugin a configured store
+/// lists, by name. The store's cached catalogue (verified when the store was added or updated)
+/// pins the plugin's content by hash; the install verifies that hash, reconciles the catalogue's
+/// advertised name and scheme against the plugin's manifest, and places it exactly as a local
+/// install would. A deliberate user act. Reads only the owner-only cache — no fetch, no network.
+fn plugins_store_install(args: &[OsString]) -> ExitCode {
+    let (Some(store_name), Some(plugin_name)) = (
+        args.first().and_then(|a| a.to_str()),
+        args.get(1).and_then(|a| a.to_str()),
+    ) else {
+        eprintln!("ops: usage: ops plugins store install <store> <plugin>");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    match stores::install_plugin(&layout, store_name, plugin_name) {
+        Ok(installed) => {
+            println!(
+                "installed '{}' ({}://) from store '{store_name}' — remove with: ops plugins rm {}",
+                installed.name, installed.scheme, installed.name
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("ops: cannot install plugin: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops plugins store info <name>`: a configured remote store in detail — its origin URL, the
+/// pinned public key, the accepted catalogue revision, and each plugin it lists. Reads only the
+/// owner-only cache (trusted by location): no fetch, no network.
+fn plugins_store_info(name: Option<&str>) -> ExitCode {
+    let Some(name) = name else {
+        eprintln!("ops: usage: ops plugins store info <name>");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let cfg = match stores::read_configured(&layout, name) {
+        Ok(cfg) => cfg,
+        Err(why) => {
+            eprintln!("ops: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("store '{}'", cfg.name);
+    println!("  url:      {}", cfg.url);
+    println!("  key:      {}", plugin_store::to_hex(&cfg.pubkey));
+    println!(
+        "  trust:    {}",
+        if cfg.tofu {
+            "trust-on-first-use (verify the key out of band)"
+        } else {
+            "pinned key (supplied out of band)"
+        }
+    );
+    println!("  revision: {}", cfg.locked_rev);
+    match stores::cached_catalogue(&layout, name) {
+        Ok(cat) if cat.plugins.is_empty() => println!("  plugins:  (none)"),
+        Ok(cat) => {
+            println!("  plugins:");
+            for (pname, entry) in &cat.plugins {
+                print!("    {pname}  ({}://)", entry.scheme);
+                if !entry.version.is_empty() {
+                    print!("  v{}", entry.version);
+                }
+                println!();
+                if !entry.description.is_empty() {
+                    println!("      {}", entry.description);
+                }
+            }
+        }
+        Err(why) => eprintln!("ops: warning: cannot read the cached catalogue: {why}"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// `ops plugins store rm <name>`: remove a configured remote store from the cache. Host-level,
+/// like `add`; refuses a name that is not configured.
+fn plugins_store_remove(name: Option<&str>) -> ExitCode {
+    let Some(name) = name else {
+        eprintln!("ops: usage: ops plugins store rm <name>");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    match stores::remove(&layout, name) {
+        Ok(()) => {
+            println!("removed store '{name}'");
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("ops: cannot remove store: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops plugins store list`: the resolver plugins bundled in the binary, each with its scheme,
+/// version, description, and whether it is already installed, followed by every configured
+/// remote store with its accepted revision and plugin count. No fetch, no network.
+fn plugins_store_list() -> ExitCode {
+    let layout = store::Layout::from_env();
+    let installed_dir = layout.as_ref().map(|l| l.plugins_dir());
+    println!("built-in plugin store (install one with: ops plugins install <name>):");
+    for entry in plugins::embedded_listing() {
+        let scheme = entry.scheme.as_deref().unwrap_or("?");
+        print!("  {}  ({scheme}://)", entry.name);
+        if let Some(v) = &entry.version {
+            print!("  v{v}");
+        }
+        let is_installed = installed_dir
+            .as_ref()
+            .is_some_and(|d| d.join(&entry.name).is_dir());
+        if is_installed {
+            print!("  [installed]");
+        }
+        println!();
+        if let Some(desc) = &entry.description {
+            println!("    {desc}");
+        }
+    }
+
+    // Configured remote stores, read from their owner-only caches (trusted by location).
+    if let Some(layout) = &layout {
+        let names = stores::list(layout);
+        if !names.is_empty() {
+            println!("configured remote stores (update with: ops plugins store update <name>):");
+            for name in &names {
+                match stores::read_configured(layout, name) {
+                    Ok(cfg) => {
+                        let detail = match stores::cached_catalogue(layout, name) {
+                            Ok(cat) => {
+                                let n = cat.plugins.len();
+                                format!("{n} plugin{}", if n == 1 { "" } else { "s" })
+                            }
+                            Err(_) => "catalogue unreadable".to_string(),
+                        };
+                        let marker = if cfg.tofu { "  [tofu]" } else { "" };
+                        println!("  {name}  (rev {}, {detail}){marker}", cfg.locked_rev);
+                    }
+                    Err(why) => eprintln!("ops: warning: store '{name}': {why}"),
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `ops plugins rm <name>`: remove an installed resolver plugin by its name (the token `list`
+/// shows). Host-level, like `install`; refuses an unsafe name or a directory that is not a plugin.
+fn plugins_remove(name: Option<&str>) -> ExitCode {
+    let Some(name) = name else {
+        eprintln!("ops: usage: ops plugins rm <name>");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    match plugins::remove(&layout, name) {
+        Ok(()) => {
+            println!("removed '{name}'");
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("ops: cannot remove plugin: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops plugins info <scheme>`: the full manifest and sandbox grant of the plugin claiming
+/// `scheme`. A built-in scheme is reported as such (not an error); an unknown scheme is a
+/// non-zero "no such plugin". Like `list`, host-level and side-effect-free.
+fn plugins_info(scheme: Option<&str>) -> ExitCode {
+    let Some(scheme) = scheme else {
+        eprintln!("ops: usage: ops plugins info <scheme>");
+        return ExitCode::from(2);
+    };
+    if plugins::builtin_schemes().contains(&scheme) {
+        println!("{scheme}: a built-in resolver (compiled into ops, not a plugin)");
+        return ExitCode::SUCCESS;
+    }
+    let Some((registry, warnings)) = load_plugin_registry() else {
+        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let Some(p) = registry.resolver(scheme) else {
+        // A scheme can be absent because nothing claims it — or because it was *dropped* (two
+        // plugins claimed it, or its manifest is malformed). That reason lives in the load
+        // warnings, and `info <scheme>` is exactly the command a user runs to learn why their
+        // plugin is not picked up, so re-emit them before the generic miss.
+        for w in &warnings {
+            eprintln!("ops: warning: {w}");
+        }
+        eprintln!("ops: no installed resolver plugin claims the scheme '{scheme}'");
+        return ExitCode::FAILURE;
+    };
+    println!("resolver plugin: {}", p.name);
+    println!("  scheme:      {}://", p.scheme);
+    println!(
+        "  version:     {}",
+        p.version.as_deref().unwrap_or("(unset)")
+    );
+    println!(
+        "  description: {}",
+        p.description.as_deref().unwrap_or("(none)")
+    );
+    print!("  exec:        {}", p.exec.display());
+    match p.check_exec() {
+        Ok(()) => println!(),
+        Err(why) => println!("  [not runnable: {why}]"),
+    }
+    println!("  sandbox grant:");
+    println!("    network:     {}", p.sandbox.network);
+    print_grant_paths("allow_paths", &p.sandbox.allow_paths);
+    print_grant_env("allow_env", &p.sandbox.allow_env);
+    ExitCode::SUCCESS
+}
+
+/// One `ops plugins info` grant line listing read-only path binds, or `(none)`.
+fn print_grant_paths(label: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        println!("    {label}:  (none)");
+    } else {
+        let joined = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("    {label}:  {joined}");
+    }
+}
+
+/// One `ops plugins info` grant line listing passed-through environment variables, or `(none)`.
+fn print_grant_env(label: &str, keys: &[String]) {
+    if keys.is_empty() {
+        println!("    {label}:    (none)");
+    } else {
+        println!("    {label}:    {}", keys.join(", "));
     }
 }
 

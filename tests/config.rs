@@ -85,6 +85,43 @@ impl Fixture {
         std::fs::write(self.proj.path().join(".mise.toml"), body).unwrap();
     }
 
+    /// Stage a resolver plugin under the data dir (`<data>/plugins/<name>/plugin.toml`), the
+    /// trusted-by-location registry `ops config` and the launcher read.
+    fn write_plugin(&self, name: &str, manifest: &str) {
+        let dir = self.data_home.path().join("ops").join("plugins").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+    }
+
+    /// Stage (or re-permission) a plugin's `resolve` executable with `mode`, returning its path.
+    /// The plugin directory must already exist (call [`write_plugin`](Self::write_plugin) first).
+    fn write_plugin_exec(&self, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exec = self
+            .data_home
+            .path()
+            .join("ops/plugins")
+            .join(name)
+            .join("resolve");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(mode)).unwrap();
+        exec
+    }
+
+    /// Build a *source* plugin directory (a manifest and a `resolve` executable) under a scratch
+    /// area, returning its path — the kind of directory `ops plugins install <dir>` consumes. It is
+    /// deliberately outside the data dir, so the install must copy it in.
+    fn source_plugin(&self, dirname: &str, manifest: &str, exec_mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.bind_dir.path().join(dirname);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+        let exec = dir.join("resolve");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(exec_mode)).unwrap();
+        dir
+    }
+
     /// Create a real directory to bind, returning its absolute path. Binds are
     /// canonicalized and missing ones dropped, so a bind target must exist.
     fn bind_target(&self, name: &str) -> PathBuf {
@@ -742,5 +779,460 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     assert!(
         has_per_project_nixpkgs_lock(fx.data_home.path()),
         "a trusted pin must record a per-project nixpkgs lock"
+    );
+}
+
+#[test]
+fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
+    let fx = Fixture::new();
+    fx.write_plugin(
+        "pass",
+        "type = \"resolver\"\nscheme = \"pass\"\nexec = \"resolve\"\n",
+    );
+    fx.write_project(
+        "[network]\nmode = \"allowlist\"\nallow = [\"api.github.com\"]\n\n\
+         [secret.\"api.github.com\"]\nfrom = \"pass://github/token\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Authorization -> api.github.com"),
+        "the secret must be shown:\n{stdout}"
+    );
+    // the source is the plugin scheme + locator — by reference, never a value
+    assert!(
+        stdout.contains("from pass github/token"),
+        "the resolver plugin source must be shown:\n{stdout}"
+    );
+}
+
+#[test]
+fn an_unregistered_resolver_scheme_drops_the_secret_with_a_warning() {
+    let fx = Fixture::new();
+    // no plugin claims `vault`
+    fx.write_project(
+        "[network]\nmode = \"allowlist\"\nallow = [\"api.github.com\"]\n\n\
+         [secret.\"api.github.com\"]\nfrom = \"vault://secret/x\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config"]);
+    assert!(out.status.success(), "an unknown scheme must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("Authorization -> api.github.com"),
+        "a secret with an unknown scheme must be dropped:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("vault://") && stderr.contains("plugin"),
+        "the dropped secret must be explained, naming the scheme:\n{stderr}"
+    );
+}
+
+#[test]
+fn plugins_list_shows_installed_plugins_builtins_and_drop_warnings() {
+    let fx = Fixture::new();
+    // a valid, runnable plugin
+    fx.write_plugin(
+        "pass",
+        "name=\"pass\"\ntype=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n\
+         version=\"0.1.0\"\ndescription=\"read from the pass store\"\n",
+    );
+    fx.write_plugin_exec("pass", 0o755);
+    // two plugins claiming one scheme (both dropped), and a malformed manifest (dropped)
+    fx.write_plugin(
+        "v1",
+        "type=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+    );
+    fx.write_plugin(
+        "v2",
+        "type=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+    );
+    fx.write_plugin("broken", "not valid toml [[[\n");
+
+    let out = fx.run(&["plugins", "list"]);
+    assert!(out.status.success(), "plugins list must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // the built-in namespace and the surviving plugin are listed
+    assert!(
+        stdout.contains("built-in schemes") && stdout.contains("env, file, sops"),
+        "the built-in namespace must be shown:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("pass://") && stdout.contains("v0.1.0"),
+        "the installed plugin must be listed with its version:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("read from the pass store"),
+        "the description must be shown:\n{stdout}"
+    );
+    // the ambiguous scheme dropped both, and the malformed manifest was dropped — explained
+    assert!(
+        !stdout.contains("vault://"),
+        "an ambiguous scheme must resolve to nothing:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("claimed by both") && stderr.contains("invalid plugin.toml"),
+        "drops must be explained on stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn plugins_list_flags_a_non_runnable_executable() {
+    let fx = Fixture::new();
+    fx.write_plugin(
+        "pass",
+        "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
+    );
+    // a group-writable exec loads fine but the runner would refuse it — `list` surfaces the gap
+    fx.write_plugin_exec("pass", 0o775);
+
+    let out = fx.run(&["plugins", "list"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("pass://")
+            && stdout.contains("not runnable")
+            && stdout.contains("group or other"),
+        "a non-runnable exec must be flagged:\n{stdout}"
+    );
+}
+
+#[test]
+fn plugins_info_reports_builtin_unknown_and_a_plugin() {
+    let fx = Fixture::new();
+    fx.write_plugin(
+        "pass",
+        "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\nversion=\"0.1.0\"\n\
+         [sandbox]\nallow_paths=[\"/etc/passwd\"]\nallow_env=[\"GNUPGHOME\"]\nnetwork=false\n",
+    );
+    fx.write_plugin_exec("pass", 0o755);
+
+    // a built-in scheme is reported as such, with success
+    let builtin = fx.run(&["plugins", "info", "env"]);
+    assert!(builtin.status.success());
+    assert!(
+        String::from_utf8_lossy(&builtin.stdout).contains("built-in resolver"),
+        "info on a built-in must say so"
+    );
+
+    // an unknown scheme is a non-zero miss
+    let unknown = fx.run(&["plugins", "info", "nope"]);
+    assert!(
+        !unknown.status.success(),
+        "info on an unknown scheme must be non-zero"
+    );
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no installed resolver plugin"));
+
+    // an installed plugin's manifest and grant are shown
+    let info = fx.run(&["plugins", "info", "pass"]);
+    assert!(info.status.success());
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(
+        stdout.contains("scheme:      pass://")
+            && stdout.contains("version:     0.1.0")
+            && stdout.contains("/etc/passwd")
+            && stdout.contains("GNUPGHOME"),
+        "the plugin's manifest and grant must be shown:\n{stdout}"
+    );
+}
+
+#[test]
+fn plugins_info_explains_a_dropped_conflicting_scheme() {
+    // `info <scheme>` is the command a user runs to learn why their plugin is not picked up. When
+    // two plugins claim one scheme, both are dropped — so the registry has no entry for it, and the
+    // miss must be *explained* (the conflict warning), not a bare "no plugin claims it".
+    let fx = Fixture::new();
+    fx.write_plugin(
+        "v1",
+        "type=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+    );
+    fx.write_plugin(
+        "v2",
+        "type=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+    );
+
+    let out = fx.run(&["plugins", "info", "vault"]);
+    assert!(
+        !out.status.success(),
+        "info on a dropped scheme must be non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("claimed by both") && stderr.contains("vault"),
+        "the conflict must be explained, not hidden behind a bare miss:\n{stderr}"
+    );
+}
+
+#[test]
+fn plugins_install_then_list_then_remove_through_the_binary() {
+    let fx = Fixture::new();
+    // a source plugin whose manifest name differs from its directory name
+    let source = fx.source_plugin(
+        "checkout",
+        "name=\"pass\"\ntype=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n\
+         version=\"0.1.0\"\ndescription=\"read from the pass store\"\n",
+        0o755,
+    );
+    let source = source.to_str().unwrap();
+
+    // install: places it under its manifest name, and names the `rm` token in the report
+    let out = fx.run(&["plugins", "install", source]);
+    assert!(out.status.success(), "install must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("installed 'pass'") && stdout.contains("ops plugins rm pass"),
+        "the install report must name the plugin and the rm token:\n{stdout}"
+    );
+
+    // list now surfaces it (teeth: zero drop warnings on stderr) with the removal hint
+    let out = fx.run(&["plugins", "list"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("pass://") && stdout.contains("read from the pass store"),
+        "the installed plugin must be listed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("remove one with: ops plugins rm <name>"),
+        "list must surface the rm token:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("warning"),
+        "a cleanly installed plugin must load without warnings:\n{stderr}"
+    );
+
+    // rm removes it, and list falls back to none
+    let out = fx.run(&["plugins", "rm", "pass"]);
+    assert!(out.status.success(), "rm must succeed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("removed 'pass'"));
+
+    let out = fx.run(&["plugins", "list"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"),
+        "the plugin must be gone after rm"
+    );
+}
+
+#[test]
+fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
+    let fx = Fixture::new();
+    let alpha = fx.source_plugin(
+        "alpha-src",
+        "name=\"alpha\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+        0o755,
+    );
+    assert!(
+        fx.run(&["plugins", "install", alpha.to_str().unwrap()])
+            .status
+            .success(),
+        "the first install must succeed"
+    );
+
+    // a different plugin claiming the same scheme: installing it would make the registry drop both,
+    // so it is refused up front, naming the conflict and the rm token
+    let beta = fx.source_plugin(
+        "beta-src",
+        "name=\"beta\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+        0o755,
+    );
+    let out = fx.run(&["plugins", "install", beta.to_str().unwrap()]);
+    assert!(!out.status.success(), "a colliding install must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("already claimed by the installed plugin `alpha`"),
+        "the collision must be explained:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // teeth: the original still resolves, and `beta` was never placed
+    let info = fx.run(&["plugins", "info", "vault"]);
+    assert!(info.status.success(), "the original must still resolve");
+    assert!(String::from_utf8_lossy(&info.stdout).contains("resolver plugin: alpha"));
+}
+
+#[test]
+fn plugins_store_list_then_install_a_builtin_then_remove() {
+    let fx = Fixture::new();
+
+    // the built-in store lists the bundled plugins, none installed yet
+    let out = fx.run(&["plugins", "store", "list"]);
+    assert!(out.status.success(), "store list must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("vault  (vault://)") && stdout.contains("pass  (pass://)"),
+        "the built-in store must list its plugins:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("[installed]"),
+        "nothing is installed yet:\n{stdout}"
+    );
+
+    // install one by bare name (no path separator) — `vault` declares no allow_paths, so the
+    // install needs no environment beyond the redirected data dir
+    let out = fx.run(&["plugins", "install", "vault"]);
+    assert!(
+        out.status.success(),
+        "installing a built-in by name must succeed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("installed 'vault'"));
+
+    // it now reads as installed in both the store list and the installed list
+    let out = fx.run(&["plugins", "store", "list"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("[installed]"),
+        "the store list must mark it installed"
+    );
+    let out = fx.run(&["plugins", "list"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("vault://"),
+        "the installed list must surface it"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("warning"),
+        "a built-in install must load cleanly"
+    );
+
+    // rm removes it, and the store list shows it uninstalled again
+    assert!(fx.run(&["plugins", "rm", "vault"]).status.success());
+    let out = fx.run(&["plugins", "store", "list"]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("[installed]"),
+        "the store list must show it uninstalled again"
+    );
+}
+
+#[test]
+fn plugins_install_an_unknown_builtin_name_is_refused() {
+    let fx = Fixture::new();
+    let out = fx.run(&["plugins", "install", "nope"]);
+    assert!(!out.status.success(), "an unknown built-in name must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no built-in plugin named `nope`"),
+        "the refusal must name it:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Whether `git` is on PATH, so the publish→clone→install end-to-end can run (it clones a
+/// `file://` store the publish produced). Absent → the test skips rather than fails.
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run a git subcommand in `dir` with an explicit identity and no signing, independent of the
+/// host's git configuration. Asserts success.
+fn git_in(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .args(["-C", dir.to_str().unwrap()])
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .status()
+        .expect("spawn git")
+        .success();
+    assert!(ok, "git {args:?} failed");
+}
+
+/// The producing side feeds the consuming side through a *real* git clone: `ops plugins store
+/// publish` signs a plugin tree, the operator commits exactly that tree, and `store add`/`store
+/// install` fetch it via `file://`. This is the only proof the signed format survives a clone —
+/// the catalogue bytes the signature is over, the per-plugin content digest, and the executable
+/// bit all have to come back byte-identical, or `add` (signature) and `install` (content hash)
+/// refuse. Skips, never fails, when git is absent.
+#[test]
+fn publish_then_add_and_install_through_a_real_clone() {
+    if !git_available() {
+        eprintln!("skipping publish e2e: git is not available");
+        return;
+    }
+    let fx = Fixture::new();
+
+    // A store source repository with one resolver plugin (scheme distinct from its name, so the
+    // install-time reconciliation is exercised, not bypassed).
+    let repo = fx.bind_dir.path().join("store");
+    let plugin = repo.join("plugins/pass");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        "name = \"pass\"\ntype = \"resolver\"\nscheme = \"secret-store\"\nexec = \"resolve\"\n\
+         version = \"0.1.0\"\ndescription = \"a test resolver\"\n",
+    )
+    .unwrap();
+    let exec = plugin.join("resolve");
+    std::fs::write(&exec, "#!/bin/sh\necho secret\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Publish: sign the tree (generating the key on first use).
+    let keyfile = fx.bind_dir.path().join("store.key");
+    let publish = fx.run(&[
+        "plugins",
+        "store",
+        "publish",
+        repo.to_str().unwrap(),
+        "--key",
+        keyfile.to_str().unwrap(),
+    ]);
+    assert!(
+        publish.status.success(),
+        "publish failed:\n{}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    // Commit exactly the published tree — the operator's step.
+    git_in(&repo, &["init", "-q"]);
+    git_in(&repo, &["add", "-A"]);
+    git_in(&repo, &["commit", "-q", "-m", "store"]);
+    let url = format!("file://{}", repo.to_str().unwrap());
+
+    // Add via a real clone: trust-on-first-use reads the shipped `pubkey` and verifies the cloned
+    // catalogue against it (so a clone that mangled the signed bytes would be refused here).
+    let add = fx.run(&[
+        "plugins", "store", "add", "--name", "acme", "--url", &url, "--trust",
+    ]);
+    assert!(
+        add.status.success(),
+        "add failed:\n{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // Install: the cloned plugin subdirectory must reproduce the catalogue's content digest.
+    let install = fx.run(&["plugins", "store", "install", "acme", "pass"]);
+    assert!(
+        install.status.success(),
+        "install failed:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    // The plugin is now installed and claims its scheme.
+    let list = fx.run(&["plugins", "list"]);
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        stdout.contains("secret-store"),
+        "the installed plugin must appear in `plugins list`:\n{stdout}"
     );
 }

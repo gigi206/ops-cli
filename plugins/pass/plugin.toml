@@ -1,0 +1,17 @@
+name        = "pass"
+type        = "resolver"
+scheme      = "pass"
+exec        = "resolve"
+version     = "0.1.0"
+description  = "Read a secret from the pass(1) password store: pass://<path> (the first line)"
+
+[sandbox]
+# The store, the GnuPG home (public keyring + trustdb), and the gpg-agent socket — which
+# lives under $XDG_RUNTIME_DIR/gnupg/, not ~/.gnupg. Binding the live agent socket lets the
+# resolver use the already-running host agent, so a read-only grant suffices (the agent holds
+# the secret keys and does the decryption; the client writes nothing).
+allow_paths = ["~/.password-store", "~/.gnupg", "$XDG_RUNTIME_DIR/gnupg"]
+# GNUPGHOME for a non-default store; XDG_RUNTIME_DIR so gpg locates the agent socket. Each is
+# passed through only when set in ops's environment (an unset one is simply omitted).
+allow_env   = ["GNUPGHOME", "XDG_RUNTIME_DIR"]
+network     = false

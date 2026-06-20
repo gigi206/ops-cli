@@ -69,6 +69,26 @@ impl Layout {
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+
+    /// Where installed resolver plugins live, one directory per plugin. Trusted by
+    /// location: a project cannot write here, so a plugin's presence is the user's act.
+    pub(crate) fn plugins_dir(&self) -> PathBuf {
+        self.data_dir.join("plugins")
+    }
+
+    /// Where configured remote plugin stores are cached, one directory per store. Like
+    /// the plugins tree, trusted by location (owner-only), so the verified catalogue and
+    /// fetched artifacts cannot be tampered with by a project.
+    pub(crate) fn stores_dir(&self) -> PathBuf {
+        self.data_dir.join("stores")
+    }
+
+    /// The cache directory of one named remote store: `<stores>/<name>/`, holding its
+    /// `store.toml` (url + public key), `checkout/` (the verified git clone), and
+    /// `catalogue.lock` (the catalogue revision last accepted).
+    pub(crate) fn store_path(&self, name: &str) -> PathBuf {
+        self.stores_dir().join(name)
+    }
 }
 
 /// Pure core of [`Layout::from_env`]: prefer an absolute `XDG_DATA_HOME`, else
@@ -115,6 +135,13 @@ pub(crate) fn resolve_nix() -> Option<PathBuf> {
 /// the per-project store seed the launcher backs the cage's writable `/nix` with.
 pub(crate) fn resolve_nix_store() -> Option<PathBuf> {
     crate::pathfind::find_on_path("nix-store")
+}
+
+/// Locate the `git` binary that fetches a remote plugin store. Resolved from `PATH`;
+/// needed only by `ops plugins store` (a remote store is a git repository), not by a
+/// launch — so its absence is a feature gap, never a boundary failure.
+pub(crate) fn resolve_git() -> Option<PathBuf> {
+    crate::pathfind::find_on_path("git")
 }
 
 /// Build a daemonless nix invocation against the user-owned store: the daemon is

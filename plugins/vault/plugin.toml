@@ -1,0 +1,10 @@
+name        = "vault"
+type        = "resolver"
+scheme      = "vault"
+exec        = "resolve"
+version     = "0.1.0"
+description  = "Fetch a field from a HashiCorp Vault KV secret: vault://<path>#<field>"
+
+[sandbox]
+allow_env = ["VAULT_ADDR", "VAULT_TOKEN", "VAULT_NAMESPACE"]
+network   = true

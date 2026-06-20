@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# ops resolver plugin: pass(1) password store.
+# Contract: ops passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
+#   Ref:  pass://<path>   e.g.  pass://github/token   (returns the first line — the password)
+set -euo pipefail
+
+ref="${1:?pass: missing secret ref}"
+path="${ref#pass://}"
+[ "$path" != "$ref" ] || { echo "pass: ref must start with pass:// ('$ref')" >&2; exit 1; }
+[ -n "$path" ] || { echo "pass: empty path in '$ref'" >&2; exit 1; }
+
+# pass(1) prints the whole entry; the first line is the secret by convention.
+pass show "$path" | head -n1

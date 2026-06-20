@@ -334,11 +334,17 @@ fn build(
     let mut egress_env: Vec<(String, String)> = Vec::new();
     let mut cmd = cmd;
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
-        let (guard, wiring) = egress::start(&prep.layout, policy.clone(), &prep.cfg.secrets)
-            .map_err(|e| {
-                eprintln!("ops: cannot start the egress filtering proxy: {e}");
-                ExitCode::FAILURE
-            })?;
+        let (guard, wiring) = egress::start(
+            &prep.layout,
+            policy.clone(),
+            &prep.cfg.secrets,
+            &prep.cwd,
+            &prep.bwrap,
+        )
+        .map_err(|e| {
+            eprintln!("ops: cannot start the egress filtering proxy: {e}");
+            ExitCode::FAILURE
+        })?;
         cmd = egress::wrap_command(&prep.userland.socat_bin, &prep.userland.shell_bin, cmd);
         egress_binds = wiring.binds;
         egress_env = wiring.env;

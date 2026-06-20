@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ops resolver plugin: HashiCorp Vault KV.
+# Contract: ops passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
+#   Ref:  vault://<path>#<field>   e.g.  vault://secret/myapp#password
+# Needs VAULT_ADDR and VAULT_TOKEN in the environment (declared in plugin.toml).
+set -euo pipefail
+
+ref="${1:?vault: missing secret ref}"
+rest="${ref#vault://}"
+[ "$rest" != "$ref" ] || { echo "vault: ref must start with vault:// ('$ref')" >&2; exit 1; }
+
+if [[ "$rest" == *"#"* ]]; then
+    path="${rest%%#*}"
+    field="${rest#*#}"
+    exec vault kv get -field="$field" "$path"
+else
+    echo "vault: ref must name a field: vault://<path>#<field> ('$ref')" >&2
+    exit 1
+fi

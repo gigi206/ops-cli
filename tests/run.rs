@@ -354,7 +354,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 #[test]
 fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // The 6.3a integration neither the unit nor the proxy tests can reach: a trusted
-    // `[[secret]]` under a network allowlist must be resolved *host-side* and wired into the
+    // A `[secret]` entry under a network allowlist must be resolved *host-side* and wired into the
     // egress proxy without the plaintext ever entering the cage. So `printenv` inside the cage
     // must show neither the source variable's name nor its value — the launch carries the
     // credential only through the proxy, never the sandbox environment. (The complementary
@@ -368,8 +368,8 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     std::fs::write(
         project.path().join(".ops.toml"),
         "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\n\
-         [[secret]]\nkind = \"http-header\"\nfrom_env = \"OPS_E2E_SECRET\"\n\
-         to = \"cache.nixos.org\"\nheader = \"Authorization\"\ntype = \"bearer\"\n",
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
     )
     .unwrap();
 
@@ -435,9 +435,102 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
 }
 
 #[test]
+fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
+    // The full 2b seam no in-crate test crosses: a resolver plugin *installed on disk* under
+    // `<data>/plugins/<name>/` is discovered by `PluginRegistry::load`, claimed by a trusted
+    // project's `[secret]` `from`, and run host-side in its own bwrap cage by the launcher — the
+    // plaintext wired into the egress proxy, never the sandbox environment. So a launch that runs
+    // the resolver must succeed, and `printenv` inside the cage must show neither the locator nor
+    // the resolved value. Skips (never fails) when the host cannot sandbox.
+    let project = TmpDir::new("rplugin-proj");
+    let data = TmpDir::new("rplugin-data");
+    let state = TmpDir::new("rplugin-state");
+    let secret_value = "ops-plugin-e2e-secret-7q2z";
+
+    // install a resolver plugin: a manifest plus an executable that returns a constant plaintext.
+    // (`PluginRegistry::load` reads `<XDG_DATA_HOME>/ops/plugins`.)
+    let plugin_dir = data.path().join("ops/plugins/myresolver");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("plugin.toml"),
+        "name = \"myresolver\"\ntype = \"resolver\"\nscheme = \"myscheme\"\nexec = \"resolve\"\n",
+    )
+    .unwrap();
+    let exec = plugin_dir.join("resolve");
+    std::fs::write(&exec, format!("#!/bin/sh\nprintf '%s' '{secret_value}'\n")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\n\
+         [secret.\"cache.nixos.org\"]\nfrom = \"myscheme://github/token\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net, secret dropped): seeds the store, confirms sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping resolver-plugin e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // `ops config` shows the plugin-backed source honored, by scheme + locator (never a value).
+    let cfg = ops_in(project.path(), data.path(), state.path(), &["config"]);
+    let cfg_out = String::from_utf8_lossy(&cfg.stdout);
+    assert!(
+        cfg_out.contains("Authorization -> cache.nixos.org")
+            && cfg_out.contains("from myscheme github/token"),
+        "the plugin-backed secret was not honored by `ops config`: {cfg_out}"
+    );
+
+    // the launch resolves the secret by *running the plugin host-side*; it must succeed, and the
+    // cage env must contain neither the locator nor the resolved value.
+    let env_out = ops()
+        .args(["run", "--", "printenv"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("spawn ops run");
+    assert!(
+        env_out.status.success(),
+        "the launch running the resolver plugin failed: {}",
+        String::from_utf8_lossy(&env_out.stderr)
+    );
+    let cage_env = String::from_utf8_lossy(&env_out.stdout);
+    assert!(
+        !cage_env.contains(secret_value),
+        "the resolved secret value leaked into the cage env"
+    );
+    assert!(
+        !cage_env.contains("github/token"),
+        "the secret's locator leaked into the cage env: {cage_env}"
+    );
+}
+
+#[test]
 fn an_outbound_secret_is_refused_at_the_proxy() {
     // The 6.3b outbound tripwire end to end through the real binary: under a trusted network
-    // allowlist with a `[[secret]]`, a request that carries the secret value verbatim is refused
+    // allowlist with a `[secret]` entry, a request that carries the secret value verbatim is refused
     // *at the proxy* (block, never strip) — even toward the allowed host the secret is scoped to —
     // so a credential the agent obtained out of band (a reflecting upstream) cannot be
     // re-exfiltrated in the clear. The cage never holds the value; the test hardcodes it to play
@@ -452,8 +545,8 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     std::fs::write(
         project.path().join(".ops.toml"),
         "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\n\
-         [[secret]]\nkind = \"http-header\"\nfrom_env = \"OPS_E2E_LEAK\"\n\
-         to = \"cache.nixos.org\"\nheader = \"Authorization\"\ntype = \"bearer\"\n",
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_LEAK\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
     )
     .unwrap();
 

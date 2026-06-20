@@ -53,7 +53,7 @@
 //!
 //! ## Credential injection
 //!
-//! Under a configured `[[secret]]`, the proxy injects a host-scoped HTTP header into an allowed
+//! Under a configured `[secret]` entry, the proxy injects a host-scoped HTTP header into an allowed
 //! request ([`HeaderInjection`]): the plaintext is read host-side at launch and never enters the
 //! cage, and the injection fires only *after* the verdict and only for the concrete host (and
 //! path) the secret was scoped to, replacing any client-supplied copy of the header. The

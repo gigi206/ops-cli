@@ -169,6 +169,7 @@ dependencies = [
  "libc",
  "rcgen",
  "regex",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

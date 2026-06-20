@@ -18,8 +18,12 @@ pub(crate) mod safety;
 mod schema;
 
 use crate::allowlist::Rule;
+use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
-use schema::{NetworkField, NetworkTable, RawConfig, RawSecret};
+use schema::{
+    NetworkField, NetworkTable, RawConfig, RawHostSecret, RawHostSecrets, RawSecretDefaults,
+    SecretFrom,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -166,8 +170,9 @@ pub(crate) enum NetworkPolicy {
 /// injection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeaderSecret {
-    /// Where ops reads the plaintext at launch — host-side, never inside the cage.
-    pub(crate) source: SecretSource,
+    /// The resolver chain ops reads the plaintext from at launch — host-side, never inside the
+    /// cage — tried in order, the first that resolves winning (a later one is a fallback).
+    pub(crate) sources: Vec<SecretSource>,
     /// The concrete host (and optional path) the injection is scoped to: a request to
     /// anything else never receives the header. A `*.` wildcard or `re:` regex is
     /// rejected at validation, so a credential reaches exactly one known destination.
@@ -178,23 +183,51 @@ pub(crate) struct HeaderSecret {
     pub(crate) shape: HeaderShape,
 }
 
-/// Where ops reads a secret's plaintext, host-side at launch. Exactly one form per
-/// secret. Only the locator is kept here — never the value.
+impl HeaderSecret {
+    /// A human label for `ops config` — the resolver chain by locator (a variable name or file
+    /// path), never a value. A single source reads as itself; a fallback chain is joined with
+    /// `, then ` so the precedence is visible.
+    pub(crate) fn describe_sources(&self) -> String {
+        self.sources
+            .iter()
+            .map(SecretSource::describe)
+            .collect::<Vec<_>>()
+            .join(", then ")
+    }
+}
+
+/// One resolver ref in a secret's source chain — where ops reads the plaintext, host-side at
+/// launch. Only the locator is kept here, never the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SecretSource {
     /// A host environment variable, by name (not its value).
     Env(String),
     /// An absolute host file path, read host-side and never bound into the cage.
     File(PathBuf),
+    /// A SOPS-encrypted file, decrypted host-side with the `sops` CLI. `file` is the encrypted
+    /// path (relative ones resolve against the project root); `key` is an optional dotted path
+    /// into the decrypted document (`db.password`), or the whole file when absent.
+    Sops { file: PathBuf, key: Option<String> },
+    /// A resolver plugin claims this ref's scheme. The launcher runs the plugin host-side under
+    /// least privilege, passing `locator` (the part after `scheme://`) and reading the plaintext
+    /// from its stdout. The validated manifest travels with the source so the launch runs exactly
+    /// the plugin the config layer validated.
+    Plugin {
+        plugin: crate::plugins::ResolverPlugin,
+        locator: String,
+    },
 }
 
 impl SecretSource {
-    /// A human label for `ops config` — the variable name or the file path, neither of
+    /// A human label for `ops config` — the variable name, file path, or sops file/key, none of
     /// which is the secret itself.
     pub(crate) fn describe(&self) -> String {
         match self {
             SecretSource::Env(var) => format!("env {var}"),
             SecretSource::File(path) => format!("file {}", path.display()),
+            SecretSource::Sops { file, key: Some(k) } => format!("sops {}#{k}", file.display()),
+            SecretSource::Sops { file, key: None } => format!("sops {}", file.display()),
+            SecretSource::Plugin { plugin, locator } => format!("{} {locator}", plugin.scheme),
         }
     }
 }
@@ -330,7 +363,11 @@ pub(crate) struct Resolved {
 /// Free fields (`env`) apply from any project, minus the reserved-key denylist for
 /// an untrusted one. Security fields (`binds`) apply only from a trusted project;
 /// an untrusted or since-changed project's binds are dropped with a warning.
-fn resolve(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resolved {
+fn resolve(
+    global: RawConfig,
+    project: Option<(RawConfig, TrustState)>,
+    plugins: &PluginRegistry,
+) -> Resolved {
     let mut warnings = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut binds: Vec<PathBuf> = Vec::new();
@@ -357,8 +394,22 @@ fn resolve(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resol
         .network
         .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v))
         .unwrap_or_default();
-    // Secrets are trusted by location at the global layer.
-    apply_secrets(&mut secrets, &mut warnings, GLOBAL_CONFIG, global.secret);
+    // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
+    // captured for the global hosts and as the base a trusted project may extend.
+    let mut secret_defaults = SecretDefaults::default();
+    if let Some(section) = global.secret {
+        if let Some(raw_defaults) = &section.defaults {
+            secret_defaults = SecretDefaults::from_raw(raw_defaults);
+        }
+        apply_secret_section(
+            &mut secrets,
+            &mut warnings,
+            GLOBAL_CONFIG,
+            section.hosts,
+            &secret_defaults,
+            plugins,
+        );
+    }
 
     let mut nixpkgs_project = None;
     if let Some((proj, state)) = project {
@@ -411,18 +462,32 @@ fn resolve(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resol
                 ));
             }
         }
-        // `[[secret]]` is a security field — a trusted project may inject credentials;
-        // an untrusted or changed one may not (it would aim the user's secrets at a host
-        // of its choosing). The whole list is dropped, with one count warning.
-        if !proj.secret.is_empty() {
+        // The `[secret]` section is a security field — a trusted project may inject
+        // credentials (and extend the resolver defaults); an untrusted or changed one may
+        // not (it would aim the user's secrets at a host of its choosing). The whole
+        // section — defaults included — is dropped, with one count warning.
+        if let Some(section) = proj.secret {
             if trusted {
-                apply_secrets(&mut secrets, &mut warnings, PROJECT_CONFIG, proj.secret);
+                let effective = match &section.defaults {
+                    Some(raw_defaults) => secret_defaults.merged_with(raw_defaults),
+                    None => secret_defaults.clone(),
+                };
+                apply_secret_section(
+                    &mut secrets,
+                    &mut warnings,
+                    PROJECT_CONFIG,
+                    section.hosts,
+                    &effective,
+                    plugins,
+                );
             } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring {} secret(s) ({})",
-                    proj.secret.len(),
-                    untrusted_reason(state)
-                ));
+                let n = count_host_secrets(&section.hosts);
+                if n > 0 {
+                    warnings.push(format!(
+                        "{PROJECT_CONFIG}: ignoring {n} secret(s) ({})",
+                        untrusted_reason(state)
+                    ));
+                }
             }
         }
     }
@@ -645,23 +710,44 @@ fn classify_entries(
     rules
 }
 
-/// Validate and fold a layer's `[[secret]]` declarations into `out`. Each entry is fully
-/// validated (kind, source, target, header, type); a malformed one is dropped with a
-/// warning — fail-closed, since a credential injection is security-relevant. A later entry
-/// for the same (target, header) overrides an earlier one (last-wins) with a warning, so a
-/// duplicate destination never silently emits two header copies upstream.
-fn apply_secrets(
+/// Validate and fold a layer's `[secret]` host entries into `out`, expanding any terse `key`
+/// through `defaults`. Each entry is fully validated (kind, source, target, header, type); a
+/// malformed one is dropped with a warning naming the host — fail-closed, since a credential
+/// injection is security-relevant. A later entry for the same (host, header) overrides an
+/// earlier one (last-wins) with a warning, so a duplicate destination never silently emits two
+/// header copies upstream.
+fn apply_secret_section(
     out: &mut Vec<HeaderSecret>,
     warnings: &mut Vec<String>,
     source: &str,
-    secrets: Vec<RawSecret>,
+    hosts: BTreeMap<String, RawHostSecrets>,
+    defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
 ) {
-    for raw in secrets {
-        match validate_secret(raw) {
-            Ok(secret) => upsert_secret(out, warnings, source, secret),
-            Err(e) => warnings.push(format!("{source}: ignoring secret — {e}")),
+    for (host, entry) in hosts {
+        let list = match entry {
+            RawHostSecrets::One(s) => vec![s],
+            RawHostSecrets::Many(v) => v,
+        };
+        for raw in list {
+            match validate_host_secret(&host, raw, defaults, plugins) {
+                Ok(secret) => upsert_secret(out, warnings, source, secret),
+                Err(e) => warnings.push(format!("{source}: ignoring secret for `{host}` — {e}")),
+            }
         }
     }
+}
+
+/// Total host secrets in a section — counting each element of a `[[secret."host"]]` array — for
+/// the one-line warning when an untrusted project's whole section is dropped.
+fn count_host_secrets(hosts: &BTreeMap<String, RawHostSecrets>) -> usize {
+    hosts
+        .values()
+        .map(|h| match h {
+            RawHostSecrets::One(_) => 1,
+            RawHostSecrets::Many(v) => v.len(),
+        })
+        .sum()
 }
 
 /// Set the secret for its (target, header) pair, overriding an existing one (last-wins)
@@ -688,51 +774,364 @@ fn upsert_secret(
     }
 }
 
-/// Validate one `[[secret]]` into a [`HeaderSecret`], or report why it is malformed. Every
-/// check fails closed: an unknown kind, an ambiguous or missing source, a non-concrete
-/// target, a bad header name, or a missing/unknown type each drops the secret.
-fn validate_secret(raw: RawSecret) -> Result<HeaderSecret, String> {
-    if raw.kind != "http-header" {
+/// Validate one host entry into a [`HeaderSecret`], or report why it is malformed. `host` is the
+/// section key (the injection target). Every check fails closed: an unknown kind, a missing or
+/// both-set source, a non-concrete target, a bad header name, or a missing/unknown type each
+/// drops the secret. `kind` is optional, defaulting to the only kind today.
+fn validate_host_secret(
+    host: &str,
+    raw: RawHostSecret,
+    defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) -> Result<HeaderSecret, String> {
+    let kind = raw.kind.as_deref().unwrap_or("http-header");
+    if kind != "http-header" {
         return Err(format!(
-            "unknown kind `{}` (the only secret kind today is \"http-header\")",
-            raw.kind
+            "unknown kind `{kind}` (the only secret kind today is \"http-header\")"
         ));
     }
-    let source = validate_secret_source(&raw)?;
-    let to = validate_secret_target(&raw.to)?;
-    validate_header_name(&raw.header)?;
-    let shape = validate_header_shape(raw.value_type.as_deref(), raw.prefix.as_deref())?;
+    let sources = resolve_host_sources(&raw, defaults, plugins)?;
+    let to = validate_secret_target(host)?;
+    // `header` and `type` may come from the entry or fall back to `[secret.defaults]`; an entry
+    // that names neither (on itself or in the defaults) is the same explicit error as before —
+    // there is no silent built-in default.
+    let header = raw
+        .header
+        .as_deref()
+        .or(defaults.header.as_deref())
+        .ok_or_else(|| {
+            "set `header` (or a `[secret.defaults] header`) — the request header to set".to_string()
+        })?;
+    validate_header_name(header)?;
+    let value_type = raw.value_type.as_deref().or(defaults.value_type.as_deref());
+    let shape = validate_header_shape(value_type, raw.prefix.as_deref())?;
     Ok(HeaderSecret {
-        source,
+        sources,
         to,
-        header: raw.header,
+        header: header.to_string(),
         shape,
     })
 }
 
-/// The source for a secret: exactly one of `from_env` (a variable name) or `from_file`
-/// (an absolute host path). Both-set or neither-set is rejected — an ambiguous source must
-/// never silently pick one. The value is not read here; that is host-side at launch.
-fn validate_secret_source(raw: &RawSecret) -> Result<SecretSource, String> {
-    match (raw.from_env.as_deref(), raw.from_file.as_deref()) {
+/// The resolver chain for a host secret: either the explicit `from` (a single `scheme://locator`
+/// ref or a list tried in order) or the terse `key` expanded through `defaults` — exactly one of
+/// the two. Both set, or neither, is rejected; an empty `from` list is rejected. The values are
+/// not read here; that is host-side at launch.
+fn resolve_host_sources(
+    raw: &RawHostSecret,
+    defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) -> Result<Vec<SecretSource>, String> {
+    match (raw.key.as_deref(), &raw.from) {
         (Some(_), Some(_)) => {
-            Err("set exactly one of `from_env` or `from_file`, not both".to_string())
+            Err("set `key` or `from`, not both — a secret has one source form".to_string())
         }
-        (None, None) => Err("set exactly one of `from_env` or `from_file`".to_string()),
-        (Some(var), None) => {
-            if !is_valid_env_key(var) {
-                return Err(format!("`from_env` is not a valid variable name `{var}`"));
-            }
-            Ok(SecretSource::Env(var.to_string()))
-        }
-        (None, Some(file)) => {
-            let path = PathBuf::from(file);
-            if !path.is_absolute() {
-                return Err(format!("`from_file` must be an absolute path `{file}`"));
-            }
-            Ok(SecretSource::File(path))
+        (None, None) => Err(
+            "set `key` or `from` — a secret needs a source (e.g. `key = \"github_token\"` \
+                 or `from = \"env://VAR\"`)"
+                .to_string(),
+        ),
+        (Some(key), None) => expand_key(key, defaults),
+        (None, Some(from)) => {
+            let refs: &[String] = match from {
+                SecretFrom::One(one) => std::slice::from_ref(one),
+                SecretFrom::Many(list) => {
+                    if list.is_empty() {
+                        return Err(
+                            "`from` is an empty list — declare at least one resolver ref"
+                                .to_string(),
+                        );
+                    }
+                    list
+                }
+            };
+            refs.iter().map(|r| parse_secret_ref(r, plugins)).collect()
         }
     }
+}
+
+/// The validated `[secret.defaults]` — the resolver order and per-resolver bindings a terse `key`
+/// expands through, plus a default `header`/`type` an entry may omit. Built per config layer;
+/// bindings and the header/type are validated lazily, when an entry actually uses them, so a
+/// defaults table no entry references never blocks a launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SecretDefaults {
+    /// Resolver names to try, in order, for an unpinned key.
+    order: Vec<String>,
+    /// The sops file a terse sops key reads from (`sops://<file>#<key>`).
+    sops_file: Option<String>,
+    /// How to case a terse key before using it as a variable name (`upper`/`lower`/`asis`).
+    env_case: Option<String>,
+    /// The base directory a terse file key reads from (`file://<dir>/<key>`).
+    file_dir: Option<String>,
+    /// The default header name for an entry that omits `header`.
+    header: Option<String>,
+    /// The default value type for an entry that omits `type`.
+    value_type: Option<String>,
+}
+
+impl SecretDefaults {
+    /// The defaults declared in one `[secret.defaults]` table.
+    fn from_raw(raw: &RawSecretDefaults) -> Self {
+        Self {
+            order: raw.order.clone(),
+            sops_file: raw.sops.as_ref().map(|s| s.file.clone()),
+            env_case: raw.env.as_ref().and_then(|e| e.case.clone()),
+            file_dir: raw.file.as_ref().map(|f| f.dir.clone()),
+            header: raw.header.clone(),
+            value_type: raw.value_type.clone(),
+        }
+    }
+
+    /// These defaults overridden field-by-field by a project's `[secret.defaults]`: an order, a
+    /// binding, or a header/type the project sets wins; anything it omits inherits the global value.
+    fn merged_with(&self, raw: &RawSecretDefaults) -> Self {
+        Self {
+            order: if raw.order.is_empty() {
+                self.order.clone()
+            } else {
+                raw.order.clone()
+            },
+            sops_file: raw
+                .sops
+                .as_ref()
+                .map(|s| s.file.clone())
+                .or_else(|| self.sops_file.clone()),
+            env_case: raw
+                .env
+                .as_ref()
+                .and_then(|e| e.case.clone())
+                .or_else(|| self.env_case.clone()),
+            file_dir: raw
+                .file
+                .as_ref()
+                .map(|f| f.dir.clone())
+                .or_else(|| self.file_dir.clone()),
+            header: raw.header.clone().or_else(|| self.header.clone()),
+            value_type: raw.value_type.clone().or_else(|| self.value_type.clone()),
+        }
+    }
+}
+
+/// Expand a terse `key` spec into a resolver chain. The spec is `name[@resolver[,resolver…]]`:
+/// without a `@` pin the default `order` is used; with one, exactly those resolvers in that
+/// order, for this secret only. The `name` is validated as a conservative dotted key (so it can
+/// never carry a path separator into the `file`/`sops` locator), each resolver builds a
+/// `scheme://locator` ref, and the existing [`parse_secret_ref`] validates it — one validation
+/// path for terse and explicit sources alike. A missing binding or an empty order fails closed.
+fn expand_key(spec: &str, defaults: &SecretDefaults) -> Result<Vec<SecretSource>, String> {
+    let (name, resolvers) = match spec.rsplit_once('@') {
+        Some((name, pin)) => {
+            let list: Vec<String> = pin.split(',').map(|r| r.trim().to_string()).collect();
+            if list.iter().any(String::is_empty) {
+                return Err(format!(
+                    "the key `{spec}` has an empty resolver name after `@`"
+                ));
+            }
+            (name, list)
+        }
+        None => (spec, defaults.order.clone()),
+    };
+    validate_terse_key(name)?;
+    if resolvers.is_empty() {
+        return Err(format!(
+            "no resolver for key `{name}`: set `[secret.defaults] order` or pin it (e.g. \
+             `{name}@env`)"
+        ));
+    }
+    // A terse `key` only ever expands to a built-in resolver ref (`build_ref` emits `env://`,
+    // `sops://`, or `file://`), so the registry is intentionally empty here: terse plugin
+    // bindings (`key@<plugin>`) are a deliberate later addition, not silently in scope.
+    let builtins_only = PluginRegistry::default();
+    resolvers
+        .iter()
+        .map(|r| parse_secret_ref(&build_ref(r, name, defaults)?, &builtins_only))
+        .collect()
+}
+
+/// Build a `scheme://locator` ref for one resolver from a terse `key`, applying that resolver's
+/// binding: `env` cases the key into a variable name; `sops` joins the key onto the bound file
+/// (`<file>#<key>`); `file` joins it onto the bound base directory (`<dir>/<key>`). A resolver
+/// whose binding is unset, or an unknown resolver name, fails closed.
+fn build_ref(resolver: &str, key: &str, defaults: &SecretDefaults) -> Result<String, String> {
+    match resolver {
+        "env" => {
+            let name = match defaults.env_case.as_deref() {
+                None | Some("asis") => key.to_string(),
+                Some("upper") => key.to_ascii_uppercase(),
+                Some("lower") => key.to_ascii_lowercase(),
+                Some(other) => {
+                    return Err(format!(
+                        "unknown env `case` `{other}` (expected \"upper\", \"lower\", or \"asis\")"
+                    ))
+                }
+            };
+            Ok(format!("env://{name}"))
+        }
+        "sops" => {
+            let file = defaults.sops_file.as_deref().ok_or_else(|| {
+                format!("key `{key}` uses the sops resolver, but `[secret.defaults.sops] file` is unset")
+            })?;
+            if file.contains('#') {
+                return Err(format!(
+                    "the sops file `{file}` contains `#`, reserved by the `sops://<file>#<key>` form"
+                ));
+            }
+            Ok(format!("sops://{file}#{key}"))
+        }
+        "file" => {
+            let dir = defaults.file_dir.as_deref().ok_or_else(|| {
+                format!(
+                    "key `{key}` uses the file resolver, but `[secret.defaults.file] dir` is unset"
+                )
+            })?;
+            if !std::path::Path::new(dir).is_absolute() {
+                return Err(format!(
+                    "the `[secret.defaults.file] dir` `{dir}` must be an absolute path"
+                ));
+            }
+            let sep = if dir.ends_with('/') { "" } else { "/" };
+            Ok(format!("file://{dir}{sep}{key}"))
+        }
+        other => Err(format!(
+            "unknown resolver `{other}` for key `{key}` (built-in: env, file, sops)"
+        )),
+    }
+}
+
+/// Validate a terse `key`: dot-separated segments, each non-empty and made of letters, digits,
+/// `_`, or `-`. Stricter than an env variable name on purpose — it forbids `/` and `..`, so a key
+/// joined onto a `file`/`sops` locator can never carry a path separator or traverse out of the
+/// bound directory.
+fn validate_terse_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("a terse `key` is empty".to_string());
+    }
+    for seg in key.split('.') {
+        if seg.is_empty() {
+            return Err(format!("the key `{key}` has an empty segment"));
+        }
+        if !seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "the key `{key}` has an invalid segment `{seg}` (allowed: letters, digits, _, -, \
+                 separated by `.`)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse one `from` entry — a `scheme://locator` resolver ref — into a [`SecretSource`]. The
+/// built-in schemes are `env`, `file`, and `sops`; any other scheme must be claimed by an
+/// installed resolver plugin, else it is an error. A bare token with no `://` is an error too
+/// (fail-closed: never a silent mis-read as a path or a variable).
+fn parse_secret_ref(reff: &str, plugins: &PluginRegistry) -> Result<SecretSource, String> {
+    let Some((scheme, locator)) = reff.split_once("://") else {
+        return Err(format!(
+            "a secret source needs a scheme, e.g. `env://VAR` or `file:///abs/path` (`{reff}`)"
+        ));
+    };
+    match scheme {
+        "env" => env_source(locator),
+        "file" => file_source(locator),
+        "sops" => sops_source(locator),
+        other => match plugins.resolver(other) {
+            Some(plugin) => {
+                validate_plugin_locator(other, locator)?;
+                Ok(SecretSource::Plugin {
+                    plugin: plugin.clone(),
+                    locator: locator.to_string(),
+                })
+            }
+            None => Err(format!(
+                "unknown secret resolver scheme `{other}://` (built-in: env, file, sops; \
+                 or install a resolver plugin that claims it)"
+            )),
+        },
+    }
+}
+
+/// Validate a plugin ref's locator before it becomes the plugin's `argv[1]`: non-empty and free
+/// of control characters (a NUL would truncate the argument, a newline could confuse a
+/// line-oriented resolver). The trust gate is the real control — an untrusted project's secrets
+/// are dropped before this is reached — so this is belt-and-suspenders for the trusted path.
+fn validate_plugin_locator(scheme: &str, locator: &str) -> Result<(), String> {
+    if locator.is_empty() {
+        return Err(format!("the `{scheme}://` ref has an empty locator"));
+    }
+    if locator.chars().any(char::is_control) {
+        return Err(format!(
+            "the `{scheme}://` ref locator contains a control character"
+        ));
+    }
+    Ok(())
+}
+
+/// An `env` source from a variable name, validated as a usable shell variable name.
+fn env_source(var: &str) -> Result<SecretSource, String> {
+    if !is_valid_env_key(var) {
+        return Err(format!("`{var}` is not a valid environment variable name"));
+    }
+    Ok(SecretSource::Env(var.to_string()))
+}
+
+/// A `sops` source from `<file>[#<dotted.key>]`. The `#` is split off the **end** (a sops key
+/// cannot contain `#`, so a `#` in the file path is preserved); the key, when present, is
+/// charset-validated so it can never malform the `["seg"]["seg"]` extract expression sops parses.
+/// The file may be relative (resolved against the project root host-side) or absolute.
+fn sops_source(locator: &str) -> Result<SecretSource, String> {
+    let (file, key) = match locator.rsplit_once('#') {
+        Some((f, k)) => (f, Some(k)),
+        None => (locator, None),
+    };
+    if file.is_empty() {
+        return Err("a sops source needs a file path `sops://<file>[#<key>]`".to_string());
+    }
+    if let Some(k) = key {
+        validate_sops_key(k)?;
+    }
+    Ok(SecretSource::Sops {
+        file: PathBuf::from(file),
+        key: key.map(String::from),
+    })
+}
+
+/// Validate a sops `--extract` key path: dot-separated segments, each non-empty and made of
+/// letters, digits, `_`, or `-`. Rejects an empty key (a trailing `#`), an empty segment
+/// (`a..b`, `.a`, `a.`), and any character that could break the bracketed extract expression.
+fn validate_sops_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("the sops source has an empty key after `#`".to_string());
+    }
+    for seg in key.split('.') {
+        if seg.is_empty() {
+            return Err(format!("the sops key `{key}` has an empty path segment"));
+        }
+        if !seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "the sops key `{key}` has an invalid segment `{seg}` (allowed: letters, digits, _, -)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A `file` source from an absolute host path (a relative path is rejected — it would resolve
+/// against an unpredictable working directory).
+fn file_source(file: &str) -> Result<SecretSource, String> {
+    let path = PathBuf::from(file);
+    if !path.is_absolute() {
+        return Err(format!(
+            "a file secret path must be an absolute path `{file}`"
+        ));
+    }
+    Ok(SecretSource::File(path))
 }
 
 /// Classify a secret's `to` into a concrete-host rule. A credential goes to one known
@@ -782,17 +1181,22 @@ fn validate_header_shape(
             return Err("the `prefix` contains a control character".to_string());
         }
     }
-    let (default_prefix, base64) = match value_type {
-        Some("bearer") => ("Bearer ", false),
-        Some("raw") => ("", false),
-        Some("basic") => ("Basic ", true),
-        Some(other) => {
-            return Err(format!(
-                "unknown `type` `{other}` (expected \"bearer\", \"basic\", or \"raw\")"
-            ))
-        }
-        None => return Err("missing `type` (one of \"bearer\", \"basic\", or \"raw\")".to_string()),
-    };
+    let (default_prefix, base64) =
+        match value_type {
+            Some("bearer") => ("Bearer ", false),
+            Some("raw") => ("", false),
+            Some("basic") => ("Basic ", true),
+            Some(other) => {
+                return Err(format!(
+                    "unknown `type` `{other}` (expected \"bearer\", \"basic\", or \"raw\")"
+                ))
+            }
+            None => return Err(
+                "missing `type` (one of \"bearer\", \"basic\", or \"raw\"; set it on the secret \
+                 or as a `[secret.defaults] type`)"
+                    .to_string(),
+            ),
+        };
     Ok(HeaderShape {
         prefix: prefix.unwrap_or(default_prefix).to_string(),
         base64,
@@ -876,6 +1280,13 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
     let global = read_global(&mut warnings);
     let project = read_project(cwd, &mut warnings);
 
+    // Discover installed resolver plugins (trusted by location, under the data dir). With no
+    // usable data directory there are simply no plugins; a malformed one warns and is dropped.
+    let plugins = match crate::store::Layout::from_env() {
+        Some(layout) => PluginRegistry::load(&layout.plugins_dir(), &mut warnings),
+        None => PluginRegistry::default(),
+    };
+
     // Capture the mise file, its verdict, and its validated bytes before `resolve`
     // consumes the project layer. A mise file is anchored on the `.ops.toml`: with no
     // usable project config there is nothing to gate it, so it is only flagged, not
@@ -888,7 +1299,11 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
         .unwrap_or_default();
     let mise = mise_status(cwd, project_state, mise_files, &mut warnings);
 
-    let mut resolved = resolve(global, project.map(|(raw, state, _)| (raw, state)));
+    let mut resolved = resolve(
+        global,
+        project.map(|(raw, state, _)| (raw, state)),
+        &plugins,
+    );
     resolved.mise = mise;
 
     // Canonicalize the (already absolute) bind sources, dropping any that cannot be
@@ -1072,6 +1487,7 @@ fn global_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::schema::{RawEnvDefaults, RawFileDefaults, RawSecretSection, RawSopsDefaults};
     use super::*;
     use std::collections::BTreeMap;
 
@@ -1085,7 +1501,7 @@ mod tests {
             packages: BTreeMap::new(),
             nixpkgs: None,
             network: None,
-            secret: Vec::new(),
+            secret: None,
         }
     }
 
@@ -1143,7 +1559,7 @@ mod tests {
 
     #[test]
     fn global_only_is_honored_in_full() {
-        let r = resolve(raw(&[("FOO", "g")], &["/srv/data"]), None);
+        let r = resolve_no_plugins(raw(&[("FOO", "g")], &["/srv/data"]), None);
         assert_eq!(get(&r.env, "FOO"), Some("g"));
         assert_eq!(r.ro_binds, vec![PathBuf::from("/srv/data")]);
         assert!(r.warnings.is_empty());
@@ -1151,7 +1567,7 @@ mod tests {
 
     #[test]
     fn a_trusted_project_overrides_env_and_adds_binds() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw(&[("FOO", "global"), ("ONLYG", "g")], &["/srv/global"]),
             Some((
                 raw(&[("FOO", "proj")], &["/srv/project"]),
@@ -1171,7 +1587,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_project_keeps_free_env_but_drops_binds() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
                 raw(&[("PROJVAR", "v")], &["/etc/ssh"]),
@@ -1189,7 +1605,7 @@ mod tests {
 
     #[test]
     fn a_changed_project_drops_binds_with_a_reapproval_hint() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((raw(&[], &["/etc/ssh"]), TrustState::Changed)),
         );
@@ -1200,7 +1616,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_project_cannot_set_reserved_env_keys() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
                 raw(
@@ -1228,7 +1644,7 @@ mod tests {
     fn a_trusted_project_may_set_reserved_env_keys() {
         // vouching for a config honors the whole schema; overriding PATH/LD_PRELOAD
         // harms only its own sandbox (out of scope by design).
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
                 raw(
@@ -1298,7 +1714,7 @@ mod tests {
     fn a_non_absolute_bind_is_dropped() {
         // even a trusted project's relative bind is refused — extra binds are
         // out-of-project absolute paths by construction.
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((raw(&[], &["relative/dir", "/abs/ok"]), TrustState::Trusted)),
         );
@@ -1310,7 +1726,7 @@ mod tests {
     #[test]
     fn a_malformed_env_key_is_dropped() {
         // a quoted TOML key could carry `=`; it must never reach `--setenv`
-        let r = resolve(raw(&[("A=B", "x"), ("OK", "y")], &[]), None);
+        let r = resolve_no_plugins(raw(&[("A=B", "x"), ("OK", "y")], &[]), None);
         assert_eq!(get(&r.env, "OK"), Some("y"));
         assert!(r.env.iter().all(|(k, _)| k != "A=B"));
         assert_eq!(r.warnings.len(), 1);
@@ -1328,7 +1744,7 @@ mod tests {
 
     #[test]
     fn global_packages_are_trusted_by_location() {
-        let r = resolve(raw_packages(&[("node", "nodejs_20")]), None);
+        let r = resolve_no_plugins(raw_packages(&[("node", "nodejs_20")]), None);
         let node = pkg(&r.packages, "node").expect("global package present");
         assert_eq!(node.attr, "nodejs_20");
         assert_eq!(
@@ -1341,7 +1757,7 @@ mod tests {
 
     #[test]
     fn a_trusted_project_package_overrides_the_global_one_by_name() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_packages(&[("node", "nodejs_20"), ("onlyg", "ripgrep")]),
             Some((raw_packages(&[("node", "nodejs_22")]), TrustState::Trusted)),
         );
@@ -1357,7 +1773,7 @@ mod tests {
     fn an_untrusted_project_package_is_carried_but_flagged_untrusted() {
         // The launcher, not this stage, decides admission — so the package is kept,
         // stamped with its source's trust, with no drop and no warning here.
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
                 raw_packages(&[("node", "nodejs_20")]),
@@ -1377,7 +1793,7 @@ mod tests {
     fn a_changed_project_package_keeps_the_changed_state_distinct_from_untrusted() {
         // The Changed≠Untrusted distinction must survive onto the package: a changed
         // project points the user at re-approval, not first approval.
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((raw_packages(&[("node", "nodejs_20")]), TrustState::Changed)),
         );
@@ -1394,7 +1810,7 @@ mod tests {
 
     #[test]
     fn a_malformed_package_name_or_attribute_is_dropped() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_packages(&[
                 ("../escape", "hello"), // label escapes its directory
                 ("ok", "bad attr!"),    // attribute carries an illegal character
@@ -1433,13 +1849,13 @@ mod tests {
     #[test]
     fn a_global_nixpkgs_override_is_honored_a_trusted_project_overrides_it() {
         // global is trusted by location
-        let r = resolve(raw_nixpkgs("nixos-23.11"), None);
+        let r = resolve_no_plugins(raw_nixpkgs("nixos-23.11"), None);
         assert_eq!(r.nixpkgs_global.as_deref(), Some("nixos-23.11"));
         assert_eq!(r.nixpkgs_project, None);
         assert!(r.warnings.is_empty());
 
         // a trusted project sets its own (the launcher prefers it for the tools)
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_nixpkgs("nixos-unstable"),
             Some((raw_nixpkgs("nixos-23.11"), TrustState::Trusted)),
         );
@@ -1450,7 +1866,7 @@ mod tests {
     #[test]
     fn an_untrusted_project_nixpkgs_override_is_dropped_with_a_warning() {
         for state in [TrustState::Untrusted, TrustState::Changed] {
-            let r = resolve(
+            let r = resolve_no_plugins(
                 RawConfig::default(),
                 Some((raw_nixpkgs("nixos-23.11"), state)),
             );
@@ -1466,7 +1882,7 @@ mod tests {
     #[test]
     fn a_malformed_nixpkgs_source_is_dropped() {
         // a full flake reference is not (yet) a valid source: it must not reach nix
-        let r = resolve(raw_nixpkgs("github:evil/nixpkgs"), None);
+        let r = resolve_no_plugins(raw_nixpkgs("github:evil/nixpkgs"), None);
         assert_eq!(r.nixpkgs_global, None);
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("malformed nixpkgs source"));
@@ -1477,7 +1893,7 @@ mod tests {
         // No declared posture anywhere means the host network — the documented
         // default until the egress allowlist ships.
         assert_eq!(
-            resolve(RawConfig::default(), None).network,
+            resolve_no_plugins(RawConfig::default(), None).network,
             NetworkPolicy::Shared
         );
     }
@@ -1485,12 +1901,12 @@ mod tests {
     #[test]
     fn a_global_network_posture_is_honored_a_trusted_project_overrides_it() {
         // global is trusted by location
-        let r = resolve(raw_network("none"), None);
+        let r = resolve_no_plugins(raw_network("none"), None);
         assert_eq!(r.network, NetworkPolicy::Isolated);
         assert!(r.warnings.is_empty());
 
         // a trusted project sets its own, overriding the global posture
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_network("none"),
             Some((raw_network("shared"), TrustState::Trusted)),
         );
@@ -1503,7 +1919,7 @@ mod tests {
         // an untrusted project may not change the network — its choice is dropped and
         // the default (or the global posture) stands.
         for state in [TrustState::Untrusted, TrustState::Changed] {
-            let r = resolve(RawConfig::default(), Some((raw_network("none"), state)));
+            let r = resolve_no_plugins(RawConfig::default(), Some((raw_network("none"), state)));
             assert_eq!(
                 r.network,
                 NetworkPolicy::Shared,
@@ -1518,7 +1934,7 @@ mod tests {
     fn an_untrusted_project_cannot_widen_a_globally_isolated_network() {
         // The gate cuts both ways: with the global config isolating the network, an
         // untrusted project asking for `"shared"` cannot reopen it.
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_network("none"),
             Some((raw_network("shared"), TrustState::Untrusted)),
         );
@@ -1530,7 +1946,7 @@ mod tests {
     #[test]
     fn an_unknown_network_posture_is_dropped_with_a_warning() {
         // a typo must not silently leave the network in the wrong posture
-        let r = resolve(raw_network("offline"), None);
+        let r = resolve_no_plugins(raw_network("offline"), None);
         assert_eq!(r.network, NetworkPolicy::Shared);
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("unknown network policy `offline`"));
@@ -1557,7 +1973,7 @@ mod tests {
 
     #[test]
     fn a_trusted_project_allowlist_is_classified() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
                 raw_network_allow(&["github.com", "*.nixos.org", "1.2.3.4", "ex.com/p"]),
@@ -1584,7 +2000,7 @@ mod tests {
     #[test]
     fn an_untrusted_project_allowlist_is_dropped_with_a_warning() {
         for state in [TrustState::Untrusted, TrustState::Changed] {
-            let r = resolve(
+            let r = resolve_no_plugins(
                 RawConfig::default(),
                 Some((raw_network_allow(&["github.com"]), state)),
             );
@@ -1601,7 +2017,7 @@ mod tests {
     #[test]
     fn a_trusted_project_deny_carves_out_of_allow() {
         // deny always wins: a broad allow with a deny carve-out blocks the carve-out.
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_network_table(&["*.nixos.org"], &["evil.nixos.org"]),
             Some((RawConfig::default(), TrustState::Trusted)),
         );
@@ -1619,7 +2035,7 @@ mod tests {
     fn a_malformed_entry_in_either_list_is_dropped_keeping_the_valid_ones() {
         // global is trusted by location; a bad entry fails closed (that host stays
         // unreachable / its carve-out absent), the valid ones are kept, each drop named.
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_network_table(&["github.com", "bad host"], &["evil.com", "also bad"]),
             None,
         );
@@ -1650,7 +2066,7 @@ mod tests {
 
     #[test]
     fn an_unknown_network_mode_is_dropped_with_a_warning() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig {
                 network: Some(NetworkField::Table(NetworkTable {
                     mode: "bogus".into(),
@@ -1698,35 +2114,781 @@ mod tests {
         header: &str,
         ty: Option<&str>,
         prefix: Option<&str>,
-    ) -> RawSecret {
-        RawSecret {
-            kind: "http-header".into(),
-            from_env: from_env.map(String::from),
-            from_file: from_file.map(String::from),
-            to: to.into(),
-            header: header.into(),
-            value_type: ty.map(String::from),
-            prefix: prefix.map(String::from),
+    ) -> (String, RawHostSecret) {
+        // Map the convenience params onto a `from` ref so the many call sites stay terse. The
+        // host is returned alongside the secret, since it is the section key in the new shape.
+        let from = match (from_env, from_file) {
+            (Some(v), None) => Some(SecretFrom::One(format!("env://{v}"))),
+            (None, Some(p)) => Some(SecretFrom::One(format!("file://{p}"))),
+            (None, None) => None,
+            (Some(_), Some(_)) => panic!("test helper: set at most one of from_env / from_file"),
+        };
+        (
+            to.into(),
+            RawHostSecret {
+                kind: Some("http-header".into()),
+                key: None,
+                from,
+                header: Some(header.into()),
+                value_type: ty.map(String::from),
+                prefix: prefix.map(String::from),
+            },
+        )
+    }
+
+    /// Group `(host, secret)` pairs into a `[secret]` section, collapsing repeats of the same
+    /// host into a `[[secret."host"]]` array (so the duplicate-target and multi-header cases are
+    /// expressible).
+    fn raw_secret_section(secrets: Vec<(String, RawHostSecret)>) -> RawSecretSection {
+        let mut hosts: BTreeMap<String, RawHostSecrets> = BTreeMap::new();
+        for (host, s) in secrets {
+            match hosts.remove(&host) {
+                None => {
+                    hosts.insert(host, RawHostSecrets::One(s));
+                }
+                Some(RawHostSecrets::One(first)) => {
+                    hosts.insert(host, RawHostSecrets::Many(vec![first, s]));
+                }
+                Some(RawHostSecrets::Many(mut v)) => {
+                    v.push(s);
+                    hosts.insert(host, RawHostSecrets::Many(v));
+                }
+            }
+        }
+        RawSecretSection {
+            defaults: None,
+            hosts,
         }
     }
 
     /// A `RawConfig` declaring a network allowlist (so secrets are not dropped by the
     /// allowlist dependency) plus the given secrets.
-    fn raw_secrets(allow: &[&str], secrets: Vec<RawSecret>) -> RawConfig {
+    fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mode: "allowlist".into(),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
             })),
-            secret: secrets,
+            secret: Some(raw_secret_section(secrets)),
             ..RawConfig::default()
         }
     }
 
+    /// A `RawHostSecret` whose `from` is the given resolver-ref list, for the validation tests.
+    fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
+        RawHostSecret {
+            kind: Some("http-header".into()),
+            key: None,
+            from: Some(SecretFrom::Many(
+                from.into_iter().map(String::from).collect(),
+            )),
+            header: Some("Authorization".into()),
+            value_type: Some("bearer".into()),
+            prefix: None,
+        }
+    }
+
+    /// Validate a host secret against empty defaults, for the source/parse tests. The host is a
+    /// fixed concrete target so the tests focus on the source form.
+    fn validate(secret: RawHostSecret) -> Result<HeaderSecret, String> {
+        vhs("api.github.com", secret, &SecretDefaults::default())
+    }
+
+    /// [`validate_host_secret`] with no installed plugins — the default for the secret tests,
+    /// which exercise the built-in resolvers. The plugin-scheme tests build a registry explicitly.
+    fn vhs(
+        host: &str,
+        secret: RawHostSecret,
+        defaults: &SecretDefaults,
+    ) -> Result<HeaderSecret, String> {
+        validate_host_secret(host, secret, defaults, &PluginRegistry::default())
+    }
+
+    /// [`resolve`] with no installed plugins — the default for the layering tests.
+    fn resolve_no_plugins(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resolved {
+        super::resolve(global, project, &PluginRegistry::default())
+    }
+
+    /// A terse `RawHostSecret` — `key` only, no explicit `from` — for the expansion tests.
+    fn terse(key: &str) -> RawHostSecret {
+        RawHostSecret {
+            kind: None,
+            key: Some(key.into()),
+            from: None,
+            header: Some("Authorization".into()),
+            value_type: Some("bearer".into()),
+            prefix: None,
+        }
+    }
+
+    /// A terse `RawHostSecret` that also omits `header` and `type`, so they must come from
+    /// `[secret.defaults]` — for the default-header/type tests.
+    fn terse_bare(key: &str) -> RawHostSecret {
+        RawHostSecret {
+            kind: None,
+            key: Some(key.into()),
+            from: None,
+            header: None,
+            value_type: None,
+            prefix: None,
+        }
+    }
+
+    /// A raw `[secret.defaults]` table from its parts, for the expansion and layering tests.
+    fn raw_defaults(
+        order: &[&str],
+        sops_file: Option<&str>,
+        env_case: Option<&str>,
+        file_dir: Option<&str>,
+    ) -> RawSecretDefaults {
+        RawSecretDefaults {
+            order: order.iter().map(|s| s.to_string()).collect(),
+            header: None,
+            value_type: None,
+            sops: sops_file.map(|f| RawSopsDefaults { file: f.into() }),
+            env: env_case.map(|c| RawEnvDefaults {
+                case: Some(c.into()),
+            }),
+            file: file_dir.map(|d| RawFileDefaults { dir: d.into() }),
+        }
+    }
+
+    /// A trusted-shaped network allowlist for the given hosts.
+    fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
+        Some(NetworkField::Table(NetworkTable {
+            mode: "allowlist".into(),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: vec![],
+        }))
+    }
+
+    /// A `[secret]` section with the given defaults and one terse host entry.
+    fn terse_section(defaults: RawSecretDefaults, host: &str, key: &str) -> RawSecretSection {
+        let mut hosts = BTreeMap::new();
+        hosts.insert(host.to_string(), RawHostSecrets::One(terse(key)));
+        RawSecretSection {
+            defaults: Some(defaults),
+            hosts,
+        }
+    }
+
+    #[test]
+    fn a_from_chain_parses_into_ordered_sources() {
+        let s = validate(raw_secret_from(vec![
+            "env://GH_TOKEN",
+            "file:///run/secrets/gh",
+        ]))
+        .unwrap();
+        assert_eq!(
+            s.sources,
+            vec![
+                SecretSource::Env("GH_TOKEN".into()),
+                SecretSource::File("/run/secrets/gh".into()),
+            ]
+        );
+        // the chain is shown by locator (never a value), precedence visible
+        assert_eq!(
+            s.describe_sources(),
+            "env GH_TOKEN, then file /run/secrets/gh"
+        );
+    }
+
+    #[test]
+    fn a_single_string_from_parses_to_one_source() {
+        let mut raw = raw_secret_from(vec!["env://GH_TOKEN"]);
+        raw.from = Some(SecretFrom::One("env://GH_TOKEN".into()));
+        let s = validate(raw).unwrap();
+        assert_eq!(s.sources, vec![SecretSource::Env("GH_TOKEN".into())]);
+    }
+
+    #[test]
+    fn an_empty_from_list_is_rejected() {
+        let err = validate(raw_secret_from(vec![])).unwrap_err();
+        assert!(err.contains("empty list"), "{err}");
+    }
+
+    #[test]
+    fn a_from_entry_without_a_scheme_is_rejected() {
+        let err = validate(raw_secret_from(vec!["GH_TOKEN"])).unwrap_err();
+        assert!(err.contains("needs a scheme"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_resolver_scheme_is_rejected() {
+        let err = validate(raw_secret_from(vec!["vault://secret/x#f"])).unwrap_err();
+        assert!(
+            err.contains("unknown secret resolver scheme") && err.contains("vault"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_secret_with_no_source_at_all_is_rejected() {
+        let mut raw = raw_secret_from(vec!["env://X"]);
+        raw.from = None;
+        let err = validate(raw).unwrap_err();
+        assert!(err.contains("needs a source"), "{err}");
+    }
+
+    #[test]
+    fn a_sops_ref_parses_to_a_file_and_key() {
+        let s = validate(raw_secret_from(vec![
+            "sops://secrets/prod.yaml#db.password",
+        ]))
+        .unwrap();
+        assert_eq!(
+            s.sources,
+            vec![SecretSource::Sops {
+                file: "secrets/prod.yaml".into(),
+                key: Some("db.password".into()),
+            }]
+        );
+        assert_eq!(s.describe_sources(), "sops secrets/prod.yaml#db.password");
+    }
+
+    #[test]
+    fn a_sops_ref_without_a_key_decrypts_the_whole_file() {
+        let s = validate(raw_secret_from(vec!["sops:///abs/secrets.yaml"])).unwrap();
+        assert_eq!(
+            s.sources,
+            vec![SecretSource::Sops {
+                file: "/abs/secrets.yaml".into(),
+                key: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sops_key_with_an_invalid_segment_is_rejected() {
+        let err = validate(raw_secret_from(vec!["sops://f.yaml#db.pa$$word"])).unwrap_err();
+        assert!(err.contains("invalid segment"), "{err}");
+    }
+
+    #[test]
+    fn a_sops_ref_with_a_trailing_hash_or_empty_segment_is_rejected() {
+        let err = validate(raw_secret_from(vec!["sops://f.yaml#"])).unwrap_err();
+        assert!(err.contains("empty key"), "{err}");
+        let err = validate(raw_secret_from(vec!["sops://f.yaml#a..b"])).unwrap_err();
+        assert!(err.contains("empty path segment"), "{err}");
+    }
+
+    // --- the terse `key` form + `[secret.defaults]` ------------------------------------------
+
+    #[test]
+    fn a_terse_key_expands_through_the_default_order() {
+        // order [env, sops] with an env case + a sops file: the key becomes a fallback chain, env
+        // first (upcased), then sops (joined onto the bound file). The chain reuses the existing
+        // source types, so everything downstream is unchanged.
+        let d = SecretDefaults::from_raw(&raw_defaults(
+            &["env", "sops"],
+            Some("prod.yaml"),
+            Some("upper"),
+            None,
+        ));
+        let s = vhs("api.github.com", terse("github_token"), &d).unwrap();
+        assert_eq!(
+            s.sources,
+            vec![
+                SecretSource::Env("GITHUB_TOKEN".into()),
+                SecretSource::Sops {
+                    file: "prod.yaml".into(),
+                    key: Some("github_token".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            s.describe_sources(),
+            "env GITHUB_TOKEN, then sops prod.yaml#github_token"
+        );
+    }
+
+    #[test]
+    fn a_pinned_resolver_overrides_the_order() {
+        // `key@sops` ignores the default order and uses sops only
+        let d = SecretDefaults::from_raw(&raw_defaults(&["env"], Some("prod.yaml"), None, None));
+        let s = vhs("api.github.com", terse("tok@sops"), &d).unwrap();
+        assert_eq!(
+            s.sources,
+            vec![SecretSource::Sops {
+                file: "prod.yaml".into(),
+                key: Some("tok".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pin_can_reorder_several_resolvers() {
+        // `key@sops,env` is that order for this secret only, regardless of the default
+        let d = SecretDefaults::from_raw(&raw_defaults(&["env"], Some("prod.yaml"), None, None));
+        let s = vhs("api.github.com", terse("tok@sops,env"), &d).unwrap();
+        assert_eq!(
+            s.sources,
+            vec![
+                SecretSource::Sops {
+                    file: "prod.yaml".into(),
+                    key: Some("tok".into()),
+                },
+                SecretSource::Env("tok".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_terse_file_key_joins_the_base_dir() {
+        let d =
+            SecretDefaults::from_raw(&raw_defaults(&["file"], None, None, Some("/run/secrets")));
+        let s = vhs("h.test", terse("npm"), &d).unwrap();
+        assert_eq!(
+            s.sources,
+            vec![SecretSource::File("/run/secrets/npm".into())]
+        );
+    }
+
+    #[test]
+    fn a_relative_file_dir_is_rejected_naming_the_binding() {
+        // a relative `[secret.defaults.file] dir` fails closed with a message naming the binding,
+        // not the joined path
+        let d = SecretDefaults::from_raw(&raw_defaults(&["file"], None, None, Some("rel/secrets")));
+        let err = vhs("h.test", terse("npm"), &d).unwrap_err();
+        assert!(
+            err.contains("[secret.defaults.file] dir") && err.contains("absolute"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_terse_key_using_an_unbound_resolver_is_rejected() {
+        // sops is in the order but no `[secret.defaults.sops] file` is set — fail closed
+        let d = SecretDefaults::from_raw(&raw_defaults(&["sops"], None, None, None));
+        let err = vhs("h.test", terse("tok"), &d).unwrap_err();
+        assert!(err.contains("sops") && err.contains("unset"), "{err}");
+    }
+
+    #[test]
+    fn a_terse_key_with_no_order_and_no_pin_is_rejected() {
+        // no default order and no `@resolver` — there is nothing to resolve through
+        let err = vhs("h.test", terse("tok"), &SecretDefaults::default()).unwrap_err();
+        assert!(err.contains("no resolver for key"), "{err}");
+    }
+
+    #[test]
+    fn a_terse_key_with_a_path_separator_is_rejected() {
+        // a terse key may not carry a `/` — it would traverse out of a file/sops base
+        let d =
+            SecretDefaults::from_raw(&raw_defaults(&["file"], None, None, Some("/run/secrets")));
+        let err = vhs("h.test", terse("../../etc/shadow"), &d).unwrap_err();
+        assert!(err.contains("segment"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_env_case_is_rejected() {
+        let d = SecretDefaults::from_raw(&raw_defaults(&["env"], None, Some("title"), None));
+        let err = vhs("h.test", terse("tok"), &d).unwrap_err();
+        assert!(err.contains("unknown env `case`"), "{err}");
+    }
+
+    #[test]
+    fn key_and_from_together_is_rejected() {
+        let mut s = terse("tok");
+        s.from = Some(SecretFrom::One("env://TOK".into()));
+        let err = validate(s).unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    /// A test resolver plugin claiming `scheme`. The exec path and sandbox grant are
+    /// placeholders — the config layer only records them, it never runs the plugin.
+    fn plugin(scheme: &str) -> crate::plugins::ResolverPlugin {
+        crate::plugins::ResolverPlugin {
+            name: scheme.to_string(),
+            scheme: scheme.to_string(),
+            dir: PathBuf::from(format!("/data/plugins/{scheme}")),
+            exec: PathBuf::from(format!("/data/plugins/{scheme}/resolve")),
+            sandbox: crate::plugins::SandboxGrant::default(),
+            version: None,
+            description: None,
+        }
+    }
+
+    /// [`validate_host_secret`] against a given registry, for the plugin-scheme tests.
+    fn vhs_with(secret: RawHostSecret, plugins: &PluginRegistry) -> Result<HeaderSecret, String> {
+        validate_host_secret(
+            "api.github.com",
+            secret,
+            &SecretDefaults::default(),
+            plugins,
+        )
+    }
+
+    #[test]
+    fn a_from_ref_resolves_through_a_registered_plugin() {
+        let reg = PluginRegistry::with([plugin("pass")]);
+        let s = vhs_with(raw_secret_from(vec!["pass://github/token"]), &reg).unwrap();
+        match &s.sources[..] {
+            [SecretSource::Plugin { plugin, locator }] => {
+                assert_eq!(plugin.scheme, "pass");
+                assert_eq!(locator, "github/token");
+            }
+            other => panic!("expected one plugin source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_describes_without_the_value() {
+        let reg = PluginRegistry::with([plugin("pass")]);
+        let s = vhs_with(raw_secret_from(vec!["pass://github/token"]), &reg).unwrap();
+        assert_eq!(s.describe_sources(), "pass github/token");
+    }
+
+    #[test]
+    fn an_unregistered_plugin_scheme_is_rejected() {
+        // no plugin claims `vault` → the scheme stays unknown and fails closed
+        let err = vhs_with(
+            raw_secret_from(vec!["vault://secret/x"]),
+            &PluginRegistry::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("vault://"), "{err}");
+        assert!(err.contains("plugin"), "{err}");
+    }
+
+    #[test]
+    fn a_plugin_can_follow_a_builtin_in_a_fallback_chain() {
+        let reg = PluginRegistry::with([plugin("pass")]);
+        let s = vhs_with(
+            raw_secret_from(vec!["env://TOK", "pass://github/token"]),
+            &reg,
+        )
+        .unwrap();
+        assert!(matches!(s.sources[0], SecretSource::Env(_)));
+        assert!(matches!(s.sources[1], SecretSource::Plugin { .. }));
+    }
+
+    #[test]
+    fn a_plugin_locator_with_a_control_character_is_rejected() {
+        let reg = PluginRegistry::with([plugin("pass")]);
+        let err = vhs_with(raw_secret_from(vec!["pass://bad\nref"]), &reg).unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_plugin_locator_is_rejected() {
+        let reg = PluginRegistry::with([plugin("pass")]);
+        let err = vhs_with(raw_secret_from(vec!["pass://"]), &reg).unwrap_err();
+        assert!(err.contains("empty locator"), "{err}");
+    }
+
+    #[test]
+    fn a_terse_key_never_resolves_a_plugin_scheme() {
+        // a terse `key` pinned to a plugin name is not a plugin binding — it is an unknown
+        // resolver binding (terse plugin bindings are deliberately out of scope)
+        let reg = PluginRegistry::with([plugin("pass")]);
+        let err = validate_host_secret(
+            "api.github.com",
+            terse("tok@pass"),
+            &SecretDefaults::default(),
+            &reg,
+        )
+        .unwrap_err();
+        assert!(err.contains("pass"), "{err}");
+    }
+
+    #[test]
+    fn a_trusted_project_terse_secret_expands_through_global_defaults() {
+        // the resolver defaults are global; a trusted project's terse `key` resolves through them
+        let global = RawConfig {
+            network: allowlist_net(&["api.github.com"]),
+            secret: Some(RawSecretSection {
+                defaults: Some(raw_defaults(
+                    &["sops"],
+                    Some("secrets/prod.yaml"),
+                    None,
+                    None,
+                )),
+                hosts: BTreeMap::new(),
+            }),
+            ..RawConfig::default()
+        };
+        let proj = RawConfig {
+            secret: Some(terse_section(
+                RawSecretDefaults::default(),
+                "api.github.com",
+                "gh_token",
+            )),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, Some((proj, TrustState::Trusted)));
+        assert_eq!(r.secrets.len(), 1);
+        assert_eq!(
+            r.secrets[0].sources,
+            vec![SecretSource::Sops {
+                file: "secrets/prod.yaml".into(),
+                key: Some("gh_token".into()),
+            }]
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn a_trusted_project_overrides_a_global_default_binding() {
+        // global points sops at prod; the project, with an empty order (inherited), overrides the
+        // sops file to staging — the project's binding wins, the order is inherited
+        let global = RawConfig {
+            network: allowlist_net(&["api.github.com"]),
+            secret: Some(RawSecretSection {
+                defaults: Some(raw_defaults(&["sops"], Some("prod.yaml"), None, None)),
+                hosts: BTreeMap::new(),
+            }),
+            ..RawConfig::default()
+        };
+        let proj = RawConfig {
+            secret: Some(terse_section(
+                raw_defaults(&[], Some("staging.yaml"), None, None),
+                "api.github.com",
+                "tok",
+            )),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, Some((proj, TrustState::Trusted)));
+        assert_eq!(
+            r.secrets[0].sources,
+            vec![SecretSource::Sops {
+                file: "staging.yaml".into(),
+                key: Some("tok".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_untrusted_project_secret_section_steers_nothing() {
+        // neither an explicit `sops://` source nor the terse `key` + `[secret.defaults]` is honored
+        // from an untrusted project: the whole section — defaults included — is dropped, so it can
+        // neither inject a credential nor redirect a secret's source.
+        for state in [TrustState::Untrusted, TrustState::Changed] {
+            let mut hosts = BTreeMap::new();
+            hosts.insert(
+                "api.github.com".to_string(),
+                RawHostSecrets::One(RawHostSecret {
+                    kind: None,
+                    key: None,
+                    from: Some(SecretFrom::One("sops://prod.yaml#tok".into())),
+                    header: Some("Authorization".into()),
+                    value_type: Some("bearer".into()),
+                    prefix: None,
+                }),
+            );
+            hosts.insert(
+                "api.openai.com".to_string(),
+                RawHostSecrets::One(terse("openai_key")),
+            );
+            let proj = RawConfig {
+                secret: Some(RawSecretSection {
+                    defaults: Some(raw_defaults(
+                        &["env", "sops"],
+                        Some("prod.yaml"),
+                        None,
+                        None,
+                    )),
+                    hosts,
+                }),
+                ..RawConfig::default()
+            };
+            let global = RawConfig {
+                network: allowlist_net(&["api.github.com", "api.openai.com"]),
+                ..RawConfig::default()
+            };
+            let r = resolve_no_plugins(global, Some((proj, state)));
+            assert!(
+                r.secrets.is_empty(),
+                "an untrusted project may not inject or redirect"
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.contains("ignoring 2 secret(s)")),
+                "{:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn two_headers_to_one_host_both_survive() {
+        // the array form (`[[secret."host"]]`) keeps several credentials for one host: a different
+        // header is not a duplicate, so both are kept
+        let r = resolve_no_plugins(
+            raw_secrets(
+                &["api.github.com"],
+                vec![
+                    raw_secret(
+                        Some("A"),
+                        None,
+                        "api.github.com",
+                        "Authorization",
+                        Some("bearer"),
+                        None,
+                    ),
+                    raw_secret(
+                        Some("B"),
+                        None,
+                        "api.github.com",
+                        "X-Api-Key",
+                        Some("raw"),
+                        None,
+                    ),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            r.secrets.len(),
+            2,
+            "different headers to one host both survive"
+        );
+    }
+
+    // --- default `header` / `type` in `[secret.defaults]` -------------------------------------
+
+    /// `[secret.defaults]` with a default header + type, plus the given resolver order/sops file.
+    fn defaults_with_shape(order: &[&str], sops_file: Option<&str>) -> RawSecretDefaults {
+        let mut d = raw_defaults(order, sops_file, None, None);
+        d.header = Some("Authorization".into());
+        d.value_type = Some("bearer".into());
+        d
+    }
+
+    #[test]
+    fn a_terse_entry_inherits_the_default_header_and_type() {
+        let d = SecretDefaults::from_raw(&defaults_with_shape(&["sops"], Some("prod.yaml")));
+        let s = vhs("api.github.com", terse_bare("gh_token"), &d).unwrap();
+        assert_eq!(s.header, "Authorization");
+        assert_eq!(s.shape.format("abc"), "Bearer abc");
+        assert_eq!(
+            s.sources,
+            vec![SecretSource::Sops {
+                file: "prod.yaml".into(),
+                key: Some("gh_token".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_per_secret_header_and_type_override_the_defaults() {
+        let d = SecretDefaults::from_raw(&defaults_with_shape(&["sops"], Some("prod.yaml")));
+        let mut secret = terse_bare("k");
+        secret.header = Some("X-Api-Key".into());
+        secret.value_type = Some("raw".into());
+        let s = vhs("h.test", secret, &d).unwrap();
+        assert_eq!(
+            s.header, "X-Api-Key",
+            "the entry's header wins over the default"
+        );
+        assert_eq!(s.shape.format("abc"), "abc", "the entry's raw type wins");
+    }
+
+    #[test]
+    fn neither_a_secret_nor_a_default_header_is_an_error() {
+        // no `header` on the entry and none in the defaults — the same explicit error as before,
+        // never a silent built-in default
+        let d = SecretDefaults::from_raw(&raw_defaults(&["sops"], Some("p.yaml"), None, None));
+        let err = vhs("h.test", terse_bare("k"), &d).unwrap_err();
+        assert!(err.contains("set `header`"), "{err}");
+    }
+
+    #[test]
+    fn neither_a_secret_nor_a_default_type_is_an_error() {
+        // header is supplied by the defaults but type is set nowhere — still an explicit error
+        let mut raw = raw_defaults(&["sops"], Some("p.yaml"), None, None);
+        raw.header = Some("Authorization".into());
+        let d = SecretDefaults::from_raw(&raw);
+        let err = vhs("h.test", terse_bare("k"), &d).unwrap_err();
+        assert!(err.contains("missing `type`"), "{err}");
+    }
+
+    #[test]
+    fn a_default_header_collapses_array_entries_that_omit_it() {
+        // the sharp edge: two `[[secret."host"]]` entries that both inherit the default header
+        // collapse on `(host, header)` to the last one (with a warning) — fail-closed, never two
+        // silent header copies upstream
+        let mut hosts = BTreeMap::new();
+        hosts.insert(
+            "api.github.com".to_string(),
+            RawHostSecrets::Many(vec![terse_bare("a"), terse_bare("b")]),
+        );
+        let global = RawConfig {
+            network: allowlist_net(&["api.github.com"]),
+            secret: Some(RawSecretSection {
+                defaults: Some(defaults_with_shape(&["sops"], Some("prod.yaml"))),
+                hosts,
+            }),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(
+            r.secrets.len(),
+            1,
+            "entries that both inherit the default header collapse to one"
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("overrides")));
+        assert_eq!(
+            r.secrets[0].sources,
+            vec![SecretSource::Sops {
+                file: "prod.yaml".into(),
+                key: Some("b".into()),
+            }],
+            "last wins"
+        );
+    }
+
+    #[test]
+    fn a_global_default_header_and_type_reach_a_project_through_merge() {
+        // global sets the default header/type; a trusted project that declares its OWN
+        // `[secret.defaults]` (so `merged_with` runs) but omits header/type inherits them, while a
+        // per-entry header still wins after the merge — pins both merged_with header/type lines.
+        let global = RawConfig {
+            network: allowlist_net(&["a.test", "b.test"]),
+            secret: Some(RawSecretSection {
+                defaults: Some(defaults_with_shape(&["sops"], Some("prod.yaml"))),
+                hosts: BTreeMap::new(),
+            }),
+            ..RawConfig::default()
+        };
+        let mut hosts = BTreeMap::new();
+        // inherits the global default header *and* type through the merge
+        hosts.insert("a.test".to_string(), RawHostSecrets::One(terse_bare("ka")));
+        // overrides the header per-entry, after the merge
+        let mut overriding = terse_bare("kb");
+        overriding.header = Some("X-Api-Key".into());
+        hosts.insert("b.test".to_string(), RawHostSecrets::One(overriding));
+        let proj = RawConfig {
+            // the project's own defaults set only the order, so header/type come from the global
+            secret: Some(RawSecretSection {
+                defaults: Some(raw_defaults(&["sops"], Some("prod.yaml"), None, None)),
+                hosts,
+            }),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, Some((proj, TrustState::Trusted)));
+        assert_eq!(r.secrets.len(), 2);
+        let a = r
+            .secrets
+            .iter()
+            .find(|s| s.header == "Authorization")
+            .expect("a.test inherits the global default header through the merge");
+        assert_eq!(
+            a.shape.format("x"),
+            "Bearer x",
+            "and the global default type"
+        );
+        assert!(
+            r.secrets.iter().any(|s| s.header == "X-Api-Key"),
+            "a per-entry header still wins after the merge"
+        );
+    }
+
     #[test]
     fn a_trusted_project_header_secret_is_honored() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
                 raw_secrets(
@@ -1745,7 +2907,7 @@ mod tests {
         );
         assert_eq!(r.secrets.len(), 1);
         let s = &r.secrets[0];
-        assert_eq!(s.source, SecretSource::Env("GH_TOKEN".into()));
+        assert_eq!(s.sources, vec![SecretSource::Env("GH_TOKEN".into())]);
         assert_eq!(s.header, "Authorization");
         assert_eq!(s.to, crate::allowlist::classify("api.github.com").unwrap());
         assert_eq!(s.shape.format("abc"), "Bearer abc");
@@ -1754,7 +2916,7 @@ mod tests {
 
     #[test]
     fn a_global_secret_is_honored_by_location() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_secrets(
                 &["api.github.com"],
                 vec![raw_secret(
@@ -1775,7 +2937,7 @@ mod tests {
     #[test]
     fn an_untrusted_project_secret_is_dropped_with_a_warning() {
         for state in [TrustState::Untrusted, TrustState::Changed] {
-            let r = resolve(
+            let r = resolve_no_plugins(
                 RawConfig::default(),
                 Some((
                     raw_secrets(
@@ -1804,16 +2966,16 @@ mod tests {
     fn a_secret_without_an_allowlist_is_dropped_with_a_warning() {
         // a secret declared while the network stays shared (no filtering proxy) has
         // nowhere to inject; it is cleared with a warning, never a silent no-op.
-        let r = resolve(
+        let r = resolve_no_plugins(
             RawConfig {
-                secret: vec![raw_secret(
+                secret: Some(raw_secret_section(vec![raw_secret(
                     Some("GH"),
                     None,
                     "api.github.com",
                     "Authorization",
                     Some("bearer"),
                     None,
-                )],
+                )])),
                 ..RawConfig::default()
             },
             None,
@@ -1829,7 +2991,7 @@ mod tests {
     #[test]
     fn a_wildcard_or_regex_secret_target_is_rejected() {
         for to in ["*.github.com", "re:^https://api\\.github\\.com/"] {
-            let r = resolve(
+            let r = resolve_no_plugins(
                 raw_secrets(
                     &["api.github.com"],
                     vec![raw_secret(
@@ -1850,7 +3012,7 @@ mod tests {
 
     #[test]
     fn a_missing_or_unknown_secret_type_is_rejected() {
-        let missing = resolve(
+        let missing = resolve_no_plugins(
             raw_secrets(
                 &["api.github.com"],
                 vec![raw_secret(
@@ -1870,7 +3032,7 @@ mod tests {
             .iter()
             .any(|w| w.contains("missing `type`")));
 
-        let unknown = resolve(
+        let unknown = resolve_no_plugins(
             raw_secrets(
                 &["api.github.com"],
                 vec![raw_secret(
@@ -1892,38 +3054,21 @@ mod tests {
     }
 
     #[test]
-    fn both_or_neither_secret_source_is_rejected() {
-        let both = resolve(
-            raw_secrets(
-                &["h.test"],
-                vec![raw_secret(
-                    Some("A"),
-                    Some("/f"),
-                    "h.test",
-                    "H",
-                    Some("raw"),
-                    None,
-                )],
-            ),
-            None,
-        );
-        assert!(both.secrets.is_empty());
-        assert!(both.warnings.iter().any(|w| w.contains("exactly one")));
-
-        let neither = resolve(
+    fn a_secret_with_no_source_is_dropped_with_a_warning() {
+        let r = resolve_no_plugins(
             raw_secrets(
                 &["h.test"],
                 vec![raw_secret(None, None, "h.test", "H", Some("raw"), None)],
             ),
             None,
         );
-        assert!(neither.secrets.is_empty());
-        assert!(neither.warnings.iter().any(|w| w.contains("exactly one")));
+        assert!(r.secrets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("needs a source")));
     }
 
     #[test]
     fn a_duplicate_target_header_secret_is_last_wins_with_a_warning() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_secrets(
                 &["h.test"],
                 vec![
@@ -1954,8 +3099,8 @@ mod tests {
             "a duplicate (host, header) collapses to one"
         );
         assert_eq!(
-            r.secrets[0].source,
-            SecretSource::Env("SECOND".into()),
+            r.secrets[0].sources,
+            vec![SecretSource::Env("SECOND".into())],
             "last wins"
         );
         assert!(r.warnings.iter().any(|w| w.contains("overrides")));
@@ -1963,7 +3108,7 @@ mod tests {
 
     #[test]
     fn a_non_absolute_from_file_is_rejected() {
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_secrets(
                 &["h.test"],
                 vec![raw_secret(
@@ -1984,12 +3129,12 @@ mod tests {
     #[test]
     fn an_unknown_secret_kind_and_a_bad_header_name_are_rejected() {
         let mut bad_kind = raw_secret(Some("X"), None, "h.test", "H", Some("raw"), None);
-        bad_kind.kind = "ssh-agent".into();
-        let r = resolve(raw_secrets(&["h.test"], vec![bad_kind]), None);
+        bad_kind.1.kind = Some("ssh-agent".into());
+        let r = resolve_no_plugins(raw_secrets(&["h.test"], vec![bad_kind]), None);
         assert!(r.secrets.is_empty());
         assert!(r.warnings.iter().any(|w| w.contains("unknown kind")));
 
-        let r = resolve(
+        let r = resolve_no_plugins(
             raw_secrets(
                 &["h.test"],
                 vec![raw_secret(
