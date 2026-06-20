@@ -145,33 +145,45 @@ but fenced:
 
 ## 6. Schema sketch
 
-A single typed `[[secret]]` table; transport (what can connect where) stays in
+A typed `[secret]` table **keyed by destination host** — the host is the section, so a
+credential's target reads at a glance; transport (what can connect where) stays in
 `[network]`, orthogonal and composable.
 
 ```toml
-# broker tier — structural, secret never in the cage
-[[secret]]
-from   = "sops://secrets.enc.yaml#github.token"   # resolver (SOURCE)
+# broker tier — structural, secret never in the cage; the destination host is the table key
+[secret."api.github.com"]
+from   = "sops://secrets.enc.yaml#github.token"   # resolver (SOURCE); one ref or a fallback chain
 kind   = "http-header"                             # broker (SINK), first-party
-to     = "api.github.com/repos/*"                  # concrete host + optional path, via allowlist::Rule
 header = "Authorization"
-type   = "bearer"                                  # bearer | basic | raw
+type   = "bearer"                                  # bearer | basic | raw (+ optional `prefix`)
 
-# ssh — key brokered by ssh-agent, transport via the tunnel lane
-[[secret]]
-kind = "ssh-agent"
-to   = "git.example.com:22"
+# several credentials to one host — an array of tables for that key
+[[secret."registry.example.com"]]
+from   = "env://CI_TOKEN"
+header = "Authorization"
+type   = "bearer"
+
+# shared defaults — the resolver order a terse `key` expands through, plus default header/type
+[secret.defaults]
+order  = ["env", "sops"]                          # try env first, then sops
+header = "Authorization"
+type   = "bearer"
+[secret.defaults.sops]
+file = "secrets.enc.yaml"
+
+# a terse entry resolves `key` through `[secret.defaults] order` (omits the verbose `from`)
+[secret."api.npmjs.org"]
+key = "npm_token"                                  # = "npm_token@sops" to pin one resolver
 
 # transport (orthogonal to the secret)
 [network]
-mode   = "allowlist"
-allow  = ["api.github.com/repos/*"]   # MITM-filtered lane (host+path+regex, content-aware)
-tunnel = ["git.example.com:22"]       # blind TCP/SOCKS lane (host:port only), opt-in
+mode  = "allowlist"
+allow = ["api.github.com/repos/*"]   # MITM-filtered lane (host+path+regex, content-aware)
 ```
 
-`to` is classified with `allowlist::classify` and restricted to **concrete-host kinds**
-(`Ip`/`Host`/`Url` host+path, exact or `/*`); `*.domain` and `re:` are rejected for an
-injection target. Host-scoped by default, path on opt-in (git-credential's
+The host key is classified with `allowlist::classify` and restricted to **concrete-host
+kinds** (`Ip`/`Host`/`Url` host+path, exact or `/*`); `*.domain` and `re:` are rejected for
+an injection target. Host-scoped by default, path on opt-in (git-credential's
 `useHttpPath=false` model). One canonicalizer/matcher across allow / deny / inject.
 
 ### 6.1 6.3a schema locks (from the architecture review)
@@ -184,22 +196,23 @@ injection target. Host-scoped by default, path on opt-in (git-credential's
   Likewise, a `to` host absent from the `allow` list is denied *before* injection, so
   `ops config` surfaces it as a warning (a forgotten `allow` entry is not a silent "why
   is my auth missing").
-- **Table name:** ship the kind-tagged **`[[secret]]`** (forward-compatible across all
-  brokers), consciously chosen over the earlier `[[network.inject]]` working name — not
-  drifted into.
+- **Table shape:** ship the **host-keyed `[secret."host"]`** table (the destination host
+  is the section key; an array `[[secret."host"]]` carries several credentials to one host),
+  consciously chosen over the earlier `[[network.inject]]` and flat-`[[secret]]`-with-`to`
+  working names — not drifted into. The `kind` tag stays forward-compatible across brokers.
 - **`type = bearer | basic | raw` plus an optional `prefix`.** `bearer` =
   `Authorization: Bearer <secret>`; `basic` base64s a `user:pass`; `raw` = `<header>:
   <secret>` (no prefix). An optional `prefix` makes non-Bearer schemes expressible
   (`raw` + `prefix = "token "` → `Authorization: token <tok>`); `bearer` is just sugar
   for `raw` + `prefix = "Bearer "`.
-- **Basic input format:** `from_env`/`from_file` holds the `user:pass` pair; ops
-  base64-encodes it (the agent never pre-encodes).
-- **`from_file`:** an absolute host path, read **host-side** at launch; it is **never
-  bound into the cage** (only the resolved value reaches the broker, host-side).
+- **Basic input format:** the resolved `from` source (or terse `key`) holds the
+  `user:pass` pair; ops base64-encodes it (the agent never pre-encodes).
+- **`file://` source:** a host path, read **host-side** at launch; it is **never bound
+  into the cage** (only the resolved value reaches the broker, host-side).
 
 ## 7. Worked example — a SOPS token for an HTTPS API
 
-1. **Declare** (trusted project): the `[[secret]]` above.
+1. **Declare** (trusted project): the `[secret."api.github.com"]` above.
 2. **Launch (host-side, before the cage):** ops calls the SOPS resolver plugin
    (host-side subprocess) → it uses the host-side age/KMS key to decrypt
    `secrets.enc.yaml` and returns `github.token`'s plaintext over a pipe. ops
@@ -226,6 +239,14 @@ transparently proxy).
   have exec escapes (`git -c …`, `tar --to-command`, `find -exec`, `awk`, …), so the
   egress allowlist, not the command list, is the load-bearing barrier for that tier.
 - **Capability is fully usable in-session** — scope the secret tightly at the source.
+- **A `network = true` resolver gets unrestricted host egress.** A resolver plugin runs
+  **host-side** (outside the agent's cage), so a manifest that declares `network = true`
+  (to reach a Vault / KMS / 1Password engine) shares the host network and is **not** behind
+  the cage's Model-B egress allowlist. Accepted because resolvers are in the TCB
+  (first-party, or trust-installed and signed when from a store) and an engine resolver
+  needs real network to do its job; the lever is keeping the resolver *set* trusted and
+  scoping the secret at the source, not bounding the resolver's own egress. A
+  `network = false` resolver runs in an empty network namespace and has no such reach.
 
 ## 9. Positioning
 
@@ -238,22 +259,32 @@ primitive.
 
 ## 10. Roadmap
 
-Secret/broker bricks (each shipped + tested + advisor-reviewed + validated):
+Secret/broker bricks (each shipped + tested + advisor-reviewed + validated). Items 1–5
+are **DONE**; the host-keyed `[secret."host"]` schema and the resolver-plugin store below
+supersede the early `[[secret]]`/`from_env`/`from_file` sketch this doc opened with:
 
-1. **6.3a** — `kind = "http-header"`, built-in `from_env` / `from_file` resolvers, the
-   `[[secret]]` shape + the security deltas (strip-and-replace the header
+1. **6.3a — DONE** — `kind = "http-header"`, built-in `env://` / `file://` resolvers, the
+   host-keyed `[secret."host"]` shape + the security deltas (strip-and-replace the header
    case-insensitively over all spellings; scope host+path via `allowlist::Rule`; match
    the verified CONNECT host + the same canonical `Request` the verdict used;
    fail-closed on a missing/empty source; per-request re-match; secret hygiene —
    never logged, redacted in `Debug`). **The foundation; proves the wire-injection
    consumption model end-to-end.**
-2. **6.3b** — outbound secret redaction (block/refuse, a backstop).
-3. **+** — a `sops://` resolver (proves the SOURCE layer is distinct from the BROKER,
-   on the already-solid http-header broker).
-4. **+** — one engine resolver (Vault or 1Password) → proves the generic resolver
-   contract.
-5. **+** — generalise into the **plugin store** once the resolver contract is
-   battle-tested (default signed store + opt-in third-party).
+2. **6.3b — DONE** — outbound secret redaction (block/refuse) + response-side redaction
+   (6.3d), the exfil/reflection backstops.
+3. **`sops://` resolver — DONE** — proves the SOURCE layer is distinct from the BROKER,
+   on the already-solid http-header broker. Alongside it: the terse `key` form expanded
+   through `[secret.defaults] order` (a per-resolver-bound resolver chain with fallback).
+4. **Resolver-plugin contract — DONE** — instead of baking one engine (Vault/1Password)
+   in-tree, ops ships a **typed resolver-plugin registry**: a plugin declares a `scheme`,
+   ops runs it host-side under bwrap, and a `scheme://locator` `from` ref routes to it.
+   This generalises the resolver contract without an in-tree engine dependency.
+5. **Plugin store — DONE** — the resolver contract generalised into a **remote signed
+   store**: `ops plugins store add/update/info/list/rm` (git-fetched catalogue,
+   Ed25519-verified, anti-rollback, trust-on-first-use), `install <store> <plugin>`
+   (per-entry `dir_digest` pin), and `store publish` (the signer that produces a signed
+   store). The default-store *registration* (an embedded pubkey for a hosted default
+   store) is deferred to an operational step (needs a hosting URL + a long-term key).
 
 Transport / broker bricks, in parallel:
 

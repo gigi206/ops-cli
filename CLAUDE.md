@@ -655,15 +655,15 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   *skipped*).
   **6.3a — http-header credential injection (DONE)** (`schema.rs` + `config/mod.rs` + `allowlist.rs`
   + `proxy.rs` + `egress.rs` + `main.rs`; full design `docs/bwrap-secrets-architecture.md`): a
-  `[[secret]]` array (`kind="http-header"`, `from_env` XOR `from_file`, `to`, `header`,
+  host-keyed `[secret."host"]` table (`kind="http-header"`, a `from` source, `header`,
   `type=bearer|basic|raw`, optional `prefix`) injects a host-scoped credential into an allowed
   request **host-side, after the verdict** — the plaintext is read in `egress::start` and **never
-  enters the cage**, the injection fires only for the concrete `to` host (and path), and
-  **strip-and-replace**s any client-supplied copy so ops's value is the only one upstream. A security
-  field, gated trusted/global; `to` restricted to a concrete Ip/Host/Url (reject `*.`/`re:`);
-  **CR/LF/NUL rejected** naming the source not the value; only under `mode="allowlist"`. **Residual:**
-  an injection-target host that *reflects* the header returns it into the cage — bounding egress to
-  the one `to` host is the real control, the two tripwires below the backstops. Proven live + a
+  enters the cage**, the injection fires only for the concrete destination host (the table key, and
+  path), and **strip-and-replace**s any client-supplied copy so ops's value is the only one upstream.
+  A security field, gated trusted/global; the host key is restricted to a concrete Ip/Host/Url (reject
+  `*.`/`re:`); **CR/LF/NUL rejected** naming the source not the value; only under `mode="allowlist"`.
+  **Residual:** an injection-target host that *reflects* the header returns it into the cage — bounding
+  egress to the one destination host is the real control, the two tripwires below the backstops. Proven live + a
   committed no-leak e2e (`a_secret_is_resolved_host_side_and_never_enters_the_cage`).
   **6.3b — outbound secret redaction (the exfil tripwire, DONE)** (`config/mod.rs`
   `HeaderShape::needles` + `proxy.rs` `SecretNeedle`/`carries_secret`): the proxy scans each decrypted
@@ -692,6 +692,48 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   plan AND impl (the response-side scoping is its load-bearing fix). **Next:** the secret **resolvers**
   (`sops://`) — the SOURCE layer, distinct from the broker; least-privilege/scoping at the source is
   the real lever against a reflecting host.
+  **6.3 secret resolvers + resolver-plugin store (DONE)** (`src/config/` + `src/plugins.rs` +
+  `src/stores.rs` + `src/plugin_store.rs` + `src/main.rs`; full design
+  `docs/bwrap-secrets-architecture.md`): the SOURCE layer that 6.3a/6.3b left open, shipped as a
+  resolver engine, a typed plugin registry, and a remote signed store — all under the graved
+  invariant *ops never places a plaintext secret in the cage* (every resolution is **host-side**,
+  before the cage). **The schema settled on the host-keyed form** `[secret."host"]` (an array
+  `[[secret."host"]]` for several credentials to one host) with a shared `[secret.defaults]`
+  (resolver `order` + per-resolver bindings + default `header`/`type`) — superseding the early
+  `[[secret]]`/`from_env`/`from_file` sketch. A secret's source is either a verbose `from`
+  (one `scheme://locator` ref or a fallback chain) or a terse `key` expanded through the default
+  resolver order, optionally pinned `key@resolver`. **(a) Resolver engine** — `from` refs route
+  through built-in `env://` and `file://` resolvers (read host-side, the value never bound into the
+  cage) with a first-wins fallback chain; **the `sops://` built-in** (`sops://<file>[#<key>]`)
+  proves the SOURCE layer is distinct from the http-header BROKER. **(b) Resolver-plugin registry**
+  (`src/plugins.rs`) — a plugin declares a `scheme` in a `plugin.toml`; ops discovers + validates it
+  and **runs it host-side under bwrap** (the resolver is in the TCB but still sandboxed), so a
+  `scheme://locator` `from` ref routes to a third-party resolver without an in-tree engine
+  dependency; `ops plugins list|info`, local `ops plugins install <dir>` / `rm <name>`, and an
+  **embedded default store**. **(c) Remote signed store** (`src/stores.rs` + `src/plugin_store.rs`,
+  the *3d* track) — `ops plugins store add/update/info/list/rm` fetches a git catalogue, verifies it
+  with **Ed25519** (`ring`), enforces **anti-rollback** (a monotonic `rev`), caches it, and supports
+  **trust-on-first-use** (`store add --trust` pins the key on first sight); `store install <store>
+  <plugin>` pins each entry by a frozen **`dir_digest`** (`plugin_store::dir_digest`, the one
+  wire-format) and re-verifies it through `verify_entry`; and **`store publish`** is the signer that
+  *produces* a signed store — it walks a `plugins/` tree, pins each plugin by `dir_digest`, builds +
+  signs a `catalogue.toml`, and writes the four store-root artifacts (the producing counterpart of
+  the consuming `add`). The **signer reuses the one `dir_digest`** so signer and verifier cannot
+  drift past both green suites; a committed clone e2e reads the published artifacts back through the
+  full consumer chain. **Two pieces deferred to an operational step** (need a hosting URL + a
+  long-term signing key, confirmed deferred 2026-06-20): the **default-store registration** (an
+  embedded pubkey so the default store verifies against a baked key, never TOFU) and its routing
+  guard. Honest residuals: (1) a resolver runs **host-side**, so a plugin manifest with
+  `network = true` (to reach a Vault/KMS/1Password engine) shares the host network and is **not**
+  behind the cage's egress allowlist — accepted because resolvers are in the TCB and an engine
+  resolver needs real network; the lever is the trusted resolver set + scoping the secret at the
+  source (a `network = false` resolver runs in an empty netns); (2) `publish` digests the
+  **working tree**, so an untracked/gitignored file git won't deliver would make a later install
+  mismatch — "commit exactly what you publish"; a `git ls-files`-scoped digest is the future
+  hardening. Memory: [[secrets-architecture]]. Each sub-increment shipped green + advisor-reviewed
+  (plan AND impl) + user-validated per the cadence; **474 tests green** (418 in-crate + 32 config +
+  7 run.rs + 17 across the other suites), fmt/clippy clean. The shipping static musl binary links
+  with the new C/asm deps via `mise exec -- cargo zigbuild` (zig cc); see `mise.toml`.
   **M3.3d.2a** (`src/trust.rs::MISE_CONFIG_NAMES`): the trust-hashed (and
   later-authorized) mise file set now covers mise's full *same-directory* discovery
   — `mise.local.toml`, `.mise.toml`, `mise.toml`, `.tool-versions` — up from the two
