@@ -59,7 +59,7 @@ fn main() -> ExitCode {
         None => {
             eprintln!(
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
-                 app <name> | search <query> | test net <url> | \
+                 app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
                  plugins <list|info|install|rm|store> | \
                  ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise]>"
             );
@@ -609,24 +609,261 @@ fn config_cmd() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the global
+/// or project config, or an imported `<name>.toml` profile) inside the project sandbox. The
+/// management verbs `import`/`export`/`rm`/`list` are reserved (and so can never be an app name),
+/// so the first token disambiguates a subcommand from an app to launch with no overlap.
+fn app_cmd(args: Vec<OsString>) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("import") => app_import(&args[1..]),
+        Some("export") => app_export(),
+        Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
+        Some("list") => app_list(),
+        // Otherwise the first non-flag token names an app to launch.
+        _ => {
+            let name = args
+                .iter()
+                .filter_map(|a| a.to_str())
+                .find(|a| !a.starts_with('-'));
+            let Some(name) = name else {
+                eprintln!(
+                    "ops: usage: ops app <name> | ops app <import <file> [--as <name>] [--force] \
+                     | export | rm <name> | list>"
+                );
+                return ExitCode::from(2);
+            };
+            sandbox::app(name)
+        }
+    }
+}
+
+/// `ops app import <file> [--as <name>] [--force]`: validate a portable app profile and place it
+/// under the imported-profiles directory, where it is trusted by location (honored even on an
+/// untrusted project). The deliberate command IS the consent — an agent in the cage cannot run it,
+/// and the profile stays inert until `ops app <name>` launches it — so there is no interactive
+/// prompt, but the granted posture is printed so the act is informed. The bytes are copied
+/// verbatim (comments and formatting preserved); the name comes from `--as` or the source file
+/// stem, never the file's contents, so the profile is name-agnostic and re-namable for free.
+fn app_import(args: &[OsString]) -> ExitCode {
+    let mut source: Option<&OsString> = None;
+    let mut as_name: Option<String> = None;
+    let mut force = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--as") => match it.next().and_then(|a| a.to_str()) {
+                Some(n) => as_name = Some(n.to_string()),
+                None => {
+                    eprintln!("ops: --as needs a name");
+                    return ExitCode::from(2);
+                }
+            },
+            Some("--force") => force = true,
+            Some(flag) if flag.starts_with("--") => {
+                eprintln!("ops: unknown flag '{flag}' (usage: ops app import <file> [--as <name>] [--force])");
+                return ExitCode::from(2);
+            }
+            _ if source.is_none() => source = Some(arg),
+            _ => {
+                eprintln!("ops: ops app import takes a single file");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(source) = source else {
+        eprintln!("ops: usage: ops app import <file> [--as <name>] [--force]");
+        return ExitCode::from(2);
+    };
+    let src_path = Path::new(source);
+
+    // The app name: `--as`, else the source file stem. It keys an on-disk file, so it is validated
+    // (charset/length) and refused if it is a reserved subcommand verb — fail-closed.
+    let name = match as_name {
+        Some(n) => n,
+        None => match src_path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                eprintln!(
+                    "ops: cannot derive a name from {} — pass --as <name>",
+                    src_path.display()
+                );
+                return ExitCode::from(2);
+            }
+        },
+    };
+    if config::is_reserved_app_verb(&name) || !config::is_valid_app_name(&name) {
+        eprintln!(
+            "ops: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`, and not \
+             a reserved subcommand)"
+        );
+        return ExitCode::from(2);
+    }
+
+    let Some(dir) = config::profiles_dir() else {
+        eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return ExitCode::FAILURE;
+    };
+
+    // Read the source through the same safety gate every config file passes (owner-owned,
+    // non-world-writable, regular file), then validate it is a real profile before writing.
+    let bytes = match config::safety::read_safe_bytes(src_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("ops: cannot read {}: {e}", src_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let preview = match config::validate_profile(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "ops: {} is not a valid app profile: {e}",
+                src_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let dest = dir.join(format!("{name}.toml"));
+    if dest.exists() && !force {
+        eprintln!(
+            "ops: a profile '{name}' already exists at {} (use --force to overwrite)",
+            dest.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = write_profile_file(&dir, &dest, &bytes) {
+        eprintln!("ops: cannot write {}: {e}", dest.display());
+        return ExitCode::FAILURE;
+    }
+
+    println!("imported app profile '{name}' -> {}", dest.display());
+    println!("  granted posture (trusted by location — honored even on an untrusted project):");
+    for line in &preview.summary {
+        println!("    {line}");
+    }
+    println!("  launch it with: ops app {name}");
+    ExitCode::SUCCESS
+}
+
+/// Write a profile's bytes to `dest`, owner-only, creating the profiles directory owner-only if
+/// it is missing. The bytes go to a sibling temp file (owner-only from creation, so a later read
+/// passes the safety gate) and are then renamed into place — atomic, like every other on-disk
+/// placement ops makes: a failed or interrupted write never leaves a partial profile at the real
+/// name, and a `--force` overwrite keeps the previous profile until the new one is fully written.
+fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let tmp = dir.join(format!(".import-{}.tmp", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    if let Err(e) = f.write_all(bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `ops app export <name>`: write a profile out as a portable artifact. Deferred to the next
+/// increment (serializing a `RawApp` cleanly back to TOML needs a round-trip spike first); the
+/// verb is reserved now so adding it later never collides with an app name.
+fn app_export() -> ExitCode {
+    eprintln!("ops: `ops app export` is not available yet — it lands in the next increment");
+    ExitCode::from(2)
+}
+
+/// `ops app rm <name>`: remove an imported profile. Only an imported profile (a file in the
+/// profiles directory) is removed here — an inline `[app.<name>]` lives in `ops.toml` and is the
+/// user's to edit there. The name is validated before it is joined to a path (anti-traversal).
+fn app_rm(name: Option<&str>) -> ExitCode {
+    let Some(name) = name else {
+        eprintln!("ops: usage: ops app rm <name>");
+        return ExitCode::from(2);
+    };
+    if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+        eprintln!("ops: '{name}' is not a valid app name");
+        return ExitCode::from(2);
+    }
+    let Some(dir) = config::profiles_dir() else {
+        eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let path = dir.join(format!("{name}.toml"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("removed app profile '{name}'");
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "ops: no imported profile '{name}' (an inline [app.{name}] lives in ops.toml — \
+                 edit it there)"
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("ops: cannot remove {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops app list`: the imported profiles (the artifacts `import`/`rm` manage), by name. The full
+/// resolved app set — inline, project, and profile apps together with their gating — is `ops
+/// config`; this is the focused view of what is on disk to manage.
+fn app_list() -> ExitCode {
+    let Some(dir) = config::profiles_dir() else {
+        eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let mut names: Vec<String> = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("toml") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("ops: cannot read {}: {e}", dir.display());
+            return ExitCode::FAILURE;
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        println!("no imported app profiles (import one with: ops app import <file>)");
+    } else {
+        println!("imported app profiles (in {}):", dir.display());
+        for n in &names {
+            println!("  {n}");
+        }
+        println!("(remove one with: ops app rm <name>; see all resolved apps with: ops config)");
+    }
+    ExitCode::SUCCESS
+}
+
 /// `ops search <query>`: discover the `nix:` tools (and `[packages]` attributes) a
 /// project can declare, by querying nixhub. Host-side and read-only — it resolves
 /// nothing into the sandbox and needs no trust gate (a discovery front-end, like a plain
 /// `nix search`). It needs nix only to ride its fetcher for the one network step.
-/// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the
-/// global or project config) inside the project sandbox.
-fn app_cmd(args: Vec<OsString>) -> ExitCode {
-    let name = args
-        .iter()
-        .filter_map(|a| a.to_str())
-        .find(|a| !a.starts_with('-'));
-    let Some(name) = name else {
-        eprintln!("ops: usage: ops app <name>");
-        return ExitCode::from(2);
-    };
-    sandbox::app(name)
-}
-
 fn search_cmd(args: Vec<OsString>) -> ExitCode {
     // The query is the first non-flag argument; any further words are ignored (nixhub
     // matches a single token, so a multi-word search is pointless — quote a phrase to

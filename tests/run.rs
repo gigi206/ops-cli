@@ -279,6 +279,60 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
 }
 
 #[test]
+fn an_imported_profile_launches_trusted_by_location() {
+    let project = TmpDir::new("import-proj");
+    let data = TmpDir::new("import-data");
+    let config = TmpDir::new("import-config");
+    // A portable profile authored as a standalone file: it prints a free env var, so a successful
+    // launch proves the profile was loaded (from the config dir, trusted by location) and run.
+    std::fs::write(
+        project.path().join("greet.toml"),
+        b"cmd = [\"printenv\", \"PROFILEVAR\"]\n[env]\nPROFILEVAR = \"from-profile\"\n",
+    )
+    .unwrap();
+
+    // capability probe via `ops run -- true`; skip (not fail) if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping imported-profile e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // Import the profile — the deliberate consent act; it lands under the config dir.
+    let imp = ops()
+        .args(["app", "import", "greet.toml"])
+        .current_dir(project.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn ops app import");
+    assert!(
+        imp.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    // Launch it by name: the profile's command runs in the cage and its free env reaches it —
+    // proving the imported profile was discovered and launched end to end.
+    let greet = ops()
+        .args(["app", "greet"])
+        .current_dir(project.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn ops app");
+    assert!(
+        String::from_utf8_lossy(&greet.stdout).contains("from-profile"),
+        "the imported profile did not launch with its env: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&greet.stdout),
+        String::from_utf8_lossy(&greet.stderr)
+    );
+}
+
+#[test]
 fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
     let project = TmpDir::new("mise-proj");
     let data = TmpDir::new("mise-data");

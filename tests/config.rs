@@ -85,6 +85,15 @@ impl Fixture {
         std::fs::write(self.proj.path().join(".mise.toml"), body).unwrap();
     }
 
+    /// Drop an imported app profile under the profiles directory
+    /// (`<config>/ops/apps/<name>.toml`) — the artifact `ops app import` produces, trusted by
+    /// location beside the global config.
+    fn write_profile(&self, name: &str, body: &str) {
+        let dir = self.config_home.path().join("ops").join("apps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
     /// Stage a resolver plugin under the data dir (`<data>/plugins/<name>/plugin.toml`), the
     /// trusted-by-location registry `ops config` and the launcher read.
     fn write_plugin(&self, name: &str, manifest: &str) {
@@ -1294,4 +1303,165 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
         !stdout.contains("note:"),
         "a trusted app must not drop its bind:\n{stdout}"
     );
+}
+
+#[test]
+fn an_imported_profile_is_a_trusted_by_location_app() {
+    let fx = Fixture::new();
+    // A profile dropped beside the global config is honored in full — its security `network`
+    // field included — even with no project trust, exactly like a global `[app.<name>]`.
+    fx.write_profile(
+        "claude",
+        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n",
+    );
+    let out = fx.run(&["config"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("claude: claude"),
+        "the imported profile must resolve as an app:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("network: allowlist"),
+        "a profile's security field must be honored (trusted by location):\n{stdout}"
+    );
+}
+
+#[test]
+fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project() {
+    let fx = Fixture::new();
+    // The flagship case: an imported profile (trusted by location) runs *on* untrusted code without
+    // the repo hijacking it. The profile sets the command and a network allowlist.
+    fx.write_profile(
+        "claude",
+        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n",
+    );
+    // An untrusted project tries to override the very same app's command and widen its network.
+    fx.write_project("[app.claude]\ncmd = [\"evil\"]\nnetwork = \"shared\"\n");
+
+    let out = fx.run(&["config"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The profile's command stands; the untrusted override is refused.
+    assert!(
+        stdout.contains("claude: claude"),
+        "the profile command must stand:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("claude: evil"),
+        "the untrusted command must not win:\n{stdout}"
+    );
+    // The profile's network posture stands (the untrusted `shared` is dropped), and the refusals
+    // are explained on the app.
+    assert!(
+        stdout.contains("network: allowlist"),
+        "the profile network must stand:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("note:") && stdout.to_lowercase().contains("cmd"),
+        "the refused command override must be noted:\n{stdout}"
+    );
+}
+
+#[test]
+fn ops_app_import_places_validates_renames_and_removes_a_profile() {
+    let fx = Fixture::new();
+    // A portable profile authored as a standalone file (the app's fields at the top level).
+    std::fs::write(
+        fx.proj.path().join("claude.toml"),
+        "cmd = \"claude\"\n\
+         [network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n\
+         [secret.\"api.anthropic.com\"]\nfrom = \"env://ANTHROPIC_API_KEY\"\n\
+         header = \"x-api-key\"\ntype = \"raw\"\n",
+    )
+    .unwrap();
+
+    // Import names it by the file stem, validates it, prints the granted posture, and places it.
+    let imp = fx.run(&["app", "import", "claude.toml"]);
+    assert!(
+        imp.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+    let out = String::from_utf8_lossy(&imp.stdout);
+    assert!(out.contains("imported app profile 'claude'"), "{out}");
+    assert!(out.contains("granted posture"), "{out}");
+    assert!(out.contains("command: claude"), "{out}");
+    // The secret is shown by destination + source locator, never a value.
+    assert!(
+        out.contains("api.anthropic.com") && out.contains("env://ANTHROPIC_API_KEY"),
+        "{out}"
+    );
+
+    // It now resolves as a trusted-by-location app.
+    let cfg = String::from_utf8_lossy(&fx.run(&["config"]).stdout).to_string();
+    assert!(cfg.contains("claude: claude"), "{cfg}");
+
+    // A second import without --force refuses to clobber.
+    let again = fx.run(&["app", "import", "claude.toml"]);
+    assert!(
+        !again.status.success(),
+        "a second import must refuse without --force"
+    );
+    assert!(String::from_utf8_lossy(&again.stderr).contains("--force"));
+
+    // `--as` re-keys to a different name (the contents are name-agnostic), and `list` shows both.
+    let renamed = fx.run(&["app", "import", "claude.toml", "--as", "agent"]);
+    assert!(renamed.status.success());
+    let listed = String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).to_string();
+    assert!(
+        listed.contains("agent") && listed.contains("claude"),
+        "{listed}"
+    );
+
+    // Remove an imported profile; the other remains.
+    let rm = fx.run(&["app", "rm", "claude"]);
+    assert!(
+        rm.status.success(),
+        "rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    let after = String::from_utf8_lossy(&fx.run(&["config"]).stdout).to_string();
+    assert!(
+        !after.contains("claude: claude"),
+        "removed app lingers:\n{after}"
+    );
+    assert!(
+        after.contains("agent: claude"),
+        "the other app must remain:\n{after}"
+    );
+}
+
+#[test]
+fn ops_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
+    let fx = Fixture::new();
+    // A file mistakenly wrapped in `[app.<name>]` has no top-level cmd → refused with a hint.
+    std::fs::write(
+        fx.proj.path().join("wrapped.toml"),
+        "[app.claude]\ncmd = \"claude\"\n",
+    )
+    .unwrap();
+    let wrapped = fx.run(&["app", "import", "wrapped.toml"]);
+    assert!(
+        !wrapped.status.success(),
+        "a wrapped profile must be refused"
+    );
+    assert!(String::from_utf8_lossy(&wrapped.stderr).contains("cmd"));
+
+    // A reserved subcommand verb cannot be an app name.
+    std::fs::write(fx.proj.path().join("ok.toml"), "cmd = \"x\"\n").unwrap();
+    let reserved = fx.run(&["app", "import", "ok.toml", "--as", "rm"]);
+    assert!(
+        !reserved.status.success(),
+        "a reserved name must be refused"
+    );
+    assert!(String::from_utf8_lossy(&reserved.stderr).contains("reserved"));
+}
+
+#[test]
+fn ops_app_rm_of_an_absent_profile_points_at_ops_toml() {
+    let fx = Fixture::new();
+    let out = fx.run(&["app", "rm", "nope"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ops.toml"));
 }

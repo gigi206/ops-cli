@@ -259,6 +259,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<RawConfig, String> {
     toml::from_str(text).map_err(|e| e.to_string())
 }
 
+/// Parse bytes as a single app profile — a top-level [`RawApp`]. A profile file *is* one app
+/// (its fields at the top level, no `[app.<name>]` wrapper), and its name comes from the file,
+/// not the contents — so the file is name-agnostic and portable. The error is a human-readable
+/// string, like [`parse`]. A file written in the inline `[app.<name>]` shape parses here as an
+/// empty `RawApp` (the wrapper is an unknown top-level field, ignored); the import path catches
+/// that by requiring a `cmd`, so the wrong shape is refused rather than silently mis-imported.
+pub(crate) fn parse_app(bytes: &[u8]) -> Result<RawApp, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
+    toml::from_str(text).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +340,42 @@ mod tests {
             cfg.app["build"].cmd.as_ref().map(|c| c.clone().into_argv()),
             Some(vec!["make".to_string(), "-j4".to_string()])
         );
+    }
+
+    #[test]
+    fn parses_a_top_level_app_profile() {
+        // A profile file is one app at the top level — its fields directly, no `[app.<name>]`
+        // wrapper. The name lives in the filename, so the contents are name-agnostic.
+        let app = parse_app(
+            br#"
+            cmd = "claude"
+            home_scope = "global"
+            [packages]
+            claude-code = "claude-code"
+            [network]
+            mode = "allowlist"
+            allow = ["api.anthropic.com"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            app.cmd.map(|c| c.into_argv()),
+            Some(vec!["claude".to_string()])
+        );
+        assert_eq!(app.home_scope.as_deref(), Some("global"));
+        assert_eq!(
+            app.packages.get("claude-code").map(String::as_str),
+            Some("claude-code")
+        );
+        assert!(matches!(app.network, Some(NetworkField::Table(_))));
+    }
+
+    #[test]
+    fn an_inline_wrapped_profile_parses_as_an_empty_app() {
+        // A file mistakenly written in the inline `[app.<name>]` shape has no top-level `cmd`,
+        // so it parses as an empty app — the tell-tale the import path refuses on.
+        let app = parse_app(b"[app.claude]\ncmd = \"claude\"\n").unwrap();
+        assert_eq!(app.cmd, None);
     }
 
     #[test]

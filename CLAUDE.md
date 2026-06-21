@@ -218,6 +218,50 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   ships **zero** apps — every profile is a separate, portable artifact authored independently and
   **imported** (a conscious trust act; may reuse the signed-store machinery). The ramp is now
   3) flagship `ops app claude` e2e, 4) **export/import of app profiles**, 5) the GUI/Wayland hole.
+  **`ops app` export/import — sub-slice 1: import (DONE)** (`src/config/schema.rs` +
+  `config/mod.rs` + `src/main.rs`): the portable-profile **import** half — an app profile is a
+  **standalone TOML file shaped as a top-level `RawApp`** (the app's fields directly, *no*
+  `[app.<name>]` wrapper), whose **filename is the app name** (chosen with the user over the inline
+  wrapper: `--as` becomes a trivial different-filename, the import path needs **zero serialization**
+  — a verbatim copy preserving comments — and a file is structurally one app). Profiles live under
+  **`<config>/ops/apps/<name>.toml`**, a sibling of `ops.toml`, **trusted by location** through the
+  same `safety` gate. (Note: an `apps` directory under the *config* root holds profiles, while one
+  under the *data* root holds each app's home — two distinct trees.) **Wiring** (`load`): the
+  profiles dir is read and its apps folded into `global_apps` **before** `resolve` —
+  `resolve_app`/`resolve_apps` are **unchanged**, so a profile gets the global layer's
+  trust-by-location, the per-field gating, the `cmd`/`home_scope` integrity gates, and the
+  project-overlay layering for free (the **flagship property holds for profiles**: a profile's
+  `cmd` and network survive an untrusted project's override attempt — directly tested). The read is
+  **infallible** like the rest of `load` (unsafe/unparseable/unsafely-named profile → warn+skip,
+  deterministic order); on a name collision an **inline `[app.<name>]` in `ops.toml` wins** with a
+  loud warning. The four `ops app` management verbs **`import`/`export`/`rm`/`list` are reserved** —
+  dispatched as subcommands **and** rejected as app names (`is_reserved_app_verb`, checked in
+  `resolve_apps` and at import), so an app named `import` can never shadow the subcommand
+  (advisor-caught dispatch hole, fixed at the source). **`ops app import <file> [--as <name>]
+  [--force]`**: safety-gate the source → parse as `RawApp` → **require a `cmd`** (a profile with no
+  command is unlaunchable, and an empty parse is the tell-tale of a wrongly-`[app.<name>]`-wrapped
+  file, refused with a hint) → validate the name (charset/length, not `.`/`..`, not a reserved verb
+  — anti-traversal, since the name keys an on-disk file) → write **owner-only, atomically**
+  (temp + rename, like every other on-disk placement; a `--force` overwrite keeps the old profile
+  until the new one lands). **The deliberate command IS the consent** (parity with `plugins install
+  <dir>` — an agent in the cage cannot run it, and the profile stays **inert until `ops app
+  <name>`**), so there is no interactive prompt, but the **granted posture is printed** (command,
+  home scope, packages, binds, network, and each credential by **destination + source locator** —
+  never a plaintext value, which a profile does not carry; a note flags secrets declared without an
+  allowlist, which would not inject). `ops app rm`/`list` manage imported profiles only (an inline
+  app lives in `ops.toml`, edited there). **`export` is a reserved stub** — deferred to sub-slice 2
+  with a `toml::to_string(&RawApp)` round-trip spike first (serializing `#[serde(flatten)]` +
+  untagged enums is a known-fragile `toml` corner; the import path deliberately needs none). **538
+  tests green** (7 unit: top-level + wrapped parse, reserved-verb-as-name, profile-keying,
+  absent-dir, inline-shadow, validate/summarize + 5 config integration: trusted-by-location,
+  the flagship untrusted-override, import/rename/rm, wrapped+reserved refusal, absent-rm + 1 run.rs
+  e2e: import→launch under the synthetic identity), fmt/clippy clean, **musl static build
+  verified**, advisor-reviewed (plan AND impl — it caught the dispatch hole pre-impl and, post-impl,
+  had me re-run the full suite on the atomic-write code, add the flagship untrusted-override test,
+  and flag the secret-without-allowlist over-claim, all folded in). **Honest scope:** this is the
+  **import** half; **export** (sub-slice 2) and the signed-store *distribution* of profiles (needs a
+  hosting URL + long-term key, like the default-store registration) are deferred. The ramp's item 4
+  is now: export (next), then signed distribution; items 3 (flagship `claude` e2e) and 5 (GUI) stand.
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

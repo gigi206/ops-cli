@@ -32,6 +32,24 @@ use std::path::{Path, PathBuf};
 const GLOBAL_CONFIG: &str = "ops.toml";
 /// The project config file name, in the project root.
 pub(crate) const PROJECT_CONFIG: &str = ".ops.toml";
+/// The directory of imported app profiles, beside the global config (`…/ops/apps/`). A profile
+/// is a standalone TOML file (a top-level [`schema::RawApp`]) whose *filename* is the app name;
+/// it is trusted by location, exactly like the global config, so its apps join the global app
+/// layer. (Note: under the *config* root this `apps` directory holds profiles, while under the
+/// *data* root an `apps` directory holds each app's persistent home — two distinct trees.)
+const PROFILES_DIR: &str = "apps";
+
+/// The subcommand verbs of `ops app` (`ops app import`, `… export`, `… rm`, `… list`). They are
+/// reserved so they can never also be an app name: otherwise `ops app import` would be ambiguous
+/// between the subcommand and launching an app literally named `import`, and such an app could be
+/// neither launched nor managed. Reserving them removes the ambiguity at the source — they are
+/// rejected as app names wherever one is resolved.
+pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list"];
+
+/// Whether `name` is a reserved `ops app` subcommand verb, and so may not be an app name.
+pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
+    RESERVED_APP_VERBS.contains(&name)
+}
 
 /// Environment keys an *untrusted or changed* project may not set. The point is
 /// not to contain the agent — in Mode B it already runs arbitrary code inside the
@@ -642,6 +660,12 @@ fn resolve_apps(
         .collect();
     let mut out = BTreeMap::new();
     for name in names {
+        if is_reserved_app_verb(&name) {
+            warnings.push(format!(
+                "ignoring app `{name}`: the name is a reserved `ops app` subcommand (rename it)"
+            ));
+            continue;
+        }
         if !is_valid_app_name(&name) {
             warnings.push(format!(
                 "ignoring app `{name}`: a name must be 1–64 of [A-Za-z0-9._-] and not `.`/`..` \
@@ -658,9 +682,11 @@ fn resolve_apps(
 }
 
 /// Whether an app name is safe to use as a single on-disk path component (it keys the app's
-/// persistent home directory). Restricted to a conservative charset and length, and `.`/`..`
-/// are rejected outright so a name can never traverse out of the data directory.
-fn is_valid_app_name(name: &str) -> bool {
+/// persistent home directory and, for an imported profile, its file). Restricted to a conservative
+/// charset and length, and `.`/`..` are rejected outright so a name can never traverse out of a
+/// directory. Reserved subcommand verbs are a *separate* check ([`is_reserved_app_verb`]) — a verb
+/// like `rm` is otherwise a perfectly valid path component.
+pub(crate) fn is_valid_app_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name != "."
@@ -1624,7 +1650,12 @@ fn dropped_binds_warning(state: TrustState, count: usize) -> String {
 /// bad config — least of all an attacker-controlled project one.
 pub(crate) fn load(cwd: &Path) -> Resolved {
     let mut warnings = Vec::new();
-    let global = read_global(&mut warnings);
+    let mut global = read_global(&mut warnings);
+    // Imported app profiles live beside the global config and are trusted by location, so they
+    // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
+    // layer them exactly like an inline global app, with no special casing.
+    let profiles = read_profile_apps(&mut warnings);
+    fold_profile_apps(&mut global, profiles, &mut warnings);
     let project = read_project(cwd, &mut warnings);
 
     // Discover installed resolver plugins (trusted by location, under the data dir). With no
@@ -1839,10 +1870,221 @@ fn global_path() -> Option<PathBuf> {
         .then(|| home.join(".config/ops").join(GLOBAL_CONFIG))
 }
 
+/// The imported-profiles directory (`…/ops/apps/`), a sibling of the global config. `None` when
+/// no config base resolves, like [`global_path`]; `ops app import`/`rm`/`list` and [`load`] all
+/// route through this one place so the location can never drift.
+pub(crate) fn profiles_dir() -> Option<PathBuf> {
+    global_path().and_then(|p| p.parent().map(|d| d.join(PROFILES_DIR)))
+}
+
+/// The posture an importable app profile would grant, in human-readable lines — shown so the
+/// deliberate `ops app import` is informed (it is the consent act; an imported profile is then
+/// honored even on an untrusted project, so what it grants must be visible).
+#[derive(Debug)]
+pub(crate) struct ProfilePreview {
+    /// Display lines: the command, home scope, tools, binds, network, and each credential by
+    /// destination + source *locator* (never a plaintext value — a profile carries only a locator).
+    pub(crate) summary: Vec<String>,
+}
+
+/// Validate bytes as an importable app profile: they must parse as a top-level [`schema::RawApp`]
+/// and declare a `cmd`. The `cmd` requirement is both a real rule (a profile with no command is
+/// not launchable) and the guard against the wrong shape — a file wrapped in `[app.<name>]` parses
+/// as an empty app, which this refuses with a hint rather than importing a silently-empty profile.
+/// Returns the granted posture for display, or a human-readable reason to refuse. Reads nothing
+/// from disk and resolves no secret — only the *shape* and *locators* are inspected.
+pub(crate) fn validate_profile(bytes: &[u8]) -> Result<ProfilePreview, String> {
+    let app = schema::parse_app(bytes)?;
+    if app.cmd.is_none() {
+        return Err(
+            "a profile must declare a `cmd` (the command to run). A profile file holds the \
+                    app's fields at the top level — if you wrapped it in an `[app.<name>]` table, \
+                    remove the wrapper (the name comes from the file name)"
+                .to_string(),
+        );
+    }
+    Ok(ProfilePreview {
+        summary: describe_app_posture(&app),
+    })
+}
+
+/// Build the posture summary for a raw app profile: the command, the persistent-home scope, the
+/// extra tools, the read-only binds, the network posture, and each injected credential by
+/// destination and source *locator*. A profile never carries a plaintext secret — only a locator
+/// (`env://VAR`, a `key`) — so this is safe to display and to share.
+fn describe_app_posture(app: &RawApp) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(cmd) = &app.cmd {
+        lines.push(format!("command: {}", cmd.clone().into_argv().join(" ")));
+    }
+    lines.push(format!(
+        "home: {}",
+        app.home_scope.as_deref().unwrap_or("global")
+    ));
+    if !app.packages.is_empty() {
+        let names: Vec<&str> = app.packages.keys().map(String::as_str).collect();
+        lines.push(format!("packages: {}", names.join(", ")));
+    }
+    if !app.binds.is_empty() {
+        lines.push(format!("binds (read-only): {}", app.binds.join(", ")));
+    }
+    match &app.network {
+        None => {}
+        Some(NetworkField::Posture(p)) => lines.push(format!("network: {p}")),
+        Some(NetworkField::Table(t)) => {
+            let mut s = format!("network: {}", t.mode);
+            if !t.allow.is_empty() {
+                s.push_str(&format!(" — allow {}", t.allow.join(", ")));
+            }
+            if !t.deny.is_empty() {
+                s.push_str(&format!(" — deny {}", t.deny.join(", ")));
+            }
+            lines.push(s);
+        }
+    }
+    if let Some(section) = &app.secret {
+        let mut any = false;
+        for (host, entry) in &section.hosts {
+            let secrets: &[RawHostSecret] = match entry {
+                RawHostSecrets::One(s) => std::slice::from_ref(s),
+                RawHostSecrets::Many(v) => v.as_slice(),
+            };
+            for s in secrets {
+                lines.push(format!("secret: {host} <- {}", describe_secret_source(s)));
+                any = true;
+            }
+        }
+        // A credential is injected only under a network allowlist (the filtering proxy performs the
+        // injection). If the profile declares secrets but not its own allowlist, say so — otherwise
+        // the summary reads as if they would be injected when, standalone, they would not.
+        let allowlisted =
+            matches!(&app.network, Some(NetworkField::Table(t)) if t.mode == "allowlist");
+        if any && !allowlisted {
+            lines.push(
+                "note: secrets are injected only under a network allowlist (declare \
+                 `[network] mode = \"allowlist\"`)"
+                    .to_string(),
+            );
+        }
+    }
+    lines
+}
+
+/// A one-line description of where a credential is read from: the terse `key`, or the explicit
+/// `from` ref/chain. The locator only — never a value (a profile carries none).
+fn describe_secret_source(s: &RawHostSecret) -> String {
+    if let Some(key) = &s.key {
+        return format!("key `{key}`");
+    }
+    match &s.from {
+        Some(SecretFrom::One(r)) => format!("from {r}"),
+        Some(SecretFrom::Many(rs)) => format!("from {}", rs.join(" | ")),
+        None => "from (unspecified)".to_string(),
+    }
+}
+
+/// Read every imported app profile from the profiles directory, keyed by filename stem.
+/// Delegates to [`read_profile_apps_from`] with the resolved [`profiles_dir`]; the split keeps the
+/// directory-reading logic unit-testable against an arbitrary directory, without depending on the
+/// process environment.
+fn read_profile_apps(warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
+    match profiles_dir() {
+        Some(dir) => read_profile_apps_from(&dir, warnings),
+        None => BTreeMap::new(),
+    }
+}
+
+/// Read every `<name>.toml` profile under `dir`, keyed by its filename stem (the app name). Each
+/// file is a standalone top-level [`schema::RawApp`], trusted by location. Infallible, like the
+/// rest of [`load`]: an absent directory yields nothing; an unsafe, unparseable, or unsafely-named
+/// file is dropped with a warning, never aborting the load. Entries are processed in sorted order
+/// so warnings are deterministic.
+fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
+    let mut out = BTreeMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            warnings.push(format!(
+                "ignoring profiles directory {}: {e}",
+                dir.display()
+            ));
+            return out;
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        // Only `*.toml` files are profiles; anything else under the directory is ignored silently.
+        if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            warnings.push(format!(
+                "ignoring profile {}: its file name is not valid UTF-8",
+                path.display()
+            ));
+            continue;
+        };
+        if is_reserved_app_verb(&name) || !is_valid_app_name(&name) {
+            warnings.push(format!(
+                "ignoring profile {}: `{name}` is not a usable app name",
+                path.display()
+            ));
+            continue;
+        }
+        let bytes = match safety::read_safe_bytes(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warnings.push(format!("ignoring profile {}: {e}", path.display()));
+                continue;
+            }
+        };
+        match schema::parse_app(&bytes) {
+            Ok(app) => {
+                out.insert(name, app);
+            }
+            Err(e) => warnings.push(format!("ignoring profile {}: {e}", path.display())),
+        }
+    }
+    out
+}
+
+/// Fold imported profile apps into the global config's app map. They are trusted by location, so
+/// they belong to the global layer. On a name collision an inline `[app.<name>]` in `ops.toml`
+/// wins — the more explicit, hand-authored statement — and the profile is skipped with a loud
+/// warning, never a silent merge of two definitions.
+fn fold_profile_apps(
+    global: &mut RawConfig,
+    profiles: BTreeMap<String, RawApp>,
+    warnings: &mut Vec<String>,
+) {
+    use std::collections::btree_map::Entry;
+    for (name, app) in profiles {
+        match global.app.entry(name) {
+            Entry::Occupied(occupied) => {
+                let name = occupied.key();
+                warnings.push(format!(
+                    "app `{name}`: an inline [app.{name}] in {GLOBAL_CONFIG} shadows the imported \
+                     profile of the same name (remove one)"
+                ));
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(app);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::schema::{RawEnvDefaults, RawFileDefaults, RawSecretSection, RawSopsDefaults};
     use super::*;
+    use crate::testutil::TmpDir;
     use std::collections::BTreeMap;
 
     fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
@@ -2157,6 +2399,137 @@ mod tests {
         // A conventional name survives.
         assert!(is_valid_app_name("claude"));
         assert!(is_valid_app_name("opencode-2.dev_x"));
+    }
+
+    #[test]
+    fn a_reserved_subcommand_verb_is_rejected_as_an_app_name() {
+        // `import`/`export`/`rm`/`list` are `ops app` subcommands; an app of that name would be
+        // unreachable and unmanageable, so it is dropped at resolve time (the charset check would
+        // otherwise pass — `rm` is a valid path component, hence the separate reserved check).
+        for verb in RESERVED_APP_VERBS {
+            assert!(is_reserved_app_verb(verb));
+            assert!(
+                is_valid_app_name(verb),
+                "`{verb}` is a valid path component"
+            );
+            let global = raw_with_app(verb, raw_app(&["x"], &[], &[], &[], None));
+            let r = resolve_no_plugins(global, None);
+            assert!(
+                !r.apps.contains_key(*verb),
+                "a reserved-verb app `{verb}` must be dropped"
+            );
+            assert!(
+                r.warnings.iter().any(|w| w.contains("reserved")),
+                "a dropped reserved-verb app `{verb}` must say so"
+            );
+        }
+        assert!(!is_reserved_app_verb("claude"));
+    }
+
+    #[test]
+    fn reading_profiles_keys_each_app_by_its_file_stem() {
+        // A profile file is a top-level app; its filename (stem) is the app name.
+        let dir = TmpDir::new();
+        std::fs::write(
+            dir.path().join("claude.toml"),
+            b"cmd = \"claude\"\n[env]\nA = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("review.toml"), b"cmd = [\"review\"]\n").unwrap();
+        // A non-.toml file is ignored; a profile whose stem is a reserved verb or an unsafe name
+        // is dropped with a warning, never keyed.
+        std::fs::write(dir.path().join("notes.txt"), b"ignore me\n").unwrap();
+        std::fs::write(dir.path().join("import.toml"), b"cmd = \"x\"\n").unwrap();
+
+        let mut warnings = Vec::new();
+        let apps = read_profile_apps_from(dir.path(), &mut warnings);
+        assert!(apps.contains_key("claude") && apps.contains_key("review"));
+        assert!(
+            !apps.contains_key("import"),
+            "a reserved-verb profile is dropped"
+        );
+        assert!(
+            !apps.contains_key("notes"),
+            "a non-.toml file is not a profile"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("import.toml")),
+            "a dropped reserved-verb profile must warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_profiles_directory_is_simply_no_profiles() {
+        let dir = TmpDir::new();
+        let mut warnings = Vec::new();
+        let apps = read_profile_apps_from(&dir.path().join("nope"), &mut warnings);
+        assert!(apps.is_empty() && warnings.is_empty());
+    }
+
+    #[test]
+    fn an_inline_app_shadows_a_profile_of_the_same_name() {
+        // On a name collision the hand-authored inline app wins, loudly; the unique profile is
+        // folded in.
+        let mut global = raw_with_app("claude", raw_app(&["inline"], &[], &[], &[], None));
+        let profiles: BTreeMap<String, RawApp> = [
+            (
+                "claude".to_string(),
+                raw_app(&["profile"], &[], &[], &[], None),
+            ),
+            (
+                "review".to_string(),
+                raw_app(&["review"], &[], &[], &[], None),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut warnings = Vec::new();
+        fold_profile_apps(&mut global, profiles, &mut warnings);
+        // The inline definition is untouched; the non-colliding profile is added.
+        assert_eq!(
+            global.app["claude"]
+                .cmd
+                .as_ref()
+                .map(|c| c.clone().into_argv()),
+            Some(vec!["inline".to_string()])
+        );
+        assert!(global.app.contains_key("review"));
+        assert!(
+            warnings.iter().any(|w| w.contains("shadows")),
+            "a collision must warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
+        // A complete profile validates and its granted posture is summarized for display.
+        let ok = validate_profile(
+            br#"
+            cmd = "claude"
+            [network]
+            mode = "allowlist"
+            allow = ["api.anthropic.com"]
+            [secret."api.anthropic.com"]
+            from = "env://ANTHROPIC_API_KEY"
+            header = "x-api-key"
+            type = "raw"
+            "#,
+        )
+        .unwrap();
+        let joined = ok.summary.join("\n");
+        assert!(joined.contains("command: claude"), "{joined}");
+        assert!(joined.contains("network: allowlist"), "{joined}");
+        // The secret shows its destination and source locator — never a value (a profile has none).
+        assert!(
+            joined.contains("api.anthropic.com") && joined.contains("env://ANTHROPIC_API_KEY"),
+            "{joined}"
+        );
+
+        // A profile with no command is refused — and so is a file wrapped in `[app.<name>]` (it
+        // parses as an empty app, so it trips the same gate with a helpful hint).
+        assert!(validate_profile(b"[env]\nA = \"1\"\n").is_err());
+        let wrapped = validate_profile(b"[app.claude]\ncmd = \"claude\"\n").unwrap_err();
+        assert!(wrapped.contains("cmd"), "{wrapped}");
     }
 
     #[test]
