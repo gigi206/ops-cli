@@ -616,7 +616,7 @@ fn config_cmd() -> ExitCode {
 fn app_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("import") => app_import(&args[1..]),
-        Some("export") => app_export(),
+        Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
         Some("list") => app_list(),
         // Otherwise the first non-flag token names an app to launch.
@@ -777,12 +777,83 @@ fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-/// `ops app export <name>`: write a profile out as a portable artifact. Deferred to the next
-/// increment (serializing a `RawApp` cleanly back to TOML needs a round-trip spike first); the
-/// verb is reserved now so adding it later never collides with an app name.
-fn app_export() -> ExitCode {
-    eprintln!("ops: `ops app export` is not available yet — it lands in the next increment");
-    ExitCode::from(2)
+/// `ops app export <name> [--out <file>]`: write a named app out as a portable profile — an
+/// imported profile verbatim, or an inline app serialized to a minimal top-level profile (as
+/// authored, security fields and all; import is the trust act, not export). Writes to stdout by
+/// default (composable and clobber-safe — `ops app export claude > claude.toml`), or to `--out
+/// <file>` directly. The exported file re-imports identically (the round-trip the feature sells).
+fn app_export(args: &[OsString]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut out: Option<&OsString> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--out") => match it.next() {
+                Some(p) => out = Some(p),
+                None => {
+                    eprintln!("ops: --out needs a file");
+                    return ExitCode::from(2);
+                }
+            },
+            Some(flag) if flag.starts_with("--") => {
+                eprintln!(
+                    "ops: unknown flag '{flag}' (usage: ops app export <name> [--out <file>])"
+                );
+                return ExitCode::from(2);
+            }
+            Some(n) if name.is_none() => name = Some(n),
+            None if name.is_none() => {
+                eprintln!("ops: the app name must be valid UTF-8");
+                return ExitCode::from(2);
+            }
+            _ => {
+                eprintln!("ops: ops app export takes a single name");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("ops: usage: ops app export <name> [--out <file>]");
+        return ExitCode::from(2);
+    };
+    // The name reaches a filesystem lookup, so validate it (and a reserved verb can never be an
+    // app name anyway).
+    if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+        eprintln!("ops: '{name}' is not a valid app name");
+        return ExitCode::from(2);
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bytes = match config::export_profile(&cwd, name) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match out {
+        None => {
+            use std::io::Write as _;
+            if let Err(e) = std::io::stdout().write_all(&bytes) {
+                eprintln!("ops: cannot write the profile: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Some(path) => {
+            let path = Path::new(path);
+            if let Err(e) = std::fs::write(path, &bytes) {
+                eprintln!("ops: cannot write {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            eprintln!("exported app `{name}` -> {}", path.display());
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// `ops app rm <name>`: remove an imported profile. Only an imported profile (a file in the

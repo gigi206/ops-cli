@@ -1459,6 +1459,72 @@ fn ops_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
 }
 
 #[test]
+fn ops_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_trips() {
+    let fx = Fixture::new();
+
+    // (a) An imported profile exports verbatim — comments and formatting survive.
+    let profile_body = "# my claude profile\n\
+                        cmd = \"claude\"\n\
+                        [network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n";
+    fx.write_profile("claude", profile_body);
+    let exp = fx.run(&["app", "export", "claude"]);
+    assert!(
+        exp.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&exp.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exp.stdout),
+        profile_body,
+        "an imported profile must export verbatim"
+    );
+
+    // (b) An inline (untrusted) project app serializes to a minimal profile and re-imports
+    //     identically — the export -> import portability loop, exercising `--out` too.
+    fx.write_project(
+        "[app.review]\ncmd = [\"review\", \"--all\"]\n[app.review.env]\nMODE = \"ci\"\n",
+    );
+    let exported = fx.proj.path().join("review.toml");
+    let exp2 = fx.run(&[
+        "app",
+        "export",
+        "review",
+        "--out",
+        exported.to_str().unwrap(),
+    ]);
+    assert!(
+        exp2.status.success(),
+        "inline export failed: {}",
+        String::from_utf8_lossy(&exp2.stderr)
+    );
+    let serialized = std::fs::read_to_string(&exported).unwrap();
+    assert!(
+        serialized.contains("cmd = [\"review\", \"--all\"]") && serialized.contains("MODE"),
+        "the serialized profile is missing fields:\n{serialized}"
+    );
+    assert!(
+        !serialized.contains("[packages]"),
+        "empty fields must be skipped:\n{serialized}"
+    );
+    // Re-import the exported file: it resolves as an app, closing the loop.
+    let imp = fx.run(&["app", "import", exported.to_str().unwrap()]);
+    assert!(
+        imp.status.success(),
+        "re-import of the exported profile failed: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).contains("review"),
+        "the re-imported profile must list"
+    );
+
+    // (c) An unknown app is a clean error.
+    let missing = fx.run(&["app", "export", "nope"]);
+    assert!(!missing.status.success(), "an unknown export must fail");
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no app"));
+}
+
+#[test]
 fn ops_app_rm_of_an_absent_profile_points_at_ops_toml() {
     let fx = Fixture::new();
     let out = fx.run(&["app", "rm", "nope"]);

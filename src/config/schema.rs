@@ -1,6 +1,6 @@
 //! The on-disk shape of an `ops` config file and its parse.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The fields a global `ops.toml` or a project `.ops.toml` may declare. Every
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 /// field (applied even from an untrusted project, minus a reserved-key denylist),
 /// `binds` is a *security* field (honored only from a trusted source). The
 /// distinction lives in the loader so the schema stays a plain data shape.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawConfig {
     /// Extra environment variables for the sandbox.
     #[serde(default)]
@@ -57,22 +57,23 @@ pub(crate) struct RawConfig {
 /// baseline. The overlay fields reuse the baseline shapes and gate identically — an
 /// untrusted project's app may add `env`/`packages` and choose the command, but its
 /// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawApp {
     /// The command to run, as an argv. A bare string is taken as a single-element argv
     /// (the program name, no arguments) — never split on whitespace, so a path with a
     /// space is not mis-parsed and there is no shell-quoting surface.
     pub(crate) cmd: Option<RawCmd>,
     /// Extra environment for this app, layered over the baseline (the app wins on a key
-    /// collision). A free field, like the baseline `env`.
-    #[serde(default)]
+    /// collision). A free field, like the baseline `env`. Skipped when empty on serialize, so an
+    /// exported profile carries no noise `[env]` table.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
     /// Extra host paths to bind read-only for this app. A security field.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) binds: Vec<String>,
     /// Extra tools to provision for this app, `name = "<nixpkgs attribute>"`, overriding a
     /// baseline tool of the same name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) packages: BTreeMap<String, String>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
@@ -91,7 +92,7 @@ pub(crate) struct RawApp {
 /// The command form of an app's `cmd`: a full argv (`["claude", "--flag"]`) or a bare
 /// program name (`"claude"`, taken as a one-element argv). An untagged enum so both TOML
 /// shapes parse, matching the string-or-table forward-compatibility of `NetworkField`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawCmd {
     /// A bare program name — a single-element argv, never whitespace-split.
@@ -118,7 +119,7 @@ impl RawCmd {
 /// every other key is a concrete host whose value is one secret or, as an array of tables
 /// (`[[secret."host"]]`), several (different headers to the same host). A host can therefore not
 /// be named `defaults` — that key is reserved for the settings table.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawSecretSection {
     /// Resolver order and per-resolver bindings the terse `key` form expands through.
     pub(crate) defaults: Option<RawSecretDefaults>,
@@ -130,7 +131,7 @@ pub(crate) struct RawSecretSection {
 
 /// The secret(s) declared for one host: a single table (`[secret."host"]`) or an array of
 /// tables (`[[secret."host"]]`) for several credentials (different headers) to that host.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawHostSecrets {
     /// `[secret."host"]` — one secret.
@@ -142,7 +143,7 @@ pub(crate) enum RawHostSecrets {
 /// One credential bound to a host (the host is the section key, so there is no `to` field). The
 /// source is either the terse `key` (expanded through `[secret.defaults]`) or an explicit `from`
 /// resolver ref/chain — exactly one of the two. `header`/`type`/`prefix` shape what is set.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawHostSecret {
     /// The broker kind; optional, defaulting to the only kind today, `"http-header"`.
     pub(crate) kind: Option<String>,
@@ -173,12 +174,12 @@ pub(crate) struct RawHostSecret {
 /// here nor on itself is still an explicit error (no silent built-in default). The resolver order
 /// is a security setting — it selects a secret's source — so this whole table is honored from the
 /// global config or a trusted project, never an untrusted one.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawSecretDefaults {
     /// The resolver names to try, in order, for a terse key — e.g. `["env", "sops"]`. The first
     /// that resolves at launch wins; a later one is a fallback. A per-secret `key@resolver`
     /// overrides this order for that secret.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) order: Vec<String>,
     /// The default header name for entries that omit `header` (e.g. `Authorization`). Note: the
     /// header is half the `(host, header)` dedup key, so several `[[secret."host"]]` entries that
@@ -196,13 +197,13 @@ pub(crate) struct RawSecretDefaults {
 }
 
 /// The `sops` resolver binding: a terse key `k` expands to `sops://<file>#k`.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawSopsDefaults {
     pub(crate) file: String,
 }
 
 /// The `env` resolver binding: a terse key `k` expands to `env://<case(k)>`.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawEnvDefaults {
     /// `"upper"`, `"lower"`, or `"asis"` (the default) — how to case the key before using it as
     /// a variable name.
@@ -210,7 +211,7 @@ pub(crate) struct RawEnvDefaults {
 }
 
 /// The `file` resolver binding: a terse key `k` expands to `file://<dir>/k`.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawFileDefaults {
     pub(crate) dir: String,
 }
@@ -218,7 +219,7 @@ pub(crate) struct RawFileDefaults {
 /// The two shapes a secret's `from` accepts: a single resolver ref string, or a list of refs
 /// tried in order. An untagged enum so both TOML forms parse — `from = "env://VAR"` and
 /// `from = ["env://VAR", "file:///p"]` — keeping the single-source case a one-liner.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum SecretFrom {
     /// `from = "env://VAR"`.
@@ -230,7 +231,7 @@ pub(crate) enum SecretFrom {
 /// The two shapes the `network` field accepts: a bare posture string, or a table for
 /// the allowlist. An untagged enum so both TOML forms parse — `network = "none"` and
 /// `[network] mode = "allowlist"` — keeping the simple case a one-liner.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum NetworkField {
     /// `network = "none"` | `"shared"`.
@@ -242,7 +243,7 @@ pub(crate) enum NetworkField {
 /// The table form of the `network` field: a mode plus, for the allowlist, the egress
 /// entries (IPs, domains, `*.domain` wildcards, exact URLs — classified later). `deny`
 /// carves exceptions out of `allow`, and deny always wins.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
     pub(crate) mode: String,
     #[serde(default)]
@@ -257,6 +258,15 @@ pub(crate) struct NetworkTable {
 pub(crate) fn parse(bytes: &[u8]) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
     toml::from_str(text).map_err(|e| e.to_string())
+}
+
+/// Serialize an app as a top-level profile — the inverse of [`parse_app`], producing the portable
+/// file `ops app export` writes. Empty `env`/`binds`/`packages` are skipped (the field attributes),
+/// and an unset `Option` is omitted by TOML, so the output is the minimal faithful profile. The
+/// error is a human-readable string. Proven a lossless round-trip with [`parse_app`] in the tests,
+/// including the `#[serde(flatten)]` secret hosts and the untagged `cmd`/`network`/`from` enums.
+pub(crate) fn serialize_app(app: &RawApp) -> Result<String, String> {
+    toml::to_string(app).map_err(|e| e.to_string())
 }
 
 /// Parse bytes as a single app profile — a top-level [`RawApp`]. A profile file *is* one app
@@ -376,6 +386,76 @@ mod tests {
         // so it parses as an empty app — the tell-tale the import path refuses on.
         let app = parse_app(b"[app.claude]\ncmd = \"claude\"\n").unwrap();
         assert_eq!(app.cmd, None);
+    }
+
+    #[test]
+    fn serializing_an_app_round_trips_through_toml() {
+        // `serialize_app` is the inverse of `parse_app` — what `ops app export` writes must
+        // re-import identically. Covers the fragile corners: `#[serde(flatten)]` secret hosts
+        // (with a `defaults` table and an array-of-tables host) and the untagged `cmd`/`network`/
+        // `from` enums.
+        let src = br#"
+            cmd = ["claude", "--resume"]
+            home_scope = "global"
+            binds = ["/opt/data"]
+            [env]
+            FOO = "bar"
+            [packages]
+            claude-code = "claude-code"
+            [network]
+            mode = "allowlist"
+            allow = ["api.anthropic.com", "*.nixos.org"]
+            deny = ["evil.example.com"]
+            [secret.defaults]
+            order = ["env", "sops"]
+            [secret."api.anthropic.com"]
+            from = "env://ANTHROPIC_API_KEY"
+            header = "x-api-key"
+            type = "raw"
+            [[secret."api.npmjs.org"]]
+            key = "npm_a"
+            header = "X-A"
+            type = "raw"
+            [[secret."api.npmjs.org"]]
+            key = "npm_b"
+            header = "X-B"
+            type = "raw"
+            "#;
+        let app = parse_app(src).unwrap();
+        let serialized = serialize_app(&app).unwrap();
+        let reparsed = parse_app(serialized.as_bytes()).unwrap();
+        assert_eq!(app, reparsed, "export must round-trip losslessly");
+    }
+
+    #[test]
+    fn serializing_skips_empty_collections_and_round_trips_a_bare_command() {
+        // A minimal app serializes to a minimal profile — no noise `[env]`/`[packages]` tables or
+        // `binds = []`, and an unset option is omitted entirely.
+        let app = parse_app(b"cmd = \"claude\"\n").unwrap();
+        let out = serialize_app(&app).unwrap();
+        assert!(out.contains("cmd"), "{out}");
+        assert!(!out.contains("[env]"), "empty env must be skipped:\n{out}");
+        assert!(
+            !out.contains("[packages]"),
+            "empty packages must be skipped:\n{out}"
+        );
+        assert!(
+            !out.contains("binds"),
+            "empty binds must be skipped:\n{out}"
+        );
+        assert!(
+            !out.contains("network"),
+            "unset network must be omitted:\n{out}"
+        );
+        assert!(
+            !out.contains("home_scope"),
+            "unset home_scope must be omitted:\n{out}"
+        );
+        // A bare-string command (`RawCmd::Line`) round-trips as itself — not silently promoted to a
+        // one-element array — so an exported minimal profile re-imports identically.
+        let reparsed = parse_app(out.as_bytes()).unwrap();
+        assert_eq!(reparsed.cmd, Some(RawCmd::Line("claude".into())));
+        assert_eq!(app, reparsed);
     }
 
     #[test]

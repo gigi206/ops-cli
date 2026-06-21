@@ -262,6 +262,41 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **import** half; **export** (sub-slice 2) and the signed-store *distribution* of profiles (needs a
   hosting URL + long-term key, like the default-store registration) are deferred. The ramp's item 4
   is now: export (next), then signed distribution; items 3 (flagship `claude` e2e) and 5 (GUI) stand.
+  **`ops app` export/import — sub-slice 2: export (DONE)** (`src/config/schema.rs` +
+  `config/mod.rs` + `src/main.rs`): `ops app export <name> [--out <file>]` — the inverse of import,
+  writing a portable profile out. **De-risked by a spike first** (advisor's call): `toml::to_string`
+  of a `RawApp` is the known-fragile `toml` corner (`#[serde(flatten)]` secret hosts + untagged
+  `cmd`/`network`/`from` enums), so a throwaway round-trip test proved it **lossless** — including a
+  `[secret.defaults]` table beside an array-of-tables host (`[[secret."h"]]`) — **before** committing
+  to the serialize path. The app types gained `Serialize`; `skip_serializing_if` on the empty-able
+  `env`/`binds`/`packages` (and `secret.defaults.order`) keeps the output **minimal** (TOML already
+  omits a `None` option), so a one-line app exports as one line. `serialize_app` is the inverse of
+  `parse_app` (a permanent round-trip test, plus a bare-string-`cmd` round-trip — `RawCmd::Line` is
+  not silently promoted to a one-element array). **Two sources, by origin:** an **imported profile**
+  (`<config>/ops/apps/<name>.toml`) is emitted **verbatim** (comments + formatting preserved);
+  otherwise an app declared **inline** — project `.ops.toml` preferred over global `ops.toml` — has
+  its `RawApp` serialized. The app is exported **as authored, security fields and all, regardless of
+  trust** (import is the trust act, not export). **Output = stdout by default** (user's call —
+  composable + clobber-safe, `ops app export claude > claude.toml`), `--out <file>` writes directly
+  (a user-chosen leaf path → plain `std::fs::write`/`>` semantics, *not* the atomic store-placement
+  the managed import does — a deliberate role distinction). **Precedence is the inverse of load's
+  collision rule** (export prefers the profile; a launch prefers the inline) — they only diverge when
+  one name is both, a state the load-time collision warning already pushes the user to resolve
+  (documented on `export_profile`). **The export→import portability loop is proven** (an inline
+  untrusted-project app → `--out` file → re-import → resolves as a trusted-by-location app). **541
+  tests green** (2 net-new schema unit: the round-trip + the skip-empty/bare-cmd; 1 net-new config
+  integration: verbatim-profile + serialized-inline + the round-trip loop + unknown→error), fmt/clippy
+  clean, **musl static build verified**, advisor-reviewed (plan AND impl — the spike was its call; it
+  flagged the export-vs-load precedence divergence, now documented). Export/import is **complete**;
+  the **signed-store distribution** of profiles stays deferred. **NEXT (user, 2026-06-21):** author
+  starter app **profiles** as importable `profiles/*.toml` artifacts in the repo (NOT built-in —
+  imported deliberately): doable-now CLI tools (**claude code** = `claude-code`, the flagship; **codex**
+  = OpenAI; **opencode** = multi-provider) verified via `ops search` first; **blocked on the Wayland
+  GUI hole** (item 5) for the desktop variants (opencode desktop, **antigravity** = Google's agentic
+  IDE, hermes desktop); credential caveat — the broker injects **HTTP headers**, so a query-param key
+  (Gemini `?key=`) or OAuth/device-flow does **not** fit the `[secret]` model; and **pi/agy/hermes
+  need disambiguation** (package, argv, API host, credential mechanism) before any profile is written
+  (no fabrication).
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

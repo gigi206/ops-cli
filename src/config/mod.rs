@@ -2080,6 +2080,45 @@ fn fold_profile_apps(
     }
 }
 
+/// Produce the portable profile bytes for `name`, for `ops app export`. An **imported profile**
+/// (`<config>/ops/apps/<name>.toml`) is emitted **verbatim**, so the author's comments and
+/// formatting survive a round-trip through the store; otherwise an app declared **inline** — in the
+/// project `.ops.toml` (preferred, the local definition one would share) or the global `ops.toml` —
+/// has its `RawApp` **serialized** to a minimal top-level profile. The app is exported **as
+/// authored**, security fields and all, regardless of trust: import is the trust act, not export.
+/// Returns the bytes to emit, or a human-readable reason none was found.
+///
+/// Note the precedence here is the **inverse** of [`fold_profile_apps`] at load: export prefers the
+/// imported profile, whereas a launch prefers an inline `[app.<name>]`. They only diverge when one
+/// name is *both* an imported profile and inline — a state the load-time collision warning already
+/// pushes the user to resolve — so `ops app export <name>` may emit the profile while `ops app
+/// <name>` would launch the inline definition. Keep at most one definition per name.
+pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> {
+    // 1. An imported profile: emit it verbatim (fidelity over re-serialization).
+    if let Some(dir) = profiles_dir() {
+        let path = dir.join(format!("{name}.toml"));
+        if path.exists() {
+            return safety::read_safe_bytes(&path).map_err(|e| e.to_string());
+        }
+    }
+    // 2. An inline app: serialize its raw definition. The project layer is preferred over the
+    //    global (the local definition is the one being packaged for sharing).
+    let mut warnings = Vec::new();
+    if let Some((mut project, _, _)) = read_project(cwd, &mut warnings) {
+        if let Some(app) = project.app.remove(name) {
+            return schema::serialize_app(&app).map(String::into_bytes);
+        }
+    }
+    let mut global = read_global(&mut warnings);
+    if let Some(app) = global.app.remove(name) {
+        return schema::serialize_app(&app).map(String::into_bytes);
+    }
+    Err(format!(
+        "no app `{name}` to export (not an imported profile, nor an inline [app.{name}] in \
+         {PROJECT_CONFIG} or {GLOBAL_CONFIG})"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::schema::{RawEnvDefaults, RawFileDefaults, RawSecretSection, RawSopsDefaults};
