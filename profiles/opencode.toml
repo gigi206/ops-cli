@@ -1,0 +1,31 @@
+# opencode — a terminal AI coding agent (multi-provider), sandboxed by ops.
+#
+#   ops app import profiles/opencode.toml
+#   ops app opencode
+#
+# Version tracks your base nix channel — roll it with `ops upgrade nix`.
+#
+# opencode is MULTI-PROVIDER, so its egress depends on the model you use. This
+# template is set up for Anthropic; for another provider, change the allowlist and
+# the [secret] block (e.g. OpenAI: allow "api.openai.com", header "Authorization",
+# type "bearer", env OPENAI_API_KEY). If a request is blocked, the proxy reports
+# the host it refused — add it to `allow` (or check with `ops test net <url>`).
+cmd = "opencode"
+
+[packages]
+opencode = "opencode"
+
+[network]
+mode = "allowlist"
+# api.anthropic.com: the provider API. models.dev: opencode's model catalogue.
+allow = ["api.anthropic.com", "models.dev"]
+
+# The real key is read on the HOST and injected by the egress proxy — never in the
+# cage. Provide it on the host as $ANTHROPIC_API_KEY (or a resolver).
+[env]
+ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+
+[secret."api.anthropic.com"]
+from = "env://ANTHROPIC_API_KEY"
+header = "x-api-key"
+type = "raw"

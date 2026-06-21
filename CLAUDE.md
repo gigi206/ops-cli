@@ -288,15 +288,47 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   integration: verbatim-profile + serialized-inline + the round-trip loop + unknown→error), fmt/clippy
   clean, **musl static build verified**, advisor-reviewed (plan AND impl — the spike was its call; it
   flagged the export-vs-load precedence divergence, now documented). Export/import is **complete**;
-  the **signed-store distribution** of profiles stays deferred. **NEXT (user, 2026-06-21):** author
-  starter app **profiles** as importable `profiles/*.toml` artifacts in the repo (NOT built-in —
-  imported deliberately): doable-now CLI tools (**claude code** = `claude-code`, the flagship; **codex**
-  = OpenAI; **opencode** = multi-provider) verified via `ops search` first; **blocked on the Wayland
-  GUI hole** (item 5) for the desktop variants (opencode desktop, **antigravity** = Google's agentic
-  IDE, hermes desktop); credential caveat — the broker injects **HTTP headers**, so a query-param key
-  (Gemini `?key=`) or OAuth/device-flow does **not** fit the `[secret]` model; and **pi/agy/hermes
-  need disambiguation** (package, argv, API host, credential mechanism) before any profile is written
-  (no fabrication).
+  the **signed-store distribution** of profiles stays deferred. **Starter app profiles — first three
+  SHIPPED (user, 2026-06-21)** (`profiles/{claude-code,codex,opencode}.toml` + `profiles/README.md` +
+  a `the_shipped_profiles_import_and_resolve` test): importable `profiles/*.toml` artifacts in the repo
+  (NOT built-in — imported deliberately). Each = `cmd` + `[packages]` (the tool from nixpkgs) +
+  `[network] allowlist` (the provider host) + `[secret]` (the API key injected **host-side** by the
+  egress proxy, never in the cage; an in-cage placeholder lets the CLI start, the proxy strips +
+  substitutes the real key on the wire). **Grounded, not guessed:** packages confirmed via `ops search`
+  (claude-code 2.1.177, codex 0.139.0, opencode 1.17.4); API hosts/headers are established facts
+  (Anthropic `x-api-key`; OpenAI `Authorization: Bearer`); opencode ships as a multi-provider template
+  (Anthropic default, allowlist adjustable — the proxy's 6.2e reasons report a refused host). **Honest
+  scope:** the profiles **import + resolve** (the test proves it, verified live — `ops config` shows
+  `network: allowlist` + `secrets: 1 injected host-side`), but the **live auth e2e** (the CLI
+  authenticating through the proxy-injected key — does the tool accept the placeholder?) is the
+  **flagship validation, item 3**, pending a real key (the user's; never used by the assistant).
+  Freshness: `[packages]` tracks the **base nix channel** (rolled by `ops upgrade nix`; the app overlay
+  has no per-tool nixhub-floating — that, and non-nix mise backends, are the **multi-backend
+  increment** below). **Deferred / blocked:** the **GUI/Wayland hole** (item 5) gates the *desktop*
+  variants (opencode desktop, **antigravity** = Google's agentic IDE, hermes desktop); **pi/agy/hermes**
+  await disambiguation (package, argv, API host, credential mechanism — no fabrication); a
+  query-param key (Gemini `?key=`) or OAuth/device-flow does **not** fit the header-injection
+  `[secret]` model.
+  **mise multi-backend — spike DONE, build NEXT (user chose: ship nix profiles first)** (`docs`-worthy
+  finding, no code yet): the user wants ops to honor **mise's full backend set** (`aqua:`/`github:`/
+  `npm:`/`cargo:`/…), not just the custom `nix:` plugin, for upstream-fresh versions. **The advisor's
+  call — empirical, not architectural — and a live spike CONFIRMED the capability already exists
+  in-cage:** a trusted project's `[tools] "aqua:BurntSushi/ripgrep" = "latest"` → `ops run` → the
+  cage's mise (full binary, `MISE_EXPERIMENTAL=1`/`MISE_YES=1`) **read the tool, downloaded from
+  upstream over the (shared) network, verified the checksum, extracted, and `rg` ran** (`ubi:` also
+  reached the download but failed extraction — deprecated backend + ripgrep's `rg`≠repo-name quirk;
+  `aqua:` is the clean, checksummed path). So multi-backend is a **~small increment, NOT an
+  architecture**: (1) soften the misleading host-side `not provisioned by ops` warning (non-nix tools
+  ARE handled — **in-cage**, self-equip, not host pre-provisioned); (2) **auto-install at launch** so a
+  profile whose `cmd` IS the tool starts on first `ops app` (unify with the nix: launch path + the 2b.5
+  activation/shims for PATH — a bare `mise install` without `use` leaves a `No version set` shim, so an
+  install trigger is needed); (3) document the **egress requirement** — a non-nix tool needs its
+  backend host in the allowlist, which is **the security control, not backend curation**: trust-gated,
+  so an untrusted project may *declare* `aqua:evil/x` but **cannot open** the egress to fetch it. **Locus
+  = in-cage, egress-gated** (host-side npm/ubi would mutate the host + break hermeticity — rejected).
+  **Residual:** a non-nix tool **kills offline launch** (fetches upstream at install) — the price of
+  freshness vs the nix seed's offline reuse. Decided to **ship the nix profiles first** (these three are
+  fresh in nixpkgs) and do multi-backend as its own de-risked increment.
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

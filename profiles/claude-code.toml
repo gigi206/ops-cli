@@ -1,0 +1,32 @@
+# Claude Code — Anthropic's agentic coding CLI, sandboxed by ops.
+#
+#   ops app import profiles/claude-code.toml
+#   ops app claude-code
+#
+# The tool is provisioned from nixpkgs into the project's own store (no host
+# mutation). Its version tracks your base nix channel — roll it with
+# `ops upgrade nix`.
+cmd = "claude"
+
+[packages]
+claude-code = "claude-code"
+
+# Egress is denied by construction except the Anthropic API (plus the always-on
+# nix cache, so the toolchain can self-equip). The agent may run on untrusted
+# project code, but it can only reach Anthropic.
+[network]
+mode = "allowlist"
+allow = ["api.anthropic.com"]
+
+# The real API key is read on the HOST and injected into the outbound request by
+# the egress proxy — it never enters the cage. Provide it on the host as
+# $ANTHROPIC_API_KEY (or point `from` at a resolver, e.g. sops://secrets.yaml#anthropic).
+# The in-cage placeholder lets the CLI start and issue the request; the proxy
+# strips it and substitutes the real key on the wire.
+[env]
+ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+
+[secret."api.anthropic.com"]
+from = "env://ANTHROPIC_API_KEY"
+header = "x-api-key"
+type = "raw"

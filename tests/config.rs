@@ -1525,6 +1525,43 @@ fn ops_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
 }
 
 #[test]
+fn the_shipped_profiles_import_and_resolve() {
+    // Every profile under the repo's `profiles/` directory must import cleanly (parse, have a
+    // command, a usable name) and resolve as a launchable app — so a shipped profile is never
+    // subtly broken, and the import path is re-exercised on real artifacts.
+    let fx = Fixture::new();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+    let mut imported = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("profiles/ dir exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let imp = fx.run(&["app", "import", path.to_str().unwrap()]);
+        assert!(
+            imp.status.success(),
+            "shipped profile `{name}` failed to import: {}",
+            String::from_utf8_lossy(&imp.stderr)
+        );
+        imported.push(name);
+    }
+    assert!(
+        !imported.is_empty(),
+        "expected at least one shipped profile in {}",
+        dir.display()
+    );
+    // Each imported profile now resolves as an app (`ops config` lists it by name).
+    let cfg = String::from_utf8_lossy(&fx.run(&["config"]).stdout).to_string();
+    for name in &imported {
+        assert!(
+            cfg.contains(&format!("{name}:")),
+            "shipped profile `{name}` did not resolve as an app:\n{cfg}"
+        );
+    }
+}
+
+#[test]
 fn ops_app_rm_of_an_absent_profile_points_at_ops_toml() {
     let fx = Fixture::new();
     let out = fx.run(&["app", "rm", "nope"]);

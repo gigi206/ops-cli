@@ -1,0 +1,29 @@
+# Codex — OpenAI's coding agent CLI, sandboxed by ops.
+#
+#   ops app import profiles/codex.toml
+#   ops app codex
+#
+# Version tracks your base nix channel — roll it with `ops upgrade nix`.
+#
+# This profile uses the API-key path (api.openai.com). Codex's ChatGPT login flow
+# is an OAuth/device flow, which does not fit the header-injection model below —
+# use the API key if you want the sandboxed credential boundary.
+cmd = "codex"
+
+[packages]
+codex = "codex"
+
+[network]
+mode = "allowlist"
+allow = ["api.openai.com"]
+
+# The real key is read on the HOST and injected by the egress proxy — never in the
+# cage. Provide it on the host as $OPENAI_API_KEY (or a resolver). The placeholder
+# lets the CLI start; the proxy substitutes the real key on the wire.
+[env]
+OPENAI_API_KEY = "sk-ops-placeholder-replaced-by-the-egress-proxy"
+
+[secret."api.openai.com"]
+from = "env://OPENAI_API_KEY"
+header = "Authorization"
+type = "bearer"
