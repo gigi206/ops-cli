@@ -360,6 +360,20 @@ pub(crate) struct Resolved {
     pub(crate) warnings: Vec<String>,
 }
 
+/// Where an app's persistent `$HOME` (its config, login state, history) is keyed. The home
+/// is always per-app and isolated from the project's default shell home; this chooses whether
+/// it is *also* per-project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppHomeScope {
+    /// One home per app, shared across every project — the app keeps a single identity
+    /// wherever it runs. The default. Carries a residual: an agent run on an untrusted
+    /// project writes into the same home a trusted project's run uses (`"project"` isolates).
+    Global,
+    /// A home per (project, app) — what the agent writes in one project is invisible to
+    /// another. Aligned with running an agent on untrusted code.
+    Project,
+}
+
 /// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
 /// environment, binds, packages, network posture, and credentials it declares — each
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
@@ -369,6 +383,10 @@ pub(crate) struct ResolvedApp {
     /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
     /// silent default.
     pub(crate) cmd: Vec<String>,
+    /// Where this app's persistent home is keyed (`Global` by default). Integrity-gated like
+    /// `cmd`: an untrusted project may set its own app's scope but not flip a trusted app from
+    /// `Project` to `Global`.
+    pub(crate) home_scope: AppHomeScope,
     /// Extra environment, in application order; folded over the baseline's so the app wins.
     pub(crate) env: Vec<(String, String)>,
     /// Extra read-only host binds (absolute; canonicalized in [`load`], like the baseline).
@@ -558,7 +576,13 @@ fn resolve(
 
     enforce_secret_posture(&network, &mut secrets, &mut warnings);
 
-    let apps = resolve_apps(global_apps, project_apps, &secret_defaults, plugins);
+    let apps = resolve_apps(
+        &mut warnings,
+        global_apps,
+        project_apps,
+        &secret_defaults,
+        plugins,
+    );
 
     Resolved {
         env,
@@ -598,8 +622,10 @@ fn enforce_secret_posture(
 
 /// Resolve every declared app into a gated overlay. The set of names is the union of the
 /// global and project app tables; each app is layered global-under-project and gated by the
-/// trust of the layer that supplied each field — identical to the baseline.
+/// trust of the layer that supplied each field — identical to the baseline. An app whose name
+/// is not a safe path component is dropped with a warning before it can ever key a directory.
 fn resolve_apps(
+    warnings: &mut Vec<String>,
     mut global_apps: BTreeMap<String, RawApp>,
     project_apps: Option<(BTreeMap<String, RawApp>, TrustState)>,
     secret_defaults: &SecretDefaults,
@@ -616,12 +642,32 @@ fn resolve_apps(
         .collect();
     let mut out = BTreeMap::new();
     for name in names {
+        if !is_valid_app_name(&name) {
+            warnings.push(format!(
+                "ignoring app `{name}`: a name must be 1–64 of [A-Za-z0-9._-] and not `.`/`..` \
+                 (it keys an on-disk home directory)"
+            ));
+            continue;
+        }
         let global = global_apps.remove(&name);
         let project = project_apps.remove(&name).zip(project_state);
         let resolved = resolve_app(&name, global, project, secret_defaults, plugins);
         out.insert(name, resolved);
     }
     out
+}
+
+/// Whether an app name is safe to use as a single on-disk path component (it keys the app's
+/// persistent home directory). Restricted to a conservative charset and length, and `.`/`..`
+/// are rejected outright so a name can never traverse out of the data directory.
+fn is_valid_app_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Resolve one app: layer its global definition (trusted by location) under its project
@@ -649,6 +695,12 @@ fn resolve_app(
     // — else `ops app claude` against an untrusted repo would silently run the repo's command
     // under the trusted app's posture (an integrity-of-intent hijack).
     let mut cmd_trusted = false;
+    // The persistent-home keying, defaulting to one global home per app. Integrity-gated by
+    // `home_scope_trusted` for the same reason as `cmd`: an untrusted project may set the scope
+    // of its own app, but must not flip a trusted app from `Project` to `Global` — that would
+    // route the untrusted run into the home a trusted run shares.
+    let mut home_scope = AppHomeScope::Global;
+    let mut home_scope_trusted = false;
 
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
@@ -678,6 +730,12 @@ fn resolve_app(
         if let Some(c) = app.cmd {
             cmd = c.into_argv();
             cmd_trusted = true;
+        }
+        if let Some(raw) = app.home_scope {
+            if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
+                home_scope = scope;
+                home_scope_trusted = true;
+            }
         }
     }
 
@@ -736,16 +794,52 @@ fn resolve_app(
                 ));
             }
         }
+        if let Some(raw) = app.home_scope {
+            // A trusted project may set any scope; an untrusted one may set its own app's scope
+            // (nothing trusted to override) but not flip a trusted app — which could only widen
+            // it to the shared `Global` home, the contamination vector.
+            if trusted || !home_scope_trusted {
+                if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
+                    home_scope = scope;
+                }
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `home_scope` override of a trusted app ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
     }
 
     ResolvedApp {
         cmd,
+        home_scope,
         env,
         ro_binds,
         packages,
         network,
         secrets,
         warnings,
+    }
+}
+
+/// Parse an app's `home_scope` string into [`AppHomeScope`]. An unrecognized value is dropped
+/// with a warning and the caller keeps the prior (defaulting to `Global`) — fail-safe, never a
+/// silent mis-scope.
+fn validate_home_scope(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: &str,
+) -> Option<AppHomeScope> {
+    match raw {
+        "global" => Some(AppHomeScope::Global),
+        "project" => Some(AppHomeScope::Project),
+        other => {
+            warnings.push(format!(
+                "{source}: ignoring unknown home_scope `{other}` (expected \"global\" or \"project\")"
+            ));
+            None
+        }
     }
 }
 
@@ -1837,6 +1931,7 @@ mod tests {
                 .collect(),
             network,
             secret: None,
+            home_scope: None,
         }
     }
 
@@ -1970,10 +2065,106 @@ mod tests {
     }
 
     #[test]
+    fn an_app_home_scope_defaults_to_global_and_a_trusted_layer_may_set_project() {
+        // Unset → the global default. A trusted layer (here the global config) may pin it.
+        let plain = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
+        let r = resolve_no_plugins(plain, None);
+        assert_eq!(r.apps["claude"].home_scope, AppHomeScope::Global);
+
+        let scoped = raw_with_app(
+            "review",
+            RawApp {
+                home_scope: Some("project".into()),
+                ..raw_app(&["claude"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(scoped, None);
+        assert_eq!(r.apps["review"].home_scope, AppHomeScope::Project);
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_widen_a_trusted_apps_home_scope_to_global() {
+        // The integrity guard, mirroring `cmd`: a trusted app pinned to a per-project home must
+        // not be flipped to the shared global home by an untrusted repo (the contamination
+        // vector). The safe direction — narrowing to `project` — and an untrusted project's own
+        // app are both allowed.
+        let global = raw_with_app(
+            "claude",
+            RawApp {
+                home_scope: Some("project".into()),
+                ..raw_app(&["claude"], &[], &[], &[], None)
+            },
+        );
+        let project = raw_with_app(
+            "claude",
+            RawApp {
+                home_scope: Some("global".into()),
+                ..raw_app(&[], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["claude"];
+        assert_eq!(
+            app.home_scope,
+            AppHomeScope::Project,
+            "the widening is refused"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("home_scope")));
+
+        // An untrusted project's OWN app (nothing trusted to override) may set any scope.
+        let project = raw_with_app(
+            "mine",
+            RawApp {
+                home_scope: Some("global".into()),
+                ..raw_app(&["tool"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        assert_eq!(r.apps["mine"].home_scope, AppHomeScope::Global);
+    }
+
+    #[test]
+    fn an_unknown_home_scope_defaults_to_global_with_a_warning() {
+        let global = raw_with_app(
+            "claude",
+            RawApp {
+                home_scope: Some("frobnicate".into()),
+                ..raw_app(&["claude"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, None);
+        let app = &r.apps["claude"];
+        assert_eq!(app.home_scope, AppHomeScope::Global);
+        assert!(app.warnings.iter().any(|w| w.contains("home_scope")));
+    }
+
+    #[test]
+    fn an_app_with_an_unsafe_name_is_dropped_before_it_can_key_a_directory() {
+        // An app name keys an on-disk home directory, so a traversal or odd-charset name must
+        // never reach the launcher. It is dropped at resolve time with a baseline warning.
+        for bad in ["../escape", "a/b", "..", ".", "with space", ""] {
+            let global = raw_with_app(bad, raw_app(&["x"], &[], &[], &[], None));
+            let r = resolve_no_plugins(global, None);
+            assert!(
+                !r.apps.contains_key(bad),
+                "app `{bad}` must be dropped, not resolved"
+            );
+            assert!(
+                r.warnings.iter().any(|w| w.contains("ignoring app")),
+                "a dropped app `{bad}` must warn"
+            );
+        }
+        // A conventional name survives.
+        assert!(is_valid_app_name("claude"));
+        assert!(is_valid_app_name("opencode-2.dev_x"));
+    }
+
+    #[test]
     fn merge_app_overlays_the_baseline_with_app_precedence() {
         let mut base = resolve_no_plugins(raw(&[("A", "base"), ("B", "base")], &[]), None);
         let app = ResolvedApp {
             cmd: vec!["x".into()],
+            home_scope: AppHomeScope::Global,
             env: vec![("A".into(), "app".into()), ("C".into(), "app".into())],
             ro_binds: vec![],
             packages: vec![],
@@ -1995,6 +2186,7 @@ mod tests {
         let mut base = resolve_no_plugins(raw_network("shared"), None);
         let app = ResolvedApp {
             cmd: vec!["x".into()],
+            home_scope: AppHomeScope::Global,
             env: vec![],
             ro_binds: vec![],
             packages: vec![],
@@ -2015,6 +2207,7 @@ mod tests {
         let mut base = resolve_no_plugins(raw_network("shared"), None);
         let app = ResolvedApp {
             cmd: vec!["x".into()],
+            home_scope: AppHomeScope::Global,
             env: vec![],
             ro_binds: vec![],
             packages: vec![],

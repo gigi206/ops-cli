@@ -79,7 +79,7 @@ pub(crate) fn run(cmd: Vec<OsString>) -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let (spec, egress) = match build(&prep, cmd) {
+    let (spec, egress) = match build(&prep, binds::Runtime::ProjectDefault, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -128,13 +128,18 @@ pub(crate) fn app(name: &str) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    // The argv is owned by the app; extract it before the overlay is folded in (which moves
-    // the app but never touches its command).
+    // The argv and the home scope are owned by the app; read them before the overlay is folded
+    // in (which moves the app but does not touch them). The scope keys this app's persistent
+    // home: one shared across projects (`Global`) or one per project (`Project`).
     let cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
+    let runtime = match app.home_scope {
+        crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
+        crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
+    };
     eprintln!("ops: launching app `{name}`");
     prep.cfg.merge_app(app);
 
-    let (spec, egress) = match build(&prep, cmd) {
+    let (spec, egress) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -213,7 +218,7 @@ pub(crate) fn shell() -> ExitCode {
         OsString::from("--rcfile"),
         OsString::from(binds::SHELL_RC_INCAGE),
     ];
-    let (spec, egress) = match build(&prep, cmd) {
+    let (spec, egress) = match build(&prep, binds::Runtime::ProjectDefault, cmd) {
         Ok((s, e)) => (s.with_private_tty(), e),
         Err(code) => return code,
     };
@@ -344,6 +349,7 @@ pub(crate) fn effective_lock_target(
 /// since it is a stated requirement.
 fn build(
     prep: &Prepared,
+    runtime: binds::Runtime,
     cmd: Vec<OsString>,
 ) -> Result<(SandboxSpec, Option<egress::Egress>), ExitCode> {
     for warning in &prep.cfg.warnings {
@@ -453,6 +459,7 @@ fn build(
     let spec = binds::build_spec(
         prep.layout.data_dir(),
         &prep.cwd,
+        runtime,
         &prep.userland,
         &nix_mount,
         &overlay,

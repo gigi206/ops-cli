@@ -452,11 +452,36 @@ fn group_contents(id: &Identity) -> String {
     )
 }
 
-/// Host-side runtime paths for `project` under ops's data directory. The home
-/// and the synthetic `/etc` are siblings so the latter sits outside every
-/// read-write bind (module integrity note).
-fn project_runtime(data_dir: &Path, project: &Path) -> ProjectRuntime {
-    let base = data_dir.join("projects").join(project_id(project));
+/// Which persistent runtime a launch uses — the writable `$HOME` and its sibling synthetic
+/// `/etc`. `ops run`/`ops shell` use the project's shared default; an app gets a dedicated,
+/// persistent home so its config, login state, and history never bleed into the project shell
+/// or another app. An app's home is either shared across projects (`GlobalApp`, one identity
+/// everywhere) or keyed per-project (`ProjectApp`, isolated per project).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Runtime<'a> {
+    /// The project's default shared home — `ops run` and `ops shell`.
+    ProjectDefault,
+    /// `ops app <name>` with one home per app, shared across every project.
+    GlobalApp(&'a str),
+    /// `ops app <name>` with a home per (project, app).
+    ProjectApp(&'a str),
+}
+
+/// Host-side runtime paths for `project` under ops's data directory, for the given
+/// [`Runtime`]. The home and the synthetic `/etc` are always siblings so the latter sits
+/// outside every read-write bind (module integrity note). An app name is a validated single
+/// path component (the config app-name check), so joining it cannot traverse out of the data
+/// directory.
+fn project_runtime(data_dir: &Path, project: &Path, runtime: Runtime) -> ProjectRuntime {
+    let project_base = || data_dir.join("projects").join(project_id(project));
+    let base = match runtime {
+        Runtime::ProjectDefault => project_base(),
+        // A global app's home is project-independent — keyed only by the app name, so the same
+        // identity is reused in every project.
+        Runtime::GlobalApp(name) => data_dir.join("apps").join(name),
+        // A per-project app's home nests under the project, isolating its state per project.
+        Runtime::ProjectApp(name) => project_base().join("apps").join(name),
+    };
     ProjectRuntime {
         home_src: base.join("home"),
         etc_dir: base.join("etc"),
@@ -551,6 +576,7 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
 pub(crate) fn build_spec(
     data_dir: &Path,
     cwd: &Path,
+    runtime: Runtime,
     userland: &Userland,
     nix: &NixMount,
     overlay: &Overlay,
@@ -562,7 +588,7 @@ pub(crate) fn build_spec(
     use std::os::unix::fs::DirBuilderExt;
 
     let project = canonicalize_project(cwd)?;
-    let rt = project_runtime(data_dir, &project);
+    let rt = project_runtime(data_dir, &project, runtime);
 
     DirBuilder::new()
         .recursive(true)
@@ -1062,17 +1088,61 @@ mod tests {
 
     #[test]
     fn synthetic_etc_lives_outside_the_writable_home() {
-        // The core integrity property: the read-only identity files have no
-        // read-write alias inside the sandbox.
-        let pr = project_runtime(Path::new("/data/ops"), Path::new("/home/u/proj"));
-        assert!(
-            !pr.etc_dir.starts_with(&pr.home_src),
-            "synthetic /etc ({}) must not sit under the rw home ({})",
-            pr.etc_dir.display(),
-            pr.home_src.display(),
-        );
-        assert!(pr.home_src.ends_with("home"));
-        assert!(pr.etc_dir.ends_with("etc"));
+        // The core integrity property holds for every runtime scope: the read-only identity
+        // files have no read-write alias inside the sandbox.
+        let data = Path::new("/data/ops");
+        let project = Path::new("/home/u/proj");
+        for runtime in [
+            Runtime::ProjectDefault,
+            Runtime::GlobalApp("claude"),
+            Runtime::ProjectApp("claude"),
+        ] {
+            let pr = project_runtime(data, project, runtime);
+            assert!(
+                !pr.etc_dir.starts_with(&pr.home_src),
+                "synthetic /etc ({}) must not sit under the rw home ({})",
+                pr.etc_dir.display(),
+                pr.home_src.display(),
+            );
+            assert!(pr.home_src.ends_with("home"));
+            assert!(pr.etc_dir.ends_with("etc"));
+        }
+    }
+
+    #[test]
+    fn each_runtime_scope_keys_a_distinct_persistent_home() {
+        // Isolation with teeth: the project default, a global app, a per-project app, and a
+        // second app all resolve to different homes — so no two share writable state. The
+        // global app's home is project-independent; the per-project app's nests under the
+        // project.
+        let data = Path::new("/data/ops");
+        let p1 = Path::new("/home/u/proj");
+        let p2 = Path::new("/home/u/other");
+        let home = |project: &Path, rt| project_runtime(data, project, rt).home_src;
+
+        let default = home(p1, Runtime::ProjectDefault);
+        let global_a = home(p1, Runtime::GlobalApp("claude"));
+        let global_b = home(p1, Runtime::GlobalApp("opencode"));
+        let proj_a = home(p1, Runtime::ProjectApp("claude"));
+
+        // all four are distinct
+        for (x, y) in [
+            (&default, &global_a),
+            (&default, &proj_a),
+            (&global_a, &global_b),
+            (&global_a, &proj_a),
+        ] {
+            assert_ne!(x, y, "runtime homes must not collide");
+        }
+        // a global app keeps the same home across projects; a per-project one does not
+        assert_eq!(global_a, home(p2, Runtime::GlobalApp("claude")));
+        assert_ne!(proj_a, home(p2, Runtime::ProjectApp("claude")));
+        // the project default and a per-project app both nest under the same project dir
+        let project_dir = data.join("projects").join(project_id(p1));
+        assert!(default.starts_with(&project_dir));
+        assert!(proj_a.starts_with(&project_dir));
+        // a global app does not nest under any project dir
+        assert!(!global_a.starts_with(data.join("projects")));
     }
 
     #[test]
@@ -1223,6 +1293,7 @@ mod smoke {
         let spec = build_spec(
             data.path(),
             project.path(),
+            Runtime::ProjectDefault,
             &userland,
             &nix_mount,
             &overlay,
@@ -1354,6 +1425,7 @@ mod smoke {
         let foreign_spec = build_spec(
             data.path(),
             &proj,
+            Runtime::ProjectDefault,
             &userland,
             &nix_mount,
             &bare,
@@ -1394,6 +1466,7 @@ mod smoke {
         let cross_spec = build_spec(
             data.path(),
             &proj,
+            Runtime::ProjectDefault,
             &userland,
             &nix_mount,
             &with_tool,
@@ -1527,6 +1600,7 @@ mod smoke {
         let spec = build_spec(
             data.path(),
             &proj,
+            Runtime::ProjectDefault,
             &userland,
             &nix_mount,
             &overlay,
@@ -1689,6 +1763,7 @@ mod smoke {
         let spec = build_spec(
             data.path(),
             &proj,
+            Runtime::ProjectDefault,
             &userland,
             &nix_mount,
             &overlay,
@@ -1850,6 +1925,7 @@ mod smoke {
         let spec = build_spec(
             data.path(),
             &proj,
+            Runtime::ProjectDefault,
             &userland,
             &nix_mount,
             &overlay,
@@ -1971,6 +2047,7 @@ mod smoke {
             let spec = build_spec(
                 data.path(),
                 &proj,
+                Runtime::ProjectDefault,
                 &userland,
                 &nix_mount,
                 &overlay,

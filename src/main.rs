@@ -579,6 +579,12 @@ fn config_cmd() -> ExitCode {
                 app.cmd.join(" ")
             };
             println!("    {name}: {cmd}");
+            match app.home_scope {
+                config::AppHomeScope::Global => {
+                    println!("      home: global (shared across projects)")
+                }
+                config::AppHomeScope::Project => println!("      home: per-project"),
+            }
             if !app.packages.is_empty() {
                 let names: Vec<&str> = app.packages.iter().map(|p| p.name.as_str()).collect();
                 println!("      packages: {}", names.join(", "));

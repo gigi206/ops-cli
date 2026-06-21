@@ -24,7 +24,11 @@ impl TmpDir {
         // it matches production (the store lives on disk). `cargo clean` reclaims it.
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
-        d.push(format!("ops-run-it-{tag}-{}-{n}", std::process::id()));
+        // A short prefix on purpose: a launch's egress proxy binds a Unix socket under this
+        // data dir (`…/<dir>/ops/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path
+        // at 108 bytes. A longer prefix plus a 7-digit pid (counted twice — here and in the
+        // socket name) tips a deep checkout over the limit, so keep this terse.
+        d.push(format!("r-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -209,6 +213,68 @@ fn ops_app_launches_the_apps_command_with_its_overlay() {
         String::from_utf8_lossy(&missing.stderr).contains("no app named"),
         "unknown app must be named: {}",
         String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
+fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell() {
+    let project = TmpDir::new("apphome-proj");
+    let data = TmpDir::new("apphome-data");
+    // `counter` appends a line to a file in its own `$HOME` and prints the running count, so a
+    // second launch reveals whether the home persisted. The default home scope is global —
+    // one home per app — and this single project exercises persistence; isolation from the
+    // project shell is the second assertion.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[app.counter]\n\
+          cmd = [\"sh\", \"-c\", \"echo x >> \\\"$HOME/COUNT\\\"; wc -l < \\\"$HOME/COUNT\\\" | tr -d ' '\"]\n",
+    )
+    .unwrap();
+
+    // capability probe via `ops run -- true`; skip (not fail) if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping app-home e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // First launch: the home is fresh, so the count is 1.
+    let first = app_in(project.path(), data.path(), "counter");
+    assert!(
+        String::from_utf8_lossy(&first.stdout).trim() == "1",
+        "first launch should count 1, got: {:?}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    // Second launch of the same app: the home persisted, so the file is still there and the
+    // count is 2 — the persistence the app framework promises.
+    let second = app_in(project.path(), data.path(), "counter");
+    assert!(
+        String::from_utf8_lossy(&second.stdout).trim() == "2",
+        "second launch should count 2 (home persisted), got: {:?}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    // Isolation with teeth: `ops run` uses the project's default home, a different directory,
+    // so the app's COUNT file is absent there — the app's writable state never bleeds into the
+    // project shell.
+    let leaked = run_in(
+        project.path(),
+        data.path(),
+        &[
+            "sh",
+            "-c",
+            "test -e \"$HOME/COUNT\" && echo LEAKED || echo CLEAN",
+        ],
+    );
+    let leaked_out = String::from_utf8_lossy(&leaked.stdout);
+    assert!(
+        leaked_out.contains("CLEAN") && !leaked_out.contains("LEAKED"),
+        "the app's home leaked into the project shell: stdout={:?} stderr={:?}",
+        leaked_out,
+        String::from_utf8_lossy(&leaked.stderr)
     );
 }
 

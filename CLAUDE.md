@@ -156,6 +156,68 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   claude` e2e** (key injection via the proxy + an Anthropic allowlist; the credential hole is
   *bounded to the allowlist*, not closed — Step 3), and the **GUI/Wayland hole** for
   opencode/hermes desktop (Step 4).
+  **`ops app` framework — Step 2: per-app persistent isolated `$HOME` (DONE)**
+  (`src/config/schema.rs` + `config/mod.rs` + `sandbox/binds.rs` + `launch.rs` + `main.rs`):
+  the **creds dir** — each `ops app <name>` gets a **dedicated, persistent, isolated `$HOME`**
+  so the app's config, login state, and history never bleed into the project shell or another
+  app (the threat-model row "a dedicated, persistent, isolated creds dir, mounted for that tool
+  alone"; the security-stack "each app … its own `$HOME`"). The home is **always** per-app and
+  isolated from the project's default shell home; a new per-app **`home_scope`** chooses whether
+  it is *also* per-project: **`"global"` (the default, user's call) — one home per app shared
+  across every project** (`<data>/apps/<name>/home`), so an agent keeps a single identity
+  everywhere; **`"project"` (opt-in)** — a home per `(project, app)`
+  (`<data>/projects/<id>/apps/<name>/home`), isolating what the agent writes in one project from
+  another. A `binds::Runtime` (`ProjectDefault | GlobalApp(name) | ProjectApp(name)`) is threaded
+  `build → build_spec → project_runtime`; `ops run`/`ops shell` keep `ProjectDefault` (the
+  project's shared home, unchanged). The synthetic `/etc` stays a **sibling** of the home for
+  every scope, so the read-only-identity integrity invariant holds without special-casing.
+  **`home_scope` is integrity-gated exactly like `cmd`** (`home_scope_trusted`): an untrusted
+  project may set the scope of *its own* app but **may not flip a trusted app `"project"` →
+  `"global"`** — that would route the untrusted run into the home a trusted run shares (the
+  contamination vector); the safe direction (`"global"` → `"project"`, more isolation) is
+  allowed. **App-name validation** (`is_valid_app_name`: 1–64 of `[A-Za-z0-9._-]`, not `.`/`..`)
+  drops an unsafe name with a warning at resolve time — the name now keys an **on-disk** home
+  directory, so a traversal/odd-charset name must never reach the launcher (fail-closed). The
+  per-project **store (`/nix`, rw), the nixpkgs/tools locks, and the mise-config staging stay
+  project-scoped (shared across apps)** — only the home + its sibling `/etc` become app-scoped; a
+  consciously-accepted **cross-app integrity residual** (app A's self-equip writes are visible to
+  app B in the same project) within the already-documented same-uid self-harm class — per-app
+  *home* isolation is **not** per-app *store* isolation. **Residual specific to the global scope
+  (advisor-caught, documented not fixed):** `MISE_DATA_DIR` lives under `$HOME`, so a
+  `"global"`-scope app's mise activation state (`mise use`'s `config.toml` + shims) is **shared
+  across projects**, while the store backing `/nix` is **per-project** (`seed_project_store` keys
+  on the cwd). So an agent in a global app that `mise use`s a `nix:` tool in project A persists
+  the *activation* globally but builds the tool's store path into project A's store only — in
+  project B mise believes the tool active while B's store lacks it (**offline: a hard failure;
+  online: a silent rebuild**). This is *new in Step 2* (before, an app used the per-project home,
+  so mise-data and store were aligned). It dents the self-equip persistence promise specifically
+  for global apps; the **already-present mitigation is `home_scope = "project"`** (mise-data and
+  store both per-project, aligned), and the only clean fix for the global case is splitting the
+  home (creds/config global, mise-data per-project) — **named, not built**. The creds/login/
+  identity the user chose global *for* persist correctly; only tool self-equip is the caveat.
+  Reasoned from the path layout, not separately e2e-proven (a discriminating test needs two full
+  project provisions). `ops config` shows each app's
+  `home: global (shared across projects)` / `home: per-project`. **The residual the user accepted
+  by choosing the global default:** an agent run on an untrusted project writes into the same
+  global home a trusted project's run uses (`"project"` is the per-app mitigation knob); with
+  Step-3's proxy-injected key the credential is **not** in the home, so the re-login cost of
+  `"project"` mostly does not apply. **525 tests green** (schema parse extended + 4 config unit
+  [default/set, integrity-gate widening refused, unknown value defaults global, unsafe name
+  dropped] + 1 binds unit [each scope a distinct home, a global app project-independent, a
+  per-project app nests under the project] + the `ops config` integration extended + a
+  **real-sandbox e2e that ran** —
+  `an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell`: two `ops app`
+  launches count 1→2 = persistence, an `ops run` sees no `COUNT` = isolation from the project
+  shell), fmt/clippy clean, **musl static build verified**, advisor-reviewed (plan — it caught
+  that the keying default was the user's call, not mine, and had me re-read the secrets doc to
+  confirm the creds-dir IS the mounted `$HOME` — AND impl). **Also fixed a pre-existing test
+  flake** (own concern, not Step 2): the egress proxy binds a Unix socket under the test data
+  dir (`…/ops/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path at 108 bytes; a
+  7-digit pid plus the long `run.rs` temp prefix tipped two secret e2e tests over `SUN_LEN`, so
+  the temp-dir prefix was shortened. **No built-in apps + export/import (user, 2026-06-20):** ops
+  ships **zero** apps — every profile is a separate, portable artifact authored independently and
+  **imported** (a conscious trust act; may reuse the signed-store machinery). The ramp is now
+  3) flagship `ops app claude` e2e, 4) **export/import of app profiles**, 5) the GUI/Wayland hole.
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

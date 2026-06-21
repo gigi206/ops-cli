@@ -79,6 +79,13 @@ pub(crate) struct RawApp {
     /// Credentials the egress proxy injects for this app. A security field, effective only
     /// under a network allowlist, like the baseline `[secret]` section.
     pub(crate) secret: Option<RawSecretSection>,
+    /// Where this app's persistent `$HOME` (its config, login state, history) lives:
+    /// `"global"` (the default) — one home per app, shared across every project, so the app
+    /// keeps a single identity wherever it runs; or `"project"` — a home per (project, app),
+    /// isolating what the agent writes in one project from another. An *integrity* field: an
+    /// untrusted project may set the scope of its own app but may not move a trusted app from
+    /// `"project"` to `"global"` (which would let it write into the shared home).
+    pub(crate) home_scope: Option<String>,
 }
 
 /// The command form of an app's `cmd`: a full argv (`["claude", "--flag"]`) or a bare
@@ -291,6 +298,7 @@ mod tests {
             br#"
             [app.claude]
             cmd = "claude"
+            home_scope = "project"
             [app.claude.packages]
             claude-code = "claude-code"
 
@@ -307,6 +315,9 @@ mod tests {
                 .map(|c| c.clone().into_argv()),
             Some(vec!["claude".to_string()])
         );
+        // the optional home scope parses as a bare string; an app without it leaves it unset
+        assert_eq!(cfg.app["claude"].home_scope.as_deref(), Some("project"));
+        assert_eq!(cfg.app["build"].home_scope, None);
         assert_eq!(
             cfg.app["claude"]
                 .packages

@@ -1246,7 +1246,10 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
          cmd = [\"id\"]\n\
          binds = [{bind:?}]\n\
          [app.probe.packages]\n\
-         tool = \"ripgrep\"\n",
+         tool = \"ripgrep\"\n\
+         [app.review]\n\
+         cmd = [\"id\"]\n\
+         home_scope = \"project\"\n",
         bind = bind.display().to_string()
     ));
 
@@ -1259,6 +1262,16 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
     assert!(
         stdout.contains("probe: id"),
         "app command missing:\n{stdout}"
+    );
+    // The home scope is shown: `probe` defaults to a global home, `review` opted into a
+    // per-project one.
+    assert!(
+        stdout.contains("home: global"),
+        "the default global home scope must show:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("home: per-project"),
+        "an opted-in per-project home scope must show:\n{stdout}"
     );
     assert!(
         stdout.contains("packages: tool"),
