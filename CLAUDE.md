@@ -104,7 +104,13 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
   reqwest), so in-cage TLS no longer depends on the host's `/etc/ssl`; and the base
   carries a small curated CLI set (`curl git less grep sed awk find which`) sharing the
-  base glibc, so an agent gets the everyday tools without declaring them.** **M4.1 done —
+  base glibc, so an agent gets the everyday tools without declaring them.** **M3.5 done —
+  `ops search <query>`: a host-side, read-only, no-trust-gate tool-discovery front-end over
+  nixhub (the heavy `nix search` dropped after a probe found nixhub's fuzzy endpoint covers it);
+  a fuzzy query lists matches, an exact name leads with that package's versions + the
+  `nix:`/`[packages]` declaration lines; rides the shared nix fetcher (no new dep), free query
+  percent-encoded safe-by-construction, version-fetch failure is best-effort (keeps the list).**
+  **M4.1 done —
   the first in-cage enforcement layer: a two-filter `seccompiler` cBPF **seccomp denylist
   (Posture A)** handed to bwrap via `--add-seccomp-fd`, blocking the historically-abused
   syscall set AND the mount/ns family (so the userns→mount→overlayfs/`pivot_root` LPE
@@ -461,6 +467,34 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (fmt/clippy clean), advisor-reviewed (plan AND impl). The threat-model bind-layout doc row
   was split: `/etc/ssl/certs` is now **ops's own cacert (ro)**, distinct from the host's
   best-effort `/etc/resolv.conf`.
+  **M3.5 — `ops search` (tool discovery, DONE)** (`src/sandbox/search.rs` + `nixhub.rs` +
+  `mod.rs` + `main.rs`): a host-side, **read-only**, **no-trust-gate** discovery front-end
+  (the posture of a plain `nix search`) that turns "what `nix:` tool do I declare?" into one
+  command. **Spike-decided away from `nix search`:** probes found nixhub exposes a fuzzy
+  endpoint (`search.devbox.sh/v2/search?q=`, `{results:[{name,summary}]}`), so the whole
+  increment is nixhub-based — lighter and reusing the resolver's machinery — and the heavy
+  `nix search` (full nixpkgs eval, tens of seconds cold) was **dropped as unnecessary**.
+  **Two behaviours over one verb** (the user's "floue + versions" scope): a fuzzy query lists
+  matches (`name — summary`, capped at 25, name column capped so one long `python312Packages.…`
+  cannot blow out alignment); when the query **names a package exactly** (case-insensitive), the
+  report **leads** with that package's versions for the host system + the lines to declare it
+  (`[tools] "nix:<pkg>" = "<latest>"` / `[packages] <pkg> = "<attr>"`) and a compact `related:`
+  footer. **No new dependency:** the one network step rides the **shared** nix fetcher — the old
+  private `fetch_metadata` was generalised to `fetch_url_json` (the `builtins.fetchurl { url;
+  name; }` form, an explicit store-path name so a query-string URL with percent-encoding's `%`
+  fetches cleanly — the bare-string form errors on `%`), reused by both search and the resolver;
+  `platform_for` exposed so the version shape is read in one place. **Free-form query made safe by
+  construction:** percent-encoded to the RFC-3986 unreserved set before it reaches the URL, so it
+  carries no `"`/`$`/`\`/space/control to escape the nix string literal (the resolver's
+  validated-pkg interpolation trick does not apply to a free query — the advisor's point). **Three
+  exact-hit states, not two** (advisor-caught best-effort bug): the version GET is *enrichment*
+  over a search that already succeeded, so its failure is `Exact::Unavailable` → render the list +
+  a "could not fetch versions" note, **never** discard the list (the naive `?` did) and **never**
+  the absurd "name a package exactly" nudge after the user already named one (the `Err(_)=>None`
+  trap); the no-host-build case is the third state. **509 tests green** (9 net-new search unit +
+  the failure-state render branch + a live skip-not-fail integration that *ran*), fmt/clippy clean,
+  musl static build verified, advisor-reviewed (plan AND impl). Proven live: `ops search jq`
+  (versions-first + declare hints), `ops search ripgr` (capped fuzzy list + exact-name nudge).
   **M6.0 — the network slice + the P-vs-B architecture lock** (`src/config/` +
   `src/sandbox/launch.rs` + `ops config`): the network increment ("network last")
   opened with its **cheapest, decision-independent slice** — a trusted-only

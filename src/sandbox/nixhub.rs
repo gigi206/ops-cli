@@ -31,6 +31,10 @@ const NIX_PREFIX: &str = "nix:";
 /// releases and, per release, the nixpkgs commit and attribute that shipped it.
 const NIXHUB_BASE: &str = "https://search.devbox.sh/v2/pkg?name=";
 
+/// The nixhub fuzzy-search endpoint. A GET of `<base><url-encoded query>` returns the
+/// matching packages with a name and one-line summary each. Used by `ops search`.
+pub(crate) const NIXHUB_SEARCH_BASE: &str = "https://search.devbox.sh/v2/search?q=";
+
 /// The idiomatic version file, which is line-oriented rather than TOML.
 const TOOL_VERSIONS: &str = ".tool-versions";
 
@@ -529,11 +533,14 @@ pub(crate) fn resolve(
     })
 }
 
-/// Fetch a package's nixhub metadata as JSON, using nix's `fetchurl` + `readFile` so
-/// the HTTP request rides nix's own fetcher (no added HTTP dependency) and lands in
-/// ops's own store, never the host's `/nix`. `pkg` is re-validated here so a value that
-/// somehow reached this point cannot break out of the nix expression string.
-fn fetch_metadata(nix: &Path, layout: &Layout, pkg: &str) -> io::Result<serde_json::Value> {
+/// Fetch a package's nixhub metadata as JSON. `pkg` is re-validated here so a value
+/// that somehow reached this point cannot break out of the request URL, then the GET
+/// rides the shared fetcher. Exposed so `ops search` can show an exact match's versions.
+pub(crate) fn fetch_metadata(
+    nix: &Path,
+    layout: &Layout,
+    pkg: &str,
+) -> io::Result<serde_json::Value> {
     if !is_valid_pkg(pkg) {
         return Err(io::Error::other(format!(
             "refusing to fetch metadata for invalid package name `{pkg}`"
@@ -541,19 +548,37 @@ fn fetch_metadata(nix: &Path, layout: &Layout, pkg: &str) -> io::Result<serde_js
     }
     // `pkg` is restricted to `[A-Za-z0-9._+-]`, so it carries no quote, `$`, or
     // backslash and cannot escape the quoted nix string or the URL's `name=`.
-    let expr = format!("builtins.readFile (builtins.fetchurl \"{NIXHUB_BASE}{pkg}\")");
+    fetch_url_json(nix, layout, &format!("{NIXHUB_BASE}{pkg}"))
+}
+
+/// Fetch a URL's body and parse it as JSON, using nix's `fetchurl` + `readFile` so the
+/// request rides nix's own HTTP+TLS fetcher (no added HTTP dependency) and the body
+/// lands in ops's own store, never the host's `/nix`. The `{ url; name; }` form gives
+/// the store path a fixed name, so a URL carrying a query string — including
+/// percent-encoding, whose `%` is illegal in a derived store-path name — fetches
+/// cleanly. `url` must already be safe to place in a nix string literal: callers build
+/// it from a validated package name or a percent-encoded query, so it carries no quote,
+/// `$`, or backslash to escape the expression.
+pub(crate) fn fetch_url_json(
+    nix: &Path,
+    layout: &Layout,
+    url: &str,
+) -> io::Result<serde_json::Value> {
+    let expr = format!(
+        "builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"ops-nixhub\"; }})"
+    );
     let out = store::nix_command(nix, layout)
         .args(["--extra-experimental-features", "nix-command flakes"])
         .args(["eval", "--impure", "--raw", "--expr", &expr])
         .output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
-            "fetching nixhub metadata for `{pkg}` failed: {}",
+            "fetching {url} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
     serde_json::from_slice(&out.stdout)
-        .map_err(|e| io::Error::other(format!("parsing nixhub metadata for `{pkg}`: {e}")))
+        .map_err(|e| io::Error::other(format!("parsing JSON from {url}: {e}")))
 }
 
 /// Select the nixpkgs pin for `version_req` on `system` from a package's nixhub
@@ -626,8 +651,12 @@ fn pick_by_version<'a>(
 }
 
 /// The platform entry of `release` whose `system` matches, or `None` when the release
-/// ships no build for it.
-fn platform_for<'a>(release: &'a serde_json::Value, system: &str) -> Option<&'a serde_json::Value> {
+/// ships no build for it. Exposed so `ops search` reads a release's per-system commit
+/// and attribute through the same accessor the resolver uses (no shape drift).
+pub(crate) fn platform_for<'a>(
+    release: &'a serde_json::Value,
+    system: &str,
+) -> Option<&'a serde_json::Value> {
     release
         .get("platforms")?
         .as_array()?

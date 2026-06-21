@@ -45,20 +45,21 @@ fn main() -> ExitCode {
             sandbox::run(cmd)
         }
         Some("mise") => sandbox::run_mise(args.collect()),
+        Some("search") => search_cmd(args.collect()),
         Some("test") => test_cmd(args.collect()),
         Some("plugins") => plugins_cmd(args.collect()),
         Some(other) => {
             eprintln!(
-                "ops: unknown command '{other}' (known: doctor, shell, run, mise, test, \
-                 plugins, ps, trust, untrust, config, upgrade)"
+                "ops: unknown command '{other}' (known: doctor, shell, run, mise, search, \
+                 test, plugins, ps, trust, untrust, config, upgrade)"
             );
             ExitCode::from(2)
         }
         None => {
             eprintln!(
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
-                 test net <url> | plugins <list|info|install|rm|store> | ps | trust [path] | \
-                 untrust [path] | config | upgrade [all|nix|mise]>"
+                 search <query> | test net <url> | plugins <list|info|install|rm|store> | \
+                 ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise]>"
             );
             ExitCode::from(2)
         }
@@ -567,6 +568,42 @@ fn config_cmd() -> ExitCode {
         eprintln!("ops: warning: {w}");
     }
     ExitCode::SUCCESS
+}
+
+/// `ops search <query>`: discover the `nix:` tools (and `[packages]` attributes) a
+/// project can declare, by querying nixhub. Host-side and read-only — it resolves
+/// nothing into the sandbox and needs no trust gate (a discovery front-end, like a plain
+/// `nix search`). It needs nix only to ride its fetcher for the one network step.
+fn search_cmd(args: Vec<OsString>) -> ExitCode {
+    // The query is the first non-flag argument; any further words are ignored (nixhub
+    // matches a single token, so a multi-word search is pointless — quote a phrase to
+    // pass it as one argument if ever needed).
+    let query = args
+        .iter()
+        .filter_map(|a| a.to_str())
+        .find(|a| !a.starts_with('-'));
+    let Some(query) = query else {
+        eprintln!("ops: usage: ops search <query>");
+        return ExitCode::from(2);
+    };
+    let Some(nix) = store::resolve_nix() else {
+        eprintln!("ops: nix not found — `ops search` needs it to query nixhub. See `ops doctor`.");
+        return ExitCode::FAILURE;
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    match sandbox::search(&nix, &layout, query, &sandbox::current_system()) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ops search: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `ops test <kind> <target>`: probe whether an access would be allowed and explain why —
