@@ -108,6 +108,65 @@ pub(crate) fn run(cmd: Vec<OsString>) -> ExitCode {
     }
 }
 
+/// `ops app <name>`: launch the named application profile — the project sandbox baseline
+/// plus the app's gated overlay, running the command the app declares. Apps run in the same
+/// locked-down posture as `ops run`; the overlay's security fields took effect only if their
+/// source was trusted (the global config or a trusted project), so launching an app on
+/// untrusted code is as safe as `ops run` there.
+pub(crate) fn app(name: &str) -> ExitCode {
+    let mut prep = match prepare() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let Some(app) = prep.cfg.apps.remove(name) else {
+        eprintln!("ops: no app named `{name}`.{}", available_apps(&prep.cfg));
+        return ExitCode::from(2);
+    };
+    if app.cmd.is_empty() {
+        eprintln!(
+            "ops: app `{name}` declares no command — add a `cmd` to its `[app.{name}]` table."
+        );
+        return ExitCode::FAILURE;
+    }
+    // The argv is owned by the app; extract it before the overlay is folded in (which moves
+    // the app but never touches its command).
+    let cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
+    eprintln!("ops: launching app `{name}`");
+    prep.cfg.merge_app(app);
+
+    let (spec, egress) = match build(&prep, cmd) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    register(prep.layout.data_dir(), &spec, Kind::Run);
+
+    match egress {
+        None => {
+            let err = exec(&prep.bwrap, &spec);
+            eprintln!("ops: failed to launch the sandbox: {err}");
+            ExitCode::FAILURE
+        }
+        Some(guard) => {
+            let code = run_supervised(&prep.bwrap, &spec);
+            drop(guard);
+            code
+        }
+    }
+}
+
+/// A suffix for the "no such app" error: " (available: a, b)" listing the configured app
+/// names, or a note that none are configured — so a typo or an unconfigured name points at
+/// what exists.
+fn available_apps(cfg: &crate::config::Resolved) -> String {
+    if cfg.apps.is_empty() {
+        " No apps are configured.".to_string()
+    } else {
+        let names: Vec<&str> = cfg.apps.keys().map(String::as_str).collect();
+        format!(" (available: {})", names.join(", "))
+    }
+}
+
 /// `ops mise [args...]`: run mise inside the project's open cage, where it can
 /// self-equip the project's `nix:` tools (`ops mise install nix:<pkg>`) into the
 /// project's own writable store. Sugar over `ops run -- mise [args...]`: mise is
@@ -889,6 +948,7 @@ mod tests {
             mise: None,
             network: crate::config::NetworkPolicy::default(),
             secrets: vec![],
+            apps: std::collections::BTreeMap::new(),
             warnings: vec![],
         }
     }

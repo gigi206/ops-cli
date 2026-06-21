@@ -124,6 +124,38 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   never a hard-fail); one `limiter()` decision shared by launch + doctor; wired at all three launch
   sites + a doctor line. 500 tests green. The M4 enforcement stack is complete (seccomp + cgroups);
   Landlock-FS is a deferred defense-in-depth option, not a gap.**
+  **`ops app` framework — Step 1 (DONE)** (`src/config/schema.rs` + `config/mod.rs` +
+  `sandbox/launch.rs` + `mod.rs` + `main.rs`): the flagship surface — a **named, reusable
+  agent launcher** — landed as its framework slice. A `[app.<name>]` table (declarable in
+  the **global OR project** config) carries a `cmd` (argv; a bare string is a one-element
+  argv, **never whitespace-split** → zero quoting surface) plus a security/free overlay
+  (`env`/`binds`/`packages`/`network`/`secret`). **Two-layer noun** (sandbox baseline +
+  named app overlay; the reusable *preset* noun is deferred, YAGNI/additive). **Layering =
+  global → project → app, override per field, each security field gated by the trust of the
+  layer that supplied it** (`resolve_app`/`resolve_apps` mirror the baseline gating: a
+  global app is **trusted-by-location**, a project app rides its own verdict). `merge_app`
+  is then a **pure merge** over the resolved baseline (env upsert, packages override-by-name,
+  binds/secrets unioned, network override-if-set) followed by a **re-check of the
+  secret↔posture invariant** (`enforce_secret_posture`) — an app may add secrets or flip the
+  posture, so the check runs post-merge. **Flagship property:** a **globally-declared app
+  keeps its posture even under an untrusted project** — the whole point is to run an agent
+  *on* untrusted code safely. The verb is **`ops app <name>`** (umbrella name, future-proof
+  for TUI and GUI agents alike); `ops config` lists each app (cmd, packages, network, secret
+  count, per-app gating notes). **Advisor-caught integrity fix:** `cmd` is **integrity-gated**
+  — an untrusted project may define *its own* app but **cannot override the `cmd` of a
+  trusted/global app** (else `ops app claude` would launch attacker code under the app's
+  posture); a `cmd_trusted` flag drops+warns the untrusted override. **Every app is Mode B**
+  (the locked-down agent posture) — the `mode` field is **deliberately deferred** (additive,
+  default-agent, for when a concrete interactive Mode-A tool appears); GUI is a separate
+  *hole* axis (Wayland), not a mode. **519 tests green** (1 schema parse + 7 config unit
+  [layering/gating/merge/cmd-integrity] + 1 `ops config` integration + 1 **real-sandbox e2e**
+  that ran: a `[app.probe]` runs under the synthetic identity, a free-env overlay reaches the
+  cage, an unknown app exits 2), fmt/clippy clean, **musl static build verified**,
+  advisor-reviewed (plan AND impl). **Honest scope — this is the *framework*; deferred to
+  later steps:** the **persistent isolated creds dir** (Step 2), the **flagship `ops app
+  claude` e2e** (key injection via the proxy + an Anthropic allowlist; the credential hole is
+  *bounded to the allowlist*, not closed — Step 3), and the **GUI/Wayland hole** for
+  opencode/hermes desktop (Step 4).
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

@@ -1236,3 +1236,49 @@ fn publish_then_add_and_install_through_a_real_clone() {
         "the installed plugin must appear in `plugins list`:\n{stdout}"
     );
 }
+
+#[test]
+fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
+    let fx = Fixture::new();
+    let bind = fx.bind_target("appdir");
+    fx.write_project(&format!(
+        "[app.probe]\n\
+         cmd = [\"id\"]\n\
+         binds = [{bind:?}]\n\
+         [app.probe.packages]\n\
+         tool = \"ripgrep\"\n",
+        bind = bind.display().to_string()
+    ));
+
+    // Untrusted: the app shows with its command and package, but its bind is a security
+    // field — dropped, with a note on the app.
+    let out = fx.run(&["config"]);
+    assert!(out.status.success(), "config must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("apps:"), "apps section missing:\n{stdout}");
+    assert!(
+        stdout.contains("probe: id"),
+        "app command missing:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("packages: tool"),
+        "app package missing:\n{stdout}"
+    );
+    assert!(
+        stdout.to_lowercase().contains("note:") && stdout.to_lowercase().contains("bind"),
+        "an untrusted app's bind must be dropped with a note:\n{stdout}"
+    );
+
+    // Trusted: the bind is honored — no drop note remains.
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    let out = fx.run(&["config"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("probe: id"),
+        "app command missing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("note:"),
+        "a trusted app must not drop its bind:\n{stdout}"
+    );
+}

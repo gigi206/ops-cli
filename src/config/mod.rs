@@ -21,10 +21,10 @@ use crate::allowlist::Rule;
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
-    NetworkField, NetworkTable, RawConfig, RawHostSecret, RawHostSecrets, RawSecretDefaults,
-    SecretFrom,
+    NetworkField, NetworkTable, RawApp, RawConfig, RawHostSecret, RawHostSecrets,
+    RawSecretDefaults, SecretFrom,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -352,8 +352,65 @@ pub(crate) struct Resolved {
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
     pub(crate) secrets: Vec<HeaderSecret>,
+    /// Named application launch profiles, each a gated overlay over this baseline. Keyed
+    /// by name; `ops app <name>` looks one up and folds it on with [`Resolved::merge_app`].
+    /// `ops run`/`ops shell` ignore them.
+    pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
     pub(crate) warnings: Vec<String>,
+}
+
+/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
+/// environment, binds, packages, network posture, and credentials it declares — each
+/// already gated by the trust of the layer that supplied it (the global config, trusted by
+/// location, or a project layer by its verdict). `ops app <name>` folds this onto the
+/// baseline with [`Resolved::merge_app`].
+pub(crate) struct ResolvedApp {
+    /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
+    /// silent default.
+    pub(crate) cmd: Vec<String>,
+    /// Extra environment, in application order; folded over the baseline's so the app wins.
+    pub(crate) env: Vec<(String, String)>,
+    /// Extra read-only host binds (absolute; canonicalized in [`load`], like the baseline).
+    pub(crate) ro_binds: Vec<PathBuf>,
+    /// Extra tools, each tagged with its source's trust; override a baseline tool by name.
+    pub(crate) packages: Vec<Package>,
+    /// The app's own network posture, set only when a trusted source declared one. `Some`
+    /// overrides the baseline; `None` leaves the baseline posture in place.
+    pub(crate) network: Option<NetworkPolicy>,
+    /// Credentials to inject for this app (gated; the plaintext never enters the cage).
+    pub(crate) secrets: Vec<HeaderSecret>,
+    /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
+    /// launched, not on every `ops run`.
+    pub(crate) warnings: Vec<String>,
+}
+
+impl Resolved {
+    /// Fold an app's overlay onto this baseline with precedence **app > baseline**: the
+    /// app's environment upserts over the baseline's, its packages override by name, its
+    /// binds and credentials add, and its network posture (when it set one) replaces the
+    /// baseline's. Every value was gated at resolve time, so this is a pure merge — no
+    /// re-gating. The secret-vs-posture consistency is re-checked at the end, since the
+    /// overlay can add secrets or change the posture.
+    pub(crate) fn merge_app(&mut self, app: ResolvedApp) {
+        for (key, val) in app.env {
+            upsert(&mut self.env, key, val);
+        }
+        for pkg in app.packages {
+            upsert_package(&mut self.packages, pkg.name, pkg.attr, pkg.state);
+        }
+        for bind in app.ro_binds {
+            if !self.ro_binds.contains(&bind) {
+                self.ro_binds.push(bind);
+            }
+        }
+        if let Some(network) = app.network {
+            self.network = network;
+        }
+        self.secrets.extend(app.secrets);
+        self.warnings.extend(app.warnings);
+        enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
+    }
 }
 
 /// Layer the global config (trusted by location) under the project config, gating
@@ -364,10 +421,17 @@ pub(crate) struct Resolved {
 /// an untrusted one. Security fields (`binds`) apply only from a trusted project;
 /// an untrusted or since-changed project's binds are dropped with a warning.
 fn resolve(
-    global: RawConfig,
-    project: Option<(RawConfig, TrustState)>,
+    mut global: RawConfig,
+    mut project: Option<(RawConfig, TrustState)>,
     plugins: &PluginRegistry,
 ) -> Resolved {
+    // Lift the app overlays out before the baseline fields are consumed below; they are
+    // resolved and gated on their own at the end (each app a self-contained overlay).
+    let global_apps = std::mem::take(&mut global.app);
+    let project_apps = project
+        .as_mut()
+        .map(|(proj, state)| (std::mem::take(&mut proj.app), *state));
+
     let mut warnings = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut binds: Vec<PathBuf> = Vec::new();
@@ -492,19 +556,9 @@ fn resolve(
         }
     }
 
-    // Credential injection is performed by the filtering proxy, which exists only under a
-    // network allowlist. Under `shared` (no proxy) or `none` (no traffic) there is nowhere
-    // to inject, so the secrets are cleared rather than silently ignored — a loud warning,
-    // never a no-op the user mistakes for working injection. (The plaintext is never read,
-    // so dropping is fail-safe.)
-    if !secrets.is_empty() && !matches!(network, NetworkPolicy::Allowlist(_)) {
-        warnings.push(format!(
-            "ignoring {} HTTP-header secret(s): credential injection requires \
-             `[network] mode = \"allowlist\"` (the filtering proxy that injects them)",
-            secrets.len()
-        ));
-        secrets.clear();
-    }
+    enforce_secret_posture(&network, &mut secrets, &mut warnings);
+
+    let apps = resolve_apps(global_apps, project_apps, &secret_defaults, plugins);
 
     Resolved {
         env,
@@ -516,8 +570,207 @@ fn resolve(
         mise: None,
         network,
         secrets,
+        apps,
         warnings,
     }
+}
+
+/// Clear injected credentials unless the posture is an allowlist. Injection is performed by
+/// the filtering proxy, which exists only under a network allowlist; under `shared` (no
+/// proxy) or `none` (no traffic) there is nowhere to inject, so the secrets are cleared with
+/// a loud warning rather than left as a no-op the user mistakes for working injection. (The
+/// plaintext is never read, so dropping is fail-safe.) Shared by the baseline resolution and
+/// the per-app overlay, which can add secrets or change the posture.
+fn enforce_secret_posture(
+    network: &NetworkPolicy,
+    secrets: &mut Vec<HeaderSecret>,
+    warnings: &mut Vec<String>,
+) {
+    if !secrets.is_empty() && !matches!(network, NetworkPolicy::Allowlist(_)) {
+        warnings.push(format!(
+            "ignoring {} HTTP-header secret(s): credential injection requires \
+             `[network] mode = \"allowlist\"` (the filtering proxy that injects them)",
+            secrets.len()
+        ));
+        secrets.clear();
+    }
+}
+
+/// Resolve every declared app into a gated overlay. The set of names is the union of the
+/// global and project app tables; each app is layered global-under-project and gated by the
+/// trust of the layer that supplied each field — identical to the baseline.
+fn resolve_apps(
+    mut global_apps: BTreeMap<String, RawApp>,
+    project_apps: Option<(BTreeMap<String, RawApp>, TrustState)>,
+    secret_defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) -> BTreeMap<String, ResolvedApp> {
+    let (mut project_apps, project_state) = match project_apps {
+        Some((map, state)) => (map, Some(state)),
+        None => (BTreeMap::new(), None),
+    };
+    let names: BTreeSet<String> = global_apps
+        .keys()
+        .chain(project_apps.keys())
+        .cloned()
+        .collect();
+    let mut out = BTreeMap::new();
+    for name in names {
+        let global = global_apps.remove(&name);
+        let project = project_apps.remove(&name).zip(project_state);
+        let resolved = resolve_app(&name, global, project, secret_defaults, plugins);
+        out.insert(name, resolved);
+    }
+    out
+}
+
+/// Resolve one app: layer its global definition (trusted by location) under its project
+/// definition (gated by the project's verdict), reusing the baseline's per-field gating. The
+/// project layer overrides the global per field. Security fields (`binds`/`network`/`secret`)
+/// are honored only from a trusted source; `env` is free (denylisted for an untrusted
+/// project); the command may come from either (the project wins). Each app collects its own
+/// warnings, surfaced when the app is launched rather than on every `ops run`.
+fn resolve_app(
+    name: &str,
+    global: Option<RawApp>,
+    project: Option<(RawApp, TrustState)>,
+    secret_defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) -> ResolvedApp {
+    let mut warnings = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut ro_binds: Vec<PathBuf> = Vec::new();
+    let mut packages: Vec<Package> = Vec::new();
+    let mut secrets: Vec<HeaderSecret> = Vec::new();
+    let mut network: Option<NetworkPolicy> = None;
+    let mut cmd: Vec<String> = Vec::new();
+    // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
+    // *own* app's command, but may not override the command of an app a trusted layer defined
+    // — else `ops app claude` against an untrusted repo would silently run the repo's command
+    // under the trusted app's posture (an integrity-of-intent hijack).
+    let mut cmd_trusted = false;
+
+    // The global layer — trusted by location, honored in full.
+    if let Some(app) = global {
+        let source = app_source(GLOBAL_CONFIG, name);
+        apply_env(&mut env, &mut warnings, &source, app.env, false);
+        apply_binds(&mut ro_binds, &mut warnings, &source, app.binds);
+        apply_packages(
+            &mut packages,
+            &mut warnings,
+            &source,
+            app.packages,
+            TrustState::Trusted,
+        );
+        if let Some(field) = app.network {
+            network = validate_network(&mut warnings, &source, field);
+        }
+        if let Some(section) = app.secret {
+            apply_app_secret(
+                &mut secrets,
+                &mut warnings,
+                &source,
+                section,
+                secret_defaults,
+                plugins,
+            );
+        }
+        if let Some(c) = app.cmd {
+            cmd = c.into_argv();
+            cmd_trusted = true;
+        }
+    }
+
+    // The project layer — gated by the project's verdict, overriding the global per field.
+    if let Some((app, state)) = project {
+        let trusted = state == TrustState::Trusted;
+        let source = app_source(PROJECT_CONFIG, name);
+        apply_env(&mut env, &mut warnings, &source, app.env, !trusted);
+        if !app.binds.is_empty() {
+            if trusted {
+                apply_binds(&mut ro_binds, &mut warnings, &source, app.binds);
+            } else {
+                warnings.push(dropped_binds_warning(state, app.binds.len()));
+            }
+        }
+        apply_packages(&mut packages, &mut warnings, &source, app.packages, state);
+        if let Some(field) = app.network {
+            if trusted {
+                if let Some(policy) = validate_network(&mut warnings, &source, field) {
+                    network = Some(policy);
+                }
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `network` policy ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        if let Some(section) = app.secret {
+            if trusted {
+                apply_app_secret(
+                    &mut secrets,
+                    &mut warnings,
+                    &source,
+                    section,
+                    secret_defaults,
+                    plugins,
+                );
+            } else {
+                let n = count_host_secrets(&section.hosts);
+                if n > 0 {
+                    warnings.push(format!(
+                        "{source}: ignoring {n} secret(s) ({})",
+                        untrusted_reason(state)
+                    ));
+                }
+            }
+        }
+        if let Some(c) = app.cmd {
+            if trusted || !cmd_trusted {
+                cmd = c.into_argv();
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `cmd` override of a trusted app ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+    }
+
+    ResolvedApp {
+        cmd,
+        env,
+        ro_binds,
+        packages,
+        network,
+        secrets,
+        warnings,
+    }
+}
+
+/// Apply an app's `[app.<name>.secret]` section, merging any app-level `defaults` over the
+/// base resolver defaults before resolving each host's credential — the same shape as the
+/// baseline `[secret]` section.
+fn apply_app_secret(
+    out: &mut Vec<HeaderSecret>,
+    warnings: &mut Vec<String>,
+    source: &str,
+    section: schema::RawSecretSection,
+    base_defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) {
+    let effective = match &section.defaults {
+        Some(raw) => base_defaults.merged_with(raw),
+        None => base_defaults.clone(),
+    };
+    apply_secret_section(out, warnings, source, section.hosts, &effective, plugins);
+}
+
+/// The warning source label for a field of `[app.<name>]` in a given config file — e.g.
+/// `".ops.toml [app.claude]"` — so a dropped app field reads as clearly as a baseline one.
+fn app_source(config: &str, name: &str) -> String {
+    format!("{config} [app.{name}]")
 }
 
 /// Fold a layer's environment into `out`: drop a malformed key, drop a reserved
@@ -1313,6 +1566,13 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
     let declared = std::mem::take(&mut resolved.ro_binds);
     resolved.ro_binds = canonicalize_binds(declared, &mut resolved.warnings);
 
+    // Each app's binds are canonicalized the same way, into that app's own warnings — so an
+    // app overlay also advertises only the binds the launch would actually make.
+    for app in resolved.apps.values_mut() {
+        let declared = std::mem::take(&mut app.ro_binds);
+        app.ro_binds = canonicalize_binds(declared, &mut app.warnings);
+    }
+
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
     warnings.extend(std::mem::take(&mut resolved.warnings));
     resolved.warnings = warnings;
@@ -1502,6 +1762,7 @@ mod tests {
             nixpkgs: None,
             network: None,
             secret: None,
+            app: BTreeMap::new(),
         }
     }
 
@@ -1547,6 +1808,225 @@ mod tests {
     /// A `RawConfig` declaring only an allow list (no deny).
     fn raw_network_allow(allow: &[&str]) -> RawConfig {
         raw_network_table(allow, &[])
+    }
+
+    /// A `RawApp` from its parts, for the app-layering tests.
+    fn raw_app(
+        cmd: &[&str],
+        env: &[(&str, &str)],
+        binds: &[&str],
+        packages: &[(&str, &str)],
+        network: Option<NetworkField>,
+    ) -> RawApp {
+        RawApp {
+            cmd: if cmd.is_empty() {
+                None
+            } else {
+                Some(schema::RawCmd::Argv(
+                    cmd.iter().map(|s| s.to_string()).collect(),
+                ))
+            },
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            binds: binds.iter().map(|s| s.to_string()).collect(),
+            packages: packages
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            network,
+            secret: None,
+        }
+    }
+
+    /// A `RawConfig` declaring a single `[app.<name>]`.
+    fn raw_with_app(name: &str, app: RawApp) -> RawConfig {
+        RawConfig {
+            app: std::iter::once((name.to_string(), app)).collect(),
+            ..RawConfig::default()
+        }
+    }
+
+    /// A `HeaderSecret` with an explicit `env://` source, for the overlay-merge tests (no
+    /// dependence on the default resolver order).
+    fn a_header_secret() -> HeaderSecret {
+        let raw = RawHostSecret {
+            kind: None,
+            key: None,
+            from: Some(SecretFrom::One("env://TOKEN".into())),
+            header: Some("Authorization".into()),
+            value_type: Some("bearer".into()),
+            prefix: None,
+        };
+        validate(raw).unwrap()
+    }
+
+    #[test]
+    fn an_app_layers_global_under_project_overriding_the_command_and_unioning_fields() {
+        let global = raw_with_app(
+            "claude",
+            raw_app(
+                &["claude"],
+                &[("BASE", "g")],
+                &[],
+                &[("tool", "ripgrep")],
+                None,
+            ),
+        );
+        let project = raw_with_app(
+            "claude",
+            raw_app(&["claude", "--resume"], &[("EXTRA", "p")], &[], &[], None),
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        let app = &r.apps["claude"];
+        // The project's command wins; the global one is replaced, not appended.
+        assert_eq!(app.cmd, vec!["claude".to_string(), "--resume".to_string()]);
+        // Free env is unioned across both layers.
+        assert!(app.env.iter().any(|(k, v)| k == "BASE" && v == "g"));
+        assert!(app.env.iter().any(|(k, v)| k == "EXTRA" && v == "p"));
+        // The global package is carried, trusted by location.
+        assert!(app
+            .packages
+            .iter()
+            .any(|p| p.name == "tool" && p.state == TrustState::Trusted));
+    }
+
+    #[test]
+    fn an_untrusted_project_apps_security_fields_drop_but_env_packages_and_command_survive() {
+        let project = raw_with_app(
+            "probe",
+            raw_app(
+                &["id"],
+                &[("OK", "v")],
+                &["/etc/secret"],
+                &[("pkg", "ripgrep")],
+                allowlist_net(&["x.com"]),
+            ),
+        );
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        let app = &r.apps["probe"];
+        // Security fields drop under an untrusted project.
+        assert!(app.ro_binds.is_empty(), "binds must drop");
+        assert!(app.network.is_none(), "network must drop");
+        // Free fields and the command survive; the package is carried, stamped untrusted, for
+        // the launcher to weigh.
+        assert_eq!(app.cmd, vec!["id".to_string()]);
+        assert!(app.env.iter().any(|(k, _)| k == "OK"));
+        assert!(app
+            .packages
+            .iter()
+            .any(|p| p.name == "pkg" && p.state == TrustState::Untrusted));
+        // The drops are explained.
+        assert!(app.warnings.iter().any(|w| w.contains("bind")));
+        assert!(app.warnings.iter().any(|w| w.contains("network")));
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_override_a_trusted_apps_command() {
+        // The integrity-of-intent guard: `ops app claude` against an untrusted repo must run
+        // the trusted app's command, never one the repo substituted.
+        let global = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
+        let project = raw_with_app("claude", raw_app(&["evil"], &[], &[], &[], None));
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["claude"];
+        assert_eq!(app.cmd, vec!["claude".to_string()]);
+        assert!(app.warnings.iter().any(|w| w.contains("cmd")));
+
+        // A trusted project, by contrast, may override the command.
+        let global = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
+        let project = raw_with_app(
+            "claude",
+            raw_app(&["claude", "--resume"], &[], &[], &[], None),
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        assert_eq!(
+            r.apps["claude"].cmd,
+            vec!["claude".to_string(), "--resume".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_global_apps_network_survives_an_untrusted_projects_override_attempt() {
+        // A globally-declared app keeps its posture even when launched under an untrusted
+        // project — the flagship use case: run an agent *on* untrusted code, safely.
+        let global = raw_with_app(
+            "claude",
+            raw_app(
+                &["claude"],
+                &[],
+                &[],
+                &[],
+                allowlist_net(&["api.anthropic.com"]),
+            ),
+        );
+        let mut widen = raw_app(&[], &[], &[], &[], None);
+        widen.network = Some(NetworkField::Posture("shared".into()));
+        let project = raw_with_app("claude", widen);
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["claude"];
+        assert!(matches!(app.network, Some(NetworkPolicy::Allowlist(_))));
+        assert!(app.warnings.iter().any(|w| w.contains("network")));
+    }
+
+    #[test]
+    fn merge_app_overlays_the_baseline_with_app_precedence() {
+        let mut base = resolve_no_plugins(raw(&[("A", "base"), ("B", "base")], &[]), None);
+        let app = ResolvedApp {
+            cmd: vec!["x".into()],
+            env: vec![("A".into(), "app".into()), ("C".into(), "app".into())],
+            ro_binds: vec![],
+            packages: vec![],
+            network: Some(NetworkPolicy::Isolated),
+            secrets: vec![],
+            warnings: vec![],
+        };
+        base.merge_app(app);
+        // App env wins on a collision; baseline-only and app-only keys both survive.
+        assert!(base.env.iter().any(|(k, v)| k == "A" && v == "app"));
+        assert!(base.env.iter().any(|(k, v)| k == "B" && v == "base"));
+        assert!(base.env.iter().any(|(k, v)| k == "C" && v == "app"));
+        // The app's posture replaces the baseline's.
+        assert!(matches!(base.network, NetworkPolicy::Isolated));
+    }
+
+    #[test]
+    fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
+        let mut base = resolve_no_plugins(raw_network("shared"), None);
+        let app = ResolvedApp {
+            cmd: vec!["x".into()],
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            network: None, // inherits the baseline's shared posture
+            secrets: vec![a_header_secret()],
+            warnings: vec![],
+        };
+        base.merge_app(app);
+        assert!(base.secrets.is_empty());
+        assert!(base
+            .warnings
+            .iter()
+            .any(|w| w.contains("credential injection requires")));
+    }
+
+    #[test]
+    fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
+        let mut base = resolve_no_plugins(raw_network("shared"), None);
+        let app = ResolvedApp {
+            cmd: vec!["x".into()],
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            network: Some(NetworkPolicy::Allowlist(
+                crate::allowlist::EgressPolicy::new(vec![], vec![]),
+            )),
+            secrets: vec![a_header_secret()],
+            warnings: vec![],
+        };
+        base.merge_app(app);
+        assert_eq!(base.secrets.len(), 1);
+        assert!(matches!(base.network, NetworkPolicy::Allowlist(_)));
     }
 
     fn pkg<'a>(packages: &'a [Package], name: &str) -> Option<&'a Package> {

@@ -45,20 +45,22 @@ fn main() -> ExitCode {
             sandbox::run(cmd)
         }
         Some("mise") => sandbox::run_mise(args.collect()),
+        Some("app") => app_cmd(args.collect()),
         Some("search") => search_cmd(args.collect()),
         Some("test") => test_cmd(args.collect()),
         Some("plugins") => plugins_cmd(args.collect()),
         Some(other) => {
             eprintln!(
-                "ops: unknown command '{other}' (known: doctor, shell, run, mise, search, \
-                 test, plugins, ps, trust, untrust, config, upgrade)"
+                "ops: unknown command '{other}' (known: doctor, shell, run, mise, app, \
+                 search, test, plugins, ps, trust, untrust, config, upgrade)"
             );
             ExitCode::from(2)
         }
         None => {
             eprintln!(
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
-                 search <query> | test net <url> | plugins <list|info|install|rm|store> | \
+                 app <name> | search <query> | test net <url> | \
+                 plugins <list|info|install|rm|store> | \
                  ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise]>"
             );
             ExitCode::from(2)
@@ -564,6 +566,37 @@ fn config_cmd() -> ExitCode {
             );
         }
     }
+    // Named application profiles (`[app.<name>]`), each a gated overlay over the baseline.
+    // Shown without launching: the command it runs and what its overlay adds, plus each
+    // app's own dropped-field notes (so `ops app <name>` holds no surprises). The overlay's
+    // security fields appear only when their source was trusted, exactly as at launch.
+    if !resolved.apps.is_empty() {
+        println!("  apps:");
+        for (name, app) in &resolved.apps {
+            let cmd = if app.cmd.is_empty() {
+                "(no command)".to_string()
+            } else {
+                app.cmd.join(" ")
+            };
+            println!("    {name}: {cmd}");
+            if !app.packages.is_empty() {
+                let names: Vec<&str> = app.packages.iter().map(|p| p.name.as_str()).collect();
+                println!("      packages: {}", names.join(", "));
+            }
+            match &app.network {
+                Some(config::NetworkPolicy::Shared) => println!("      network: shared"),
+                Some(config::NetworkPolicy::Isolated) => println!("      network: none"),
+                Some(config::NetworkPolicy::Allowlist(_)) => println!("      network: allowlist"),
+                None => {}
+            }
+            if !app.secrets.is_empty() {
+                println!("      secrets: {} injected host-side", app.secrets.len());
+            }
+            for w in &app.warnings {
+                println!("      note: {w}");
+            }
+        }
+    }
     for w in &resolved.warnings {
         eprintln!("ops: warning: {w}");
     }
@@ -574,6 +607,20 @@ fn config_cmd() -> ExitCode {
 /// project can declare, by querying nixhub. Host-side and read-only — it resolves
 /// nothing into the sandbox and needs no trust gate (a discovery front-end, like a plain
 /// `nix search`). It needs nix only to ride its fetcher for the one network step.
+/// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the
+/// global or project config) inside the project sandbox.
+fn app_cmd(args: Vec<OsString>) -> ExitCode {
+    let name = args
+        .iter()
+        .filter_map(|a| a.to_str())
+        .find(|a| !a.starts_with('-'));
+    let Some(name) = name else {
+        eprintln!("ops: usage: ops app <name>");
+        return ExitCode::from(2);
+    };
+    sandbox::app(name)
+}
+
 fn search_cmd(args: Vec<OsString>) -> ExitCode {
     // The query is the first non-flag argument; any further words are ignored (nixhub
     // matches a single token, so a multi-word search is pointless — quote a phrase to
@@ -1883,6 +1930,7 @@ mod tests {
             mise: None,
             network: config::NetworkPolicy::default(),
             secrets: vec![],
+            apps: std::collections::BTreeMap::new(),
             warnings: vec![],
         };
 

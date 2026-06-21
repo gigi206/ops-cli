@@ -72,6 +72,17 @@ fn run_in(project: &Path, data: &Path, args: &[&str]) -> Output {
         .expect("spawn ops run")
 }
 
+/// `ops app <name>` from `project`, with ops's data dir redirected to `data`.
+fn app_in(project: &Path, data: &Path, name: &str) -> Output {
+    ops()
+        .arg("app")
+        .arg(name)
+        .current_dir(project)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("spawn ops app")
+}
+
 /// `ops <args>` from `project` with both the data dir and the trust-store dir
 /// redirected, so a test can trust a project and launch it without touching the
 /// real `$HOME` or the user's trust store.
@@ -144,6 +155,60 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
         String::from_utf8_lossy(&passwd.stdout).contains("sandbox:x:"),
         "synthetic passwd missing: {}",
         String::from_utf8_lossy(&passwd.stdout)
+    );
+}
+
+#[test]
+fn ops_app_launches_the_apps_command_with_its_overlay() {
+    let project = TmpDir::new("appproj");
+    let data = TmpDir::new("appdata");
+    // Two untrusted apps: `probe` runs the synthetic-identity check; `greet` carries a free
+    // `env` overlay (which applies even untrusted, like the baseline `env`).
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[app.probe]\n\
+          cmd = [\"id\"]\n\n\
+          [app.greet]\n\
+          cmd = [\"printenv\", \"APPVAR\"]\n\
+          [app.greet.env]\n\
+          APPVAR = \"from-app\"\n",
+    )
+    .unwrap();
+
+    // capability probe via `ops run -- true`; skip (not fail) if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping ops app e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // The app's command runs inside the cage — the synthetic identity proves it is the
+    // sandbox, not the host.
+    let id = app_in(project.path(), data.path(), "probe");
+    assert!(
+        String::from_utf8_lossy(&id.stdout).contains("(sandbox)"),
+        "the app command did not run in the cage: {}",
+        String::from_utf8_lossy(&id.stdout)
+    );
+
+    // The app's free `env` overlay reaches the cage.
+    let greet = app_in(project.path(), data.path(), "greet");
+    assert!(
+        String::from_utf8_lossy(&greet.stdout).contains("from-app"),
+        "the app env overlay did not reach the cage: {}",
+        String::from_utf8_lossy(&greet.stdout)
+    );
+
+    // An unknown app name is a clean usage error, not a launch.
+    let missing = app_in(project.path(), data.path(), "nope");
+    assert_eq!(missing.status.code(), Some(2), "unknown app must exit 2");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no app named"),
+        "unknown app must be named: {}",
+        String::from_utf8_lossy(&missing.stderr)
     );
 }
 

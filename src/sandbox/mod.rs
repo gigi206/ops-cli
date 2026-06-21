@@ -25,7 +25,7 @@ mod smoke;
 mod spec;
 
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
-pub(crate) use launch::{effective_lock_target, run, run_mise, shell};
+pub(crate) use launch::{app, effective_lock_target, run, run_mise, shell};
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 pub(crate) use proxy::nix_cache_hosts;
 pub(crate) use search::run as search;

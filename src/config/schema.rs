@@ -44,6 +44,64 @@ pub(crate) struct RawConfig {
     /// and only effective under a network allowlist — the filtering proxy is what performs
     /// the injection, so the plaintext never enters the cage.
     pub(crate) secret: Option<RawSecretSection>,
+    /// Named application launch profiles, declared as `[app.<name>]` tables. Each is an
+    /// overlay over the sandbox baseline — a command to run plus the extra tools,
+    /// environment, binds, network posture, and credentials that app needs. The overlay's
+    /// fields are gated exactly like the baseline (the security ones honored only from a
+    /// trusted source), then merged onto the baseline by `ops app <name>`.
+    #[serde(default)]
+    pub(crate) app: BTreeMap<String, RawApp>,
+}
+
+/// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
+/// baseline. The overlay fields reuse the baseline shapes and gate identically — an
+/// untrusted project's app may add `env`/`packages` and choose the command, but its
+/// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct RawApp {
+    /// The command to run, as an argv. A bare string is taken as a single-element argv
+    /// (the program name, no arguments) — never split on whitespace, so a path with a
+    /// space is not mis-parsed and there is no shell-quoting surface.
+    pub(crate) cmd: Option<RawCmd>,
+    /// Extra environment for this app, layered over the baseline (the app wins on a key
+    /// collision). A free field, like the baseline `env`.
+    #[serde(default)]
+    pub(crate) env: BTreeMap<String, String>,
+    /// Extra host paths to bind read-only for this app. A security field.
+    #[serde(default)]
+    pub(crate) binds: Vec<String>,
+    /// Extra tools to provision for this app, `name = "<nixpkgs attribute>"`, overriding a
+    /// baseline tool of the same name.
+    #[serde(default)]
+    pub(crate) packages: BTreeMap<String, String>,
+    /// The app's network posture, overriding the baseline's when set. A security field.
+    pub(crate) network: Option<NetworkField>,
+    /// Credentials the egress proxy injects for this app. A security field, effective only
+    /// under a network allowlist, like the baseline `[secret]` section.
+    pub(crate) secret: Option<RawSecretSection>,
+}
+
+/// The command form of an app's `cmd`: a full argv (`["claude", "--flag"]`) or a bare
+/// program name (`"claude"`, taken as a one-element argv). An untagged enum so both TOML
+/// shapes parse, matching the string-or-table forward-compatibility of `NetworkField`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawCmd {
+    /// A bare program name — a single-element argv, never whitespace-split.
+    Line(String),
+    /// A full argv: the program followed by its arguments.
+    Argv(Vec<String>),
+}
+
+impl RawCmd {
+    /// The argv this command denotes: a bare name becomes a one-element argv, an array is
+    /// taken verbatim.
+    pub(crate) fn into_argv(self) -> Vec<String> {
+        match self {
+            RawCmd::Line(program) => vec![program],
+            RawCmd::Argv(argv) => argv,
+        }
+    }
 }
 
 /// The `[secret]` section: a reserved `defaults` table plus one entry per destination host.
@@ -224,6 +282,41 @@ mod tests {
         assert_eq!(
             cfg.packages.get("python").map(String::as_str),
             Some("python311")
+        );
+    }
+
+    #[test]
+    fn parses_an_app_table_with_a_string_or_array_command() {
+        let cfg = parse(
+            br#"
+            [app.claude]
+            cmd = "claude"
+            [app.claude.packages]
+            claude-code = "claude-code"
+
+            [app.build]
+            cmd = ["make", "-j4"]
+            "#,
+        )
+        .unwrap();
+        // A bare string is a single-element argv; an array is taken verbatim.
+        assert_eq!(
+            cfg.app["claude"]
+                .cmd
+                .as_ref()
+                .map(|c| c.clone().into_argv()),
+            Some(vec!["claude".to_string()])
+        );
+        assert_eq!(
+            cfg.app["claude"]
+                .packages
+                .get("claude-code")
+                .map(String::as_str),
+            Some("claude-code")
+        );
+        assert_eq!(
+            cfg.app["build"].cmd.as_ref().map(|c| c.clone().into_argv()),
+            Some(vec!["make".to_string(), "-j4".to_string()])
         );
     }
 
