@@ -91,7 +91,8 @@ the host's `$HOME`, most of `/etc`.
 | `/nix` (base) | **ops's trusted base store** (ro lower) | append-only, secret-free; ro = the agent cannot tamper with installed binaries |
 | FHS loader | `nixpkgs#glibc.out` → `/lib64/ld-linux-…` | 100% nix userland (hermetic FHS, cf. spike) |
 | `/etc/passwd`, `/etc/group` | **SYNTHETIC** (sandbox-user + nobody) | uid/gid resolution **without** leaking the host's accounts |
-| `/etc/ssl/certs`, `/etc/resolv.conf` | host, ro | TLS / DNS (if network allowed) |
+| `/etc/ssl/certs/ca-bundle.crt`, `…/ca-certificates.crt` | **ops's own `cacert`**, ro | TLS trust anchor, hermetic — the cage trusts ops's bundle, not the host's certs (under a network allowlist the egress proxy's per-session CA overrides it) |
+| `/etc/resolv.conf` | host, ro (best-effort) | DNS (if network allowed) |
 | `/dev` | minimal `--dev` (not the host `/dev`) | null/zero/urandom/tty only |
 
 Never: `/etc/shadow`, the **host's** `/etc/passwd`.

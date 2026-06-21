@@ -352,6 +352,196 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 }
 
 #[test]
+fn a_shared_network_launch_trusts_ops_own_cacert() {
+    // Under the default shared-network posture the cage no longer binds the host's `/etc/ssl`;
+    // ops provisions its own cacert and names it through the CA-bundle variables, so HTTPS is
+    // hermetic — it works on a host that carries no certificates of its own. Teeth, both in one
+    // test so success proves causation: an HTTPS fetch returns the known nix-cache-info hash
+    // (TLS verified against ops's bundle), and the *same* fetch with the CA file forced empty
+    // FAILS — so the fetch succeeds *because of* the configured trust anchor, not some ambient
+    // cert path. Skips (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("cacert-proj");
+    let data = TmpDir::new("cacert-data");
+
+    // capability probe; also seeds the project store so a later TLS failure is a real fault.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping cacert e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping cacert e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // HTTPS works, trusting ops's hermetic bundle (the host's /etc/ssl is not bound).
+    let fetched = run_in(
+        project.path(),
+        data.path(),
+        &[
+            "nix-prefetch-url",
+            "--type",
+            "sha256",
+            "https://cache.nixos.org/nix-cache-info",
+        ],
+    );
+    assert!(
+        fetched.status.success(),
+        "hermetic HTTPS fetch failed: {}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fetched.stdout)
+            .contains("15sqg1j6gq6081nk0v5c6npadlswb9238l336wb2g9bmmrry779c"),
+        "fetch did not return the expected nix-cache-info hash: {}",
+        String::from_utf8_lossy(&fetched.stdout)
+    );
+
+    // teeth: the configured CA is load-bearing — with the cert vars pointed at an empty file
+    // the same fetch fails, so the success above is ops's bundle at work, not an ambient path.
+    let no_ca = run_in(
+        project.path(),
+        data.path(),
+        &[
+            "sh",
+            "-c",
+            "NIX_SSL_CERT_FILE=/dev/null SSL_CERT_FILE=/dev/null \
+             nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info",
+        ],
+    );
+    assert!(
+        !no_ca.status.success(),
+        "fetch with an empty CA file unexpectedly succeeded — TLS trust is not coming from \
+         ops's bundle: {}",
+        String::from_utf8_lossy(&no_ca.stdout)
+    );
+}
+
+#[test]
+fn the_curated_base_tools_run_in_the_cage() {
+    // The curated CLI toolset is reachable by name and actually executes in the cage — so the
+    // PATH wiring and the one-channel glibc are right, not merely that the binaries were
+    // realised. One launch probes each tool; `set -e` fails on the first missing or broken one.
+    // No network: the tools are seeded into the project store. Skips when the host cannot
+    // sandbox.
+    let project = TmpDir::new("tools-proj");
+    let data = TmpDir::new("tools-data");
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping curated-tools e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let out = run_in(
+        project.path(),
+        data.path(),
+        &[
+            "sh",
+            "-c",
+            "set -e; \
+             curl --version >/dev/null; \
+             git --version >/dev/null; \
+             grep --version >/dev/null; \
+             sed --version >/dev/null; \
+             awk --version >/dev/null; \
+             find --version >/dev/null; \
+             less --version >/dev/null; \
+             which ls >/dev/null; \
+             echo ALL_TOOLS_OK",
+        ],
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ALL_TOOLS_OK"),
+        "a curated base tool is missing or broken in the cage: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
+    // The headline self-equip path (`ops mise install`) under the headline security posture (a
+    // trusted `network = "allowlist"`). mise reads its CA roots from the certificate *file*, not
+    // the CA-bundle env variables, so this is the exact case where the two halves of the trust
+    // setup must combine: the hermetic cacert (a real bundle at the file path, which mise needs
+    // present to load any roots at all) and the egress proxy's per-session MITM CA (injected via
+    // env). If only one were in place, mise could not trust the proxy and the self-equip would
+    // fail. Teeth: jq installs through the empty-netns proxy into the project's own store. Skips
+    // (never fails) when the host cannot sandbox or the cache is unreachable.
+    // Short tags: the egress proxy's Unix socket lives under the data dir, and its full path
+    // must fit a `sockaddr_un` (~108 bytes). The test tree (`target/test-tmp/…`) is already
+    // deep, so a long tag would overflow `SUN_LEN`. (Production's `~/.local/share/ops` is short.)
+    let project = TmpDir::new("ma-proj");
+    let data = TmpDir::new("ma-data");
+    let state = TmpDir::new("ma-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net); also seeds the project store.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping mise-allowlist e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping mise-allowlist e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // trust the project so its allowlist posture is honored (otherwise it degrades to shared
+    // network and the proxy path — the thing under test — is never exercised).
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // self-equip jq through the MITM proxy: mise must trust the proxy's per-session leaf
+    // (devbox.sh metadata + cache.nixos.org substitution both ride the allowlist's built-in
+    // nix-cache set).
+    let installed = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["mise", "install", "nix:jq"],
+    );
+    assert!(
+        installed.status.success(),
+        "self-equip via mise under a network allowlist failed — mise could not trust the egress \
+         proxy through the cage's certificate file: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&installed.stderr),
+        String::from_utf8_lossy(&installed.stdout)
+    );
+    assert!(
+        log.contains("jq") && log.to_lowercase().contains("installed"),
+        "mise did not report installing jq through the allowlist: {log}"
+    );
+}
+
+#[test]
 fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // The 6.3a integration neither the unit nor the proxy tests can reach: a trusted
     // A `[secret]` entry under a network allowlist must be resolved *host-side* and wired into the

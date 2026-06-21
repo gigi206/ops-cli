@@ -49,6 +49,11 @@ pub(crate) struct Userland {
     /// The nix-ld shim file, bound at the standard interpreter path so a foreign
     /// binary that hard-codes it is intercepted by it.
     pub(crate) interp_src: PathBuf,
+    /// ops's own CA bundle (`cacert`'s `ca-bundle.crt`), bound read-only at the standard
+    /// certificate paths so the cage's TLS trusts a known set of roots without depending on
+    /// the host. A physical bind source (it backs a mount), unlike the logical store paths
+    /// elsewhere on this type.
+    pub(crate) ca_bundle_src: PathBuf,
     /// Where the interpreter shim is exposed (`/lib64/ld-linux-x86-64.so.2`).
     pub(crate) interp_dest: PathBuf,
     /// The real base loader the shim re-execs for a foreign binary, as the in-sandbox
@@ -225,10 +230,21 @@ fn assemble(
             src: paths.group_src.to_path_buf(),
             dest: PathBuf::from("/etc/group"),
         },
-        // Zone 1 — TLS / DNS for a network-sharing shell; absent is fine.
-        Mount::RoBindTry {
-            src: PathBuf::from("/etc/ssl"),
-            dest: PathBuf::from("/etc/ssl"),
+        // Zone 1 — TLS: ops's own CA bundle from its store rather than the host, so HTTPS
+        // trust is hermetic. Bound at the two standard certificate paths a Linux toolchain
+        // looks for by default — the NixOS `ca-bundle.crt` (nix's own libcurl) and the
+        // Debian/OpenSSL `ca-certificates.crt` (a tool that reads the system store and does
+        // not honor the CA-bundle env variables, e.g. mise's HTTP client) — both naming the
+        // same bundle. This replaces a bind of the host's `/etc/ssl`, so the cage no longer
+        // depends on — nor sees — the host's certificates. DNS stays host-provided for a
+        // network-sharing shell (absent is fine; an isolated posture ignores it).
+        Mount::RoBind {
+            src: userland.ca_bundle_src.clone(),
+            dest: PathBuf::from(CAGE_CA_BUNDLE),
+        },
+        Mount::RoBind {
+            src: userland.ca_bundle_src.clone(),
+            dest: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
         },
         Mount::RoBindTry {
             src: PathBuf::from("/etc/resolv.conf"),
@@ -366,6 +382,26 @@ fn mise_env() -> Vec<(String, String)> {
             "extra-experimental-features = nix-command flakes".to_string(),
         ),
     ]
+}
+
+/// Where ops's CA bundle appears in the cage. The cacert tree is bound at `/etc/ssl`
+/// (replacing the host's), so the bundle sits at the path nix and OpenSSL look for by
+/// default.
+const CAGE_CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
+
+/// The CA-bundle environment, naming ops's own bundle so the cage's toolchains trust it
+/// without depending on the host having certificates. It uses the exact key set the egress
+/// proxy injects ([`super::egress::CA_FILE_ENV_KEYS`]) — one source of truth — so under a
+/// network allowlist the proxy's per-session CA, layered *after* this by the launcher,
+/// overrides every key (there the cage must trust the MITM leaf, not these roots). For the
+/// shared and isolated postures this is the trust anchor. Carried in the overlay rather than
+/// the structural defaults so it sits above host passthrough (which is not denylist-filtered)
+/// yet below the egress wiring.
+pub(crate) fn cacert_env() -> Vec<(String, String)> {
+    super::egress::CA_FILE_ENV_KEYS
+        .iter()
+        .map(|k| ((*k).to_string(), CAGE_CA_BUNDLE.to_string()))
+        .collect()
 }
 
 /// Set `key` to `val`, overriding an existing entry so a config-supplied value
@@ -571,6 +607,7 @@ mod tests {
             ],
             interp_src: PathBuf::from("/store/nix-ld/libexec/nix-ld"),
             interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ca_bundle_src: PathBuf::from("/store/cacert/etc/ssl/certs/ca-bundle.crt"),
             base_loader: PathBuf::from("/nix/store/glibc/lib/ld-linux-x86-64.so.2"),
             foreign_lib_paths: vec![
                 PathBuf::from("/nix/store/glibc/lib"),
@@ -661,8 +698,66 @@ mod tests {
         assert_eq!(text[passwd - 1], "/data/ops/projects/abc/etc/passwd");
         assert_eq!(text[passwd - 2], "--ro-bind");
 
-        // TLS/DNS are best-effort
-        assert!(text.iter().any(|s| s == "--ro-bind-try"));
+        // TLS is hermetic — the CA bundle is a firm bind of ops's cacert (not the host's);
+        // only DNS stays best-effort.
+        let ssl = text
+            .iter()
+            .position(|s| s == "/etc/ssl/certs/ca-bundle.crt")
+            .unwrap();
+        assert_eq!(text[ssl - 1], "/store/cacert/etc/ssl/certs/ca-bundle.crt");
+        assert_eq!(text[ssl - 2], "--ro-bind");
+        let resolv = text.iter().position(|s| s == "/etc/resolv.conf").unwrap();
+        assert_eq!(text[resolv - 1], "--ro-bind-try");
+    }
+
+    #[test]
+    fn the_cage_trusts_ops_own_ca_bundle_not_the_host() {
+        // ops's CA bundle is bound at both standard certificate paths (the NixOS and the
+        // Debian/OpenSSL conventions), so the cage's TLS trust comes from ops's store rather
+        // than whatever the host happens to carry — and the host's own `/etc/ssl` is never a
+        // bind source, so the cage cannot see it.
+        let spec = assembled();
+        let argv = super::super::argv::to_argv(&spec);
+        let text: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for dest in [
+            "/etc/ssl/certs/ca-bundle.crt",
+            "/etc/ssl/certs/ca-certificates.crt",
+        ] {
+            let i = text
+                .iter()
+                .position(|s| s == dest)
+                .unwrap_or_else(|| panic!("{dest} not bound"));
+            assert_eq!(
+                text[i - 1],
+                "/store/cacert/etc/ssl/certs/ca-bundle.crt",
+                "{dest} must be ops's cacert bundle, not the host's"
+            );
+            assert_eq!(text[i - 2], "--ro-bind", "{dest} must be a firm bind");
+        }
+        // the host's `/etc/ssl` is never a bind source (no `--ro-bind*` whose source is the
+        // host tree), so the cage cannot see the host's certificates.
+        assert!(
+            !text.iter().any(|s| s == "/etc/ssl"),
+            "the host's /etc/ssl must not be bound"
+        );
+    }
+
+    #[test]
+    fn cacert_env_names_ops_bundle_under_every_ca_key() {
+        // One source of truth: the keys ops sets equal the egress key set, each pointing at
+        // ops's in-cage bundle.
+        let env = cacert_env();
+        assert_eq!(env.len(), super::super::egress::CA_FILE_ENV_KEYS.len());
+        for (k, v) in &env {
+            assert!(
+                super::super::egress::CA_FILE_ENV_KEYS.contains(&k.as_str()),
+                "unexpected CA key {k}"
+            );
+            assert_eq!(v, CAGE_CA_BUNDLE, "{k} must name ops's bundle");
+        }
     }
 
     #[test]
@@ -1333,7 +1428,9 @@ mod smoke {
         };
 
         // provision the base userland into a throwaway shared store, plus an unrelated
-        // package (`jq`) the seed must NOT drag in — it is not among the seeded roots.
+        // package (`hello`) the seed must NOT drag in — it is not among the seeded roots,
+        // nor in any base root's closure (a curated base tool would taint a closure-shared
+        // witness, so this one is deliberately a leaf nothing in the base depends on).
         let data = TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
         let base_ref = crate::store::LockTarget::global(&layout, None)
@@ -1341,15 +1438,15 @@ mod smoke {
             .expect("resolve base channel");
         let userland = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
             .expect("resolve userland");
-        let jq = crate::store::provision(
+        let unseeded = crate::store::provision(
             &nix,
             &layout,
-            &data.path().join("roots").join("jq"),
+            &data.path().join("roots").join("hello"),
             &base_ref,
-            "jq",
-            "bin/jq",
+            "hello",
+            "bin/hello",
         )
-        .expect("provision jq");
+        .expect("provision hello");
 
         // a project whose own store is seeded with exactly the base roots (the launcher
         // collects base ∪ packages ∪ tools; the base closure is what backs the shell).
@@ -1380,7 +1477,7 @@ mod smoke {
         // ...while the unrelated package — in the shared store but not a seeded root —
         // is absent, so the completeness check distinguishes seeded from shared-at-large.
         assert!(
-            !in_store(&jq),
+            !in_store(&unseeded),
             "an unseeded package leaked into the per-project store"
         );
 

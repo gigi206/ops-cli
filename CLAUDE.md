@@ -81,7 +81,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   per-project store by default (the Mode-B posture inversion, 2b.3.2b.1)**;
   **nix now lives in the cage so the agent self-equips (2b.3.2b.2) — offline
   reuse from the seeded base proven and in-cage HTTPS to the default cache already
-  works (M3.4 only makes its TLS hermetic)**; the **concurrency/flock settlement
+  works (M3.4 since made its TLS hermetic — done)**; the **concurrency/flock settlement
   landed (2b.3.3) — no ops lock: atomic per-path placement + nix's own store lock
   carry concurrent same-project seeds, proven by a concurrent-seed smoke**; and
   **`ops mise` passthrough shipped (2b.4) — the agent self-equips a project's `nix:`
@@ -99,7 +99,12 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   way: its safe first slice shipped — a trusted-only `network = "none"` posture (the
   `NetPolicy::Isolated` an empty netns) gated like `binds`/`nixpkgs`, plus a live
   P-vs-B spike that LOCKED the egress architecture on **Model B** (deny-by-construction,
-  pending the user's confirmation)).**
+  pending the user's confirmation)).** **M3.4 done — hermetic TLS + a curated base
+  toolset: ops provisions its own `cacert` into the base userland and binds the bundle
+  at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
+  reqwest), so in-cage TLS no longer depends on the host's `/etc/ssl`; and the base
+  carries a small curated CLI set (`curl git less grep sed awk find which`) sharing the
+  base glibc, so an agent gets the everyday tools without declaring them.**
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped
@@ -325,9 +330,10 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (in-cage lua plugin → `nixhub.lua`) and `ops run`'s host-side `nixhub.rs`→`tools.lock`
   are parallel resolution+realise paths sharing no state — a self-installed tool is not
   in `tools.lock`, not reproduced by a fresh `ops run`, outside `ops upgrade mise`.
-  **Latent gap noted for M3.4:** the plugin shells `find` (findutils) on the
+  **Latent gap CLOSED by M3.4:** the plugin shells `find` (findutils) on the
   `MiseEnv`/flake path (not the `nix:` install path used here) — the curated-base-
-  packages concern. **Proven e2e through the real binary** (`ops mise install nix:jq` →
+  packages concern, now resolved (`findutils`/`which` ship in the base toolset).
+  **Proven e2e through the real binary** (`ops mise install nix:jq` →
   `jq-1.8.1`, `ops mise ls`, `ops mise exec` all work; the "not activated" warning
   observed live) + a **network smoke** (`the_cage_self_equips_a_nix_tool_via_mise`:
   an **untrusted** project self-equips jq, the binary runs from the per-project store,
@@ -400,6 +406,48 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   byte-identical; `ops config` showing the two locks at distinct revs). **Honest scope:** a
   real `ops run` with `engine_ref ≠ base` was not re-run live (a 2nd full base provision is
   minutes) — covered structurally by the nix-ld smoke + the migration unit test.
+  **M3.4 — hermetic TLS + a curated base toolset (DONE)** (`src/sandbox/fhs.rs` +
+  `binds.rs` + `launch.rs`): two slices, shipped together. **(a) hermetic TLS** — the base
+  userland now provisions its **own `cacert`** (nss-cacert) beside glibc/bash/nix/mise, and
+  the cage binds ops's bundle **read-only at BOTH conventional paths** instead of
+  `--ro-bind-try`-ing the host's `/etc/ssl`: `/etc/ssl/certs/ca-bundle.crt` (nix's libcurl
+  default) **and** `/etc/ssl/certs/ca-certificates.crt` (the Debian/OpenSSL spelling). Both
+  paths are needed because the two TLS clients in the cage disagree — **nix** (libcurl) reads
+  `ca-bundle.crt` *and* honors the `*_CA_*` env, but **mise** (reqwest) reads the **file**
+  `ca-certificates.crt` and does **not** honor `SSL_CERT_FILE`; nss-cacert ships only
+  `ca-bundle.crt`, so ops binds its one bundle at both names (the regression that proved this:
+  a dir-bind exposing only `ca-bundle.crt` let nix fetch but broke every mise smoke — caught
+  live, fixed to two file-binds). `cacert_env()` also exports ops's bundle under the broad
+  `CA_FILE_ENV_KEYS` set (the same const the egress MITM uses) so env-reading clients agree
+  with the file. **Precedence is explicit** — `extra_cage_env` layers `structural <
+  passthrough < cacert < mise < egress < cfg.env`, so under `network = "allowlist"` the
+  egress MITM CA (injected via the same keys, replace-not-append) **wins** over the structural
+  cacert (a launch-path unit test `egress_ca_overrides_the_structural_cacert` pins this);
+  with `network = "shared"`/`"none"` the cacert is the cage's trust root and the host's CA
+  bundle is **no longer in the cage at all** (`the_cage_trusts_ops_own_ca_bundle_not_the_host`).
+  **(b) curated base tools** — the base carries a small everyday CLI set (`BASE_TOOLS`:
+  `curl git less gnugrep gnused gawk findutils which`) provisioned into ops's store, bins
+  prepended to the base PATH, **sharing the base glibc** (the one-channel rule — these are the
+  OS-substrate layer, not cross-channel dev tools). This closes the earlier latent gap (the
+  mise `nix:` plugin shells `find`/`which`, absent from a bare hermetic cage). **`xdg-utils`
+  was considered and dropped** (user call) — measured at **+76 MB / 42 store paths** of
+  dbus/glib/systemd-libs/X11 (a GUI stack) dragged into every project's seed for no headless
+  benefit; the curated-set doc records "declare it per project if ever needed". `git`'s
+  closure (≈353 MB, perl) dominates the set; the other seven are negligible. **Proven live +
+  committed e2e:** `a_shared_network_launch_trusts_ops_own_cacert` (a real
+  `nix-prefetch-url` over the cage's hermetic TLS, with **causation teeth** —
+  `NIX_SSL_CERT_FILE=/dev/null SSL_CERT_FILE=/dev/null` makes the same fetch fail, so success
+  means the bound bundle, not a leaked host one); `the_curated_base_tools_run_in_the_cage` (one
+  launch runs each curated tool by name); and `the_cage_self_equips_via_mise_under_a_network_
+  allowlist` (a **trusted allowlist** project runs `ops mise install nix:jq` end-to-end —
+  the load-bearing proof that mise's reqwest trusts the MITM CA through the `ca-certificates.crt`
+  file-bind, which an advisor flagged as a likely blind spot and the live run **disproved**).
+  The seed-witness smoke's "unseeded" probe moved `jq`→`hello` (xdg-utils' closure contains
+  `jq`, which would have made the witness legitimately present). **486 tests green** (3 net-new
+  run.rs e2e + new unit tests in fhs/binds/launch), **4 consecutive green full runs**
+  (fmt/clippy clean), advisor-reviewed (plan AND impl). The threat-model bind-layout doc row
+  was split: `/etc/ssl/certs` is now **ops's own cacert (ro)**, distinct from the host's
+  best-effort `/etc/resolv.conf`.
   **M6.0 — the network slice + the P-vs-B architecture lock** (`src/config/` +
   `src/sandbox/launch.rs` + `ops config`): the network increment ("network last")
   opened with its **cheapest, decision-independent slice** — a trusted-only

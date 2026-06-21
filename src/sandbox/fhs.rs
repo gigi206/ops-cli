@@ -2,8 +2,9 @@
 //!
 //! The base userland (an interactive shell, coreutils, the glibc loader and the
 //! C/C++ runtime that *foreign* binaries need, the nix-ld shim that routes them to
-//! it, and nix itself so an agent can self-equip its toolchain into the project's
-//! writable store) is provisioned into ops's user-owned store — never the host `/nix`
+//! it, nix itself so an agent can self-equip its toolchain into the project's
+//! writable store, and a CA bundle so its HTTPS is hermetic) is provisioned into
+//! ops's user-owned store — never the host `/nix`
 //! — against the pinned nixpkgs, each output rooted by a gcroot so a later store
 //! GC cannot collect it. The store is bound read-only at `/nix` inside the
 //! sandbox, so the *logical* `/nix/store/…` paths these provisions report resolve
@@ -26,11 +27,29 @@ const LOADER: &str = "lib/ld-linux-x86-64.so.2";
 /// re-execs the real base loader named in `NIX_LD`.
 const NIX_LD_SHIM: &str = "libexec/nix-ld";
 
+/// The curated base CLI tools every cage carries: `(nixpkgs attribute, a binary the output
+/// must contain, gcroot name)`. The attribute and the binary name diverge for the GNU
+/// userland (`gnugrep` → `grep`, `gnused` → `sed`, `gawk` → `awk`). Kept small and transverse —
+/// heavier, language-specific, or GUI-oriented tooling is a project concern, never the base
+/// (a desktop helper like `xdg-utils` drags a dbus/glib/X11 stack into a headless cage for no
+/// benefit; declare it per project if ever needed).
+const BASE_TOOLS: &[(&str, &str, &str)] = &[
+    ("curl", "bin/curl", "curl"),
+    ("git", "bin/git", "git"),
+    ("less", "bin/less", "less"),
+    ("gnugrep", "bin/grep", "gnugrep"),
+    ("gnused", "bin/sed", "gnused"),
+    ("gawk", "bin/awk", "gawk"),
+    ("findutils", "bin/find", "findutils"),
+    ("which", "bin/which", "which"),
+];
+
 /// Provision the base hermetic userland into ops's store and report its paths.
 /// The launcher resolves the userland before assembling a spec; on a project's
 /// first launch this fetches the base closure from the binary cache. `nixpkgs` is
 /// the pinned reference for the OS substrate (glibc, gcc, bash, coreutils, nix-ld,
-/// nix, socat), resolved once by the caller so it is shared with the project's own
+/// nix, socat, cacert, and a curated CLI toolset), resolved once by the caller so it is
+/// shared with the project's own
 /// package provisioning (and so a future channel override is plumbed in a single
 /// place). `engine_ref` is the **separately-locked** reference for mise alone (see
 /// below) — usually the same revision, but advanced on its own by `ops upgrade mise`.
@@ -69,9 +88,9 @@ pub(crate) fn resolve_userland(
     // project's toolchain into the project's own writable store (the cage's `/nix`).
     // nix's compiled defaults already do the heavy lifting unconfigured — they resolve
     // the store to the local `/nix`, build from the seeded base offline, and substitute
-    // new tools from the default cache over HTTPS (the cage binds the host's CA bundle
-    // at `/etc/ssl`, which is nix's default certificate path; a future change ships
-    // ops's own cacert so trust no longer depends on the host having one). The only
+    // new tools from the default cache over HTTPS (the cage binds ops's own CA bundle at
+    // nix's default certificate path, so trust does not depend on the host — see `cacert`
+    // below). The only
     // configuration ops adds is `extra-experimental-features = nix-command flakes` (via
     // `NIX_CONFIG`, set by the assembler), which the mise `nix:` plugin's `nix build`
     // needs; being `extra-`, it is purely additive — it does not touch `sandbox`,
@@ -102,38 +121,71 @@ pub(crate) fn resolve_userland(
     // in every cage (like nix and mise) so the posture stays a launch decision, not a different
     // base. Only the allowlist posture references it; other postures simply never invoke it.
     let socat = realise("socat", "bin/socat", "socat")?;
+    // cacert: a bundle of trusted CA roots from ops's own store, so the cage's TLS does not
+    // depend on the host carrying one. Its `ca-bundle.crt` is bound read-only at the standard
+    // certificate paths (replacing any host bind) and named by the CA-bundle environment
+    // variables, so an HTTPS fetch — an agent self-equipping over the default cache, or a
+    // later `git`/`curl` — is hermetic. It ships no binary (so it is off PATH); only its
+    // certificate bundle matters. Under a network allowlist the egress proxy injects its own
+    // per-session CA over the same variables, so that leaf still wins; for every other posture
+    // this is the trust anchor.
+    let cacert = realise("cacert", "etc/ssl/certs/ca-bundle.crt", "cacert")?;
+
+    // Curated base CLI tools: a small, broadly-useful set every project gets without
+    // per-project provisioning — an HTTP client, version control, a pager, the text-processing
+    // trio, file search, and `which`. Each is nix-built, so it shares the base glibc (the
+    // one-channel rule) and runs from the relocated store; its closure joins the seed and its
+    // `bin` joins the base PATH. Heavier or language-specific tooling stays a project concern
+    // (`[packages]` or a `nix:` mise tool), not the base.
+    let tools = BASE_TOOLS
+        .iter()
+        .map(|(attr, marker, name)| realise(attr, marker, name))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    // The logical roots whose closures a project's own store must carry to run the base —
+    // surfaced from the very provisions above, so none is forgotten. The nix-ld root is
+    // included even though its shim is bound separately: its own closure (its glibc) must be
+    // in the store the cage reads.
+    let mut base_roots = vec![
+        glibc.clone(),
+        gcc.clone(),
+        bash.clone(),
+        coreutils.clone(),
+        nix_ld.clone(),
+        nix_pkg.clone(),
+        mise.clone(),
+        socat.clone(),
+        cacert.clone(),
+    ];
+    base_roots.extend(tools.iter().cloned());
+
+    // nix's and mise's bins join the base PATH so the agent can drive them directly, then the
+    // curated CLI tools; the project's own tools still precede the base (prepended by the
+    // launcher).
+    let mut bin_paths = vec![
+        bash.join("bin"),
+        coreutils.join("bin"),
+        nix_pkg.join("bin"),
+        mise.join("bin"),
+    ];
+    bin_paths.extend(tools.iter().map(|t| t.join("bin")));
 
     Ok(Userland {
-        // The logical roots whose closures a project's own store must carry to run the
-        // base — surfaced from the very provisions above, so none is forgotten. The
-        // nix-ld root is included even though its shim is bound separately: its own
-        // closure (its glibc) must be in the store the cage reads.
-        base_roots: vec![
-            glibc.clone(),
-            gcc.clone(),
-            bash.clone(),
-            coreutils.clone(),
-            nix_ld.clone(),
-            nix_pkg.clone(),
-            mise.clone(),
-            socat.clone(),
-        ],
+        base_roots,
         // The nix-ld shim is a host-side bind source, so physical; in-sandbox paths
         // stay logical (they resolve through the store bound at `/nix`).
         interp_src: crate::store::physical_path(layout, &nix_ld.join(NIX_LD_SHIM)),
+        // The CA bundle file is a host-side bind source (it backs the `/etc/ssl/certs/…`
+        // mounts), so physical, like the shim above.
+        ca_bundle_src: crate::store::physical_path(
+            layout,
+            &cacert.join("etc/ssl/certs/ca-bundle.crt"),
+        ),
         interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
         // The real base loader the shim re-execs is an in-sandbox path, so logical.
         base_loader: glibc.join(LOADER),
         foreign_lib_paths: vec![glibc.join("lib"), gcc.join("lib")],
-        // nix's and mise's bins join the base PATH so the agent can drive them
-        // directly; the project's own tools still precede the base (prepended by the
-        // launcher).
-        bin_paths: vec![
-            bash.join("bin"),
-            coreutils.join("bin"),
-            nix_pkg.join("bin"),
-            mise.join("bin"),
-        ],
+        bin_paths,
         shell_bin: bash.join("bin/bash"),
         // The forwarder is invoked by absolute store path from the egress wrapper, never via
         // PATH (so it does not need to be a user-visible tool), so socat's bin stays off the
@@ -170,12 +222,24 @@ mod resolve_tests {
 
         // the base roots are logical store paths, each backed by ops's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure
-        // roots the per-project store is seeded from. The expected base set is present.
+        // roots the per-project store is seeded from. The expected base set is present:
+        // the nine core provisions plus one root per curated CLI tool.
         assert_eq!(
             u.base_roots.len(),
-            8,
-            "glibc, gcc, bash, coreutils, nix-ld, nix, mise, socat"
+            9 + BASE_TOOLS.len(),
+            "glibc, gcc, bash, coreutils, nix-ld, nix, mise, socat, cacert + the curated tools"
         );
+        // every curated tool is reachable by name: its marker binary physically exists in
+        // one of the base PATH directories (so it is both realised and on PATH).
+        for (_, marker, name) in BASE_TOOLS {
+            let bin = marker.strip_prefix("bin/").unwrap();
+            assert!(
+                u.bin_paths
+                    .iter()
+                    .any(|p| physical_path(&layout, &p.join(bin)).exists()),
+                "curated tool {name} ({bin}) is not reachable on the base PATH"
+            );
+        }
         for root in &u.base_roots {
             assert_eq!(
                 root.parent().and_then(|p| p.to_str()),
@@ -200,6 +264,19 @@ mod resolve_tests {
             u.interp_src.starts_with(layout.store_dir()),
             "nix-ld shim is not under ops's store: {}",
             u.interp_src.display()
+        );
+
+        // the CA bundle bound under /etc/ssl/certs is ops's own cacert: a physical bind
+        // source under ops's store, the very file nix and OpenSSL verify against
+        assert!(
+            u.ca_bundle_src.starts_with(layout.store_dir()),
+            "CA bundle is not under ops's store: {}",
+            u.ca_bundle_src.display()
+        );
+        assert!(
+            u.ca_bundle_src.is_file(),
+            "CA bundle missing from ops's cacert: {}",
+            u.ca_bundle_src.display()
         );
 
         // in-sandbox paths are logical (`/nix/store/…`) and backed by the store —

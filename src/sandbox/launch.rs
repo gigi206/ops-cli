@@ -370,17 +370,20 @@ fn build(
         egress_guard = Some(guard);
     }
 
-    // Environment, lowest precedence first: host passthrough, then a trusted project's
-    // mise `[env]`, then the egress machinery (proxy + CA), then the `.ops.toml` `[env]`
-    // (the ops-native config has the final say). The structural HOME/PATH/... are added
-    // by the assembler, which upserts all of these over them. An untrusted config has
-    // already lost its reserved keys upstream — including the proxy and CA keys — so it
-    // can neither redirect the egress nor swap the CA; a trusted config overriding them
-    // only harms its own cage.
-    let mut extra_env = passthrough_env();
-    extra_env.extend(mise_env(prep)?);
-    extra_env.extend(egress_env);
-    extra_env.extend(prep.cfg.env.iter().cloned());
+    // Environment, lowest precedence first: host passthrough, then ops's hermetic CA bundle,
+    // then a trusted project's mise `[env]`, then the egress machinery (proxy + CA), then the
+    // `.ops.toml` `[env]` (the ops-native config has the final say). The structural
+    // HOME/PATH/... are added by the assembler, which upserts all of these over them. An
+    // untrusted config has already lost its reserved keys upstream — including the proxy and
+    // CA keys — so it can neither redirect the egress nor swap the CA; a trusted config
+    // overriding them only harms its own cage.
+    let extra_env = extra_cage_env(
+        passthrough_env(),
+        binds::cacert_env(),
+        mise_env(prep)?,
+        egress_env,
+        &prep.cfg.env,
+    );
 
     let overlay = binds::Overlay {
         env: &extra_env,
@@ -803,6 +806,29 @@ fn passthrough_env() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Layer the cage's extra environment, lowest precedence first: host passthrough, then ops's
+/// hermetic CA bundle, then a trusted project's mise `[env]`, then the egress machinery, then
+/// the `.ops.toml` `[env]`. The assembler upserts these over the structural defaults and takes
+/// the last occurrence of a key, so a later layer wins: the egress proxy's per-session CA
+/// overrides the structural cacert under an allowlist, and a trusted config has the final say
+/// (self-harm only). The CA bundle sits above passthrough on purpose — passthrough is a
+/// separate channel, not filtered by the untrusted-config denylist, so a host CA variable
+/// could otherwise clobber ops's hermetic bundle.
+fn extra_cage_env(
+    passthrough: Vec<(String, String)>,
+    cacert: Vec<(String, String)>,
+    mise: Vec<(String, String)>,
+    egress: Vec<(String, String)>,
+    config: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env = passthrough;
+    env.extend(cacert);
+    env.extend(mise);
+    env.extend(egress);
+    env.extend(config.iter().cloned());
+    env
+}
+
 fn missing(what: &str) -> ExitCode {
     eprintln!("ops: {what} not found — the sandbox cannot run. See `ops doctor`.");
     ExitCode::FAILURE
@@ -905,6 +931,7 @@ mod tests {
             ],
             interp_src: PathBuf::from("/store/nix-ld"),
             interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ca_bundle_src: PathBuf::from("/store/cacert/etc/ssl/certs/ca-bundle.crt"),
             base_loader: PathBuf::from("/nix/store/glibc/lib/ld"),
             foreign_lib_paths: vec![],
             bin_paths: vec![],
@@ -931,6 +958,52 @@ mod tests {
             .contains(&PathBuf::from("/nix/store/nodejs")));
         assert!(
             !collect_roots(&userland, &[], &tool_roots).contains(&PathBuf::from("/nix/store/jq"))
+        );
+    }
+
+    #[test]
+    fn egress_ca_overrides_the_structural_cacert() {
+        // The assembler upserts the overlay env on last-occurrence, so the winner for a key is
+        // its last entry in this layering. Under a network allowlist the cage must trust the
+        // egress proxy's per-session CA, not ops's root bundle: egress is layered after cacert,
+        // so it wins. A trusted config, layered last, still has the final say (self-harm only).
+        let winner = |env: &[(String, String)]| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == "SSL_CERT_FILE")
+                .map(|(_, v)| v.clone())
+        };
+
+        let cacert = vec![(
+            "SSL_CERT_FILE".into(),
+            "/etc/ssl/certs/ca-bundle.crt".into(),
+        )];
+        let egress = vec![("SSL_CERT_FILE".into(), "/opt/ops/egress-ca.pem".into())];
+        let env = extra_cage_env(vec![], cacert.clone(), vec![], egress.clone(), &[]);
+        assert_eq!(
+            winner(&env).as_deref(),
+            Some("/opt/ops/egress-ca.pem"),
+            "egress CA must override the structural cacert"
+        );
+
+        let cfg = vec![("SSL_CERT_FILE".into(), "/cfg/ca.pem".into())];
+        let env = extra_cage_env(vec![], cacert, vec![], egress, &cfg);
+        assert_eq!(
+            winner(&env).as_deref(),
+            Some("/cfg/ca.pem"),
+            "a trusted config has the final say over the CA"
+        );
+
+        // with no egress (shared/isolated posture) the structural cacert stands
+        let cacert = vec![(
+            "SSL_CERT_FILE".into(),
+            "/etc/ssl/certs/ca-bundle.crt".into(),
+        )];
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], &[]);
+        assert_eq!(
+            winner(&env).as_deref(),
+            Some("/etc/ssl/certs/ca-bundle.crt"),
+            "without egress the hermetic cacert is the trust anchor"
         );
     }
 
