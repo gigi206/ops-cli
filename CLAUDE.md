@@ -104,7 +104,20 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
   reqwest), so in-cage TLS no longer depends on the host's `/etc/ssl`; and the base
   carries a small curated CLI set (`curl git less grep sed awk find which`) sharing the
-  base glibc, so an agent gets the everyday tools without declaring them.**
+  base glibc, so an agent gets the everyday tools without declaring them.** **M4.1 done —
+  the first in-cage enforcement layer: a two-filter `seccompiler` cBPF **seccomp denylist
+  (Posture A)** handed to bwrap via `--add-seccomp-fd`, blocking the historically-abused
+  syscall set AND the mount/ns family (so the userns→mount→overlayfs/`pivot_root` LPE
+  surface is unreachable), reconciled with nix by forcing `sandbox = false` +
+  `filter-syscalls = false`. Spike-decided A-vs-B, advisor-reviewed, 494 tests green.**
+  **M4.2 done — the anti-DoS layer: the cage runs inside a transient systemd user scope
+  (`systemd-run --user --scope`) carrying cgroup v2 limits (`MemoryHigh=80%`, `MemoryMax=90%`,
+  `TasksMax=16384`) — chosen over Landlock-FS (whose confidentiality job the hermetic FHS already
+  does) to close the unaddressed resource-exhaustion gap. systemd-run exec-chains (non-invasive,
+  pty job control survives); best-effort/graceful-degradation (no cgroups/systemd → no limits,
+  never a hard-fail); one `limiter()` decision shared by launch + doctor; wired at all three launch
+  sites + a doctor line. 500 tests green. The M4 enforcement stack is complete (seccomp + cgroups);
+  Landlock-FS is a deferred defense-in-depth option, not a gap.**
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped
@@ -821,6 +834,116 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (plan AND impl) + user-validated per the cadence; **474 tests green** (418 in-crate + 32 config +
   7 run.rs + 17 across the other suites), fmt/clippy clean. The shipping static musl binary links
   with the new C/asm deps via `mise exec -- cargo zigbuild` (zig cc); see `mise.toml`.
+  **M4.1 — seccomp denylist, Posture A (DONE)** (`src/sandbox/seccomp.rs` + `mod.rs` + `binds.rs`
+  + `fhs.rs` + `launch.rs` + `smoke.rs`; spike `docs/bwrap-seccomp-spike-2026-06-21.md`): the first
+  enforcement layer **inside** the bwrap namespace cage — a syscall denylist that removes the
+  userns→mount→overlayfs/`pivot_root` kernel-LPE surface and the historically-abused syscall set,
+  delivered as **two `seccompiler`-compiled cBPF filters** (a new musl-clean pure-Rust dep, no
+  libseccomp) handed to bwrap via `--add-seccomp-fd` over **non-CLOEXEC `memfd`s** (inherited
+  across `exec`, kept alive until bwrap reads them). Two filters because one `seccompiler` program
+  carries one match-action: an **EPERM** set (ptrace/process_vm_*, kernel modules, kexec/reboot,
+  `bpf`, `perf_event_open`, `io_uring_*`, `userfaultfd`, keyring, swap/acct/syslog,
+  sethostname/setdomainname, personality, x86_64 `ioperm`/`iopl`, the **mount/ns family**
+  `unshare`/`setns`/`mount`/`umount2`/`pivot_root`/`chroot`, `clone` **arg-filtered** on
+  `CLONE_NEWUSER`/`CLONE_NEWNS`, `ioctl` arg-filtered on `TIOCSTI`/`TIOCLINUX`) **plus** an
+  **ENOSYS** set (`clone3` + the new mount API `open_tree`/`move_mount`/`fsopen`/`fsconfig`/
+  `fsmount`/`fspick`/`mount_setattr`). `clone3 → ENOSYS` is **mandatory** — it both blocks the
+  arg-filter bypass and lets glibc fall back to `clone` (glibc only retries on ENOSYS, so EPERM
+  would break **all** process creation); proven live (`fork`/8 threads/`subprocess` survive, a real
+  nix builder forks 50×). The two disjoint denylists both load; `ERRNO` outranks `ALLOW` so each
+  denied syscall gets its own filter's action. **Carve-outs kept allowed:** `AF_UNIX`,
+  `socketpair`, `recvfrom` (the Model-B egress `socat` forwarder + toolchain plumbing).
+  **Posture A vs B settled by the spike's evidence** (not a predetermined pick): the *conflict-free
+  core* ships in both; the contested delta is the mount/ns family. **A blocks it** and ops forces
+  nix `sandbox = false` + `filter-syscalls = false` via the structural `NIX_CONFIG` (already on the
+  untrusted-only denylist) — the userns→mount→overlayfs/`pivot_root` paths become **unreachable**
+  in the cage (real reduction of the most common Linux LPE class); the cost is nix builds lose
+  their *inner* sandbox, accepted inside the Mode-B threat model (the agent already runs arbitrary
+  code in-cage; the per-project store is the boundary). The **discriminating fact** the spike
+  surfaced: `--cap-drop ALL` + bwrap's single-uid userns already **neuter** a nested userns
+  (`unshare(CLONE_NEWUSER)` succeeds but `write /proc/self/uid_map` → EPERM, the single-uid map
+  cannot map root), so blocking mount/ns is surface-reduction, **not** the sole escape-block. There
+  is **no clean third option in M4.1** — seccomp is process-wide + inherited, so one filter cannot
+  allow `unshare` for nix yet deny it for the agent; the selective path is the nested-ns
+  re-isolation helper, deferred to M5 and itself gated by that uid_map limit. **`NIX_CONFIG`
+  reconciliation** updated (`binds.rs::mise_env`): the additive `extra-experimental-features`
+  line now also carries `sandbox = false` + `filter-syscalls = false`, **superseding** the
+  earlier "ops sets no NIX_CONFIG / sandbox=true works in-cage" note — that held only while the
+  cage carried *no* syscall filter, exactly the load-bearing dependency recorded at 2b.3.2b.2.
+  **Wired at all four launch sites** (`exec`, `run_supervised`, `supervise`/pty, and the `doctor`
+  smoke) via `seccomp::memfds()` + `seccomp::argv_prefix()`, so `doctor` now proves the full
+  launch path *with* the filter (fail-closed on a host without `CONFIG_SECCOMP` — intended for a
+  mandatory control). `to_argv` stays pure; arch-gated to x86_64/aarch64 (`compile_error!`
+  otherwise). **494 tests green** (8 net-new seccomp unit + a real-bwrap **teeth test** —
+  python3 probe in the live cage asserting keyctl/clone3/unshare/`clone(CLONE_NEWUSER)`/
+  `ioctl(TIOCSTI)` are refused with the right errno while `fork`/`AF_UNIX` succeed and a benign
+  `ioctl(TIOCGWINSZ)` returns ENOTTY — the arg-filter is selective, not a blanket block),
+  fmt/clippy clean, **musl static build verified** (zigbuild + seccompiler). Non-regression
+  proof: the `the_cage_self_equips_via_mise_under_a_network_allowlist` smoke **executed** (a real
+  in-cage `nix build` under both filters + `sandbox = false`) and the egress e2e passed (AF_UNIX
+  forwarder in the empty netns). Advisor-reviewed (plan AND impl — it caught that the committed
+  teeth test exercised only the *unconditional* rules, not the arg-filtered `clone`/`ioctl`
+  firing, a distinct escape path; folded the firing probes into the committed test). Memory:
+  [[m4-seccomp-denylist]].
+  **M4.2 — cgroup v2 resource limits, anti-DoS (DONE)** (`src/sandbox/cgroup.rs` + `mod.rs` +
+  `launch.rs` + `main.rs` + `tests/run.rs`/`tests/shell.rs`; spike
+  `docs/bwrap-cgroups-spike-2026-06-21.md`): the M4 enforcement stack's anti-DoS layer — nothing
+  in the namespace/seccomp/egress stack bounds *resource consumption*, so an in-cage agent can
+  fork-bomb, exhaust memory, or peg the CPU (a runaway build or deliberate). **cgroups was chosen
+  over Landlock-FS for M4.2 with the user**: Landlock's confidentiality job is **already done by
+  the hermetic FHS** (a secret is *absent* from the cage, not merely read-only-bound — Landlock
+  would re-police paths that simply are not mounted), whereas resource exhaustion is a live,
+  unaddressed gap; Landlock-FS stays a *defense-in-depth* option for a later milestone, not a M4.2
+  need. **Mechanism: a transient systemd user scope** (`systemd-run --user --scope -q --collect
+  -p <prop> -- <bwrap…>`) carrying the limits, **not** a hand-rolled cgroup — under cgroup v2 an
+  ad-hoc cgroup under systemd's `app.slice` is unsanctioned and GC-able, while `systemd-run` asks
+  the user manager for a proper scope it owns/tracks/auto-removes. **The spike's load-bearing
+  measurement** (a real pty): `systemd-run` **exec-chains** (registers the scope, moves itself in,
+  `execve`s → parent of the cage is the original process, no lingering `systemd-run`), so **pty
+  job control survives** (`JOBCTRL_ON`, no "no job control" warning) — it behaves as a plain argv
+  prefix, the same non-invasive shape the seccomp prefix has. **Profile:** `MemoryHigh=80%`
+  (reclaim/throttle threshold — a heavy build slows, survives), `MemoryMax=90%` (hard **per-cage**
+  OOM ceiling), `TasksMax=16384` (the unambiguous host-wide anti-DoS win — any finite bound defeats
+  a fork-bomb, while the cap sits far above any real `make -j`; maps to cgroup `pids.max` — the
+  property is `TasksMax`, **not** `PidsMax`, which systemd rejects). No `CPUQuota` (the scheduler is
+  already fair; a hard quota would only slow legitimate builds). The memory ceiling is honestly
+  **per-cage, not host-global** — N concurrent cages each capped relative to total RAM can sum past
+  it; the task cap is the clean host-wide guarantee. **Best-effort / graceful degradation — never
+  the boundary** (resource limits are hardening; the namespace+seccomp+egress layer is the control
+  and *that* hard-fails): where there is no cgroup v2, no reachable systemd user session, no
+  `systemd-run`, or no delegated controller, the cage launches **without** limits rather than
+  failing — the launch must never regress where it previously worked. **The `-p` list is built from
+  the *delegated* controllers** (`/proc/self/cgroup` → the session's `user@<uid>.service` →
+  `cgroup.controllers`), so an undelegated property is dropped rather than risking a `systemd-run`
+  rejection. **One single decision** — `cgroup::limiter()` — is consulted by **both** the launch
+  path (`wrap`) and the `doctor` probe (`probe`), so `doctor` can never report a posture a launch
+  would not take (the `effective_lock_target` pattern). **The launch must require a *reachable* user
+  manager, not merely `XDG_RUNTIME_DIR` set** (advisor-caught blocking regression): a detached/
+  cron/post-logout context can inherit the env var while the session bus is gone, which would
+  hard-fail the launch; `limiter()` requires `$XDG_RUNTIME_DIR/bus` to **exist** (residual: a stale
+  socket from a crashed manager, rare, then the failure names `systemd-run`). **Wired at all three
+  launch sites** via `cgroup::wrap(bwrap, argv)` (pure `compose` splices bwrap after the scope
+  prefix, or returns it unchanged when degraded): `exec` (exec-replace — the cage pid *becomes*
+  systemd-run→bwrap, so host `/proc/<pid>/cgroup` reads the scope), `run_supervised` (the egress
+  allowlist path — the scope coexists with the proxy thread + supervised wait + exit propagation),
+  and `supervise`/pty (the shell — `execv` with the launcher as `argv[0]`). `doctor` gains a
+  `[ ok ] resource limits` line (or `[warn]` + the degradation note, **never** a remediation entry,
+  since it is not the boundary). The cage uses `--unshare-cgroup` and does not mount
+  `/sys/fs/cgroup`, so limits are **not visible from inside** — verification is **host-side** via
+  `/proc/<pid>/cgroup`. **500 tests green** (5 net-new `cgroup` unit — incl. a **landing test** that
+  launches a real scope and reads back `pids.max==16384` + `memory.high < memory.max` from the
+  cgroup files, skip-not-fail; the degraded `compose(None,…)` branch tested host-independently — and
+  a net-new `tests/run.rs::the_cage_runs_under_a_resource_limit_scope` e2e that drives a real
+  `ops run -- sleep` and asserts `pids.max==16384` host-side through `/proc/<pid>/cgroup`,
+  skip-not-fail), fmt/clippy clean, **musl static build verified** (cgroup.rs is std-only, no new
+  dep). Non-regression proof: the egress e2e **executed** (the wrapped `run_supervised` path — scope
+  + proxy thread + exit propagation coexist) and the pty `shell.rs` test **executed** (`CTTY=OK`
+  proves job control survives the wrapped supervisor→scope→bwrap→shell chain). Advisor-reviewed
+  (plan AND impl — it caught the `XDG_RUNTIME_DIR`-only regression, an untested degraded branch, an
+  over-claimed memory comment, and a doctor↔launch precondition drift now closed by the shared
+  `limiter()`). Memory: [[m4-cgroup-resource-limits]]. **The M4 enforcement stack is complete —
+  seccomp denylist (M4.1) + cgroup v2 limits (M4.2); Landlock-FS is a deferred defense-in-depth
+  option, not a gap.**
   **M3.3d.2a** (`src/trust.rs::MISE_CONFIG_NAMES`): the trust-hashed (and
   later-authorized) mise file set now covers mise's full *same-directory* discovery
   — `mise.local.toml`, `.mise.toml`, `mise.toml`, `.tool-versions` — up from the two

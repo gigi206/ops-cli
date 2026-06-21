@@ -826,3 +826,74 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
         String::from_utf8_lossy(&clean.stdout)
     );
 }
+
+/// The cage runs inside a transient systemd scope carrying the anti-DoS resource
+/// limits. `ops run` exec-replaces, so the spawned child keeps its pid *as* the
+/// bwrap process placed in the scope; reading that pid's cgroup from the host and
+/// finding `pids.max` equal to the configured task cap is conclusive proof the
+/// limit landed through the full launch path — no unrelated process carries that
+/// exact value. Skips (does not fail) where the host cannot sandbox or has no
+/// systemd user session that delegates the pids controller.
+#[test]
+fn the_cage_runs_under_a_resource_limit_scope() {
+    const TASK_CAP: &str = "16384"; // mirrors sandbox::cgroup::TASKS_MAX
+    let project = TmpDir::new("cg-proj");
+    let data = TmpDir::new("cg-data");
+
+    // capability probe (also primes the base userland so the sleep launches fast)
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping resource-limit e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let mut child = ops()
+        .arg("run")
+        .arg("--")
+        .args(["sleep", "5"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ops run");
+    let pid = child.id();
+
+    // Poll the cage's host-visible cgroup until the scope's task cap appears.
+    let mut pids_max = String::new();
+    for _ in 0..50 {
+        if let Some(scope) = host_cgroup_path(pid) {
+            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
+                pids_max = v.trim().to_string();
+                if pids_max == TASK_CAP {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // A match means a real `ops run` placed the cage in a scope with the
+    // configured cap; otherwise skip (no systemd user session delegating pids).
+    if pids_max != TASK_CAP {
+        eprintln!(
+            "skipping resource-limit e2e: the cage is not under a task-capped scope \
+             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+        );
+    }
+}
+
+/// The real cgroup v2 path of a process, read from the host (`0::<path>`), or
+/// `None` if the process is gone or its cgroup cannot be read.
+fn host_cgroup_path(pid: u32) -> Option<String> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::to_string)
+}

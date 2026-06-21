@@ -67,7 +67,14 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     );
 
     let spec = probe_spec(work.path(), script)?;
-    let out = Command::new(bwrap).args(to_argv(&spec)).output()?;
+    // Load the mandatory seccomp filters too, so `doctor` proves the real launch
+    // path — hardening *and* filter — works on this host, not just the namespaces.
+    // The memfds stay alive until `output` returns (bwrap reads them at startup).
+    let seccomp = super::seccomp::memfds()?;
+    let mut argv = super::seccomp::argv_prefix(&seccomp);
+    argv.extend(to_argv(&spec));
+    let out = Command::new(bwrap).args(argv).output()?;
+    drop(seccomp);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     Ok(SmokeReport {

@@ -28,6 +28,7 @@ use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use crate::session::{self, Kind, RecordGuard, Session};
 use crate::store::Layout;
 use std::ffi::{CString, OsString};
+use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
@@ -554,16 +555,33 @@ fn register(data_dir: &Path, spec: &SandboxSpec, kind: Kind) -> Option<PathBuf> 
 /// egress guard is present. `Command::status` forks, waits, and yields the child's code;
 /// the proxy thread was already spawned (by `egress::start`) before the launch.
 fn run_supervised(bwrap: &Path, spec: &SandboxSpec) -> ExitCode {
-    match Command::new(bwrap)
-        .args(super::argv::to_argv(spec))
-        .status()
-    {
+    let (argv, _seccomp) = match seccomp_argv(spec) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ops: failed to prepare the seccomp filter: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (prog, args) = super::cgroup::wrap(bwrap, argv);
+    match Command::new(prog).args(args).status() {
         Ok(status) => ExitCode::from(status_code(status) as u8),
         Err(e) => {
             eprintln!("ops: failed to launch the sandbox: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// The bwrap argv with the mandatory seccomp filters prepended. Returns the
+/// backing memfds the caller must keep alive until bwrap has read them — they are
+/// not close-on-exec, and dropping a `File` early would close the descriptor
+/// bwrap is told to read. Seccomp is loaded on every launch path the same way the
+/// namespace hardening is emitted unconditionally by `to_argv`.
+fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
+    let memfds = super::seccomp::memfds()?;
+    let mut argv = super::seccomp::argv_prefix(&memfds);
+    argv.extend(super::argv::to_argv(spec));
+    Ok((argv, memfds))
 }
 
 /// A process's exit code in the shell convention: its own code, or 128 + the signal that
@@ -586,7 +604,14 @@ fn exec(bwrap: &Path, spec: &SandboxSpec) -> io::Error {
             "internal error: a private-tty sandbox must be launched through the pty supervisor",
         );
     }
-    Command::new(bwrap).args(super::argv::to_argv(spec)).exec()
+    let (argv, _seccomp) = match seccomp_argv(spec) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // `_seccomp` stays alive until the exec replaces this process (or, on failure,
+    // until this returns), so bwrap can read the inherited filter descriptors.
+    let (prog, args) = super::cgroup::wrap(bwrap, argv);
+    Command::new(prog).args(args).exec()
 }
 
 /// Run `spec` under a pty supervisor and return its exit status code. ops opens
@@ -594,11 +619,21 @@ fn exec(bwrap: &Path, spec: &SandboxSpec) -> io::Error {
 /// `login_tty`), keeps the *master* itself, puts the real terminal in raw mode,
 /// and relays bytes both ways until the session ends.
 fn supervise(bwrap: &Path, spec: &SandboxSpec) -> io::Result<i32> {
-    // Build the argv as C strings *before* forking: nothing between fork and
-    // exec may allocate.
-    let bwrap_c = cstring(bwrap.as_os_str().as_bytes())?;
-    let mut argv_owned = vec![bwrap_c.clone()];
-    for arg in super::argv::to_argv(spec) {
+    // The seccomp filters are loaded into anonymous files *before* the fork so the
+    // child inherits their descriptors; the parent holds `seccomp` alive through
+    // `pump` so the descriptors stay open until bwrap has read them.
+    let seccomp = super::seccomp::memfds()?;
+
+    // Build the bwrap argv (seccomp prefix + the hardened spec), then wrap it in
+    // the resource-limit scope: the program may become `systemd-run` with bwrap
+    // spliced in after `--`. Compose as C strings *before* forking — nothing
+    // between fork and exec may allocate.
+    let mut bwrap_argv = super::seccomp::argv_prefix(&seccomp);
+    bwrap_argv.extend(super::argv::to_argv(spec));
+    let (program, full_argv) = super::cgroup::wrap(bwrap, bwrap_argv);
+    let program_c = cstring(program.as_os_str().as_bytes())?;
+    let mut argv_owned = vec![program_c.clone()];
+    for arg in &full_argv {
         argv_owned.push(cstring(arg.as_bytes())?);
     }
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
@@ -656,7 +691,7 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec) -> io::Result<i32> {
             // dup it onto stdin/out/err. This is what gives the sandbox a
             // controlling terminal (and thus job control).
             if libc::login_tty(slave) == 0 {
-                libc::execv(bwrap_c.as_ptr(), argv.as_ptr());
+                libc::execv(program_c.as_ptr(), argv.as_ptr());
             }
             // only reached if login_tty or execv failed
             libc::_exit(127);

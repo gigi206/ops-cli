@@ -366,9 +366,15 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 /// - `MISE_EXPERIMENTAL` enables mise's custom backends, the gate on `nix:`;
 /// - `MISE_YES` auto-confirms prompts so a non-interactive `mise install` never
 ///   blocks;
-/// - `NIX_CONFIG` appends the experimental features the plugin's `nix build`
-///   (a flake reference) needs — `extra-`, so it adds to nix's compiled defaults
-///   rather than replacing them, and so the offline base build still works.
+/// - `NIX_CONFIG` carries three settings (newline-separated): it *appends* the
+///   experimental features the plugin's `nix build` (a flake reference) needs —
+///   `extra-`, so it adds to nix's compiled defaults rather than replacing them —
+///   and it forces `sandbox = false` + `filter-syscalls = false`. The cage's
+///   seccomp filter denies the mount/namespace syscalls nix's *inner* build
+///   sandbox would use, so an in-cage build must run without it (the cage is the
+///   boundary, not nix's inner sandbox); setting it here makes that deterministic
+///   rather than relying on nix's silent fallback. These keys are on the
+///   untrusted-only env denylist, so only ops sets them.
 fn mise_env() -> Vec<(String, String)> {
     vec![
         (
@@ -379,7 +385,10 @@ fn mise_env() -> Vec<(String, String)> {
         ("MISE_YES".to_string(), "1".to_string()),
         (
             "NIX_CONFIG".to_string(),
-            "extra-experimental-features = nix-command flakes".to_string(),
+            "extra-experimental-features = nix-command flakes\n\
+             sandbox = false\n\
+             filter-syscalls = false"
+                .to_string(),
         ),
     ]
 }

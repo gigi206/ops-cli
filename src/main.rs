@@ -111,6 +111,7 @@ fn doctor() -> ExitCode {
     if let Some(v) = read_sysctl("/proc/sys/kernel/unprivileged_userns_clone") {
         println!("         · kernel.unprivileged_userns_clone = {v}");
     }
+    report_resource_limits();
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, ops cannot provision a project's tools.
@@ -177,6 +178,23 @@ fn doctor() -> ExitCode {
             eprintln!("       • {hint}");
         }
         ExitCode::FAILURE
+    }
+}
+
+/// Report best-effort cgroup v2 resource limiting (anti-DoS). Unlike the security
+/// boundary, resource limits are hardening: where they cannot be applied the cage
+/// still runs, so an unavailable limiter is reported for context and never
+/// recorded as a missing prerequisite. The probe launches a real transient scope,
+/// so a green line means limiting actually works on this host.
+fn report_resource_limits() {
+    let report: sandbox::LimitReport = sandbox::resource_limits();
+    if report.verified {
+        println!(
+            "  [ ok ] resource limits   cage capped via a systemd scope ({})",
+            report.properties.join(", ")
+        );
+    } else if let Some(note) = report.note {
+        println!("  [warn] resource limits   {note}");
     }
 }
 

@@ -2,6 +2,12 @@
 //! and assert the *property* that separates it from `ops run` — the sandbox gets
 //! a controlling terminal, so job control works (not merely "a command ran").
 //! Skipped, not failed, where the host cannot sandbox.
+//!
+//! On a host with a systemd user session this also exercises the *wrapped* launch
+//! chain: the pty supervisor's child becomes the resource-limit scope launcher,
+//! which exec-chains into bubblewrap and then the shell. A `CTTY=OK` with no "no
+//! job control" warning therefore proves job control survives that whole chain —
+//! the load-bearing concern for putting the cage inside a transient scope.
 
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};

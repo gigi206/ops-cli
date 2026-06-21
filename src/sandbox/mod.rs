@@ -8,6 +8,7 @@
 
 mod argv;
 mod binds;
+mod cgroup;
 pub(crate) mod egress;
 mod fhs;
 mod launch;
@@ -18,9 +19,11 @@ mod packages;
 mod projectstore;
 mod proxy;
 mod resolver;
+mod seccomp;
 mod smoke;
 mod spec;
 
+pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use launch::{effective_lock_target, run, run_mise, shell};
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 pub(crate) use proxy::nix_cache_hosts;

@@ -90,16 +90,16 @@ pub(crate) fn resolve_userland(
     // the store to the local `/nix`, build from the seeded base offline, and substitute
     // new tools from the default cache over HTTPS (the cage binds ops's own CA bundle at
     // nix's default certificate path, so trust does not depend on the host — see `cacert`
-    // below). The only
-    // configuration ops adds is `extra-experimental-features = nix-command flakes` (via
-    // `NIX_CONFIG`, set by the assembler), which the mise `nix:` plugin's `nix build`
-    // needs; being `extra-`, it is purely additive — it does not touch `sandbox`,
-    // `substituters`, or `require-sigs`, so the offline base build is unaffected. That
-    // the build sandbox works *at all* in-cage rests on the cage carrying no syscall
-    // filter yet: nix's build sandbox creates nested namespaces (`unshare`/`clone`,
-    // `mount`, `pivot_root`) and installs a seccomp filter, so a later cage-level
-    // seccomp denylist must allowlist those — or force nix's `sandbox`/`filter-syscalls`
-    // off — or it will silently break in-cage builds.
+    // below). ops adds three settings via `NIX_CONFIG` (set by the assembler):
+    // `extra-experimental-features = nix-command flakes`, which the mise `nix:`
+    // plugin's `nix build` needs (`extra-`, so purely additive — it does not touch
+    // `substituters` or `require-sigs`, leaving the offline base build unaffected),
+    // and `sandbox = false` + `filter-syscalls = false`. The latter two reconcile
+    // with the cage's seccomp denylist, which refuses the nested-namespace syscalls
+    // (`unshare`/`clone(NEWNS)`, `mount`, `pivot_root`) nix's *inner* build sandbox
+    // would use: the cage is the boundary, so an in-cage build runs without that
+    // redundant inner sandbox. Forcing it off makes that deterministic instead of
+    // relying on nix's silent `sandbox-fallback`.
     let nix_pkg = realise("nix", "bin/nix", "nix")?;
     // mise, the dev-tool front-end an agent drives to self-equip a project's
     // `nix:` toolchain (`mise install nix:<pkg>`) into the project's own writable
