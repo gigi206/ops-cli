@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         Some("doctor") => doctor(),
         Some("shell") => sandbox::shell(),
         Some("ps") => list_sessions(),
+        Some("attach") => attach_cmd(args.collect()),
         Some("trust") => trust_cmd(args.collect()),
         Some("untrust") => untrust_cmd(args.next()),
         Some("config") => config_cmd(),
@@ -53,7 +54,7 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!(
                 "ops: unknown command '{other}' (known: doctor, shell, run, mise, app, \
-                 search, test, plugins, ps, trust, untrust, config, upgrade, gc)"
+                 search, test, plugins, ps, attach, trust, untrust, config, upgrade, gc)"
             );
             ExitCode::from(2)
         }
@@ -62,8 +63,8 @@ fn main() -> ExitCode {
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
                  app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
                  plugins <list|info|install|rm|store> | \
-                 ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise|flake] | \
-                 gc [--all] [--prune]>"
+                 ps | attach <id> | trust [path] | untrust [path] | config | \
+                 upgrade [all|nix|mise|flake] | gc [--all] [--prune]>"
             );
             ExitCode::from(2)
         }
@@ -305,7 +306,7 @@ fn list_sessions() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    println!("{:<6}  {:>8}  {:>8}  PROJECT", "KIND", "PID", "AGE");
+    println!("{:<14}  {:>8}  {:>8}  PROJECT", "KIND", "PID", "AGE");
     let uptime = uptime_seconds();
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     for s in &sessions {
@@ -316,15 +317,35 @@ fn list_sessions() -> ExitCode {
             }
             _ => "?".to_string(),
         };
+        // An app session shows its app name, so the user can tell which sessions are agents (and
+        // that `ops attach` will drop them into that app's isolated home).
+        let kind = match &s.runtime {
+            session::SessionRuntime::Project => s.kind.as_str().to_string(),
+            session::SessionRuntime::GlobalApp(name)
+            | session::SessionRuntime::ProjectApp(name) => {
+                format!("app:{name}")
+            }
+        };
         println!(
-            "{:<6}  {:>8}  {:>8}  {}",
-            s.kind.as_str(),
+            "{:<14}  {:>8}  {:>8}  {}",
+            kind,
             s.pid,
             age,
             s.project.display()
         );
     }
     ExitCode::SUCCESS
+}
+
+/// `ops attach <id>`: open a shell in a running session's environment. Exactly one operand — the
+/// PID `ops ps` shows. A missing, extra, or non-UTF-8 operand is a usage error; a well-formed id
+/// that matches no live session is reported by `attach` itself.
+fn attach_cmd(args: Vec<OsString>) -> ExitCode {
+    let Some(id) = (args.len() == 1).then(|| args[0].to_str()).flatten() else {
+        eprintln!("ops: usage: ops attach <id>   (the PID shown by `ops ps`)");
+        return ExitCode::from(2);
+    };
+    sandbox::attach(id)
 }
 
 /// The config path an `ops trust`/`untrust` invocation targets: the given path,

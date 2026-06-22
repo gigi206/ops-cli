@@ -85,7 +85,12 @@ pub(crate) fn run(cmd: Vec<OsString>) -> ExitCode {
         Err(code) => return code,
     };
 
-    register(prep.layout.data_dir(), &spec, Kind::Run);
+    register(
+        prep.layout.data_dir(),
+        &spec,
+        Kind::Run,
+        binds::Runtime::ProjectDefault,
+    );
 
     match egress {
         // The default postures: exec-replace, so the command's exit status becomes ops's.
@@ -145,7 +150,7 @@ pub(crate) fn app(name: &str) -> ExitCode {
         Err(code) => return code,
     };
 
-    register(prep.layout.data_dir(), &spec, Kind::Run);
+    register(prep.layout.data_dir(), &spec, Kind::Run, runtime);
 
     match egress {
         None => {
@@ -402,7 +407,8 @@ pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
     if all {
         match crate::store::Layout::from_env() {
             Some(layout) => {
-                reap_dead_trees(&layout, prune);
+                let live_ids = session_housekeeping(&layout);
+                reap_dead_trees(&layout, &live_ids, prune);
                 shared_store_gc(&layout, prune);
             }
             None => eprintln!(
@@ -425,29 +431,45 @@ pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
     }
 }
 
+/// Prune dead session records and report it (the dedicated housekeeping pass the registry deferred:
+/// an `ops run` record with no post-exec hook lingered until the next `ops ps`). Returns the ids of
+/// projects with a *live* session — hashing each recorded canonical path — so the dead-tree reap
+/// can skip a tree a session still holds without scanning the registry a second time.
+fn session_housekeeping(layout: &crate::store::Layout) -> std::collections::BTreeSet<String> {
+    match session::Registry::at(layout.data_dir()).housekeep() {
+        Ok((live, pruned)) => {
+            if pruned > 0 {
+                println!(
+                    "ops gc --all: pruned {pruned} stale session record(s); {} live.",
+                    live.len()
+                );
+            }
+            // Hash the stored path directly rather than re-canonicalise: a live session's recorded
+            // path is already canonical, so its hash matches the id its tree is keyed by.
+            live.iter().map(|s| binds::project_id(&s.project)).collect()
+        }
+        Err(e) => {
+            eprintln!(
+                "ops gc: cannot read the session registry ({e}); skipping session housekeeping."
+            );
+            std::collections::BTreeSet::new()
+        }
+    }
+}
+
 /// Reap — or, in a dry run, list — the runtime trees under `<data>/projects/` whose project
 /// directory is gone, plus surface any markerless legacy trees. A tree is reclaimed only when it
 /// carries a `project` marker, that path is absent while its parent directory still exists (a cheap
 /// guard, not a reliable unmount check — the dry-run default is the backstop there), and no live
 /// session holds it. Markerless trees (their project path unknown) are listed for a manual decision,
 /// never reclaimed. Pure host-side filesystem work — no sandbox, no nix.
-fn reap_dead_trees(layout: &crate::store::Layout, prune: bool) {
+fn reap_dead_trees(
+    layout: &crate::store::Layout,
+    live_ids: &std::collections::BTreeSet<String>,
+    prune: bool,
+) {
     let projects_dir = layout.data_dir().join("projects");
-    // Ids of running sessions, by hashing each recorded canonical project path — so a tree a live
-    // session still holds is skipped. We hash the stored path directly rather than re-canonicalise:
-    // a dead project's path no longer exists, but a live session's recorded path is already
-    // canonical, so its hash matches the id the tree is keyed by.
-    let live_ids: std::collections::BTreeSet<String> = session::Registry::at(layout.data_dir())
-        .list()
-        .map(|sessions| {
-            sessions
-                .iter()
-                .map(|s| binds::project_id(&s.project))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let report = super::gc::reap_dead_projects(&projects_dir, &live_ids, prune);
+    let report = super::gc::reap_dead_projects(&projects_dir, live_ids, prune);
     if report.dead.is_empty() && report.unidentified.is_empty() {
         println!("ops gc --all: no dead project trees to reclaim.");
         return;
@@ -749,25 +771,31 @@ pub(crate) fn shell() -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
-    // The command is the resolved interactive shell; the pty gives it a
-    // controlling terminal so it starts interactively with job control. It starts with
-    // `--rcfile` pointing at the synthetic in-cage rc, which activates mise so the
-    // project's activated tools (`mise use`) manage PATH/env in the interactive shell —
-    // mise's documented interactive mechanism. (`ops run` instead reaches activated
-    // tools through the shims dir on PATH, with no shell to hook.)
+    launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
+}
+
+/// Launch an interactive shell in the cage for `runtime`, under a pty supervisor so job control
+/// works — the shared body of `ops shell` (the project's default home) and `ops attach` (which
+/// reproduces a session's home, including an app's isolated one). The command is the resolved
+/// interactive shell started with `--rcfile` at the synthetic in-cage rc, which activates mise so
+/// the project's activated tools (`mise use`) manage PATH/env in the interactive shell — mise's
+/// documented interactive mechanism. (`ops run` instead reaches activated tools through the shims
+/// dir on PATH, with no shell to hook.) Assumes stdin is a terminal (the callers check).
+fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCode {
     let cmd = vec![
         prep.userland.shell_bin.clone().into_os_string(),
         OsString::from("--rcfile"),
         OsString::from(binds::SHELL_RC_INCAGE),
     ];
-    let (spec, egress) = match build(&prep, binds::Runtime::ProjectDefault, cmd) {
+    let (spec, egress) = match build(prep, runtime, cmd) {
         Ok((s, e)) => (s.with_private_tty(), e),
         Err(code) => return code,
     };
 
     // Register the session and hold the guard for the whole supervised session;
     // it unlinks the record when the shell exits (dropped as this scope ends).
-    let _record = register(prep.layout.data_dir(), &spec, Kind::Shell).map(RecordGuard::new);
+    let _record =
+        register(prep.layout.data_dir(), &spec, Kind::Shell, runtime).map(RecordGuard::new);
     // Hold the egress guard for the session too (under an allowlist): the host proxy thread
     // runs alongside the pty supervisor, and the guard unlinks the socket and CA on exit.
     let _egress = egress;
@@ -779,6 +807,96 @@ pub(crate) fn shell() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ops attach <id>`: open an interactive shell in a running session's environment — a second
+/// terminal sharing that session's persistent home and store (the deterministic per-project
+/// runtime), **not** a join of the running process (there is no setns). `<id>` is the PID `ops ps`
+/// shows. For a plain `ops run`/`ops shell` session that is the project's default home; for an
+/// `ops app` agent it is the app's isolated home plus the app's current posture (its egress
+/// allowlist, packages, and injected secrets), so attaching to a running agent drops you into the
+/// same environment it works in.
+pub(crate) fn attach(id: &str) -> ExitCode {
+    let Some(layout) = crate::store::Layout::from_env() else {
+        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ops attach: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // A pid is unique among live processes, so this is a 0-or-1 match. Resolve the target before
+    // the terminal check, so an unknown id is reported even without a tty.
+    let Some(target) = sessions.into_iter().find(|s| s.pid.to_string() == id) else {
+        eprintln!("ops attach: no live session '{id}' — run `ops ps` to list them.");
+        return ExitCode::from(2);
+    };
+    // SAFETY: `isatty` only inspects fd 0. The attached shell needs a real terminal, like `shell`.
+    if unsafe { libc::isatty(0) } != 1 {
+        eprintln!("ops: `ops attach` needs a terminal on stdin.");
+        return ExitCode::from(2);
+    }
+    let project = target.project;
+    let runtime = target.runtime;
+
+    // A new cage in the session's project: changing directory makes the launch resolve that
+    // project (and its config), exactly as if the user had `cd`'d there.
+    if let Err(e) = std::env::set_current_dir(&project) {
+        eprintln!(
+            "ops attach: the session's project is no longer reachable ({}): {e}",
+            project.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let prep = match prepare() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    match runtime {
+        session::SessionRuntime::Project => {
+            eprintln!(
+                "ops: attaching a shell to {} (a second terminal in the same sandbox)",
+                project.display()
+            );
+            launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
+        }
+        session::SessionRuntime::GlobalApp(name) => attach_app_shell(prep, &name, true),
+        session::SessionRuntime::ProjectApp(name) => attach_app_shell(prep, &name, false),
+    }
+}
+
+/// Open an interactive shell in app `name`'s environment: its isolated home — kept by the
+/// session's recorded scope (`global_home`), where the agent's state actually lives — plus the
+/// app's current overlay posture (egress, packages, secrets), folded in by re-resolving the app
+/// from the project's config. Refuses if the app is no longer configured for this project, since
+/// its posture could not then be reproduced.
+///
+/// Residual: the posture is reproduced from the **current** config and trust, so if the project was
+/// untrusted or its config edited since the agent launched, the attach shell can get a different
+/// posture than the running agent (e.g. a since-dropped `network` allowlist). That is inherent to
+/// reproducing from current config; any security field the trust gate drops on re-resolution is
+/// surfaced as a warning by [`build`], so a weaker shell is never silent.
+fn attach_app_shell(mut prep: Prepared, name: &str, global_home: bool) -> ExitCode {
+    let Some(app) = prep.cfg.apps.remove(name) else {
+        eprintln!(
+            "ops attach: app `{name}` is no longer configured for this project — cannot reproduce \
+             its environment."
+        );
+        return ExitCode::FAILURE;
+    };
+    // The home is keyed by the record's scope (where the agent runs); the overlay — network,
+    // packages, secrets — comes from the app's current resolution.
+    prep.cfg.merge_app(app);
+    let runtime = if global_home {
+        binds::Runtime::GlobalApp(name)
+    } else {
+        binds::Runtime::ProjectApp(name)
+    };
+    eprintln!("ops: attaching a shell to app `{name}` (its isolated home and posture)");
+    launch_interactive_shell(&prep, runtime)
 }
 
 /// Hard prerequisites + per-launch resolution shared by `run` and `shell`. Returns
@@ -1564,9 +1682,24 @@ fn wrap_flake_equip(
 /// on `spec.workdir` — the canonical project root, the same identity the runtime
 /// layout derives from. Returns the record's path (to hand to a [`RecordGuard`])
 /// when it was written.
-fn register(data_dir: &Path, spec: &SandboxSpec, kind: Kind) -> Option<PathBuf> {
-    let session = Session::current(spec.workdir.clone(), kind).ok()?;
+fn register(
+    data_dir: &Path,
+    spec: &SandboxSpec,
+    kind: Kind,
+    runtime: binds::Runtime,
+) -> Option<PathBuf> {
+    let session = Session::current(spec.workdir.clone(), kind, session_runtime(runtime)).ok()?;
     session::Registry::at(data_dir).register(&session).ok()
+}
+
+/// The owned [`session::SessionRuntime`] for a launch's borrowing [`binds::Runtime`], so the
+/// record can outlive the launch and let `ops attach` reproduce the same home.
+fn session_runtime(runtime: binds::Runtime) -> session::SessionRuntime {
+    match runtime {
+        binds::Runtime::ProjectDefault => session::SessionRuntime::Project,
+        binds::Runtime::GlobalApp(name) => session::SessionRuntime::GlobalApp(name.to_string()),
+        binds::Runtime::ProjectApp(name) => session::SessionRuntime::ProjectApp(name.to_string()),
+    }
 }
 
 /// Run the cage as a child and propagate its exit status, keeping ops alive for the
@@ -1911,6 +2044,24 @@ mod tests {
     use std::path::PathBuf;
 
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+
+    #[test]
+    fn session_runtime_maps_each_launch_runtime_to_its_owned_form() {
+        // The owned record runtime `ops attach` reads back must mirror the launch-side runtime, so
+        // an app session is reproduced in the app's home rather than the project's default.
+        assert_eq!(
+            session_runtime(binds::Runtime::ProjectDefault),
+            session::SessionRuntime::Project
+        );
+        assert_eq!(
+            session_runtime(binds::Runtime::GlobalApp("claude-code")),
+            session::SessionRuntime::GlobalApp("claude-code".to_string())
+        );
+        assert_eq!(
+            session_runtime(binds::Runtime::ProjectApp("agent")),
+            session::SessionRuntime::ProjectApp("agent".to_string())
+        );
+    }
 
     /// A minimal resolved config carrying only the channel choices the builder reads.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {

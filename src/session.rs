@@ -55,8 +55,47 @@ impl Kind {
     }
 }
 
+/// Which persistent home a session runs in — the bit `ops attach` needs to reproduce the same
+/// environment. A plain `ops run`/`ops shell` uses the project's default home (`Project`); an
+/// `ops app` uses its own isolated home, keyed by the app name and its scope (`GlobalApp` shared
+/// across projects, `ProjectApp` per project). Owned (unlike the borrowing launch-side `Runtime`),
+/// so a record outlives the launch that wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionRuntime {
+    Project,
+    GlobalApp(String),
+    ProjectApp(String),
+}
+
+impl SessionRuntime {
+    /// Serialise to a single token: `project`, `global-app:<name>`, or `project-app:<name>`. An
+    /// app name is a validated single component (`[A-Za-z0-9._-]`), so it carries no `:` or newline
+    /// to confuse the framing.
+    fn serialize(&self) -> String {
+        match self {
+            SessionRuntime::Project => "project".to_string(),
+            SessionRuntime::GlobalApp(name) => format!("global-app:{name}"),
+            SessionRuntime::ProjectApp(name) => format!("project-app:{name}"),
+        }
+    }
+
+    /// Parse the token form. An unrecognised or absent value is the project default — back-compat
+    /// with records written before this field, and fail-safe: an unknown runtime attaches as a
+    /// plain project shell rather than as an app it cannot identify.
+    fn parse(value: &str) -> Self {
+        if let Some(name) = value.strip_prefix("global-app:") {
+            SessionRuntime::GlobalApp(name.to_string())
+        } else if let Some(name) = value.strip_prefix("project-app:") {
+            SessionRuntime::ProjectApp(name.to_string())
+        } else {
+            SessionRuntime::Project
+        }
+    }
+}
+
 /// One registered sandbox. The `(pid, start_ticks)` pair identifies the live
-/// process; `project` is the canonical project root (display and identity).
+/// process; `project` is the canonical project root (display and identity); `runtime` is the home
+/// it runs in, so `ops attach` can reproduce it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Session {
     pub(crate) project: PathBuf,
@@ -65,12 +104,17 @@ pub(crate) struct Session {
     /// Pins the pid to one incarnation, defeating pid reuse.
     pub(crate) start_ticks: u64,
     pub(crate) kind: Kind,
+    pub(crate) runtime: SessionRuntime,
 }
 
 impl Session {
     /// Describe the *current* process as a session for `project`. Reads this
     /// process's own start time so the record can later be matched against it.
-    pub(crate) fn current(project: PathBuf, kind: Kind) -> io::Result<Self> {
+    pub(crate) fn current(
+        project: PathBuf,
+        kind: Kind,
+        runtime: SessionRuntime,
+    ) -> io::Result<Self> {
         let pid = std::process::id();
         let start_ticks = read_start_ticks(pid)
             .ok_or_else(|| io::Error::other("cannot read this process's start time"))?;
@@ -79,6 +123,7 @@ impl Session {
             pid,
             start_ticks,
             kind,
+            runtime,
         })
     }
 
@@ -127,21 +172,28 @@ impl Registry {
         Ok(final_path)
     }
 
-    /// The live sessions, sorted for stable display. Every record is re-validated
-    /// against the running process; dead or unparseable records are pruned as a
-    /// side effect. Pruning happens only here, so the directory is bounded by how
-    /// often this runs: `ops shell` self-cleans on exit via [`RecordGuard`], but an
-    /// `ops run` record (no post-exec hook) lingers until the next `ops ps` reaps
-    /// it — acceptable until the dedicated housekeeping pass lands.
+    /// The live sessions, sorted for stable display — the live half of
+    /// [`housekeep`](Self::housekeep), which also prunes the dead records as a side effect.
     pub(crate) fn list(&self) -> io::Result<Vec<Session>> {
+        self.housekeep().map(|(live, _)| live)
+    }
+
+    /// Re-validate every record against its running process: return the live sessions (sorted for
+    /// stable display) and the count of dead or unparseable records reaped. Pruning happens only
+    /// here, so the directory is bounded by how often this runs: `ops shell` self-cleans on exit via
+    /// [`RecordGuard`], an `ops run` record (no post-exec hook) lingers until the next `ops ps` or
+    /// `ops gc` reaps it. `ops gc` calls this directly to report the prune; `ops ps` and the gc
+    /// reaper take the live half through [`list`](Self::list).
+    pub(crate) fn housekeep(&self) -> io::Result<(Vec<Session>, usize)> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(e) => e,
             // No sessions directory yet means no sessions — not an error.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(e) => return Err(e),
         };
 
         let mut live = Vec::new();
+        let mut pruned = 0;
         for entry in entries {
             let path = entry?.path();
             // Skip dotfiles (in-flight temp records) and anything not a plain file.
@@ -156,13 +208,15 @@ impl Registry {
                 Some(session) if is_alive(&session) => live.push(session),
                 // Dead or corrupt: reclaim it.
                 _ => {
-                    let _ = std::fs::remove_file(&path);
+                    if std::fs::remove_file(&path).is_ok() {
+                        pruned += 1;
+                    }
                 }
             }
         }
 
         live.sort_by(|a, b| a.project.cmp(&b.project).then(a.pid.cmp(&b.pid)));
-        Ok(live)
+        Ok((live, pruned))
     }
 }
 
@@ -191,10 +245,11 @@ impl Drop for RecordGuard {
 /// trips exactly; the other fields are ASCII.
 fn serialize(s: &Session) -> String {
     format!(
-        "kind={}\npid={}\nstart={}\nproject={}\n",
+        "kind={}\npid={}\nstart={}\nruntime={}\nproject={}\n",
         s.kind.as_str(),
         s.pid,
         s.start_ticks,
+        s.runtime.serialize(),
         to_hex(s.project.as_os_str().as_bytes()),
     )
 }
@@ -204,6 +259,8 @@ fn serialize(s: &Session) -> String {
 fn parse_record(path: &Path) -> Option<Session> {
     let content = std::fs::read_to_string(path).ok()?;
     let (mut kind, mut pid, mut start, mut project) = (None, None, None, None);
+    // Absent in records written before the field; defaults to the project home (back-compat).
+    let mut runtime = SessionRuntime::Project;
     for line in content.lines() {
         if line.is_empty() {
             continue;
@@ -213,6 +270,7 @@ fn parse_record(path: &Path) -> Option<Session> {
             "kind" => kind = Kind::from_str(value),
             "pid" => pid = value.parse::<u32>().ok(),
             "start" => start = value.parse::<u64>().ok(),
+            "runtime" => runtime = SessionRuntime::parse(value),
             "project" => project = from_hex(value).map(|b| PathBuf::from(OsString::from_vec(b))),
             _ => {}
         }
@@ -222,6 +280,7 @@ fn parse_record(path: &Path) -> Option<Session> {
         pid: pid?,
         start_ticks: start?,
         kind: kind?,
+        runtime,
     })
 }
 
@@ -307,6 +366,7 @@ mod tests {
             pid,
             start_ticks: start,
             kind,
+            runtime: SessionRuntime::Project,
         }
     }
 
@@ -319,11 +379,37 @@ mod tests {
             pid: 4321,
             start_ticks: 99887766,
             kind: Kind::Shell,
+            // an app runtime must round-trip too, so attach can reproduce the app's home
+            runtime: SessionRuntime::GlobalApp("claude-code".to_string()),
         };
         let dir = TmpDir::new();
         let path = dir.join("rec");
         std::fs::write(&path, serialize(&s)).unwrap();
         assert_eq!(parse_record(&path), Some(s));
+    }
+
+    #[test]
+    fn a_record_without_a_runtime_line_defaults_to_the_project_home() {
+        // Back-compat: a record written before the `runtime` field must parse as a project shell,
+        // never panic — and a project-app runtime must round-trip the other branch.
+        let dir = TmpDir::new();
+        let legacy = dir.join("legacy");
+        std::fs::write(&legacy, "kind=run\npid=7\nstart=42\nproject=2f70\n").unwrap();
+        assert_eq!(
+            parse_record(&legacy).unwrap().runtime,
+            SessionRuntime::Project
+        );
+
+        let pa = Session {
+            project: PathBuf::from("/w/p"),
+            pid: 9,
+            start_ticks: 3,
+            kind: Kind::Run,
+            runtime: SessionRuntime::ProjectApp("agent".to_string()),
+        };
+        let path = dir.join("pa");
+        std::fs::write(&path, serialize(&pa)).unwrap();
+        assert_eq!(parse_record(&path), Some(pa));
     }
 
     #[test]
@@ -343,7 +429,12 @@ mod tests {
     fn register_then_list_returns_the_live_current_process() {
         let dir = TmpDir::new();
         let reg = Registry::at(dir.path());
-        let me = Session::current(PathBuf::from("/work/proj"), Kind::Run).unwrap();
+        let me = Session::current(
+            PathBuf::from("/work/proj"),
+            Kind::Run,
+            SessionRuntime::Project,
+        )
+        .unwrap();
 
         reg.register(&me).unwrap();
         let listed = reg.list().unwrap();
@@ -358,7 +449,12 @@ mod tests {
         let dir = TmpDir::new();
         let reg = Registry::at(dir.path());
 
-        let mut me = Session::current(PathBuf::from("/work/live"), Kind::Shell).unwrap();
+        let mut me = Session::current(
+            PathBuf::from("/work/live"),
+            Kind::Shell,
+            SessionRuntime::Project,
+        )
+        .unwrap();
         reg.register(&me).unwrap();
 
         // same pid, deliberately wrong start time
@@ -391,8 +487,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TmpDir::new();
         let reg = Registry::at(dir.path());
-        reg.register(&Session::current(PathBuf::from("/work/p"), Kind::Run).unwrap())
-            .unwrap();
+        reg.register(
+            &Session::current(PathBuf::from("/work/p"), Kind::Run, SessionRuntime::Project)
+                .unwrap(),
+        )
+        .unwrap();
 
         let mode = std::fs::metadata(dir.path().join("sessions"))
             .unwrap()
@@ -407,7 +506,14 @@ mod tests {
         let dir = TmpDir::new();
         let reg = Registry::at(dir.path());
         let path = reg
-            .register(&Session::current(PathBuf::from("/work/p"), Kind::Shell).unwrap())
+            .register(
+                &Session::current(
+                    PathBuf::from("/work/p"),
+                    Kind::Shell,
+                    SessionRuntime::Project,
+                )
+                .unwrap(),
+            )
             .unwrap();
         assert!(path.exists());
 
@@ -421,8 +527,11 @@ mod tests {
         let dir = TmpDir::new();
         let reg = Registry::at(dir.path());
         // seed the directory
-        reg.register(&Session::current(PathBuf::from("/work/p"), Kind::Run).unwrap())
-            .unwrap();
+        reg.register(
+            &Session::current(PathBuf::from("/work/p"), Kind::Run, SessionRuntime::Project)
+                .unwrap(),
+        )
+        .unwrap();
         // a dotted temp file (as register writes mid-flight) must be ignored, not
         // parsed or pruned
         let tmp = dir.path().join("sessions").join(".999-1.tmp");
