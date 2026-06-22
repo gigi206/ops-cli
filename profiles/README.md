@@ -26,6 +26,8 @@ with `ops app export <name>`.
 | `hermes`          | `flake:github:NousResearch/hermes-agent#default` | `openrouter.ai` (BYOK)  |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
+| `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
+| `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
@@ -58,7 +60,10 @@ can only reach the provider you listed.
 > empty-netns MITM), `kilocode` (7.3.50, equipped via the mise `github` backend and run
 > in-cage — `kilo --version`), and `freebuff` (0.0.112, equipped via mise's **npm** backend
 > over a `nix:nodejs` runtime — the npm launcher and its 46 MB binary both fetched through the
-> empty-netns MITM allowlist, then `freebuff --version`). The one remaining *live* end-to-end is
+> empty-netns MITM allowlist, then `freebuff --version`), and `cline` (3.0.29) and `droid`
+> (0.153.1) (both equipped via mise's **npm** backend over a `nix:nodejs` runtime — their
+> native platform binaries resolved through the empty-netns MITM allowlist, then `--version`).
+> The one remaining *live* end-to-end is
 > the credential step: for the BYOK profiles, the CLI **authenticating** through the
 > proxy-injected key (does the tool accept the placeholder and let the proxy fill in the real
 > key?); for `freebuff`, completing its account **login** once inside the cage (the token then
@@ -84,6 +89,8 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix Python) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
+| `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
+| `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
 (mise's `aqua`/`github`/registry backends pull the real release binary), so the version is the
@@ -112,10 +119,12 @@ allowlist (for such a tool, prefer its release-binary `mise:` backend — that i
 **npm/node CLIs** are also supported: declare a `node` runtime (`nix:nodejs`) and the
 tool via mise's npm backend (`mise:npm:<pkg>`). The cage synthesises `/usr/bin/env`, so
 a tool's `#!/usr/bin/env node` shebang resolves (a hermetic cage has no host `/usr`).
-`freebuff` ships this way — its npm package is a thin launcher that downloads the real
-binary at first run into the app's isolated home. Like `mise:`, an npm CLI fetches at
-first launch (the node runtime and the package), so the first launch in a project needs
-the network.
+`freebuff`, `cline`, and `droid` ship this way. They differ in how the binary arrives:
+`freebuff`'s npm package is a thin launcher that downloads the real binary at first run into
+the app's isolated home, while `cline` and `droid` deliver a self-contained native platform
+binary through the npm package's optional dependencies (resolved at install, no separate
+first-run download). Like `mise:`, an npm CLI fetches at first launch (the node runtime and
+the package), so the first launch in a project needs the network.
 
 **Offline trade-off:** a `mise:` tool **fetches at first launch** (the price of upstream
 freshness), so a profile's *first* launch in a given project needs the network; a `nix:`
@@ -145,16 +154,6 @@ endpoint (**OpenRouter** is the universal one: one key, hundreds of models, `Aut
 Bearer`). An OAuth/account login or a query-param key has no header for ops's `[secret]`
 broker to strip-and-replace. The tools below were each researched against primary sources; we
 do not guess the values, so each waits on a real fact or on a named feature:
-
-- **Node/npm CLIs — now unblocked, pending verify-and-ship** — **`cline`** (`cline/cline`)
-  and **`droid`** (Factory). Both are genuine standalone CLIs with env-var BYOK against
-  OpenAI-compatible/Anthropic endpoints (so OpenRouter-keyable), packaged as npm/node tools
-  (`cline` ships a node wrapper over a bun-embedded binary; `droid` installs via npm or a
-  `curl|sh` to a self-contained binary). The gap that blocked them is **closed**: the cage now
-  synthesises `/usr/bin/env` and a node runtime is a one-line `nix:nodejs` (this is exactly how
-  `freebuff` above ships). They are the next to **verify-and-ship** — each needs a live equip/run
-  check and its hosts grounded. (`droid` additionally takes a **second** key — a mandatory
-  Factory account `FACTORY_API_KEY` alongside the model key — and `*.factory.ai` in `allow`.)
 
 - **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
   Sign-In / an OAuth token in the keyring** and exposes no env-var/API-key path. A header broker

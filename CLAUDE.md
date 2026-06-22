@@ -512,9 +512,40 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   also proven (the 124 MB binary landed in `<data>/apps/freebuff/home/.config/manicode/`).
   `the_shipped_profiles_import_and_resolve` now covers **7** profiles. fmt/clippy clean. **Pending
   (the flagship, like every profile):** the live **login** once inside the cage (whether it completes
-  headlessly — URL-paste vs a browser — is unverified; the user's account). **Next non-desktop CLIs
-  (unblocked by this facade, pending verify-and-ship):** `cline` + `droid` (both npm/node BYOK,
-  OpenRouter-keyable; `droid` takes a 2nd `FACTORY_API_KEY` + `*.factory.ai`). See
+  headlessly — URL-paste vs a browser — is unverified; the user's account). `cline` + `droid` (the
+  next non-desktop CLIs this facade unblocked) **then SHIPPED** — see the next block. See
+  [[ops-app-framework]], [[ubi-backend-deprecated]].
+  **`cline` + `droid` profiles — DONE (2026-06-22)** (`profiles/{cline,droid}.toml`; the
+  data-driven `the_shipped_profiles_import_and_resolve` now covers **9** profiles): the two npm/node
+  CLIs the `/usr/bin/env` facade unblocked, both equipped `nix:nodejs` + `mise:npm:<tool>`.
+  **Grounded from primary sources first** (two parallel research agents, every value URL-cited or
+  flagged unconfirmed — no guessing): `cline` (`cline/cline`, npm `cline`, a **native platform binary
+  via optional-deps** — not a bun self-fetcher, so no proxy-wall risk) is a **clean header-BYOK**
+  profile keyed to **OpenRouter** (`OPENROUTER_API_KEY` → `Authorization: Bearer`, injected host-side
+  on the wire to `openrouter.ai`, placeholder in `[env]` — the hermes pattern), allow
+  `registry.npmjs.org`/`openrouter.ai`/`api.cline.bot`/`data.cline.bot`. `droid` (Factory, npm
+  `droid`, also a native optional-dep binary) is **account-class (freebuff-style), NOT clean
+  header-BYOK**: it authenticates to a **Factory account** (`FACTORY_API_KEY`, `fk-…`, required for
+  headless `droid exec`), and per-provider BYOK lives in `~/.factory/settings.json` (`${VAR}` refs),
+  **not** a top-level env var — and Factory's auth **header is not a published, groundable detail**,
+  so ops does **not** MITM-inject it; the credential persists in the isolated `~/.factory/` (interactive
+  login). A **headless `FACTORY_API_KEY` has no clean ops env-injection path** (the env passthrough
+  carries only TERM/LANG, and the `[secret]` broker injects an HTTP header on the wire, not an env var,
+  and the profile `[env]` is highest-precedence so a `= ""` placeholder would set *empty* in the cage,
+  not pass the host value), so the profile ships **no `[env]`** — freebuff parity; a literal `[env]`
+  key is the user's own call (advisor-caught: the first cut shipped a false "ops passes it through"
+  claim). allow `registry.npmjs.org`/`app.factory.ai`/`api.factory.ai`. **Both PROVEN live through the empty-netns MITM allowlist**
+  (smoke-first): `mise:npm:cline` → `cline --version` → **3.0.29** and `mise:npm:droid` → `droid
+  --version` → **0.153.1**, their native optional-dep binaries resolved **through the proxy** (the
+  discriminating npm-optional-dep-over-MITM case, the class freebuff settled — passed). **Two live
+  observations** (non-blocking): mise skips the npm `postinstall` (`--ignore-scripts=true`) for both
+  yet `--version` works (the native bin resolves without it); and `cline` prints a benign `hostname:
+  command not found` (absent from the hermetic cage), exit 0 regardless. `ops config` shows `cline`
+  with `secrets: 1 injected host-side` and `droid` with none — the posture split, visible. fmt/clippy
+  clean. **Pending (the flagship, every profile):** the live credential step — `cline` authenticating
+  through the proxy-injected OpenRouter key, `droid`'s Factory account login — the user's key/account,
+  never the assistant's. **Next non-desktop CLIs:** the BYOK/account CLI space this facade reaches is
+  largely covered; what remains is the **GUI/Wayland** desktop class (the user's deferred track). See
   [[ops-app-framework]], [[ubi-backend-deprecated]].
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the

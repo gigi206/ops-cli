@@ -1,0 +1,62 @@
+# Cline — the autonomous coding agent's standalone CLI, sandboxed by ops.
+#
+#   ops app import profiles/cline.toml
+#   ops app cline
+#
+# Cline ships a genuine terminal CLI on npm (the `cline` package), distributed as a
+# self-contained native binary resolved through platform-specific optional dependencies
+# — so ops equips it in-cage with a node runtime (for the npm install) plus mise's npm
+# backend. The native binary needs no node at runtime; the install fetches it (and the
+# package's deps) from registry.npmjs.org, so the first launch in a project needs the
+# network and the allowlist below.
+#
+# Cline is BYOK and multi-provider. This template keys it to OpenRouter (one key, hundreds
+# of models, OpenAI-compatible bearer auth). The real key is read on the HOST and injected
+# by the egress proxy on the wire to openrouter.ai — never in the cage. Provide it on the
+# host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g. sops://secrets.yaml#openrouter),
+# then select OpenRouter inside Cline (`cline auth`, persisted in the app's isolated home, or
+# launch `cline -P openrouter`). To use a different provider, change the allowlist host + the
+# [secret] block + the env var — e.g. Anthropic (api.anthropic.com, ANTHROPIC_API_KEY, header
+# "x-api-key", type "raw") or OpenAI (api.openai.com, OPENAI_API_KEY, header "Authorization",
+# type "bearer"). Cline reads ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY directly.
+#
+# Cline stores its config + credentials under ~/.cline in the app's persistent isolated home.
+# (A benign `hostname: command not found` may print — Cline probes the host name, which the
+# hermetic cage does not carry; it is harmless and the agent runs regardless.) If a request is
+# blocked, the proxy reports the host it refused — add it to `allow` (or check ahead with
+# `ops test net <url>`).
+cmd = "cline"
+
+[packages]
+# A node runtime (the npm install needs it), then Cline itself via mise's npm backend. The
+# executed `cline` is a native binary (resolved via the package's optional dependencies), so
+# node is needed only to install. Both are trusted-only [packages]; this profile is trusted
+# by location once imported.
+nodejs = "nix:nodejs"
+cline = "mise:npm:cline"
+
+[network]
+mode = "allowlist"
+allow = [
+    # Install: the npm package, its dependencies, and the platform binary (an optional dep).
+    "registry.npmjs.org",
+    # Runtime: the LLM provider — OpenRouter, this template's BYOK endpoint.
+    "openrouter.ai",
+    # Runtime: Cline's backend/account control plane and its telemetry endpoint. Telemetry can
+    # be turned off in Cline's settings; keep `data.cline.bot` here (or deny it explicitly) to
+    # avoid silent drops. Cline publishes no exhaustive host list — if a real run is refused a
+    # host, the proxy names it; add it here.
+    "api.cline.bot",
+    "data.cline.bot",
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage.
+# The in-cage placeholder lets Cline start and issue the request; the proxy strips it and
+# substitutes the real key on the wire to openrouter.ai.
+[env]
+OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+
+[secret."openrouter.ai"]
+from = "env://OPENROUTER_API_KEY"
+header = "Authorization"
+type = "bearer"
