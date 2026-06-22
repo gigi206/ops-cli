@@ -301,7 +301,7 @@ fn detach_parent(
             log.display()
         );
         eprintln!(
-            "ops: `ops ps` lists it, `ops attach {child}` opens a shell beside it, \
+            "ops: `ops ls` lists it, `ops attach {child}` opens a shell beside it, \
              `ops stop {child}` ends it."
         );
         ExitCode::SUCCESS
@@ -680,7 +680,7 @@ pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
 }
 
 /// Prune dead session records and report it (the dedicated housekeeping pass the registry deferred:
-/// an `ops run` record with no post-exec hook lingered until the next `ops ps`). Returns the ids of
+/// an `ops run` record with no post-exec hook lingered until the next `ops ls`). Returns the ids of
 /// projects with a *live* session — hashing each recorded canonical path — so the dead-tree reap
 /// can skip a tree a session still holds without scanning the registry a second time.
 fn session_housekeeping(layout: &crate::store::Layout) -> std::collections::BTreeSet<String> {
@@ -889,7 +889,7 @@ fn sweep_current(prune: bool) -> Result<(), ExitCode> {
     if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
         if sessions.iter().any(|s| s.project == project) {
             eprintln!(
-                "ops gc: a sandbox is running in this project — stop it first (see `ops ps`)."
+                "ops gc: a sandbox is running in this project — stop it first (see `ops ls`)."
             );
             return Err(ExitCode::FAILURE);
         }
@@ -1059,7 +1059,7 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
 
 /// `ops attach <id>`: open an interactive shell in a running session's environment — a second
 /// terminal sharing that session's persistent home and store (the deterministic per-project
-/// runtime), **not** a join of the running process (there is no setns). `<id>` is the PID `ops ps`
+/// runtime), **not** a join of the running process (there is no setns). `<id>` is the PID `ops ls`
 /// shows. For a plain `ops run`/`ops shell` session that is the project's default home; for an
 /// `ops app` agent it is the app's isolated home plus the app's current posture (its egress
 /// allowlist, packages, and injected secrets), so attaching to a running agent drops you into the
@@ -1079,7 +1079,7 @@ pub(crate) fn attach(id: &str) -> ExitCode {
     // A pid is unique among live processes, so this is a 0-or-1 match. Resolve the target before
     // the terminal check, so an unknown id is reported even without a tty.
     let Some(target) = sessions.into_iter().find(|s| s.pid.to_string() == id) else {
-        eprintln!("ops attach: no live session '{id}' — run `ops ps` to list them.");
+        eprintln!("ops attach: no live session '{id}' — run `ops ls` to list them.");
         return ExitCode::from(2);
     };
     // SAFETY: `isatty` only inspects fd 0. The attached shell needs a real terminal, like `shell`.
@@ -1117,7 +1117,7 @@ pub(crate) fn attach(id: &str) -> ExitCode {
 }
 
 /// `ops stop <id>...` / `ops stop --all`: stop running sessions. With ids, stop the named ones (the
-/// pids `ops ps` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
+/// pids `ops ls` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
 /// SIGKILL if it has not exited within `grace`. Targets are resolved through the same
 /// liveness-validated registry `attach` uses, so a stale or reused pid is never signalled. For ids,
 /// reports each and exits 2 if any matched no live session, else 0; for `--all`, stopping nothing is
@@ -1167,7 +1167,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let mut any_missing = false;
     for id in ids {
         let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
-            eprintln!("ops stop: no live session '{id}' — run `ops ps` to list them.");
+            eprintln!("ops stop: no live session '{id}' — run `ops ls` to list them.");
             any_missing = true;
             continue;
         };
@@ -1182,7 +1182,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
 }
 
 /// Stop one resolved session and reap its record: SIGTERM, then SIGKILL after `grace`, report the
-/// outcome by pid and label, and drop the record so `ops ps` is clean at once rather than waiting
+/// outcome by pid and label, and drop the record so `ops ls` is clean at once rather than waiting
 /// for the killed process to stop reading as a zombie.
 fn stop_session(registry: &session::Registry, target: &session::Session, grace: Duration) {
     let pid = target.pid;
@@ -2012,7 +2012,7 @@ fn wrap_flake_equip(
     out
 }
 
-/// Record this sandbox in the on-disk registry so `ops ps` can list it. Best
+/// Record this sandbox in the on-disk registry so `ops ls` can list it. Best
 /// effort: the registry is observability, not a security control, so a failure to
 /// register degrades visibility but never blocks the sandbox. The session is keyed
 /// on `spec.workdir` — the canonical project root, the same identity the runtime

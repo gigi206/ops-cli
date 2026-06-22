@@ -61,7 +61,7 @@ fn force_remove(path: &Path) {
 #[test]
 fn attach_to_an_unknown_id_reports_and_exits_two() {
     // No tty needed: `attach` resolves the target before the terminal check, so an unknown id is a
-    // clean exit-2 with a pointer to `ops ps` — never a panic or a misparse of garbage.
+    // clean exit-2 with a pointer to `ops ls` — never a panic or a misparse of garbage.
     let data = TmpDir::new("noid");
     for id in ["999999", "not-a-pid"] {
         let out = ops()

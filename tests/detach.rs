@@ -2,7 +2,7 @@
 //!
 //! The headline property is *detachment itself*: the `--detach` command **returns** (the launching
 //! shell gets its prompt back) while the agent keeps running in the background — something a
-//! foreground launch never does. That is the discriminating assertion here; `ops ps`/`stop` on top
+//! foreground launch never does. That is the discriminating assertion here; `ops ls`/`stop` on top
 //! only confirm the detached session is a first-class registry citizen. Both launch paths are
 //! exercised under one data directory (so the base userland is provisioned once): the supervised
 //! path (a network allowlist, where the daemon hosts the filtering proxy thread) and the exec path
@@ -252,12 +252,12 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         "the detached agent never appeared — `--detach` did not start it in the background"
     );
 
-    // It is a first-class session: `ops ps` lists it.
-    let ps = ops_run(project.path(), data.path(), state.path(), &["ps"]);
+    // It is a first-class session: `ops ls` lists it.
+    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
     assert!(
-        String::from_utf8_lossy(&ps.stdout).contains(&sup_pid.to_string()),
-        "the detached session is not listed by `ops ps`:\n{}",
-        String::from_utf8_lossy(&ps.stdout)
+        String::from_utf8_lossy(&ls.stdout).contains(&sup_pid.to_string()),
+        "the detached session is not listed by `ops ls`:\n{}",
+        String::from_utf8_lossy(&ls.stdout)
     );
 
     // `ops stop` tears it down: stopping the supervisor takes the cage with it (`--die-with-parent`).

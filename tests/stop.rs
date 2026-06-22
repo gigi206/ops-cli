@@ -378,11 +378,11 @@ fn stop_tears_down_a_supervised_app_session() {
         "the cage's `sleep` was orphaned — stopping the supervisor did not tear the cage down"
     );
 
-    // The stopped session no longer appears in `ops ps` (its record was reaped).
-    let ps = ops_run(project.path(), data.path(), state.path(), &["ps"]);
+    // The stopped session no longer appears in `ops ls` (its record was reaped).
+    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
     assert!(
-        !String::from_utf8_lossy(&ps.stdout).contains(&pid.to_string()),
-        "the stopped session still shows in `ops ps`"
+        !String::from_utf8_lossy(&ls.stdout).contains(&pid.to_string()),
+        "the stopped session still shows in `ops ls`"
     );
 }
 
@@ -458,9 +458,9 @@ fn stop_all_stops_every_session() {
         "both detached agents should be running before `ops stop --all`"
     );
 
-    // `ops ps` lists both sessions.
-    let ps = ops_run(project.path(), data.path(), state.path(), &["ps"]);
-    let listing = String::from_utf8_lossy(&ps.stdout);
+    // `ops ls` lists both sessions.
+    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
+    let listing = String::from_utf8_lossy(&ls.stdout);
     for pid in &pids {
         assert!(
             listing.contains(&pid.to_string()),
@@ -489,13 +489,13 @@ fn stop_all_stops_every_session() {
         "`ops stop --all` left an agent running"
     );
 
-    // And `ops ps` no longer lists either (records reaped).
-    let ps = ops_run(project.path(), data.path(), state.path(), &["ps"]);
-    let listing = String::from_utf8_lossy(&ps.stdout);
+    // And `ops ls` no longer lists either (records reaped).
+    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
+    let listing = String::from_utf8_lossy(&ls.stdout);
     for pid in &pids {
         assert!(
             !listing.contains(&pid.to_string()),
-            "session {pid} still shows in `ops ps` after stop --all:\n{listing}"
+            "session {pid} still shows in `ops ls` after stop --all:\n{listing}"
         );
     }
 }

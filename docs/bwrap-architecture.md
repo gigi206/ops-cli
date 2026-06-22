@@ -75,7 +75,7 @@ runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** mo
 >   (dynamic `SIGWINCH` is a follow-up). Implemented in raw `libc`
 >   (`openpty`/`login_tty`/`termios`/`poll`) — no new dependency.
 
-> **As built — `session/` is the daemonless registry; `ops ps` lists it.**
+> **As built — `session/` is the daemonless registry; `ops ls` lists it.**
 > Shipped as a single file (`src/session.rs`) for now; it grows into the dir when
 > GC lands. Each sandbox writes a record under `<data>/sessions/`. With no daemon,
 > a record is a **liveness-validated hint** — never trusted to be removed:

@@ -69,7 +69,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "--detach",
-                "run in the background as a session `ops ps`/`attach`/`stop` can see",
+                "run in the background as a session `ops ls`/`attach`/`stop` can see",
             ),
             ("--", "end ops's own flags; everything after runs literally"),
         ],
@@ -95,7 +95,7 @@ const PAGES: &[Page] = &[
         summary: "launch or manage named application profiles",
         options: &[(
             "--detach",
-            "launch the app in the background as a session `ops ps`/`attach`/`stop` can see",
+            "launch the app in the background as a session `ops ls`/`attach`/`stop` can see",
         )],
         details:
             "`ops app <name>` launches a named application profile (an [app.<name>] table from\n\
@@ -131,8 +131,8 @@ const PAGES: &[Page] = &[
             declares a `scheme://` ops can route a secret `from` reference to.",
     },
     Page {
-        path: &["ps"],
-        synopsis: "ops ps",
+        path: &["ls"],
+        synopsis: "ops ls",
         summary: "list the live sandbox sessions",
         options: &[],
         details:
@@ -145,7 +145,7 @@ const PAGES: &[Page] = &[
         path: &["attach"],
         synopsis: "ops attach <id>",
         summary: "open a shell in a running session's environment",
-        options: &[("<id>", "the PID `ops ps` shows for the session")],
+        options: &[("<id>", "the PID `ops ls` shows for the session")],
         details:
             "Opens a shell in a running session's environment. For an app session, that is the\n\
             app's isolated environment.",
@@ -157,7 +157,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "<id>...",
-                "the PIDs `ops ps` shows for the sessions to stop",
+                "the PIDs `ops ls` shows for the sessions to stop",
             ),
             (
                 "--all",

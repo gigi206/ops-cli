@@ -1828,7 +1828,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
     hermetic, synthetic identity — the M1 headline. Empirically required to omit
     `--new-session` and own the session via a pty (see architecture §2/§3 "As
     built"); raw `libc`, no new dependency.
-  - **M1.4 `session/` + `ops ps`** (`src/session.rs`): the **daemonless** on-disk
+  - **M1.4 `session/` + `ops ls`** (`src/session.rs`): the **daemonless** on-disk
     registry. Each sandbox writes a record under `<data>/sessions/`; a record is a
     **liveness-validated hint**, never trusted to be cleaned up — `list()` prunes
     by liveness, so a crash/`SIGKILL` self-heals. Liveness = `(pid, start_ticks)`
@@ -1858,6 +1858,6 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
   The M1.1/M1.2 scaffolding is load-bearing (the `#[allow(dead_code)]` are gone
   except the M3-reserved store primitives). **M1 is complete** — the minimal
-  sandbox is end-to-end: `doctor` gate → `run`/`shell` launch → `ps` registry,
+  sandbox is end-to-end: `doctor` gate → `run`/`shell` launch → `ls` registry,
   all proven through the CLI. Next: **M2** (config + trust gate), per the
   milestone table.

@@ -57,7 +57,7 @@ fn main() -> ExitCode {
     match name {
         "doctor" => doctor(),
         "shell" => sandbox::shell(),
-        "ps" => list_sessions(),
+        "ls" => list_sessions(),
         "attach" => attach_cmd(rest),
         "stop" => stop_cmd(rest),
         "trust" => trust_cmd(rest),
@@ -327,7 +327,7 @@ fn classify_namespace_failure(userns: Userns, remediation: &mut Vec<&'static str
     remediation.push(USERNS_REMEDIATION);
 }
 
-/// `ops ps`: list the live sandbox sessions from the on-disk registry. Reading
+/// `ops ls`: list the live sandbox sessions from the on-disk registry. Reading
 /// the registry re-validates and prunes dead records as a side effect, so the
 /// list is always current without a daemon.
 fn list_sessions() -> ExitCode {
@@ -372,12 +372,12 @@ fn list_sessions() -> ExitCode {
 }
 
 /// `ops attach <id>`: open a shell in a running session's environment. Exactly one operand — the
-/// PID `ops ps` shows. A missing, extra, or non-UTF-8 operand is a usage error; a well-formed id
+/// PID `ops ls` shows. A missing, extra, or non-UTF-8 operand is a usage error; a well-formed id
 /// that matches no live session is reported by `attach` itself.
 fn attach_cmd(args: Vec<OsString>) -> ExitCode {
     let Some(id) = (args.len() == 1).then(|| args[0].to_str()).flatten() else {
         eprintln!(
-            "ops: usage: {}   (the PID shown by `ops ps`)",
+            "ops: usage: {}   (the PID shown by `ops ls`)",
             help::synopsis("attach")
         );
         return ExitCode::from(2);
@@ -390,7 +390,7 @@ fn attach_cmd(args: Vec<OsString>) -> ExitCode {
 const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
 
 /// `ops stop <id>... [--delay <secs>]` / `ops stop --all [--delay <secs>]`: stop running sessions.
-/// With ids, stop the named ones (the pids `ops ps` shows); with `--all`, stop every live session.
+/// With ids, stop the named ones (the pids `ops ls` shows); with `--all`, stop every live session.
 /// Sends SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once).
 /// Either ids or `--all` is required (not both); a non-UTF-8 operand or a malformed `--delay` value
 /// is a usage error.
@@ -420,7 +420,7 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
             Some("--all") => all = true,
             Some(id) => ids.push(id.to_string()),
             None => {
-                eprintln!("ops: stop ids must be valid text (the PID shown by `ops ps`).");
+                eprintln!("ops: stop ids must be valid text (the PID shown by `ops ls`).");
                 return ExitCode::from(2);
             }
         }
@@ -431,7 +431,7 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
     }
     if !all && ids.is_empty() {
         eprintln!(
-            "ops: usage: {}\n   (ids are the PIDs shown by `ops ps`)",
+            "ops: usage: {}\n   (ids are the PIDs shown by `ops ls`)",
             help::synopsis("stop")
         );
         return ExitCode::from(2);
@@ -785,7 +785,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
         Some("list") => app_list(),
         // Otherwise the first non-flag token names an app to launch; `--detach` runs it in the
-        // background as a session `ops ps`/`attach`/`stop` can see.
+        // background as a session `ops ls`/`attach`/`stop` can see.
         _ => {
             let detach = args.iter().any(|a| a.to_str() == Some("--detach"));
             let name = args
