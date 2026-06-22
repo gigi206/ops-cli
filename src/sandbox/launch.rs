@@ -1112,9 +1112,15 @@ fn seed_project_store(
     tool_roots: &[PathBuf],
     font_roots: &[PathBuf],
 ) -> io::Result<super::projectstore::ProjectStore> {
-    let id = binds::project_runtime_id(&prep.cwd)?;
+    let (id, canonical) = binds::project_identity(&prep.cwd)?;
     let roots = collect_roots(&prep.userland, pkg_roots, tool_roots, font_roots);
-    super::projectstore::prepare(&prep.nix_store, &prep.layout, &id, &roots)
+    let store = super::projectstore::prepare(&prep.nix_store, &prep.layout, &id, &roots)?;
+    // Record the project's canonical path so a later `ops gc` can recognise this tree and reclaim
+    // it once the project is gone. Best-effort: a housekeeping marker must never fail a launch.
+    if let Err(e) = super::projectstore::write_marker(&prep.layout, &id, &canonical) {
+        eprintln!("ops: warning: could not record the project marker: {e}");
+    }
+    Ok(store)
 }
 
 /// The complete set of logical store roots the cage resolves through `/nix`: the base

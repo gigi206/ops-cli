@@ -560,7 +560,18 @@ fn project_id(project: &Path) -> String {
 /// identity as the real path (the same pin [`canonicalize_project`] applies to the
 /// bind source).
 pub(crate) fn project_runtime_id(cwd: &Path) -> io::Result<String> {
-    Ok(project_id(&canonicalize_project(cwd)?))
+    Ok(project_identity(cwd)?.0)
+}
+
+/// The per-project identity together with the canonical project path it derives from. The id keys
+/// the project's runtime tree (home, store, gcroots); the canonical path is what a launch records
+/// in a durable marker so housekeeping can later recognise — and reclaim — that tree once the
+/// project directory is gone (the id alone is a one-way hash). Canonicalises once, so id and path
+/// agree and both match the bind source's pinned location.
+pub(crate) fn project_identity(cwd: &Path) -> io::Result<(String, PathBuf)> {
+    let canonical = canonicalize_project(cwd)?;
+    let id = project_id(&canonical);
+    Ok((id, canonical))
 }
 
 /// Resolve `path` to a real, existing directory, following symlinks in the host

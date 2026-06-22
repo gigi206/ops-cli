@@ -85,15 +85,50 @@ impl ProjectStore {
     }
 }
 
+/// The marker file recording a project's canonical path, beside its store under the runtime tree.
+/// The id keying the tree is a one-way hash of that path, so this is what lets housekeeping
+/// recognise a tree and reclaim it once the project directory is gone.
+pub(crate) const PROJECT_MARKER: &str = "project";
+
+/// A project's runtime tree directory, `<data>/projects/<id>` — the parent of its store, home,
+/// synthetic identity, and locks. The single place that path is named, shared by the seed (which
+/// records the marker) and by housekeeping (which reads it).
+pub(crate) fn project_dir(layout: &Layout, project_id: &str) -> PathBuf {
+    layout.data_dir().join("projects").join(project_id)
+}
+
 /// The per-project store directory for `project_id`, keyed on the same identity as
 /// the rest of the project's runtime (home, synthetic identity, gcroots), so
 /// housekeeping can reclaim it alongside them.
 fn store_dir_for(layout: &Layout, project_id: &str) -> PathBuf {
-    layout
-        .data_dir()
-        .join("projects")
-        .join(project_id)
-        .join("store")
+    project_dir(layout, project_id).join("store")
+}
+
+/// Record the project's canonical path in a durable marker beside its store, so a later `ops gc`
+/// can recognise this tree (`<id>` alone is a one-way hash) and reclaim it once the project
+/// directory is gone. Atomic (temp + rename) and owner-only; overwritten each launch — the path is
+/// stable, so the write is idempotent. The path is stored as raw bytes, no newline, so even a
+/// non-UTF-8 path round-trips exactly.
+pub(crate) fn write_marker(layout: &Layout, project_id: &str, canonical: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = project_dir(layout, project_id);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(&dir)?;
+    let marker = dir.join(PROJECT_MARKER);
+    let tmp = dir.join(format!(".{PROJECT_MARKER}.tmp-{}", unique()));
+    let _ = fs::remove_file(&tmp);
+    fs::write(&tmp, canonical.as_os_str().as_bytes())?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    match fs::rename(&tmp, &marker) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Seed (or top up) `project_id`'s own store with the closure of `roots` from the
@@ -453,6 +488,39 @@ mod tests {
             store_dir_for(&layout, "abc"),
             PathBuf::from("/data/ops/projects/abc/store")
         );
+        // the marker is a sibling of the store under the same runtime tree
+        assert_eq!(
+            project_dir(&layout, "abc").join(PROJECT_MARKER),
+            PathBuf::from("/data/ops/projects/abc/project")
+        );
+    }
+
+    #[test]
+    fn write_marker_records_the_canonical_path_owner_only_and_idempotently() {
+        use std::os::unix::ffi::OsStrExt;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let id = "deadbeefdeadbeef";
+        let marker = project_dir(&layout, id).join(PROJECT_MARKER);
+
+        let canonical = PathBuf::from("/home/user/some/project");
+        write_marker(&layout, id, &canonical).unwrap();
+        // stored as the raw path bytes, no newline — so a non-UTF-8 path would round-trip exactly
+        let read = std::fs::read(&marker).unwrap();
+        assert_eq!(std::ffi::OsStr::from_bytes(&read), canonical.as_os_str());
+        // owner-only
+        let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // overwriting (the every-launch idempotent path) replaces the content, leaks no temp
+        write_marker(&layout, id, &PathBuf::from("/new/path")).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"/new/path");
+        let leftovers: Vec<_> = std::fs::read_dir(project_dir(&layout, id))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".project.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "a temp placement leaked");
     }
 
     #[test]
