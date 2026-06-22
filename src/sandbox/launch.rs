@@ -75,7 +75,7 @@ struct Prepared {
 /// ops process so the command's exit status becomes ops's.
 pub(crate) fn run(cmd: Vec<OsString>, detach: bool) -> ExitCode {
     if cmd.is_empty() {
-        eprintln!("ops: usage: ops run [--detach] [--] <command> [args...]");
+        eprintln!("ops: usage: {}", crate::help::synopsis("run"));
         return ExitCode::from(2);
     }
     let prep = match prepare() {

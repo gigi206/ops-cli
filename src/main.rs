@@ -9,6 +9,7 @@
 
 mod allowlist;
 mod config;
+mod help;
 mod pathfind;
 mod plugin_store;
 mod plugins;
@@ -29,22 +30,47 @@ fn main() -> ExitCode {
     // `args_os`, not `args`: a command run via `ops run` may carry non-UTF-8
     // arguments, and panicking on them would be wrong.
     let mut args = std::env::args_os().skip(1);
-    match args.next().as_deref().and_then(|s| s.to_str()) {
-        Some("doctor") => doctor(),
-        Some("shell") => sandbox::shell(),
-        Some("ps") => list_sessions(),
-        Some("attach") => attach_cmd(args.collect()),
-        Some("stop") => stop_cmd(args.collect()),
-        Some("trust") => trust_cmd(args.collect()),
-        Some("untrust") => untrust_cmd(args.next()),
-        Some("config") => config_cmd(),
-        Some("upgrade") => upgrade_cmd(args.collect()),
-        Some("gc") => gc_cmd(args.collect()),
-        Some("run") => {
-            let mut cmd: Vec<OsString> = args.collect();
-            // Leading ops flags before the command: `--detach` to run in the background, and an
-            // optional `--` separating ops's arguments from the command's. A `--` is consumed
-            // before scanning the command, so `ops run -- --detach` runs the literal `--detach`.
+    let cmd = args.next();
+    let rest: Vec<OsString> = args.collect();
+    let name = match cmd.as_deref().and_then(|s| s.to_str()) {
+        // No command at all is a usage error; an explicit help request is not. Both render
+        // the same command list — to stderr/exit 2 for the error, to stdout/exit 0 for help.
+        None => {
+            eprint!("{}", help::top_level_usage());
+            return ExitCode::from(2);
+        }
+        Some("help" | "--help" | "-h") => return help::dispatch(rest),
+        Some(name) => name,
+    };
+
+    // A known command carrying a help flag shows the page for the deepest command path it
+    // names (so `ops plugins store add --help` lands on that page). `run` (which forwards
+    // `--help` after a `--`) and `mise` (a passthrough) handle a leading help flag
+    // themselves; an *unknown* command is left to the dispatch below, which names it and may
+    // hint a subcommand parent.
+    if help::is_command(name) && !matches!(name, "run" | "mise") {
+        if let Some(code) = help::maybe_help(name, &rest) {
+            return code;
+        }
+    }
+
+    match name {
+        "doctor" => doctor(),
+        "shell" => sandbox::shell(),
+        "ps" => list_sessions(),
+        "attach" => attach_cmd(rest),
+        "stop" => stop_cmd(rest),
+        "trust" => trust_cmd(rest),
+        "untrust" => untrust_cmd(rest.into_iter().next()),
+        "config" => config_cmd(),
+        "upgrade" => upgrade_cmd(rest),
+        "gc" => gc_cmd(rest),
+        "run" => {
+            let mut cmd: Vec<OsString> = rest;
+            // Leading ops flags before the command: `--detach` to run in the background,
+            // `--help`/`-h` for this command's page, and an optional `--` separating ops's
+            // arguments from the command's. The `--` is consumed before scanning the command,
+            // so `ops run -- --detach` (or `-- --help`) runs the literal argument.
             let mut detach = false;
             while let Some(first) = cmd.first().and_then(|a| a.to_str()) {
                 match first {
@@ -52,6 +78,7 @@ fn main() -> ExitCode {
                         detach = true;
                         cmd.remove(0);
                     }
+                    "--help" | "-h" => return help::show(&["run"]),
                     "--" => {
                         cmd.remove(0);
                         break;
@@ -61,28 +88,25 @@ fn main() -> ExitCode {
             }
             sandbox::run(cmd, detach)
         }
-        Some("mise") => sandbox::run_mise(args.collect()),
-        Some("app") => app_cmd(args.collect()),
-        Some("search") => search_cmd(args.collect()),
-        Some("test") => test_cmd(args.collect()),
-        Some("plugins") => plugins_cmd(args.collect()),
-        Some(other) => {
-            eprintln!(
-                "ops: unknown command '{other}' (known: doctor, shell, run, mise, app, \
-                 search, test, plugins, ps, attach, stop, trust, untrust, config, upgrade, gc)"
-            );
-            ExitCode::from(2)
+        "mise" => {
+            // A passthrough, so a help flag is only ops's when it leads: `ops mise --help`
+            // shows ops's page, while `ops mise help` (and any later `--help`) reaches the
+            // in-cage mise's own help.
+            if matches!(rest.first().and_then(|a| a.to_str()), Some("--help" | "-h")) {
+                return help::show(&["mise"]);
+            }
+            sandbox::run_mise(rest)
         }
-        None => {
-            eprintln!(
-                "ops: usage: ops <doctor | shell | run [--detach] [--] <command> | mise <args> | \
-                 app <name [--detach] | import <file> | rm <name> | list> | search <query> | \
-                 test net <url> | \
-                 plugins <list|info|install|rm|store> | \
-                 ps | attach <id> | stop <id>...|--all [--delay <secs>] | trust [path] | \
-                 untrust [path] | config | \
-                 upgrade [all|nix|mise|flake] | gc [--all] [--prune]>"
-            );
+        "app" => app_cmd(rest),
+        "search" => search_cmd(rest),
+        "test" => test_cmd(rest),
+        "plugins" => plugins_cmd(rest),
+        other => {
+            eprintln!("ops: unknown command '{other}'");
+            if let Some(path) = help::subcommand_hint(other) {
+                eprintln!("       did you mean `{path}`?");
+            }
+            eprintln!("Run `ops --help` for the list of commands.");
             ExitCode::from(2)
         }
     }
@@ -352,7 +376,10 @@ fn list_sessions() -> ExitCode {
 /// that matches no live session is reported by `attach` itself.
 fn attach_cmd(args: Vec<OsString>) -> ExitCode {
     let Some(id) = (args.len() == 1).then(|| args[0].to_str()).flatten() else {
-        eprintln!("ops: usage: ops attach <id>   (the PID shown by `ops ps`)");
+        eprintln!(
+            "ops: usage: {}   (the PID shown by `ops ps`)",
+            help::synopsis("attach")
+        );
         return ExitCode::from(2);
     };
     sandbox::attach(id)
@@ -404,8 +431,8 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
     }
     if !all && ids.is_empty() {
         eprintln!(
-            "ops: usage: ops stop <id>... [--delay <secs>]   or   ops stop --all [--delay <secs>]\n\
-             (ids are the PIDs shown by `ops ps`)"
+            "ops: usage: {}\n   (ids are the PIDs shown by `ops ps`)",
+            help::synopsis("stop")
         );
         return ExitCode::from(2);
     }
@@ -766,10 +793,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
                 .filter_map(|a| a.to_str())
                 .find(|a| !a.starts_with('-'));
             let Some(name) = name else {
-                eprintln!(
-                    "ops: usage: ops app <name> [--detach] | ops app <import <file> [--as <name>] \
-                     [--force] | export | rm <name> | list>"
-                );
+                eprintln!("ops: usage: {}", help::synopsis("app"));
                 return ExitCode::from(2);
             };
             sandbox::app(name, detach)
@@ -800,7 +824,10 @@ fn app_import(args: &[OsString]) -> ExitCode {
             },
             Some("--force") => force = true,
             Some(flag) if flag.starts_with("--") => {
-                eprintln!("ops: unknown flag '{flag}' (usage: ops app import <file> [--as <name>] [--force])");
+                eprintln!(
+                    "ops: unknown flag '{flag}' (usage: {})",
+                    help::synopsis_of(&["app", "import"])
+                );
                 return ExitCode::from(2);
             }
             _ if source.is_none() => source = Some(arg),
@@ -811,7 +838,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
         }
     }
     let Some(source) = source else {
-        eprintln!("ops: usage: ops app import <file> [--as <name>] [--force]");
+        eprintln!("ops: usage: {}", help::synopsis_of(&["app", "import"]));
         return ExitCode::from(2);
     };
     let src_path = Path::new(source);
@@ -937,7 +964,8 @@ fn app_export(args: &[OsString]) -> ExitCode {
             },
             Some(flag) if flag.starts_with("--") => {
                 eprintln!(
-                    "ops: unknown flag '{flag}' (usage: ops app export <name> [--out <file>])"
+                    "ops: unknown flag '{flag}' (usage: {})",
+                    help::synopsis_of(&["app", "export"])
                 );
                 return ExitCode::from(2);
             }
@@ -953,7 +981,7 @@ fn app_export(args: &[OsString]) -> ExitCode {
         }
     }
     let Some(name) = name else {
-        eprintln!("ops: usage: ops app export <name> [--out <file>]");
+        eprintln!("ops: usage: {}", help::synopsis_of(&["app", "export"]));
         return ExitCode::from(2);
     };
     // The name reaches a filesystem lookup, so validate it (and a reserved verb can never be an
@@ -1001,7 +1029,7 @@ fn app_export(args: &[OsString]) -> ExitCode {
 /// user's to edit there. The name is validated before it is joined to a path (anti-traversal).
 fn app_rm(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!("ops: usage: ops app rm <name>");
+        eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
         return ExitCode::from(2);
     };
     if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
@@ -1084,7 +1112,7 @@ fn search_cmd(args: Vec<OsString>) -> ExitCode {
         .filter_map(|a| a.to_str())
         .find(|a| !a.starts_with('-'));
     let Some(query) = query else {
-        eprintln!("ops: usage: ops search <query>");
+        eprintln!("ops: usage: {}", help::synopsis("search"));
         return ExitCode::from(2);
     };
     let Some(nix) = store::resolve_nix() else {
@@ -1118,7 +1146,7 @@ fn test_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            eprintln!("ops: usage: ops test net <url>");
+            eprintln!("ops: usage: {}", help::synopsis("test"));
             ExitCode::from(2)
         }
     }
@@ -1131,7 +1159,7 @@ fn test_cmd(args: Vec<OsString>) -> ExitCode {
 /// since "the URL would be denied" is a valid answer, not an error.
 fn net_test(args: &[OsString]) -> ExitCode {
     let Some(url) = args.first().and_then(|a| a.to_str()) else {
-        eprintln!("ops: usage: ops test net <url>");
+        eprintln!("ops: usage: {}", help::synopsis("test"));
         return ExitCode::from(2);
     };
     let cwd = match std::env::current_dir() {
@@ -1201,10 +1229,7 @@ fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            eprintln!(
-                "ops: usage: ops plugins <list | info <scheme> | install <name | dir> | \
-                 rm <name> | store <list | add | update | install | info | rm>>"
-            );
+            eprintln!("ops: usage: {}", help::synopsis("plugins"));
             ExitCode::from(2)
         }
     }
@@ -1275,7 +1300,7 @@ fn plugins_list() -> ExitCode {
 /// launcher will and refused, fail-closed, on any flaw. No fetch, no network, no signature.
 fn plugins_install(source: Option<&OsString>) -> ExitCode {
     let Some(source) = source else {
-        eprintln!("ops: usage: ops plugins install <name | dir>");
+        eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "install"]));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
@@ -1340,11 +1365,7 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            eprintln!(
-                "ops: usage: ops plugins store <list | add --name <n> --url <git-url> \
-                 (--key <hex|@file> | --trust) | publish <dir> --key <key-file> [--rev <n>] | \
-                 update [name] | install <store> <plugin> | info <name> | rm <name>>"
-            );
+            eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "store"]));
             ExitCode::from(2)
         }
     }
@@ -1359,8 +1380,10 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
 /// authenticity; the pinned key's fingerprint is printed for out-of-band verification). One of the
 /// two is required: a store with no verifying key would be unsigned, refused fail-closed.
 fn plugins_store_add(args: &[OsString]) -> ExitCode {
-    const USAGE: &str =
-        "ops: usage: ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)";
+    let usage = format!(
+        "ops: usage: {}",
+        help::synopsis_of(&["plugins", "store", "add"])
+    );
     let (mut name, mut url, mut key) = (None, None, None);
     let mut trust = false;
     let mut it = args.iter();
@@ -1375,13 +1398,13 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                     "ops: unexpected argument '{}'",
                     other.unwrap_or("(non-UTF-8)")
                 );
-                eprintln!("{USAGE}");
+                eprintln!("{usage}");
                 return ExitCode::from(2);
             }
         }
     }
     let (Some(name), Some(url)) = (name, url) else {
-        eprintln!("{USAGE}");
+        eprintln!("{usage}");
         return ExitCode::from(2);
     };
 
@@ -1469,7 +1492,10 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 /// across publishes) or generated and persisted owner-only on first use; it is the store's secret
 /// and never leaves the operator's host.
 fn plugins_store_publish(args: &[OsString]) -> ExitCode {
-    const USAGE: &str = "ops: usage: ops plugins store publish <dir> --key <key-file> [--rev <n>]";
+    let usage = format!(
+        "ops: usage: {}",
+        help::synopsis_of(&["plugins", "store", "publish"])
+    );
     let mut dir: Option<&OsStr> = None;
     let mut key: Option<&OsStr> = None;
     let mut rev: Option<u64> = None;
@@ -1479,7 +1505,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             Some("--key") => key = it.next().map(|v| v.as_os_str()),
             Some("--rev") => {
                 let Some(value) = it.next().and_then(|v| v.to_str()) else {
-                    eprintln!("{USAGE}");
+                    eprintln!("{usage}");
                     return ExitCode::from(2);
                 };
                 match value.parse::<u64>() {
@@ -1492,14 +1518,14 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             }
             Some(flag) if flag.starts_with('-') => {
                 eprintln!("ops: unexpected argument '{flag}'");
-                eprintln!("{USAGE}");
+                eprintln!("{usage}");
                 return ExitCode::from(2);
             }
             // Anything else (including a non-UTF-8 path) is the positional directory.
             _ => {
                 if dir.is_some() {
                     eprintln!("ops: publish takes a single directory");
-                    eprintln!("{USAGE}");
+                    eprintln!("{usage}");
                     return ExitCode::from(2);
                 }
                 dir = Some(arg.as_os_str());
@@ -1507,7 +1533,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
         }
     }
     let (Some(dir), Some(key)) = (dir, key) else {
-        eprintln!("{USAGE}");
+        eprintln!("{usage}");
         return ExitCode::from(2);
     };
 
@@ -1624,7 +1650,10 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
         args.first().and_then(|a| a.to_str()),
         args.get(1).and_then(|a| a.to_str()),
     ) else {
-        eprintln!("ops: usage: ops plugins store install <store> <plugin>");
+        eprintln!(
+            "ops: usage: {}",
+            help::synopsis_of(&["plugins", "store", "install"])
+        );
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
@@ -1651,7 +1680,10 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
 /// owner-only cache (trusted by location): no fetch, no network.
 fn plugins_store_info(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!("ops: usage: ops plugins store info <name>");
+        eprintln!(
+            "ops: usage: {}",
+            help::synopsis_of(&["plugins", "store", "info"])
+        );
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
@@ -1702,7 +1734,10 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
 /// like `add`; refuses a name that is not configured.
 fn plugins_store_remove(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!("ops: usage: ops plugins store rm <name>");
+        eprintln!(
+            "ops: usage: {}",
+            help::synopsis_of(&["plugins", "store", "rm"])
+        );
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
@@ -1776,7 +1811,7 @@ fn plugins_store_list() -> ExitCode {
 /// shows). Host-level, like `install`; refuses an unsafe name or a directory that is not a plugin.
 fn plugins_remove(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!("ops: usage: ops plugins rm <name>");
+        eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "rm"]));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
@@ -1800,7 +1835,7 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
 /// non-zero "no such plugin". Like `list`, host-level and side-effect-free.
 fn plugins_info(scheme: Option<&str>) -> ExitCode {
     let Some(scheme) = scheme else {
-        eprintln!("ops: usage: ops plugins info <scheme>");
+        eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "info"]));
         return ExitCode::from(2);
     };
     if plugins::builtin_schemes().contains(&scheme) {
@@ -2008,7 +2043,7 @@ fn gc_cmd(args: Vec<OsString>) -> ExitCode {
             Some("--prune") => prune = true,
             Some("--all") => all = true,
             _ => {
-                eprintln!("ops: usage: ops gc [--all] [--prune]");
+                eprintln!("ops: usage: {}", help::synopsis("gc"));
                 return ExitCode::from(2);
             }
         }

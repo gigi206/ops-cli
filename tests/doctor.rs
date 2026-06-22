@@ -220,7 +220,8 @@ fn doctor_reports_the_locked_channel_revision() {
 fn no_arguments_is_a_usage_error() {
     let out = ops().output().expect("spawn ops");
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
+    // No command prints the command list to stderr (an error path) and exits non-zero.
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage:"));
 }
 
 #[test]
