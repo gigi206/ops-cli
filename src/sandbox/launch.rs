@@ -27,6 +27,7 @@ use super::egress;
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use crate::session::{self, Kind, RecordGuard, Session};
 use crate::store::Layout;
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io;
@@ -387,6 +388,166 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
     ok
 }
 
+/// `ops gc [--prune]`: reclaim the current project's own writable store.
+///
+/// The agent self-equips into a per-project store — `flake:` builds, in-cage installs — and over
+/// time a flake revision rolled forward by `ops upgrade flake` (or a package removed outright)
+/// leaves the previous build behind. This reclaims it. Everything the project still needs is
+/// gc-rooted by a **host-resolvable** root (one whose target is a `/nix/store/<hash>` path, which
+/// the relocated store reads both in-cage and host-side): the seeded base and `nix:` tools are
+/// rooted at seed time, mise installs root themselves the same way, and each `flake:` build
+/// registers a root keyed by package name that a roll re-points — so the current build survives and
+/// the rolled-away one, now unrooted, is collected. A removed package's lingering root (which a
+/// roll's overwrite cannot reach) is dropped first, by name, against the set the current config
+/// still declares across every runtime. A plain host-side `nix-store --gc` then does the rest with
+/// no per-home enumeration: the rooting lives in the store, keyed by build, not in any home — which
+/// is why a `flake:` package in an app's own `$HOME` needs no special handling.
+///
+/// A dry run by default — it reports what would be freed and changes nothing; `--prune` sweeps the
+/// dead paths. It refuses while a live sandbox holds the project (its store is in use). Like a
+/// launch it provisions the current tools and re-seeds first, which re-establishes the base/tool
+/// roots on a store seeded before rooting existed, so a sweep can never delete the unrooted base.
+///
+/// Limitation (a follow-up): a build the agent roots only by an in-cage path — a raw `nix build
+/// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`ops mise`,
+/// `nix profile`, declared `flake:` packages) — is not seen host-side and would be collected. The
+/// supported self-equip paths all root by store path, so they survive.
+pub(crate) fn gc(prune: bool) -> ExitCode {
+    let prep = match prepare() {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
+    // writes could drop a path it still needs. The registry list prunes dead records as it goes.
+    let project = match prep.cwd.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops gc: cannot resolve the project directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
+        if sessions.iter().any(|s| s.project == project) {
+            eprintln!(
+                "ops gc: a sandbox is running in this project — stop it first (see `ops ps`)."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Surface what the trust gate dropped or withheld, exactly as a launch would.
+    for warning in &prep.cfg.warnings {
+        eprintln!("ops: warning: {warning}");
+    }
+
+    // Provision the project's declared tools and seed its store: the seed gc-roots the base and
+    // every `nix:` tool, so the sweep keeps them and collects only orphans — and this re-roots a
+    // store seeded before rooting existed. The `flake:` builds carry their own roots from launch.
+    let store = match equip_for_gc(&prep) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let store_dir = store.store_dir().to_path_buf();
+
+    // Drop the `ops-flake-<name>` roots of removed packages. A roll self-cleans (its root is
+    // overwritten onto the new build), but a removal leaves the root pointing at an unwanted build;
+    // this prunes those so the sweep reclaims them. The current set spans every runtime — the
+    // baseline and each app's merged packages — so a flake package declared only in an app keeps
+    // its root.
+    let mut flake_names: std::collections::BTreeSet<String> =
+        super::packages::flake_packages(&prep.cfg.packages)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+    for app in prep.cfg.apps.values() {
+        let mut merged = prep.cfg.clone();
+        merged.merge_app(app.clone());
+        flake_names.extend(
+            super::packages::flake_packages(&merged.packages)
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+    }
+    let pruned = super::gc::prune_flake_roots(&store_dir, &flake_names, prune).len();
+
+    println!("ops gc — {}", project.display());
+    let report = match super::gc::collect(&prep.nix_store, &store_dir, prune) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ops gc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if prune {
+        // The pruned roots' builds were unrooted before the sweep, so they are already counted in
+        // `report.paths`; name how many removed-package builds that included.
+        println!(
+            "  collected {} store path(s) ({} from removed package(s)), freed {}.",
+            report.paths,
+            pruned,
+            super::gc::human_bytes(report.bytes)
+        );
+    } else {
+        // A dry run cannot size the removed-package builds (their roots still hold them, so they are
+        // not yet in the dead set), so report their count separately from the currently-dead total.
+        println!(
+            "  {} store path(s) collectable now, {} would be freed — run `ops gc --prune` to reclaim.",
+            report.paths,
+            super::gc::human_bytes(report.bytes)
+        );
+        if pruned > 0 {
+            println!("  and {pruned} removed-package flake build(s) would also be reclaimed.");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Provision the project's declared tools and seed its store, returning the store. Mirrors
+/// the provisioning a launch does — native `[packages]`, `nix:` tools, and (under the GUI
+/// hole) fonts — so the seed gc-roots the same set a launch would, but stops at the seed: gc
+/// needs the rooted store, not a runnable cage.
+///
+/// It inherits a launch's strictness — a withheld (untrusted) tool only warns, but an admitted
+/// tool that cannot be realised is fatal — so gc shares a launch's provisioning (and its
+/// network need). For protecting the base only the base roots matter, and those come from
+/// `prep.userland` without provisioning; re-provisioning the rest keeps gc's rooted set in
+/// lockstep with a launch's at the cost of that coupling — an accepted trade for a single
+/// source of the project's root set.
+fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, ExitCode> {
+    let packages = super::packages::provision(
+        &prep.nix,
+        &prep.layout,
+        &prep.cwd,
+        &prep.nixpkgs,
+        &prep.cfg.packages,
+    )
+    .map_err(|e| {
+        eprintln!("ops gc: {e}");
+        ExitCode::FAILURE
+    })?;
+    for warning in &packages.warnings {
+        eprintln!("ops: warning: {warning}");
+    }
+
+    let tools = mise_tools(prep)?;
+    for warning in &tools.warnings {
+        eprintln!("ops: warning: {warning}");
+    }
+
+    let font_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        super::fonts::provision(&prep.nix, &prep.layout, &prep.nixpkgs).ok()
+    } else {
+        None
+    };
+    let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
+
+    seed_project_store(prep, &packages.roots, &tools.roots, font_roots).map_err(|e| {
+        eprintln!("ops gc: cannot prepare the project's store: {e}");
+        ExitCode::FAILURE
+    })
+}
+
 /// `ops shell`: an interactive shell inside the project sandbox, under a pty
 /// supervisor so job control works.
 pub(crate) fn shell() -> ExitCode {
@@ -593,26 +754,20 @@ fn build(
     // this launch (the rev-keyed path does not yet exist). An unpinned package floats — it builds
     // the declared ref into a name-keyed out-link, the v1 behaviour kept for a project that never
     // ran `ops upgrade flake`.
-    let flake_lock = if flake_pkgs.is_empty() {
-        // The common launch declares no flake package — read no lock, derive no project id.
-        std::collections::BTreeMap::new()
-    } else {
-        match binds::project_runtime_id(&prep.cwd) {
-            Ok(id) => super::flake::pins(&prep.layout, &id),
-            Err(_) => std::collections::BTreeMap::new(),
-        }
-    };
-    let mut flake_pairs: Vec<(String, PathBuf)> = Vec::with_capacity(flake_pkgs.len());
+    let flake_lock = read_flake_lock(prep, &flake_pkgs);
+    // Each triple carries the build ref, the out-link, and the package name — the name keys the
+    // host-resolvable gc root the build registers, so a roll re-points one root and a host-side
+    // `ops gc` keeps the current build while collecting the rolled-away one.
+    let mut flake_pairs: Vec<(String, PathBuf, String)> = Vec::with_capacity(flake_pkgs.len());
     for (name, reference) in &flake_pkgs {
-        let (build_ref, out_link) = match flake_lock.get(reference) {
-            Some(pin) => (
-                pin.locked_ref.clone(),
-                binds::flake_out_link_rev(name, &pin.rev),
-            ),
-            None => (reference.clone(), binds::flake_out_link(name)),
+        // A pinned package builds its locked (immutable) ref; an unpinned one the declared ref.
+        let build_ref = match flake_lock.get(reference) {
+            Some(pin) => pin.locked_ref.clone(),
+            None => reference.clone(),
         };
+        let out_link = flake_out_link_for(name, reference, &flake_lock);
         bin_paths.push(out_link.join("bin"));
-        flake_pairs.push((build_ref, out_link));
+        flake_pairs.push((build_ref, out_link, name.clone()));
     }
 
     // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
@@ -980,6 +1135,37 @@ fn collect_roots(
     roots
 }
 
+/// Read the project's flake lock, but only when a `flake:` package is declared — the common
+/// launch reads no lock and derives no project id. An unreadable id or absent lock yields an
+/// empty map (every package floats), the v1 behaviour.
+fn read_flake_lock(
+    prep: &Prepared,
+    flake_pkgs: &[(String, String)],
+) -> BTreeMap<String, super::flake::FlakePin> {
+    if flake_pkgs.is_empty() {
+        return BTreeMap::new();
+    }
+    match binds::project_runtime_id(&prep.cwd) {
+        Ok(id) => super::flake::pins(&prep.layout, &id),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// The out-link a `flake:` package builds into, given the project's flake lock: a pinned
+/// package's revision-keyed path, an unpinned one's name-keyed path. The single place that
+/// choice is made, so the launch (which builds the out-link) and `ops gc` (which decides
+/// whether an out-link on disk is a current root or a rolled-away leftover) never diverge.
+fn flake_out_link_for(
+    name: &str,
+    reference: &str,
+    lock: &BTreeMap<String, super::flake::FlakePin>,
+) -> PathBuf {
+    match lock.get(reference) {
+        Some(pin) => binds::flake_out_link_rev(name, &pin.rev),
+        None => binds::flake_out_link(name),
+    }
+}
+
 /// Resolve a trusted project's mise `[env]` into environment entries. Empty when
 /// the project declares no mise file, or it is withheld — an untrusted or changed
 /// mise file only warns (its `[env]` is held back, like its security fields).
@@ -1118,34 +1304,46 @@ fn wrap_mise_equip(
 }
 
 /// Wrap `cmd` so the cage builds a set of `flake:` packages before running it: a static bash
-/// that, for each `(ref, out-link)` pair, runs `nix build <ref> --out-link <out-link>` unless
-/// the out-link is already realised, then `exec`s the real command (which stays the cage's
-/// main process, leaving `ops shell`'s pty job control unchanged). Only the absolute `nix`
-/// path, the out-link parent directory, and the integer pair count are interpolated into the
-/// script — the refs and out-links ride `"$@"` positionally, so a flake ref from config can
-/// never inject shell. The short-circuit `[ -e "$out/bin" ]` dereferences the out-link symlink
-/// into the cage's `/nix` (the per-project store): a path already present skips the build (a
-/// warm no-op that also works offline), while a dangling cross-project out-link (the
-/// `home_scope = "global"` residual) rebuilds. Best-effort: a failed build does not abort the
-/// command (the missing tool surfaces when it is used), matching the in-cage self-equip posture.
-/// `mkdir` is invoked by name (it resolves to the base coreutils); a persisted tool that shadows
-/// it on PATH would be a trusted layer harming its own cage — the same self-equip self-harm class
-/// already accepted, never a cross-tenant concern.
+/// that, for each `(ref, out-link, key)` triple, runs `nix build <ref> --out-link <out-link>`
+/// unless the out-link is already realised, registers a host-resolvable gc root for the build,
+/// then `exec`s the real command (which stays the cage's main process, leaving `ops shell`'s pty
+/// job control unchanged). Only the absolute `nix` path, the out-link parent directory, and the
+/// integer triple count are interpolated into the script — the refs, out-links, and keys ride
+/// `"$@"` positionally, so a value from config can never inject shell. The short-circuit
+/// `[ -e "$out/bin" ]` dereferences the out-link symlink into the cage's `/nix` (the per-project
+/// store): a path already present skips the build (a warm no-op that also works offline), while a
+/// dangling cross-project out-link (the `home_scope = "global"` residual) rebuilds.
+///
+/// The gc root is the same pattern mise's plugin uses for its installs: a symlink under
+/// `/nix/var/nix/gcroots/` whose target is the build's `/nix/store/<hash>` path — host-resolvable
+/// (the relocated store reads it both in-cage and host-side), unlike the in-cage `--out-link`
+/// indirect root nix also creates, whose `/home/sandbox/…` target dangles host-side. Keyed by the
+/// **package name** and overwritten (`ln -sfn`) every launch: a roll re-points the one root to the
+/// new build, dropping the old store path, so a host-side `ops gc` keeps the current build and
+/// collects the rolled-away one with no per-home enumeration. Written unconditionally (warm or
+/// fresh) so an older store missing the root self-heals. Best-effort: a failed build leaves no
+/// out-link, so the `readlink` yields nothing and no root is written (the missing tool surfaces
+/// when it is used), matching the in-cage self-equip posture. `mkdir`/`ln`/`readlink` are invoked
+/// by name (the base coreutils); a persisted tool shadowing one on PATH is a trusted layer harming
+/// its own cage — the self-equip self-harm class already accepted, never a cross-tenant concern.
 fn wrap_flake_equip(
     nix: &Path,
     bash: &Path,
     flake_dir: &Path,
-    pairs: &[(String, PathBuf)],
+    triples: &[(String, PathBuf, String)],
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
-    let n = pairs.len();
+    let n = triples.len();
     let script = format!(
         "mkdir -p '{dir}'\n\
          n={n}\n\
          while [ \"$n\" -gt 0 ]; do\n\
          out=\"$2\"\n\
          [ -e \"$out/bin\" ] || '{nix}' build \"$1\" --out-link \"$out\" 1>&2\n\
-         shift 2\n\
+         sp=$(readlink -f \"$out\" 2>/dev/null)\n\
+         [ -n \"$sp\" ] && mkdir -p /nix/var/nix/gcroots \
+         && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/ops-flake-$3\"\n\
+         shift 3\n\
          n=$((n - 1))\n\
          done\n\
          exec \"$@\"",
@@ -1156,12 +1354,13 @@ fn wrap_flake_equip(
         bash.as_os_str().to_os_string(),
         OsString::from("-c"),
         OsString::from(script),
-        // `$0` — a label; the pairs are `$1..$2n`, the command is what remains after the shifts.
+        // `$0` — a label; the triples are `$1..$3n`, the command is what remains after the shifts.
         OsString::from("ops-flake-equip"),
     ];
-    for (reference, out_link) in pairs {
+    for (reference, out_link, key) in triples {
         out.push(OsString::from(reference));
         out.push(out_link.as_os_str().to_os_string());
+        out.push(OsString::from(key));
     }
     out.extend(cmd);
     out
@@ -1894,45 +2093,51 @@ mod tests {
 
     #[test]
     fn wrap_flake_equip_passes_refs_and_command_positionally_and_short_circuits() {
-        // Each (ref, out-link) rides `"$@"`, so a flake ref from an untrusted-but-trusted-app
+        // Each (ref, out-link, key) rides `"$@"`, so a value from an untrusted-but-trusted-app
         // config can never inject shell: only the absolute nix path, the out-link parent, and
-        // the integer pair count reach the script string. The short-circuit and the per-pair
-        // `nix build` are both present.
+        // the integer triple count reach the script string. The short-circuit, the per-triple
+        // `nix build`, and the host-resolvable gc root (keyed by package name, the `$3`
+        // positional, never interpolated) are all present.
         let nix = PathBuf::from("/nix/store/nix/bin/nix");
         let bash = PathBuf::from("/nix/store/bash/bin/bash");
         let dir = PathBuf::from("/home/sandbox/.local/state/ops/flake");
-        let pairs = vec![
+        let triples = vec![
             (
                 "github:NousResearch/hermes-agent#tui".to_string(),
                 PathBuf::from("/home/sandbox/.local/state/ops/flake/hermes"),
+                "hermes".to_string(),
             ),
             // a hostile ref must stay a single positional arg, never reach the script
             (
                 "github:evil/x#bin; rm -rf /".to_string(),
                 PathBuf::from("/home/sandbox/.local/state/ops/flake/evil"),
+                "evil".to_string(),
             ),
         ];
         let cmd = vec![OsString::from("hermes"), OsString::from("-z")];
 
-        let argv = wrap_flake_equip(&nix, &bash, &dir, &pairs, cmd);
+        let argv = wrap_flake_equip(&nix, &bash, &dir, &triples, cmd);
 
         assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
         assert_eq!(argv[1], OsString::from("-c"));
         let script = argv[2].to_string_lossy();
-        // nix by absolute path; the pair count drives the loop, not the refs; the out-link
-        // presence short-circuits the build; the command is exec'd after the pairs are shifted.
+        // nix by absolute path; the triple count drives the loop, not the refs; the out-link
+        // presence short-circuits the build; the command is exec'd after the triples are shifted.
         assert!(script.contains("n=2"));
         assert!(script.contains(
             "[ -e \"$out/bin\" ] || '/nix/store/nix/bin/nix' build \"$1\" --out-link \"$out\""
         ));
         assert!(script.contains("mkdir -p '/home/sandbox/.local/state/ops/flake'"));
-        assert!(script.contains("shift 2"));
+        // the gc root is keyed by the `$3` positional (the package name), targeting the build's
+        // store path resolved by `readlink -f` — host-resolvable, overwritten each launch
+        assert!(script.contains("ln -sfn \"$sp\" \"/nix/var/nix/gcroots/ops-flake-$3\""));
+        assert!(script.contains("shift 3"));
         assert!(script.trim_end().ends_with("exec \"$@\""));
         assert!(
             !script.contains("rm -rf"),
             "a hostile ref must never be interpolated into the script: {script}"
         );
-        // label, then interleaved (ref, out-link) pairs, then the command — all positional
+        // label, then interleaved (ref, out-link, key) triples, then the command — all positional
         assert_eq!(argv[3], OsString::from("ops-flake-equip"));
         assert_eq!(
             argv[4],
@@ -1942,13 +2147,15 @@ mod tests {
             argv[5],
             OsString::from("/home/sandbox/.local/state/ops/flake/hermes")
         );
-        assert_eq!(argv[6], OsString::from("github:evil/x#bin; rm -rf /"));
+        assert_eq!(argv[6], OsString::from("hermes"));
+        assert_eq!(argv[7], OsString::from("github:evil/x#bin; rm -rf /"));
         assert_eq!(
-            argv[7],
+            argv[8],
             OsString::from("/home/sandbox/.local/state/ops/flake/evil")
         );
-        assert_eq!(argv[8], OsString::from("hermes"));
-        assert_eq!(argv[9], OsString::from("-z"));
+        assert_eq!(argv[9], OsString::from("evil"));
+        assert_eq!(argv[10], OsString::from("hermes"));
+        assert_eq!(argv[11], OsString::from("-z"));
     }
 
     #[test]

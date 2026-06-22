@@ -154,6 +154,13 @@ pub(crate) fn prepare(
     // Register exactly that closure in the project store's own database.
     load_db(nix_store, &shared_store, &store_dir, &closure)?;
 
+    // Root the seeded paths so a later `nix-store --gc` against this store keeps the
+    // base userland and the project's tools while collecting only orphaned paths (a
+    // rolled-away flake build, an abandoned in-cage install). Without a root, gc would
+    // see the whole seed as dead and delete it; this also protects the base from an
+    // in-cage `nix-collect-garbage`, which previously could remove the unrooted seed.
+    gcroot_roots(&store_dir, roots)?;
+
     Ok(ProjectStore { store_dir })
 }
 
@@ -374,6 +381,57 @@ fn load_db(
     Ok(())
 }
 
+/// The project store's garbage-collector roots directory. `nix-store --gc` keeps every
+/// path reachable from a symlink here, so this is where the seed anchors what the cage
+/// needs. A sibling of the store's `db/`, under the relocated store's `nix/var` tree.
+pub(crate) fn gcroots_dir(store_dir: &Path) -> PathBuf {
+    store_dir.join("nix/var/nix/gcroots")
+}
+
+/// Register each logical `roots` path (`/nix/store/<hash>-name`) as a direct gc root in
+/// `store_dir`'s store, so `nix-store --gc` keeps it and its closure. A root is a symlink
+/// `gcroots/<hash-name> -> /nix/store/<hash-name>` — the relocated store interprets that
+/// logical target as one of its own paths. The store-path name is unique per content, so
+/// it is the root's stable, collision-free file name.
+///
+/// Idempotent and race-tolerant: a root already pointing at the right target is left
+/// alone, and a concurrent same-project seed racing on the same name resolves to the same
+/// link. Each link is placed atomically (write to a unique temp name, then `rename`), so a
+/// reader never sees a half-made root and the loser of a race overwrites with an identical
+/// link.
+fn gcroot_roots(store_dir: &Path, roots: &[PathBuf]) -> io::Result<()> {
+    let dir = gcroots_dir(store_dir);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(&dir)?;
+    for root in roots {
+        let Some(name) = root.file_name() else {
+            continue;
+        };
+        let link = dir.join(name);
+        // Already the right root: nothing to do (the common warm re-seed).
+        if fs::read_link(&link).is_ok_and(|t| t == *root) {
+            continue;
+        }
+        let mut tmp_name = std::ffi::OsString::from(format!(".tmp-{}-", unique()));
+        tmp_name.push(name);
+        let tmp = dir.join(tmp_name);
+        // A stale temp from a crashed seed would block the symlink; clear it first.
+        let _ = fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(root, &tmp)?;
+        match fs::rename(&tmp, &link) {
+            Ok(()) => {}
+            // Lost the race or the link already existed: another seed placed an identical
+            // root, so discard the temp and accept it.
+            Err(_) => {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +452,48 @@ mod tests {
         assert_eq!(
             store_dir_for(&layout, "abc"),
             PathBuf::from("/data/ops/projects/abc/store")
+        );
+    }
+
+    #[test]
+    fn gcroot_roots_links_each_root_and_is_idempotent() {
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+        let roots = [
+            PathBuf::from("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base"),
+            PathBuf::from("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-tool"),
+        ];
+
+        gcroot_roots(&store_dir, &roots).unwrap();
+
+        // each root is a direct gc-root symlink named for the store path, pointing at the
+        // logical store path the relocated store resolves as its own
+        let dir = gcroots_dir(&store_dir);
+        for root in &roots {
+            let link = dir.join(root.file_name().unwrap());
+            assert_eq!(std::fs::read_link(&link).unwrap(), *root);
+        }
+        // no stray temp left behind by the atomic placement
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "a temp placement leaked");
+
+        // re-running is a no-op (the warm re-seed path): the links keep the same identity
+        let before = roots
+            .iter()
+            .map(|r| ino(&dir.join(r.file_name().unwrap())))
+            .collect::<Vec<_>>();
+        gcroot_roots(&store_dir, &roots).unwrap();
+        let after = roots
+            .iter()
+            .map(|r| ino(&dir.join(r.file_name().unwrap())))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before, after,
+            "idempotent re-seed replaced an unchanged root"
         );
     }
 

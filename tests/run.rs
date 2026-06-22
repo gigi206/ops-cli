@@ -1578,6 +1578,193 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
     );
 }
 
+/// The single project store dir under `data` (these tests run one project).
+fn project_store_dir(data: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(data.join("ops").join("projects"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("store"))
+        .find(|p| p.exists())
+}
+/// The logical store path a flake out-link named `link` points at (its build output).
+fn project_flake_link_target(data: &Path, link: &str) -> Option<PathBuf> {
+    std::fs::read_dir(data.join("ops").join("projects"))
+        .ok()?
+        .flatten()
+        .find_map(|e| {
+            std::fs::read_link(e.path().join("home/.local/state/ops/flake").join(link)).ok()
+        })
+}
+/// Whether `path` (a logical `/nix/store/<hash>-name`) is physically present in `store_dir`.
+fn in_store(store_dir: &Path, path: &Path) -> bool {
+    store_dir
+        .join("nix/store")
+        .join(path.file_name().expect("store path basename"))
+        .exists()
+}
+
+#[test]
+fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
+    // The load-bearing live proof of `ops gc` (the M5 in-project store slice), in two phases that
+    // pin the one property that matters: a host-side `ops gc --prune` must KEEP a current `flake:`
+    // build and reclaim one whose package is gone. The build registers a host-resolvable gc root
+    // (keyed by package name, target `/nix/store/<hash>`), the same way mise roots its installs —
+    // without it, the in-cage `--out-link` root targets `/home/sandbox/…`, which dangles host-side,
+    // so a host-side gc would delete the *current* build (the bug phase 1 exists to catch).
+    //   Phase 1: build `hello`, then `ops gc --prune` with `hello` still declared — the build SURVIVES,
+    //            and a seeded base path survives too (checked before any relaunch).
+    //   Phase 2: remove the package, re-trust, `ops gc --prune` — its lingering root is pruned and the
+    //            build COLLECTED (deterministic: `hello`'s output is unique to it). A roll reaches the
+    //            same end by overwriting the root, which the `wrap_flake_equip` unit test covers.
+    // Skips (never fails) without sandbox or network.
+    let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+    let project = TmpDir::new("gc-proj");
+    let data = TmpDir::new("gc-data");
+    let state = TmpDir::new("gc-state");
+    let flake_cfg = format!(
+        "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
+         [network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n"
+    );
+    std::fs::write(project.path().join(".ops.toml"), &flake_cfg).unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping ops gc e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping ops gc e2e: the network is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(trusted.status.success(), "ops trust failed");
+
+    // Build the flake package in-cage. Floating is enough — no pin needed.
+    let built = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "hello"],
+    );
+    if !built.status.success() || !String::from_utf8_lossy(&built.stdout).contains("Hello, world!")
+    {
+        eprintln!(
+            "skipping ops gc e2e: the flake build did not complete in-cage: {}{}",
+            String::from_utf8_lossy(&built.stderr),
+            String::from_utf8_lossy(&built.stdout)
+        );
+        return;
+    }
+
+    let store_dir = project_store_dir(data.path()).expect("project store");
+    let built_path =
+        project_flake_link_target(data.path(), "hello").expect("hello out-link target");
+    assert!(
+        in_store(&store_dir, &built_path),
+        "the flake build is not in the project store before gc: {built_path:?}"
+    );
+    // The build registered a host-resolvable gc root keyed by package name (the fix): a symlink
+    // under the store's gcroots whose target is the build's `/nix/store/<hash>` path.
+    let flake_root = store_dir.join("nix/var/nix/gcroots/ops-flake-hello");
+    assert_eq!(
+        std::fs::read_link(&flake_root).ok().as_deref(),
+        Some(built_path.as_path()),
+        "the build did not register a host-resolvable gc root at {flake_root:?}"
+    );
+    // A seeded base gc-root (any top-level root that is not auto/ nor the flake root) — both the
+    // phase-1 survival witness and, in phase 2, the path the roll re-points the flake root onto.
+    let base_path = std::fs::read_dir(store_dir.join("nix/var/nix/gcroots"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name() != "auto" && e.file_name() != "ops-flake-hello")
+        .find_map(|e| std::fs::read_link(e.path()).ok())
+        .expect("a seeded base gc-root");
+
+    // ---- Phase 1: gc with `hello` still current — the build must SURVIVE. ----
+    let gc1 = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["gc", "--prune"],
+    );
+    let gc1_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&gc1.stderr),
+        String::from_utf8_lossy(&gc1.stdout)
+    );
+    assert!(
+        gc1.status.success(),
+        "ops gc --prune (phase 1) failed: {gc1_log}"
+    );
+    assert!(
+        in_store(&store_dir, &built_path),
+        "the CURRENT flake build was collected by gc — host-side rooting did not hold: \
+         {built_path:?}\n{gc1_log}"
+    );
+    assert!(
+        in_store(&store_dir, &base_path),
+        "a seeded base path was collected by gc: {base_path:?}\n{gc1_log}"
+    );
+
+    // ---- Phase 2: remove the package, re-trust, gc — its lingering name-keyed root is now stale,
+    // so `prune_flake_roots` drops it and the sweep reclaims the build. This exercises the
+    // removed-package path end-to-end (no manual gcroot mutation); a roll's self-clean is the same
+    // outcome reached by an overwrite, which the `wrap_flake_equip` unit test covers. ----
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+    let retrust = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(retrust.status.success(), "re-trust failed");
+
+    let gc2 = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["gc", "--prune"],
+    );
+    let gc2_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&gc2.stderr),
+        String::from_utf8_lossy(&gc2.stdout)
+    );
+    assert!(
+        gc2.status.success(),
+        "ops gc --prune (phase 2) failed: {gc2_log}"
+    );
+    // the lingering root was pruned, and its build collected by the sweep
+    assert!(
+        !flake_root.exists(),
+        "the removed package's gc root was not pruned: {flake_root:?}\n{gc2_log}"
+    );
+    assert!(
+        !in_store(&store_dir, &built_path),
+        "the removed package's flake build was not collected: {built_path:?}\n{gc2_log}"
+    );
+    // The base still runs end-to-end (it re-seeds first, so this is a convenience check).
+    let base = run_in(project.path(), data.path(), &["sh", "-c", "echo BASE-OK"]);
+    assert!(
+        base.status.success() && String::from_utf8_lossy(&base.stdout).contains("BASE-OK"),
+        "the cage no longer runs after gc: {}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+}
+
 #[test]
 fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // The 6.3a integration neither the unit nor the proxy tests can reach: a trusted

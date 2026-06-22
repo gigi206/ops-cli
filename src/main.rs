@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         Some("untrust") => untrust_cmd(args.next()),
         Some("config") => config_cmd(),
         Some("upgrade") => upgrade_cmd(args.collect()),
+        Some("gc") => gc_cmd(args.collect()),
         Some("run") => {
             let mut cmd: Vec<OsString> = args.collect();
             // an optional `--` separates ops's arguments from the command's
@@ -52,7 +53,7 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!(
                 "ops: unknown command '{other}' (known: doctor, shell, run, mise, app, \
-                 search, test, plugins, ps, trust, untrust, config, upgrade)"
+                 search, test, plugins, ps, trust, untrust, config, upgrade, gc)"
             );
             ExitCode::from(2)
         }
@@ -61,7 +62,8 @@ fn main() -> ExitCode {
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
                  app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
                  plugins <list|info|install|rm|store> | \
-                 ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise|flake]>"
+                 ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise|flake] | \
+                 gc [--prune]>"
             );
             ExitCode::from(2)
         }
@@ -1904,6 +1906,23 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// `ops gc [--prune]`: reclaim the current project's own writable store. A dry run by
+/// default (it reports what would be freed and touches nothing); `--prune` actually
+/// reclaims. Reclamation is irreversible, so the destructive form is opt-in.
+fn gc_cmd(args: Vec<OsString>) -> ExitCode {
+    let mut prune = false;
+    for arg in &args {
+        match arg.to_str() {
+            Some("--prune") => prune = true,
+            _ => {
+                eprintln!("ops: usage: ops gc [--prune]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    sandbox::gc(prune)
 }
 
 /// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else
