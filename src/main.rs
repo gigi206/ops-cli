@@ -79,7 +79,7 @@ fn main() -> ExitCode {
                  app <name [--detach] | import <file> | rm <name> | list> | search <query> | \
                  test net <url> | \
                  plugins <list|info|install|rm|store> | \
-                 ps | attach <id> | stop <id>... [--delay <secs>] | trust [path] | \
+                 ps | attach <id> | stop <id>...|--all [--delay <secs>] | trust [path] | \
                  untrust [path] | config | \
                  upgrade [all|nix|mise|flake] | gc [--all] [--prune]>"
             );
@@ -362,11 +362,14 @@ fn attach_cmd(args: Vec<OsString>) -> ExitCode {
 /// finish writing and shut down cleanly, short enough not to hang. `--delay` overrides it.
 const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
 
-/// `ops stop <id>... [--delay <secs>]`: stop running sessions by the pid `ops ps` shows. Sends
-/// SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once). At
-/// least one id is required; a non-UTF-8 operand or a malformed `--delay` value is a usage error.
+/// `ops stop <id>... [--delay <secs>]` / `ops stop --all [--delay <secs>]`: stop running sessions.
+/// With ids, stop the named ones (the pids `ops ps` shows); with `--all`, stop every live session.
+/// Sends SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once).
+/// Either ids or `--all` is required (not both); a non-UTF-8 operand or a malformed `--delay` value
+/// is a usage error.
 fn stop_cmd(args: Vec<OsString>) -> ExitCode {
     let mut delay = STOP_DEFAULT_DELAY;
+    let mut all = false;
     let mut ids: Vec<String> = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -387,6 +390,7 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
                     }
                 }
             }
+            Some("--all") => all = true,
             Some(id) => ids.push(id.to_string()),
             None => {
                 eprintln!("ops: stop ids must be valid text (the PID shown by `ops ps`).");
@@ -394,14 +398,19 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
             }
         }
     }
-    if ids.is_empty() {
+    if all && !ids.is_empty() {
+        eprintln!("ops: stop takes either explicit ids or --all, not both.");
+        return ExitCode::from(2);
+    }
+    if !all && ids.is_empty() {
         eprintln!(
-            "ops: usage: ops stop <id>... [--delay <secs>]   (ids are the PIDs shown by `ops ps`)"
+            "ops: usage: ops stop <id>... [--delay <secs>]   or   ops stop --all [--delay <secs>]\n\
+             (ids are the PIDs shown by `ops ps`)"
         );
         return ExitCode::from(2);
     }
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    sandbox::stop(&id_refs, delay)
+    sandbox::stop(&id_refs, delay, all)
 }
 
 /// The config path an `ops trust`/`untrust` invocation targets: the given path,

@@ -1116,10 +1116,12 @@ pub(crate) fn attach(id: &str) -> ExitCode {
     }
 }
 
-/// `ops stop <id>...`: stop one or more running sessions by the pid `ops ps` shows. Each session is
-/// sent SIGTERM, then SIGKILL if it has not exited within `grace`. Targets are resolved through the
-/// same liveness-validated registry `attach` uses, so a stale or reused pid is never signalled.
-/// Reports each id and exits 2 if any id matched no live session, else 0.
+/// `ops stop <id>...` / `ops stop --all`: stop running sessions. With ids, stop the named ones (the
+/// pids `ops ps` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
+/// SIGKILL if it has not exited within `grace`. Targets are resolved through the same
+/// liveness-validated registry `attach` uses, so a stale or reused pid is never signalled. For ids,
+/// reports each and exits 2 if any matched no live session, else 0; for `--all`, stopping nothing is
+/// a no-op success (there is simply nothing to do).
 ///
 /// Residuals (named, not fixed here), both because a signal terminates a supervisor without running
 /// its RAII drops:
@@ -1130,8 +1132,11 @@ pub(crate) fn attach(id: &str) -> ExitCode {
 /// - stopping an `ops shell` session signals its pty supervisor, whose terminal-state restore is
 ///   also a RAII guard, so the owner's terminal (where that `ops shell` runs) is left in raw mode
 ///   and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is unaffected; this
-///   only bites the unusual case of stopping an interactive shell from another terminal.
-pub(crate) fn stop(ids: &[&str], grace: Duration) -> ExitCode {
+///   only bites the unusual case of stopping an interactive shell from another terminal. `--all`
+///   targets *every* session, interactive shells included (a deliberate choice — "all" means all,
+///   matching how `ops stop <id>` already treats a shell), so it can trip this residual on a shell
+///   open elsewhere; stop a single agent by pid to avoid it.
+pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
@@ -1145,6 +1150,20 @@ pub(crate) fn stop(ids: &[&str], grace: Duration) -> ExitCode {
         }
     };
 
+    if all {
+        if sessions.is_empty() {
+            println!("ops stop: no active sessions to stop.");
+            return ExitCode::SUCCESS;
+        }
+        // Sessions are independent cages (separate pid namespaces), so they are torn down one after
+        // another — never interfering. A well-behaved agent exits on SIGTERM well before its grace
+        // window elapses, so this is not grace-per-session in practice.
+        for target in &sessions {
+            stop_session(&registry, target, grace);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let mut any_missing = false;
     for id in ids {
         let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
@@ -1152,24 +1171,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration) -> ExitCode {
             any_missing = true;
             continue;
         };
-        let label = target.label();
-        match target.stop(grace) {
-            session::StopOutcome::AlreadyGone => {
-                eprintln!("ops stop: session {id} ({label}) had already exited.");
-            }
-            session::StopOutcome::Terminated => {
-                eprintln!("ops stop: stopped session {id} ({label}).");
-            }
-            session::StopOutcome::Killed => {
-                eprintln!(
-                    "ops stop: session {id} ({label}) did not exit within {}s — sent SIGKILL.",
-                    grace.as_secs()
-                );
-            }
-        }
-        // It is down (or already was): drop its record now, so `ops ps` is clean immediately
-        // rather than waiting for the killed process to stop reading as a zombie.
-        registry.reap(target);
+        stop_session(&registry, target, grace);
     }
 
     if any_missing {
@@ -1177,6 +1179,29 @@ pub(crate) fn stop(ids: &[&str], grace: Duration) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Stop one resolved session and reap its record: SIGTERM, then SIGKILL after `grace`, report the
+/// outcome by pid and label, and drop the record so `ops ps` is clean at once rather than waiting
+/// for the killed process to stop reading as a zombie.
+fn stop_session(registry: &session::Registry, target: &session::Session, grace: Duration) {
+    let pid = target.pid;
+    let label = target.label();
+    match target.stop(grace) {
+        session::StopOutcome::AlreadyGone => {
+            eprintln!("ops stop: session {pid} ({label}) had already exited.");
+        }
+        session::StopOutcome::Terminated => {
+            eprintln!("ops stop: stopped session {pid} ({label}).");
+        }
+        session::StopOutcome::Killed => {
+            eprintln!(
+                "ops stop: session {pid} ({label}) did not exit within {}s — sent SIGKILL.",
+                grace.as_secs()
+            );
+        }
+    }
+    registry.reap(target);
 }
 
 /// Open an interactive shell in app `name`'s environment: its isolated home — kept by the

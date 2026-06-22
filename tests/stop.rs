@@ -70,6 +70,46 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Parse the detached session id out of `ops`'s startup message ("...detached session <pid>...").
+fn parse_detach_pid(stderr: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(stderr);
+    let after = text.split("detached session ").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Best-effort SIGKILL of any leaked, fingerprinted background process on drop. A detached daemon is
+/// reparented to init and cannot be reaped by the test, so a `KillOnDrop` (which holds a `Child`)
+/// does not cover it — this sweeps by the unique `sleep` argument instead, as a backstop for when an
+/// assertion panics before the stop under test runs.
+struct FingerprintCleanup(Vec<&'static str>);
+
+impl Drop for FingerprintCleanup {
+    fn drop(&mut self) {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let cmdline = String::from_utf8_lossy(&bytes);
+            if self.0.iter().any(|fp| cmdline.contains(fp)) {
+                // SAFETY: a best-effort SIGKILL of a leaked test process matched by its unique
+                // fingerprint; a failure (already gone) is ignored.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
 #[test]
 fn stop_with_no_or_bad_arguments_is_a_usage_error() {
     let data = TmpDir::new("usage");
@@ -112,6 +152,48 @@ fn stop_an_unknown_id_reports_and_exits_two() {
         String::from_utf8_lossy(&out.stderr).contains("no live session"),
         "missing-id message: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn stop_all_together_with_an_id_is_a_usage_error() {
+    // `--all` and explicit ids are mutually exclusive: passing both is ambiguous, so it is rejected
+    // before any signalling (exit 2), not silently resolved one way.
+    let data = TmpDir::new("all-and-id");
+    let out = ops()
+        .args(["stop", "--all", "123"])
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ops stop");
+    assert_eq!(out.status.code(), Some(2), "--all with an id must exit 2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("either explicit ids or --all"),
+        "message: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn stop_all_with_no_sessions_is_a_no_op_success() {
+    // Stopping every session when there are none is not an error — there is simply nothing to do,
+    // like `ops gc` with nothing to reclaim. No sandbox is needed (the registry is just empty).
+    let data = TmpDir::new("all-empty");
+    let out = ops()
+        .args(["stop", "--all"])
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ops stop");
+    assert!(
+        out.status.success(),
+        "stop --all with no sessions must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no active sessions"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 
@@ -302,4 +384,118 @@ fn stop_tears_down_a_supervised_app_session() {
         !String::from_utf8_lossy(&ps.stdout).contains(&pid.to_string()),
         "the stopped session still shows in `ops ps`"
     );
+}
+
+#[test]
+fn stop_all_stops_every_session() {
+    // `ops stop --all` must tear down *every* live session at once, not just one. Two background
+    // agents are started with `--detach` (so each is a first-class registry session); a single
+    // `ops stop --all` must leave neither running. The unusual sleep durations are unique
+    // fingerprints in the host's process table. Both apps use the default posture (the exec path),
+    // which keeps the fixture to one provisioning and is enough to prove the fan-out — the
+    // supervised teardown itself is covered by `stop_tears_down_a_supervised_app_session`.
+    let project = TmpDir::new("all-proj");
+    let data = TmpDir::new("all-data");
+    let state = TmpDir::new("all-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[app.one]\n\
+         cmd = [\"sleep\", \"31341\"]\n\
+         [app.two]\n\
+         cmd = [\"sleep\", \"31342\"]\n",
+    )
+    .unwrap();
+
+    if !host_can_sandbox(project.path(), data.path(), state.path()) {
+        eprintln!("skipping ops stop --all e2e: host cannot sandbox");
+        return;
+    }
+    let trusted = ops_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Backstop: SIGKILL either agent if an assertion panics before `ops stop --all` runs (a detached
+    // daemon is reparented to init and cannot be reaped by the test).
+    let _cleanup = FingerprintCleanup(vec!["31341", "31342"]);
+
+    // Start two background sessions with `--detach`; each returns once its cage is ready, printing
+    // its session pid.
+    let mut pids = Vec::new();
+    for app in ["one", "two"] {
+        let started = ops_run(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["app", app, "--detach"],
+        );
+        assert!(
+            started.status.success(),
+            "ops app {app} --detach must exit 0: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let pid = parse_detach_pid(&started.stderr).unwrap_or_else(|| {
+            panic!(
+                "could not parse the detached session id from: {}",
+                String::from_utf8_lossy(&started.stderr)
+            )
+        });
+        pids.push(pid);
+    }
+
+    // Both agents are running before the stop.
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(30), || {
+            process_with_arg("31341") && process_with_arg("31342")
+        }),
+        "both detached agents should be running before `ops stop --all`"
+    );
+
+    // `ops ps` lists both sessions.
+    let ps = ops_run(project.path(), data.path(), state.path(), &["ps"]);
+    let listing = String::from_utf8_lossy(&ps.stdout);
+    for pid in &pids {
+        assert!(
+            listing.contains(&pid.to_string()),
+            "session {pid} should be listed before stop:\n{listing}"
+        );
+    }
+
+    // One command stops them all.
+    let stopped = ops_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["stop", "--all"],
+    );
+    assert!(
+        stopped.status.success(),
+        "ops stop --all must exit 0: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    // Neither cage is left running.
+    assert!(
+        wait_until(Instant::now() + Duration::from_secs(10), || {
+            !process_with_arg("31341") && !process_with_arg("31342")
+        }),
+        "`ops stop --all` left an agent running"
+    );
+
+    // And `ops ps` no longer lists either (records reaped).
+    let ps = ops_run(project.path(), data.path(), state.path(), &["ps"]);
+    let listing = String::from_utf8_lossy(&ps.stdout);
+    for pid in &pids {
+        assert!(
+            !listing.contains(&pid.to_string()),
+            "session {pid} still shows in `ops ps` after stop --all:\n{listing}"
+        );
+    }
 }
