@@ -28,6 +28,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// What kind of sandbox a record describes. Both are tracked: `ops run` is the
 /// autonomous-agent path (the sandboxes the registry most needs to surface) and
@@ -93,6 +94,18 @@ impl SessionRuntime {
     }
 }
 
+/// What [`Session::stop`] did to a session's process.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    /// Nothing was signalled: the process had already exited, or its pid had been
+    /// reused by a different incarnation (so signalling it would hit the wrong process).
+    AlreadyGone,
+    /// SIGTERM was enough — the process exited within the grace window.
+    Terminated,
+    /// The process outlived the grace window and was forced down with SIGKILL.
+    Killed,
+}
+
 /// One registered sandbox. The `(pid, start_ticks)` pair identifies the live
 /// process; `project` is the canonical project root (display and identity); `runtime` is the home
 /// it runs in, so `ops attach` can reproduce it.
@@ -132,6 +145,103 @@ impl Session {
     fn file_name(&self) -> String {
         format!("{}-{}", self.pid, self.start_ticks)
     }
+
+    /// A short label for display: the kind (`run`/`shell`) for a project session, or `app:<name>`
+    /// for an app — so a listing or a stop message tells agents apart from plain shells.
+    pub(crate) fn label(&self) -> String {
+        match &self.runtime {
+            SessionRuntime::Project => self.kind.as_str().to_string(),
+            SessionRuntime::GlobalApp(name) | SessionRuntime::ProjectApp(name) => {
+                format!("app:{name}")
+            }
+        }
+    }
+
+    /// Stop this session's process: SIGTERM, then SIGKILL if it has not exited within `grace`.
+    ///
+    /// Signalling goes through a **pidfd**, not a bare pid, for two reasons that matter here. A
+    /// pidfd pins one exact process: the pid is read once after opening to confirm it is the
+    /// incarnation we recorded (the same `(pid, start_ticks)` guard the registry uses), and from
+    /// then on the kernel cannot reuse that pid behind our back, so a stop can never signal an
+    /// unrelated process. And a pidfd becomes *readable* when its process terminates, so waiting
+    /// on it reports the exit cleanly — including the brief zombie window a plain liveness read
+    /// would still see as alive.
+    ///
+    /// Killing the recorded pid tears the whole cage down on both launch paths: it is bubblewrap
+    /// itself on the exec path (pid 1 of the cage's namespace), and the supervisor on the
+    /// allowlist path — where bubblewrap dies with its parent, taking the cage with it.
+    pub(crate) fn stop(&self, grace: Duration) -> StopOutcome {
+        let Some(pidfd) = open_pidfd(self.pid) else {
+            return StopOutcome::AlreadyGone;
+        };
+        // Confirm the pinned process is the one we recorded: the pid could have been reused
+        // between listing and the open. Once confirmed, the held fd keeps it pinned.
+        if read_start_ticks(self.pid) != Some(self.start_ticks) {
+            close_fd(pidfd);
+            return StopOutcome::AlreadyGone;
+        }
+        let outcome = stop_pinned(pidfd, grace);
+        close_fd(pidfd);
+        outcome
+    }
+}
+
+/// Open a pidfd for `pid`, or `None` if the process is already gone.
+fn open_pidfd(pid: u32) -> Option<libc::c_int> {
+    // SAFETY: `pidfd_open` only reads `pid`; it returns a new fd or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    (fd >= 0).then_some(fd as libc::c_int)
+}
+
+fn close_fd(fd: libc::c_int) {
+    // SAFETY: closing a fd we opened.
+    unsafe { libc::close(fd) };
+}
+
+/// Send `signal` to the process a pidfd pins. Returns whether the kernel accepted it (a failure
+/// means the process has already exited).
+fn send_signal(pidfd: libc::c_int, signal: libc::c_int) -> bool {
+    // SAFETY: `pidfd_send_signal` with a null `siginfo` sends `signal` as if by `kill`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    rc == 0
+}
+
+/// Wait up to `timeout` for the pinned process to terminate. A pidfd is readable once its process
+/// exits, so a positive poll means it is gone; returns `true` in that case.
+fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: polling one fd we own.
+    unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+}
+
+/// SIGTERM the pinned process, then SIGKILL it if it outlives `grace`. A `grace` of zero escalates
+/// immediately (SIGTERM, then SIGKILL with no wait).
+fn stop_pinned(pidfd: libc::c_int, grace: Duration) -> StopOutcome {
+    if !send_signal(pidfd, libc::SIGTERM) {
+        // It exited between the open and now.
+        return StopOutcome::AlreadyGone;
+    }
+    if wait_for_exit(pidfd, grace) {
+        return StopOutcome::Terminated;
+    }
+    // It did not go down in time. SIGKILL cannot be caught, so this is bounded; a SIGKILL on an
+    // already-exited process is harmless, so a late voluntary exit only confirms it is gone.
+    let _ = send_signal(pidfd, libc::SIGKILL);
+    wait_for_exit(pidfd, Duration::from_secs(5));
+    StopOutcome::Killed
 }
 
 /// The session registry rooted at `<data>/sessions`. Holds no I/O itself; each
@@ -217,6 +327,14 @@ impl Registry {
 
         live.sort_by(|a, b| a.project.cmp(&b.project).then(a.pid.cmp(&b.pid)));
         Ok((live, pruned))
+    }
+
+    /// Remove a specific session's record (best-effort), so a session just stopped disappears from
+    /// `ops ps` at once rather than lingering until liveness pruning catches it — which it would
+    /// not do immediately anyway while the killed process is still a zombie reading as alive. A
+    /// missing record is fine; liveness pruning remains the real cleanup.
+    pub(crate) fn reap(&self, session: &Session) {
+        let _ = std::fs::remove_file(self.dir.join(session.file_name()));
     }
 }
 
@@ -370,6 +488,44 @@ mod tests {
         }
     }
 
+    /// Spawn a quiet child process and build a [`Session`] that points at it, with its real start
+    /// time — so `stop` exercises the genuine pidfd signalling path against a live process.
+    fn spawn_session(cmd: &str, args: &[&str]) -> (std::process::Child, Session) {
+        let child = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id();
+        let start_ticks = read_start_ticks(pid).expect("read the child's start time");
+        let session = Session {
+            project: PathBuf::from("/test"),
+            pid,
+            start_ticks,
+            kind: Kind::Run,
+            runtime: SessionRuntime::Project,
+        };
+        (child, session)
+    }
+
+    /// Block until `pid`'s `comm` becomes `want`, so a test can wait for a shell to finish
+    /// `exec`ing into the program it launches (e.g. for an ignored-signal disposition to be in
+    /// place) before acting on it — making the test deterministic rather than racing startup.
+    fn wait_for_comm(pid: u32, want: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                if comm.trim() == want {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process {pid} never became `{want}`");
+    }
+
     #[test]
     fn record_round_trips_through_serialization() {
         // a path with a space, a newline and a non-UTF-8 byte must survive intact
@@ -480,6 +636,81 @@ mod tests {
 
         assert!(reg.list().unwrap().is_empty());
         assert!(!dir.path().join(dead.file_name()).exists());
+    }
+
+    #[test]
+    fn label_distinguishes_apps_from_plain_sessions() {
+        assert_eq!(session_at("/p", 1, 1, Kind::Run).label(), "run");
+        let mut s = session_at("/p", 1, 1, Kind::Shell);
+        assert_eq!(s.label(), "shell");
+        s.runtime = SessionRuntime::GlobalApp("claude".into());
+        assert_eq!(s.label(), "app:claude");
+        s.runtime = SessionRuntime::ProjectApp("agent".into());
+        assert_eq!(s.label(), "app:agent");
+    }
+
+    #[test]
+    fn stop_a_dead_pid_reports_already_gone() {
+        // A pid above the kernel's ceiling cannot exist: pidfd_open fails, so there is nothing to
+        // signal.
+        let s = session_at("/test", u32::MAX, 1, Kind::Run);
+        assert_eq!(s.stop(Duration::from_secs(5)), StopOutcome::AlreadyGone);
+    }
+
+    #[test]
+    fn stop_does_not_signal_a_reused_pid() {
+        // A record carrying *our own* live pid but the wrong start time describes a different
+        // incarnation. `stop` must refuse to signal it — returning AlreadyGone — rather than
+        // SIGTERM the running test process under that pid. This is the reuse guard that makes
+        // signalling safe; without it this test would terminate the whole run.
+        let mut s = session_at("/test", std::process::id(), 0, Kind::Run);
+        s.start_ticks = read_start_ticks(std::process::id())
+            .unwrap()
+            .wrapping_add(1);
+        assert_eq!(s.stop(Duration::from_secs(5)), StopOutcome::AlreadyGone);
+
+        // Sanity: with the correct start time the same pid reads as our live incarnation — proving
+        // the AlreadyGone above came from the start-time mismatch, not from the pid being absent.
+        s.start_ticks = read_start_ticks(std::process::id()).unwrap();
+        assert!(is_alive(&s));
+    }
+
+    #[test]
+    fn stop_terminates_a_live_process_with_sigterm() {
+        let (mut child, s) = spawn_session("sleep", &["30"]);
+        assert!(is_alive(&s));
+        assert_eq!(s.stop(Duration::from_secs(5)), StopOutcome::Terminated);
+        // Reap the zombie so the start-time check below sees the pid truly gone (a not-yet-reaped
+        // zombie still carries the recorded start time and would read as alive).
+        let _ = child.wait();
+        assert!(!is_alive(&s));
+    }
+
+    #[test]
+    fn stop_kills_a_process_that_ignores_sigterm() {
+        // `trap "" TERM` makes the shell ignore SIGTERM; `exec sleep` keeps that ignore (an ignored
+        // disposition survives execve), so the single recorded process cannot be terminated by
+        // SIGTERM and must be forced down with SIGKILL once the short grace window elapses.
+        let (mut child, s) = spawn_session("sh", &["-c", "trap '' TERM; exec sleep 30"]);
+        // Wait until the shell has exec'd into `sleep`: the `trap` runs before the `exec` in the
+        // script, so once `comm` is `sleep` the SIGTERM-ignore is guaranteed in place. Without this
+        // the stop could race the shell's startup and SIGTERM it before the trap is set.
+        wait_for_comm(s.pid, "sleep");
+        assert_eq!(s.stop(Duration::from_millis(300)), StopOutcome::Killed);
+        let _ = child.wait();
+        assert!(!is_alive(&s));
+    }
+
+    #[test]
+    fn reap_removes_a_specific_record() {
+        let dir = TmpDir::new();
+        let reg = Registry::at(dir.path());
+        let s =
+            Session::current(PathBuf::from("/w/p"), Kind::Run, SessionRuntime::Project).unwrap();
+        let path = reg.register(&s).unwrap();
+        assert!(path.exists());
+        reg.reap(&s);
+        assert!(!path.exists());
     }
 
     #[test]

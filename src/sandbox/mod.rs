@@ -32,7 +32,7 @@ pub(crate) use flake::{
     upgrade as upgrade_flake, withheld as withheld_flake_packages, FlakeUpgrade,
 };
 pub(crate) use launch::{
-    app, attach, effective_lock_target, gc, run, run_mise, shell, upgrade_mise_packages,
+    app, attach, effective_lock_target, gc, run, run_mise, shell, stop, upgrade_mise_packages,
 };
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 pub(crate) use proxy::nix_cache_hosts;

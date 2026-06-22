@@ -35,6 +35,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
 /// the engine, ops's store layout, the current directory, the resolved
@@ -865,6 +866,69 @@ pub(crate) fn attach(id: &str) -> ExitCode {
         }
         session::SessionRuntime::GlobalApp(name) => attach_app_shell(prep, &name, true),
         session::SessionRuntime::ProjectApp(name) => attach_app_shell(prep, &name, false),
+    }
+}
+
+/// `ops stop <id>...`: stop one or more running sessions by the pid `ops ps` shows. Each session is
+/// sent SIGTERM, then SIGKILL if it has not exited within `grace`. Targets are resolved through the
+/// same liveness-validated registry `attach` uses, so a stale or reused pid is never signalled.
+/// Reports each id and exits 2 if any id matched no live session, else 0.
+///
+/// Residuals (named, not fixed here), both because a signal terminates a supervisor without running
+/// its RAII drops:
+/// - the `network = "allowlist"` supervisor leaves its per-session egress socket and CA under
+///   `<data>/egress/` on disk — the same leak any crash or `SIGKILL` of that process already
+///   produces; a future sweep of stale egress artefacts (alongside the session housekeeping) is the
+///   clean fix.
+/// - stopping an `ops shell` session signals its pty supervisor, whose terminal-state restore is
+///   also a RAII guard, so the owner's terminal (where that `ops shell` runs) is left in raw mode
+///   and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is unaffected; this
+///   only bites the unusual case of stopping an interactive shell from another terminal.
+pub(crate) fn stop(ids: &[&str], grace: Duration) -> ExitCode {
+    let Some(layout) = crate::store::Layout::from_env() else {
+        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let registry = session::Registry::at(layout.data_dir());
+    let sessions = match registry.list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ops stop: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut any_missing = false;
+    for id in ids {
+        let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
+            eprintln!("ops stop: no live session '{id}' — run `ops ps` to list them.");
+            any_missing = true;
+            continue;
+        };
+        let label = target.label();
+        match target.stop(grace) {
+            session::StopOutcome::AlreadyGone => {
+                eprintln!("ops stop: session {id} ({label}) had already exited.");
+            }
+            session::StopOutcome::Terminated => {
+                eprintln!("ops stop: stopped session {id} ({label}).");
+            }
+            session::StopOutcome::Killed => {
+                eprintln!(
+                    "ops stop: session {id} ({label}) did not exit within {}s — sent SIGKILL.",
+                    grace.as_secs()
+                );
+            }
+        }
+        // It is down (or already was): drop its record now, so `ops ps` is clean immediately
+        // rather than waiting for the killed process to stop reading as a zombie.
+        registry.reap(target);
+    }
+
+    if any_missing {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

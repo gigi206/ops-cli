@@ -23,6 +23,7 @@ mod trust;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn main() -> ExitCode {
     // `args_os`, not `args`: a command run via `ops run` may carry non-UTF-8
@@ -33,6 +34,7 @@ fn main() -> ExitCode {
         Some("shell") => sandbox::shell(),
         Some("ps") => list_sessions(),
         Some("attach") => attach_cmd(args.collect()),
+        Some("stop") => stop_cmd(args.collect()),
         Some("trust") => trust_cmd(args.collect()),
         Some("untrust") => untrust_cmd(args.next()),
         Some("config") => config_cmd(),
@@ -54,7 +56,7 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!(
                 "ops: unknown command '{other}' (known: doctor, shell, run, mise, app, \
-                 search, test, plugins, ps, attach, trust, untrust, config, upgrade, gc)"
+                 search, test, plugins, ps, attach, stop, trust, untrust, config, upgrade, gc)"
             );
             ExitCode::from(2)
         }
@@ -63,7 +65,8 @@ fn main() -> ExitCode {
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
                  app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
                  plugins <list|info|install|rm|store> | \
-                 ps | attach <id> | trust [path] | untrust [path] | config | \
+                 ps | attach <id> | stop <id>... [--delay <secs>] | trust [path] | \
+                 untrust [path] | config | \
                  upgrade [all|nix|mise|flake] | gc [--all] [--prune]>"
             );
             ExitCode::from(2)
@@ -317,18 +320,11 @@ fn list_sessions() -> ExitCode {
             }
             _ => "?".to_string(),
         };
-        // An app session shows its app name, so the user can tell which sessions are agents (and
-        // that `ops attach` will drop them into that app's isolated home).
-        let kind = match &s.runtime {
-            session::SessionRuntime::Project => s.kind.as_str().to_string(),
-            session::SessionRuntime::GlobalApp(name)
-            | session::SessionRuntime::ProjectApp(name) => {
-                format!("app:{name}")
-            }
-        };
+        // An app session shows its app name (`app:<name>`), so the user can tell which sessions are
+        // agents — and that `ops attach`/`ops stop` act on that app's isolated environment.
         println!(
             "{:<14}  {:>8}  {:>8}  {}",
-            kind,
+            s.label(),
             s.pid,
             age,
             s.project.display()
@@ -346,6 +342,52 @@ fn attach_cmd(args: Vec<OsString>) -> ExitCode {
         return ExitCode::from(2);
     };
     sandbox::attach(id)
+}
+
+/// The default grace period between SIGTERM and SIGKILL for `ops stop`: long enough for an agent to
+/// finish writing and shut down cleanly, short enough not to hang. `--delay` overrides it.
+const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
+
+/// `ops stop <id>... [--delay <secs>]`: stop running sessions by the pid `ops ps` shows. Sends
+/// SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once). At
+/// least one id is required; a non-UTF-8 operand or a malformed `--delay` value is a usage error.
+fn stop_cmd(args: Vec<OsString>) -> ExitCode {
+    let mut delay = STOP_DEFAULT_DELAY;
+    let mut ids: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--delay") => {
+                let Some(value) = it.next() else {
+                    eprintln!("ops: --delay needs a value in seconds (e.g. --delay 10).");
+                    return ExitCode::from(2);
+                };
+                match value.to_str().and_then(|v| v.parse::<u64>().ok()) {
+                    Some(secs) => delay = Duration::from_secs(secs),
+                    None => {
+                        eprintln!(
+                            "ops: --delay must be a whole number of seconds, not '{}'.",
+                            value.to_string_lossy()
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            Some(id) => ids.push(id.to_string()),
+            None => {
+                eprintln!("ops: stop ids must be valid text (the PID shown by `ops ps`).");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if ids.is_empty() {
+        eprintln!(
+            "ops: usage: ops stop <id>... [--delay <secs>]   (ids are the PIDs shown by `ops ps`)"
+        );
+        return ExitCode::from(2);
+    }
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sandbox::stop(&id_refs, delay)
 }
 
 /// The config path an `ops trust`/`untrust` invocation targets: the given path,
