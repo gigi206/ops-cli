@@ -642,6 +642,56 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   `aionui` *needs* the GUI hole** (Electron/AppImage-in-cage, heavy/unproven). So the user **acted the
   GUI/Wayland track closed here** — primitive + fonts + composition delivered as infra; heavy desktop
   packaging deferred until a concrete need (grounded-not-guessed). See [[ops-app-framework]].
+  **`[packages]` freshness roll-forward (mise: + flake:) — DONE (2026-06-22)**
+  (`src/sandbox/flake.rs` [new] + `launch.rs` + `binds.rs` + `config/mod.rs` + `mod.rs` + `main.rs`
+  + `tests/{run,upgrade}.rs`): `ops upgrade` now advances the two non-nix `[packages]` backends,
+  which both **froze at their first-launch version** (the "named, not built" gap from the
+  backend-prefix slice). **(1) `mise:` (8 of 9 profiles — the value centre, advisor-reframed from
+  difficulty to value)** — spike (mise's own help) settled it: `mise use -g <bare token>` writes
+  `latest` (fuzzy; ops sets no `MISE_PIN`), so the config IS mise's lock and **no ops-side lock is
+  needed**; the *freeze* is the installed version, so a roll **must run `mise upgrade`** (it fetches,
+  unlike the pure host-side lock rewrites). `ops upgrade mise` runs `mise upgrade` **in-cage**, **per
+  home** — the project baseline (default home) and **each app** (its own home, by `home_scope`),
+  generic over `mise_package_groups` (no app special-cased), reusing `wrap_mise_equip(verb="upgrade")`
+  through `build()` + a fork-and-wait `run_status` (extracted from `run_supervised`, since N groups
+  run sequentially). The fetch rides the app's egress allowlist; trusted-only (an untrusted project's
+  `mise:` is **withheld and named**, not silent — advisor parity); `network = "none"` skips a group;
+  **best-effort** when the host can't sandbox. **Semantic recorded + tested:** a baseline `mise:` tool
+  is equipped in *every* app home too (an app's cage equips baseline + overlay), so it rolls in N+1
+  homes (profiles put `mise:` in app overlays, so baseline is usually empty). **Advisor-caught
+  regression fixed:** groups are computed from the already-loaded config **before** any `prepare()`,
+  so `ops upgrade nix`/`all` keeps its cheap, sandbox-free path (a first cut paid a full `prepare()`
+  — and crashed with a userns error — even with no `mise:` package). **(2) `flake:` (hermes + future)**
+  — a **per-project `flake-packages.lock`** (NOT `flake.lock` — collision with nix's own), keyed by
+  the *declared* ref: `nix flake metadata <base> --json` (spiked: `.revision` + `.url`; `.url`'s
+  `?narHash=…` plus an appended `#<attr>` evals fine) yields `(rev, locked_ref)`; `ops upgrade flake`
+  rewrites the lock (pin/roll/prune, best-effort per ref, atomic temp+rename, self-healing reads). A
+  launch **consults the lock**: a pinned package builds the **locked immutable ref** into an out-link
+  **keyed by the rev** (`flake_out_link_rev`, `<name>-<rev>`), so a re-pin — a rev-keyed path that
+  does not yet exist — **rebuilds at the next launch with no home enumerated** (the host-side lock
+  rewrite is the whole roll); an unpinned package floats (v1 unchanged; the lock read is skipped when
+  there is no flake package). Generic over `declared_refs` (baseline + all apps, deduped,
+  trusted-only). `ops upgrade [all|nix|mise|flake]`. `Resolved`/`ResolvedApp` gained `Clone` (no
+  cascade — contained types are already `Clone`) for the per-group/per-ref merges.
+  **Advisor-reviewed (plan AND impl)** — slice 1: caught the `prepare()` regression + the untrusted
+  "no packages" lie (both fixed); slice 2: caught that **no test executed the *locked* launch path**
+  (the `Some(pin)` branch + the narHash ref built in-cage through the allowlist — my own
+  "build-succeeded-anyway" trap), closed by the committed e2e
+  `a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link` (**ran live, 56s**: pin →
+  in-cage narHash build through the empty-netns MITM → `Hello, world!` in `hello-<rev>`, not the
+  floating `hello`). **Proven live + committed e2es:** `ops_upgrade_mise_rolls_a_mise_package_in_cage`
+  (the upgrade cage equips the `rg` shim into the project home — teeth: probe runs an *empty* project,
+  so only the upgrade could place it), `upgrade_flake_pins_and_locks_a_declared_flake_package` (pin +
+  lock + idempotent "unchanged"), the locked-flake e2e above; + units (mise grouping; flake
+  `declared_refs`/`split_attr`/`is_rev`/lock round-trip+self-heal; both report summaries; the
+  rev-keyed out-link distinctness = the advisor's load-bearing property b). Full regression green
+  (unit ~500 + config 40 + upgrade 3 + run.rs 25 + shell 1), fmt/clippy clean, musl inherited
+  (std-only; no new dep). **Named residuals (advisor, deferred):** stale rev-keyed out-links
+  accumulate (each roll A→B leaves `<name>-A` + its closure) → **M5-GC class** (re-seed/GC heals,
+  same-tenant disk only); `ops config` does not show a flake's pinned rev (minor parity, would read
+  the lock network-free). The two slices share the `Clone` derive + the upgrade dispatch + re-exports
+  + test helpers, so they shipped as **one cohesive commit** (the message delineates both). See
+  [[ops-mise-passthrough]], [[ubi-backend-deprecated]], [[ops-app-framework]].
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped
