@@ -400,14 +400,35 @@ fn build(
         flake_pairs.push((reference.clone(), out_link));
     }
 
+    // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
+    // rather than boxes. Provisioned here — before the seed — so its store roots join the
+    // project store and the cage reads the fonts through `/nix`. Best-effort, like the display
+    // socket below: a font fetch that fails (no network on a first launch) warns and the app
+    // runs without fonts rather than failing the launch.
+    let font_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        match super::fonts::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(layer) => Some(layer),
+            Err(e) => {
+                eprintln!(
+                    "ops: warning: gui = \"wayland\" but the font set could not be provisioned \
+                     ({e}) — text may not render"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
+
     // Seed the project's own writable store with the closure of everything the cage
-    // resolves through `/nix` — the base userland plus every provisioned tool — then
-    // back `/nix` with it read-write. The cage reads and writes only its own store, so
-    // an agent that installs a toolchain writes into the project's copy and the shared
-    // store is never in the cage. Which store backs `/nix` is ops's decision, not a
-    // configurable field, so an untrusted project cannot keep the shared store mounted
-    // or widen its access.
-    let project_store = match seed_project_store(prep, &packages.roots, &tools.roots) {
+    // resolves through `/nix` — the base userland, every provisioned tool, and (under the
+    // GUI hole) the fonts — then back `/nix` with it read-write. The cage reads and writes
+    // only its own store, so an agent that installs a toolchain writes into the project's
+    // copy and the shared store is never in the cage. Which store backs `/nix` is ops's
+    // decision, not a configurable field, so an untrusted project cannot keep the shared
+    // store mounted or widen its access.
+    let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, font_roots) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ops: cannot prepare the project's store: {e}");
@@ -550,6 +571,76 @@ fn build(
         egress_guard = Some(guard);
     }
 
+    // GUI hole: under `gui = "wayland"`, bind the host's Wayland compositor socket read-only so a
+    // graphical app can map a window. The cage runs same-uid, so a read-only bind suffices to
+    // connect(). Only the socket *file* is bound, never `$XDG_RUNTIME_DIR` itself — that directory
+    // also holds the dbus session bus, pulse, and the gpg/ssh agents, which binding the directory
+    // would hand to the cage. Best-effort: with no compositor socket found, warn and run without
+    // it (the app fails on its own) — not binding is the fail-closed direction for a display hole.
+    // The cage env (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) is fixed here by ops; an untrusted
+    // `[env]` could only mispoint a client at a nonexistent socket (self-DoS), never redirect the
+    // bind, whose source path is set by ops — so these keys need no denylist entry.
+    let mut gui_binds: Vec<binds::ExtraBind> = Vec::new();
+    let mut gui_env: Vec<(String, String)> = Vec::new();
+    if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        let display = std::env::var("WAYLAND_DISPLAY").ok();
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+        match resolve_wayland_hole(display.as_deref(), runtime_dir.as_deref()) {
+            Ok((socket, env)) if socket.exists() => {
+                gui_binds.push(binds::ExtraBind {
+                    src: socket.clone(),
+                    dest: socket,
+                    writable: false,
+                });
+                gui_env = env;
+            }
+            Ok((socket, _)) => eprintln!(
+                "ops: warning: gui = \"wayland\" but the compositor socket {} does not exist — \
+                 running without a display",
+                socket.display()
+            ),
+            Err(reason) => eprintln!(
+                "ops: warning: gui = \"wayland\" but {reason} — running without a display"
+            ),
+        }
+
+        // Fonts: bind the generated fontconfig configuration read-only and name it to the
+        // cage's fontconfig. The font *files* were provisioned and seeded above; this points
+        // fontconfig at them so text renders rather than boxes. Independent of the socket
+        // above (a missing display already warned; the fonts are harmless either way) and
+        // best-effort (a staging failure warns, the app runs without fonts). `FONTCONFIG_FILE`
+        // is fixed by ops; a project `[env]` could override it (highest precedence), but that
+        // only re-points the agent's own in-cage fontconfig at its own config — self-sabotage,
+        // not an escape (it already controls what runs in the cage) — so the key needs no
+        // denylist entry, exactly like `WAYLAND_DISPLAY`.
+        if let Some(layer) = &font_layer {
+            let conf = super::fonts::fonts_conf_for(layer);
+            match super::fonts::stage(prep.layout.data_dir(), &conf) {
+                Ok(path) => {
+                    gui_binds.push(binds::ExtraBind {
+                        src: path,
+                        dest: PathBuf::from(super::fonts::FONTS_CONF_INCAGE),
+                        writable: false,
+                    });
+                    gui_env.push((
+                        "FONTCONFIG_FILE".to_string(),
+                        super::fonts::FONTS_CONF_INCAGE.to_string(),
+                    ));
+                }
+                Err(e) => eprintln!(
+                    "ops: warning: gui = \"wayland\" but the font configuration could not be \
+                     staged ({e}) — text may not render"
+                ),
+            }
+        }
+    }
+
+    // The launcher's extra binds, emitted after the structural mounts: the egress machinery
+    // (socket + CA) and the GUI socket. Their destinations are ops's or the host's, never a
+    // project path, so they neither shadow nor are shadowed by a structural mount.
+    let mut extra_binds = egress_binds;
+    extra_binds.extend(gui_binds);
+
     // Environment, lowest precedence first: host passthrough, then ops's hermetic CA bundle,
     // then a trusted project's mise `[env]`, then the egress machinery (proxy + CA), then the
     // `.ops.toml` `[env]` (the ops-native config has the final say). The structural
@@ -560,6 +651,7 @@ fn build(
     let extra_env = extra_cage_env(
         passthrough_env(),
         binds::cacert_env(),
+        gui_env,
         autoequip_env,
         mise_env(prep)?,
         egress_env,
@@ -578,7 +670,7 @@ fn build(
         &prep.userland,
         &nix_mount,
         &overlay,
-        &egress_binds,
+        &extra_binds,
         net_policy(&prep.cfg.network),
         cmd,
     )
@@ -604,6 +696,41 @@ fn net_policy(network: &crate::config::NetworkPolicy) -> NetPolicy {
     }
 }
 
+/// Resolve the host's Wayland compositor socket and the cage environment that points a
+/// graphical app at it, from the host `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`. Pure: the impure
+/// existence check and the bind are the caller's, so the path/env computation is unit-tested.
+///
+/// Per the Wayland convention an absolute `WAYLAND_DISPLAY` is the socket path verbatim;
+/// otherwise it is a name resolved under `XDG_RUNTIME_DIR`. The returned path is always the
+/// socket **file** — never the runtime directory, which also holds the dbus session bus, pulse,
+/// and the gpg/ssh agents; the caller binds exactly this file read-only, so none of those is
+/// exposed (the whole point of gating the GUI hole trusted-only). The returned env carries
+/// `WAYLAND_DISPLAY` and, when known, `XDG_RUNTIME_DIR`, so the in-cage client finds the same
+/// socket at the same path (the cage runs same-uid, so a read-only bind is enough to connect).
+fn resolve_wayland_hole(
+    display: Option<&str>,
+    runtime_dir: Option<&str>,
+) -> Result<(PathBuf, Vec<(String, String)>), String> {
+    let display = display.ok_or("WAYLAND_DISPLAY is unset")?;
+    if display.is_empty() {
+        return Err("WAYLAND_DISPLAY is empty".to_string());
+    }
+    let mut env = vec![("WAYLAND_DISPLAY".to_string(), display.to_string())];
+    if Path::new(display).is_absolute() {
+        // An absolute display is the socket path itself; XDG_RUNTIME_DIR is not needed to
+        // locate it, but pass it through when set (some clients still read it).
+        if let Some(dir) = runtime_dir {
+            env.push(("XDG_RUNTIME_DIR".to_string(), dir.to_string()));
+        }
+        Ok((PathBuf::from(display), env))
+    } else {
+        let dir =
+            runtime_dir.ok_or("XDG_RUNTIME_DIR is unset (needed to locate the Wayland socket)")?;
+        env.push(("XDG_RUNTIME_DIR".to_string(), dir.to_string()));
+        Ok((Path::new(dir).join(display), env))
+    }
+}
+
 /// Seed (or top up) the project's own writable store with the closure of everything
 /// the cage reads through `/nix`: the base userland, the native `[packages]`, and the
 /// `nix:` tools. The roots are collected from the provisioners and handed as the single
@@ -613,25 +740,28 @@ fn seed_project_store(
     prep: &Prepared,
     pkg_roots: &[PathBuf],
     tool_roots: &[PathBuf],
+    font_roots: &[PathBuf],
 ) -> io::Result<super::projectstore::ProjectStore> {
     let id = binds::project_runtime_id(&prep.cwd)?;
-    let roots = collect_roots(&prep.userland, pkg_roots, tool_roots);
+    let roots = collect_roots(&prep.userland, pkg_roots, tool_roots, font_roots);
     super::projectstore::prepare(&prep.nix_store, &prep.layout, &id, &roots)
 }
 
 /// The complete set of logical store roots the cage resolves through `/nix`: the base
-/// userland's roots, then the native `[packages]`, then the `nix:` tools. Collected
-/// from the provisioners (never reconstructed by stripping sub-paths), so the seed
-/// carries every closure the cage needs — a forgotten source would silently make the
-/// cage re-fetch it. Pure, so the collection is unit-tested.
+/// userland's roots, then the native `[packages]`, the `nix:` tools, and (under the GUI
+/// hole) the fonts. Collected from the provisioners (never reconstructed by stripping
+/// sub-paths), so the seed carries every closure the cage needs — a forgotten source would
+/// silently make the cage re-fetch it. Pure, so the collection is unit-tested.
 fn collect_roots(
     userland: &Userland,
     pkg_roots: &[PathBuf],
     tool_roots: &[PathBuf],
+    font_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut roots = userland.base_roots.clone();
     roots.extend(pkg_roots.iter().cloned());
     roots.extend(tool_roots.iter().cloned());
+    roots.extend(font_roots.iter().cloned());
     roots
 }
 
@@ -1126,17 +1256,19 @@ fn passthrough_env() -> Vec<(String, String)> {
 }
 
 /// Layer the cage's extra environment, lowest precedence first: host passthrough, then ops's
-/// hermetic CA bundle, then the non-`nix:` auto-equip variable, then a trusted project's mise
-/// `[env]`, then the egress machinery, then the `.ops.toml` `[env]`. The assembler upserts
-/// these over the structural defaults and takes the last occurrence of a key, so a later layer
-/// wins: the egress proxy's per-session CA overrides the structural cacert under an allowlist,
-/// and a trusted config has the final say (self-harm only). The CA bundle sits above
-/// passthrough on purpose — passthrough is a separate channel, not filtered by the
+/// hermetic CA bundle, then the Wayland GUI hole, then the non-`nix:` auto-equip variable, then a
+/// trusted project's mise `[env]`, then the egress machinery, then the `.ops.toml` `[env]`. The
+/// assembler upserts these over the structural defaults and takes the last occurrence of a key,
+/// so a later layer wins: the egress proxy's per-session CA overrides the structural cacert under
+/// an allowlist, and a trusted config has the final say (self-harm only). The CA bundle sits
+/// above passthrough on purpose — passthrough is a separate channel, not filtered by the
 /// untrusted-config denylist, so a host CA variable could otherwise clobber ops's hermetic
-/// bundle.
+/// bundle. The GUI keys (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) collide with nothing else, so their
+/// position is immaterial; they sit here for a single, documented precedence order.
 fn extra_cage_env(
     passthrough: Vec<(String, String)>,
     cacert: Vec<(String, String)>,
+    gui: Vec<(String, String)>,
     autoequip: Vec<(String, String)>,
     mise: Vec<(String, String)>,
     egress: Vec<(String, String)>,
@@ -1144,6 +1276,7 @@ fn extra_cage_env(
 ) -> Vec<(String, String)> {
     let mut env = passthrough;
     env.extend(cacert);
+    env.extend(gui);
     env.extend(autoequip);
     env.extend(mise);
     env.extend(egress);
@@ -1175,6 +1308,7 @@ mod tests {
             nixpkgs_project: project.map(String::from),
             mise: None,
             network: crate::config::NetworkPolicy::default(),
+            gui: crate::config::GuiPolicy::default(),
             secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -1244,9 +1378,9 @@ mod tests {
     }
 
     #[test]
-    fn collect_roots_unions_base_then_packages_then_tools() {
+    fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
         // The seed's completeness rides on this collection: every provisioner's roots
-        // must reach it. The order is base, then packages, then tools.
+        // must reach it. The order is base, then packages, then tools, then fonts.
         let userland = Userland {
             base_roots: vec![
                 PathBuf::from("/nix/store/glibc"),
@@ -1266,25 +1400,28 @@ mod tests {
         };
         let pkg_roots = [PathBuf::from("/nix/store/jq")];
         let tool_roots = [PathBuf::from("/nix/store/nodejs")];
+        let font_roots = [PathBuf::from("/nix/store/dejavu")];
 
         assert_eq!(
-            collect_roots(&userland, &pkg_roots, &tool_roots),
+            collect_roots(&userland, &pkg_roots, &tool_roots, &font_roots),
             vec![
                 PathBuf::from("/nix/store/glibc"),
                 PathBuf::from("/nix/store/bash"),
                 PathBuf::from("/nix/store/jq"),
                 PathBuf::from("/nix/store/nodejs"),
+                PathBuf::from("/nix/store/dejavu"),
             ]
         );
 
         // teeth: dropping a source loses exactly its roots — a launch that forgot to
-        // forward the tools' (or packages') roots would seed an incomplete closure, and
-        // the cage would silently re-fetch the missing one.
-        assert!(!collect_roots(&userland, &pkg_roots, &[])
+        // forward the tools' (or packages', or fonts') roots would seed an incomplete
+        // closure, and the cage would silently re-fetch the missing one.
+        assert!(!collect_roots(&userland, &pkg_roots, &[], &font_roots)
             .contains(&PathBuf::from("/nix/store/nodejs")));
-        assert!(
-            !collect_roots(&userland, &[], &tool_roots).contains(&PathBuf::from("/nix/store/jq"))
-        );
+        assert!(!collect_roots(&userland, &[], &tool_roots, &font_roots)
+            .contains(&PathBuf::from("/nix/store/jq")));
+        assert!(!collect_roots(&userland, &pkg_roots, &tool_roots, &[])
+            .contains(&PathBuf::from("/nix/store/dejavu")));
     }
 
     #[test]
@@ -1305,7 +1442,15 @@ mod tests {
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
         let egress = vec![("SSL_CERT_FILE".into(), "/opt/ops/egress-ca.pem".into())];
-        let env = extra_cage_env(vec![], cacert.clone(), vec![], vec![], egress.clone(), &[]);
+        let env = extra_cage_env(
+            vec![],
+            cacert.clone(),
+            vec![],
+            vec![],
+            vec![],
+            egress.clone(),
+            &[],
+        );
         assert_eq!(
             winner(&env).as_deref(),
             Some("/opt/ops/egress-ca.pem"),
@@ -1313,7 +1458,7 @@ mod tests {
         );
 
         let cfg = vec![("SSL_CERT_FILE".into(), "/cfg/ca.pem".into())];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], egress, &cfg);
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], egress, &cfg);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/cfg/ca.pem"),
@@ -1325,7 +1470,7 @@ mod tests {
             "SSL_CERT_FILE".into(),
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], &[]);
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], vec![], &[]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/etc/ssl/certs/ca-bundle.crt"),
@@ -1496,6 +1641,38 @@ mod tests {
             )),
             NetPolicy::Isolated
         );
+    }
+
+    #[test]
+    fn resolve_wayland_hole_binds_the_socket_file_never_the_runtime_dir() {
+        // The load-bearing invariant of the GUI hole: a relative display resolves under
+        // XDG_RUNTIME_DIR to the socket *file*, never the runtime directory — which also holds the
+        // dbus session bus, pulse, and the gpg/ssh agents a directory bind would leak.
+        let (socket, env) =
+            resolve_wayland_hole(Some("wayland-0"), Some("/run/user/1000")).unwrap();
+        assert_eq!(socket, PathBuf::from("/run/user/1000/wayland-0"));
+        assert_ne!(
+            socket,
+            PathBuf::from("/run/user/1000"),
+            "the bind target must be the socket file, never the runtime directory"
+        );
+        assert_eq!(socket.file_name().unwrap(), "wayland-0");
+        assert!(env.contains(&("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string())));
+        assert!(env.contains(&("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())));
+
+        // An absolute display is the socket path verbatim (XDG_RUNTIME_DIR is not needed to
+        // locate it, per the Wayland convention).
+        let (socket, env) =
+            resolve_wayland_hole(Some("/tmp/wl.sock"), Some("/run/user/1000")).unwrap();
+        assert_eq!(socket, PathBuf::from("/tmp/wl.sock"));
+        assert!(env.contains(&("WAYLAND_DISPLAY".to_string(), "/tmp/wl.sock".to_string())));
+
+        // No display, an empty display, or a relative display with no runtime dir cannot be
+        // located → error, so the caller warns and runs without a display (fail-closed — it
+        // never binds a wrong or guessed path).
+        assert!(resolve_wayland_hole(None, Some("/run/user/1000")).is_err());
+        assert!(resolve_wayland_hole(Some(""), Some("/run/user/1000")).is_err());
+        assert!(resolve_wayland_hole(Some("wayland-0"), None).is_err());
     }
 
     #[test]

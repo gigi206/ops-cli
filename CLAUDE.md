@@ -547,6 +547,101 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   never the assistant's. **Next non-desktop CLIs:** the BYOK/account CLI space this facade reaches is
   largely covered; what remains is the **GUI/Wayland** desktop class (the user's deferred track). See
   [[ops-app-framework]], [[ubi-backend-deprecated]].
+  **GUI/Wayland — Slice A: the `gui = "wayland"` security field (DONE 2026-06-22)** (`src/config/
+  schema.rs` + `config/mod.rs` + `sandbox/launch.rs` + `main.rs` + `tests/run.rs`; spike
+  `docs/bwrap-gui-wayland-spike-2026-06-22.md`, threat-model §5a): the desktop-app track opened with
+  its **primitive** — a `gui` field that is the **exact mirror of `network`**, a security posture
+  gated **trusted/global-only**. `"none"` (default) | `"wayland"` (X11 never offered — the spike's
+  protocol enumeration showed Wayland-under-Mutter advertises none of screencopy/virtual-keyboard/
+  data-control, the basis for "Wayland never X11"). `GuiPolicy` (config-side enum, `validate_gui`),
+  `Resolved.gui`/`ResolvedApp.gui`, `merge_app` precedence, gated in `resolve`/`resolve_app` exactly
+  like `network` (an untrusted project can **neither open nor close/override** a display — baseline
+  AND app-level, the flagship property both directions unit-tested, incl. `a_global_apps_gui_survives_
+  an_untrusted_projects_override_attempt`). **The cage hole** (`launch::resolve_wayland_hole` + the
+  `build` gui block): a **read-only bind of the socket FILE** (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`,
+  never `$XDG_RUNTIME_DIR` itself — it holds dbus/pulse/agents), same-uid so ro `connect()` works;
+  env `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`; **best-effort** (socket absent → warn + run without =
+  fail-closed-by-not-binding); `/dev/dri`/dbus/pulse/X11 **not** exposed (each a separate later
+  opt-in hole). Chromium/Electron flags (`--no-sandbox --ozone-platform=wayland --disable-gpu
+  --disable-dev-shm-usage`) are **app argv** (profile `cmd`), not hole state — the spike proved a
+  real Chromium renderer **survives the M4.1 seccomp cage** (its own SUID/userns/ptrace sandbox is
+  blocked → `--no-sandbox` mandatory and acceptable: bwrap+seccomp+empty-netns **is** the boundary)
+  and a top-level window **maps** on Mutter. `ops config` shows `gui: wayland (exposure depends on
+  your compositor)`. **566 tests green** (schema parse + 6 config gating/flagship + a launch unit
+  **with teeth** [the hole binds the socket *file*, asserts `!= the runtime dir`, `file_name ==
+  wayland-0`] + the **live e2e** `a_gui_wayland_launch_connects_to_the_host_compositor` — under
+  `network = "none"` a trusted `gui = "wayland"` project runs `wayland-info` → exit 0 + `wl_compositor`;
+  the netns is empty so a successful connect can **only** be the bound socket), fmt/clippy clean,
+  **musl static verified**, advisor-reviewed (plan AND impl). **Honest scope — this is the primitive,
+  not yet a usable GUI app** (two deliberate incompletes, same class, no regression — posed only under
+  `gui = "wayland"`): (1) **gui + `network = "allowlist"` is untested** — the real desktop-agent target
+  (GUI **+** filtered egress, both stacking `ExtraBind`s); the code is trivially correct (disjoint
+  dests, local IPC in the empty netns) but **unproven** → Slice C. (2) **`XDG_RUNTIME_DIR` points at a
+  read-only dir** (bwrap auto-creates `/run/user/<uid>` on the ro rootfs to host the socket bind), so a
+  toolkit wanting to write `$XDG_RUNTIME_DIR/<app>` fails — same class as fonts. **Residuals**
+  (threat-model §5a): clipboard (`wl_data_device`, focus-bounded), **compositor-dependent** isolation
+  (Mutter safe; wlroots/sway/hyprland *would* expose screencopy + input-injection to ordinary clients),
+  and **fonts** (the cage renders boxes without them) → **Slice B (next): font + fontconfig provisioning
+  by the hole** (the spike's §4 — a font package has no `bin/` so it **cannot** ride `[packages]`; the
+  hole provisions fontconfig + a base font like the base userland, and generates a `fonts.conf` via
+  `FONTCONFIG_FILE`). Slice C = a real desktop agent profile (a concrete Electron target + packaging +
+  credential, and the gui+allowlist proof). See [[ops-app-framework]].
+  **GUI/Wayland — Slice B (fonts) + Slice C1 (composition) DONE; track ACTED CLOSED (2026-06-22)**
+  (`src/sandbox/fonts.rs` + `mod.rs` + `launch.rs` + `tests/run.rs`; threat-model §5a). **Slice B —
+  font/fontconfig provisioning by the hole:** a fontless cage renders boxes, and a font package has no
+  `bin/` so it **cannot** ride `[packages]` — the hole provisions it directly (like the base userland).
+  `fonts::provision` realises DejaVu into ops's store (gcroot **keyed by revision** `<data>/gcroots/gui/
+  <rev>/`, marker = a **directory** `share/fonts`, not a bin); its roots join `collect_roots`/
+  `seed_project_store` so the cage reads them through `/nix`. `fonts_conf` generates a **self-contained**
+  fontconfig XML (a `<dir>` per font dir, `<cachedir>` on the cage tmpfs `/tmp/.ops-fontconfig`, 3
+  generic-family aliases → DejaVu; every interpolated value ops-controlled → no XML escaping), staged
+  **content-keyed + atomic** (`stage`, mirrors `miseplugin`), bound ro at `/opt/ops/fonts.conf` and named
+  via `FONTCONFIG_FILE`. **Best-effort** like the socket (provision/stage failure → warn, run without).
+  **Parity with Slice A:** `FONTCONFIG_FILE` is fixed by ops; an untrusted `[env]` override only
+  re-points the agent's own in-cage fontconfig (self-sabotage, not an escape) → no denylist entry.
+  **Scope boundary:** the hole supplies the font *files* + the *configuration*; the fontconfig
+  **library** is the app's own (a nix-packaged app's closure; the e2e brings it via `[packages]
+  fontconfig`). e2e `a_gui_wayland_launch_provisions_fonts_the_cage_can_find` (ran live): under
+  `network = "none"`, `fc-list` lists the **DejaVu store path** — a hermetic cage has no `/etc/fonts`, so
+  the store path appears only because the hole seeded the fonts **and** the generated config's `<dir>`
+  names them. **Slice C1 — the gui + `network = "allowlist"` composition proof** (the residual Slice A
+  named): proven to need **no new production code** — `gui_binds`/`gui_env` and `egress_binds`/`egress_env`
+  are disjoint and coexist as wired (the Wayland UDS connects inside the empty netns the allowlist imposes,
+  local IPC needing no route). e2e `a_gui_wayland_launch_composes_with_a_network_allowlist` (ran live): a
+  **single** `ops run` under both holes emits four co-located markers — `wayland-info` → `wl_compositor`,
+  `fc-list` → DejaVu, allowed host → known hash, **denied host → `403`** (under `shared` it would be a
+  404, so the 403 proves the allowlist enforces *and* catches a silent trust fallback). **The compose
+  tooth = the denied-403 AND the wl_compositor enumeration in the *same* run** (split, they would only
+  re-prove Slice A + 6.2d). **Honest scope:** proven = **coexistence** (disjoint binds/env, UDS in the
+  empty netns, filtered egress + fonts with the display open); **not** proven = a real desktop **app**, the
+  **writable `XDG_RUNTIME_DIR`**, and **compositor-independence** (this is Mutter).
+  **Real rendering — PROVEN LIVE 2026-06-22** (the advisor-named gap, the user's "rendu réel" before
+  compacting): the fonts don't just list, they **rasterize**. A headless **Chromium** (the desktop-agent
+  class engine — the spike proved it runs in the cage with `--no-sandbox`) renders a black `Hello` on
+  white to a `--screenshot`, measured by ImageMagick (`%[fx:minima]`/`standard_deviation`): under
+  `gui = "wayland"` the hole's DejaVu is present → darkest pixel **0**, std **0.091** (glyphs drawn);
+  the **control** `gui = "none"` (no font) renders the *same* page **perfectly blank** → darkest pixel
+  **1**, std **0**. The only delta is the font hole → the hole's fonts are what produce rendered text
+  (the spike's HarfBuzz `glyph_count: 0` failure, closed). **Heavy live proof, NOT a committed e2e** —
+  Chromium re-provisions on every fresh-TmpDir suite run (minutes), so a per-run test is impractical,
+  exactly like the in-cage flake build; documented as proven-live. The per-run fonts guard stays the
+  Slice B `fc-list` e2e. (The `fc-list`-in-the-render-smoke red herring: it showed `0` only because the
+  smoke's `[packages]` omitted `fontconfig`, so `fc-list` wasn't on PATH — Chromium reads
+  `FONTCONFIG_FILE` via its own libfontconfig, which the rendering asymmetry confirms.)
+  **570 tests green** (1 net-new composition e2e over Slice B; *one config network test degraded to
+  skip-not-fail this run* — a transient nix `git-2.42.2` substitution hiccup, not a failure), fmt/clippy
+  clean, **musl inherited** (C1 = test + doc, zero production-code change → the Slice-B musl verification
+  stands), advisor-reviewed (plan AND impl — Slice B impl review caught the egress-flake-fix-as-separate-
+  commit discipline; C1 impl review confirmed both markers catch a trust fallback). **Slice B also fixed a
+  pre-existing test flake** (own concern, **a separate commit when committing**): `egress.rs`'s
+  `run_sops_passes_…` test wrote a fake `sops` then exec'd it, racing other threads' forks → intermittent
+  **ETXTBSY**; a bounded retry scoped to the spawn-error class (a real decrypt/extract error still fails).
+  **Slice C2 — a real desktop agent profile — CONSCIOUSLY DEFERRED (user, 2026-06-22):** the triage is
+  decisive — opencode-desktop/t3/hermes-desktop have their **CLI twins already shipped** (same agent
+  function, no GUI), `agy` is **OAuth-blocked** (a credential problem, not a display one), and **only
+  `aionui` *needs* the GUI hole** (Electron/AppImage-in-cage, heavy/unproven). So the user **acted the
+  GUI/Wayland track closed here** — primitive + fonts + composition delivered as infra; heavy desktop
+  packaging deferred until a concrete need (grounded-not-guessed). See [[ops-app-framework]].
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

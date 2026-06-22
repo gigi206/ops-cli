@@ -227,6 +227,21 @@ pub(crate) enum NetworkPolicy {
     Allowlist(crate::allowlist::EgressPolicy),
 }
 
+/// The sandbox's resolved GUI posture. A security choice, gated exactly like
+/// [`NetworkPolicy`]: honored from the global config (trusted by location) or a trusted
+/// project, ignored from an untrusted one. The default exposes no display — a graphical app
+/// cannot reach the host's compositor. `Wayland` binds the compositor socket read-only so a
+/// window can map; X11 is deliberately never offered (an X client could snoop and drive every
+/// other window, which Wayland's per-client isolation prevents on a well-behaved compositor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GuiPolicy {
+    /// No display access (the default): a graphical app cannot reach a compositor.
+    #[default]
+    None,
+    /// Bind the host's Wayland compositor socket read-only so a graphical app can map a window.
+    Wayland,
+}
+
 /// A credential the egress proxy injects into matching outbound requests as an HTTP
 /// header. The plaintext is deliberately **not** here — only how to obtain it host-side
 /// at launch ([`SecretSource`]), where to inject it ([`Self::to`]), and how to shape it
@@ -415,6 +430,10 @@ pub(crate) struct Resolved {
     /// or a trusted project asked for `"none"`. An untrusted project's choice is
     /// dropped with a warning — it may not narrow or widen the network.
     pub(crate) network: NetworkPolicy,
+    /// The resolved GUI posture: the default (`None`) unless the global config or a trusted
+    /// project asked for `"wayland"`. An untrusted project's choice is dropped with a warning
+    /// — it may not open a display.
+    pub(crate) gui: GuiPolicy,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -463,6 +482,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own network posture, set only when a trusted source declared one. `Some`
     /// overrides the baseline; `None` leaves the baseline posture in place.
     pub(crate) network: Option<NetworkPolicy>,
+    /// The app's own GUI posture, set only when a trusted source declared one. `Some` overrides
+    /// the baseline; `None` leaves the baseline posture in place.
+    pub(crate) gui: Option<GuiPolicy>,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
@@ -491,6 +513,9 @@ impl Resolved {
         }
         if let Some(network) = app.network {
             self.network = network;
+        }
+        if let Some(gui) = app.gui {
+            self.gui = gui;
         }
         self.secrets.extend(app.secrets);
         self.warnings.extend(app.warnings);
@@ -543,6 +568,12 @@ fn resolve(
     let mut network = global
         .network
         .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v))
+        .unwrap_or_default();
+    // The GUI posture is trusted by location at the global layer; an invalid or unset value
+    // falls back to the default (no display).
+    let mut gui = global
+        .gui
+        .and_then(|v| validate_gui(&mut warnings, GLOBAL_CONFIG, v))
         .unwrap_or_default();
     // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
     // captured for the global hosts and as the base a trusted project may extend.
@@ -613,6 +644,21 @@ fn resolve(
                 ));
             }
         }
+        // `gui` is a security field — a trusted project may open a display; an untrusted or
+        // changed one may not (exposing a compositor socket is a confidentiality and integrity
+        // choice an untrusted project must not make).
+        if let Some(value) = proj.gui {
+            if trusted {
+                if let Some(policy) = validate_gui(&mut warnings, PROJECT_CONFIG, value) {
+                    gui = policy;
+                }
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `gui` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // The `[secret]` section is a security field — a trusted project may inject
         // credentials (and extend the resolver defaults); an untrusted or changed one may
         // not (it would aim the user's secrets at a host of its choosing). The whole
@@ -662,6 +708,7 @@ fn resolve(
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
         mise: None,
         network,
+        gui,
         secrets,
         apps,
         warnings,
@@ -766,6 +813,7 @@ fn resolve_app(
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
     let mut network: Option<NetworkPolicy> = None;
+    let mut gui: Option<GuiPolicy> = None;
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
@@ -794,6 +842,9 @@ fn resolve_app(
         );
         if let Some(field) = app.network {
             network = validate_network(&mut warnings, &source, field);
+        }
+        if let Some(value) = app.gui {
+            gui = validate_gui(&mut warnings, &source, value);
         }
         if let Some(section) = app.secret {
             apply_app_secret(
@@ -847,6 +898,21 @@ fn resolve_app(
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `network` policy ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `gui` mirrors `network`: an untrusted project may not open a display, on its own app
+        // or by overriding a trusted one (the flagship property — an agent runs *on* untrusted
+        // code without that code being able to expose the user's compositor).
+        if let Some(value) = app.gui {
+            if trusted {
+                if let Some(policy) = validate_gui(&mut warnings, &source, value) {
+                    gui = Some(policy);
+                }
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `gui` posture ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -905,6 +971,7 @@ fn resolve_app(
         ro_binds,
         packages,
         network,
+        gui,
         secrets,
         warnings,
     }
@@ -1123,6 +1190,28 @@ fn validate_nixpkgs(
             "{source_label}: ignoring malformed nixpkgs source `{value}`"
         ));
         None
+    }
+}
+
+/// Validate a `gui` posture string into [`GuiPolicy`], warning on anything unrecognized. A
+/// typo must never silently leave the GUI in the wrong posture; returning `None` keeps the
+/// prior (default or global) posture rather than guessing. There is intentionally no `x11`
+/// value — X is never offered.
+fn validate_gui(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    value: String,
+) -> Option<GuiPolicy> {
+    match value.as_str() {
+        "none" => Some(GuiPolicy::None),
+        "wayland" => Some(GuiPolicy::Wayland),
+        other => {
+            warnings.push(format!(
+                "{source_label}: ignoring unknown gui posture `{other}` \
+                 (expected \"none\" or \"wayland\")"
+            ));
+            None
+        }
     }
 }
 
@@ -2101,6 +2190,9 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
             lines.push(s);
         }
     }
+    if let Some(gui) = &app.gui {
+        lines.push(format!("gui: {gui}"));
+    }
     if let Some(section) = &app.secret {
         let mut any = false;
         for (host, entry) in &section.hosts {
@@ -2295,6 +2387,7 @@ mod tests {
             packages: BTreeMap::new(),
             nixpkgs: None,
             network: None,
+            gui: None,
             secret: None,
             app: BTreeMap::new(),
         }
@@ -2344,6 +2437,14 @@ mod tests {
         raw_network_table(allow, &[])
     }
 
+    /// A `RawConfig` declaring only a `gui` posture.
+    fn raw_gui(value: &str) -> RawConfig {
+        RawConfig {
+            gui: Some(value.to_string()),
+            ..RawConfig::default()
+        }
+    }
+
     /// A `RawApp` from its parts, for the app-layering tests.
     fn raw_app(
         cmd: &[&str],
@@ -2370,6 +2471,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             network,
+            gui: None,
             secret: None,
             home_scope: None,
         }
@@ -2590,6 +2692,50 @@ mod tests {
         let app = &r.apps["claude"];
         assert!(matches!(app.network, Some(NetworkPolicy::Allowlist(_))));
         assert!(app.warnings.iter().any(|w| w.contains("network")));
+    }
+
+    #[test]
+    fn a_global_apps_gui_survives_an_untrusted_projects_override_attempt() {
+        // The flagship property for the GUI hole: a globally-declared app keeps its display
+        // posture even under an untrusted project, which can neither close it nor (in the reverse
+        // case) open one — running an agent *on* untrusted code never lets that code touch the
+        // compositor exposure.
+        let global = raw_with_app(
+            "desktop",
+            RawApp {
+                gui: Some("wayland".into()),
+                ..raw_app(&["agent"], &[], &[], &[], None)
+            },
+        );
+        // The untrusted project tries to flip the app to no display.
+        let project = raw_with_app(
+            "desktop",
+            RawApp {
+                gui: Some("none".into()),
+                ..raw_app(&[], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["desktop"];
+        assert_eq!(
+            app.gui,
+            Some(GuiPolicy::Wayland),
+            "an untrusted project may not change a trusted app's GUI posture"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("gui")));
+
+        // The reverse: an untrusted project cannot *open* a display on its own app either.
+        let project = raw_with_app(
+            "mine",
+            RawApp {
+                gui: Some("wayland".into()),
+                ..raw_app(&["tool"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        let app = &r.apps["mine"];
+        assert_eq!(app.gui, None, "an untrusted project may not open a display");
+        assert!(app.warnings.iter().any(|w| w.contains("gui")));
     }
 
     #[test]
@@ -2828,6 +2974,7 @@ mod tests {
             ro_binds: vec![],
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
+            gui: None,
             secrets: vec![],
             warnings: vec![],
         };
@@ -2850,6 +2997,7 @@ mod tests {
             ro_binds: vec![],
             packages: vec![],
             network: None, // inherits the baseline's shared posture
+            gui: None,
             secrets: vec![a_header_secret()],
             warnings: vec![],
         };
@@ -2873,6 +3021,7 @@ mod tests {
             network: Some(NetworkPolicy::Allowlist(
                 crate::allowlist::EgressPolicy::new(vec![], vec![]),
             )),
+            gui: None,
             secrets: vec![a_header_secret()],
             warnings: vec![],
         };
@@ -3373,6 +3522,69 @@ mod tests {
         assert_eq!(r.network, NetworkPolicy::Shared);
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("unknown network policy `offline`"));
+    }
+
+    #[test]
+    fn the_default_gui_posture_is_none() {
+        // No declared posture anywhere means no display — the cage exposes no compositor.
+        assert_eq!(
+            resolve_no_plugins(RawConfig::default(), None).gui,
+            GuiPolicy::None
+        );
+    }
+
+    #[test]
+    fn a_global_gui_posture_is_honored_a_trusted_project_overrides_it() {
+        // global is trusted by location
+        let r = resolve_no_plugins(raw_gui("wayland"), None);
+        assert_eq!(r.gui, GuiPolicy::Wayland);
+        assert!(r.warnings.is_empty());
+
+        // a trusted project sets its own, overriding the global posture
+        let r = resolve_no_plugins(
+            raw_gui("wayland"),
+            Some((raw_gui("none"), TrustState::Trusted)),
+        );
+        assert_eq!(r.gui, GuiPolicy::None);
+        assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_project_gui_posture_is_dropped_with_a_warning() {
+        // the flagship property at the baseline: an untrusted project may not open a display —
+        // its `gui = "wayland"` is dropped and the default (no display) stands.
+        for state in [TrustState::Untrusted, TrustState::Changed] {
+            let r = resolve_no_plugins(RawConfig::default(), Some((raw_gui("wayland"), state)));
+            assert_eq!(
+                r.gui,
+                GuiPolicy::None,
+                "an untrusted project may not open a display"
+            );
+            assert_eq!(r.warnings.len(), 1);
+            assert!(r.warnings[0].contains("gui"));
+        }
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_close_a_globally_opened_gui() {
+        // The gate cuts both ways: with the global config opening the display, an untrusted
+        // project asking for `none` cannot touch it (it may not change a security field at all).
+        let r = resolve_no_plugins(
+            raw_gui("wayland"),
+            Some((raw_gui("none"), TrustState::Untrusted)),
+        );
+        assert_eq!(r.gui, GuiPolicy::Wayland);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("gui"));
+    }
+
+    #[test]
+    fn an_unknown_gui_posture_is_dropped_with_a_warning() {
+        // a typo (or an X11 request, which is never offered) must not silently mis-set the posture
+        let r = resolve_no_plugins(raw_gui("x11"), None);
+        assert_eq!(r.gui, GuiPolicy::None);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("unknown gui posture `x11`"));
     }
 
     #[test]

@@ -41,6 +41,15 @@ pub(crate) struct RawConfig {
     /// since narrowing or widening the network is a confidentiality choice an
     /// untrusted project may not make.
     pub(crate) network: Option<NetworkField>,
+    /// The sandbox's GUI posture: `"none"` (the default — no display access) or `"wayland"`
+    /// (bind the host's Wayland compositor socket read-only so a graphical app can map a
+    /// window). A security field — honored from the global config or a trusted project,
+    /// ignored from an untrusted one: exposing a compositor socket is a confidentiality and
+    /// integrity choice (clipboard access, and on some compositors screen capture or input
+    /// injection) an untrusted project may not make. X11 is deliberately never offered — an
+    /// X client can snoop and drive every other window, which Wayland's per-client isolation
+    /// prevents on a well-behaved compositor.
+    pub(crate) gui: Option<String>,
     /// Credentials the egress proxy injects into matching outbound requests, declared
     /// as the `[secret]` section — a table keyed by destination host. A security field:
     /// honored from the global config or a trusted project, ignored from an untrusted one,
@@ -81,6 +90,10 @@ pub(crate) struct RawApp {
     pub(crate) packages: BTreeMap<String, String>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
+    /// The app's GUI posture, overriding the baseline's when set. A security field, like the
+    /// baseline `gui`. An unset `Option` is omitted by TOML on export, so an app with no GUI
+    /// need carries no `gui` line.
+    pub(crate) gui: Option<String>,
     /// Credentials the egress proxy injects for this app. A security field, effective only
     /// under a network allowlist, like the baseline `[secret]` section.
     pub(crate) secret: Option<RawSecretSection>,
@@ -401,6 +414,7 @@ mod tests {
         let src = br#"
             cmd = ["claude", "--resume"]
             home_scope = "global"
+            gui = "wayland"
             binds = ["/opt/data"]
             [env]
             FOO = "bar"
@@ -455,11 +469,23 @@ mod tests {
             !out.contains("home_scope"),
             "unset home_scope must be omitted:\n{out}"
         );
+        assert!(!out.contains("gui"), "unset gui must be omitted:\n{out}");
         // A bare-string command (`RawCmd::Line`) round-trips as itself — not silently promoted to a
         // one-element array — so an exported minimal profile re-imports identically.
         let reparsed = parse_app(out.as_bytes()).unwrap();
         assert_eq!(reparsed.cmd, Some(RawCmd::Line("claude".into())));
         assert_eq!(app, reparsed);
+    }
+
+    #[test]
+    fn parses_the_gui_posture_string() {
+        let cfg = parse(b"gui = \"wayland\"\n").unwrap();
+        assert_eq!(cfg.gui.as_deref(), Some("wayland"));
+        // unset means no declared posture — the loader treats that as the default (none).
+        assert_eq!(parse(b"").unwrap().gui, None);
+        // an app overlay carries its own gui posture
+        let app = parse_app(b"cmd = \"x\"\ngui = \"wayland\"\n").unwrap();
+        assert_eq!(app.gui.as_deref(), Some("wayland"));
     }
 
     #[test]

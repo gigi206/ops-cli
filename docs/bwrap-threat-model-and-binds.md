@@ -138,11 +138,81 @@ project config.
 | Hole | Mode B (agent, default) | Mode A (interactive, opt-in) |
 |---|---|---|
 | **Network** | open in v1 **but** block `169.254.169.254` + `localhost`; **target goal = allowlist** (Landlock/netns) | same / broader |
-| **GUI** | **off**; if required, Wayland (better isolated) never X11 (an X client keylogs/screenshots the other windows) | opt-in, Wayland preferred |
+| **GUI** | **off** by default; opt-in via `gui = "wayland"` (trusted/global only) — Wayland (per-client isolated on a well-behaved compositor), **never X11** (an X client keylogs/screenshots the other windows). **BUILT** — see §5a. | opt-in, Wayland preferred |
 | **Nested containers (podman socket)** | **DROPPED** — the socket = **root-equivalent on the host** (launch a container with `/` bind-mounted). Not "gated": **absent**. A filtering proxy-broker is **future work**, not a v1 checkbox. | gated + confirmation |
 | **ssh-agent** (`$SSH_AUTH_SOCK`) | **off** (hands over ALL your keys for their lifetime) | scoped opt-in |
 | **Secret injection** | least-privilege, declared in **trusted** config only | same |
 | **A tool's credential persistence** (e.g. claude-code's own creds) | a **dedicated, persistent, isolated** creds dir, mounted **for that tool alone** — never all of `~/.config` | same |
+
+### 5a. The GUI / Wayland hole (BUILT — `gui = "wayland"`)
+
+A security field `gui`, gated **exactly like `network`**: honored from the global config
+(trusted by location) or a trusted project, dropped with a warning from an untrusted one — so
+an agent run *on* untrusted code can never have that code open the user's compositor (the
+flagship property, tested both ways). `"none"` (the default) exposes no display; `"wayland"`
+opens the hole. There is **no `x11` value** — X is never offered.
+
+The hole, when opened:
+
+- **Mount** — a **read-only bind of the Wayland socket *file*** only (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`,
+  or `$WAYLAND_DISPLAY` verbatim when absolute). Never `$XDG_RUNTIME_DIR` itself — that directory
+  also holds the dbus session bus, pulse, and the gpg/ssh agents, which a directory bind would
+  hand to the cage. Read-only suffices because the cage runs **same-uid**, so `connect()` succeeds.
+- **Env** — `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`, fixed by ops; an untrusted `[env]` could only
+  mispoint a client at a nonexistent socket (self-DoS), never redirect the bound socket.
+- **Best-effort** — with no compositor socket found, ops warns and runs without the bind (the app
+  fails on its own); *not* binding is the fail-closed direction for a display hole.
+- **Fonts** — a fontless cage renders boxes, so the hole provisions a base font set (DejaVu)
+  host-side into ops's store, **seeds it into the project store** (the cage reads it through `/nix`),
+  and binds a generated, self-contained fontconfig configuration read-only at `/opt/ops/fonts.conf`,
+  named to the cage's fontconfig via `FONTCONFIG_FILE`. A font package has no `bin/`, so it **cannot**
+  ride the user-facing `[packages]` field (which selects a bin-bearing output) — the hole provisions
+  it directly, like the base userland. Best-effort like the socket (a font fetch/stage failure warns
+  and the app runs without fonts). `FONTCONFIG_FILE` is fixed by ops; an untrusted `[env]` override
+  only re-points the agent's own in-cage fontconfig (self-sabotage, not an escape). The hole supplies
+  the font *files* and the *configuration*; the fontconfig **library** is the app's own (a nix-packaged
+  app carries it in its closure).
+- **Not exposed** — `/dev/dri` (software GL renders fine), dbus, pipewire/pulse, X11/`DISPLAY`.
+  Each is a separate, later, opt-in hole.
+
+A Chromium/Electron app additionally needs `--no-sandbox` (its own namespace sandbox collides with
+the cage's seccomp denylist; bwrap + seccomp + the netns *is* the boundary) plus
+`--ozone-platform=wayland --disable-gpu --disable-dev-shm-usage` — these are **app argv** (a
+profile's `cmd`), not hole state.
+
+**Composition with `network = "allowlist"` (proven).** The real desktop-agent posture opens the
+display hole *and* a filtered egress at once. They coexist with no special-casing: the display is a
+local **Unix** socket (so it connects inside the empty netns the allowlist imposes — it needs no
+network route), and its binds/env are disjoint from the egress machinery (the proxy socket + CA under
+`/opt/ops`, the forwarder on cage loopback). A single-cage e2e holds the teeth together — `wayland-info`
+enumerates the compositor **and** a non-allowlisted host is refused `403`, in the same launch — so the
+two holes are proven to function together, not merely each alone.
+
+**Real rendering (proven live).** The fonts are not merely *discoverable* (`fc-list`) — they
+*rasterize*. A headless **Chromium** (the desktop-agent class engine) run in the cage renders a black
+`Hello` on white to a screenshot: with `gui = "wayland"` the hole's DejaVu is present and the image
+carries black glyph pixels (darkest pixel `0`, non-zero variance); with `gui = "none"` the cage has no
+font and the *same* render is perfectly blank (darkest pixel `1`, zero variance). The only difference
+between the two is the font hole, so the hole's fonts are what turn an empty page into rendered **Latin**
+text — the spike's HarfBuzz `glyph_count: 0` failure, now closed. (Proven *text-vs-nothing*, not
+*text-vs-boxes*: DejaVu covers Latin, so CJK/emoji would still box — broader script coverage is a
+per-need extension. This is a heavy live proof — Chromium's closure makes a per-run committed test
+impractical, like the in-cage flake build — so it is documented as proven-live, **not** a committed e2e.)
+
+**Residuals (documented, not assumed away):**
+
+- **Clipboard** — `wl_data_device` is advertised, so a *focused* GUI client can read/set the
+  clipboard. Bounded to focus, but a real cross-app channel.
+- **Compositor-dependent** — the isolation is the *compositor's*. On GNOME/Mutter ordinary clients
+  get no screen-capture or input-injection protocol; on **wlroots** (sway/hyprland) they would get
+  `wlr_screencopy` + virtual-keyboard/pointer. So "Wayland is isolated" is **host-compositor-dependent**;
+  active compositor detection + a doctor warning is a later refinement.
+- **A read-only `XDG_RUNTIME_DIR`** — bwrap auto-creates `/run/user/<uid>` on the read-only rootfs to
+  host the socket bind, so the directory holds only the socket and is not writable. A client that
+  *connects* (the Wayland case) is fine; a toolkit that wants to *write* `$XDG_RUNTIME_DIR/<app>` would
+  fail. A writable per-app runtime directory is a later refinement, driven by a real app's need.
+
+Feasibility, recipe, and the protocol enumeration: [`bwrap-gui-wayland-spike-2026-06-22.md`](bwrap-gui-wayland-spike-2026-06-22.md).
 
 ## 6. The trust gate (security-first) — DECIDED (option a)
 

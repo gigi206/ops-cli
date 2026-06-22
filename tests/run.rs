@@ -425,6 +425,171 @@ fn cache_reachable() -> bool {
     })
 }
 
+/// The host's Wayland compositor socket, if one is reachable — so the GUI e2e skips (does not
+/// fail) on a headless host. Mirrors the launcher's own resolution: an absolute `WAYLAND_DISPLAY`
+/// is the socket path itself, otherwise it is a name resolved under `XDG_RUNTIME_DIR`.
+fn wayland_socket() -> Option<PathBuf> {
+    let display = std::env::var("WAYLAND_DISPLAY").ok()?;
+    if display.is_empty() {
+        return None;
+    }
+    let socket = if Path::new(&display).is_absolute() {
+        PathBuf::from(display)
+    } else {
+        PathBuf::from(std::env::var("XDG_RUNTIME_DIR").ok()?).join(display)
+    };
+    socket.exists().then_some(socket)
+}
+
+#[test]
+fn a_gui_wayland_launch_connects_to_the_host_compositor() {
+    // `gui = "wayland"` binds the host's Wayland compositor socket read-only into the cage, so a
+    // graphical client connects. Proven with the cage's network CUT (`network = "none"`): Wayland
+    // is a local Unix socket, so a successful connect can only be the bound socket — the hermetic
+    // cage has no host `/run`, so without the GUI hole that socket file is absent and the client
+    // fails to connect. `wayland-info` dumps the compositor registry and exits 0 on a good
+    // connection. Skips (never fails) when the host cannot sandbox, has no compositor, or the
+    // cache is unreachable (wayland-utils is provisioned on the first launch).
+    let project = TmpDir::new("gui-proj");
+    let data = TmpDir::new("gui-data");
+    let state = TmpDir::new("gui-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\nnetwork = \"none\"\n\
+         [packages]\nwayland-utils = \"nix:wayland-utils\"\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping gui e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if wayland_socket().is_none() {
+        eprintln!("skipping gui e2e: no Wayland compositor on the host");
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping gui e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // `gui` and `[packages]` are trusted-only, so trust the project before launching.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "wayland-info"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "a Wayland client could not connect through the cage (gui = \"wayland\"): {log}"
+    );
+    // A real registry dump names the core interface — proof it talked to the compositor, not just
+    // that the binary started.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("wl_compositor"),
+        "wayland-info did not enumerate the compositor registry: {log}"
+    );
+}
+
+#[test]
+fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
+    // Under `gui = "wayland"` the hole provisions a base font set host-side, seeds it into the
+    // project store, and generates a fontconfig configuration naming it (via `FONTCONFIG_FILE`),
+    // so a graphical app renders text rather than boxes. Proven with the cage's network CUT
+    // (`network = "none"`): `fc-list` (from the project's own `nix:fontconfig`) reads the cage's
+    // fontconfig, and a hermetic cage carries no fonts and no `/etc/fonts` — so a non-empty
+    // listing can only come from the hole's seeded fonts + generated config. Teeth on the store
+    // path, not just a family name: the output must contain the DejaVu *store path* the hole
+    // provisioned (`/nix/store/…dejavu-fonts…`), which appears only because the generated config
+    // points fontconfig at exactly that seeded directory. Skips (never fails) when the host cannot
+    // sandbox or the cache is unreachable (the fonts and fontconfig are provisioned host-side on
+    // the first launch).
+    let project = TmpDir::new("gui-fonts-proj");
+    let data = TmpDir::new("gui-fonts-data");
+    let state = TmpDir::new("gui-fonts-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\nnetwork = \"none\"\n\
+         [packages]\nfontconfig = \"nix:fontconfig\"\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping gui-fonts e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    // The fonts and fontconfig are fetched host-side on the first launch, so the cache must be
+    // reachable. No compositor is needed: this exercises the font layer, not the display socket.
+    if !cache_reachable() {
+        eprintln!("skipping gui-fonts e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // `gui` and `[packages]` are trusted-only, so trust the project before launching.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "fc-list"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "fc-list failed in the cage (gui = \"wayland\"): {log}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The DejaVu store path is the proof: it appears only because the generated config's `<dir>`
+    // names the seeded font directory and `FONTCONFIG_FILE` points fontconfig at it.
+    assert!(
+        stdout.contains("/nix/store/") && stdout.contains("dejavu-fonts"),
+        "fc-list did not list the hole's provisioned DejaVu fonts by store path: {log}"
+    );
+}
+
 #[test]
 fn a_network_allowlist_filters_egress_through_the_proxy() {
     // The Model-B egress path end to end through the real binary: a trusted
@@ -541,6 +706,111 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
         String::from_utf8_lossy(&denied.stderr).contains("403"),
         "denied egress must be refused with a 403 at the proxy: {}",
         String::from_utf8_lossy(&denied.stderr)
+    );
+}
+
+#[test]
+fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
+    // The real desktop-agent posture: `gui = "wayland"` AND `network = "allowlist"` open at once,
+    // each stacking its own binds and env into one cage. The display socket (a local Unix socket,
+    // bound read-only), the fonts (seeded + a generated config), and the egress machinery (the
+    // bound proxy socket + the injected CA + the empty netns) must coexist — neither hole displaces
+    // the other. Separately, Slice A proved the display and 6.2d proved the allowlist; the
+    // *composition* is what this asserts, so the teeth are co-located in a SINGLE `ops run`:
+    //
+    //   - `wayland-info` enumerates the compositor  ⇒ the display socket connects *inside the empty
+    //     netns* (it has no network route, so a successful connect can only be the bound Unix socket);
+    //   - a denied host is refused with `403`        ⇒ the allowlist is actually enforcing (not a
+    //     `shared` posture leaking through) *with the display hole also open*;
+    //   - an allowed host returns the known hash     ⇒ egress works through the proxy, gui open;
+    //   - `fc-list` lists the seeded DejaVu fonts    ⇒ the font layer is intact, gui open.
+    //
+    // The compose tooth is the denied-`403` AND the `wl_compositor` enumeration in the *same* run:
+    // split across two launches they would only re-prove Slice A and 6.2d, not coexistence. Skips
+    // (never fails) when the host cannot sandbox, has no compositor, or the cache is unreachable
+    // (the tools and fonts are provisioned host-side on the first launch).
+    let project = TmpDir::new("gui-net-proj");
+    let data = TmpDir::new("gui-net-data");
+    let state = TmpDir::new("gui-net-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\n\
+         [network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\
+         [packages]\nwayland-utils = \"nix:wayland-utils\"\nfontconfig = \"nix:fontconfig\"\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping gui+net e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if wayland_socket().is_none() {
+        eprintln!("skipping gui+net e2e: no Wayland compositor on the host");
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping gui+net e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // `gui`, `network`, and `[packages]` are all trusted-only, so trust the project first.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // One cage, all four facets. Each emits a distinct marker on success; the test asserts every
+    // marker is present, so the four holes are proven to function *together*. No `set -e`: the
+    // denied fetch is meant to fail, and a missing facet must surface as a missing marker (caught
+    // below) rather than aborting the script early.
+    let script = "\
+        wayland-info 2>&1 | grep -q wl_compositor && echo COMPOSE-WL\n\
+        fc-list | grep -q dejavu-fonts && echo COMPOSE-FONT\n\
+        nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info 2>/dev/null \
+            | grep -q 15sqg1j6gq6081nk0v5c6npadlswb9238l336wb2g9bmmrry779c && echo COMPOSE-ALLOW\n\
+        nix-prefetch-url --type sha256 https://example.com/nix-cache-info 2>&1 \
+            | grep -q 403 && echo COMPOSE-DENY\n";
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", script],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let log = format!("{}{stdout}", String::from_utf8_lossy(&out.stderr));
+
+    // The display hole, inside the empty netns the allowlist imposes.
+    assert!(
+        stdout.contains("COMPOSE-WL"),
+        "wayland-info did not enumerate the compositor with the allowlist also open: {log}"
+    );
+    // The font layer, with the allowlist also open.
+    assert!(
+        stdout.contains("COMPOSE-FONT"),
+        "fc-list did not list the seeded DejaVu fonts with the allowlist also open: {log}"
+    );
+    // Egress works through the proxy, with the display hole also open.
+    assert!(
+        stdout.contains("COMPOSE-ALLOW"),
+        "the allowed fetch did not return the known hash with the display hole also open: {log}"
+    );
+    // The allowlist still has teeth, with the display hole also open — the other half of the
+    // composition tooth.
+    assert!(
+        stdout.contains("COMPOSE-DENY"),
+        "a denied host was not refused with a 403 with the display hole also open: {log}"
     );
 }
 

@@ -589,6 +589,13 @@ fn config_cmd() -> ExitCode {
             println!("    (deny wins over allow)");
         }
     }
+    // The GUI posture — a security field, gated like the network. Shown only when opened
+    // (`wayland`), so a non-GUI config stays uncluttered; the default exposes no display. The
+    // exposure depends on the host's compositor: a well-behaved one isolates clients, but some
+    // expose screen capture or input injection to ordinary clients — the line says so.
+    if matches!(resolved.gui, config::GuiPolicy::Wayland) {
+        println!("  gui: wayland (exposure depends on your compositor)");
+    }
     // Credentials the egress proxy injects into matching requests — a security field, gated
     // like the binds (an untrusted project's are dropped). The source is shown by locator (the
     // variable name or file path), never the value, which ops reads only host-side at launch.
@@ -631,6 +638,11 @@ fn config_cmd() -> ExitCode {
                 Some(config::NetworkPolicy::Shared) => println!("      network: shared"),
                 Some(config::NetworkPolicy::Isolated) => println!("      network: none"),
                 Some(config::NetworkPolicy::Allowlist(_)) => println!("      network: allowlist"),
+                None => {}
+            }
+            match app.gui {
+                Some(config::GuiPolicy::Wayland) => println!("      gui: wayland"),
+                Some(config::GuiPolicy::None) => println!("      gui: none"),
                 None => {}
             }
             if !app.secrets.is_empty() {
@@ -2288,6 +2300,7 @@ mod tests {
             nixpkgs_project: None,
             mise: None,
             network: config::NetworkPolicy::default(),
+            gui: config::GuiPolicy::default(),
             secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],

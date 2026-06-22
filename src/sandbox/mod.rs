@@ -11,6 +11,7 @@ mod binds;
 mod cgroup;
 pub(crate) mod egress;
 mod fhs;
+mod fonts;
 mod launch;
 mod mise;
 mod miseplugin;
