@@ -1259,6 +1259,7 @@ mod tests {
             foreign_lib_paths: vec![],
             bin_paths: vec![],
             shell_bin: PathBuf::from("/nix/store/bash/bin/bash"),
+            env_bin: PathBuf::from("/nix/store/coreutils/bin/env"),
             socat_bin: PathBuf::from("/nix/store/socat/bin/socat"),
             mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),

@@ -187,6 +187,9 @@ pub(crate) fn resolve_userland(
         foreign_lib_paths: vec![glibc.join("lib"), gcc.join("lib")],
         bin_paths,
         shell_bin: bash.join("bin/bash"),
+        // The coreutils `env` `/usr/bin/env` links to, so an interpreted tool's
+        // `#!/usr/bin/env <interp>` shebang resolves. Logical, like the shell above.
+        env_bin: coreutils.join("bin/env"),
         // The forwarder is invoked by absolute store path from the egress wrapper, never via
         // PATH (so it does not need to be a user-visible tool), so socat's bin stays off the
         // base PATH above.
@@ -293,6 +296,7 @@ mod resolve_tests {
             .chain(&u.foreign_lib_paths)
             .chain(std::iter::once(&u.base_loader))
             .chain(std::iter::once(&u.shell_bin))
+            .chain(std::iter::once(&u.env_bin))
         {
             assert!(
                 p.starts_with("/nix/store"),

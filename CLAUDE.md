@@ -473,6 +473,49 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   key) stays the flagship pending-real-key step for every profile. Triage of the rest (cline/droid →
   `/usr/bin/env` shim; agy/freebuff → OAuth not header; opencode-desktop/t3 → Wayland; aionui →
   Electron-in-cage deferred) in `profiles/README.md`. See [[ubi-backend-deprecated]], [[ops-app-framework]].
+  **`/usr/bin/env` FHS facade + the first npm/node CLI profile (freebuff) — DONE (2026-06-22)**
+  (`src/sandbox/binds.rs` + `fhs.rs` + `launch.rs` + `tests/run.rs` + `profiles/freebuff.toml`):
+  the design answer to *"is nix even the right approach?"* (the user's question, after the
+  `/usr/bin/env` friction): **yes — keep nix, complete the FHS-interop facade.** The cage already
+  synthesises the only two FHS paths nix's own ecosystem standardises — `/bin/sh` and, now,
+  **`/usr/bin/env`** — so an interpreted upstream tool's `#!/usr/bin/env <interp>` shebang resolves
+  (a hermetic cage has no host `/usr`). This is **nix convention, not a workaround**; the *retreat*
+  would be a full `buildFHSEnv` ambient `/usr` (rejected — the minimal explicit bind set IS the
+  confidentiality-by-absence edge). Mechanism: a `Userland.env_bin` (logical `/nix/store/.../bin/env`,
+  coreutils) + one `Mount::Symlink` for `/usr/bin/env` in `assemble`, mirroring `/bin/sh` exactly;
+  bwrap auto-creates the `/usr/bin` parent, so `/usr` stays the **minimal synthetic tree** (only
+  `bin/env`, never the host's). **Advisor-caught (the same class I hit by luck):** the change adds
+  `/usr` to *every* cage, so the two tests encoding the old "no `/usr`" invariant
+  (`binds.rs`'s hermetic smoke AND `run.rs::run_executes_commands_in_a_hermetic_sandbox`) both went
+  red — found via `grep -rn "/usr"` + running the *other* cage-launching paths (pty `shell.rs`,
+  doctor `smoke.rs`), now reworked to assert `/usr` is minimal (`USR=bin,`, `/usr/lib` absent) rather
+  than absent. `smoke.rs`/`resolver.rs`/`seccomp.rs` build their **own** specs (host `/usr` bound,
+  not via `assemble`) → untouched. **Proven live + committed e2e**
+  (`a_usr_bin_env_shebang_resolves_in_the_cage`): a `#!/usr/bin/env node` script (with `nix:nodejs`)
+  executed *by its own path* → `ENV-SHEBANG-OK v24.15.0` (teeth: a bare `node <script>` would prove
+  node, not the shebang path). **This unblocks the `npm:` backend** (the documented gap is closed),
+  shipped as **`profiles/freebuff.toml`** — the **first npm/node-runtime CLI profile**: `cmd =
+  "freebuff"`, `[packages] nodejs = "nix:nodejs"` + `freebuff = "mise:npm:freebuff"`,
+  `[network] allow = ["registry.npmjs.org", "codebuff.com", "www.codebuff.com"]`. **A different
+  credential posture (user-accepted, not header-BYOK):** freebuff's npm package is a thin launcher
+  that downloads the real ~124 MB binary into the app's **isolated `$HOME`** (`~/.config/manicode/`),
+  and authenticates to a **Codebuff account** (model traffic proxied server-side) — so there is **no
+  `[secret]`**; the login token persists in the isolated home (in the — isolated — cage, never the
+  project shell). **Smoke-first, grounded not guessed** (advisor's discipline — `ENV-SHEBANG-OK`
+  proves the shebang resolves, NOT that a real CLI runs): equipped + ran the **real** freebuff binary
+  end-to-end through the **empty-netns MITM allowlist** — `mise use -g npm:freebuff` installed via
+  the proxy (mise's npm backend honours the MITM CA — the discriminating case), the 46 MB tar
+  downloaded through it, `freebuff --version` → **0.0.112**; the allowlist hosts were grounded by
+  *reading the launcher source* (download URL `codebuff.com/api/releases/download/...` → 301 →
+  `www.codebuff.com`, no further CDN; PostHog telemetry off by default) and confirmed by the proxy's
+  refusals. The **`ops app freebuff` path** (import → isolated global home → equip → download) was
+  also proven (the 124 MB binary landed in `<data>/apps/freebuff/home/.config/manicode/`).
+  `the_shipped_profiles_import_and_resolve` now covers **7** profiles. fmt/clippy clean. **Pending
+  (the flagship, like every profile):** the live **login** once inside the cage (whether it completes
+  headlessly — URL-paste vs a browser — is unverified; the user's account). **Next non-desktop CLIs
+  (unblocked by this facade, pending verify-and-ship):** `cline` + `droid` (both npm/node BYOK,
+  OpenRouter-keyable; `droid` takes a 2nd `FACTORY_API_KEY` + `*.factory.ai`). See
+  [[ops-app-framework]], [[ubi-backend-deprecated]].
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

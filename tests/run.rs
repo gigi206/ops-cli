@@ -144,13 +144,21 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
         String::from_utf8_lossy(&ls.stdout)
     );
 
-    // hermetic: there is no host /usr to list
+    // hermetic: `/usr` is the minimal synthetic tree — it holds only `bin` (which carries the
+    // single `/usr/bin/env` symlink), never the host's `/usr`, which would expose `lib`/`share`/…
+    // alongside. (That `/usr/bin/env` resolves an interpreted shebang is proven separately by
+    // `a_usr_bin_env_shebang_resolves_in_the_cage`.)
     let usr = run_in(project.path(), data.path(), &["ls", "/usr"]);
-    assert!(!usr.status.success(), "host /usr unexpectedly present");
     assert!(
-        String::from_utf8_lossy(&usr.stderr).contains("/usr"),
-        "expected a hermetic /usr failure: {}",
-        String::from_utf8_lossy(&usr.stderr)
+        usr.status.success() && String::from_utf8_lossy(&usr.stdout).trim() == "bin",
+        "/usr is not the minimal synthetic tree (host /usr may have leaked): {}",
+        String::from_utf8_lossy(&usr.stdout)
+    );
+    // a host-`/usr` subtree a leak would expose is absent
+    let usr_lib = run_in(project.path(), data.path(), &["ls", "/usr/lib"]);
+    assert!(
+        !usr_lib.status.success(),
+        "host /usr/lib unexpectedly present (not hermetic)"
     );
 
     // synthetic passwd content, not the host's
@@ -647,6 +655,82 @@ fn the_curated_base_tools_run_in_the_cage() {
         "a curated base tool is missing or broken in the cage: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_usr_bin_env_shebang_resolves_in_the_cage() {
+    // The synthetic `/usr/bin/env` lets an interpreted upstream tool run. A script whose shebang
+    // is `#!/usr/bin/env node` is executed by its own path, so the kernel reads the shebang and
+    // execs `/usr/bin/env node <script>`. With no host `/usr`, that only resolves because the cage
+    // synthesises `/usr/bin/env` as a symlink to coreutils' `env`, which finds `node` (declared
+    // `nix:nodejs`, trusted-only) on PATH. Teeth: a bare `node <script>` would prove node works but
+    // not the shebang path; running the script by its own path proves the `/usr/bin/env` facade
+    // specifically. Skips (never fails) when the host cannot sandbox or the cache is unreachable
+    // (node is fetched on the first launch).
+    let project = TmpDir::new("env-proj");
+    let data = TmpDir::new("env-data");
+    let state = TmpDir::new("env-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[packages]\nnodejs = \"nix:nodejs\"\n",
+    )
+    .unwrap();
+    // an executable script whose shebang routes through `/usr/bin/env`
+    let script = project.path().join("hello.js");
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env node\nconsole.log(\"ENV-SHEBANG-OK\", process.version)\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping usr-bin-env e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping usr-bin-env e2e: the network is unreachable");
+        return;
+    }
+
+    // `[packages]` is trusted-only, so trust the project before the node toolchain provisions.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // run the script by its own absolute path, so the shebang (not an explicit `node`) drives
+    // execution — the path through `/usr/bin/env`.
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", script.to_str().unwrap()],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ENV-SHEBANG-OK"),
+        "a `#!/usr/bin/env node` shebang did not resolve in the cage: {log}"
     );
 }
 

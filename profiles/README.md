@@ -25,9 +25,16 @@ with `ops app export <name>`.
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
 | `hermes`          | `flake:github:NousResearch/hermes-agent#default` | `openrouter.ai` (BYOK)  |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
+| `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
+
+> **Two credential postures.** Most profiles are **BYOK** — your provider key is read
+> on the host and injected by the proxy, never entering the cage (see below).
+> `freebuff` is the other kind: it logs in to a service **account** and the token
+> persists in the app's isolated `$HOME` (so it *does* live in the — isolated — cage,
+> never in the project shell). Both stay bounded by the egress allowlist.
 
 ## Credentials — the key never enters the cage
 
@@ -48,10 +55,15 @@ can only reach the provider you listed.
 > **Status:** the profiles import and resolve cleanly (covered by a test), and the
 > tool is **provisioned fresh and runs** under the profile's own allowlist — proven
 > live for `claude-code` (2.1.185, equipped via `mise use -g` and run through the
-> empty-netns MITM) and `kilocode` (7.3.50, equipped via the mise `github` backend and run
-> in-cage — `kilo --version`). The one remaining *live* end-to-end is the CLI **authenticating**
-> through the proxy-injected key (does the tool accept the placeholder and let the proxy
-> fill in the real key?) — the flagship validation, still to be proven with a real key.
+> empty-netns MITM), `kilocode` (7.3.50, equipped via the mise `github` backend and run
+> in-cage — `kilo --version`), and `freebuff` (0.0.112, equipped via mise's **npm** backend
+> over a `nix:nodejs` runtime — the npm launcher and its 46 MB binary both fetched through the
+> empty-netns MITM allowlist, then `freebuff --version`). The one remaining *live* end-to-end is
+> the credential step: for the BYOK profiles, the CLI **authenticating** through the
+> proxy-injected key (does the tool accept the placeholder and let the proxy fill in the real
+> key?); for `freebuff`, completing its account **login** once inside the cage (the token then
+> persists in the isolated home). Both are the flagship validation, still to be proven with a
+> real key/account.
 >
 > The **flake-backed** profile `hermes` carries an extra first-launch step — the in-cage
 > `nix build` that compiles it (uv2nix Python + its bundled node front-ends) — and that build
@@ -71,6 +83,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix Python) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
+| `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
 (mise's `aqua`/`github`/registry backends pull the real release binary), so the version is the
@@ -95,6 +108,14 @@ runs under the cage's egress posture: a build step that fetches with its **own**
 `bun install`) rather than through nix's fetcher may not honour the proxy / MITM CA under an
 allowlist (for such a tool, prefer its release-binary `mise:` backend — that is exactly how
 `kilocode` is equipped here, after its `flake:` source build hit this very wall).
+
+**npm/node CLIs** are also supported: declare a `node` runtime (`nix:nodejs`) and the
+tool via mise's npm backend (`mise:npm:<pkg>`). The cage synthesises `/usr/bin/env`, so
+a tool's `#!/usr/bin/env node` shebang resolves (a hermetic cage has no host `/usr`).
+`freebuff` ships this way — its npm package is a thin launcher that downloads the real
+binary at first run into the app's isolated home. Like `mise:`, an npm CLI fetches at
+first launch (the node runtime and the package), so the first launch in a project needs
+the network.
 
 **Offline trade-off:** a `mise:` tool **fetches at first launch** (the price of upstream
 freshness), so a profile's *first* launch in a given project needs the network; a `nix:`
@@ -125,25 +146,23 @@ Bearer`). An OAuth/account login or a query-param key has no header for ops's `[
 broker to strip-and-replace. The tools below were each researched against primary sources; we
 do not guess the values, so each waits on a real fact or on a named feature:
 
-- **Node/npm CLIs — blocked on a `/usr/bin/env` shim** — **`cline`** (`cline/cline`) and
-  **`droid`** (Factory). Both are genuine standalone CLIs with env-var BYOK against
-  OpenAI-compatible/Anthropic endpoints (so OpenRouter-keyable) — but they package as npm /
-  node-runtime tools (`cline` runs under **bun**, shebang `#!/usr/bin/env bun`; `droid` is
-  `npm i -g droid` or a `curl|sh` installer with no confirmed GitHub/aqua release). The
-  hermetic cage has **no `/usr/bin/env`** (the documented gap that already blocks `npm:`
-  tools) and bakes no node/bun runtime, so neither can be cleanly equipped today. Unblocking
-  needs the small **`/usr/bin/env → coreutils/bin/env` shim** in the synthetic FHS plus a
-  `node`/`bun` runtime tool. (`droid` additionally needs a **second** key — a mandatory
+- **Node/npm CLIs — now unblocked, pending verify-and-ship** — **`cline`** (`cline/cline`)
+  and **`droid`** (Factory). Both are genuine standalone CLIs with env-var BYOK against
+  OpenAI-compatible/Anthropic endpoints (so OpenRouter-keyable), packaged as npm/node tools
+  (`cline` ships a node wrapper over a bun-embedded binary; `droid` installs via npm or a
+  `curl|sh` to a self-contained binary). The gap that blocked them is **closed**: the cage now
+  synthesises `/usr/bin/env` and a node runtime is a one-line `nix:nodejs` (this is exactly how
+  `freebuff` above ships). They are the next to **verify-and-ship** — each needs a live equip/run
+  check and its hosts grounded. (`droid` additionally takes a **second** key — a mandatory
   Factory account `FACTORY_API_KEY` alongside the model key — and `*.factory.ai` in `allow`.)
 
-- **OAuth / non-header credential** — **`agy`** (Antigravity CLI, Google) authenticates with
-  **Google Sign-In / an OAuth token in the keyring**, and **`freebuff`** (CodebuffAI) is
-  **not BYOK at all** — it stores an account-bound OAuth `authToken` (and its backend/ad hosts
-  are only secondhand-inferred, so an allowlist can't be written with confidence). A *header*
-  broker has nothing to inject into an OAuth flow. What would unblock the OAuth case is an
-  **interactive device-code login** (prints a URL + code you approve in your own browser; the
-  token persists in the app's isolated `$HOME`, no in-cage browser) **plus** observing the
-  tool's runtime API host (run once, read the proxy's refusal) before writing `allow`.
+- **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
+  Sign-In / an OAuth token in the keyring** and exposes no env-var/API-key path. A header broker
+  has nothing to inject, and the `freebuff`-style account-login posture does not fit either — it
+  needs a browser/keyring, not a token file written under the isolated home. What would unblock
+  it is an **interactive device-code login** (prints a URL + code you approve in your own
+  browser; the token persists in the app's isolated `$HOME`, no in-cage browser) **plus**
+  observing the tool's runtime API host before writing `allow`.
 
 - **GUI / desktop agents — blocked on the Wayland passthrough** — **opencode desktop** and
   **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that drives *other* agents,

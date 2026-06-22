@@ -29,6 +29,13 @@ const SANDBOX_HOME: &str = "/home/sandbox";
 /// here, and the synthetic passwd points its shell field at the same path.
 const SANDBOX_SHELL: &str = "/bin/sh";
 
+/// The in-sandbox `/usr/bin/env`, synthesised as a symlink to coreutils' `env`. An
+/// interpreted tool's `#!/usr/bin/env <interp>` shebang resolves through it (a hermetic
+/// cage has no host `/usr`). With `/bin/sh` these are the two — and only two — FHS paths
+/// nix's own ecosystem standardises, so synthesising it follows nix convention rather than
+/// working around it.
+const SANDBOX_ENV: &str = "/usr/bin/env";
+
 /// The resolved hermetic userland (provided by the nix resolver). A nix binary
 /// finds its own libraries by absolute RPATH, so a read-only `/nix` suffices for
 /// it and it is never steered by the sandbox's library search. *Foreign* binaries
@@ -66,6 +73,12 @@ pub(crate) struct Userland {
     pub(crate) bin_paths: Vec<PathBuf>,
     /// The shell binary `/bin/sh` links to and the default command runs.
     pub(crate) shell_bin: PathBuf,
+    /// The coreutils `env` binary `/usr/bin/env` links to, so an interpreted tool's
+    /// `#!/usr/bin/env <interp>` shebang resolves. A hermetic cage has no host `/usr`;
+    /// this and `/bin/sh` are the only two FHS paths nix's own ecosystem standardizes,
+    /// so synthesising it follows nix convention. An in-sandbox logical path (it
+    /// resolves through the store bound at `/nix`).
+    pub(crate) env_bin: PathBuf,
     /// The in-cage egress forwarder (`socat`), as an in-sandbox logical path. Invoked
     /// by absolute path from the allowlist-posture wrapper; off `PATH` and untouched by
     /// other postures.
@@ -213,6 +226,14 @@ fn assemble(
         Mount::Symlink {
             target: userland.shell_bin.clone(),
             dest: PathBuf::from(SANDBOX_SHELL),
+        },
+        // Zone 1 — the synthetic `/usr/bin/env`: an interpreted tool's
+        // `#!/usr/bin/env <interp>` shebang resolves here to coreutils' `env`. The cage
+        // carries no host `/usr`; this is the second FHS path (beside `/bin/sh`) that nix's
+        // own ecosystem standardises, the affordance every shebang-based CLI assumes.
+        Mount::Symlink {
+            target: userland.env_bin.clone(),
+            dest: PathBuf::from(SANDBOX_ENV),
         },
         // Zone 1 — the embedded mise "nix" backend plugin, read-only: an agent's
         // in-cage mise resolves it (via a symlink in the writable mise data dir) to
@@ -680,6 +701,7 @@ mod tests {
                 PathBuf::from("/store/coreutils/bin"),
             ],
             shell_bin: PathBuf::from("/store/bash/bin/bash"),
+            env_bin: PathBuf::from("/store/coreutils/bin/env"),
             socat_bin: PathBuf::from("/store/socat/bin/socat"),
             mise_bin: PathBuf::from("/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/store/nix/bin/nix"),
@@ -1008,6 +1030,24 @@ mod tests {
     }
 
     #[test]
+    fn usr_bin_env_is_symlinked_to_coreutils_env() {
+        // An interpreted tool's `#!/usr/bin/env <interp>` shebang must resolve: the cage
+        // synthesises `/usr/bin/env` as a symlink to coreutils' `env`, the second FHS path
+        // beside `/bin/sh`. bwrap creates the `/usr/bin` parent for the symlink.
+        let argv = argv_strings(&assembled());
+        let env = argv
+            .iter()
+            .position(|s| s == "/usr/bin/env")
+            .expect("/usr/bin/env is synthesised");
+        assert_eq!(
+            argv[env - 1],
+            "/store/coreutils/bin/env",
+            "/usr/bin/env links to coreutils' env"
+        );
+        assert_eq!(argv[env - 2], "--symlink", "/usr/bin/env is a symlink");
+    }
+
+    #[test]
     fn the_shell_rc_is_bound_read_only_for_mise_activation() {
         // `ops shell` points bash's `--rcfile` at this path; it must be a read-only bind
         // so the agent cannot rewrite the init its own interactive shell sources.
@@ -1304,8 +1344,12 @@ mod smoke {
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
             OsString::from("-c"),
-            // resolve the synthetic user, prove no host /usr, list the project
-            OsString::from("id -un; ls /usr 2>&1; ls"),
+            // resolve the synthetic user, show `/usr` is the minimal synthetic tree (only
+            // `bin`, never the host's), show `/usr/bin/env` resolves into ops's store, list
+            // the project
+            OsString::from(
+                "id -un; echo USR=$(ls /usr | tr '\\n' ','); echo ENV=$(readlink /usr/bin/env); ls",
+            ),
         ];
         let env = [("TERM".to_string(), "dumb".to_string())];
         let overlay = Overlay {
@@ -1347,10 +1391,18 @@ mod smoke {
             stdout.contains("sandbox"),
             "synthetic identity not resolved:\n{stdout}"
         );
-        // hermetic: there is no host /usr to list
+        // hermetic: `/usr` is the minimal synthetic tree — only `bin` (which holds the
+        // single `env` symlink), never the host's `/usr` (which would carry `lib`/`share`/…
+        // alongside). The cage synthesises `/usr/bin/env` and nothing else under `/usr`.
         assert!(
-            stdout.contains("cannot access '/usr'"),
-            "host /usr leaked (not hermetic):\n{stdout}"
+            stdout.contains("USR=bin,"),
+            "/usr is not the minimal synthetic tree (host /usr may have leaked):\n{stdout}"
+        );
+        // `/usr/bin/env` is the synthetic symlink into ops's store, so an interpreted
+        // tool's `#!/usr/bin/env <interp>` shebang resolves
+        assert!(
+            stdout.contains("ENV=/nix/store") && stdout.contains("bin/env"),
+            "/usr/bin/env does not resolve into ops's store:\n{stdout}"
         );
         // nix coreutils ran and saw the project
         assert!(

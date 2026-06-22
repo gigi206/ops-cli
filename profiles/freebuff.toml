@@ -1,0 +1,42 @@
+# Freebuff — CodebuffAI's free terminal coding agent, sandboxed by ops.
+#
+#   ops app import profiles/freebuff.toml
+#   ops app freebuff
+#
+# Freebuff is a Node CLI distributed on npm, so ops equips it in-cage with a node
+# runtime (nix) plus mise's npm backend. The npm package is a thin launcher: on the
+# first run it downloads the real ~46 MB binary from www.codebuff.com into the app's
+# isolated home (`~/.config/manicode/`), where it persists across launches. (This is
+# why the first launch needs the network and the allowlist below.)
+#
+# CREDENTIAL POSTURE — different from the BYOK profiles. Freebuff is NOT bring-your-
+# own-key against a provider endpoint; it authenticates to a Codebuff ACCOUNT and
+# routes model traffic through Codebuff's backend server-side. So there is no API key
+# to inject and no [secret] block. Instead you log in ONCE inside the cage:
+#
+#   ops app freebuff        # then, in the agent: `freebuff login`
+#
+# The login token is written under the app's dedicated, persistent, isolated home
+# (`~/.config/manicode/`), so it survives later launches and never bleeds into the
+# project shell or another app. The trade-off versus the injected-key profiles: the
+# token lives in the (isolated) cage home rather than never entering the cage. The
+# sandbox + the egress allowlist still bound everything the agent can reach.
+#
+# If a request is blocked, the proxy reports the host it refused — add it to `allow`
+# (or check ahead with `ops test net <url>`).
+cmd = "freebuff"
+
+[packages]
+# A node runtime (the launcher and the npm install need it), then freebuff itself via
+# mise's npm backend. Both are trusted-only [packages]; this profile is trusted by
+# location once imported.
+nodejs = "nix:nodejs"
+freebuff = "mise:npm:freebuff"
+
+[network]
+mode = "allowlist"
+# registry.npmjs.org: the npm install of the launcher. codebuff.com: the launcher's
+# hard-coded download URL, which 301-redirects to www.codebuff.com. www.codebuff.com:
+# the real binary download AND Codebuff's runtime backend (REST + websocket). Add any
+# further runtime host the proxy reports on first real use.
+allow = ["registry.npmjs.org", "codebuff.com", "www.codebuff.com"]
