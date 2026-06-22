@@ -42,11 +42,24 @@ fn main() -> ExitCode {
         Some("gc") => gc_cmd(args.collect()),
         Some("run") => {
             let mut cmd: Vec<OsString> = args.collect();
-            // an optional `--` separates ops's arguments from the command's
-            if cmd.first().and_then(|a| a.to_str()) == Some("--") {
-                cmd.remove(0);
+            // Leading ops flags before the command: `--detach` to run in the background, and an
+            // optional `--` separating ops's arguments from the command's. A `--` is consumed
+            // before scanning the command, so `ops run -- --detach` runs the literal `--detach`.
+            let mut detach = false;
+            while let Some(first) = cmd.first().and_then(|a| a.to_str()) {
+                match first {
+                    "--detach" => {
+                        detach = true;
+                        cmd.remove(0);
+                    }
+                    "--" => {
+                        cmd.remove(0);
+                        break;
+                    }
+                    _ => break,
+                }
             }
-            sandbox::run(cmd)
+            sandbox::run(cmd, detach)
         }
         Some("mise") => sandbox::run_mise(args.collect()),
         Some("app") => app_cmd(args.collect()),
@@ -62,8 +75,9 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!(
-                "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
-                 app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
+                "ops: usage: ops <doctor | shell | run [--detach] [--] <command> | mise <args> | \
+                 app <name [--detach] | import <file> | rm <name> | list> | search <query> | \
+                 test net <url> | \
                  plugins <list|info|install|rm|store> | \
                  ps | attach <id> | stop <id>... [--delay <secs>] | trust [path] | \
                  untrust [path] | config | \
@@ -734,20 +748,22 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
         Some("list") => app_list(),
-        // Otherwise the first non-flag token names an app to launch.
+        // Otherwise the first non-flag token names an app to launch; `--detach` runs it in the
+        // background as a session `ops ps`/`attach`/`stop` can see.
         _ => {
+            let detach = args.iter().any(|a| a.to_str() == Some("--detach"));
             let name = args
                 .iter()
                 .filter_map(|a| a.to_str())
                 .find(|a| !a.starts_with('-'));
             let Some(name) = name else {
                 eprintln!(
-                    "ops: usage: ops app <name> | ops app <import <file> [--as <name>] [--force] \
-                     | export | rm <name> | list>"
+                    "ops: usage: ops app <name> [--detach] | ops app <import <file> [--as <name>] \
+                     [--force] | export | rm <name> | list>"
                 );
                 return ExitCode::from(2);
             };
-            sandbox::app(name)
+            sandbox::app(name, detach)
         }
     }
 }

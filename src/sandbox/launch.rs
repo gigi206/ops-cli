@@ -32,6 +32,7 @@ use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -72,26 +73,58 @@ struct Prepared {
 
 /// `ops run [--] <cmd>`: run a command inside the project sandbox, replacing the
 /// ops process so the command's exit status becomes ops's.
-pub(crate) fn run(cmd: Vec<OsString>) -> ExitCode {
+pub(crate) fn run(cmd: Vec<OsString>, detach: bool) -> ExitCode {
     if cmd.is_empty() {
-        eprintln!("ops: usage: ops run [--] <command> [args...]");
+        eprintln!("ops: usage: ops run [--detach] [--] <command> [args...]");
         return ExitCode::from(2);
     }
     let prep = match prepare() {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let (spec, egress) = match build(&prep, binds::Runtime::ProjectDefault, cmd) {
+    launch(
+        prep,
+        binds::Runtime::ProjectDefault,
+        Kind::Run,
+        cmd,
+        detach,
+        "run",
+    )
+}
+
+/// Build the cage, register it, and run it — either in the foreground (this process becomes or
+/// supervises the cage) or detached into a background daemon. The single seam `run`, `app`, and
+/// the mise passthrough share, so the build → register → launch sequence is identical on both
+/// paths and lives in one place. `label` names the session in the detached startup message.
+fn launch(
+    prep: Prepared,
+    runtime: binds::Runtime,
+    kind: Kind,
+    cmd: Vec<OsString>,
+    detach: bool,
+    label: &str,
+) -> ExitCode {
+    if detach {
+        launch_detached(prep, runtime, kind, cmd, label)
+    } else {
+        launch_foreground(prep, runtime, kind, cmd)
+    }
+}
+
+/// Run the cage in the foreground: this process becomes the cage (exec) or supervises it
+/// (allowlist), and its exit status becomes ops's.
+fn launch_foreground(
+    prep: Prepared,
+    runtime: binds::Runtime,
+    kind: Kind,
+    cmd: Vec<OsString>,
+) -> ExitCode {
+    let (spec, egress) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };
 
-    register(
-        prep.layout.data_dir(),
-        &spec,
-        Kind::Run,
-        binds::Runtime::ProjectDefault,
-    );
+    register(prep.layout.data_dir(), &spec, kind, runtime);
 
     match egress {
         // The default postures: exec-replace, so the command's exit status becomes ops's.
@@ -115,12 +148,244 @@ pub(crate) fn run(cmd: Vec<OsString>) -> ExitCode {
     }
 }
 
+/// The byte the detached child writes to the readiness pipe once the cage is built, registered,
+/// and its log is open — the parent treats any other outcome (a closed pipe, no byte) as failure.
+const DETACH_READY: u8 = 1;
+
+/// Launch the cage as a background daemon and return to the caller's shell once it is ready.
+///
+/// The work is split across a `fork` for one structural reason: under a network allowlist the
+/// cage's host filtering proxy runs on a thread, and a thread does not survive `fork` — only the
+/// forking thread does. So the daemon must call [`build`] (which spawns that thread) *itself*,
+/// after the fork. The process is single-threaded at this point (nothing before [`build`] spawns
+/// a thread), which is what makes it safe for the child to run arbitrary code before `exec`.
+///
+/// A readiness pipe makes the handoff honest rather than blind: the child reports success only
+/// after the cage is built, registered, and its log opened, so the parent returns a real session
+/// id — not "started" for a daemon that then failed to provision with no terminal to show it. Any
+/// setup error is printed to the caller's terminal (the child keeps it until success) before the
+/// daemon redirects its output to the log.
+fn launch_detached(
+    prep: Prepared,
+    runtime: binds::Runtime,
+    kind: Kind,
+    cmd: Vec<OsString>,
+    label: &str,
+) -> ExitCode {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe2` fills the two-element array; `O_CLOEXEC` so neither end leaks into the
+    // eventual `exec` of bwrap.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        eprintln!(
+            "ops: cannot create the detach pipe: {}",
+            io::Error::last_os_error()
+        );
+        return ExitCode::FAILURE;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    // SAFETY: the process is single-threaded here, so the child may safely run code (allocate,
+    // build the cage, spawn the proxy thread) before any `exec`.
+    match unsafe { libc::fork() } {
+        -1 => {
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            eprintln!(
+                "ops: cannot start the detached session: {}",
+                io::Error::last_os_error()
+            );
+            ExitCode::FAILURE
+        }
+        0 => {
+            // Child: the parent's read end is not ours.
+            unsafe { libc::close(read_fd) };
+            detached_child(prep, runtime, kind, cmd, write_fd)
+        }
+        child => {
+            // Parent: the child's write end is not ours.
+            unsafe { libc::close(write_fd) };
+            detach_parent(read_fd, child, prep.layout.data_dir(), label)
+        }
+    }
+}
+
+/// The daemon body. Detaches from the controlling terminal, builds and registers the cage with
+/// its output still on the terminal (so setup errors are visible), signals readiness, then
+/// redirects to the session log and runs the cage. Never returns: every path ends in `exec`
+/// (which replaces the process) or [`std::process::exit`], so the parent's tail logic can never
+/// run a second time in the child.
+fn detached_child(
+    prep: Prepared,
+    runtime: binds::Runtime,
+    kind: Kind,
+    cmd: Vec<OsString>,
+    write_fd: libc::c_int,
+) -> ! {
+    // A new session with no controlling terminal: closing the launching terminal will not SIGHUP
+    // the daemon, and it is no longer in that terminal's foreground process group.
+    // SAFETY: `setsid` in the freshly forked child.
+    unsafe { libc::setsid() };
+    // The daemon reads no input; take stdin off the terminal now. stdout/stderr stay on the
+    // terminal through build/register so provisioning progress and any error are seen live.
+    redirect_stdin_to_null();
+
+    let (spec, egress) = match build(&prep, runtime, cmd) {
+        Ok(v) => v,
+        // `build` already printed the cause to the terminal; close the pipe (no readiness byte)
+        // so the parent reports failure.
+        Err(_) => fail_detached(write_fd),
+    };
+    register(prep.layout.data_dir(), &spec, kind, runtime);
+
+    // Open the session log before signalling ready: a daemon whose output we cannot capture is
+    // not ready. Its name is keyed by this process's pid — the session id the parent reports.
+    let log_path = detach_log_path(prep.layout.data_dir(), std::process::id());
+    let log = match open_detach_log(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "ops: cannot open the session log {}: {e}",
+                log_path.display()
+            );
+            fail_detached(write_fd);
+        }
+    };
+
+    // Ready: tell the parent, then hand stdout/stderr to the log and drop the pipe.
+    signal_detach_ready(write_fd);
+    redirect_to_log(&log);
+    unsafe { libc::close(write_fd) };
+    // The log fd is now duplicated onto 1/2; the owning handle is no longer needed.
+    drop(log);
+
+    match egress {
+        None => {
+            // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
+            let err = exec(&prep.bwrap, &spec);
+            eprintln!("ops: failed to launch the sandbox: {err}");
+            std::process::exit(1);
+        }
+        Some(guard) => {
+            // Supervise: this daemon is the long-lived parent the proxy thread and bwrap
+            // (`--die-with-parent`) hang from. Drop the guard explicitly before exiting — a bare
+            // `process::exit` runs no destructors, so the socket and CA would otherwise leak even
+            // on a clean exit.
+            let code = run_status(&prep.bwrap, &spec);
+            drop(guard);
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Wait for the daemon's readiness byte, then report. On success the daemon is reparented to init
+/// and runs on; the parent must *not* `waitpid` it (that would block until the agent exits and
+/// defeat detaching). On failure the daemon has already exited after printing its error, so reap
+/// it to avoid a zombie.
+fn detach_parent(
+    read_fd: libc::c_int,
+    child: libc::pid_t,
+    data_dir: &Path,
+    label: &str,
+) -> ExitCode {
+    // A `File` over the owned read end: its `read` retries `EINTR`, and dropping it closes the fd.
+    // SAFETY: `read_fd` is a fresh fd we own and do not use elsewhere.
+    let mut pipe = unsafe { File::from_raw_fd(read_fd) };
+    let mut byte = [0u8; 1];
+    use std::io::Read;
+    if matches!(pipe.read(&mut byte), Ok(1) if byte[0] == DETACH_READY) {
+        let log = detach_log_path(data_dir, child as u32);
+        eprintln!(
+            "ops: started `{label}` as detached session {child} (logs: {})",
+            log.display()
+        );
+        eprintln!(
+            "ops: `ops ps` lists it, `ops attach {child}` opens a shell beside it, \
+             `ops stop {child}` ends it."
+        );
+        ExitCode::SUCCESS
+    } else {
+        // The daemon closed the pipe without signalling success: it failed before launch (the
+        // error is already on this terminal). Reap it.
+        // SAFETY: `waitpid` on our own child.
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        eprintln!("ops: the detached session failed to start (see the error above).");
+        ExitCode::FAILURE
+    }
+}
+
+/// The detached session's log file: `<data>/logs/<pid>.log`, keyed by the daemon's pid (the
+/// session id). Shared by the daemon (which writes it) and the parent (which reports its path).
+fn detach_log_path(data_dir: &Path, pid: u32) -> PathBuf {
+    data_dir.join("logs").join(format!("{pid}.log"))
+}
+
+/// Open (creating, owner-only, appending) the detached session's log, making `<data>/logs` if
+/// absent. Append so a reused pid's log is added to rather than truncating a still-relevant one.
+fn open_detach_log(path: &Path) -> io::Result<File> {
+    use std::fs::{DirBuilder, OpenOptions};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if let Some(parent) = path.parent() {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Close the readiness pipe without a success byte and exit non-zero — the daemon failed to set
+/// up. The parent sees the pipe close as failure.
+fn fail_detached(write_fd: libc::c_int) -> ! {
+    unsafe { libc::close(write_fd) };
+    std::process::exit(1);
+}
+
+/// Write the readiness byte to the pipe. A short or failed write is non-fatal: the parent then
+/// observes the pipe close as failure, which is the safe interpretation.
+fn signal_detach_ready(write_fd: libc::c_int) {
+    let byte = [DETACH_READY];
+    // SAFETY: writing one byte to a pipe end we own.
+    unsafe {
+        libc::write(write_fd, byte.as_ptr() as *const libc::c_void, 1);
+    }
+}
+
+/// Point stdin at `/dev/null` (best-effort): the daemon reads no input.
+fn redirect_stdin_to_null() {
+    // SAFETY: open `/dev/null` read-only and dup it onto fd 0; a failure leaves the inherited fd.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        if null >= 0 {
+            libc::dup2(null, 0);
+            if null != 0 {
+                libc::close(null);
+            }
+        }
+    }
+}
+
+/// Point stdout and stderr at the open log file: the daemon's runtime output goes there.
+fn redirect_to_log(log: &File) {
+    let fd = log.as_raw_fd();
+    // SAFETY: dup the log fd onto stdout and stderr.
+    unsafe {
+        libc::dup2(fd, 1);
+        libc::dup2(fd, 2);
+    }
+}
+
 /// `ops app <name>`: launch the named application profile — the project sandbox baseline
 /// plus the app's gated overlay, running the command the app declares. Apps run in the same
 /// locked-down posture as `ops run`; the overlay's security fields took effect only if their
 /// source was trusted (the global config or a trusted project), so launching an app on
 /// untrusted code is as safe as `ops run` there.
-pub(crate) fn app(name: &str) -> ExitCode {
+pub(crate) fn app(name: &str, detach: bool) -> ExitCode {
     let mut prep = match prepare() {
         Ok(p) => p,
         Err(code) => return code,
@@ -146,25 +411,7 @@ pub(crate) fn app(name: &str) -> ExitCode {
     eprintln!("ops: launching app `{name}`");
     prep.cfg.merge_app(app);
 
-    let (spec, egress) = match build(&prep, runtime, cmd) {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-
-    register(prep.layout.data_dir(), &spec, Kind::Run, runtime);
-
-    match egress {
-        None => {
-            let err = exec(&prep.bwrap, &spec);
-            eprintln!("ops: failed to launch the sandbox: {err}");
-            ExitCode::FAILURE
-        }
-        Some(guard) => {
-            let code = run_supervised(&prep.bwrap, &spec);
-            drop(guard);
-            code
-        }
-    }
+    launch(prep, runtime, Kind::Run, cmd, detach, name)
 }
 
 /// A suffix for the "no such app" error: " (available: a, b)" listing the configured app
@@ -196,7 +443,7 @@ fn available_apps(cfg: &crate::config::Resolved) -> String {
 pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
     let mut cmd = vec![OsString::from("mise")];
     cmd.extend(args);
-    run(cmd)
+    run(cmd, false)
 }
 
 /// Which persistent home a `mise:` package group is equipped in, owning its app name so a
@@ -2638,5 +2885,13 @@ mod tests {
             err.to_string().contains("pty supervisor"),
             "exec must refuse a private-tty spec; got: {err}"
         );
+    }
+
+    #[test]
+    fn detach_log_path_is_keyed_by_pid_under_logs() {
+        // The daemon and the reporting parent must agree on the log location; both derive it from
+        // the session pid, so this is the single source of that name.
+        let path = detach_log_path(Path::new("/var/lib/ops"), 4242);
+        assert_eq!(path, PathBuf::from("/var/lib/ops/logs/4242.log"));
     }
 }
