@@ -648,9 +648,23 @@ mod tests {
         );
         let file = dir.join("prod.enc.yaml");
         std::fs::write(&file, "anything").unwrap();
-        let got = run_sops(&sops, &file, Some("github.token"), "Authorization")
-            .unwrap()
-            .unwrap();
+        // The fake `sops` is written then immediately executed. Under the parallel test runner,
+        // another thread's `fork` can momentarily hold the just-written file open for write, so
+        // `execve` transiently fails with ETXTBSY ("text file busy") — a property of running a
+        // freshly-written executable in a multithreaded process, not of `run_sops` (production
+        // `sops` is an installed binary). Retry briefly on that spawn error so the test is
+        // deterministic; a genuine decrypt/extract error persists and still fails.
+        let mut attempt = run_sops(&sops, &file, Some("github.token"), "Authorization");
+        for _ in 0..100 {
+            match &attempt {
+                Err(e) if e.to_string().contains("could not run sops") => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    attempt = run_sops(&sops, &file, Some("github.token"), "Authorization");
+                }
+                _ => break,
+            }
+        }
+        let got = attempt.unwrap().unwrap();
         assert_eq!(got, "ghp-the-secret-value");
         let args = std::fs::read_to_string(&args_log).unwrap();
         assert!(
