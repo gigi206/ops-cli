@@ -1,17 +1,20 @@
-//! Provisioning a project's declared tools into ops's store.
+//! Provisioning a project's declared tools.
 //!
-//! A project (or the global config) names tools as `name = "<nixpkgs attribute>"`.
-//! This module realises the *admitted* ones against the pinned nixpkgs and reports
-//! the `bin` directories to prepend to the sandbox `PATH`.
+//! A project (or the global config) names tools as `name = "<backend>:<locator>"`. This
+//! module handles the **`nix:`** ones — realising each admitted nixpkgs attribute against
+//! the pinned nixpkgs into ops's store and reporting the `bin` directories to prepend to
+//! the sandbox `PATH`. The **`mise:`** and **`flake:`** ones are not realised here: they
+//! are equipped in-cage at launch — [`mise_packages`] collects the mise tokens (`mise use
+//! -g`), [`flake_packages`] the `(name, ref)` of the flake packages (`nix build
+//! --out-link`).
 //!
-//! Admission is a security decision: realising a tool can run a build, so an
-//! untrusted project's tools are withheld until the project is trusted. (A later
-//! relaxation will admit an untrusted tool when it needs no build, only a fetch
-//! from the signed cache — the build-vs-fetch gate.) A declared tool is a stated
-//! requirement, so a failure to realise an *admitted* one is a hard error naming
-//! the attribute — never a silent drop, unlike a best-effort bind.
+//! Admission is a security decision for every backend: provisioning a tool can fetch or
+//! build, so an untrusted project's packages are withheld until the project is trusted.
+//! A declared `nix:` tool is a stated requirement, so a failure to realise an *admitted*
+//! one is a hard error naming the attribute — never a silent drop, unlike a best-effort
+//! bind.
 
-use crate::config::{untrusted_reason, Package, PROJECT_CONFIG};
+use crate::config::{untrusted_reason, Backend, Package, PROJECT_CONFIG};
 use crate::store::{self, Layout};
 use crate::trust::TrustState;
 use std::io;
@@ -89,13 +92,18 @@ pub(crate) fn provision(
     let mut bins = Vec::with_capacity(admitted.len());
     let mut roots = Vec::with_capacity(admitted.len());
     for p in admitted {
+        // A `mise:` package is equipped in-cage by `mise use -g` at launch, not host-side;
+        // only the `nix:` ones are realised here.
+        let Backend::Nix(attr) = &p.backend else {
+            continue;
+        };
         // A declared tool is a requirement: surface a realisation failure naming the
         // package and attribute, never drop it silently.
-        let logical = store::provision(nix, layout, &gcroots.join(&p.name), nixpkgs, &p.attr, BIN)
+        let logical = store::provision(nix, layout, &gcroots.join(&p.name), nixpkgs, attr, BIN)
             .map_err(|e| {
                 io::Error::other(format!(
-                    "cannot provision package `{}` ({}): {e}",
-                    p.name, p.attr
+                    "cannot provision package `{}` ({attr}): {e}",
+                    p.name
                 ))
             })?;
         bins.push(logical.join(BIN));
@@ -108,6 +116,39 @@ pub(crate) fn provision(
     })
 }
 
+/// The mise tokens of the *admitted* `mise:` packages — the ones the launcher equips
+/// in-cage globally with `mise use -g`. Trusted-only, exactly like the host-side `nix:`
+/// path: an untrusted project's `mise:` package is dropped here (its withholding is
+/// warned once by [`provision`]'s admission, so this stays a quiet pure filter). The
+/// token is what follows `mise:`, passed to mise verbatim.
+pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::Mise(token) => Some(token.clone()),
+            Backend::Nix(_) | Backend::Flake(_) => None,
+        })
+        .collect()
+}
+
+/// The `(name, ref)` of the *admitted* `flake:` packages — the ones the launcher builds
+/// in-cage with `nix build --out-link`. Trusted-only, like the host-side `nix:` path and the
+/// global `mise:` one: an untrusted project's `flake:` package is dropped here (its
+/// withholding is warned once by [`provision`]'s admission, so this stays a quiet pure
+/// filter). The name keys the per-package out-link under the home; the ref is the flake
+/// reference passed to nix positionally.
+pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::Flake(reference) => Some((p.name.clone(), reference.clone())),
+            Backend::Nix(_) | Backend::Mise(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,7 +156,23 @@ mod tests {
     fn package(name: &str, attr: &str, state: TrustState) -> Package {
         Package {
             name: name.to_string(),
-            attr: attr.to_string(),
+            backend: Backend::Nix(attr.to_string()),
+            state,
+        }
+    }
+
+    fn mise_package(name: &str, token: &str, state: TrustState) -> Package {
+        Package {
+            name: name.to_string(),
+            backend: Backend::Mise(token.to_string()),
+            state,
+        }
+    }
+
+    fn flake_package(name: &str, reference: &str, state: TrustState) -> Package {
+        Package {
+            name: name.to_string(),
+            backend: Backend::Flake(reference.to_string()),
             state,
         }
     }
@@ -150,5 +207,63 @@ mod tests {
         let (admitted, warnings) = admit(&[]);
         assert!(admitted.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn mise_packages_returns_only_trusted_mise_tokens() {
+        let pkgs = [
+            mise_package(
+                "claude-code",
+                "aqua:anthropics/claude-code",
+                TrustState::Trusted,
+            ),
+            package("node", "nodejs_20", TrustState::Trusted), // a nix package is not a mise token
+            mise_package("evil", "aqua:attacker/x", TrustState::Untrusted), // untrusted: dropped
+            mise_package("opencode", "opencode", TrustState::Trusted),
+        ];
+        // Trusted `mise:` tokens only, in declaration order; nix, flake, and untrusted are excluded.
+        let pkgs_with_flake = [
+            pkgs[0].clone(),
+            flake_package(
+                "hermes",
+                "github:NousResearch/hermes-agent#tui",
+                TrustState::Trusted,
+            ),
+        ];
+        assert_eq!(
+            mise_packages(&pkgs),
+            vec![
+                "aqua:anthropics/claude-code".to_string(),
+                "opencode".to_string()
+            ]
+        );
+        assert_eq!(
+            mise_packages(&pkgs_with_flake),
+            vec!["aqua:anthropics/claude-code".to_string()],
+            "a flake package is not a mise token"
+        );
+    }
+
+    #[test]
+    fn flake_packages_returns_only_trusted_flake_refs_by_name() {
+        let pkgs = [
+            flake_package(
+                "hermes",
+                "github:NousResearch/hermes-agent#tui",
+                TrustState::Trusted,
+            ),
+            package("node", "nodejs_20", TrustState::Trusted), // a nix package is not a flake ref
+            mise_package("opencode", "opencode", TrustState::Trusted), // nor a mise token
+            flake_package("evil", "github:attacker/x#bin", TrustState::Untrusted), // untrusted: dropped
+        ];
+        // Trusted `flake:` (name, ref) pairs only, in declaration order; nix, mise, and
+        // untrusted are excluded.
+        assert_eq!(
+            flake_packages(&pkgs),
+            vec![(
+                "hermes".to_string(),
+                "github:NousResearch/hermes-agent#tui".to_string()
+            )]
+        );
     }
 }

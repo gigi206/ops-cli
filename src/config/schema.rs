@@ -20,9 +20,12 @@ pub(crate) struct RawConfig {
     /// Extra host paths to expose read-only inside the sandbox.
     #[serde(default)]
     pub(crate) binds: Vec<String>,
-    /// Tools to provision into the sandbox, as `name = "<nixpkgs attribute>"`. The
-    /// name is a free label — the merge key across layers and the on-disk root name;
-    /// the value is the nixpkgs attribute to realise (e.g. `nodejs_20`).
+    /// Tools to provision into the sandbox, as `name = "<backend>:<locator>"`. The name
+    /// is a free label — the merge key across layers and the on-disk root name; the value
+    /// carries a mandatory backend prefix (parsed downstream, not here): `nix:<attribute>`
+    /// for a nixpkgs attribute provisioned host-side (e.g. `nix:nodejs_20`), or
+    /// `mise:<token>` for a mise backend equipped in-cage (e.g. `mise:aqua:openai/codex`).
+    /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, String>,
     /// Override the nixpkgs reference the tools resolve against: a branch/channel
@@ -71,8 +74,9 @@ pub(crate) struct RawApp {
     /// Extra host paths to bind read-only for this app. A security field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) binds: Vec<String>,
-    /// Extra tools to provision for this app, `name = "<nixpkgs attribute>"`, overriding a
-    /// baseline tool of the same name.
+    /// Extra tools to provision for this app, `name = "<backend>:<locator>"` (the same
+    /// backend-prefixed form as the baseline `packages`), overriding a baseline tool of the
+    /// same name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) packages: BTreeMap<String, String>,
     /// The app's network posture, overriding the baseline's when set. A security field.
@@ -401,7 +405,7 @@ mod tests {
             [env]
             FOO = "bar"
             [packages]
-            claude-code = "claude-code"
+            claude-code = "mise:aqua:anthropics/claude-code"
             [network]
             mode = "allowlist"
             allow = ["api.anthropic.com", "*.nixos.org"]

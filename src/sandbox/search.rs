@@ -209,7 +209,7 @@ fn render(query: &str, matches: &[Match], exact: Option<&Exact>, system: &str) -
             out.push_str(&format!(
                 "  [tools]     \"nix:{pkg}\" = \"{latest}\"   (or \"latest\")\n"
             ));
-            out.push_str(&format!("  [packages]  {pkg} = \"{attr}\"\n"));
+            out.push_str(&format!("  [packages]  {pkg} = \"nix:{attr}\"\n"));
             push_related(&mut out, pkg, matches);
         }
         // The query named a real package, but it ships no build for this host.
@@ -394,9 +394,10 @@ mod tests {
         assert!(out.contains("`jq`: JSON processor"));
         assert!(out.contains("versions for x86_64-linux"));
         assert!(out.contains("1.8.1") && out.contains("aaaaaaa"));
-        // both declaration forms, pinned to the newest version / its attribute
+        // both declaration forms, pinned to the newest version / its attribute (the
+        // `[packages]` form now carries the mandatory `nix:` backend prefix)
         assert!(out.contains("\"nix:jq\" = \"1.8.1\""));
-        assert!(out.contains("jq = \"jq\""));
+        assert!(out.contains("jq = \"nix:jq\""));
         // the sibling hits follow as a compact footer, the exact one excluded
         assert!(out.contains("related: ") && out.contains("jq-lsp"));
         assert!(

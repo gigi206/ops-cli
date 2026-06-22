@@ -69,17 +69,31 @@ pub(crate) struct Pin {
     pub(crate) version: String,
 }
 
-/// A project's declared `[tools]`, split by whether ops handles them: the valid `nix:`
-/// tools to resolve (in precedence order, the first declaration of a token winning),
-/// and the tokens declared through any other backend (or malformed `nix:` ones), which
-/// ops does not provision and the caller surfaces as a warning.
+/// A tool declared through a mise backend other than `nix:` (a backend prefix such as
+/// `aqua:`/`github:`/`npm:`, or a plain registry tool like `node`). ops does not
+/// host-provision these; the launcher auto-equips them in-cage via mise, so the token is
+/// kept exactly as written together with its requested version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MiseTool {
+    /// The tool token as written in the mise file, e.g. `aqua:BurntSushi/ripgrep` or `node`.
+    pub(crate) token: String,
+    /// The requested version: a concrete version, or an alias such as `latest`.
+    pub(crate) version: String,
+}
+
+/// A project's declared `[tools]`, split by how ops handles each: the valid `nix:` tools
+/// it resolves and host-provisions (in precedence order, the first declaration of a token
+/// winning); the tools for any other mise backend it auto-equips in-cage; and the `nix:`
+/// tokens it cannot resolve. Every token lands in exactly one bucket — none is dropped.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeclaredTools {
     /// The `nix:` tools ops will resolve and provision, highest precedence first.
     pub(crate) nix: Vec<NixTool>,
-    /// Tool tokens not handled here — a non-`nix:` backend, or a `nix:` token with a
-    /// malformed package name or version. Reported, never silently dropped.
-    pub(crate) other: Vec<String>,
+    /// Tools for another mise backend, auto-equipped in-cage (kept with their version).
+    pub(crate) non_nix: Vec<MiseTool>,
+    /// `nix:` tokens ops cannot resolve (a malformed package name or version), reported so
+    /// the declaration can be fixed.
+    pub(crate) malformed: Vec<String>,
 }
 
 /// Parse the `nix:` tools out of a project's mise files. `files` are the authorized
@@ -109,9 +123,12 @@ pub(crate) fn parse_nix_tools(files: &[(String, Vec<u8>)]) -> DeclaredTools {
                         version,
                     });
                 }
-                // a `nix:` token we cannot safely resolve, or a non-`nix:` backend:
-                // not handled here, surfaced so the caller can warn.
-                _ => out.other.push(token),
+                // a `nix:` token whose package name or version cannot be safely resolved:
+                // surfaced so the declaration can be fixed.
+                Some(_) => out.malformed.push(token),
+                // any other backend (or a plain registry tool): not host-provisioned, but
+                // auto-equipped in-cage by mise — kept with its version for the install.
+                None => out.non_nix.push(MiseTool { token, version }),
             }
         }
     }
@@ -180,16 +197,16 @@ pub(crate) fn current_system() -> String {
 }
 
 /// Provision a trusted project's declared `nix:` tools into ops's store and report the
-/// `bin` directories to prepend to the sandbox PATH, plus warnings for anything not
-/// provisioned. Resolution is cached in a per-project lock so nixhub is queried once
+/// `bin` directories to prepend to the sandbox PATH, plus a warning for any malformed
+/// `nix:` token. Resolution is cached in a per-project lock so nixhub is queried once
 /// per `(tool, version)` rather than on every launch — seeded then reused, like the
 /// channel lock, so a launch is reproducible and works offline after the first.
 ///
-/// Trusted-only for now: an untrusted project's tools are withheld with a hint (the
-/// open-cage model where the agent self-provisions is a later, deliberate relaxation).
-/// A tool declared through any other backend is reported, never silently dropped. A
-/// declared, admitted tool that fails to resolve or realise is a hard error naming it —
-/// a stated requirement, unlike a best-effort bind.
+/// `nix:` provisioning is trusted-only: an untrusted project's `nix:` tools are withheld
+/// with a hint. A tool declared through any other backend is *not* handled here — the
+/// launcher auto-equips it in-cage via mise (the open self-equip path), so it is neither
+/// provisioned nor warned about here. A declared, admitted `nix:` tool that fails to resolve
+/// or realise is a hard error naming it — a stated requirement, unlike a best-effort bind.
 pub(crate) fn provision(
     nix: &Path,
     layout: &Layout,
@@ -200,9 +217,11 @@ pub(crate) fn provision(
 ) -> io::Result<Provisioned> {
     let declared = parse_nix_tools(files);
     let mut warnings = Vec::new();
-    for token in &declared.other {
+    // A non-`nix:` backend is not a problem — the launcher auto-equips it in-cage via mise —
+    // so it is not warned here. A malformed `nix:` token cannot be resolved, so it is.
+    for token in &declared.malformed {
         warnings.push(format!(
-            "tool `{token}` is not provisioned by ops (only `nix:` tools are — use `nix:<pkg>` or `[packages]`)"
+            "tool `{token}` has a malformed `nix:` name or version and cannot be resolved — fix the declaration or use `[packages]`"
         ));
     }
     if declared.nix.is_empty() {
@@ -320,9 +339,10 @@ pub(crate) enum ToolUpgrade {
     },
     /// A lock entry for a tool no longer declared on this system, dropped from the lock.
     Pruned { pkg: String, request: String },
-    /// A declared token ops does not roll — a non-`nix:` backend, or a malformed `nix:`
-    /// token — reported so it is never a silent omission.
-    Ignored { token: String },
+    /// A declared token `ops upgrade` does not roll, reported so it is never a silent
+    /// omission. `mise_managed` distinguishes a tool for another mise backend (equipped
+    /// in-cage, so mise tracks its freshness) from a malformed `nix:` token (unresolvable).
+    Ignored { token: String, mise_managed: bool },
 }
 
 /// Re-resolve a trusted project's declared `nix:` tools against nixhub and rewrite the
@@ -422,8 +442,17 @@ pub(crate) fn upgrade_tools(
         outcomes.push(ToolUpgrade::Pruned { pkg, request });
     }
 
-    for token in declared.other {
-        outcomes.push(ToolUpgrade::Ignored { token });
+    for tool in declared.non_nix {
+        outcomes.push(ToolUpgrade::Ignored {
+            token: tool.token,
+            mise_managed: true,
+        });
+    }
+    for token in declared.malformed {
+        outcomes.push(ToolUpgrade::Ignored {
+            token,
+            mise_managed: false,
+        });
     }
 
     lock.write(&lock_path)?;
@@ -733,9 +762,17 @@ mod tests {
                 },
             ]
         );
-        // the non-`nix:` backends are reported, never silently dropped
-        assert!(got.other.contains(&"node".to_string()));
-        assert!(got.other.contains(&"npm:prettier".to_string()));
+        // the non-`nix:` backends are kept with their version (the launcher auto-equips
+        // them in-cage), never silently dropped
+        assert!(got.non_nix.contains(&MiseTool {
+            token: "node".into(),
+            version: "18".into()
+        }));
+        assert!(got.non_nix.contains(&MiseTool {
+            token: "npm:prettier".into(),
+            version: "3".into()
+        }));
+        assert!(got.malformed.is_empty());
     }
 
     #[test]
@@ -783,7 +820,13 @@ mod tests {
                 version: "20.11.0".into()
             }]
         );
-        assert_eq!(got.other, vec!["python".to_string()]);
+        assert_eq!(
+            got.non_nix,
+            vec![MiseTool {
+                token: "python".into(),
+                version: "3.12".into()
+            }]
+        );
     }
 
     #[test]
@@ -809,7 +852,9 @@ mod tests {
         let f = files(&[(".mise.toml", "[tools]\n\"nix:bad name\" = \"1\"\n")]);
         let got = parse_nix_tools(&f);
         assert!(got.nix.is_empty());
-        assert_eq!(got.other, vec!["nix:bad name".to_string()]);
+        // a malformed `nix:` token is reported as such — distinct from a non-`nix:` backend
+        assert_eq!(got.malformed, vec!["nix:bad name".to_string()]);
+        assert!(got.non_nix.is_empty());
     }
 
     /// Captured nixhub metadata shape (trimmed), in nixhub's real order — **newest
@@ -966,13 +1011,15 @@ mod resolve_tests {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         let proj = TmpDir::new();
-        // a `nix:` tool ops provisions, beside a non-`nix:` tool it leaves to mise
+        // a `nix:` tool ops provisions, beside a non-`nix:` tool the launcher auto-equips
+        // in-cage (so `provision` neither realises nor warns about it) and a malformed `nix:`
+        // token it does warn about
         let files = vec![(
             ".mise.toml".to_string(),
-            b"[tools]\n\"nix:jq\" = \"latest\"\nnode = \"20\"\n".to_vec(),
+            b"[tools]\n\"nix:jq\" = \"latest\"\nnode = \"20\"\n\"nix:bad name\" = \"1\"\n".to_vec(),
         )];
 
-        // untrusted: nothing is realised — the nix tool is withheld, the other noted
+        // untrusted: nothing is realised — the nix tool is withheld, the malformed one warned
         let out = provision(&nix, &layout, proj.path(), &files, false, &current_system())
             .expect("untrusted provisioning withholds rather than failing");
         assert!(
@@ -984,7 +1031,16 @@ mod resolve_tests {
             .warnings
             .iter()
             .any(|w| w.contains("withholding") && w.contains("jq")));
-        assert!(out.warnings.iter().any(|w| w.contains("node")));
+        // the malformed `nix:` token is reported; the non-`nix:` `node` is NOT (it is
+        // auto-equipped by the launcher, not provisioned here)
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("malformed") && w.contains("bad name")));
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("node")),
+            "a non-nix: tool is auto-equipped in-cage, so `provision` must not warn about it"
+        );
 
         // trusted: jq is resolved via nixhub and realised onto a bin dir (needs the net)
         let out = match provision(&nix, &layout, proj.path(), &files, true, &current_system()) {
@@ -1089,8 +1145,8 @@ mod resolve_tests {
         assert!(
             outcomes
                 .iter()
-                .any(|o| matches!(o, ToolUpgrade::Ignored { token } if token == "node")),
-            "a non-nix: backend is reported, never silently dropped: {outcomes:?}"
+                .any(|o| matches!(o, ToolUpgrade::Ignored { token, mise_managed: true } if token == "node")),
+            "a non-nix: backend is reported as mise-managed, never silently dropped: {outcomes:?}"
         );
         assert!(
             !outcomes

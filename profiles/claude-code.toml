@@ -3,20 +3,28 @@
 #   ops app import profiles/claude-code.toml
 #   ops app claude-code
 #
-# The tool is provisioned from nixpkgs into the project's own store (no host
-# mutation). Its version tracks your base nix channel — roll it with
-# `ops upgrade nix`.
+# The tool is equipped fresh from upstream (mise's `aqua` backend pulls Anthropic's
+# standalone `claude` release binary) into the app's persistent home — no host
+# mutation, no nixpkgs lag, and none of the unfree-license gate nixpkgs imposes.
+# It is equipped at the latest upstream version on the first launch in a project;
+# advancing an already-installed version is not yet automated by `ops upgrade`.
 cmd = "claude"
 
 [packages]
-claude-code = "claude-code"
+claude-code = "mise:aqua:anthropics/claude-code"
 
-# Egress is denied by construction except the Anthropic API (plus the always-on
-# nix cache, so the toolchain can self-equip). The agent may run on untrusted
-# project code, but it can only reach Anthropic.
+# Egress is denied by construction except the Anthropic API and the one Google Cloud
+# Storage bucket Anthropic ships the `claude` binary from (so the tool can self-equip
+# fresh at first launch). The bucket rule is path-scoped — reads from exactly that
+# bucket, not all of GCS. The agent may run on untrusted project code, but it can only
+# reach these. (If a future `claude-code` release moves buckets, the proxy reports the
+# refused host — add it; check ahead with `ops test net <url>`.)
 [network]
 mode = "allowlist"
-allow = ["api.anthropic.com"]
+allow = [
+    "api.anthropic.com",
+    "storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
+]
 
 # The real API key is read on the HOST and injected into the outbound request by
 # the egress proxy — it never enters the cage. Provide it on the host as

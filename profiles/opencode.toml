@@ -3,7 +3,10 @@
 #   ops app import profiles/opencode.toml
 #   ops app opencode
 #
-# Version tracks your base nix channel — roll it with `ops upgrade nix`.
+# The tool is equipped fresh from upstream (mise's registry resolves `opencode` to
+# its standalone release binary) — no nixpkgs lag. It is equipped at the latest
+# upstream version on the first launch in a project; advancing an already-installed
+# version is not yet automated by `ops upgrade`.
 #
 # opencode is MULTI-PROVIDER, so its egress depends on the model you use. This
 # template is set up for Anthropic; for another provider, change the allowlist and
@@ -13,7 +16,7 @@
 cmd = "opencode"
 
 [packages]
-opencode = "opencode"
+opencode = "mise:opencode"
 
 [network]
 mode = "allowlist"

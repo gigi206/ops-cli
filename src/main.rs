@@ -455,13 +455,30 @@ fn config_cmd() -> ExitCode {
     } else {
         println!("  packages:");
         for p in &resolved.packages {
+            // Show the provider and how it is realised: a `nix:` package is provisioned
+            // host-side into ops's store (durable, offline-reusable); a `mise:` package is
+            // equipped in-cage globally via `mise use -g` (fetched at launch); a `flake:`
+            // package is built in-cage with `nix build` (an uncurated flake, contained by the
+            // cage). All are trusted-only — an untrusted layer's package is withheld whatever
+            // its backend.
+            let realised = match p.backend {
+                config::Backend::Nix(_) => "host-side, durable",
+                config::Backend::Mise(_) => "in-cage via mise, fetched at launch",
+                config::Backend::Flake(_) => "in-cage via nix build, fetched at launch",
+            };
             if p.state == trust::TrustState::Trusted {
-                println!("    {} -> {}", p.name, p.attr);
+                println!(
+                    "    {} -> {}:{}  ({realised})",
+                    p.name,
+                    p.backend.label(),
+                    p.backend.locator()
+                );
             } else {
                 println!(
-                    "    {} -> {}  (withheld: {})",
+                    "    {} -> {}:{}  (withheld: {})",
                     p.name,
-                    p.attr,
+                    p.backend.label(),
+                    p.backend.locator(),
                     config::untrusted_reason(p.state)
                 );
             }
@@ -481,30 +498,51 @@ fn config_cmd() -> ExitCode {
             config::untrusted_reason(m.state)
         ),
     }
-    // The `nix:` tools the project's mise file declares — parsed only (no nixhub query,
-    // no realisation), gated by the same trust as the mise file. Like `packages`, this
-    // shows the launcher's decision without doing the work.
+    // The tools the project's mise file declares — parsed only (no nixhub query, no
+    // realisation). `nix:` tools are host-provisioned and gated by the mise file's trust;
+    // a tool for another backend is auto-equipped in-cage by mise (so it appears regardless
+    // of trust); a malformed `nix:` token is shown as unresolvable. Like `packages`, this
+    // reflects the launcher's decision without doing the work.
     if let Some(m) = &resolved.mise {
         let declared = sandbox::parse_nix_tools(&m.files);
-        if !declared.nix.is_empty() || !declared.other.is_empty() {
-            println!("  tools (nix:):");
+        if !declared.nix.is_empty()
+            || !declared.non_nix.is_empty()
+            || !declared.malformed.is_empty()
+        {
+            println!("  tools:");
             let trusted = m.state == trust::TrustState::Trusted;
             for t in &declared.nix {
                 if trusted {
-                    println!("    {} = {}", t.pkg, t.version);
+                    println!("    nix:{} = {}", t.pkg, t.version);
                 } else {
                     println!(
-                        "    {} = {}  (withheld: {})",
+                        "    nix:{} = {}  (withheld: {})",
                         t.pkg,
                         t.version,
                         config::untrusted_reason(m.state)
                     );
                 }
             }
-            // Non-`nix:` tools are not provisioned by ops; show why, so a `node = "20"`
-            // that never appears on PATH is explained rather than silently absent.
-            for token in &declared.other {
-                println!("    {token}  (ignored: not a `nix:` tool)");
+            // A non-`nix:` tool is equipped in-cage by mise at launch, not host-provisioned —
+            // so it is honored even for an untrusted project (the open self-equip path). Under
+            // `network = "none"` the launch cannot fetch it, so say so rather than over-claim.
+            let net_none = matches!(resolved.network, config::NetworkPolicy::Isolated);
+            for t in &declared.non_nix {
+                if net_none {
+                    println!(
+                        "    {} = {}  (needs network — not equipped under `network = \"none\"`)",
+                        t.token, t.version
+                    );
+                } else {
+                    println!(
+                        "    {} = {}  (equipped in-cage via mise)",
+                        t.token, t.version
+                    );
+                }
+            }
+            // A malformed `nix:` token cannot be resolved; show it so it is not silently absent.
+            for token in &declared.malformed {
+                println!("    {token}  (ignored: malformed nix: token)");
             }
         }
     }
@@ -1970,8 +2008,15 @@ fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade]) -> Vec<String> {
             Pruned { pkg, request } => {
                 format!("  nix:{pkg} ({request}): removed from the lock (no longer declared).")
             }
-            Ignored { token } => {
-                format!("  {token}: not a nix: tool — left to mise, not rolled.")
+            Ignored {
+                token,
+                mise_managed,
+            } => {
+                if *mise_managed {
+                    format!("  {token}: equipped in-cage by mise — not rolled here.")
+                } else {
+                    format!("  {token}: malformed nix: token — cannot resolve.")
+                }
             }
         });
     }
@@ -2342,6 +2387,11 @@ mod tests {
             },
             Ignored {
                 token: "node".into(),
+                mise_managed: true,
+            },
+            Ignored {
+                token: "nix:bad name".into(),
+                mise_managed: false,
             },
         ])
         .join("\n");
@@ -2352,6 +2402,7 @@ mod tests {
         assert!(text.contains("nix:fd: re-resolve failed, kept 9.0.0"));
         assert!(text.contains("nix:bat: re-resolve failed — nixhub unreachable"));
         assert!(text.contains("nix:oldtool (1.0): removed from the lock"));
-        assert!(text.contains("node: not a nix: tool"));
+        assert!(text.contains("node: equipped in-cage by mise — not rolled here"));
+        assert!(text.contains("nix:bad name: malformed nix: token — cannot resolve"));
     }
 }

@@ -727,6 +727,291 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
 }
 
 #[test]
+fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
+    // Multi-backend: a project that declares a non-`nix:` mise tool (here `aqua:`) must have
+    // it auto-installed in-cage at launch and resolvable on PATH — with no manual
+    // `ops mise install` and no `ops trust` (the open self-equip posture). Teeth: `rg` runs
+    // on a plain `ops run` of an UNtrusted project, so the launcher fetched it through mise,
+    // installed it into the project's own store, and resolved it through the shims dir — the
+    // whole auto-equip chain. Skips (never fails) when the host cannot sandbox or the network
+    // is unreachable (the tool is fetched from upstream on first launch).
+    let project = TmpDir::new("equip-proj");
+    let data = TmpDir::new("equip-data");
+    // anchored on an (empty) .ops.toml; the tool is fresh-from-upstream via mise's aqua backend
+    std::fs::write(project.path().join(".ops.toml"), "").unwrap();
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping auto-equip e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping auto-equip e2e: the network is unreachable");
+        return;
+    }
+
+    // untrusted project, plain `ops run` — the tool must still equip and run (open posture).
+    let out = run_in(project.path(), data.path(), &["rg", "--version"]);
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+        "an auto-equipped aqua: tool must run on a plain `ops run` of an untrusted project: {log}"
+    );
+}
+
+#[test]
+fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
+    // The headline posture the shipped profiles use: a non-`nix:` tool auto-equipped under a
+    // trusted `network = "allowlist"`. This is the discriminating case the shared-net test above
+    // cannot reach — it forces BOTH (1) the wrap composition (the auto-equip wrap nests *inside*
+    // the egress wrap, so the forwarder is up before the install fetches) and (2) mise's *own*
+    // reqwest through the MITM proxy on a direct download (aqua fetches from github, already in
+    // the built-in nix-cache allow-set), a TLS path nix:'s libcurl never exercises. Teeth: rg
+    // runs, so mise's reqwest trusted the proxy's per-session CA and the forwarder bridged the
+    // empty netns. Short tags keep the egress socket path under `SUN_LEN`. Skips (never fails)
+    // when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("aql-proj");
+    let data = TmpDir::new("aql-data");
+    let state = TmpDir::new("aql-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net); also seeds the project store.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping auto-equip allowlist e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping auto-equip allowlist e2e: the network is unreachable");
+        return;
+    }
+
+    // trust so the allowlist posture is honored (otherwise it degrades to shared and the MITM
+    // path under test is never exercised).
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "rg", "--version"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+        "an aqua: tool must auto-equip through the MITM proxy under a trusted allowlist — mise's \
+         reqwest must trust the proxy's per-session CA on a direct download: {log}"
+    );
+}
+
+#[test]
+fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
+    // The load-bearing proof of the fresh-profiles increment: an app declaring its tool as a
+    // `[packages] mise:` backend (the form the shipped profiles use) equips it *globally* via
+    // `mise use -g` at the `ops app` launch and runs it fresh, under the app's *own* network
+    // allowlist — claude-code's aqua release fetch rides the built-in nix-cache allow-set
+    // (github / *.githubusercontent.com), never a wide-open net. Teeth: `claude --version` prints
+    // the upstream version through the empty-netns MITM, proving (1) the global `[packages] mise:`
+    // equip path end-to-end, (2) the nixpkgs unfree blocker is gone (this is an aqua standalone
+    // binary, not nixpkgs), and (3) the app's allowlist permits the release fetch. Short tags keep
+    // the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or network.
+    let project = TmpDir::new("fmp-proj");
+    let data = TmpDir::new("fmp-data");
+    let state = TmpDir::new("fmp-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[app.cc]\n\
+         cmd = [\"claude\", \"--version\"]\n\
+         [app.cc.packages]\n\
+         claude-code = \"mise:aqua:anthropics/claude-code\"\n\
+         [app.cc.network]\n\
+         mode = \"allowlist\"\n\
+         allow = [\"api.anthropic.com\", \"storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net); also seeds the project store once.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping fresh `mise:` package app e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping fresh `mise:` package app e2e: the network is unreachable");
+        return;
+    }
+
+    // trust so the app's `[packages] mise:` and its allowlist are honored (otherwise the package
+    // is withheld and the allowlist degrades, and the MITM path under test is never exercised).
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(project.path(), data.path(), state.path(), &["app", "cc"]);
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("Claude Code"),
+        "a fresh `mise:` package app must equip claude-code via `mise use -g` and run it under its \
+         own allowlist (the aqua release fetch riding the nix-cache allow-set): {log}"
+    );
+}
+
+#[test]
+fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link() {
+    // The load-bearing proof of the `flake:` backend, in two phases.
+    //
+    // PHASE 1 (cold build under the allowlist): an app declaring its tool as a
+    // `[packages] flake:<ref>` builds the flake **in-cage** with `nix build --out-link` at the
+    // `ops app` launch — an uncurated third-party flake contained by the cage, not built
+    // host-side like a `nix:` attribute — lands the result on PATH, and runs it under the app's
+    // *own* network allowlist. The ref is a real, pinned flake (`nixpkgs#hello`); `hello` prints
+    // "Hello, world!" through the empty-netns MITM, proving the parse → in-cage build →
+    // out-link-on-PATH → run chain. Honest limitation: this flake's inputs (the nixpkgs tarball
+    // from codeload, the `hello` closure from cache.nixos.org) ride the *built-in* nix-cache
+    // allow-set, so it does NOT exercise a fetch from a host *outside* that set — the uv2nix/PyPI
+    // friction a real profile like hermes hits is a heavier manual validation, not covered here.
+    //
+    // PHASE 2 (warm + offline reuse): the same project is re-launched with `network = "none"` (the
+    // network cut entirely). With no egress, the build *cannot* re-run — so `hello` printing again
+    // proves the warm/offline short-circuit: the out-link persisted in the app's home and its
+    // closure in the per-project store are reused, no re-fetch. This is the teeth for the property
+    // that justified building `nix build --out-link` (not `nix profile install`): a warm launch is
+    // a no-op that works offline.
+    //
+    // Short tags keep the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or
+    // network.
+    let project = TmpDir::new("flk-proj");
+    let data = TmpDir::new("flk-data");
+    let state = TmpDir::new("flk-state");
+    let flake = "flake:github:NixOS/nixpkgs/9ae611a455b90cf061d8f332b977e387bda8e1ca#hello";
+    let toml = |mode: &str, net: &str| {
+        format!(
+            "[app.fk]\n\
+             cmd = [\"hello\"]\n\
+             [app.fk.packages]\n\
+             hello = \"{flake}\"\n\
+             [app.fk.network]\n\
+             mode = \"{mode}\"\n{net}"
+        )
+    };
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        toml("allowlist", "allow = [\"cache.nixos.org\"]\n"),
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net); also seeds the project store once.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping `flake:` package app e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping `flake:` package app e2e: the network is unreachable");
+        return;
+    }
+
+    let trust = |project: &Path| {
+        // trust so the app's `[packages] flake:` and its network posture are honored (both
+        // security fields); editing the network mode re-arms the gate, hence trusting per phase.
+        let t = ops_in(project, data.path(), state.path(), &["trust", ".ops.toml"]);
+        assert!(
+            t.status.success(),
+            "ops trust failed: {}",
+            String::from_utf8_lossy(&t.stderr)
+        );
+    };
+    let launch = || ops_in(project.path(), data.path(), state.path(), &["app", "fk"]);
+
+    // PHASE 1 — cold build under the allowlist.
+    trust(project.path());
+    let cold = launch();
+    let cold_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&cold.stderr),
+        String::from_utf8_lossy(&cold.stdout)
+    );
+    assert!(
+        cold.status.success() && String::from_utf8_lossy(&cold.stdout).contains("Hello, world!"),
+        "phase 1: a `flake:` package app must build the flake in-cage with `nix build --out-link` \
+         and run it under its own allowlist: {cold_log}"
+    );
+
+    // PHASE 2 — cut the network entirely and re-launch: the warm out-link must run offline.
+    std::fs::write(project.path().join(".ops.toml"), toml("none", "")).unwrap();
+    trust(project.path());
+    let warm = launch();
+    let warm_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&warm.stderr),
+        String::from_utf8_lossy(&warm.stdout)
+    );
+    assert!(
+        warm.status.success() && String::from_utf8_lossy(&warm.stdout).contains("Hello, world!"),
+        "phase 2: with `network = \"none\"` (no egress) the warm out-link must run `hello` offline \
+         — a re-fetch is impossible, so this proves the short-circuit reuses the prior build: \
+         {warm_log}"
+    );
+}
+
+#[test]
 fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // The 6.3a integration neither the unit nor the proxy tests can reach: a trusted
     // A `[secret]` entry under a network allowlist must be resolved *host-side* and wired into the

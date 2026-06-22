@@ -191,6 +191,12 @@ pub(crate) fn resolve_userland(
         // PATH (so it does not need to be a user-visible tool), so socat's bin stays off the
         // base PATH above.
         socat_bin: socat.join("bin/socat"),
+        // mise is on the base PATH (the agent drives it), but the auto-equip wrapper invokes
+        // it by absolute path so a persisted `mise` shim cannot shadow it.
+        mise_bin: mise.join("bin/mise"),
+        // nix is on the base PATH too, but the `flake:` build wrapper invokes it by absolute
+        // path for the same reason — a persisted shim must not shadow the build.
+        nix_bin: nix_pkg.join("bin/nix"),
     })
 }
 

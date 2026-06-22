@@ -387,6 +387,19 @@ fn build(
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
 
+    // `flake:` packages are built in-cage at launch (below), not host-provisioned, but their
+    // out-link `bin` directories join PATH now — ahead of the base, like every other declared
+    // tool. The out-link need not exist yet: the in-cage `nix build` creates it before the
+    // command runs, exactly as the mise shims dir is on PATH before mise populates it. Each
+    // out-link is keyed by the (validated) package name under the persistent home.
+    let flake_pkgs = super::packages::flake_packages(&prep.cfg.packages);
+    let mut flake_pairs: Vec<(String, PathBuf)> = Vec::with_capacity(flake_pkgs.len());
+    for (name, reference) in &flake_pkgs {
+        let out_link = binds::flake_out_link(name);
+        bin_paths.push(out_link.join("bin"));
+        flake_pairs.push((reference.clone(), out_link));
+    }
+
     // Seed the project's own writable store with the closure of everything the cage
     // resolves through `/nix` — the base userland plus every provisioned tool — then
     // back `/nix` with it read-write. The cage reads and writes only its own store, so
@@ -406,6 +419,108 @@ fn build(
         writable: true,
     };
 
+    // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two
+    // distinct lanes. The app's `[packages] mise:` tools are durable, trusted-only declarations,
+    // equipped **globally** (`mise use -g`, written to the home's global mise config). The
+    // project's local `.mise.toml` non-`nix:` tools (an `aqua:`/`npm:`/registry backend) are the
+    // **open** self-equip toolchain, equipped **locally** (`mise install`) with the in-cage mise
+    // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
+    // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
+    // up before either install — and both are skipped under `network = "none"`.
+    let mut cmd = cmd;
+    let mut autoequip_env: Vec<(String, String)> = Vec::new();
+    let global_mise = super::packages::mise_packages(&prep.cfg.packages);
+    let auto_equip = auto_equip_tokens(&prep.cfg);
+    if !global_mise.is_empty() || !auto_equip.is_empty() {
+        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
+            // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only
+            // fail). An already-equipped tool still resolves through its persisted shim, so this
+            // is a warning, not a hard error.
+            let declared: Vec<&str> = global_mise
+                .iter()
+                .chain(auto_equip.iter())
+                .map(String::as_str)
+                .collect();
+            eprintln!(
+                "ops: warning: mise tools [{}] are declared but network = \"none\" — they \
+                 cannot be fetched and will be absent unless already equipped",
+                declared.join(", ")
+            );
+        } else {
+            if !auto_equip.is_empty() {
+                eprintln!(
+                    "ops: equipping non-nix tools in-cage via mise: {} (each backend's host must \
+                     be in [network].allow under an allowlist)",
+                    auto_equip.join(", ")
+                );
+                cmd = wrap_mise_equip(
+                    &prep.userland.mise_bin,
+                    &prep.userland.shell_bin,
+                    "install",
+                    &auto_equip,
+                    cmd,
+                );
+                // Tell the in-cage mise to trust the project config so the installed tools
+                // resolve. This applies for the whole launch, so an agent's own `ops mise` in a
+                // project that declares non-`nix:` tools also trusts the project config — a
+                // conscious, slightly wider reach than autoequip alone, and consistent with the
+                // open self-equip posture. A distinct key, so its position in the env layering is
+                // immaterial; a trusted config could still override it (self-harm only).
+                autoequip_env.push((
+                    "MISE_TRUSTED_CONFIG_PATHS".to_string(),
+                    prep.cwd.to_string_lossy().into_owned(),
+                ));
+            }
+            if !global_mise.is_empty() {
+                eprintln!(
+                    "ops: equipping app packages in-cage via mise use -g: {}",
+                    global_mise.join(", ")
+                );
+                cmd = wrap_mise_equip(
+                    &prep.userland.mise_bin,
+                    &prep.userland.shell_bin,
+                    "use -g",
+                    &global_mise,
+                    cmd,
+                );
+            }
+        }
+    }
+
+    // `flake:` packages are built in-cage with `nix build --out-link` — an uncurated
+    // third-party flake is contained by the cage, not built host-side like a curated `nix:`
+    // attribute. The build fetches, so (like the mise equip) it wraps the command *before* the
+    // egress wrap and is skipped under `network = "none"`. The wrap short-circuits when the
+    // out-link is already realised in the project's store, so a warm launch is a no-op and an
+    // already-built tool runs offline.
+    if !flake_pairs.is_empty() {
+        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
+            let names: Vec<&str> = flake_pkgs.iter().map(|(n, _)| n.as_str()).collect();
+            eprintln!(
+                "ops: warning: flake packages [{}] are declared but network = \"none\" — they \
+                 cannot be built and will be absent unless already present",
+                names.join(", ")
+            );
+        } else {
+            eprintln!(
+                "ops: building flake packages in-cage via nix build: {} (each flake's fetch \
+                 host must be in [network].allow under an allowlist)",
+                flake_pkgs
+                    .iter()
+                    .map(|(n, r)| format!("{n} ({r})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            cmd = wrap_flake_equip(
+                &prep.userland.nix_bin,
+                &prep.userland.shell_bin,
+                &binds::flake_roots_dir(),
+                &flake_pairs,
+                cmd,
+            );
+        }
+    }
+
     // A network allowlist runs the Model-B egress path: stand up the host filtering
     // proxy on a per-launch socket, wire the cage to reach it (the bound socket, the
     // CA it trusts, the proxy environment) and wrap the command so the cage starts the
@@ -417,7 +532,6 @@ fn build(
     let mut egress_guard = None;
     let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut egress_env: Vec<(String, String)> = Vec::new();
-    let mut cmd = cmd;
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
         let (guard, wiring) = egress::start(
             &prep.layout,
@@ -446,6 +560,7 @@ fn build(
     let extra_env = extra_cage_env(
         passthrough_env(),
         binds::cacert_env(),
+        autoequip_env,
         mise_env(prep)?,
         egress_env,
         &prep.cfg.env,
@@ -577,11 +692,11 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
 
 /// Provision a trusted project's declared `nix:` mise tools into ops's store and report
 /// the `bin` directories to prepend to PATH, plus warnings. Empty when the project
-/// declares no mise file. An untrusted project's tools are withheld (warned), and a
-/// non-`nix:` tool is left to mise — both surface as warnings the caller prints. A
-/// declared, admitted tool that fails to resolve or realise is fatal, like a native
-/// `[packages]` tool. Resolution is cached per project, so nixhub is queried once per
-/// `(tool, version)` rather than on every launch.
+/// declares no mise file. An untrusted project's `nix:` tools are withheld (warned); a tool
+/// for another backend is auto-equipped in-cage instead (see [`auto_equip_tokens`]), not
+/// host-provisioned here. A declared, admitted `nix:` tool that fails to resolve or realise
+/// is fatal, like a native `[packages]` tool. Resolution is cached per project, so nixhub is
+/// queried once per `(tool, version)` rather than on every launch.
 fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode> {
     let Some(mise_cfg) = &prep.cfg.mise else {
         return Ok(super::packages::Provisioned {
@@ -602,6 +717,109 @@ fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode>
         eprintln!("ops: {e}");
         ExitCode::FAILURE
     })
+}
+
+/// The `<token>@<version>` install specs for the project's non-`nix:` mise tools — the tools
+/// the launcher auto-equips in-cage rather than host-provisioning. Empty when the project
+/// declares no mise file. A pure re-parse of the already-loaded mise files, independent of
+/// the host-side `nix:` path, and trust-independent: this is the open self-equip path, so the
+/// tools are equipped whether or not the project is trusted (the egress allowlist is the
+/// control over where they may be fetched from).
+fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
+    cfg.mise
+        .as_ref()
+        .map(|m| {
+            super::nixhub::parse_nix_tools(&m.files)
+                .non_nix
+                .into_iter()
+                .map(|t| format!("{}@{}", t.token, t.version))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Wrap `cmd` so the cage equips a set of mise tools before running it: a static bash that runs
+/// `mise <verb> <tokens>` (its stdout redirected to stderr so a piped command's stdout stays
+/// clean) and then `exec`s the real command — which therefore stays the cage's main process,
+/// leaving `ops shell`'s pty job control unchanged. The `verb` is an ops-chosen literal
+/// (`install` for the project's local `.mise.toml` tools, `use -g` for the app's `[packages]
+/// mise:` ones); the tokens and the command ride `"$@"` positionally, so only the absolute mise
+/// path, the ops-chosen verb, and the integer token count are interpolated into the script — a
+/// token from an untrusted config can never inject shell. Best-effort: a failed equip does not
+/// abort the command (the missing tool surfaces when it is used), matching the self-equip
+/// posture rather than the host `nix:` hard-fail guarantee.
+fn wrap_mise_equip(
+    mise: &Path,
+    bash: &Path,
+    verb: &str,
+    tokens: &[String],
+    cmd: Vec<OsString>,
+) -> Vec<OsString> {
+    let n = tokens.len();
+    let script = format!(
+        "{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {n}; exec \"$@\"",
+        mise = mise.to_string_lossy(),
+    );
+    let mut out = vec![
+        bash.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from(script),
+        // `$0` — a label; the tokens are `$1..$n`, the command is what remains after `shift`.
+        OsString::from("ops-mise-equip"),
+    ];
+    out.extend(tokens.iter().map(OsString::from));
+    out.extend(cmd);
+    out
+}
+
+/// Wrap `cmd` so the cage builds a set of `flake:` packages before running it: a static bash
+/// that, for each `(ref, out-link)` pair, runs `nix build <ref> --out-link <out-link>` unless
+/// the out-link is already realised, then `exec`s the real command (which stays the cage's
+/// main process, leaving `ops shell`'s pty job control unchanged). Only the absolute `nix`
+/// path, the out-link parent directory, and the integer pair count are interpolated into the
+/// script — the refs and out-links ride `"$@"` positionally, so a flake ref from config can
+/// never inject shell. The short-circuit `[ -e "$out/bin" ]` dereferences the out-link symlink
+/// into the cage's `/nix` (the per-project store): a path already present skips the build (a
+/// warm no-op that also works offline), while a dangling cross-project out-link (the
+/// `home_scope = "global"` residual) rebuilds. Best-effort: a failed build does not abort the
+/// command (the missing tool surfaces when it is used), matching the in-cage self-equip posture.
+/// `mkdir` is invoked by name (it resolves to the base coreutils); a persisted tool that shadows
+/// it on PATH would be a trusted layer harming its own cage — the same self-equip self-harm class
+/// already accepted, never a cross-tenant concern.
+fn wrap_flake_equip(
+    nix: &Path,
+    bash: &Path,
+    flake_dir: &Path,
+    pairs: &[(String, PathBuf)],
+    cmd: Vec<OsString>,
+) -> Vec<OsString> {
+    let n = pairs.len();
+    let script = format!(
+        "mkdir -p '{dir}'\n\
+         n={n}\n\
+         while [ \"$n\" -gt 0 ]; do\n\
+         out=\"$2\"\n\
+         [ -e \"$out/bin\" ] || '{nix}' build \"$1\" --out-link \"$out\" 1>&2\n\
+         shift 2\n\
+         n=$((n - 1))\n\
+         done\n\
+         exec \"$@\"",
+        dir = flake_dir.to_string_lossy(),
+        nix = nix.to_string_lossy(),
+    );
+    let mut out = vec![
+        bash.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from(script),
+        // `$0` — a label; the pairs are `$1..$2n`, the command is what remains after the shifts.
+        OsString::from("ops-flake-equip"),
+    ];
+    for (reference, out_link) in pairs {
+        out.push(OsString::from(reference));
+        out.push(out_link.as_os_str().to_os_string());
+    }
+    out.extend(cmd);
+    out
 }
 
 /// Record this sandbox in the on-disk registry so `ops ps` can list it. Best
@@ -908,22 +1126,25 @@ fn passthrough_env() -> Vec<(String, String)> {
 }
 
 /// Layer the cage's extra environment, lowest precedence first: host passthrough, then ops's
-/// hermetic CA bundle, then a trusted project's mise `[env]`, then the egress machinery, then
-/// the `.ops.toml` `[env]`. The assembler upserts these over the structural defaults and takes
-/// the last occurrence of a key, so a later layer wins: the egress proxy's per-session CA
-/// overrides the structural cacert under an allowlist, and a trusted config has the final say
-/// (self-harm only). The CA bundle sits above passthrough on purpose — passthrough is a
-/// separate channel, not filtered by the untrusted-config denylist, so a host CA variable
-/// could otherwise clobber ops's hermetic bundle.
+/// hermetic CA bundle, then the non-`nix:` auto-equip variable, then a trusted project's mise
+/// `[env]`, then the egress machinery, then the `.ops.toml` `[env]`. The assembler upserts
+/// these over the structural defaults and takes the last occurrence of a key, so a later layer
+/// wins: the egress proxy's per-session CA overrides the structural cacert under an allowlist,
+/// and a trusted config has the final say (self-harm only). The CA bundle sits above
+/// passthrough on purpose — passthrough is a separate channel, not filtered by the
+/// untrusted-config denylist, so a host CA variable could otherwise clobber ops's hermetic
+/// bundle.
 fn extra_cage_env(
     passthrough: Vec<(String, String)>,
     cacert: Vec<(String, String)>,
+    autoequip: Vec<(String, String)>,
     mise: Vec<(String, String)>,
     egress: Vec<(String, String)>,
     config: &[(String, String)],
 ) -> Vec<(String, String)> {
     let mut env = passthrough;
     env.extend(cacert);
+    env.extend(autoequip);
     env.extend(mise);
     env.extend(egress);
     env.extend(config.iter().cloned());
@@ -1039,6 +1260,8 @@ mod tests {
             bin_paths: vec![],
             shell_bin: PathBuf::from("/nix/store/bash/bin/bash"),
             socat_bin: PathBuf::from("/nix/store/socat/bin/socat"),
+            mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
+            nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),
         };
         let pkg_roots = [PathBuf::from("/nix/store/jq")];
         let tool_roots = [PathBuf::from("/nix/store/nodejs")];
@@ -1081,7 +1304,7 @@ mod tests {
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
         let egress = vec![("SSL_CERT_FILE".into(), "/opt/ops/egress-ca.pem".into())];
-        let env = extra_cage_env(vec![], cacert.clone(), vec![], egress.clone(), &[]);
+        let env = extra_cage_env(vec![], cacert.clone(), vec![], vec![], egress.clone(), &[]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/opt/ops/egress-ca.pem"),
@@ -1089,7 +1312,7 @@ mod tests {
         );
 
         let cfg = vec![("SSL_CERT_FILE".into(), "/cfg/ca.pem".into())];
-        let env = extra_cage_env(vec![], cacert, vec![], egress, &cfg);
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], egress, &cfg);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/cfg/ca.pem"),
@@ -1101,12 +1324,155 @@ mod tests {
             "SSL_CERT_FILE".into(),
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], &[]);
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], &[]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/etc/ssl/certs/ca-bundle.crt"),
             "without egress the hermetic cacert is the trust anchor"
         );
+    }
+
+    #[test]
+    fn auto_equip_tokens_formats_non_nix_tools_and_ignores_trust() {
+        // no mise file → nothing to equip
+        assert!(auto_equip_tokens(&resolved(None, None)).is_empty());
+
+        // a mise file mixing a `nix:` tool (host-provisioned), a backend-prefixed tool, and a
+        // plain registry tool: only the non-`nix:` ones become `token@version` install specs.
+        // The state is Untrusted on purpose — auto-equip is the open self-equip path, so it is
+        // independent of the project's trust verdict (the egress allowlist is the control).
+        let mut cfg = resolved(None, None);
+        cfg.mise = Some(crate::config::MiseConfig {
+            name: "mise.toml".into(),
+            state: crate::trust::TrustState::Untrusted,
+            files: vec![(
+                "mise.toml".into(),
+                b"[tools]\n\"nix:jq\" = \"latest\"\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\nnode = \"20\"\n"
+                    .to_vec(),
+            )],
+        });
+        assert_eq!(
+            auto_equip_tokens(&cfg),
+            vec![
+                "aqua:BurntSushi/ripgrep@latest".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_autoequip_passes_tokens_and_command_positionally() {
+        // The install tokens and the real command both ride `"$@"`, so a token from an
+        // untrusted project config can never inject shell: only the absolute mise path and
+        // the integer count ever reach the script string.
+        let mise = PathBuf::from("/nix/store/mise/bin/mise");
+        let bash = PathBuf::from("/nix/store/bash/bin/bash");
+        let tokens = vec![
+            "aqua:BurntSushi/ripgrep@latest".to_string(),
+            // a hostile token must stay a single positional arg, never reach the script
+            "node@20; rm -rf /".to_string(),
+        ];
+        let cmd = vec![OsString::from("claude"), OsString::from("--print")];
+
+        let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, cmd);
+
+        assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
+        assert_eq!(argv[1], OsString::from("-c"));
+        let script = argv[2].to_string_lossy();
+        // mise by absolute path; the slice/shift use the count, not the tokens; the command
+        // is exec'd (so it stays the cage's main process) after the tokens are shifted off.
+        assert!(script.contains("/nix/store/mise/bin/mise install \"${@:1:2}\""));
+        assert!(script.contains("shift 2;"));
+        assert!(script.trim_end().ends_with("exec \"$@\""));
+        assert!(
+            !script.contains("rm -rf"),
+            "a hostile token must never be interpolated into the script: {script}"
+        );
+        // label, then the tokens, then the command — all positional
+        assert_eq!(argv[3], OsString::from("ops-mise-equip"));
+        assert_eq!(argv[4], OsString::from("aqua:BurntSushi/ripgrep@latest"));
+        assert_eq!(argv[5], OsString::from("node@20; rm -rf /"));
+        assert_eq!(argv[6], OsString::from("claude"));
+        assert_eq!(argv[7], OsString::from("--print"));
+    }
+
+    #[test]
+    fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
+        // The app's `[packages] mise:` tools are equipped globally (`mise use -g`), so the verb
+        // is interpolated literally (an ops-chosen constant, never config) while the token stays
+        // positional — proving the same no-shell-injection shape for the global lane.
+        let mise = PathBuf::from("/nix/store/mise/bin/mise");
+        let bash = PathBuf::from("/nix/store/bash/bin/bash");
+        let tokens = vec!["aqua:anthropics/claude-code".to_string()];
+        let cmd = vec![OsString::from("claude")];
+
+        let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, cmd);
+
+        let script = argv[2].to_string_lossy();
+        assert!(script.contains("/nix/store/mise/bin/mise use -g \"${@:1:1}\""));
+        assert!(script.contains("shift 1;"));
+        // the token is a positional arg, never in the script
+        assert_eq!(argv[4], OsString::from("aqua:anthropics/claude-code"));
+        assert_eq!(argv[5], OsString::from("claude"));
+    }
+
+    #[test]
+    fn wrap_flake_equip_passes_refs_and_command_positionally_and_short_circuits() {
+        // Each (ref, out-link) rides `"$@"`, so a flake ref from an untrusted-but-trusted-app
+        // config can never inject shell: only the absolute nix path, the out-link parent, and
+        // the integer pair count reach the script string. The short-circuit and the per-pair
+        // `nix build` are both present.
+        let nix = PathBuf::from("/nix/store/nix/bin/nix");
+        let bash = PathBuf::from("/nix/store/bash/bin/bash");
+        let dir = PathBuf::from("/home/sandbox/.local/state/ops/flake");
+        let pairs = vec![
+            (
+                "github:NousResearch/hermes-agent#tui".to_string(),
+                PathBuf::from("/home/sandbox/.local/state/ops/flake/hermes"),
+            ),
+            // a hostile ref must stay a single positional arg, never reach the script
+            (
+                "github:evil/x#bin; rm -rf /".to_string(),
+                PathBuf::from("/home/sandbox/.local/state/ops/flake/evil"),
+            ),
+        ];
+        let cmd = vec![OsString::from("hermes"), OsString::from("-z")];
+
+        let argv = wrap_flake_equip(&nix, &bash, &dir, &pairs, cmd);
+
+        assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
+        assert_eq!(argv[1], OsString::from("-c"));
+        let script = argv[2].to_string_lossy();
+        // nix by absolute path; the pair count drives the loop, not the refs; the out-link
+        // presence short-circuits the build; the command is exec'd after the pairs are shifted.
+        assert!(script.contains("n=2"));
+        assert!(script.contains(
+            "[ -e \"$out/bin\" ] || '/nix/store/nix/bin/nix' build \"$1\" --out-link \"$out\""
+        ));
+        assert!(script.contains("mkdir -p '/home/sandbox/.local/state/ops/flake'"));
+        assert!(script.contains("shift 2"));
+        assert!(script.trim_end().ends_with("exec \"$@\""));
+        assert!(
+            !script.contains("rm -rf"),
+            "a hostile ref must never be interpolated into the script: {script}"
+        );
+        // label, then interleaved (ref, out-link) pairs, then the command — all positional
+        assert_eq!(argv[3], OsString::from("ops-flake-equip"));
+        assert_eq!(
+            argv[4],
+            OsString::from("github:NousResearch/hermes-agent#tui")
+        );
+        assert_eq!(
+            argv[5],
+            OsString::from("/home/sandbox/.local/state/ops/flake/hermes")
+        );
+        assert_eq!(argv[6], OsString::from("github:evil/x#bin; rm -rf /"));
+        assert_eq!(
+            argv[7],
+            OsString::from("/home/sandbox/.local/state/ops/flake/evil")
+        );
+        assert_eq!(argv[8], OsString::from("hermes"));
+        assert_eq!(argv[9], OsString::from("-z"));
     }
 
     #[test]

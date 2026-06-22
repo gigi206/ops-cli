@@ -70,6 +70,14 @@ pub(crate) struct Userland {
     /// by absolute path from the allowlist-posture wrapper; off `PATH` and untouched by
     /// other postures.
     pub(crate) socat_bin: PathBuf,
+    /// The in-cage mise engine, as an in-sandbox logical path. On `PATH` so an agent drives
+    /// it directly, but invoked by *absolute* path from the auto-equip wrapper so a persisted
+    /// shim named `mise` cannot shadow it.
+    pub(crate) mise_bin: PathBuf,
+    /// The in-cage nix, as an in-sandbox logical path. On `PATH` (the agent self-equips with
+    /// it), but invoked by *absolute* path from the `flake:` build wrapper so a persisted shim
+    /// cannot shadow it.
+    pub(crate) nix_bin: PathBuf,
 }
 
 /// One explicit bind injected by the launcher after the structural mounts (so it is
@@ -341,6 +349,25 @@ const MISE_DATA_REL: &str = ".local/share/mise";
 /// with no shell to activate. The dir need not exist yet (an empty project has none);
 /// a missing PATH entry is simply ignored.
 const MISE_SHIMS_REL: &str = ".local/share/mise/shims";
+
+/// Where a `flake:` package's `nix build --out-link` gcroot lives inside the cage,
+/// relative to the sandbox `$HOME`. Each package gets `<this>/<name>`, a symlink into
+/// `/nix` (the per-project store); its `<name>/bin` joins PATH. Under the persistent home,
+/// so the out-link survives across launches (the warm-launch short-circuit reuses it).
+const FLAKE_ROOTS_REL: &str = ".local/state/ops/flake";
+
+/// The directory holding every `flake:` package's out-link inside the cage (the parent the
+/// build wrapper creates before `nix build`). A fixed, ops-owned path under the home.
+pub(crate) fn flake_roots_dir() -> PathBuf {
+    PathBuf::from(format!("{SANDBOX_HOME}/{FLAKE_ROOTS_REL}"))
+}
+
+/// The in-cage out-link path for the `flake:` package named `name` — the gcroot `nix build
+/// --out-link` writes, and the symlink whose `/bin` joins PATH. The name is a validated
+/// package name (no path separators), so this never escapes [`flake_roots_dir`].
+pub(crate) fn flake_out_link(name: &str) -> PathBuf {
+    flake_roots_dir().join(name)
+}
 
 /// Where the synthetic interactive-shell rc is bound read-only. `ops shell` starts
 /// bash with `--rcfile` pointing here, so mise is activated in the interactive shell —
@@ -654,6 +681,8 @@ mod tests {
             ],
             shell_bin: PathBuf::from("/store/bash/bin/bash"),
             socat_bin: PathBuf::from("/store/socat/bin/socat"),
+            mise_bin: PathBuf::from("/store/mise/bin/mise"),
+            nix_bin: PathBuf::from("/store/nix/bin/nix"),
         }
     }
 

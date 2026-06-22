@@ -119,19 +119,68 @@ fn is_proxy_env_key(key: &str) -> bool {
     )
 }
 
+/// Which provider realises a declared package, parsed from the mandatory backend
+/// prefix on the value: `nix:<attr>`, `mise:<token>`, or `flake:<ref>`. There is no
+/// bare form — a value without a recognized prefix is dropped with a warning, so a
+/// package's source is always explicit and never silently mis-routed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Backend {
+    /// `nix:<attr>` — a nixpkgs attribute, provisioned host-side into ops's store
+    /// (seeded, offline-reusable). nixpkgs is curated, so building it host-side is
+    /// justified; realising it can run a build, so it is honored only from a trusted
+    /// source.
+    Nix(String),
+    /// `mise:<token>` — a mise backend token (e.g. `aqua:openai/codex`, `opencode`,
+    /// `npm:@scope/pkg`, or `nix:<pkg>` for nixhub), equipped in-cage globally via
+    /// `mise use -g` (durable, on PATH, fetched at launch). The token after `mise:`
+    /// is passed to mise verbatim — ops adds no per-backend logic of its own.
+    Mise(String),
+    /// `flake:<ref>` — an arbitrary nix flake reference (e.g.
+    /// `github:owner/repo#attr`), built **in-cage** with `nix build --out-link` into
+    /// the project's own writable store. A third-party flake is uncurated, so unlike
+    /// `nix:` it is *not* built host-side: its eval + build are contained by the cage
+    /// (the same posture as the in-cage `mise:nix:` self-equip). On PATH at launch and
+    /// later launches via a persistent out-link under the home.
+    Flake(String),
+}
+
+impl Backend {
+    /// The backend-specific locator as declared: the nixpkgs attribute, the mise
+    /// token, or the flake reference. Used for display and as the value the
+    /// provisioner consumes.
+    pub(crate) fn locator(&self) -> &str {
+        match self {
+            Backend::Nix(attr) => attr,
+            Backend::Mise(token) => token,
+            Backend::Flake(reference) => reference,
+        }
+    }
+
+    /// A short label naming the provider, for `ops config` and warnings.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Backend::Nix(_) => "nix",
+            Backend::Mise(_) => "mise",
+            Backend::Flake(_) => "flake",
+        }
+    }
+}
+
 /// A tool the configuration asks the sandbox to provide: a free `name` (the merge
-/// key across layers and the on-disk root name) bound to a nixpkgs `attr` to
-/// realise. Each carries whether the layer that supplied its value is trusted, so
-/// the launcher can decide — outside this pure layering — whether to provision it.
-/// Realising a tool is a security-relevant act (it can run a build), but the
-/// decision is *deferred*, not made here: this stage drops nothing for trust, it
-/// only records the verdict the launcher will weigh.
+/// key across layers and the on-disk root name) bound to a `backend` that names how
+/// to realise it (a nixpkgs attribute host-side, or a mise token in-cage). Each
+/// carries whether the layer that supplied its value is trusted, so the launcher can
+/// decide — outside this pure layering — whether to provision it. Both backends are
+/// security-relevant (each can fetch or build), so the decision is *deferred*, not
+/// made here: this stage drops nothing for trust, it only records the verdict the
+/// launcher will weigh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Package {
     /// The free label: merge key and on-disk root name.
     pub(crate) name: String,
-    /// The nixpkgs attribute to realise.
-    pub(crate) attr: String,
+    /// How to realise this package: a nixpkgs attribute (host-side) or a mise token
+    /// (in-cage), parsed from the value's mandatory backend prefix.
+    pub(crate) backend: Backend,
     /// The trust of the layer that supplied this value (global is always
     /// `Trusted`, by location; a project carries its own verdict). The full state
     /// is kept, not a bool, so a *changed* project is distinguished from a
@@ -433,7 +482,7 @@ impl Resolved {
             upsert(&mut self.env, key, val);
         }
         for pkg in app.packages {
-            upsert_package(&mut self.packages, pkg.name, pkg.attr, pkg.state);
+            upsert_package(&mut self.packages, pkg.name, pkg.backend, pkg.state);
         }
         for bind in app.ro_binds {
             if !self.ro_binds.contains(&bind) {
@@ -484,6 +533,7 @@ fn resolve(
         GLOBAL_CONFIG,
         global.packages,
         TrustState::Trusted,
+        false,
     );
     let nixpkgs_global = global
         .nixpkgs
@@ -535,6 +585,7 @@ fn resolve(
             PROJECT_CONFIG,
             proj.packages,
             state,
+            false,
         );
         // `nixpkgs` is a security field — a trusted project may pin its tools'
         // source; an untrusted or changed one may not point the catalogue elsewhere.
@@ -739,6 +790,7 @@ fn resolve_app(
             &source,
             app.packages,
             TrustState::Trusted,
+            false,
         );
         if let Some(field) = app.network {
             network = validate_network(&mut warnings, &source, field);
@@ -777,7 +829,16 @@ fn resolve_app(
                 warnings.push(dropped_binds_warning(state, app.binds.len()));
             }
         }
-        apply_packages(&mut packages, &mut warnings, &source, app.packages, state);
+        // An untrusted project may add its own app's packages but may not override a package a
+        // trusted layer supplied (the `cmd`-integrity guard, applied to the tool).
+        apply_packages(
+            &mut packages,
+            &mut warnings,
+            &source,
+            app.packages,
+            state,
+            !trusted,
+        );
         if let Some(field) = app.network {
             if trusted {
                 if let Some(policy) = validate_network(&mut warnings, &source, field) {
@@ -939,46 +1000,101 @@ fn apply_binds(
     }
 }
 
-/// Fold a layer's packages into `out`, validating the label and the attribute and
-/// stamping each with whether its source layer is trusted. A later layer overrides
-/// an earlier one at the same name, so a project can pin a tool the global set
-/// named. Nothing is dropped for trust here — that belongs to the launcher; this is
-/// a pure merge. A malformed label or attribute *is* dropped (with a warning): it
-/// could never realise, and a label names an on-disk path.
+/// Fold a layer's packages into `out`, validating the label and parsing the value's
+/// mandatory backend prefix, stamping each with whether its source layer is trusted. A
+/// later layer overrides an earlier one at the same name, so a project can pin a tool
+/// the global set named. Nothing is dropped for trust here — that belongs to the
+/// launcher; this is a pure merge. A malformed label, or a value with no `nix:`/`mise:`
+/// prefix, *is* dropped (with a warning): it could never realise, and a label names an
+/// on-disk path — fail-closed, never a silent mis-route.
 fn apply_packages(
     out: &mut Vec<Package>,
     warnings: &mut Vec<String>,
     source: &str,
     packages: BTreeMap<String, String>,
     state: TrustState,
+    protect_trusted: bool,
 ) {
-    for (name, attr) in packages {
+    for (name, value) in packages {
         if !is_valid_package_name(&name) {
             warnings.push(format!(
                 "{source}: ignoring malformed package name `{name}`"
             ));
             continue;
         }
-        if !is_valid_attr(&attr) {
+        // When `protect_trusted` is set (an untrusted project layering over a trusted app),
+        // a package a trusted layer already supplied may not be overridden — the integrity-of-
+        // intent guard `cmd` has, applied to the tool: else an untrusted project could swap a
+        // trusted app's `claude-code` for its own attribute and either run attacker code (closed
+        // separately by `[packages]` being trusted-only) or simply deny the app its tool. A new
+        // name may still be added.
+        if protect_trusted
+            && out
+                .iter()
+                .any(|p| p.name == name && p.state == TrustState::Trusted)
+        {
             warnings.push(format!(
-                "{source}: ignoring package `{name}` with invalid attribute `{attr}`"
+                "{source}: ignoring package `{name}` override of a trusted app ({})",
+                untrusted_reason(state)
             ));
             continue;
         }
-        upsert_package(out, name, attr, state);
+        let backend = match parse_backend(&value) {
+            Ok(b) => b,
+            Err(reason) => {
+                warnings.push(format!("{source}: ignoring package `{name}`: {reason}"));
+                continue;
+            }
+        };
+        upsert_package(out, name, backend, state);
     }
 }
 
-/// Set the package named `name` to `attr` with the supplying layer's trust,
+/// Parse a `[packages]` value into its [`Backend`] from the mandatory prefix. `nix:<attr>`
+/// routes to host-side nixpkgs provisioning, `mise:<token>` to the in-cage mise equip,
+/// `flake:<ref>` to an in-cage `nix build` of an arbitrary flake; a value with no recognized
+/// prefix is rejected (there is no bare form, so the backend is always explicit). The part
+/// after `mise:` is the full mise token — including a `nix:`-prefixed nixhub token
+/// (`mise:nix:<pkg>`), which is mise's concern, not a third nix code path here. `flake:` is
+/// matched before `nix:` only by being a distinct prefix; the two never overlap.
+fn parse_backend(value: &str) -> Result<Backend, String> {
+    if let Some(attr) = value.strip_prefix("nix:") {
+        if !is_valid_attr(attr) {
+            return Err(format!("invalid nix attribute `{attr}`"));
+        }
+        Ok(Backend::Nix(attr.to_string()))
+    } else if let Some(token) = value.strip_prefix("mise:") {
+        if !is_valid_mise_token(token) {
+            return Err(format!("invalid mise token `{token}`"));
+        }
+        Ok(Backend::Mise(token.to_string()))
+    } else if let Some(reference) = value.strip_prefix("flake:") {
+        if !is_valid_flake_ref(reference) {
+            return Err(format!("invalid flake reference `{reference}`"));
+        }
+        Ok(Backend::Flake(reference.to_string()))
+    } else {
+        Err(format!(
+            "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
+             or `flake:<ref>`"
+        ))
+    }
+}
+
+/// Set the package named `name` to `backend` with the supplying layer's trust,
 /// overriding an existing entry so a later layer wins while preserving declaration
 /// order.
-fn upsert_package(out: &mut Vec<Package>, name: String, attr: String, state: TrustState) {
+fn upsert_package(out: &mut Vec<Package>, name: String, backend: Backend, state: TrustState) {
     match out.iter_mut().find(|p| p.name == name) {
         Some(slot) => {
-            slot.attr = attr;
+            slot.backend = backend;
             slot.state = state;
         }
-        None => out.push(Package { name, attr, state }),
+        None => out.push(Package {
+            name,
+            backend,
+            state,
+        }),
     }
 }
 
@@ -1619,6 +1735,49 @@ fn is_valid_attr(attr: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
 }
 
+/// A mise backend token (the part after `mise:`), e.g. `aqua:openai/codex`, `opencode`,
+/// `npm:@anthropic-ai/claude-code`, or `aqua:openai/codex@0.141.0`. It rides the equip
+/// wrapper positionally, so it cannot inject shell whatever it contains; the charset is
+/// still restricted to what a real token uses (no whitespace or control characters) so a
+/// malformed value is refused rather than handed to mise.
+fn is_valid_mise_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '@' | '.' | '_' | '-' | '+')
+        })
+}
+
+/// A flake reference (the part after `flake:`), e.g. `github:owner/repo#attr`,
+/// `github:owner/repo/rev#attr`, or `git+https://host/repo?ref=main#attr`. It rides the
+/// in-cage build wrapper positionally, so it cannot inject shell whatever it contains; the
+/// charset is still restricted to what a real flake ref uses — the URL-significant
+/// characters (`:` `/` `#` `?` `=` `&` `~`) plus the identifier set — so a malformed or
+/// shell/space-bearing value is refused rather than handed to nix. **Local sources are
+/// rejected** so a package declaration can never point the in-cage build at a filesystem
+/// path: not only the explicit local schemes (`path:`, `git+file:`) but also a **bare
+/// path-flakeref** — nix treats a ref starting with `/`, `.`, or `~` as a local path — and an
+/// ambiguous registry-indirect ref (`nixpkgs`), by *requiring an explicit scheme* (a `:`). A
+/// real remote ref always carries one (`github:`, `git+https:`, `gitlab:`, …).
+fn is_valid_flake_ref(reference: &str) -> bool {
+    if reference.is_empty()
+        || reference.starts_with("path:")
+        || reference.starts_with("git+file:")
+        || reference.starts_with('/')
+        || reference.starts_with('.')
+        || reference.starts_with('~')
+        || !reference.contains(':')
+    {
+        return false;
+    }
+    reference.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                ':' | '/' | '#' | '?' | '=' | '&' | '~' | '@' | '.' | '_' | '-' | '+'
+            )
+    })
+}
+
 /// Set `key` to `val`, overriding an existing entry so a later layer wins over an
 /// earlier one at the same key while preserving declaration order.
 fn upsert(env: &mut Vec<(String, String)>, key: String, val: String) {
@@ -2246,7 +2405,7 @@ mod tests {
                 &["claude"],
                 &[("BASE", "g")],
                 &[],
-                &[("tool", "ripgrep")],
+                &[("tool", "nix:ripgrep")],
                 None,
             ),
         );
@@ -2276,7 +2435,7 @@ mod tests {
                 &["id"],
                 &[("OK", "v")],
                 &["/etc/secret"],
-                &[("pkg", "ripgrep")],
+                &[("pkg", "nix:ripgrep")],
                 allowlist_net(&["x.com"]),
             ),
         );
@@ -2320,6 +2479,94 @@ mod tests {
             r.apps["claude"].cmd,
             vec!["claude".to_string(), "--resume".to_string()]
         );
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_override_a_trusted_apps_package() {
+        // The package half of the integrity-of-intent guard (mirror of `cmd`): `ops app claude`
+        // against an untrusted repo must keep the trusted app's tool, never one the repo
+        // substituted — else the repo could deny the app its tool, or aim it at an attacker's.
+        let global = raw_with_app(
+            "claude",
+            raw_app(
+                &["claude"],
+                &[],
+                &[],
+                &[("claude-code", "mise:aqua:anthropics/claude-code")],
+                None,
+            ),
+        );
+        let project = raw_with_app(
+            "claude",
+            raw_app(
+                &["claude"],
+                &[],
+                &[],
+                &[("claude-code", "mise:aqua:attacker/x")],
+                None,
+            ),
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["claude"];
+        let p = app
+            .packages
+            .iter()
+            .find(|p| p.name == "claude-code")
+            .expect("the app's package survives");
+        // The trusted token survives, still trusted; the attacker's is refused with a warning.
+        assert_eq!(
+            p.backend,
+            Backend::Mise("aqua:anthropics/claude-code".into())
+        );
+        assert_eq!(p.state, TrustState::Trusted);
+        assert!(app
+            .warnings
+            .iter()
+            .any(|w| w.contains("claude-code") && w.contains("override")));
+        // Security teeth: the attacker's token is not merely lower-priority — it is absent, so it
+        // can never reach `mise use -g`. Exactly one `claude-code`, and it is the trusted one.
+        assert_eq!(
+            app.packages
+                .iter()
+                .filter(|p| p.name == "claude-code")
+                .count(),
+            1
+        );
+        assert!(
+            !app.packages
+                .iter()
+                .any(|p| p.backend == Backend::Mise("aqua:attacker/x".into())),
+            "the attacker token must be absent, never carried"
+        );
+
+        // A trusted project, by contrast, may override the package by name.
+        let global = raw_with_app(
+            "claude",
+            raw_app(
+                &["claude"],
+                &[],
+                &[],
+                &[("claude-code", "mise:aqua:anthropics/claude-code")],
+                None,
+            ),
+        );
+        let project = raw_with_app(
+            "claude",
+            raw_app(
+                &["claude"],
+                &[],
+                &[],
+                &[("claude-code", "nix:claude-code")],
+                None,
+            ),
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        let p = r.apps["claude"]
+            .packages
+            .iter()
+            .find(|p| p.name == "claude-code")
+            .unwrap();
+        assert_eq!(p.backend, Backend::Nix("claude-code".into()));
     }
 
     #[test]
@@ -2829,9 +3076,9 @@ mod tests {
 
     #[test]
     fn global_packages_are_trusted_by_location() {
-        let r = resolve_no_plugins(raw_packages(&[("node", "nodejs_20")]), None);
+        let r = resolve_no_plugins(raw_packages(&[("node", "nix:nodejs_20")]), None);
         let node = pkg(&r.packages, "node").expect("global package present");
-        assert_eq!(node.attr, "nodejs_20");
+        assert_eq!(node.backend, Backend::Nix("nodejs_20".into()));
         assert_eq!(
             node.state,
             TrustState::Trusted,
@@ -2843,14 +3090,20 @@ mod tests {
     #[test]
     fn a_trusted_project_package_overrides_the_global_one_by_name() {
         let r = resolve_no_plugins(
-            raw_packages(&[("node", "nodejs_20"), ("onlyg", "ripgrep")]),
-            Some((raw_packages(&[("node", "nodejs_22")]), TrustState::Trusted)),
+            raw_packages(&[("node", "nix:nodejs_20"), ("onlyg", "nix:ripgrep")]),
+            Some((
+                raw_packages(&[("node", "nix:nodejs_22")]),
+                TrustState::Trusted,
+            )),
         );
         // the project pins the shared name; the global-only tool survives
         let node = pkg(&r.packages, "node").unwrap();
-        assert_eq!(node.attr, "nodejs_22");
+        assert_eq!(node.backend, Backend::Nix("nodejs_22".into()));
         assert_eq!(node.state, TrustState::Trusted);
-        assert_eq!(pkg(&r.packages, "onlyg").unwrap().attr, "ripgrep");
+        assert_eq!(
+            pkg(&r.packages, "onlyg").unwrap().backend,
+            Backend::Nix("ripgrep".into())
+        );
         assert!(r.warnings.is_empty());
     }
 
@@ -2861,12 +3114,12 @@ mod tests {
         let r = resolve_no_plugins(
             RawConfig::default(),
             Some((
-                raw_packages(&[("node", "nodejs_20")]),
+                raw_packages(&[("node", "nix:nodejs_20")]),
                 TrustState::Untrusted,
             )),
         );
         let node = pkg(&r.packages, "node").expect("untrusted package still carried");
-        assert_eq!(node.attr, "nodejs_20");
+        assert_eq!(node.backend, Backend::Nix("nodejs_20".into()));
         assert_eq!(node.state, TrustState::Untrusted);
         assert!(
             r.warnings.is_empty(),
@@ -2880,7 +3133,10 @@ mod tests {
         // project points the user at re-approval, not first approval.
         let r = resolve_no_plugins(
             RawConfig::default(),
-            Some((raw_packages(&[("node", "nodejs_20")]), TrustState::Changed)),
+            Some((
+                raw_packages(&[("node", "nix:nodejs_20")]),
+                TrustState::Changed,
+            )),
         );
         assert_eq!(pkg(&r.packages, "node").unwrap().state, TrustState::Changed);
         assert_eq!(
@@ -2894,19 +3150,101 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_package_name_or_attribute_is_dropped() {
+    fn a_malformed_or_unprefixed_package_is_dropped() {
         let r = resolve_no_plugins(
             raw_packages(&[
-                ("../escape", "hello"), // label escapes its directory
-                ("ok", "bad attr!"),    // attribute carries an illegal character
-                ("node", "nodejs_20"),  // the well-formed one survives
+                ("../escape", "nix:hello"), // label escapes its directory
+                ("ok", "nix:bad attr!"),    // attribute carries an illegal character
+                ("bare", "nodejs_20"),      // no backend prefix — fail-closed, not a silent nix
+                ("node", "nix:nodejs_20"),  // the well-formed one survives
             ]),
             None,
         );
         assert!(pkg(&r.packages, "../escape").is_none());
         assert!(pkg(&r.packages, "ok").is_none());
-        assert_eq!(pkg(&r.packages, "node").unwrap().attr, "nodejs_20");
-        assert_eq!(r.warnings.len(), 2, "one warning per dropped package");
+        assert!(
+            pkg(&r.packages, "bare").is_none(),
+            "a value with no nix:/mise: prefix is dropped, never treated as a bare nix attr"
+        );
+        assert_eq!(
+            pkg(&r.packages, "node").unwrap().backend,
+            Backend::Nix("nodejs_20".into())
+        );
+        assert_eq!(r.warnings.len(), 3, "one warning per dropped package");
+        // the bare one names the fix, not a generic error
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("bare") && w.contains("backend prefix")));
+    }
+
+    #[test]
+    fn a_mise_prefixed_package_parses_as_a_mise_backend() {
+        // `mise:<token>` routes to the in-cage mise equip; the token is kept verbatim, including
+        // a `nix:`-prefixed nixhub token (`mise:nix:...`), which is mise's concern.
+        let r = resolve_no_plugins(
+            raw_packages(&[
+                ("claude-code", "mise:aqua:anthropics/claude-code"),
+                ("opencode", "mise:opencode"),
+                ("nixhub", "mise:nix:jq"),
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "claude-code").unwrap().backend,
+            Backend::Mise("aqua:anthropics/claude-code".into())
+        );
+        assert_eq!(
+            pkg(&r.packages, "opencode").unwrap().backend,
+            Backend::Mise("opencode".into())
+        );
+        assert_eq!(
+            pkg(&r.packages, "nixhub").unwrap().backend,
+            Backend::Mise("nix:jq".into())
+        );
+        assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_flake_prefixed_package_parses_as_a_flake_backend_and_rejects_local_sources() {
+        // `flake:<ref>` routes to the in-cage `nix build`; a remote ref is kept verbatim, while a
+        // local source (`path:`/`git+file:`) is refused — a package must never point the build at
+        // the host filesystem.
+        let r = resolve_no_plugins(
+            raw_packages(&[
+                ("hermes", "flake:github:NousResearch/hermes-agent#tui"),
+                ("pinned", "flake:github:o/r/abc123#default"),
+                ("local", "flake:path:/etc"), // local scheme: refused
+                ("localgit", "flake:git+file:///etc"), // local git scheme: refused
+                ("bare", "flake:/etc"),       // bare absolute path: refused
+                ("dotted", "flake:./x"),      // bare relative path: refused
+                ("tilde", "flake:~/x"),       // bare home path: refused
+                ("indirect", "flake:nixpkgs"), // registry-indirect (no scheme): refused
+                ("spacey", "flake:github:o/r#a b"), // whitespace: refused
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "hermes").unwrap().backend,
+            Backend::Flake("github:NousResearch/hermes-agent#tui".into())
+        );
+        assert_eq!(
+            pkg(&r.packages, "pinned").unwrap().backend,
+            Backend::Flake("github:o/r/abc123#default".into())
+        );
+        for refused in [
+            "local", "localgit", "bare", "dotted", "tilde", "indirect", "spacey",
+        ] {
+            assert!(
+                pkg(&r.packages, refused).is_none(),
+                "{refused} should be refused"
+            );
+        }
+        assert_eq!(r.warnings.len(), 7, "one warning per refused flake ref");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("local") && w.contains("flake reference")));
     }
 
     #[test]

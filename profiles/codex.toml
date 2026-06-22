@@ -3,7 +3,10 @@
 #   ops app import profiles/codex.toml
 #   ops app codex
 #
-# Version tracks your base nix channel — roll it with `ops upgrade nix`.
+# The tool is equipped fresh from upstream (mise's `aqua` backend pulls OpenAI's
+# codex release binary) — no nixpkgs lag. It is equipped at the latest upstream
+# version on the first launch in a project; advancing an already-installed version
+# is not yet automated by `ops upgrade`.
 #
 # This profile uses the API-key path (api.openai.com). Codex's ChatGPT login flow
 # is an OAuth/device flow, which does not fit the header-injection model below —
@@ -11,7 +14,7 @@
 cmd = "codex"
 
 [packages]
-codex = "codex"
+codex = "mise:aqua:openai/codex"
 
 [network]
 mode = "allowlist"

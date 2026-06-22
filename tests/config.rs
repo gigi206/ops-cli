@@ -496,13 +496,16 @@ fn config_shows_packages_with_their_trust_verdict() {
     // `ops config` reports declared tools and whether each would be provisioned,
     // without realising anything — so this needs no nix.
     let fx = Fixture::new();
-    fx.write_project("[packages]\nnode = \"nodejs_20\"\n");
+    fx.write_project("[packages]\nnode = \"nix:nodejs_20\"\n");
 
     // Untrusted: shown, but marked withheld.
     let out = fx.run(&["config"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("node -> nodejs_20"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("node -> nix:nodejs_20"),
+        "stdout:\n{stdout}"
+    );
     assert!(
         stdout.contains("withheld"),
         "an untrusted package must be shown as withheld:\n{stdout}"
@@ -512,7 +515,10 @@ fn config_shows_packages_with_their_trust_verdict() {
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
     let out = fx.run(&["config"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("node -> nodejs_20"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("node -> nix:nodejs_20"),
+        "stdout:\n{stdout}"
+    );
     assert!(
         !stdout.contains("withheld"),
         "a trusted package must not be withheld:\n{stdout}"
@@ -534,7 +540,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
         eprintln!("skipping package PATH test: host cannot sandbox");
         return;
     }
-    fx.write_project("[packages]\nhello = \"hello\"\n");
+    fx.write_project("[packages]\nhello = \"nix:hello\"\n");
 
     // Untrusted: the tool is withheld, so it is not on PATH.
     let probe = "command -v hello >/dev/null 2>&1 && echo PRESENT || echo ABSENT";
@@ -581,7 +587,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
     }
     // a well-formed attribute (so it passes validation and reaches nix) that no real
     // package provides
-    fx.write_project("[packages]\nbogus = \"ops-no-such-attribute-xyz\"\n");
+    fx.write_project("[packages]\nbogus = \"nix:ops-no-such-attribute-xyz\"\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
     let out = fx
@@ -761,7 +767,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     // channel. Trust+pin first, so even the capability probe runs on the pinned base
     // (one base closure, not two). Skipped where the host cannot sandbox.
     let fx = Fixture::new();
-    fx.write_project("nixpkgs = \"nixos-23.11\"\n[packages]\nhello = \"hello\"\n");
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n[packages]\nhello = \"nix:hello\"\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
     let can_sandbox = fx
@@ -1255,7 +1261,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
          cmd = [\"id\"]\n\
          binds = [{bind:?}]\n\
          [app.probe.packages]\n\
-         tool = \"ripgrep\"\n\
+         tool = \"nix:ripgrep\"\n\
          [app.review]\n\
          cmd = [\"id\"]\n\
          home_scope = \"project\"\n",
