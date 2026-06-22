@@ -24,6 +24,7 @@
 //! itself), so a sandboxed — possibly untrusted — process can neither read nor
 //! tamper with it. It adds no new attack surface inside the cage.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -167,9 +168,14 @@ impl Session {
     /// on it reports the exit cleanly — including the brief zombie window a plain liveness read
     /// would still see as alive.
     ///
-    /// Killing the recorded pid tears the whole cage down on both launch paths: it is bubblewrap
-    /// itself on the exec path (pid 1 of the cage's namespace), and the supervisor on the
-    /// allowlist path — where bubblewrap dies with its parent, taking the cage with it.
+    /// The cage is torn down by killing not only the recorded process but its whole descendant
+    /// subtree. Killing the recorded pid alone is *not* reliable: on the allowlist path it is a
+    /// supervisor whose death is meant to cascade to bubblewrap through `--die-with-parent`, but
+    /// when the cage runs inside a transient systemd resource-limit scope that parent-death cascade
+    /// is racy and can leave the agent running. So the stop snapshots the subtree first and SIGKILLs
+    /// any survivor directly — killing bubblewrap (pid 1 of the cage's pid namespace) makes the
+    /// kernel reap everything left inside it. The exec path (recorded pid == bubblewrap) is covered
+    /// by the same sweep.
     pub(crate) fn stop(&self, grace: Duration) -> StopOutcome {
         let Some(pidfd) = open_pidfd(self.pid) else {
             return StopOutcome::AlreadyGone;
@@ -180,7 +186,10 @@ impl Session {
             close_fd(pidfd);
             return StopOutcome::AlreadyGone;
         }
-        let outcome = stop_pinned(pidfd, grace);
+        // Snapshot the cage subtree now, while the parent links still hold — once the recorded
+        // process dies its children reparent to init and the links are lost.
+        let cage = descendants(self.pid);
+        let outcome = stop_pinned(pidfd, &cage, grace);
         close_fd(pidfd);
         outcome
     }
@@ -227,21 +236,106 @@ fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
     unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
 }
 
-/// SIGTERM the pinned process, then SIGKILL it if it outlives `grace`. A `grace` of zero escalates
-/// immediately (SIGTERM, then SIGKILL with no wait).
-fn stop_pinned(pidfd: libc::c_int, grace: Duration) -> StopOutcome {
+/// SIGTERM the pinned process and the cage subtree, then SIGKILL whatever outlives `grace`. A
+/// `grace` of zero escalates immediately (SIGTERM, then SIGKILL with no wait). The cage members are
+/// always SIGKILLed at the end — even when the recorded process exited cleanly — so a stop is
+/// deterministic regardless of how the agent, bubblewrap, or the resource-limit scope behaved.
+fn stop_pinned(pidfd: libc::c_int, cage: &[(u32, u64)], grace: Duration) -> StopOutcome {
     if !send_signal(pidfd, libc::SIGTERM) {
-        // It exited between the open and now.
+        // The recorded process exited between the open and now; still sweep any cage leftovers.
+        kill_cage(cage);
         return StopOutcome::AlreadyGone;
     }
-    if wait_for_exit(pidfd, grace) {
-        return StopOutcome::Terminated;
+    // Signalling the cage's own processes (not just the recorded parent) lets a well-behaved agent
+    // shut down — and on the supervised path that cascades a clean supervisor exit — instead of
+    // relying on a parent-death signal that may not arrive.
+    for &(pid, start) in cage {
+        signal_if_match(pid, start, libc::SIGTERM);
     }
-    // It did not go down in time. SIGKILL cannot be caught, so this is bounded; a SIGKILL on an
-    // already-exited process is harmless, so a late voluntary exit only confirms it is gone.
-    let _ = send_signal(pidfd, libc::SIGKILL);
-    wait_for_exit(pidfd, Duration::from_secs(5));
-    StopOutcome::Killed
+    let exited = wait_for_exit(pidfd, grace);
+    if !exited {
+        // SIGKILL cannot be caught, so this is bounded; a SIGKILL on an already-exited process is
+        // harmless, so a late voluntary exit only confirms it is gone.
+        let _ = send_signal(pidfd, libc::SIGKILL);
+    }
+    // Force down any surviving cage member, so the agent never outlives the stop.
+    kill_cage(cage);
+    if exited {
+        StopOutcome::Terminated
+    } else {
+        wait_for_exit(pidfd, Duration::from_secs(5));
+        StopOutcome::Killed
+    }
+}
+
+/// SIGKILL every still-present member of a cage subtree (reuse-guarded by start time), tearing the
+/// namespace down: killing bubblewrap (pid 1 of the cage's pid namespace) makes the kernel reap
+/// everything left inside it.
+fn kill_cage(cage: &[(u32, u64)]) {
+    for &(pid, start) in cage {
+        signal_if_match(pid, start, libc::SIGKILL);
+    }
+}
+
+/// Send `signal` to `pid` only if it is still the incarnation `start_ticks` recorded — the same
+/// reuse guard the registry applies, so a cage member whose pid the kernel has since recycled is
+/// never signalled by mistake. (A vanishingly small window remains between the start-time read and
+/// the `kill`; the recorded process itself is signalled through a race-free pidfd instead.)
+fn signal_if_match(pid: u32, start_ticks: u64, signal: libc::c_int) {
+    if read_start_ticks(pid) == Some(start_ticks) {
+        // SAFETY: `kill(pid, signal)`; a failure (e.g. the process just exited) is ignored.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+}
+
+/// The transitive descendants of `root` (excluding `root` itself), each paired with its start time,
+/// as a snapshot of `/proc` at this instant. Built from one pass over `/proc`: a `parent -> children`
+/// map, then a walk down from `root`. The start times let a later kill skip a pid the kernel has
+/// since reused.
+fn descendants(root: u32) -> Vec<(u32, u64)> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut start_of: HashMap<u32, u64> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            let (Some(ppid), Some(start)) = (parse_ppid(&stat), parse_start_ticks(&stat)) else {
+                continue;
+            };
+            children.entry(ppid).or_default().push(pid);
+            start_of.insert(pid, start);
+        }
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(parent) = stack.pop() {
+        let Some(kids) = children.get(&parent) else {
+            continue;
+        };
+        for &kid in kids {
+            if let Some(&start) = start_of.get(&kid) {
+                out.push((kid, start));
+                stack.push(kid);
+            }
+        }
+    }
+    out
+}
+
+/// Extract field 4 (parent pid) from the contents of `/proc/<pid>/stat`. Like
+/// [`parse_start_ticks`], it reads the clean tail after the final `)`: there field 3 (state) is the
+/// first token and field 4 (ppid) the second.
+fn parse_ppid(stat: &str) -> Option<u32> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// The session registry rooted at `<data>/sessions`. Holds no I/O itself; each
@@ -699,6 +793,46 @@ mod tests {
         assert_eq!(s.stop(Duration::from_millis(300)), StopOutcome::Killed);
         let _ = child.wait();
         assert!(!is_alive(&s));
+    }
+
+    #[test]
+    fn stop_tears_down_the_whole_descendant_tree() {
+        // Stopping a process must take its descendants with it — the property a supervised cage
+        // relies on (parent supervisor, bubblewrap + agent as descendants) that a parent-death
+        // cascade does not deliver reliably. A shell that forks a child `sleep` and waits stands in
+        // for that tree without needing a sandbox.
+        let (mut child, s) = spawn_session("sh", &["-c", "sleep 300 & wait"]);
+
+        // Wait for the child `sleep` to appear under the shell.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut kids = Vec::new();
+        while std::time::Instant::now() < deadline {
+            kids = descendants(s.pid);
+            if !kids.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(kids.len(), 1, "the shell should have one child sleep");
+        let (kid_pid, kid_start) = kids[0];
+
+        assert_eq!(s.stop(Duration::from_secs(5)), StopOutcome::Terminated);
+        let _ = child.wait();
+        assert!(!is_alive(&s), "the recorded process is gone");
+
+        // The child must be gone too — not orphaned. It is SIGKILLed and reaped by init; poll past
+        // the brief zombie window in which its start time still reads as the original.
+        let gone_by = std::time::Instant::now() + Duration::from_secs(5);
+        let child_gone = loop {
+            if read_start_ticks(kid_pid) != Some(kid_start) {
+                break true;
+            }
+            if std::time::Instant::now() >= gone_by {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(child_gone, "stopping the parent orphaned its child");
     }
 
     #[test]
