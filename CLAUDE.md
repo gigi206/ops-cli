@@ -309,26 +309,170 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   await disambiguation (package, argv, API host, credential mechanism — no fabrication); a
   query-param key (Gemini `?key=`) or OAuth/device-flow does **not** fit the header-injection
   `[secret]` model.
-  **mise multi-backend — spike DONE, build NEXT (user chose: ship nix profiles first)** (`docs`-worthy
-  finding, no code yet): the user wants ops to honor **mise's full backend set** (`aqua:`/`github:`/
-  `npm:`/`cargo:`/…), not just the custom `nix:` plugin, for upstream-fresh versions. **The advisor's
-  call — empirical, not architectural — and a live spike CONFIRMED the capability already exists
-  in-cage:** a trusted project's `[tools] "aqua:BurntSushi/ripgrep" = "latest"` → `ops run` → the
-  cage's mise (full binary, `MISE_EXPERIMENTAL=1`/`MISE_YES=1`) **read the tool, downloaded from
-  upstream over the (shared) network, verified the checksum, extracted, and `rg` ran** (`ubi:` also
-  reached the download but failed extraction — deprecated backend + ripgrep's `rg`≠repo-name quirk;
-  `aqua:` is the clean, checksummed path). So multi-backend is a **~small increment, NOT an
-  architecture**: (1) soften the misleading host-side `not provisioned by ops` warning (non-nix tools
-  ARE handled — **in-cage**, self-equip, not host pre-provisioned); (2) **auto-install at launch** so a
-  profile whose `cmd` IS the tool starts on first `ops app` (unify with the nix: launch path + the 2b.5
-  activation/shims for PATH — a bare `mise install` without `use` leaves a `No version set` shim, so an
-  install trigger is needed); (3) document the **egress requirement** — a non-nix tool needs its
-  backend host in the allowlist, which is **the security control, not backend curation**: trust-gated,
-  so an untrusted project may *declare* `aqua:evil/x` but **cannot open** the egress to fetch it. **Locus
-  = in-cage, egress-gated** (host-side npm/ubi would mutate the host + break hermeticity — rejected).
-  **Residual:** a non-nix tool **kills offline launch** (fetches upstream at install) — the price of
-  freshness vs the nix seed's offline reuse. Decided to **ship the nix profiles first** (these three are
-  fresh in nixpkgs) and do multi-backend as its own de-risked increment.
+  **mise multi-backend — DONE (2026-06-21)** (`src/sandbox/nixhub.rs` + `launch.rs` + `fhs.rs` +
+  `binds.rs` + `main.rs`; spike `docs/bwrap-mise-multibackend-derisk-2026-06-21.md`): ops now honors
+  **mise's full backend set** (`aqua:`/`github:`/`npm:`/`cargo:`/… and plain registry tools), not just
+  the custom `nix:` plugin, for upstream-fresh versions — a project's non-`nix:` `[tools]` are
+  **auto-equipped in-cage at launch** so `ops run`/`shell`/`app` start with them on PATH, no manual
+  `ops mise install`. **De-risked by a throwaway spike first** (the advisor's call — the load-bearing
+  unknown was the shim→PATH chain, not the CLI): a config-declared `aqua:BurntSushi/ripgrep` installs
+  in-cage and `command -v rg` → the **shims dir** (the config *sets* the version → the shim resolves,
+  unlike a bare ad-hoc install's `No version set`); warm `mise install` = "all installed", **zero
+  network** (`latest` does not re-resolve once installed); the persisted shim resolves even without a
+  re-install. **The increment, three parts:** (1) **`DeclaredTools` split** (`parse_nix_tools`) —
+  `nix` (host-provisioned) / `non_nix` (`MiseTool{token,version}`, auto-equipped) / `malformed` (a
+  bad `nix:` token); `provision` now warns only `malformed` (a non-nix backend is **not** a problem,
+  it is handled in-cage), and `ops config`/`ops upgrade` reworded to match (`(equipped in-cage via
+  mise)` / `Ignored{mise_managed}`). (2) **Auto-install at launch** (`build()` + `wrap_autoequip` +
+  `auto_equip_tokens` + `Userland.mise_bin`) — when non-`nix:` tools are declared, the command is
+  wrapped `bash -c '<mise> install "${@:1:N}" 1>&2; shift N; exec "$@"'` with the **tokens + command
+  positional** (only the absolute mise path + the integer count reach the script → a token from an
+  untrusted config **cannot inject shell**), and `MISE_TRUSTED_CONFIG_PATHS = cwd` is set so the
+  in-cage mise trusts the project config. **Open by design** (user's call, 2026-06-21) — runs whether
+  or not the project is trusted (the agent self-equip path, like `ops mise`); the real gate is that
+  `network = "allowlist"` is trusted/global-only, so an untrusted project may *declare* `aqua:evil/x`
+  but cannot *open* the egress to fetch it. **Composition** (advisor-caught ordering): the autoequip
+  wrap nests **inside** `egress::wrap_command`, so under an allowlist socat is up before the install
+  fetches. (3) **`network = "none"`** + a non-nix tool is an inherent conflict → **skip the install +
+  loud by-name warning** (best-effort, not the `nix:` hard-fail; a persisted tool still resolves via
+  its shim). **The advisor's discriminating case PROVEN live + committed:** a non-`nix:` tool
+  downloads via mise's **own reqwest** (not nix's libcurl), which reads the certificate *file* not the
+  env — so whether it trusts the proxy's per-session **MITM** CA on a *direct* download was untested
+  by the `nix:jq` allowlist smoke (whose heavy fetch is libcurl's). A throwaway probe + committed e2e
+  (`the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist`) settled it green: a trusted
+  `allowlist` runs `ops run -- rg --version` → `ripgrep 15.1.0` through the empty-netns MITM, so mise's
+  reqwest **does** trust the MITM CA. **Residual:** a non-nix tool **kills offline first-launch**
+  (fetches upstream at install) — the price of freshness vs the nix seed's offline reuse;
+  `MISE_TRUSTED_CONFIG_PATHS` now also reaches a manual `ops mise` in such a project (a conscious,
+  open-posture-consistent widening). **Honest scope (the advisor's #1):** this auto-equips a **project's
+  mise `[tools]`** — it does **not** make the shipped app *profiles* fresher (they declare their tool
+  via `[packages]`/nixpkgs, and the app overlay has no mise-`[tools]` field); fresh *profiles* is a
+  separate slice (the app overlay gains a tools field, or `[packages]` learns non-nix backends).
+  **546 tests green** (2 net-new run.rs e2e — shared/open + allowlist/MITM, both ran live; +
+  `wrap_autoequip` + `auto_equip_tokens` unit tests + the `DeclaredTools`/`provision`/`upgrade`
+  reworks), fmt/clippy clean, **musl static build verified** (no new dep — std-only), advisor-reviewed
+  (plan AND impl — it caught the allowlist+MITM blind spot the shared-net e2e could not see, now the
+  committed headline proof).
+  **`[packages]` backend prefix + fresh app profiles — DONE (2026-06-21)** (`src/config/schema.rs`
+  + `config/mod.rs` + `src/sandbox/packages.rs` + `launch.rs` + `main.rs` + `search.rs` +
+  `profiles/*.toml`; plan `docs/bwrap-packages-backend-prefix-plan.md`): the slice that makes the
+  shipped profiles **fresh** (measured before: nixpkgs lagged — claude-code 2.1.170 vs upstream
+  2.1.185, and was additionally **unfree** in nixpkgs). Every `[packages]` value now carries a
+  **mandatory backend prefix** — `nix:<attr>` (host-side nixpkgs, durable/seeded/offline) or
+  `mise:<token>` (in-cage, equipped **globally** via `mise use -g`, fetched at launch from
+  upstream-direct). **No bare form** — a value with no recognized prefix is dropped + warned naming
+  the fix (fail-closed, never a silent nix mis-route; a breaking change, fine pre-release).
+  `Package` gained a `Backend{Nix(attr)|Mise(token)}`; `parse_backend` routes by prefix (and
+  `mise:nix:<pkg>` reaches mise's nixhub verbatim — no third nix path). **Both backends trusted-only
+  in `[packages]`** (the advisor-caught integrity fix: per-entry "open mise:" would let an untrusted
+  project override a trusted app's package and run attacker code under its posture — the `cmd_trusted`
+  hole via packages; closed by keeping `[packages]` uniformly gated, freshness still met because
+  profiles are **trusted-by-location**). The **open self-equip stays in `.mise.toml [tools]`** (local,
+  `mise install`); `[packages] mise:` is the **global** (`mise use -g`) durable declaration — the
+  user's global-vs-local distinction. `packages::mise_packages` collects the admitted (trusted)
+  `mise:` tokens; `provision` host-realises only the `Nix` ones; `launch::build` wraps the command
+  with `mise use -g <tokens>` (a generalized `wrap_mise_equip(verb, …)`, tokens **positional** →
+  no shell injection), nested inside the egress wrap (socat first) and skipped under `network = "none"`.
+  `ops config` shows each package's `name -> backend:locator (host-side, durable | in-cage via mise,
+  fetched at launch)`; `ops search`'s `[packages]` hint now emits `nix:<attr>`. **Decision on the
+  app↔`.mise.toml` interaction (B, with the user):** `ops app` keeps honoring the project's local
+  `.mise.toml` (the agent keeps the project toolchain — `ops app` runs *on* the project's code);
+  the residual (a malicious project `.mise.toml` could shadow a `mise:` app cmd, since mise resolves
+  **local > global**) is **bounded by Mode-B** — the secret is never in the cage and egress is the
+  trusted-only allowlist, and in-cage untrusted code can already trigger the same key-injection for
+  the allowlisted host, so it adds no new capability (the "strip the project `.mise.toml` for max
+  isolation" hardening is a deferred follow-up, the user's call). **The 3 profiles migrated** to the
+  fresh backends — `mise:aqua:anthropics/claude-code` (2.1.185, **unfree blocker gone** — it is a
+  standalone release binary, not nixpkgs), `mise:aqua:openai/codex` (0.141.0), `mise:opencode`
+  (1.17.9). **Allowlist finding (live):** a `mise:` fetch must reach the tool's **distribution host**
+  — codex/opencode ride github via the built-in nix-cache allow-set (verified live), but **claude-code
+  ships from a Google Cloud Storage bucket**, so its profile **path-scopes that one bucket**
+  (`storage.googleapis.com/claude-code-dist-…/*`, least-privilege, not all of GCS). **De-risked by
+  spikes first** (advisor's call): `mise use -g` for `aqua:` persists + lands on PATH at the next
+  launch, and **two concurrent `mise use -g` writes both land** (mise's config write is
+  concurrency-safe — the "2nd terminal" race the advisor flagged is a non-issue). **The trusted-app
+  package survives an untrusted override** (the `cmd_trusted` guard mirrored onto packages,
+  `apply_packages(protect_trusted)`): an untrusted project may add its own app's packages but may not
+  override one a trusted layer supplied — so a malicious project can neither hijack nor *DoS* a global
+  app's tool (the flagship "agent on untrusted code" property, now holding for packages too). **551
+  tests green** (net-new: `parse_backend`/Backend unit + `mise_packages` filter + `wrap_mise_equip`
+  global-verb unit + the trusted-app-package-override guard test + the load-bearing run.rs e2e
+  **`a_fresh_mise_package_app_runs_under_its_own_allowlist`** — claude 2.1.185 equipped via `mise use
+  -g` at an `ops app` launch and run through the empty-netns MITM under the profile's own allowlist; it
+  **ran**, and caught the GCS-host fact the github assumption missed), fmt/clippy clean, **musl static
+  build verified** (std-only, no new dep), advisor-reviewed (plan AND impl — the impl review caught the
+  integrity hole that made `[packages]` trusted-only, walked back its own #5 nudge to PATH-precedence,
+  required the e2e run under the profile's *own* allowlist not shared net, then on the final pass caught
+  a **false `ops upgrade` roll-forward promise in the shipped profile/README docs** — corrected to state
+  the accurate behavior, fresh-at-first-launch-then-pinned — and the missing trusted-app-package guard
+  test, both folded in).
+  **Honest scope:** the tool is provisioned **fresh and runs**; the **live auth e2e** (the CLI
+  authenticating through the proxy-injected key) stays the flagship validation pending the user's real
+  key. The roll-forward of a floating `mise:` package (`@latest` freezes warm) via `ops upgrade` and a
+  `/usr/bin/env` shim for npm-only tools (the hermetic cage lacks it, so `npm:` JS tooling is blocked;
+  `aqua:`/registry standalone binaries sidestep it) are **named, not built**. See
+  [[ubi-backend-deprecated]], [[ops-app-framework]], [[ops-mise-passthrough]].
+  **`[packages]` `flake:` backend — DONE (2026-06-22)** (`src/config/mod.rs` +
+  `src/sandbox/packages.rs` + `binds.rs` + `fhs.rs` + `launch.rs` + `main.rs`; plan
+  `docs/bwrap-flake-backend-plan.md`): a **third `[packages]` backend**, `flake:<ref>`, for a tool
+  that ships **only as a nix flake** (no single release binary, no nixpkgs attribute — e.g. a
+  uv2nix-packaged Python agent). Built **in-cage** (the user's call over host-side, so an uncurated
+  third-party flake's eval+build are contained by the cage): `nix build <ref> --out-link
+  <home>/.local/state/ops/flake/<name>` realises the flake output into the **project's own**
+  writable store, the out-link's `bin/` prepended to PATH; a warm/offline **short-circuit**
+  (`[ -e "$out/bin" ] || nix build …`) makes a second launch a no-op and lets it run with the
+  network cut. `Backend::Flake(String)`; `parse_backend` routes the prefix;
+  **`is_valid_flake_ref` rejects every local-source form** (`path:`/`git+file:`/a `/`·`.`·`~`
+  lead, and the bare registry-indirect `nixpkgs` — an explicit scheme is **required**) so a
+  config-supplied ref can never aim the in-cage build at a host path, charset-validated.
+  **Trusted-only** like the other two backends, and the `protect_trusted` package guard is
+  backend-agnostic, so a trusted app's flake package **survives an untrusted project's override**
+  (the flagship property holds for flakes too). `wrap_flake_equip` passes each `(ref, out-link)`
+  pair **and** the command **positionally** through a `bash -c` script (zero shell-injection),
+  nested **inside** the egress wrap (socat up first) and **skipped under `network = "none"`** with a
+  by-name warning. `ops config` shows `flake:<ref>  (in-cage via nix build, fetched at launch)`.
+  **555 tests green** (net-new: `parse_backend`/`is_valid_flake_ref` unit with **7 refused
+  local/indirect cases**, the `flake_packages` trusted-only filter, the `wrap_flake_equip`
+  positional/short-circuit unit, and the load-bearing run.rs e2e
+  **`a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link`** — phase 1
+  builds `flake:github:NixOS/nixpkgs/<rev>#hello` in-cage under its own `allow = ["cache.nixos.org"]`
+  and runs `Hello, world!`; phase 2 rewrites the config to `network = "none"`, re-trusts,
+  re-launches, and `hello` **still runs** from the warm out-link — a re-fetch being impossible is
+  what proves the short-circuit), fmt/clippy clean, **musl static build verified** (std-only, no new
+  dep), advisor-reviewed (plan AND impl — the impl pass caught that `is_valid_flake_ref` admitted
+  bare local path-refs and that the warm/offline property was only *structurally* proven; both fixed
+  — the local-ref rejection and the 2-phase offline e2e). **Honest scope:** an in-cage flake build
+  needs **network at first launch** AND the build's own fetch hosts in the allowlist — the
+  `nixpkgs#hello` e2e rides the built-in nix-cache allow-set, but a **uv2nix flake fetches PyPI
+  wheels from `files.pythonhosted.org`**, which a real profile's allowlist must add (not exercised by
+  the e2e). **v1 floats** (no pin); a `flake:` pin (`nix flake metadata` → a lock) + `ops upgrade`
+  for flakes is **named, not built**. The backend packages a tool; it does **not** solve a tool's
+  **auth** (a flake-packaged agent still needs a header-injectable credential to be profile-able).
+  Also this thread, **starter profiles + a live flake-build validation (2026-06-22):** `profiles/pi.toml`
+  (`pi`, multi-provider/Anthropic-default, `mise:aqua:earendil-works/pi`) and **`profiles/hermes.toml`**
+  (`hermes`, `flake:github:NousResearch/hermes-agent#default`, keyed OpenRouter) ship and import+resolve
+  (`the_shipped_profiles_import_and_resolve`). **hermes's in-cage flake build was PROVEN live** — the
+  headline proof that `flake:` equips a flake-only tool: `hermes` lands on PATH after a real in-cage
+  `nix build` under its own allowlist (~7.5 min). The build corrected a grounding error — `#default`
+  **bundles the node `tui`/`web` front-ends**, so it fetches npm too (not "pure Python"); the profile's
+  allowlist gained `registry.npmjs.org` (PyPI `files.pythonhosted.org`/`pypi.org` + npm; runtime
+  `openrouter.ai` + `hermes-agent.nousresearch.com`). **A `kilocode` profile was authored then DROPPED
+  by the same live build** — two independent blockers, neither a profile typo: (1) the upstream kilocode
+  flake is **broken** (build script needs `bun@^1.3.14`, its pinned nixpkgs gives `1.3.11` — fails even
+  under `network="shared"`); (2) its `node_modules` step uses **`bun install`**, whose own HTTP client
+  does **not** honour ops's egress proxy / MITM CA under an `allowlist` (every dep `failed to resolve`
+  though `registry.npmjs.org` was allowed), unlike hermes's `buildNpmPackage` which fetches **through
+  nix's fetcher** and works. **`kilocode` was then SHIPPED via a different backend** —
+  `mise:github:Kilo-Org/kilocode`, its prebuilt release binary (`kilo-linux-x64.tar.gz`,
+  GitHub-attestation + SLSA verified by mise, self-contained), which sidesteps both blockers;
+  proven live in-cage (`kilo --version` → 7.3.50). The lesson: for a flake whose build *self-fetches*
+  (bun) and so hits the proxy wall — or is broken upstream — prefer the upstream **release binary via
+  `mise:github:`**. **Open `flake:` limitation recorded:** a flake build step that fetches with
+  its **own** client (bun) rather than nix's fetcher is blocked under the Model-B allowlist — fix = teach
+  such builders to honour the proxy or route them through nix's fetcher. Live-auth (the proxy-injected
+  key) stays the flagship pending-real-key step for every profile. Triage of the rest (cline/droid →
+  `/usr/bin/env` shim; agy/freebuff → OAuth not header; opencode-desktop/t3 → Wayland; aionui →
+  Electron-in-cage deferred) in `profiles/README.md`. See [[ubi-backend-deprecated]], [[ops-app-framework]].
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):
   project mise `[tools]` prefixed **`nix:`** (e.g. `nix:nodejs = "20"`) are the
   exact-pinned dev toolchain; ops resolves each to the nixpkgs revision that shipped

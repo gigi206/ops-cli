@@ -17,11 +17,14 @@ with `ops app export <name>`.
 
 ## What's here
 
-| Profile           | Tool            | Provider / egress       |
-| ----------------- | --------------- | ----------------------- |
-| `claude-code`     | `claude-code`   | `api.anthropic.com`     |
-| `codex`           | `codex`         | `api.openai.com`        |
-| `opencode`        | `opencode`      | provider-dependent      |
+| Profile           | Tool (fresh, upstream)               | Provider / egress       |
+| ----------------- | ------------------------------------ | ----------------------- |
+| `claude-code`     | `mise:aqua:anthropics/claude-code`   | `api.anthropic.com`     |
+| `codex`           | `mise:aqua:openai/codex`             | `api.openai.com`        |
+| `opencode`        | `mise:opencode`                      | provider-dependent      |
+| `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
+| `hermes`          | `flake:github:NousResearch/hermes-agent#default` | `openrouter.ai` (BYOK)  |
+| `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
@@ -42,31 +45,119 @@ proxy strips the placeholder and substitutes the real key on the wire. Egress is
 an **allowlist** (deny-by-construction), so even with the key in flight the agent
 can only reach the provider you listed.
 
-> **Status:** the profiles import and resolve cleanly (covered by a test). The
-> *live* end-to-end — the CLI authenticating through the proxy-injected key — is
-> the flagship validation still to be proven with a real key (does the tool accept
-> the placeholder and let the proxy fill in the real key?). Treat these as correct
-> artifacts pending that proof.
+> **Status:** the profiles import and resolve cleanly (covered by a test), and the
+> tool is **provisioned fresh and runs** under the profile's own allowlist — proven
+> live for `claude-code` (2.1.185, equipped via `mise use -g` and run through the
+> empty-netns MITM) and `kilocode` (7.3.50, equipped via the mise `github` backend and run
+> in-cage — `kilo --version`). The one remaining *live* end-to-end is the CLI **authenticating**
+> through the proxy-injected key (does the tool accept the placeholder and let the proxy
+> fill in the real key?) — the flagship validation, still to be proven with a real key.
+>
+> The **flake-backed** profile `hermes` carries an extra first-launch step — the in-cage
+> `nix build` that compiles it (uv2nix Python + its bundled node front-ends) — and that build
+> is **proven to run live in-cage** under the profile's own allowlist (`hermes` lands on PATH;
+> only the live-auth above is still pending). The `flake:` backend itself is also proven on a
+> reference flake.
 
 ## Tool freshness
 
-A profile declares its tool via `[packages]` (a nixpkgs attribute), so the version
-tracks your **base nix channel**; roll it forward with `ops upgrade nix`. For these
-agents nixpkgs is current, so that is fresh enough. Per-tool floating versions
-(nixhub `nix:<tool> = "latest"`) and non-nix mise backends (`aqua:`/`github:`/`npm:`
-for immediate-upstream freshness) are a planned increment — non-nix tools fetch
-from upstream at install (gated by the egress allowlist) and so trade away offline
-launch.
+Each profile declares its tool with a **backend-prefixed** `[packages]` value:
+
+| Profile       | Declaration                                  | Source                         |
+| ------------- | -------------------------------------------- | ------------------------------ |
+| `claude-code` | `mise:aqua:anthropics/claude-code`           | Anthropic's standalone release |
+| `codex`       | `mise:aqua:openai/codex`                      | OpenAI's GitHub release        |
+| `opencode`    | `mise:opencode`                              | opencode's standalone release  |
+| `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
+| `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix Python) |
+| `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
+
+The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
+(mise's `aqua`/`github`/registry backends pull the real release binary), so the version is the
+**latest upstream** — not whatever nixpkgs has packaged. This sidesteps both the nixpkgs
+lag and, for `claude-code`, the nixpkgs **unfree** gate (the standalone binary carries no
+such restriction). The tool is equipped at the latest upstream version on the **first
+launch in a project**; advancing an already-installed `mise:` version is **not yet
+automated** by `ops upgrade` (a roll-forward for `[packages] mise:` is a planned increment)
+— so a long-lived project store keeps its first-installed version until then.
+
+A nixpkgs attribute is still available as `nix:<attr>` (provisioned host-side, seeded,
+offline-reusable) — use it for stable substrate tools where freshness does not matter.
+
+A third backend, **`flake:<ref>`**, packages a tool that ships **only as a nix flake** — no
+single release binary and no nixpkgs attribute (e.g. a uv2nix Python agent like `hermes`). ops
+builds the flake **in-cage** with `nix build` into the project's own store; the first launch
+builds it (network + minutes — the build's own fetch hosts must be in `allow`, e.g.
+`files.pythonhosted.org`/`pypi.org` and `registry.npmjs.org` for `hermes`), and later launches
+reuse the warm build **offline**. Like `mise:`, the flake reference **floats** at HEAD for now —
+a `flake:` pin and an `ops upgrade` roll-forward are planned, not yet built. Note a flake build
+runs under the cage's egress posture: a build step that fetches with its **own** client (e.g.
+`bun install`) rather than through nix's fetcher may not honour the proxy / MITM CA under an
+allowlist (for such a tool, prefer its release-binary `mise:` backend — that is exactly how
+`kilocode` is equipped here, after its `flake:` source build hit this very wall).
+
+**Offline trade-off:** a `mise:` tool **fetches at first launch** (the price of upstream
+freshness), so a profile's *first* launch in a given project needs the network; a `nix:`
+tool is seeded and reusable offline. With the default `home_scope = "global"` the tool's
+install is shared across projects, but the per-project store means the fetch re-runs the
+first time you launch the app **in each new project** — online everywhere, the first launch
+per project not offline.
+
+**Distribution hosts and the allowlist:** a `mise:` fetch must reach the tool's
+distribution host, so the profile's `[network] allow` lists it. GitHub-distributed tools
+(`codex`, `opencode`, `kilocode`) ride the built-in nix-cache allow-set (github / githubusercontent);
+`claude-code` ships from a Google Cloud Storage bucket, so its profile path-scopes that one
+bucket (not all of GCS). If a future release moves hosts, the proxy reports the refused host
+— add it to `allow` (check ahead with `ops test net <url>`).
 
 ## Adjusting the allowlist
 
 If a tool's request is refused, the proxy reports the host it blocked — add it to
 `allow`. You can check a URL's verdict ahead of time with `ops test net <url>`.
 
-## Not here yet
+## Not here yet — and why
 
-- **GUI / desktop agents** (opencode desktop, antigravity, hermes desktop): these
-  need the Wayland passthrough, which is not built yet.
-- **Other CLI agents** (pi, agy, hermes, …): tell us the package, launch command,
-  API host(s), and credential mechanism and a profile can be added — nothing here
-  is guessed.
+A profile needs three things: a **standalone CLI/TUI** (not a GUI app, not an editor
+extension), a way to **package it in the hermetic cage**, and a **header-injectable BYOK
+credential** — an API key supplied via an env var against an OpenAI-compatible or Anthropic
+endpoint (**OpenRouter** is the universal one: one key, hundreds of models, `Authorization:
+Bearer`). An OAuth/account login or a query-param key has no header for ops's `[secret]`
+broker to strip-and-replace. The tools below were each researched against primary sources; we
+do not guess the values, so each waits on a real fact or on a named feature:
+
+- **Node/npm CLIs — blocked on a `/usr/bin/env` shim** — **`cline`** (`cline/cline`) and
+  **`droid`** (Factory). Both are genuine standalone CLIs with env-var BYOK against
+  OpenAI-compatible/Anthropic endpoints (so OpenRouter-keyable) — but they package as npm /
+  node-runtime tools (`cline` runs under **bun**, shebang `#!/usr/bin/env bun`; `droid` is
+  `npm i -g droid` or a `curl|sh` installer with no confirmed GitHub/aqua release). The
+  hermetic cage has **no `/usr/bin/env`** (the documented gap that already blocks `npm:`
+  tools) and bakes no node/bun runtime, so neither can be cleanly equipped today. Unblocking
+  needs the small **`/usr/bin/env → coreutils/bin/env` shim** in the synthetic FHS plus a
+  `node`/`bun` runtime tool. (`droid` additionally needs a **second** key — a mandatory
+  Factory account `FACTORY_API_KEY` alongside the model key — and `*.factory.ai` in `allow`.)
+
+- **OAuth / non-header credential** — **`agy`** (Antigravity CLI, Google) authenticates with
+  **Google Sign-In / an OAuth token in the keyring**, and **`freebuff`** (CodebuffAI) is
+  **not BYOK at all** — it stores an account-bound OAuth `authToken` (and its backend/ad hosts
+  are only secondhand-inferred, so an allowlist can't be written with confidence). A *header*
+  broker has nothing to inject into an OAuth flow. What would unblock the OAuth case is an
+  **interactive device-code login** (prints a URL + code you approve in your own browser; the
+  token persists in the app's isolated `$HOME`, no in-cage browser) **plus** observing the
+  tool's runtime API host (run once, read the proxy's refusal) before writing `allow`.
+
+- **GUI / desktop agents — blocked on the Wayland passthrough** — **opencode desktop** and
+  **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that drives *other* agents,
+  not a CLI), plus Antigravity *IDE* and hermes desktop. These are Electron/desktop apps that
+  need a graphical display, which the headless cage does not bind yet. Their headless siblings
+  are the path: the `opencode` **CLI** is already profiled; t3 code's targets are the CLIs it
+  wraps (`codex`/`claude`/`opencode`), already here.
+
+- **`aionui`** is the closest GUI candidate — it is an Electron app **but ships a genuine
+  headless `--webui` HTTP-server mode** and is OpenRouter-keyable. It waits on two things:
+  packaging an **Electron/AppImage app inside the hermetic cage** (unproven, heavy) and
+  confirming it reads its key from an **env var** rather than only its GUI config (so the
+  host-side injection has a request to act on). Filed as *deferred*, not refused.
+
+For any other CLI agent: give the package (a `mise:`/`nix:`/`flake:` backend), the launch
+command, the runtime API host(s), and the credential mechanism (an injectable **header** key,
+not OAuth) and a profile can be added — nothing here is guessed.

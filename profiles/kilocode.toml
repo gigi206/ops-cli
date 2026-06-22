@@ -1,0 +1,43 @@
+# Kilo Code (kilo) — a terminal AI coding agent (an opencode fork), sandboxed by ops.
+#
+#   ops app import profiles/kilocode.toml
+#   ops app kilocode
+#
+# The tool is equipped fresh from upstream: mise's `github` backend pulls Kilo Code's
+# standalone release binary (`kilo-linux-x64.tar.gz`) — verified by GitHub artifact
+# attestation + SLSA provenance, self-contained (no node/bun runtime), no nixpkgs lag. It
+# is equipped at the latest upstream version on the first launch in a project; advancing an
+# already-installed version is not yet automated by `ops upgrade`. The launched command is
+# `kilo` (the binary); the imported app is named `kilocode` (the product).
+#
+# (Why not the nix flake? Kilo Code also ships a `packages.kilo` flake, but its source
+# build is broken upstream — the package derivation uses nixpkgs' bun, older than the
+# version its own build script requires — and its `bun install` step does not fetch through
+# the cage's egress proxy. The release binary above sidesteps both.)
+#
+# Kilo Code is MULTI-PROVIDER (it shares opencode's model layer). This template is set up
+# for Anthropic; for another provider change the allowlist + the [secret] block + the env
+# var (e.g. OpenAI: allow "api.openai.com", header "Authorization", type "bearer", env
+# OPENAI_API_KEY; or OpenRouter: allow "openrouter.ai", header "Authorization", type
+# "bearer", env OPENROUTER_API_KEY). The real key is read on the HOST and injected by the
+# egress proxy — never in the cage. If a request is blocked, the proxy reports the host it
+# refused — add it to `allow` (or check ahead with `ops test net <url>`).
+cmd = "kilo"
+
+[packages]
+kilo = "mise:github:Kilo-Org/kilocode"
+
+[network]
+mode = "allowlist"
+# api.anthropic.com: the provider API. models.dev: opencode/kilo's model catalogue.
+allow = ["api.anthropic.com", "models.dev"]
+
+# The real key is read on the HOST and injected by the egress proxy — never in the cage.
+# Provide it on the host as $ANTHROPIC_API_KEY (or point `from` at a resolver).
+[env]
+ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+
+[secret."api.anthropic.com"]
+from = "env://ANTHROPIC_API_KEY"
+header = "x-api-key"
+type = "raw"
