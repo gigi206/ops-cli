@@ -388,20 +388,25 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
     ok
 }
 
-/// `ops gc [--all] [--prune]`: reclaim ops's per-project store space.
+/// `ops gc [--all] [--prune]`: reclaim ops's store space.
 ///
 /// By default it sweeps the **current** project's store (see [`sweep_current`]). With `--all` it
-/// also reaps whole runtime trees whose project directory is gone (see [`reap_dead_trees`]). The
-/// cross-project reap runs **first** and is independent of the sandbox/nix prerequisites the
-/// current-project sweep needs — so `ops gc --all` reclaims dead trees even from a directory that
-/// is not a project, or on a host that has lost its sandbox capability. A dry run by default;
-/// `--prune` is the destructive form.
+/// also, across all projects: reaps whole runtime trees whose project directory is gone (see
+/// [`reap_dead_trees`]), then garbage-collects the **shared** store — the channel revisions left
+/// behind by `ops upgrade` and the tools of reaped projects (see [`shared_store_gc`]). The
+/// cross-project passes run **first** and are independent of the sandbox/nix prerequisites the
+/// current-project sweep needs — so `ops gc --all` reclaims even from a directory that is not a
+/// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
+/// the destructive form.
 pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
     if all {
         match crate::store::Layout::from_env() {
-            Some(layout) => reap_dead_trees(&layout, prune),
+            Some(layout) => {
+                reap_dead_trees(&layout, prune);
+                shared_store_gc(&layout, prune);
+            }
             None => eprintln!(
-                "ops gc: cannot locate ops's data directory; skipping the cross-project reap."
+                "ops gc: cannot locate ops's data directory; skipping the cross-project housekeeping."
             ),
         }
     }
@@ -481,6 +486,82 @@ fn reap_dead_trees(layout: &crate::store::Layout, prune: bool) {
             "  unidentified (no marker, project path unknown): {} ({}) — remove by hand if unwanted",
             tree.dir.display(),
             super::gc::human_bytes(tree.bytes)
+        );
+    }
+}
+
+/// Garbage-collect the **shared** store: drop the gc roots of channel revisions no longer locked
+/// and of reaped projects, then `nix-store --gc` the shared store. Runs *after* the dead-tree reap,
+/// so a reaped project's pin no longer keeps its channel revision alive. Held under the exclusive
+/// shared-store lock for the whole prune + collection, so a concurrent seed's reflink copy (which
+/// holds the same lock shared) can never race the deletion. Best-effort: a missing `nix-store`, or
+/// an unlockable store, skips with a note rather than failing the command — like the reap, it is
+/// independent of the current-project sweep.
+///
+/// Concurrency scope, precisely: the lock closes the one corruption window — the seeder's direct
+/// copy versus this collector deleting mid-copy. It does **not** cover a launch *provisioning* a
+/// brand-new revision (the `nix build --out-link` and the lock write happen outside it), so a
+/// launch first-resolving a fresh revision concurrent with a `--prune` can have that revision's
+/// just-created gc root pruned (it was not in the live-set snapshot) and its closure collected,
+/// after which the launch's seed cache-misses or fails. That is **recoverable** — a re-run
+/// re-provisions, and nix's own gc lock still stops the build itself from racing the collector, so
+/// it is never corruption. Widening the ops lock to cover provisioning would make this collector
+/// wait behind minutes-long builds, so the narrow lock plus this named residual is the deliberate
+/// trade.
+fn shared_store_gc(layout: &crate::store::Layout, prune: bool) {
+    let Some(nix_store) = crate::store::resolve_nix_store() else {
+        eprintln!("ops gc: nix-store not found; skipping the shared-store gc.");
+        return;
+    };
+
+    // Exclusive across the whole prune + `nix-store --gc`: it waits for in-flight seeds to release
+    // their shared hold, and blocks new seeds until the collection finishes.
+    let _lock = match super::projectstore::lock_exclusive(layout) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("ops gc: cannot lock the shared store ({e}); skipping the shared-store gc.");
+            return;
+        }
+    };
+
+    // Read the live revisions *after* acquiring the lock, so the snapshot reflects every lock
+    // written before the exclusive acquire settled (no read-then-lock gap).
+    let live_base = crate::store::live_base_revisions(layout);
+    let live_mise = crate::store::live_mise_revisions(layout);
+
+    let stale = super::gc::prune_shared_gcroots(
+        &layout.data_dir().join("gcroots"),
+        &layout.data_dir().join("projects"),
+        &live_base,
+        &live_mise,
+        prune,
+    );
+
+    let report = match super::gc::collect(&nix_store, &layout.store_dir(), prune) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ops gc: shared-store gc failed: {e}");
+            return;
+        }
+    };
+
+    if prune {
+        println!(
+            "ops gc --all: shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
+            stale.len(),
+            report.paths,
+            super::gc::human_bytes(report.bytes)
+        );
+    } else {
+        // On a dry run the stale roots are not dropped, so their closures are still rooted and not
+        // yet counted as collectable; the count of stale roots is the signal, and `--prune` frees
+        // their closures on top of the orphans reported here (a lower bound).
+        println!(
+            "ops gc --all: shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
+             reclaimable now ({}). Run `ops gc --all --prune` to drop the roots and reclaim their closures.",
+            stale.len(),
+            report.paths,
+            super::gc::human_bytes(report.bytes)
         );
     }
 }

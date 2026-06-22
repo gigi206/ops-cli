@@ -7,6 +7,7 @@
 //! on-disk layout, bootstraps it, and builds the daemonless nix invocation that
 //! drives it.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -304,6 +305,47 @@ fn project_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
 /// project. `None` when nothing has been resolved yet. Pure file read.
 pub(crate) fn read_global_lock(layout: &Layout) -> Option<(String, String)> {
     read_lock(&global_lock_path(layout))
+}
+
+/// The base-channel revisions a shared-store gc must keep: the global channel's, plus the pin of
+/// every project whose lock is still on disk. The GUI font set is keyed by the same channel
+/// revision as the base userland, so this set covers both `gcroots/base/<rev>/` and
+/// `gcroots/gui/<rev>/` — any revision outside it is stale. Reads the locks straight from disk,
+/// so a dead project reaped before the gc no longer contributes its pin (and on a dry run, where
+/// dead projects still exist, their pins keep their revisions, making the dry run a lower bound on
+/// what `--prune` frees). Pure file reads, no nix.
+pub(crate) fn live_base_revisions(layout: &Layout) -> BTreeSet<String> {
+    let mut revs = BTreeSet::new();
+    if let Some((_, rev)) = read_global_lock(layout) {
+        revs.insert(rev);
+    }
+    if let Ok(entries) = std::fs::read_dir(layout.data_dir().join("projects")) {
+        for entry in entries.flatten() {
+            if let Some((_, rev)) = read_lock(&entry.path().join(NIXPKGS_LOCK)) {
+                revs.insert(rev);
+            }
+        }
+    }
+    revs
+}
+
+/// The mise engine revisions a shared-store gc must keep: the engine lock's, or — when the engine
+/// lock has not been written yet (an install still running its engine seeded from the global
+/// channel) — the global channel's. This mirrors [`resolve_engine_ref`]'s seed-from-global
+/// fallback, so the engine a launch is actually running is never collected. Pure file reads.
+pub(crate) fn live_mise_revisions(layout: &Layout) -> BTreeSet<String> {
+    let mut revs = BTreeSet::new();
+    match read_lock(&engine_lock_path(layout)) {
+        Some((_, rev)) => {
+            revs.insert(rev);
+        }
+        None => {
+            if let Some((_, rev)) = read_global_lock(layout) {
+                revs.insert(rev);
+            }
+        }
+    }
+    revs
 }
 
 /// Resolve the mise engine reference, seeding its dedicated lock from the global channel
@@ -733,6 +775,53 @@ mod tests {
         assert!(LockTarget::global(&layout, None)
             .resolve(Path::new(BOGUS_NIX), &layout)
             .is_err());
+    }
+
+    #[test]
+    fn live_base_revisions_collects_the_global_and_each_project_pin() {
+        const REV_B: &str = "0123456789abcdef0123456789abcdef01234567";
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("ops"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        // the global channel revision
+        write_lock(&layout.data_dir().join(NIXPKGS_LOCK), "nixos-unstable", REV).unwrap();
+        // a pinned project contributes its own revision
+        let p1 = layout.data_dir().join("projects").join("p1");
+        std::fs::create_dir_all(&p1).unwrap();
+        write_lock(&p1.join(NIXPKGS_LOCK), "nixos-23.11", REV_B).unwrap();
+        // a non-pinned project (no lock) contributes nothing — it rides the global rev
+        std::fs::create_dir_all(layout.data_dir().join("projects").join("p2")).unwrap();
+
+        let live = live_base_revisions(&layout);
+        assert!(live.contains(REV), "the global rev must be live");
+        assert!(live.contains(REV_B), "a pinned project's rev must be live");
+        assert_eq!(
+            live.len(),
+            2,
+            "only the global and the one pin are live: {live:?}"
+        );
+    }
+
+    #[test]
+    fn live_mise_revisions_falls_back_to_the_global_lock_when_the_engine_lock_is_absent() {
+        const ENGINE_REV: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("ops"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        write_lock(&layout.data_dir().join(NIXPKGS_LOCK), "nixos-unstable", REV).unwrap();
+
+        // no engine lock yet → the engine runs on the global rev, which must be kept
+        assert!(
+            live_mise_revisions(&layout).contains(REV),
+            "an absent engine lock must fall back to the global rev"
+        );
+
+        // once the engine lock exists it is the sole authority
+        write_lock(&engine_lock_path(&layout), "nixos-unstable", ENGINE_REV).unwrap();
+        assert_eq!(
+            live_mise_revisions(&layout),
+            BTreeSet::from([ENGINE_REV.to_string()])
+        );
     }
 
     #[test]

@@ -112,6 +112,67 @@ pub(crate) fn store_exists(layout: &Layout, project_id: &str) -> bool {
     store_dir_for(layout, project_id).exists()
 }
 
+/// An advisory lock serialising ops's reads of the **shared** store against the shared-store
+/// garbage collector. The seed below copies store paths out of the shared store *directly* — not
+/// as a nix process — so nothing in nix stops a concurrent `nix-store --gc <shared>` from deleting
+/// a path mid-copy and corrupting the project store it lands in. The seeder holds this **shared**
+/// (so concurrent seeds never block each other); the collector holds it **exclusive** around the
+/// whole `nix-store --gc`. Both sides call the same `flock`, so they serialise regardless of which
+/// primitive nix uses internally (`flock` and POSIX `fcntl` locks occupy separate lock spaces and
+/// do not interoperate). Dropping the guard closes the fd, releasing the lock.
+pub(crate) struct SharedGcLock(
+    // Held only for its `Drop`: closing the fd is what releases the `flock`. Never read.
+    #[allow(dead_code)] std::fs::File,
+);
+
+/// The shared-store gc lock file — a top-level sibling of `store/`, `projects/`, and `gcroots/`, so
+/// neither the dead-tree reaper nor the gcroot prune ever walks it.
+fn shared_gc_lock_path(layout: &Layout) -> PathBuf {
+    layout.data_dir().join("store-gc.lock")
+}
+
+fn acquire_shared_gc_lock(layout: &Layout, exclusive: bool) -> io::Result<SharedGcLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = shared_gc_lock_path(layout);
+    if let Some(parent) = path.parent() {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+    let op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    // SAFETY: `flock` on a valid owned fd; it blocks until the lock is granted and returns 0 on
+    // success. The fd lives in the returned guard, so the lock is held until the guard drops.
+    if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SharedGcLock(file))
+}
+
+/// Take the shared-store gc lock **shared** — for a seed's read of the shared store. Many seeds may
+/// hold it at once; only the exclusive collector blocks them.
+pub(crate) fn lock_shared(layout: &Layout) -> io::Result<SharedGcLock> {
+    acquire_shared_gc_lock(layout, false)
+}
+
+/// Take the shared-store gc lock **exclusive** — for the shared-store collector, around the whole
+/// gcroot prune and `nix-store --gc`. Blocks until every in-flight seed has released its shared
+/// hold, and blocks new seeds until the collection finishes.
+pub(crate) fn lock_exclusive(layout: &Layout) -> io::Result<SharedGcLock> {
+    acquire_shared_gc_lock(layout, true)
+}
+
 /// Record the project's canonical path in a durable marker beside its store, so a later `ops gc`
 /// can recognise this tree (`<id>` alone is a one-way hash) and reclaim it once the project
 /// directory is gone. Atomic (temp + rename) and owner-only; overwritten each launch — the path is
@@ -175,6 +236,14 @@ pub(crate) fn prepare(
     if roots.is_empty() {
         return Ok(ProjectStore { store_dir });
     }
+
+    // Serialise this whole read of the shared store against the shared-store collector. The copy
+    // below reads store paths directly (not as a nix process), so without this a concurrent
+    // `nix-store --gc <shared>` could delete a path between the closure query and the copy — or
+    // mid-copy — and leave this store with paths registered but truncated. Held shared, so
+    // concurrent same-project (and cross-project) seeds never block each other; only the exclusive
+    // collector does. Released when `_shared` drops at the end of this function.
+    let _shared = lock_shared(layout)?;
     let shared_store = layout.store_dir();
     let closure = closure_of(nix_store, &shared_store, roots)?;
 
@@ -501,6 +570,42 @@ mod tests {
             project_dir(&layout, "abc").join(PROJECT_MARKER),
             PathBuf::from("/data/ops/projects/abc/project")
         );
+    }
+
+    #[test]
+    fn shared_gc_lock_serialises_a_shared_hold_against_an_exclusive_acquire() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+
+        // hold the lock shared (as a seed does)
+        let held = lock_shared(&layout).unwrap();
+
+        // a second actor's exclusive acquire (as the collector does) must block while the shared
+        // hold is live, then proceed once it is released.
+        let (tx, rx) = mpsc::channel();
+        let path = data.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let layout = Layout::under(&path);
+            let guard = lock_exclusive(&layout).unwrap();
+            tx.send(()).unwrap();
+            // hold briefly so the release is observable, then drop
+            std::thread::sleep(Duration::from_millis(50));
+            drop(guard);
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the exclusive acquire completed while a shared hold was live — the guard released \
+             early (a `let _ =` instead of a bound guard), or the lock is not actually held"
+        );
+        drop(held); // release the shared hold
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the exclusive acquire did not proceed after the shared hold was released"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

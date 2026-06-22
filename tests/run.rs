@@ -1886,6 +1886,29 @@ fn ops_gc_all_reaps_a_deleted_projects_tree() {
         remaining, 0,
         "a project tree survived — the scratch project was seeded by the sweep instead of skipped\n{log}"
     );
+
+    // The shared-store gc pass ran (its own line) and must NOT have collected the live base: the
+    // global channel revision is still locked, so its base gc root and closure survive. (A near
+    // no-op here — there are no stale revisions — but it exercises the seeder flock, the live-set
+    // computation, the gcroot scan, and `nix-store --gc` on the real shared store.)
+    assert!(
+        String::from_utf8_lossy(&gc.stdout).contains("shared store"),
+        "the shared-store gc pass did not run: {log}"
+    );
+    let base_gcroots = data.path().join("ops/gcroots/base");
+    assert!(
+        std::fs::read_dir(&base_gcroots)
+            .map(|d| d.flatten().any(|e| e.path().is_dir()))
+            .unwrap_or(false),
+        "the live base channel's gc root was collected by the shared-store gc: {base_gcroots:?}\n{log}"
+    );
+    let shared_paths = data.path().join("ops/store/nix/store");
+    assert!(
+        std::fs::read_dir(&shared_paths)
+            .map(|d| d.flatten().next().is_some())
+            .unwrap_or(false),
+        "the shared store was emptied — the live base closure was wrongly collected: {shared_paths:?}\n{log}"
+    );
 }
 
 #[test]

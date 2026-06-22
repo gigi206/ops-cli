@@ -318,6 +318,65 @@ fn tree_size(path: &Path) -> u64 {
     total
 }
 
+/// Prune — or, in a dry run, list — the stale gc roots of the **shared** store, returning the root
+/// directories dropped. The shared store keeps one closure per channel revision and per project, so
+/// it is rooted under `<data>/gcroots/`: `base/<rev>/` and `gui/<rev>/` (both keyed by the base
+/// channel revision), `mise/<rev>/` (the engine revision), and `projects/<id>/` (a project's
+/// declared `[packages]` and `nix:` tools). A rev directory not in its live set, and a project
+/// directory whose runtime tree under `projects_dir` is gone, are stale: dropping the root lets the
+/// following `nix-store --gc` collect the closure it held. Destructive only when `prune`. The live
+/// sets must be computed *before* this runs (and after any dead-tree reap, so a reaped project's
+/// pin no longer counts) — see [`crate::store::live_base_revisions`] / [`live_mise_revisions`].
+pub(crate) fn prune_shared_gcroots(
+    gcroots_dir: &Path,
+    projects_dir: &Path,
+    live_base: &BTreeSet<String>,
+    live_mise: &BTreeSet<String>,
+    prune: bool,
+) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    // base and the GUI font set are both keyed by the base channel revision.
+    prune_rev_dirs(&gcroots_dir.join("base"), live_base, prune, &mut removed);
+    prune_rev_dirs(&gcroots_dir.join("gui"), live_base, prune, &mut removed);
+    prune_rev_dirs(&gcroots_dir.join("mise"), live_mise, prune, &mut removed);
+
+    // Per-project roots: stale once the project's runtime tree is gone (the dead-tree reaper removes
+    // the tree but not these shared-store roots, so they are reclaimed here).
+    if let Ok(entries) = std::fs::read_dir(gcroots_dir.join("projects")) {
+        for entry in entries.flatten() {
+            if projects_dir.join(entry.file_name()).exists() {
+                continue; // the project still exists — keep its tools rooted
+            }
+            if prune {
+                let _ = force_remove_dir_all(&entry.path());
+            }
+            removed.push(entry.path());
+        }
+    }
+    removed
+}
+
+/// Drop each revision-keyed root directory under `dir` whose revision is not in `live`. A root
+/// directory's name is the revision; one outside the live set roots a channel revision nothing
+/// references any more.
+fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(rev) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if live.contains(&rev) {
+            continue;
+        }
+        if prune {
+            let _ = force_remove_dir_all(&entry.path());
+        }
+        removed.push(entry.path());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +530,49 @@ mod tests {
             Path::new("/etc/hostname").exists(),
             "a symlink target was followed and deleted"
         );
+    }
+
+    #[test]
+    fn prune_shared_gcroots_drops_stale_revs_and_dead_projects_only() {
+        let base = TmpDir::new();
+        let gcroots = base.path().join("gcroots");
+        let projects = base.path().join("projects");
+
+        let mk = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::os::unix::fs::symlink("/nix/store/x", dir.join("root")).unwrap();
+        };
+        // base + gui are both keyed by the base channel rev: "live" current, "stale" rolled away
+        mk(&gcroots.join("base/live"));
+        mk(&gcroots.join("base/stale"));
+        mk(&gcroots.join("gui/live"));
+        mk(&gcroots.join("gui/stale"));
+        // mise keyed by the engine rev
+        mk(&gcroots.join("mise/eng"));
+        mk(&gcroots.join("mise/oldeng"));
+        // per-project roots: p1 still has a runtime tree, p2 was reaped
+        mk(&gcroots.join("projects/p1/tool"));
+        mk(&gcroots.join("projects/p2/tool"));
+        std::fs::create_dir_all(projects.join("p1")).unwrap();
+
+        let live_base = BTreeSet::from(["live".to_string()]);
+        let live_mise = BTreeSet::from(["eng".to_string()]);
+
+        // a dry run lists the stale set (base/stale, gui/stale, mise/oldeng, projects/p2) and
+        // removes nothing
+        let listed = prune_shared_gcroots(&gcroots, &projects, &live_base, &live_mise, false);
+        assert_eq!(listed.len(), 4, "stale set: {listed:?}");
+        assert!(
+            gcroots.join("base/stale").is_dir(),
+            "a dry run removed a root"
+        );
+
+        // a prune removes exactly those, keeping every live revision and the live project
+        let removed = prune_shared_gcroots(&gcroots, &projects, &live_base, &live_mise, true);
+        assert_eq!(removed.len(), 4);
+        assert!(!gcroots.join("base/stale").exists() && gcroots.join("base/live").is_dir());
+        assert!(!gcroots.join("gui/stale").exists() && gcroots.join("gui/live").is_dir());
+        assert!(!gcroots.join("mise/oldeng").exists() && gcroots.join("mise/eng").is_dir());
+        assert!(!gcroots.join("projects/p2").exists() && gcroots.join("projects/p1").is_dir());
     }
 }
