@@ -192,6 +192,201 @@ pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
     run(cmd)
 }
 
+/// Which persistent home a `mise:` package group is equipped in, owning its app name so a
+/// group can outlive the config it was derived from. Mirrors [`binds::Runtime`], which borrows
+/// the name; [`GroupHome::runtime`] rebuilds the borrowing form at launch.
+enum GroupHome {
+    /// The project's default shell home — where `ops run`/`ops shell` equip baseline tools.
+    ProjectDefault,
+    /// An app's home shared across projects (`home_scope = "global"`).
+    GlobalApp(String),
+    /// An app's per-project home (`home_scope = "project"`).
+    ProjectApp(String),
+}
+
+impl GroupHome {
+    fn runtime(&self) -> binds::Runtime<'_> {
+        match self {
+            GroupHome::ProjectDefault => binds::Runtime::ProjectDefault,
+            GroupHome::GlobalApp(name) => binds::Runtime::GlobalApp(name),
+            GroupHome::ProjectApp(name) => binds::Runtime::ProjectApp(name),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            GroupHome::ProjectDefault => "project".to_string(),
+            GroupHome::GlobalApp(name) | GroupHome::ProjectApp(name) => format!("app: {name}"),
+        }
+    }
+}
+
+/// One in-cage `mise:` roll: the home that equips these tokens, the merged config to launch it
+/// with, and the tokens to advance.
+struct MiseGroup {
+    home: GroupHome,
+    cfg: crate::config::Resolved,
+    tokens: Vec<String>,
+}
+
+/// The `mise:` `[packages]` groups to roll forward — generic over every declared group: the
+/// project baseline (equipped in its default home by `ops run`/`ops shell`) and each app
+/// (equipped in its own home, keyed by `home_scope`), each with its merged trusted `mise:`
+/// token set. A group with no trusted `mise:` token — and an app with no command — is omitted,
+/// so a project or app without any produces no cage, and no app is special-cased. Trusted-only
+/// by construction, since [`super::packages::mise_packages`] keeps only trusted tokens. Pure
+/// over the resolved config (it clones to merge each app), so the grouping is unit-tested
+/// without launching a cage.
+fn mise_package_groups(cfg: &crate::config::Resolved) -> Vec<MiseGroup> {
+    let mut groups = Vec::new();
+
+    // The project baseline, equipped in the default shell home.
+    let baseline = super::packages::mise_packages(&cfg.packages);
+    if !baseline.is_empty() {
+        groups.push(MiseGroup {
+            home: GroupHome::ProjectDefault,
+            cfg: cfg.clone(),
+            tokens: baseline,
+        });
+    }
+
+    // Each app, in its own home. Merging folds the baseline packages in (an app's cage equips
+    // both layers), so the token set is exactly the one the app's launch equips.
+    for (name, app) in &cfg.apps {
+        if app.cmd.is_empty() {
+            continue; // an unlaunchable app never equips anything
+        }
+        let home = match app.home_scope {
+            crate::config::AppHomeScope::Global => GroupHome::GlobalApp(name.clone()),
+            crate::config::AppHomeScope::Project => GroupHome::ProjectApp(name.clone()),
+        };
+        let mut merged = cfg.clone();
+        merged.merge_app(app.clone());
+        let tokens = super::packages::mise_packages(&merged.packages);
+        if tokens.is_empty() {
+            continue;
+        }
+        groups.push(MiseGroup {
+            home,
+            cfg: merged,
+            tokens,
+        });
+    }
+    groups
+}
+
+/// How many declared `mise:` packages are withheld for being untrusted — across the project
+/// baseline and each app's own overlay. Only a count: the per-package withholding reason is
+/// already warned on the launch path, so `ops upgrade` just needs to not read as "none declared".
+fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
+    let untrusted_mise = |pkgs: &[crate::config::Package]| {
+        pkgs.iter()
+            .filter(|p| {
+                matches!(p.backend, crate::config::Backend::Mise(_))
+                    && p.state != crate::trust::TrustState::Trusted
+            })
+            .count()
+    };
+    untrusted_mise(&cfg.packages)
+        + cfg
+            .apps
+            .values()
+            .map(|app| untrusted_mise(&app.packages))
+            .sum::<usize>()
+}
+
+/// Roll the project's and its apps' `mise:` `[packages]` forward, in-cage. A `mise:` package is
+/// equipped by `mise use -g <token>` at launch and then frozen at the installed version (the
+/// floating `latest` request stays satisfied, so a later launch does not re-resolve), so
+/// advancing it means running `mise upgrade <token>` in the same cage — the equip environment,
+/// so the fetch rides the app's egress allowlist. Generic over [`mise_package_groups`]: the
+/// project baseline (its default home) and each app (its own home), no app special-cased.
+/// Trusted-only by construction. Returns whether every group rolled cleanly; a group that fails
+/// makes this `false` but never aborts the others.
+///
+/// Unlike the host-side lock rewrites (`nix:`, the engine, `nix:` tools), the roll needs the
+/// sandbox — but only when there is something to roll: the groups are computed from the
+/// already-resolved `cfg` first, so a project with no `mise:` package costs nothing here and
+/// `ops upgrade nix`/`all` keeps its cheap, sandbox-free common path. With work to do, a host
+/// that cannot sandbox warns and rolls nothing rather than failing (best-effort, like the
+/// cgroup limits).
+pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
+    println!("ops upgrade — mise packages");
+    let groups = mise_package_groups(cfg);
+    // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
+    // read as "nothing declared" — parity with the `nix:` tools path, which warns the same.
+    let withheld = withheld_mise_packages(cfg);
+    if withheld > 0 {
+        println!(
+            "  {withheld} mise: package(s) withheld (untrusted) — not rolled; run `ops trust`."
+        );
+    }
+    if groups.is_empty() {
+        if withheld == 0 {
+            println!("  no mise: packages to roll.");
+        }
+        return true;
+    }
+
+    // Only now, with groups to roll, take on the sandbox prerequisites.
+    let mut prep = match prepare() {
+        Ok(p) => p,
+        Err(_) => {
+            // prepare() already printed the pointed reason (missing bwrap/userns/nix).
+            eprintln!(
+                "ops upgrade — mise packages: skipped (no usable sandbox; see `ops doctor`)."
+            );
+            return true;
+        }
+    };
+
+    let mut ok = true;
+    for group in groups {
+        let MiseGroup { home, cfg, tokens } = group;
+        let label = home.label();
+        // `network = "none"` cannot fetch — the launch skips the equip there — so skip the roll
+        // too (the tool stays at its persisted version). Not a failure: it is the declared posture.
+        if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
+            println!("  [{label}] network = \"none\" — cannot fetch, skipped.");
+            continue;
+        }
+        println!("  [{label}] mise upgrade {}", tokens.join(", "));
+
+        // Launch a cage in this group's home with its merged config so `build` sees the right
+        // network/packages/home. The baseline warnings were already surfaced by `upgrade_cmd`,
+        // so clear them to avoid one repeat per cage. The command is `mise upgrade <tokens>`; the
+        // launch's own `mise use -g` equip wrap runs first (a warm no-op once installed, or a
+        // fresh equip if the app was never launched), then the upgrade rolls the version.
+        let runtime = home.runtime();
+        let mut cfg = cfg;
+        cfg.warnings.clear();
+        prep.cfg = cfg;
+
+        let mut cmd = vec![
+            prep.userland.mise_bin.clone().into_os_string(),
+            OsString::from("upgrade"),
+        ];
+        cmd.extend(tokens.iter().map(OsString::from));
+
+        let (spec, egress) = match build(&prep, runtime, cmd) {
+            Ok(v) => v,
+            Err(_) => {
+                ok = false;
+                continue;
+            }
+        };
+        // Fork-and-wait (never exec-replace) so the next group can run; the egress guard, if any,
+        // is held across the wait so the proxy serves the fetch, then unlinked as the group ends.
+        let code = run_status(&prep.bwrap, &spec);
+        drop(egress);
+        if code != 0 {
+            eprintln!("  [{label}] mise upgrade exited {code}");
+            ok = false;
+        }
+    }
+    ok
+}
+
 /// `ops shell`: an interactive shell inside the project sandbox, under a pty
 /// supervisor so job control works.
 pub(crate) fn shell() -> ExitCode {
@@ -393,11 +588,31 @@ fn build(
     // command runs, exactly as the mise shims dir is on PATH before mise populates it. Each
     // out-link is keyed by the (validated) package name under the persistent home.
     let flake_pkgs = super::packages::flake_packages(&prep.cfg.packages);
+    // Consult the per-project flake lock: a pinned package builds its locked (immutable) ref into
+    // an out-link keyed by that revision, so an `ops upgrade flake` that moved the pin rebuilds at
+    // this launch (the rev-keyed path does not yet exist). An unpinned package floats — it builds
+    // the declared ref into a name-keyed out-link, the v1 behaviour kept for a project that never
+    // ran `ops upgrade flake`.
+    let flake_lock = if flake_pkgs.is_empty() {
+        // The common launch declares no flake package — read no lock, derive no project id.
+        std::collections::BTreeMap::new()
+    } else {
+        match binds::project_runtime_id(&prep.cwd) {
+            Ok(id) => super::flake::pins(&prep.layout, &id),
+            Err(_) => std::collections::BTreeMap::new(),
+        }
+    };
     let mut flake_pairs: Vec<(String, PathBuf)> = Vec::with_capacity(flake_pkgs.len());
     for (name, reference) in &flake_pkgs {
-        let out_link = binds::flake_out_link(name);
+        let (build_ref, out_link) = match flake_lock.get(reference) {
+            Some(pin) => (
+                pin.locked_ref.clone(),
+                binds::flake_out_link_rev(name, &pin.rev),
+            ),
+            None => (reference.clone(), binds::flake_out_link(name)),
+        };
         bin_paths.push(out_link.join("bin"));
-        flake_pairs.push((reference.clone(), out_link));
+        flake_pairs.push((build_ref, out_link));
     }
 
     // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
@@ -969,19 +1184,27 @@ fn register(data_dir: &Path, spec: &SandboxSpec, kind: Kind) -> Option<PathBuf> 
 /// egress guard is present. `Command::status` forks, waits, and yields the child's code;
 /// the proxy thread was already spawned (by `egress::start`) before the launch.
 fn run_supervised(bwrap: &Path, spec: &SandboxSpec) -> ExitCode {
+    ExitCode::from(run_status(bwrap, spec) as u8)
+}
+
+/// Fork the cage, wait, and return its exit status code (shell convention). The fork-and-wait
+/// core of [`run_supervised`], shared with the multi-cage upgrade roll: both run a series of
+/// cages and need the code of each rather than exec-replacing the launcher. A failure to
+/// prepare or spawn surfaces a pointed error and yields `1`, matching the supervised path.
+fn run_status(bwrap: &Path, spec: &SandboxSpec) -> i32 {
     let (argv, _seccomp) = match seccomp_argv(spec) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("ops: failed to prepare the seccomp filter: {e}");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
     let (prog, args) = super::cgroup::wrap(bwrap, argv);
     match Command::new(prog).args(args).status() {
-        Ok(status) => ExitCode::from(status_code(status) as u8),
+        Ok(status) => status_code(status),
         Err(e) => {
             eprintln!("ops: failed to launch the sandbox: {e}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
@@ -1313,6 +1536,113 @@ mod tests {
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
         }
+    }
+
+    fn mise_pkg(name: &str, token: &str, trusted: bool) -> crate::config::Package {
+        crate::config::Package {
+            name: name.into(),
+            backend: crate::config::Backend::Mise(token.into()),
+            state: if trusted {
+                crate::trust::TrustState::Trusted
+            } else {
+                crate::trust::TrustState::Untrusted
+            },
+        }
+    }
+
+    fn nix_pkg(name: &str, attr: &str) -> crate::config::Package {
+        crate::config::Package {
+            name: name.into(),
+            backend: crate::config::Backend::Nix(attr.into()),
+            state: crate::trust::TrustState::Trusted,
+        }
+    }
+
+    fn app_overlay(
+        cmd: &[&str],
+        scope: crate::config::AppHomeScope,
+        packages: Vec<crate::config::Package>,
+    ) -> crate::config::ResolvedApp {
+        crate::config::ResolvedApp {
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            home_scope: scope,
+            env: vec![],
+            ro_binds: vec![],
+            packages,
+            network: None,
+            gui: None,
+            secrets: vec![],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn mise_package_groups_covers_the_baseline_and_each_app_generically() {
+        use crate::config::AppHomeScope;
+        let mut cfg = resolved(None, None);
+        cfg.packages = vec![
+            mise_pkg("opencode", "opencode", true),
+            nix_pkg("jq", "jq"), // a nix package is not a mise token
+            mise_pkg("evil", "aqua:attacker/x", false), // untrusted: dropped
+        ];
+        let mut apps = std::collections::BTreeMap::new();
+        // An app with its own mise: package, in a shared (global) home.
+        apps.insert(
+            "alpha".to_string(),
+            app_overlay(
+                &["alpha"],
+                AppHomeScope::Global,
+                vec![mise_pkg("foo", "aqua:foo", true)],
+            ),
+        );
+        // An app with only a nix: package — no mise: group.
+        apps.insert(
+            "beta".to_string(),
+            app_overlay(
+                &["beta"],
+                AppHomeScope::Project,
+                vec![nix_pkg("rg", "ripgrep")],
+            ),
+        );
+        // An app with a mise: package but no command — never launchable, so skipped.
+        apps.insert(
+            "gamma".to_string(),
+            app_overlay(
+                &[],
+                AppHomeScope::Global,
+                vec![mise_pkg("g", "aqua:g", true)],
+            ),
+        );
+        cfg.apps = apps;
+
+        let groups = mise_package_groups(&cfg);
+        // Three groups: the project baseline plus each launchable app — beta inherits the
+        // baseline `mise:` tool (an app's cage equips both layers), so even a nix-only app gets
+        // a group. gamma has no command, so it is skipped.
+        assert_eq!(groups.len(), 3);
+
+        // The baseline group rolls only the trusted mise token, in the default home.
+        let base = &groups[0];
+        assert!(matches!(base.home, GroupHome::ProjectDefault));
+        assert_eq!(base.tokens, vec!["opencode".to_string()]);
+
+        // alpha rolls in its own (global) home; its tokens are the merged set (baseline + app).
+        let alpha = groups
+            .iter()
+            .find(|g| matches!(&g.home, GroupHome::GlobalApp(n) if n == "alpha"))
+            .expect("alpha has a global-home group");
+        assert!(alpha.tokens.contains(&"opencode".to_string()));
+        assert!(alpha.tokens.contains(&"aqua:foo".to_string()));
+
+        // beta rolls in its own per-project home, inheriting only the baseline mise tool.
+        let beta = groups
+            .iter()
+            .find(|g| matches!(&g.home, GroupHome::ProjectApp(n) if n == "beta"))
+            .expect("beta inherits the baseline mise tool in its per-project home");
+        assert_eq!(beta.tokens, vec!["opencode".to_string()]);
+
+        // The command-less app produced no group.
+        assert!(!groups.iter().any(|g| g.home.label().contains("gamma")));
     }
 
     #[test]

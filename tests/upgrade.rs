@@ -68,6 +68,103 @@ fn upgrade_rejects_an_unknown_target() {
     );
 }
 
+/// The revision the per-project flake lock records for `reference`, if any. The lock lives under
+/// the single project's directory; each line is `<reference>\t<rev>\t<locked-ref>`.
+fn flake_lock_rev(data: &Path, reference: &str) -> Option<String> {
+    let projects = data.join("ops").join("projects");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let lock = entry.path().join("flake-packages.lock");
+        if let Ok(text) = std::fs::read_to_string(&lock) {
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.first() == Some(&reference) {
+                    return parts.get(1).map(|s| s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
+    // A real resolution of a declared `flake:` package: `ops upgrade flake` resolves the floating
+    // reference to its current immutable revision with `nix flake metadata` and writes the
+    // per-project flake lock — a host-side lock rewrite (the new pin builds in-cage at the next
+    // launch). Teeth: the lock records a 40-hex revision for the declared reference, and a second
+    // run moments later re-resolves to the *same* revision ("unchanged" — idempotent). Needs nix
+    // and the network (github); skipped (not failed) where the resolution cannot run.
+    let data = TmpDir::new();
+    let proj = TmpDir::new();
+    let state = TmpDir::new();
+    let reference = "github:numtide/flake-utils";
+    std::fs::write(
+        proj.path().join(".ops.toml"),
+        format!("[packages]\nfutil = \"flake:{reference}\"\n"),
+    )
+    .unwrap();
+
+    // The flake package is a trusted-only field, so the project must be trusted to be rolled.
+    let trusted = ops()
+        .args(["trust", ".ops.toml"])
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("spawn ops trust");
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let run = || {
+        ops()
+            .args(["upgrade", "flake"])
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn ops upgrade flake")
+    };
+
+    let first = run();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&first.stdout)
+    );
+    if !first.status.success() || log.contains("re-resolve failed") {
+        eprintln!("skipping flake upgrade resolution: {log}");
+        return;
+    }
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("newly pinned"),
+        "a first resolution must pin the flake package:\n{log}"
+    );
+
+    let rev1 = flake_lock_rev(data.path(), reference)
+        .expect("the flake lock must record a revision for the declared reference");
+    assert!(
+        rev1.len() == 40 && rev1.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the lock revision must be 40-hex, got {rev1}"
+    );
+
+    // A second upgrade moments later resolves the same HEAD — an idempotent no-op.
+    let again = run();
+    assert!(again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("unchanged"),
+        "a repeat flake upgrade should be unchanged:\n{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+    assert_eq!(
+        flake_lock_rev(data.path(), reference).unwrap(),
+        rev1,
+        "an idempotent re-resolution keeps the same revision"
+    );
+}
+
 #[test]
 fn upgrade_resolves_and_locks_the_default_channel() {
     // A real resolution of the rolling channel: needs nix and the network. Skipped

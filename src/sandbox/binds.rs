@@ -390,6 +390,15 @@ pub(crate) fn flake_out_link(name: &str) -> PathBuf {
     flake_roots_dir().join(name)
 }
 
+/// The rev-keyed in-cage out-link for the `flake:` package `name` pinned to `rev` — distinct
+/// from the floating [`flake_out_link`], so re-pinning to a new revision builds a fresh path the
+/// warm short-circuit cannot mistake for the old one (a lock change rebuilds without any home
+/// being enumerated). `name` is a validated package name and `rev` is 40-hex, so neither escapes
+/// [`flake_roots_dir`].
+pub(crate) fn flake_out_link_rev(name: &str, rev: &str) -> PathBuf {
+    flake_roots_dir().join(format!("{name}-{rev}"))
+}
+
 /// Where the synthetic interactive-shell rc is bound read-only. `ops shell` starts
 /// bash with `--rcfile` pointing here, so mise is activated in the interactive shell —
 /// mise's documented interactive mechanism (a prompt hook that manages PATH/env for the
@@ -678,6 +687,25 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_flake_out_link_is_keyed_distinctly_per_revision() {
+        // The load-bearing property of pinning: a re-pin to a new revision must produce a
+        // different out-link path, so the `[ -e "$out/bin" ]` warm short-circuit (which checks
+        // that exact path) cannot mistake the new pin for an already-built old one and skip the
+        // rebuild. Each revision — and the floating (unpinned) form — is its own path.
+        let rev_a = "11707dc2f618dd54ca8739b309ec4fc024de578b";
+        let rev_b = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+        let a = flake_out_link_rev("hermes", rev_a);
+        let b = flake_out_link_rev("hermes", rev_b);
+        let floating = flake_out_link("hermes");
+        assert_ne!(a, b, "a different revision is a different out-link");
+        assert_ne!(
+            a, floating,
+            "a pinned out-link differs from the floating one"
+        );
+        assert!(a.ends_with(format!("hermes-{rev_a}")));
+    }
 
     fn userland() -> Userland {
         Userland {

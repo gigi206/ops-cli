@@ -61,7 +61,7 @@ fn main() -> ExitCode {
                 "ops: usage: ops <doctor | shell | run [--] <command> | mise <args> | \
                  app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
                  plugins <list|info|install|rm|store> | \
-                 ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise]>"
+                 ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise|flake]>"
             );
             ExitCode::from(2)
         }
@@ -1832,18 +1832,19 @@ fn engine_line(resolved: &config::Resolved) -> String {
 /// `ops upgrade [all|nix|mise]`: roll managed channels forward by re-resolving and
 /// rewriting their locks, so versions advance only here, never on an ops binary update.
 /// `nix` rolls the nixpkgs channel the current directory tracks (a trusted project pin,
-/// else the global channel) — base and native `[packages]`. `mise` rolls the mise engine
-/// (its own dedicated lock) and the project's `nix:` tools. `all` rolls every one. It
-/// needs nix (to resolve) but not the sandbox boundary: it only rewrites locks, so it
-/// does not gate on user namespaces.
+/// else the global channel) — base and native `nix:` `[packages]`. `mise` rolls the mise
+/// engine (its own dedicated lock), the project's `nix:` tools, and the project's and apps'
+/// `mise:` `[packages]` (the last in-cage). `all` rolls every one. The lock-rewriting parts
+/// need nix (to resolve) but not the sandbox boundary; the in-cage `mise:` roll needs the
+/// sandbox and degrades to a warning where it is unavailable.
 fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // Parse the target before touching anything, so a typo fails cleanly. `all` covers
     // every managed channel: the nixpkgs channel (base + native `[packages]`) and the
     // project's `nix:` mise tools.
     let what = match args.first().and_then(|s| s.to_str()).unwrap_or("all") {
-        w @ ("all" | "nix" | "mise") => w,
+        w @ ("all" | "nix" | "mise" | "flake") => w,
         other => {
-            eprintln!("ops: unknown upgrade target '{other}' (known: all, nix, mise)");
+            eprintln!("ops: unknown upgrade target '{other}' (known: all, nix, mise, flake)");
             return ExitCode::from(2);
         }
     };
@@ -1873,11 +1874,12 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     }
 
     // `all` rolls every managed channel and reports the worst exit — a tool that fails to
-    // re-resolve must not be masked by a clean roll elsewhere. `mise` rolls two distinct
-    // things: the engine (host-global, in every cage, so it rolls regardless of any
-    // project's trust) and the project's `nix:` tools (trusted-only). Rolling them as two
-    // separate, unconditional calls keeps the engine's trust-independence structural
-    // rather than dependent on the tools path not early-returning.
+    // re-resolve must not be masked by a clean roll elsewhere. `mise` rolls three distinct
+    // things: the engine (host-global, in every cage, so it rolls regardless of any project's
+    // trust), the project's `nix:` tools (trusted-only), and the project's and apps' `mise:`
+    // `[packages]` (in-cage, trusted-only). Rolling them as separate, unconditional calls keeps
+    // the engine's trust-independence structural rather than dependent on an earlier path not
+    // early-returning.
     let mut ok = true;
     if matches!(what, "nix" | "all") {
         ok &= upgrade_nix_channel(&nix, &layout, &cwd, &cfg);
@@ -1885,6 +1887,17 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     if matches!(what, "mise" | "all") {
         ok &= upgrade_mise_engine(&nix, &layout, &cfg);
         ok &= upgrade_mise_tools(&nix, &layout, &cwd, &cfg);
+        // The project's and apps' `mise:` `[packages]` are equipped in-cage, not host-side, so
+        // their roll runs `mise upgrade` inside a cage (per home) rather than rewriting a lock.
+        // Pass the already-loaded config: the groups are computed from it before any sandbox
+        // work, so a project with no `mise:` package keeps this cheap and sandbox-free.
+        ok &= sandbox::upgrade_mise_packages(&cfg);
+    }
+    if matches!(what, "flake" | "all") {
+        // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the
+        // per-project flake lock is rewritten — a host-side lock rewrite (the new pin builds
+        // in-cage at the next launch), like the `nix:` tools.
+        ok &= upgrade_flake_packages(&nix, &layout, &cwd, &cfg);
     }
     if ok {
         ExitCode::SUCCESS
@@ -2031,6 +2044,92 @@ fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade]) -> Vec<String> {
                 }
             }
         });
+    }
+    lines
+}
+
+/// Roll the project's and its apps' `flake:` `[packages]`: re-resolve each declared reference to
+/// its current immutable revision and rewrite the per-project flake lock (pinning, rolling, and
+/// pruning). Returns whether it succeeded — a reference that fails to re-resolve keeps its prior
+/// pin and makes this `false`, but never aborts the others. Trusted-only, like the `nix:` tools:
+/// an untrusted project's flake reference is never collected, so there is nothing to roll. Needs
+/// nix (to resolve) but not the sandbox boundary — the new pin builds in-cage at the next launch.
+fn upgrade_flake_packages(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+) -> bool {
+    let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("ops: cannot roll the flake packages: {e}");
+            return false;
+        }
+    };
+    for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg)) {
+        println!("{line}");
+    }
+    !outcomes
+        .iter()
+        .any(|o| matches!(o, sandbox::FlakeUpgrade::Failed { .. }))
+}
+
+/// The human-readable summary of a flake roll: one line per declared reference (newly pinned,
+/// rolled, unchanged, or failed) plus the entries pruned, and a note for any reference withheld
+/// for being untrusted (so an untrusted project does not read as "none declared" — parity with
+/// the `nix:` tools path). Pure, so every outcome is unit-tested without invoking nix.
+fn flake_upgrade_summary(outcomes: &[sandbox::FlakeUpgrade], withheld: usize) -> Vec<String> {
+    use sandbox::FlakeUpgrade::*;
+    let mut lines = vec!["ops upgrade — flake packages".to_string()];
+    let withheld_note = || {
+        format!(
+            "  {withheld} flake: package(s) withheld (untrusted) — not rolled; run `ops trust`."
+        )
+    };
+    if outcomes.is_empty() {
+        lines.push(if withheld > 0 {
+            withheld_note()
+        } else {
+            "  no flake: packages to roll.".to_string()
+        });
+        return lines;
+    }
+    for outcome in outcomes {
+        lines.push(match outcome {
+            Unchanged { reference, rev } => {
+                format!("  flake:{reference}: {} — unchanged.", short_rev(rev))
+            }
+            Rolled {
+                reference,
+                from,
+                to,
+            } => format!(
+                "  flake:{reference}: {} → {} — rolled forward.",
+                short_rev(from),
+                short_rev(to)
+            ),
+            Pinned { reference, rev } => {
+                format!("  flake:{reference}: {} — newly pinned.", short_rev(rev))
+            }
+            Pruned { reference } => {
+                format!("  flake:{reference}: removed from the lock (no longer declared).")
+            }
+            Failed {
+                reference,
+                error,
+                kept,
+            } => match kept {
+                Some(rev) => format!(
+                    "  flake:{reference}: re-resolve failed, kept {} — {error}",
+                    short_rev(rev)
+                ),
+                None => format!("  flake:{reference}: re-resolve failed — {error}"),
+            },
+        });
+    }
+    if withheld > 0 {
+        lines.push(withheld_note());
     }
     lines
 }
@@ -2417,5 +2516,62 @@ mod tests {
         assert!(text.contains("nix:oldtool (1.0): removed from the lock"));
         assert!(text.contains("node: equipped in-cage by mise — not rolled here"));
         assert!(text.contains("nix:bad name: malformed nix: token — cannot resolve"));
+    }
+
+    #[test]
+    fn flake_upgrade_summary_distinguishes_the_outcomes() {
+        use sandbox::FlakeUpgrade::*;
+
+        // an empty roll (no flake: packages) says so plainly
+        let empty = flake_upgrade_summary(&[], 0).join("\n");
+        assert!(empty.contains("no flake: packages"));
+
+        // an empty roll on an untrusted project names the withheld package instead of "none"
+        let withheld = flake_upgrade_summary(&[], 2).join("\n");
+        assert!(withheld.contains("2 flake: package(s) withheld (untrusted)"));
+        assert!(!withheld.contains("no flake: packages"));
+
+        let rev_a = "11707dc2f618dd54ca8739b309ec4fc024de578b";
+        let rev_b = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+        let text = flake_upgrade_summary(
+            &[
+                Unchanged {
+                    reference: "github:o/a#default".into(),
+                    rev: rev_a.into(),
+                },
+                Rolled {
+                    reference: "github:o/b#default".into(),
+                    from: rev_a.into(),
+                    to: rev_b.into(),
+                },
+                Pinned {
+                    reference: "github:o/c".into(),
+                    rev: rev_b.into(),
+                },
+                Pruned {
+                    reference: "github:o/old#x".into(),
+                },
+                Failed {
+                    reference: "github:o/d#default".into(),
+                    error: "metadata unreachable".into(),
+                    kept: Some(rev_a.into()),
+                },
+                Failed {
+                    reference: "github:o/e#default".into(),
+                    error: "metadata unreachable".into(),
+                    kept: None,
+                },
+            ],
+            0,
+        )
+        .join("\n");
+
+        // Revisions are shortened to the first seven hex in the report.
+        assert!(text.contains("flake:github:o/a#default: 11707dc — unchanged"));
+        assert!(text.contains("flake:github:o/b#default: 11707dc → 9ae611a — rolled forward"));
+        assert!(text.contains("flake:github:o/c: 9ae611a — newly pinned"));
+        assert!(text.contains("flake:github:o/old#x: removed from the lock"));
+        assert!(text.contains("flake:github:o/d#default: re-resolve failed, kept 11707dc"));
+        assert!(text.contains("flake:github:o/e#default: re-resolve failed — metadata unreachable"));
     }
 }

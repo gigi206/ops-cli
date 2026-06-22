@@ -1264,6 +1264,97 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     );
 }
 
+/// The path to a mise shim in the single project's default home under `data`, if present.
+/// `ops upgrade mise`/`ops run` equip a baseline `mise:` tool into this home, where mise creates
+/// a per-tool shim (its non-interactive PATH entry). Used as the teeth that the in-cage roll
+/// touched the right home.
+fn project_home_mise_shim(data: &Path, name: &str) -> Option<PathBuf> {
+    let projects = data.join("ops").join("projects");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let shim = entry.path().join("home/.local/share/mise/shims").join(name);
+        if shim.exists() {
+            return Some(shim);
+        }
+    }
+    None
+}
+
+#[test]
+fn ops_upgrade_mise_rolls_a_mise_package_in_cage() {
+    // The load-bearing proof of the `mise:` `[packages]` roll-forward: `ops upgrade mise` runs
+    // `mise upgrade` *in-cage*, per home, for the project's (and apps') `mise:` packages. A `mise:`
+    // tool freezes at its installed version after the first equip (the floating `latest` request
+    // stays satisfied, so a later launch never re-resolves), so advancing it must run `mise
+    // upgrade` inside the same cage that equips it. Teeth: the capability probe runs against an
+    // *empty* project (no package), so the only thing that can equip ripgrep into the project's
+    // home is the upgrade cage itself — proven by the `rg` shim appearing in that home's mise data
+    // dir after `ops upgrade mise` and *before* any `ops run`. The aqua release fetch rides the
+    // host network (the default `shared` posture). Skips (never fails) without sandbox or network.
+    let project = TmpDir::new("umr-proj");
+    let data = TmpDir::new("umr-data");
+    let state = TmpDir::new("umr-state");
+
+    // Capability probe against an *empty* project (nothing equipped); also seeds the store once.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping mise: package upgrade e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping mise: package upgrade e2e: the network is unreachable");
+        return;
+    }
+
+    // Declare the package only now, so nothing equipped it before the upgrade; trust so the
+    // `mise:` package (a trusted-only field) is admitted.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[packages]\nrg = \"mise:aqua:BurntSushi/ripgrep\"\n",
+    )
+    .unwrap();
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "mise"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "ops upgrade mise must roll the baseline `mise:` package in-cage: {log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("mise upgrade aqua:BurntSushi/ripgrep"),
+        "the report must name the project's mise: package group: {log}"
+    );
+
+    // Teeth: the upgrade cage equipped ripgrep into the project's own home (the `rg` shim mise
+    // creates for a `use`d tool); no `ops run` ran in between, so only the upgrade cage could have.
+    assert!(
+        project_home_mise_shim(data.path(), "rg").is_some(),
+        "ops upgrade mise must equip+roll ripgrep in the project home (no `rg` shim found): {log}"
+    );
+}
+
 #[test]
 fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link() {
     // The load-bearing proof of the `flake:` backend, in two phases.
@@ -1362,6 +1453,128 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
         "phase 2: with `network = \"none\"` (no egress) the warm out-link must run `hello` offline \
          — a re-fetch is impossible, so this proves the short-circuit reuses the prior build: \
          {warm_log}"
+    );
+}
+
+/// The names under the (single) project default home's flake out-link directory, in `data`.
+/// `ops run` builds a `flake:` package's out-link here; the name reveals whether the launch chose
+/// the rev-keyed (locked) form or the floating one.
+fn project_flake_out_links(data: &Path) -> Vec<String> {
+    let projects = data.join("ops").join("projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return vec![];
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path().join("home/.local/state/ops/flake");
+        if let Ok(links) = std::fs::read_dir(&dir) {
+            return links
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+        }
+    }
+    vec![]
+}
+
+#[test]
+fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
+    // The load-bearing proof of the *locked* launch path — the entire launch-side deliverable of
+    // the flake roll-forward. After `ops upgrade flake` pins a `flake:` package, a launch reads the
+    // per-project lock and builds the *locked* (narHash'd, immutable) reference — not the declared
+    // floating one — into an out-link keyed by the revision, in-cage through the allowlist. Teeth:
+    // (1) `hello` prints "Hello, world!", proving the locked narHash ref builds in-cage through the
+    // empty-netns MITM (the existing flake e2e builds a narHash-*free* ref, so this is the
+    // first proof the narHash form works on the wire); (2) the out-link is the rev-keyed
+    // `hello-<rev>`, not the floating `hello` — so `build()` took the `Some(pin)` branch and chose
+    // the locked ref. Reuses the revision the in-cage flake build e2e already warms. Skips (never
+    // fails) without sandbox or network.
+    let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+    let project = TmpDir::new("lfk-proj");
+    let data = TmpDir::new("lfk-data");
+    let state = TmpDir::new("lfk-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        format!(
+            "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
+             [network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n"
+        ),
+    )
+    .unwrap();
+
+    // capability probe (untrusted → the flake package is withheld, shared net); seeds the store.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping locked `flake:` e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping locked `flake:` e2e: the network is unreachable");
+        return;
+    }
+
+    // trust so the flake package and the allowlist are honored.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // pin the flake package to its current revision (a host-side lock rewrite).
+    let pinned = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "flake"],
+    );
+    let pin_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&pinned.stderr),
+        String::from_utf8_lossy(&pinned.stdout)
+    );
+    if !pinned.status.success() || pin_log.contains("re-resolve failed") {
+        eprintln!("skipping locked `flake:` e2e: cannot resolve the flake upstream: {pin_log}");
+        return;
+    }
+    assert!(
+        pin_log.contains("newly pinned"),
+        "the flake package must pin: {pin_log}"
+    );
+
+    // launch: build the *locked* ref into the rev-keyed out-link, in-cage through the allowlist.
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "hello"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("Hello, world!"),
+        "the locked flake ref must build in-cage through the allowlist and run: {log}"
+    );
+
+    // Teeth: the launch built the rev-keyed out-link (the locked branch), not the floating one.
+    let links = project_flake_out_links(data.path());
+    assert!(
+        links.iter().any(|n| n == &format!("hello-{rev}")),
+        "the launch must build the rev-keyed out-link `hello-{rev}` (links: {links:?})"
+    );
+    assert!(
+        !links.iter().any(|n| n == "hello"),
+        "the floating out-link must not be built when the package is pinned (links: {links:?})"
     );
 }
 

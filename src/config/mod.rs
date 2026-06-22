@@ -404,6 +404,7 @@ fn base64_encode(input: &[u8]) -> String {
 /// the read-only host binds, the declared tools, plus any warnings worth surfacing
 /// (dropped fields, an unparseable or unsafe file). Nothing here is a hard error —
 /// a missing or broken config yields empty defaults, never a failed launch.
+#[derive(Clone)]
 pub(crate) struct Resolved {
     /// Extra environment, in application order; a later entry overrides an earlier
     /// one at the same key.
@@ -465,6 +466,7 @@ pub(crate) enum AppHomeScope {
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
 /// location, or a project layer by its verdict). `ops app <name>` folds this onto the
 /// baseline with [`Resolved::merge_app`].
+#[derive(Clone)]
 pub(crate) struct ResolvedApp {
     /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
     /// silent default.

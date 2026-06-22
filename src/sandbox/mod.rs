@@ -11,6 +11,7 @@ mod binds;
 mod cgroup;
 pub(crate) mod egress;
 mod fhs;
+mod flake;
 mod fonts;
 mod launch;
 mod mise;
@@ -26,7 +27,10 @@ mod smoke;
 mod spec;
 
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
-pub(crate) use launch::{app, effective_lock_target, run, run_mise, shell};
+pub(crate) use flake::{
+    upgrade as upgrade_flake, withheld as withheld_flake_packages, FlakeUpgrade,
+};
+pub(crate) use launch::{app, effective_lock_target, run, run_mise, shell, upgrade_mise_packages};
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 pub(crate) use proxy::nix_cache_hosts;
 pub(crate) use search::run as search;
