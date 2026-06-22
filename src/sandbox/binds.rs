@@ -545,8 +545,10 @@ fn project_runtime(data_dir: &Path, project: &Path, runtime: Runtime) -> Project
     }
 }
 
-/// A stable, collision-resistant directory name for a canonical project path.
-fn project_id(project: &Path) -> String {
+/// A stable, collision-resistant directory name for a canonical project path. Housekeeping hashes
+/// a running session's recorded canonical path with this to match it against a runtime tree's id,
+/// so it can skip a tree a live session still holds.
+pub(crate) fn project_id(project: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     project.hash(&mut h);

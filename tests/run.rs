@@ -1794,6 +1794,101 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
 }
 
 #[test]
+fn ops_gc_all_reaps_a_deleted_projects_tree() {
+    // The live proof of `ops gc --all --prune` (the cross-project dead-tree reap), through the real
+    // binary. A launch records the project's canonical path in a `<data>/projects/<id>/project`
+    // marker and seeds the project's own (read-only, 0555) nix store; once the project directory is
+    // deleted, `ops gc --all --prune` reads that marker, sees the path is gone (its parent — the
+    // scratch root — still present), and reclaims the whole tree (store dirs and all, which is why
+    // the reaper forces them writable). Run from a *separate* scratch project so the reap is what
+    // removes the dead tree, not the current-project sweep. Skips (never fails) without sandbox or
+    // network.
+    use std::os::unix::ffi::OsStrExt;
+    let project = TmpDir::new("gca-proj");
+    let scratch = TmpDir::new("gca-scratch");
+    let data = TmpDir::new("gca-data");
+    let state = TmpDir::new("gca-state");
+
+    // A launch seeds the store and writes the marker; the probe both checks sandbox capability and
+    // does that seeding.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping ops gc --all e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping ops gc --all e2e: the network is unreachable");
+        return;
+    }
+
+    // The launch created exactly one project tree; capture it and confirm its marker records the
+    // project's canonical path (the part-1 marker, proven end-to-end through the binary).
+    let projects = data.path().join("ops").join("projects");
+    let tree = std::fs::read_dir(&projects)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a project tree after a launch");
+    let marker = std::fs::read(tree.join("project")).expect("the project marker");
+    let canonical = project.path().canonicalize().unwrap();
+    assert_eq!(
+        std::ffi::OsStr::from_bytes(&marker),
+        canonical.as_os_str(),
+        "the marker must record the project's canonical path"
+    );
+
+    // Delete the project directory — but not its parent (the scratch root), so the reap treats it
+    // as a deleted project, not an unmounted drive.
+    std::fs::remove_dir_all(project.path()).unwrap();
+
+    // Reap from a separate scratch project: the dead tree is reclaimed by the cross-project pass,
+    // not by the current-project sweep (which runs on `scratch`).
+    let gc = ops_in(
+        scratch.path(),
+        data.path(),
+        state.path(),
+        &["gc", "--all", "--prune"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&gc.stderr),
+        String::from_utf8_lossy(&gc.stdout)
+    );
+    assert!(gc.status.success(), "ops gc --all --prune failed: {log}");
+    assert!(
+        !tree.exists(),
+        "the deleted project's tree (read-only store and all) was not reclaimed: {tree:?}\n{log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&gc.stdout).contains(&canonical.display().to_string()),
+        "the reap should name the reclaimed project path: {log}"
+    );
+    // The scratch project was never launched, so the current-project sweep must SKIP it, not seed a
+    // fresh store for it — otherwise `ops gc --all` from a bare directory would silently materialise
+    // a new (and immediately stale) project tree. The skip message proves the no-store branch, and
+    // with A reaped and scratch skipped the projects directory is left empty.
+    assert!(
+        String::from_utf8_lossy(&gc.stdout).contains("no per-project store yet"),
+        "the sweep must skip the never-launched scratch project, not seed it: {log}"
+    );
+    let remaining = std::fs::read_dir(&projects)
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        remaining, 0,
+        "a project tree survived — the scratch project was seeded by the sweep instead of skipped\n{log}"
+    );
+}
+
+#[test]
 fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // The 6.3a integration neither the unit nor the proxy tests can reach: a trusted
     // A `[secret]` entry under a network allowlist must be resolved *host-side* and wired into the

@@ -104,6 +104,14 @@ fn store_dir_for(layout: &Layout, project_id: &str) -> PathBuf {
     project_dir(layout, project_id).join("store")
 }
 
+/// Whether `project_id` already has a seeded store on disk. A project that was never launched has
+/// none, so there is nothing to garbage-collect — and seeding one just to sweep it would be a heavy
+/// (possibly networked) side effect, which is what lets `ops gc` skip a never-launched directory
+/// rather than materialise a store for it.
+pub(crate) fn store_exists(layout: &Layout, project_id: &str) -> bool {
+    store_dir_for(layout, project_id).exists()
+}
+
 /// Record the project's canonical path in a durable marker beside its store, so a later `ops gc`
 /// can recognise this tree (`<id>` alone is a one-way hash) and reclaim it once the project
 /// directory is gone. Atomic (temp + rename) and owner-only; overwritten each launch — the path is

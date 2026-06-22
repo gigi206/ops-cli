@@ -63,7 +63,7 @@ fn main() -> ExitCode {
                  app <name | import <file> | rm <name> | list> | search <query> | test net <url> | \
                  plugins <list|info|install|rm|store> | \
                  ps | trust [path] | untrust [path] | config | upgrade [all|nix|mise|flake] | \
-                 gc [--prune]>"
+                 gc [--all] [--prune]>"
             );
             ExitCode::from(2)
         }
@@ -1908,21 +1908,24 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `ops gc [--prune]`: reclaim the current project's own writable store. A dry run by
-/// default (it reports what would be freed and touches nothing); `--prune` actually
-/// reclaims. Reclamation is irreversible, so the destructive form is opt-in.
+/// `ops gc [--all] [--prune]`: reclaim ops's per-project store space. By default it sweeps the
+/// current project's store; `--all` also reaps whole runtime trees whose project directory is
+/// gone. A dry run by default (it reports what would be freed and touches nothing); `--prune`
+/// actually reclaims. Reclamation is irreversible, so the destructive form is opt-in.
 fn gc_cmd(args: Vec<OsString>) -> ExitCode {
     let mut prune = false;
+    let mut all = false;
     for arg in &args {
         match arg.to_str() {
             Some("--prune") => prune = true,
+            Some("--all") => all = true,
             _ => {
-                eprintln!("ops: usage: ops gc [--prune]");
+                eprintln!("ops: usage: ops gc [--all] [--prune]");
                 return ExitCode::from(2);
             }
         }
     }
-    sandbox::gc(prune)
+    sandbox::gc(prune, all)
 }
 
 /// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else

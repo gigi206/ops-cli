@@ -388,7 +388,104 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
     ok
 }
 
-/// `ops gc [--prune]`: reclaim the current project's own writable store.
+/// `ops gc [--all] [--prune]`: reclaim ops's per-project store space.
+///
+/// By default it sweeps the **current** project's store (see [`sweep_current`]). With `--all` it
+/// also reaps whole runtime trees whose project directory is gone (see [`reap_dead_trees`]). The
+/// cross-project reap runs **first** and is independent of the sandbox/nix prerequisites the
+/// current-project sweep needs — so `ops gc --all` reclaims dead trees even from a directory that
+/// is not a project, or on a host that has lost its sandbox capability. A dry run by default;
+/// `--prune` is the destructive form.
+pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
+    if all {
+        match crate::store::Layout::from_env() {
+            Some(layout) => reap_dead_trees(&layout, prune),
+            None => eprintln!(
+                "ops gc: cannot locate ops's data directory; skipping the cross-project reap."
+            ),
+        }
+    }
+    match sweep_current(prune) {
+        Ok(()) => ExitCode::SUCCESS,
+        // Under `--all` the reap above already ran, so a current-project sweep that could not run
+        // (the host cannot sandbox, nix is unavailable) — or that hit an error — must not fail the
+        // whole command. Its own message is already printed above; only the exit code is flattened.
+        Err(_) if all => {
+            eprintln!(
+                "ops gc: the current project's store was not swept (see above); the cross-project reap ran."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+/// Reap — or, in a dry run, list — the runtime trees under `<data>/projects/` whose project
+/// directory is gone, plus surface any markerless legacy trees. A tree is reclaimed only when it
+/// carries a `project` marker, that path is absent while its parent directory still exists (a cheap
+/// guard, not a reliable unmount check — the dry-run default is the backstop there), and no live
+/// session holds it. Markerless trees (their project path unknown) are listed for a manual decision,
+/// never reclaimed. Pure host-side filesystem work — no sandbox, no nix.
+fn reap_dead_trees(layout: &crate::store::Layout, prune: bool) {
+    let projects_dir = layout.data_dir().join("projects");
+    // Ids of running sessions, by hashing each recorded canonical project path — so a tree a live
+    // session still holds is skipped. We hash the stored path directly rather than re-canonicalise:
+    // a dead project's path no longer exists, but a live session's recorded path is already
+    // canonical, so its hash matches the id the tree is keyed by.
+    let live_ids: std::collections::BTreeSet<String> = session::Registry::at(layout.data_dir())
+        .list()
+        .map(|sessions| {
+            sessions
+                .iter()
+                .map(|s| binds::project_id(&s.project))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let report = super::gc::reap_dead_projects(&projects_dir, &live_ids, prune);
+    if report.dead.is_empty() && report.unidentified.is_empty() {
+        println!("ops gc --all: no dead project trees to reclaim.");
+        return;
+    }
+
+    let mut freed = 0u64;
+    for tree in &report.dead {
+        freed += tree.bytes;
+        let verb = if prune { "reclaimed" } else { "reclaimable" };
+        println!(
+            "  {verb}: {} ({})",
+            tree.path.display(),
+            super::gc::human_bytes(tree.bytes)
+        );
+    }
+    if !report.dead.is_empty() {
+        if prune {
+            println!(
+                "ops gc --all: reclaimed {} dead project tree(s), freed up to {}.",
+                report.dead.len(),
+                super::gc::human_bytes(freed)
+            );
+        } else {
+            println!(
+                "ops gc --all: {} dead project tree(s) reclaimable (up to {}) — \
+                 run `ops gc --all --prune` to reclaim.",
+                report.dead.len(),
+                super::gc::human_bytes(freed)
+            );
+        }
+    }
+    // Markerless trees predate marker-recording: their project path is unknown, so deadness cannot
+    // be verified and they are never auto-reclaimed — only surfaced for a manual decision.
+    for tree in &report.unidentified {
+        println!(
+            "  unidentified (no marker, project path unknown): {} ({}) — remove by hand if unwanted",
+            tree.dir.display(),
+            super::gc::human_bytes(tree.bytes)
+        );
+    }
+}
+
+/// Reclaim the current project's own writable store.
 ///
 /// The agent self-equips into a per-project store — `flake:` builds, in-cage installs — and over
 /// time a flake revision rolled forward by `ops upgrade flake` (or a package removed outright)
@@ -407,32 +504,43 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
 /// dead paths. It refuses while a live sandbox holds the project (its store is in use). Like a
 /// launch it provisions the current tools and re-seeds first, which re-establishes the base/tool
 /// roots on a store seeded before rooting existed, so a sweep can never delete the unrooted base.
+/// Returns `Err(code)` when it cannot run (not a project, no sandbox capability, a nix failure),
+/// which the caller treats as fatal — except under `--all`, where the reap has already run.
 ///
 /// Limitation (a follow-up): a build the agent roots only by an in-cage path — a raw `nix build
 /// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`ops mise`,
 /// `nix profile`, declared `flake:` packages) — is not seen host-side and would be collected. The
 /// supported self-equip paths all root by store path, so they survive.
-pub(crate) fn gc(prune: bool) -> ExitCode {
-    let prep = match prepare() {
-        Ok(p) => p,
-        Err(code) => return code,
+fn sweep_current(prune: bool) -> Result<(), ExitCode> {
+    let prep = prepare()?;
+
+    let (id, project) = match binds::project_identity(&prep.cwd) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ops gc: cannot resolve the project directory: {e}");
+            return Err(ExitCode::FAILURE);
+        }
     };
+
+    // A project that was never launched has no store to reclaim. Seeding one here — just to gc it —
+    // would be a heavy, possibly networked side effect, so skip instead. This is what makes
+    // `ops gc --all` safe to run from any directory: a non-project cwd is skipped, never seeded.
+    if !super::projectstore::store_exists(&prep.layout, &id) {
+        println!(
+            "ops gc — {}: no per-project store yet, nothing to reclaim.",
+            project.display()
+        );
+        return Ok(());
+    }
 
     // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.
-    let project = match prep.cwd.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ops gc: cannot resolve the project directory: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
         if sessions.iter().any(|s| s.project == project) {
             eprintln!(
                 "ops gc: a sandbox is running in this project — stop it first (see `ops ps`)."
             );
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     }
 
@@ -444,10 +552,7 @@ pub(crate) fn gc(prune: bool) -> ExitCode {
     // Provision the project's declared tools and seed its store: the seed gc-roots the base and
     // every `nix:` tool, so the sweep keeps them and collects only orphans — and this re-roots a
     // store seeded before rooting existed. The `flake:` builds carry their own roots from launch.
-    let store = match equip_for_gc(&prep) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+    let store = equip_for_gc(&prep)?;
     let store_dir = store.store_dir().to_path_buf();
 
     // Drop the `ops-flake-<name>` roots of removed packages. A roll self-cleans (its root is
@@ -476,7 +581,7 @@ pub(crate) fn gc(prune: bool) -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ops gc: {e}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
     if prune {
@@ -500,7 +605,7 @@ pub(crate) fn gc(prune: bool) -> ExitCode {
             println!("  and {pruned} removed-package flake build(s) would also be reclaimed.");
         }
     }
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 /// Provision the project's declared tools and seed its store, returning the store. Mirrors
