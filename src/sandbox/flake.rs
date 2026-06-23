@@ -344,7 +344,9 @@ mod tests {
     ) -> crate::config::Resolved {
         crate::config::Resolved {
             env: vec![],
+            env_layer: Default::default(),
             ro_binds: vec![],
+            bind_layer: Default::default(),
             packages,
             nixpkgs_global: None,
             nixpkgs_project: None,

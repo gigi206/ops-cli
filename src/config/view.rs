@@ -7,10 +7,10 @@
 //! has always shown — by loading and projecting the resolved configuration plus the channel
 //! locks. The CLI presenter and a future management UI are both adapters over this one model.
 //!
-//! What it deliberately does *not* carry: per-field provenance beyond the trust verdict a
-//! security field already exposes (which layer set a value), and a queryable schema. Both are
-//! affordances for a management UI that does not yet exist; they are added when that consumer is
-//! concrete, against its real shape.
+//! It carries the per-layer provenance of the free fields (`env`/`binds`) — which layer, global
+//! or project, supplied each value — so `ops config` can show a value's source. What it still
+//! does *not* carry: a queryable schema, an affordance for a management UI that does not yet
+//! exist; it is added when that consumer is concrete, against its real shape.
 
 use std::path::Path;
 
@@ -29,8 +29,9 @@ pub(crate) struct ConfigView {
     pub(crate) cwd: String,
     /// Extra environment, in application order (a later entry wins at the same key).
     pub(crate) env: Vec<EnvVar>,
-    /// Extra host paths bound read-only, already canonicalized to what the launch would mount.
-    pub(crate) binds: Vec<String>,
+    /// Extra host paths bound read-only, already canonicalized to what the launch would mount,
+    /// each tagged with the layer that declared it.
+    pub(crate) binds: Vec<BindView>,
     /// Declared `[packages]` tools, each with its backend and trust verdict.
     pub(crate) packages: Vec<PackageView>,
     /// The project's mise file and whether it would be honored, when one is present.
@@ -53,11 +54,38 @@ pub(crate) struct ConfigView {
     pub(crate) warnings: Vec<String>,
 }
 
-/// One extra environment entry.
+/// One extra environment entry, with the layer whose value won at this key.
 #[derive(Serialize)]
 pub(crate) struct EnvVar {
     pub(crate) key: String,
     pub(crate) value: String,
+    /// Which config layer supplied the winning value, when known.
+    pub(crate) layer: Option<LayerView>,
+}
+
+/// One extra read-only bind: the canonical host path and the layer that declared it.
+#[derive(Serialize)]
+pub(crate) struct BindView {
+    pub(crate) path: String,
+    /// Which config layer declared the bind, when known.
+    pub(crate) layer: Option<LayerView>,
+}
+
+/// Which configuration layer supplied a free-field value — the global `ops.toml` or the
+/// project `.ops.toml`. The presentation-agnostic mirror of [`super::Layer`].
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayerView {
+    Global,
+    Project,
+}
+
+impl From<super::Layer> for LayerView {
+    fn from(l: super::Layer) -> Self {
+        match l {
+            super::Layer::Global => LayerView::Global,
+            super::Layer::Project => LayerView::Project,
+        }
+    }
 }
 
 /// A declared package: its name, backend (`nix`/`mise`/`flake`) and locator, how it is realised,
@@ -190,13 +218,17 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         .map(|(k, v)| EnvVar {
             key: k.clone(),
             value: v.clone(),
+            layer: resolved.env_layer.get(k).copied().map(LayerView::from),
         })
         .collect();
 
     let binds = resolved
         .ro_binds
         .iter()
-        .map(|b| b.display().to_string())
+        .map(|b| BindView {
+            path: b.display().to_string(),
+            layer: resolved.bind_layer.get(b).copied().map(LayerView::from),
+        })
         .collect();
 
     let packages = resolved.packages.iter().map(package_view).collect();
@@ -410,8 +442,12 @@ mod tests {
             env: vec![EnvVar {
                 key: "A".into(),
                 value: "1".into(),
+                layer: Some(LayerView::Project),
             }],
-            binds: vec!["/data".into()],
+            binds: vec![BindView {
+                path: "/data".into(),
+                layer: Some(LayerView::Global),
+            }],
             packages: vec![PackageView {
                 name: "jq".into(),
                 backend: "nix".into(),
@@ -450,6 +486,10 @@ mod tests {
         let json = serde_json::to_value(&view).expect("ConfigView serializes");
         assert_eq!(json["cwd"], "/proj");
         assert_eq!(json["env"][0]["key"], "A");
+        // The free-field provenance is part of the serialization contract.
+        assert_eq!(json["env"][0]["layer"], "Project");
+        assert_eq!(json["binds"][0]["path"], "/data");
+        assert_eq!(json["binds"][0]["layer"], "Global");
         assert_eq!(json["packages"][0]["trusted"], true);
         assert_eq!(json["mise"]["withheld_reason"], "the project is untrusted");
         assert_eq!(json["nixpkgs"]["source"], "nixos-unstable");

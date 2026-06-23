@@ -402,6 +402,16 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Which configuration layer supplied a free-field value (`env`/`binds`) — the global
+/// `ops.toml` (trusted by location) or the project `.ops.toml`. Recorded so `ops config` can
+/// show a value's source; a later layer overrides an earlier one at the same key, so for `env`
+/// this is the *winning* layer. The launcher ignores it (provenance is a display affordance).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Layer {
+    Global,
+    Project,
+}
+
 /// The resolved configuration the launcher applies: the layered environment and
 /// the read-only host binds, the declared tools, plus any warnings worth surfacing
 /// (dropped fields, an unparseable or unsafe file). Nothing here is a hard error —
@@ -411,8 +421,16 @@ pub(crate) struct Resolved {
     /// Extra environment, in application order; a later entry overrides an earlier
     /// one at the same key.
     pub(crate) env: Vec<(String, String)>,
+    /// Which layer each `env` key's winning value came from. Keyed by the env key (stable, so
+    /// the lookup matches what `env` lists). A display affordance for `ops config`; only the
+    /// baseline resolution records it (an app overlay does not), and the launcher ignores it.
+    pub(crate) env_layer: BTreeMap<String, Layer>,
     /// Extra host paths to bind read-only.
     pub(crate) ro_binds: Vec<PathBuf>,
+    /// Which layer each effective bind came from, keyed by the *canonical* path `ro_binds`
+    /// lists (re-keyed after canonicalization in [`load`], so the lookup matches the displayed
+    /// path). A display affordance for `ops config`, recorded only at the baseline.
+    pub(crate) bind_layer: BTreeMap<PathBuf, Layer>,
     /// Declared tools, in declaration order, each tagged with its source's trust.
     /// Admission (and the nix work it implies) is the launcher's, not decided here.
     pub(crate) packages: Vec<Package>,
@@ -548,14 +566,29 @@ fn resolve(
 
     let mut warnings = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
+    let mut env_layer: BTreeMap<String, Layer> = BTreeMap::new();
     let mut binds: Vec<PathBuf> = Vec::new();
+    let mut bind_layer: BTreeMap<PathBuf, Layer> = BTreeMap::new();
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
 
     // The global config is trusted by location, so it is honored in full: no
     // denylist, only key validation and the absolute-bind requirement.
-    apply_env(&mut env, &mut warnings, GLOBAL_CONFIG, global.env, false);
-    apply_binds(&mut binds, &mut warnings, GLOBAL_CONFIG, global.binds);
+    apply_env(
+        &mut env,
+        Some((Layer::Global, &mut env_layer)),
+        &mut warnings,
+        GLOBAL_CONFIG,
+        global.env,
+        false,
+    );
+    apply_binds(
+        &mut binds,
+        Some((Layer::Global, &mut bind_layer)),
+        &mut warnings,
+        GLOBAL_CONFIG,
+        global.binds,
+    );
     apply_packages(
         &mut packages,
         &mut warnings,
@@ -601,11 +634,24 @@ fn resolve(
         let trusted = state == TrustState::Trusted;
         // `env` is a free field — applied from any project, minus the reserved-key
         // denylist for an untrusted or changed one.
-        apply_env(&mut env, &mut warnings, PROJECT_CONFIG, proj.env, !trusted);
+        apply_env(
+            &mut env,
+            Some((Layer::Project, &mut env_layer)),
+            &mut warnings,
+            PROJECT_CONFIG,
+            proj.env,
+            !trusted,
+        );
         // `binds` is a security field — honored only from a trusted project.
         if !proj.binds.is_empty() {
             if trusted {
-                apply_binds(&mut binds, &mut warnings, PROJECT_CONFIG, proj.binds);
+                apply_binds(
+                    &mut binds,
+                    Some((Layer::Project, &mut bind_layer)),
+                    &mut warnings,
+                    PROJECT_CONFIG,
+                    proj.binds,
+                );
             } else {
                 warnings.push(dropped_binds_warning(state, proj.binds.len()));
             }
@@ -705,7 +751,9 @@ fn resolve(
 
     Resolved {
         env,
+        env_layer,
         ro_binds: binds,
+        bind_layer,
         packages,
         nixpkgs_global,
         nixpkgs_project,
@@ -834,8 +882,8 @@ fn resolve_app(
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
         let source = app_source(GLOBAL_CONFIG, name);
-        apply_env(&mut env, &mut warnings, &source, app.env, false);
-        apply_binds(&mut ro_binds, &mut warnings, &source, app.binds);
+        apply_env(&mut env, None, &mut warnings, &source, app.env, false);
+        apply_binds(&mut ro_binds, None, &mut warnings, &source, app.binds);
         apply_packages(
             &mut packages,
             &mut warnings,
@@ -876,10 +924,10 @@ fn resolve_app(
     if let Some((app, state)) = project {
         let trusted = state == TrustState::Trusted;
         let source = app_source(PROJECT_CONFIG, name);
-        apply_env(&mut env, &mut warnings, &source, app.env, !trusted);
+        apply_env(&mut env, None, &mut warnings, &source, app.env, !trusted);
         if !app.binds.is_empty() {
             if trusted {
-                apply_binds(&mut ro_binds, &mut warnings, &source, app.binds);
+                apply_binds(&mut ro_binds, None, &mut warnings, &source, app.binds);
             } else {
                 warnings.push(dropped_binds_warning(state, app.binds.len()));
             }
@@ -1030,6 +1078,7 @@ fn app_source(config: &str, name: &str) -> String {
 /// so a later layer overrides an earlier one at the same key.
 fn apply_env(
     out: &mut Vec<(String, String)>,
+    mut origin: Option<(Layer, &mut BTreeMap<String, Layer>)>,
     warnings: &mut Vec<String>,
     source: &str,
     env: BTreeMap<String, String>,
@@ -1047,6 +1096,12 @@ fn apply_env(
             ));
             continue;
         }
+        // Record the admitting layer at the upsert point — admission depends on the checks
+        // above, so it cannot be reconstructed from outside. A later layer overwrites the key
+        // here too, so the recorded layer always matches the value `out` ends up holding.
+        if let Some((layer, map)) = origin.as_mut() {
+            map.insert(key.clone(), *layer);
+        }
         upsert(out, key, val);
     }
 }
@@ -1057,6 +1112,7 @@ fn apply_env(
 /// relative one against the working directory would be a surprise.
 fn apply_binds(
     out: &mut Vec<PathBuf>,
+    mut origin: Option<(Layer, &mut BTreeMap<PathBuf, Layer>)>,
     warnings: &mut Vec<String>,
     source: &str,
     binds: Vec<String>,
@@ -1064,6 +1120,11 @@ fn apply_binds(
     for b in binds {
         let p = PathBuf::from(&b);
         if p.is_absolute() {
+            // Record the layer keyed by the raw declared path; [`load`] re-keys it to the
+            // canonical form when it canonicalizes, so the displayed path is the lookup key.
+            if let Some((layer, map)) = origin.as_mut() {
+                map.insert(p.clone(), *layer);
+            }
             out.push(p);
         } else {
             warnings.push(format!("{source}: ignoring non-absolute bind `{b}`"));
@@ -1940,8 +2001,22 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
     // resolved — so `ro_binds` is the *effective* list, identical to what the
     // launch will bind, and `ops config` cannot advertise a bind the launch would
     // silently skip. Following symlinks here also pins each source against a swap.
+    // The per-layer provenance is re-keyed from the raw declared path to the canonical
+    // one as we go, so a lookup against the displayed (canonical) path resolves.
     let declared = std::mem::take(&mut resolved.ro_binds);
-    resolved.ro_binds = canonicalize_binds(declared, &mut resolved.warnings);
+    let raw_layer = std::mem::take(&mut resolved.bind_layer);
+    let mut canon_binds = Vec::with_capacity(declared.len());
+    let mut canon_layer = BTreeMap::new();
+    for p in declared {
+        if let Some(canon) = canonicalize_one(&p, &mut resolved.warnings) {
+            if let Some(layer) = raw_layer.get(&p) {
+                canon_layer.insert(canon.clone(), *layer);
+            }
+            canon_binds.push(canon);
+        }
+    }
+    resolved.ro_binds = canon_binds;
+    resolved.bind_layer = canon_layer;
 
     // Each app's binds are canonicalized the same way, into that app's own warnings — so an
     // app overlay also advertises only the binds the launch would actually make.
@@ -1956,18 +2031,24 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
     resolved
 }
 
-/// Canonicalize each bind source, dropping with a warning any that cannot be
-/// resolved (a missing path or a broken symlink) — bwrap could not bind it anyway.
+/// Canonicalize one bind source, dropping it with a warning if it cannot be resolved (a
+/// missing path or a broken symlink) — bwrap could not bind it anyway. Following symlinks
+/// here also pins the source against a later swap.
+fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
+    match p.canonicalize() {
+        Ok(canon) => Some(canon),
+        Err(e) => {
+            warnings.push(format!("ignoring bind {}: {e}", p.display()));
+            None
+        }
+    }
+}
+
+/// Canonicalize each bind source, dropping with a warning any that cannot be resolved.
 fn canonicalize_binds(binds: Vec<PathBuf>, warnings: &mut Vec<String>) -> Vec<PathBuf> {
     binds
         .into_iter()
-        .filter_map(|p| match p.canonicalize() {
-            Ok(canon) => Some(canon),
-            Err(e) => {
-                warnings.push(format!("ignoring bind {}: {e}", p.display()));
-                None
-            }
-        })
+        .filter_map(|p| canonicalize_one(&p, warnings))
         .collect()
 }
 

@@ -328,6 +328,36 @@ fn the_global_config_is_honored_in_full() {
         stdout.contains(&*canon.to_string_lossy()),
         "stdout:\n{stdout}"
     );
+    // Both free fields are tagged with their source layer (the global config).
+    assert!(
+        stdout.contains("GLOBALVAR=g  (global)"),
+        "env provenance:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("{}  (global)", canon.to_string_lossy())),
+        "bind provenance:\n{stdout}"
+    );
+}
+
+#[test]
+fn env_provenance_names_the_winning_layer_on_a_same_key_override() {
+    // When both layers set the same key, the project applies last and wins — the provenance
+    // tag must name the *winning* layer, not the one that declared it first.
+    let fx = Fixture::new();
+    fx.write_global("[env]\nFOO = \"g\"\n");
+    fx.write_project("[env]\nFOO = \"p\"\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("FOO=p  (project)"),
+        "the project's value must win and the tag must say project:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("FOO=g"),
+        "the overridden global value must not be shown:\n{stdout}"
+    );
 }
 
 #[test]
@@ -340,8 +370,12 @@ fn an_untrusted_project_keeps_env_but_drops_binds() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // free field applied
+    // free field applied, tagged with its source layer (the project config)
     assert!(stdout.contains("PROJVAR=p"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("PROJVAR=p  (project)"),
+        "env provenance:\n{stdout}"
+    );
     // security field dropped, and not silently
     assert!(
         !stdout.contains("/etc/ssh"),
@@ -379,6 +413,15 @@ fn trusting_the_project_applies_its_binds() {
         "trusted binds must apply:\n{stdout}"
     );
     assert!(stdout.contains("PROJVAR=p"), "stdout:\n{stdout}");
+    // a trusted project's free fields are tagged as the project layer's
+    assert!(
+        stdout.contains(&format!("{}  (project)", canon.to_string_lossy())),
+        "bind provenance:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("PROJVAR=p  (project)"),
+        "env provenance:\n{stdout}"
+    );
 }
 
 #[test]

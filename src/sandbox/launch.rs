@@ -2547,7 +2547,9 @@ mod tests {
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
         crate::config::Resolved {
             env: vec![],
+            env_layer: Default::default(),
             ro_binds: vec![],
+            bind_layer: Default::default(),
             packages: vec![],
             nixpkgs_global: global.map(String::from),
             nixpkgs_project: project.map(String::from),

@@ -737,6 +737,18 @@ fn config_show(args: &[OsString]) -> ExitCode {
 /// adds only color and layout, so the management core stays presentation-agnostic and a future
 /// front-end can render the same model differently. Every color span is empty under a
 /// non-terminal, so captured output is byte-for-byte the plain text the integration tests pin.
+/// The dim ` (global)` / ` (project)` provenance tag a free-field line carries — which config
+/// layer supplied the value. Empty when the origin is unknown, and (like every span) empty under
+/// a non-terminal, so captured output keeps the bare `KEY=value` / path the integration tests pin.
+fn layer_tag(layer: Option<config::view::LayerView>, dim: &str, r: &str) -> String {
+    use config::view::LayerView;
+    match layer {
+        Some(LayerView::Global) => format!("  {dim}(global){r}"),
+        Some(LayerView::Project) => format!("  {dim}(project){r}"),
+        None => String::new(),
+    }
+}
+
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> String {
     use config::view::{GuiView, NetworkView};
     use std::fmt::Write as _;
@@ -757,7 +769,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
     } else {
         let _ = writeln!(o, "  {h}env:{r}");
         for e in &view.env {
-            let _ = writeln!(o, "    {n}{}{r}={}", e.key, e.value);
+            let _ = writeln!(
+                o,
+                "    {n}{}{r}={}{}",
+                e.key,
+                e.value,
+                layer_tag(e.layer, dim, r)
+            );
         }
     }
     if view.binds.is_empty() {
@@ -765,7 +783,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
     } else {
         let _ = writeln!(o, "  {h}binds (read-only):{r}");
         for b in &view.binds {
-            let _ = writeln!(o, "    {n}{b}{r}");
+            let _ = writeln!(o, "    {n}{}{r}{}", b.path, layer_tag(b.layer, dim, r));
         }
     }
 
@@ -3451,7 +3469,9 @@ mod tests {
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
             env: vec![],
+            env_layer: Default::default(),
             ro_binds: vec![],
+            bind_layer: Default::default(),
             packages: vec![],
             nixpkgs_global: Some(global.to_string()),
             nixpkgs_project: None,
@@ -3842,8 +3862,15 @@ mod tests {
         use config::view::*;
         ConfigView {
             cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
+            env: vec![EnvVar {
+                key: "EDITOR".into(),
+                value: "vim".into(),
+                layer: Some(LayerView::Project),
+            }],
+            binds: vec![BindView {
+                path: "/data".into(),
+                layer: Some(LayerView::Global),
+            }],
             packages: vec![PackageView {
                 name: "jq".into(),
                 backend: "nix".into(),
@@ -3900,6 +3927,9 @@ mod tests {
         );
         assert!(out.contains("  engine: nixos-unstable  (default)"), "{out}");
         assert!(out.contains("    deny  evil.com"), "{out}");
+        // The free-field provenance tag is plain parenthesized text on its line.
+        assert!(out.contains("    EDITOR=vim  (project)"), "{out}");
+        assert!(out.contains("    /data  (global)"), "{out}");
     }
 
     #[test]
@@ -3931,6 +3961,15 @@ mod tests {
         assert!(
             out.contains(&format!("{}deny{}", p.warn, p.reset)),
             "the deny keyword must take the caution hue:\n{out}"
+        );
+        // The free-field provenance tag is secondary information — it takes the dim hue.
+        assert!(
+            out.contains(&format!("{}(project){}", p.dim, p.reset)),
+            "the env provenance tag must be dim:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{}(global){}", p.dim, p.reset)),
+            "the bind provenance tag must be dim:\n{out}"
         );
     }
 }
