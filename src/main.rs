@@ -2915,7 +2915,7 @@ fn upgrade_mise_tools(
     };
     if mise.state != trust::TrustState::Trusted {
         diag::warn(&format!(
-            "mise file {} withheld ({}): its nix: tools are not rolled",
+            "mise file `{}` withheld ({}): its `nix:` tools are not rolled",
             mise.name,
             config::untrusted_reason(mise.state)
         ));

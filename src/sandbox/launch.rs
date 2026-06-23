@@ -1901,7 +1901,7 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
     };
     if mise_cfg.state != crate::trust::TrustState::Trusted {
         crate::diag::warn(&format!(
-            "mise file {} withheld ({}): its [env] is not applied",
+            "mise file `{}` withheld ({}): its `[env]` is not applied",
             mise_cfg.name,
             crate::config::untrusted_reason(mise_cfg.state)
         ));
