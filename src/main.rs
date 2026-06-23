@@ -739,14 +739,20 @@ fn config_show(args: &[OsString]) -> ExitCode {
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> String {
     use config::view::{GuiView, NetworkView};
     use std::fmt::Write as _;
-    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
 
-    let _ = writeln!(o, "{h}ops config{r} — resolved for {}", view.cwd);
+    // The hue carries the layering story the model already holds: a section header is bold, an
+    // identifier (a key, a path, a rule, a channel) rides the name span, a value the trust gate
+    // *withheld* is yellow while an admitted one's detail is dimmed, a channel's provenance origin
+    // is bold, and a secondary note is dim. None of this is new data — it is the gating outcome and
+    // the per-channel origin made visible. Every span is empty under a non-terminal, so captured
+    // output stays byte-for-byte the plain text the integration tests pin.
+    let _ = writeln!(o, "{h}ops config{r} — resolved for {n}{}{r}", view.cwd);
 
     // The layered environment and read-only binds, after the trust gate.
     if view.env.is_empty() {
-        let _ = writeln!(o, "  {h}env:{r}   (none)");
+        let _ = writeln!(o, "  {h}env:{r}   {dim}(none){r}");
     } else {
         let _ = writeln!(o, "  {h}env:{r}");
         for e in &view.env {
@@ -754,18 +760,19 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
         }
     }
     if view.binds.is_empty() {
-        let _ = writeln!(o, "  {h}binds:{r} (none)");
+        let _ = writeln!(o, "  {h}binds:{r} {dim}(none){r}");
     } else {
         let _ = writeln!(o, "  {h}binds (read-only):{r}");
         for b in &view.binds {
-            let _ = writeln!(o, "    {b}");
+            let _ = writeln!(o, "    {n}{b}{r}");
         }
     }
 
     // Declared tools, each with its backend and trust verdict — the launcher's decision, shown
-    // without realising anything (no nix, no network).
+    // without realising anything (no nix, no network). A withheld package's reason is yellow (the
+    // trust gate dropped it); an admitted one's realisation detail is dimmed.
     if view.packages.is_empty() {
-        let _ = writeln!(o, "  {h}packages:{r} (none)");
+        let _ = writeln!(o, "  {h}packages:{r} {dim}(none){r}");
     } else {
         let _ = writeln!(o, "  {h}packages:{r}");
         for p in &view.packages {
@@ -773,14 +780,14 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
                 Some(reason) => {
                     let _ = writeln!(
                         o,
-                        "    {n}{}{r} -> {}:{}  (withheld: {reason})",
+                        "    {n}{}{r} -> {}:{}  {warn}(withheld: {reason}){r}",
                         p.name, p.backend, p.locator
                     );
                 }
                 None => {
                     let _ = writeln!(
                         o,
-                        "    {n}{}{r} -> {}:{}  ({})",
+                        "    {n}{}{r} -> {}:{}  {dim}({}){r}",
                         p.name, p.backend, p.locator, p.realised
                     );
                 }
@@ -789,18 +796,19 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
     }
 
     // The project's mise file and whether it would be honored — a tool source gated like
-    // `packages`, reported as presence + verdict (no mise run).
+    // `packages`, reported as presence + verdict (no mise run). Trusted is green (it applies);
+    // withheld is yellow.
     match &view.mise {
         None => {
-            let _ = writeln!(o, "  {h}mise:{r}  (none)");
+            let _ = writeln!(o, "  {h}mise:{r}  {dim}(none){r}");
         }
         Some(m) if m.trusted => {
-            let _ = writeln!(o, "  {h}mise:{r}  {n}{}{r} (trusted)", m.name);
+            let _ = writeln!(o, "  {h}mise:{r}  {n}{}{r} {ok}(trusted){r}", m.name);
         }
         Some(m) => {
             let _ = writeln!(
                 o,
-                "  {h}mise:{r}  {n}{}{r} (withheld: {})",
+                "  {h}mise:{r}  {n}{}{r} {warn}(withheld: {}){r}",
                 m.name,
                 m.withheld_reason.as_deref().unwrap_or_default()
             );
@@ -817,7 +825,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
                 Some(reason) => {
                     let _ = writeln!(
                         o,
-                        "    {n}nix:{}{r} = {}  (withheld: {reason})",
+                        "    {n}nix:{}{r} = {}  {warn}(withheld: {reason}){r}",
                         t.pkg, t.version
                     );
                 }
@@ -830,37 +838,38 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
             if t.equipped {
                 let _ = writeln!(
                     o,
-                    "    {n}{}{r} = {}  (equipped in-cage via mise)",
+                    "    {n}{}{r} = {}  {dim}(equipped in-cage via mise){r}",
                     t.token, t.version
                 );
             } else {
                 let _ = writeln!(
                     o,
-                    "    {n}{}{r} = {}  (needs network — not equipped under `network = \"none\"`)",
+                    "    {n}{}{r} = {}  {warn}(needs network — not equipped under \
+                     `network = \"none\"`){r}",
                     t.token, t.version
                 );
             }
         }
         for token in &view.tools.malformed {
-            let _ = writeln!(o, "    {token}  (ignored: malformed nix: token)");
+            let _ = writeln!(o, "    {token}  {warn}(ignored: malformed nix: token){r}");
         }
     }
 
     // The nixpkgs source the tools resolve against and its locked revision, then the mise
     // engine's own channel — shown so the engine's decoupling from the base channel is visible.
     // Routed through the launch's own channel decision; an unlocked source omits the revision.
-    let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs));
-    let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine));
+    let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs, pal));
+    let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine, pal));
 
     // The network posture — a security field. `shared` keeps the host network; `none` cuts it
     // off; an `allowlist` lists exactly what egress is permitted (deny wins over allow), plus the
     // always-allowed nix-cache set so the self-equip allowance is never silent.
     match &view.network {
         NetworkView::Shared => {
-            let _ = writeln!(o, "  {h}network:{r} shared (host network)");
+            let _ = writeln!(o, "  {h}network:{r} shared {dim}(host network){r}");
         }
         NetworkView::Isolated => {
-            let _ = writeln!(o, "  {h}network:{r} none (isolated — no network)");
+            let _ = writeln!(o, "  {h}network:{r} none {dim}(isolated — no network){r}");
         }
         NetworkView::Allowlist {
             allow,
@@ -869,20 +878,24 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
         } => {
             let _ = writeln!(o, "  {h}network:{r} allowlist");
             if allow.is_empty() {
-                let _ = writeln!(o, "    allow: (none declared)");
+                let _ = writeln!(o, "    allow: {dim}(none declared){r}");
             } else {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
                 }
             }
+            // Deny wins over allow, so the keyword takes the caution hue.
             for rule in deny {
-                let _ = writeln!(o, "    deny  {n}{rule}{r}");
+                let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
             }
-            let _ = writeln!(o, "    built-in (always allowed, so self-equip works):");
+            let _ = writeln!(
+                o,
+                "    {dim}built-in (always allowed, so self-equip works):{r}"
+            );
             for host in builtin {
                 let _ = writeln!(o, "      allow {n}{host}{r}");
             }
-            let _ = writeln!(o, "    (deny wins over allow)");
+            let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
         }
     }
 
@@ -890,7 +903,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
     if matches!(view.gui, GuiView::Wayland) {
         let _ = writeln!(
             o,
-            "  {h}gui:{r} wayland (exposure depends on your compositor)"
+            "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
         );
     }
 
@@ -903,7 +916,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
         for s in &view.secrets {
             let _ = writeln!(
                 o,
-                "    {n}{}{r} -> {}  ({}, from {})",
+                "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
                 s.header, s.to, s.shape, s.sources
             );
         }
@@ -915,23 +928,34 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
     if !view.apps.is_empty() {
         let _ = writeln!(o, "  {h}apps:{r}");
         for app in &view.apps {
-            let cmd = app.cmd.as_deref().unwrap_or("(no command)");
-            let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
-            let _ = writeln!(o, "      home: {}", app.home_scope);
+            match &app.cmd {
+                Some(cmd) => {
+                    let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
+                }
+                // No layer declared a command — the app cannot launch, so flag it.
+                None => {
+                    let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
+                }
+            }
+            let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
             if !app.packages.is_empty() {
-                let _ = writeln!(o, "      packages: {}", app.packages.join(", "));
+                let _ = writeln!(o, "      {dim}packages:{r} {}", app.packages.join(", "));
             }
             if let Some(net) = &app.network {
-                let _ = writeln!(o, "      network: {net}");
+                let _ = writeln!(o, "      {dim}network:{r} {net}");
             }
             if let Some(gui) = &app.gui {
-                let _ = writeln!(o, "      gui: {gui}");
+                let _ = writeln!(o, "      {dim}gui:{r} {gui}");
             }
             if app.secret_count > 0 {
-                let _ = writeln!(o, "      secrets: {} injected host-side", app.secret_count);
+                let _ = writeln!(
+                    o,
+                    "      {dim}secrets:{r} {} injected host-side",
+                    app.secret_count
+                );
             }
             for note in &app.notes {
-                let _ = writeln!(o, "      note: {note}");
+                let _ = writeln!(o, "      {warn}note: {note}{r}");
             }
         }
     }
@@ -940,12 +964,20 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
 }
 
 /// One channel line's text (without the colored label): `<source> @ <short-rev>  (<origin>)`, or
-/// `<source>  (<origin>)` when no revision has been locked. The revision is shortened here, a
-/// presentation choice — the view model carries the full revision.
-fn channel_text(c: &config::view::ChannelView) -> String {
+/// `<source>  (<origin>)` when no revision has been locked. The source rides the name span (it is
+/// the channel identifier), the shortened revision is dimmed (secondary detail), and the origin —
+/// the per-channel provenance, the inheritance the config makes visible — is bold. The revision is
+/// shortened here, a presentation choice; the view model carries the full revision.
+fn channel_text(c: &config::view::ChannelView, pal: &style::Palette) -> String {
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     match &c.locked_rev {
-        Some(rev) => format!("{} @ {}  ({})", c.source, short_rev(rev), c.origin),
-        None => format!("{}  ({})", c.source, c.origin),
+        Some(rev) => format!(
+            "{n}{}{r} @ {dim}{}{r}  ({h}{}{r})",
+            c.source,
+            short_rev(rev),
+            c.origin
+        ),
+        None => format!("{n}{}{r}  ({h}{}{r})", c.source, c.origin),
     }
 }
 
@@ -1044,6 +1076,37 @@ fn config_get(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// The confirmation for a config write: the verb (`set`/`updated`/`unset`) in green over the
+/// dotted key, with the target file highlighted. A pure presenter — every span is empty under a
+/// non-terminal, so captured output is byte-for-byte the plain text the management tests pin.
+fn render_config_write(verb: &str, key: &str, path: &Path, pal: &style::Palette) -> String {
+    let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    format!(
+        "ops: {ok}{verb}{r} `{n}{key}{r}` in {n}{}{r}",
+        path.display()
+    )
+}
+
+/// The no-op confirmation for `ops config unset` on a key that was not set — dimmed, since nothing
+/// changed (and so trust is never re-armed). A pure presenter.
+fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palette) -> String {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    format!(
+        "ops: `{n}{key}{r}` {dim}was not set in {}{r}",
+        path.display()
+    )
+}
+
+/// The confirmation that `--trust` re-blessed a whole file after a write or edit: `trusted` in
+/// green over the path, the scope note dimmed. A pure presenter, shared by `set`/`unset`/`edit`.
+fn render_trusted_whole_file(path: &Path, pal: &style::Palette) -> String {
+    let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    format!(
+        "ops: {ok}trusted{r} {n}{}{r} {dim}(the whole file is now trusted){r}",
+        path.display()
+    )
+}
+
 /// `ops config set <key> <value>`: write a string value at a dotted key in the target layer file
 /// (`--local` by default), preserving the rest of the file's comments and formatting. Because the
 /// trust gate hashes the whole file, any edit re-arms it — so a write to a trusted file warns that
@@ -1081,7 +1144,8 @@ fn config_set(args: &[OsString]) -> ExitCode {
     match config::manage::set(&path, key, val) {
         Ok(created) => {
             let verb = if created { "set" } else { "updated" };
-            println!("ops: {verb} `{key}` in {}", path.display());
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_config_write(verb, key, &path, &pal));
             report_write_trust(&path, key, was_trusted, trust, store_dir.as_deref());
             ExitCode::SUCCESS
         }
@@ -1125,12 +1189,14 @@ fn config_unset(args: &[OsString]) -> ExitCode {
 
     match config::manage::unset(&path, key) {
         Ok(true) => {
-            println!("ops: unset `{key}` in {}", path.display());
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_config_write("unset", key, &path, &pal));
             report_write_trust(&path, key, was_trusted, trust, store_dir.as_deref());
             ExitCode::SUCCESS
         }
         Ok(false) => {
-            println!("ops: `{key}` was not set in {}", path.display());
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_config_unchanged(key, &path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1233,10 +1299,10 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     if trust_flag {
         match store_dir.as_deref() {
             Some(dir) => match trust::trust(dir, &path) {
-                Ok(()) => println!(
-                    "ops: trusted {} (the whole file is now trusted)",
-                    path.display()
-                ),
+                Ok(()) => {
+                    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+                    println!("{}", render_trusted_whole_file(&path, &pal));
+                }
                 Err(e) => eprintln!("ops: warning: could not trust {}: {e}", path.display()),
             },
             None => eprintln!("ops: warning: no trust store available; cannot --trust"),
@@ -1273,10 +1339,10 @@ fn report_write_trust(
     if trust_flag {
         match store_dir {
             Some(dir) => match trust::trust(dir, path) {
-                Ok(()) => println!(
-                    "ops: trusted {} (the whole file is now trusted)",
-                    path.display()
-                ),
+                Ok(()) => {
+                    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+                    println!("{}", render_trusted_whole_file(path, &pal));
+                }
                 Err(e) => eprintln!("ops: warning: could not trust {}: {e}", path.display()),
             },
             None => eprintln!("ops: warning: no trust store available; cannot --trust"),
@@ -1331,6 +1397,46 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
             sandbox::app(name, detach)
         }
     }
+}
+
+/// The import confirmation: `imported` in green over the app name and destination, the granted
+/// posture introduced by a dimmed label (the summary lines themselves stay plain — they carry the
+/// posture detail), and the launch hint dimmed with the name highlighted. A pure presenter — every
+/// span is empty under a non-terminal, so a captured stream is the plain text the tests pin.
+fn render_app_imported(
+    name: &str,
+    dest: &Path,
+    summary: &[String],
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "{ok}imported{r} app profile '{n}{name}{r}' -> {n}{}{r}",
+        dest.display()
+    );
+    let _ = writeln!(
+        o,
+        "  {dim}granted posture (trusted by location — honored even on an untrusted project):{r}"
+    );
+    for line in summary {
+        let _ = writeln!(o, "    {line}");
+    }
+    let _ = write!(o, "  {dim}launch it with: ops app{r} {n}{name}{r}");
+    o
+}
+
+/// The export confirmation (only on `--out`, since the default writes the profile bytes to
+/// stdout): `exported` in green over the app name and destination. Goes to stderr, so its palette
+/// is decided from stderr's stream. A pure presenter.
+fn render_app_exported(name: &str, path: &Path, pal: &style::Palette) -> String {
+    let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    format!(
+        "{ok}exported{r} app `{n}{name}{r}` -> {n}{}{r}",
+        path.display()
+    )
 }
 
 /// `ops app import <file> [--as <name>] [--force]`: validate a portable app profile and place it
@@ -1436,12 +1542,11 @@ fn app_import(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!("imported app profile '{name}' -> {}", dest.display());
-    println!("  granted posture (trusted by location — honored even on an untrusted project):");
-    for line in &preview.summary {
-        println!("    {line}");
-    }
-    println!("  launch it with: ops app {name}");
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    println!(
+        "{}",
+        render_app_imported(&name, &dest, &preview.summary, &pal)
+    );
     ExitCode::SUCCESS
 }
 
@@ -1550,7 +1655,10 @@ fn app_export(args: &[OsString]) -> ExitCode {
                 eprintln!("ops: cannot write {}: {e}", path.display());
                 return ExitCode::FAILURE;
             }
-            eprintln!("exported app `{name}` -> {}", path.display());
+            // The confirmation goes to stderr (stdout is reserved for the profile bytes), so its
+            // palette is decided from stderr's stream, not stdout's.
+            let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
+            eprintln!("{}", render_app_exported(name, path, &epal));
         }
     }
     ExitCode::SUCCESS
@@ -1575,7 +1683,8 @@ fn app_rm(name: Option<&str>) -> ExitCode {
     let path = dir.join(format!("{name}.toml"));
     match std::fs::remove_file(&path) {
         Ok(()) => {
-            println!("removed app profile '{name}'");
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_removed(Some("app profile"), name, &pal));
             ExitCode::SUCCESS
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1847,6 +1956,142 @@ fn plugins_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The confirmation for a placed plugin: `installed` in green (the change happened), the plugin
+/// name and its scheme highlighted, and the removal hint dimmed. `from_store` names the store an
+/// install came from, when one did. A pure presenter — every span is empty under a non-terminal,
+/// so a captured stream is byte-for-byte the plain text the integration tests pin.
+fn render_plugin_installed(
+    name: &str,
+    scheme: &str,
+    from_store: Option<&str>,
+    pal: &style::Palette,
+) -> String {
+    let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let from = match from_store {
+        Some(s) => format!(" from store '{n}{s}{r}'"),
+        None => String::new(),
+    };
+    format!(
+        "{ok}installed{r} '{n}{name}{r}' {dim}({scheme}://){r}{from} \
+         {dim}— remove with: ops plugins rm {name}{r}"
+    )
+}
+
+/// The confirmation for a removed thing: `removed` in green over the name. `label` names what kind
+/// (`store`, `app profile`), or `None` for a bare resolver plugin. A pure presenter.
+fn render_removed(label: Option<&str>, name: &str, pal: &style::Palette) -> String {
+    let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    match label {
+        Some(l) => format!("{ok}removed{r} {l} '{n}{name}{r}'"),
+        None => format!("{ok}removed{r} '{n}{name}{r}'"),
+    }
+}
+
+/// The trust-on-first-use caution for a freshly added store — yellow, since it pinned a key ops
+/// could not pre-verify. The pinned key is highlighted for an out-of-band comparison; the
+/// follow-up hint is dimmed. Goes to stderr, so its palette is decided from stderr's stream.
+fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palette) -> String {
+    let (warn, n, dim, r) = (pal.warn, pal.name, pal.dim, pal.reset);
+    format!(
+        "{warn}⚠ trust-on-first-use: pinned the key this store ships, unverified{r}\n  \
+         pinned key: {n}{pubkey_hex}{r}\n  \
+         {dim}verify it out of band; re-shown by `ops plugins store info {name}`{r}"
+    )
+}
+
+/// The configured-store report: `configured store` in green over the name, the revision and count
+/// dimmed, then each plugin by name with its scheme and version dimmed. A pure presenter over the
+/// catalogue's plugin lines as `(name, scheme, version)` triples.
+fn render_store_configured(
+    name: &str,
+    rev: u64,
+    plugins: &[(&str, &str, &str)],
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let plural = if plugins.len() == 1 { "" } else { "s" };
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "{ok}configured store{r} '{n}{name}{r}' {dim}(rev {rev}, {} plugin{plural}):{r}",
+        plugins.len()
+    );
+    for (pname, scheme, version) in plugins {
+        let _ = write!(o, "  {n}{pname}{r}  {dim}({scheme}://){r}");
+        if !version.is_empty() {
+            let _ = write!(o, "  {dim}v{version}{r}");
+        }
+        let _ = writeln!(o);
+    }
+    o
+}
+
+/// The keep-the-key-secret caution after a publish — yellow, over the highlighted key path. Goes
+/// to stderr, so its palette is decided from stderr's stream.
+fn render_publish_key_warning(key_path: &Path, pal: &style::Palette) -> String {
+    let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    format!(
+        "{warn}⚠ keep the signing key{r} {n}`{}`{r} \
+         {warn}secret — it is this store's identity{r}",
+        key_path.display()
+    )
+}
+
+/// The published-store report: `published store` in green, the plugins by name, the public key
+/// consumers pin highlighted, and the commit-and-host hint dimmed (with the key echoed in it). A
+/// pure presenter over the published plugin lines as `(name, scheme)` pairs.
+fn render_published(
+    rev: u64,
+    plugins: &[(&str, &str)],
+    pubkey_hex: &str,
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let plural = if plugins.len() == 1 { "" } else { "s" };
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "{ok}published store{r} at rev {rev} {dim}({} plugin{plural}):{r}",
+        plugins.len()
+    );
+    for (name, scheme) in plugins {
+        let _ = writeln!(o, "  {n}{name}{r}  {dim}({scheme}://){r}");
+    }
+    let _ = writeln!(o, "pubkey: {n}{pubkey_hex}{r}");
+    let _ = write!(
+        o,
+        "{dim}commit and host the directory, then consumers add it with: \
+         ops plugins store add --name <n> --url <git-url> --key {pubkey_hex}{r}"
+    );
+    o
+}
+
+/// The update report for one store: `updated store` in green with the revision bump when it
+/// advanced, or a dimmed already-current line when nothing moved (a no-op takes the dim hue). A
+/// pure presenter.
+fn render_store_updated(
+    name: &str,
+    old_rev: u64,
+    new_rev: u64,
+    count: usize,
+    pal: &style::Palette,
+) -> String {
+    let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
+    let plural = if count == 1 { "" } else { "s" };
+    if new_rev > old_rev {
+        format!(
+            "{ok}updated store{r} '{n}{name}{r}' \
+             {dim}(rev {old_rev} → {new_rev}, {count} plugin{plural}){r}"
+        )
+    } else {
+        format!(
+            "store '{n}{name}{r}' is {dim}already at revision {new_rev} ({count} plugin{plural}){r}"
+        )
+    }
+}
+
 /// `ops plugins install <name | dir>`: place a resolver plugin into the data dir, where it becomes
 /// trusted by location. A bare `name` installs a plugin from the built-in store (bundled in the
 /// binary); a path-like argument (`./dir`, `/abs/dir`) copies a local directory. A deliberate user
@@ -1874,9 +2119,10 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     };
     match result {
         Ok(installed) => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
-                "installed '{}' ({}://) — remove with: ops plugins rm {}",
-                installed.name, installed.scheme, installed.name
+                "{}",
+                render_plugin_installed(&installed.name, &installed.scheme, None, &pal)
             );
             ExitCode::SUCCESS
         }
@@ -2005,30 +2251,26 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
         Ok(added) => {
             // Trust on first use pinned a key ops could not pre-verify: surface it loudly on stderr
             // (so it is never silently swallowed in a scripted run) with the full key for an
-            // out-of-band comparison, while the configured-store report goes to stdout.
+            // out-of-band comparison, while the configured-store report goes to stdout. Each line's
+            // palette is decided from the stream it actually goes to.
             if added.tofu {
-                eprintln!("⚠ trust-on-first-use: pinned the key this store ships, unverified");
-                eprintln!("  pinned key: {}", plugin_store::to_hex(&added.pubkey));
+                let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
                 eprintln!(
-                    "  verify it out of band; re-shown by `ops plugins store info {}`",
-                    added.name
+                    "{}",
+                    render_store_tofu(&plugin_store::to_hex(&added.pubkey), &added.name, &epal)
                 );
             }
             let cat = &added.catalogue;
-            println!(
-                "configured store '{}' (rev {}, {} plugin{}):",
-                added.name,
-                cat.rev,
-                cat.plugins.len(),
-                if cat.plugins.len() == 1 { "" } else { "s" }
+            let plugins: Vec<(&str, &str, &str)> = cat
+                .plugins
+                .iter()
+                .map(|(p, e)| (p.as_str(), e.scheme.as_str(), e.version.as_str()))
+                .collect();
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            print!(
+                "{}",
+                render_store_configured(&added.name, cat.rev, &plugins, &pal)
             );
-            for (pname, entry) in &cat.plugins {
-                print!("  {pname}  ({}://)", entry.scheme);
-                if !entry.version.is_empty() {
-                    print!("  v{}", entry.version);
-                }
-                println!();
-            }
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -2094,29 +2336,20 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
     match stores::publish(Path::new(dir), Path::new(key), rev) {
         Ok(published) => {
             // The key file just written or reused is the store's identity; warn loudly so it is
-            // never treated as a throwaway. The public key, on stdout, is what consumers pin.
-            eprintln!(
-                "⚠ keep the signing key `{}` secret — it is this store's identity",
-                Path::new(key).display()
-            );
+            // never treated as a throwaway. The public key, on stdout, is what consumers pin. Each
+            // line's palette is decided from the stream it actually goes to.
+            let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
+            eprintln!("{}", render_publish_key_warning(Path::new(key), &epal));
             let pubkey = plugin_store::to_hex(&published.pubkey);
+            let plugins: Vec<(&str, &str)> = published
+                .plugins
+                .iter()
+                .map(|(name, scheme)| (name.as_str(), scheme.as_str()))
+                .collect();
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
-                "published store at rev {} ({} plugin{}):",
-                published.rev,
-                published.plugins.len(),
-                if published.plugins.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            );
-            for (name, scheme) in &published.plugins {
-                println!("  {name}  ({scheme}://)");
-            }
-            println!("pubkey: {pubkey}");
-            println!(
-                "commit and host the directory, then consumers add it with: \
-                 ops plugins store add --name <n> --url <git-url> --key {pubkey}"
+                "{}",
+                render_published(published.rev, &plugins, &pubkey, &pal)
             );
             ExitCode::SUCCESS
         }
@@ -2153,9 +2386,11 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
         None => {
             let all = stores::list(&layout);
             if all.is_empty() {
+                let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+                let (dim, r) = (pal.dim, pal.reset);
                 println!(
-                    "no remote stores are configured \
-                     (add one with: ops plugins store add --name <n> --url <git-url> --key <hex>)"
+                    "{dim}no remote stores are configured \
+                     (add one with: ops plugins store add --name <n> --url <git-url> --key <hex>){r}"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -2163,23 +2398,21 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
         }
     };
 
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut failed = false;
     for name in &names {
         match stores::update(&layout, name, &git) {
             Ok(u) => {
-                let n = u.catalogue.plugins.len();
-                let plural = if n == 1 { "" } else { "s" };
-                if u.new_rev > u.old_rev {
-                    println!(
-                        "updated store '{}' (rev {} → {}, {n} plugin{plural})",
-                        u.name, u.old_rev, u.new_rev
-                    );
-                } else {
-                    println!(
-                        "store '{}' is already at revision {} ({n} plugin{plural})",
-                        u.name, u.new_rev
-                    );
-                }
+                println!(
+                    "{}",
+                    render_store_updated(
+                        &u.name,
+                        u.old_rev,
+                        u.new_rev,
+                        u.catalogue.plugins.len(),
+                        &pal
+                    )
+                );
             }
             Err(why) => {
                 eprintln!("ops: cannot update store '{name}': {why}");
@@ -2216,9 +2449,10 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
     };
     match stores::install_plugin(&layout, store_name, plugin_name) {
         Ok(installed) => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
-                "installed '{}' ({}://) from store '{store_name}' — remove with: ops plugins rm {}",
-                installed.name, installed.scheme, installed.name
+                "{}",
+                render_plugin_installed(&installed.name, &installed.scheme, Some(store_name), &pal)
             );
             ExitCode::SUCCESS
         }
@@ -2302,7 +2536,8 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
     };
     match stores::remove(&layout, name) {
         Ok(()) => {
-            println!("removed store '{name}'");
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_removed(Some("store"), name, &pal));
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -2387,7 +2622,8 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
     };
     match plugins::remove(&layout, name) {
         Ok(()) => {
-            println!("removed '{name}'");
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_removed(None, name, &pal));
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -3449,5 +3685,251 @@ mod tests {
             "{}2 flake: package(s) withheld (untrusted){}",
             p.warn, p.reset
         )));
+    }
+
+    #[test]
+    fn transactional_confirmations_are_plain_text_when_uncolored() {
+        // The OFF path the integration capture and the existing substring assertions rely on:
+        // empty spans, byte-identical plain text. Each line of the original wording is preserved.
+        let p = style::Palette::plain();
+        assert_eq!(
+            render_plugin_installed("pass", "pass", None, &p),
+            "installed 'pass' (pass://) — remove with: ops plugins rm pass"
+        );
+        assert_eq!(
+            render_plugin_installed("vault", "vault", Some("hub"), &p),
+            "installed 'vault' (vault://) from store 'hub' — remove with: ops plugins rm vault"
+        );
+        assert_eq!(render_removed(None, "pass", &p), "removed 'pass'");
+        assert_eq!(
+            render_removed(Some("store"), "hub", &p),
+            "removed store 'hub'"
+        );
+        assert_eq!(
+            render_removed(Some("app profile"), "claude", &p),
+            "removed app profile 'claude'"
+        );
+        assert_eq!(
+            render_store_tofu("ab12", "hub", &p),
+            "⚠ trust-on-first-use: pinned the key this store ships, unverified\n  \
+             pinned key: ab12\n  \
+             verify it out of band; re-shown by `ops plugins store info hub`"
+        );
+        assert_eq!(
+            render_store_configured("hub", 3, &[("vault", "vault", "1.0"), ("pass", "pass", "")], &p),
+            "configured store 'hub' (rev 3, 2 plugins):\n  vault  (vault://)  v1.0\n  pass  (pass://)\n"
+        );
+        assert_eq!(
+            render_publish_key_warning(Path::new("/k/key.pem"), &p),
+            "⚠ keep the signing key `/k/key.pem` secret — it is this store's identity"
+        );
+        assert_eq!(
+            render_published(5, &[("vault", "vault")], "deadbeef", &p),
+            "published store at rev 5 (1 plugin):\n  vault  (vault://)\npubkey: deadbeef\n\
+             commit and host the directory, then consumers add it with: \
+             ops plugins store add --name <n> --url <git-url> --key deadbeef"
+        );
+        assert_eq!(
+            render_store_updated("hub", 3, 5, 2, &p),
+            "updated store 'hub' (rev 3 → 5, 2 plugins)"
+        );
+        assert_eq!(
+            render_store_updated("hub", 5, 5, 1, &p),
+            "store 'hub' is already at revision 5 (1 plugin)"
+        );
+        assert_eq!(
+            render_app_imported(
+                "claude",
+                Path::new("/c/claude.toml"),
+                &["command: x".into(), "network: allowlist".into()],
+                &p
+            ),
+            "imported app profile 'claude' -> /c/claude.toml\n  \
+             granted posture (trusted by location — honored even on an untrusted project):\n    \
+             command: x\n    network: allowlist\n  launch it with: ops app claude"
+        );
+        assert_eq!(
+            render_app_exported("claude", Path::new("/c/out.toml"), &p),
+            "exported app `claude` -> /c/out.toml"
+        );
+        let cfg = Path::new("/p/.ops.toml");
+        assert_eq!(
+            render_config_write("set", "env.FOO", cfg, &p),
+            "ops: set `env.FOO` in /p/.ops.toml"
+        );
+        assert_eq!(
+            render_config_write("unset", "env.FOO", cfg, &p),
+            "ops: unset `env.FOO` in /p/.ops.toml"
+        );
+        assert_eq!(
+            render_config_unchanged("env.FOO", cfg, &p),
+            "ops: `env.FOO` was not set in /p/.ops.toml"
+        );
+        assert_eq!(
+            render_trusted_whole_file(cfg, &p),
+            "ops: trusted /p/.ops.toml (the whole file is now trusted)"
+        );
+    }
+
+    #[test]
+    fn transactional_confirmations_color_their_key_spans() {
+        // The ON path: the success verb takes the `ok` hue, a caution takes `warn`, a no-op takes
+        // `dim`, and identifiers ride the `name` span — a swapped hue (invisible to the plain
+        // assertions above) only shows here.
+        let p = style::Palette::colored();
+
+        let installed = render_plugin_installed("pass", "pass", None, &p);
+        assert!(installed.contains(&format!("{}installed{}", p.ok, p.reset)));
+        assert!(installed.contains(&format!("'{}pass{}'", p.name, p.reset)));
+
+        assert!(render_removed(Some("store"), "hub", &p)
+            .contains(&format!("{}removed{}", p.ok, p.reset)));
+
+        let tofu = render_store_tofu("ab12", "hub", &p);
+        assert!(
+            tofu.contains(p.warn),
+            "the tofu caution must ride the warn hue:\n{tofu}"
+        );
+        assert!(tofu.contains(&format!("{}ab12{}", p.name, p.reset)));
+
+        let configured = render_store_configured("hub", 3, &[("vault", "vault", "1.0")], &p);
+        assert!(configured.contains(&format!("{}configured store{}", p.ok, p.reset)));
+        assert!(configured.contains(&format!("{}vault{}", p.name, p.reset)));
+
+        let keywarn = render_publish_key_warning(Path::new("/k/key.pem"), &p);
+        assert!(
+            keywarn.contains(p.warn),
+            "the key caution must ride the warn hue:\n{keywarn}"
+        );
+
+        let published = render_published(5, &[("vault", "vault")], "deadbeef", &p);
+        assert!(published.contains(&format!("{}published store{}", p.ok, p.reset)));
+        assert!(published.contains(&format!("{}deadbeef{}", p.name, p.reset)));
+
+        let rolled = render_store_updated("hub", 3, 5, 2, &p);
+        assert!(rolled.contains(&format!("{}updated store{}", p.ok, p.reset)));
+        let noop = render_store_updated("hub", 5, 5, 1, &p);
+        assert!(
+            noop.contains(p.dim),
+            "a no-op update must take the dim hue:\n{noop}"
+        );
+
+        let imported = render_app_imported("claude", Path::new("/c/claude.toml"), &[], &p);
+        assert!(imported.contains(&format!("{}imported{}", p.ok, p.reset)));
+        assert!(imported.contains(&format!("'{}claude{}'", p.name, p.reset)));
+
+        let exported = render_app_exported("claude", Path::new("/c/out.toml"), &p);
+        assert!(exported.contains(&format!("{}exported{}", p.ok, p.reset)));
+
+        let cfg = Path::new("/p/.ops.toml");
+        let set = render_config_write("set", "env.FOO", cfg, &p);
+        assert!(set.contains(&format!("{}set{}", p.ok, p.reset)));
+        assert!(set.contains(&format!("`{}env.FOO{}`", p.name, p.reset)));
+        let unchanged = render_config_unchanged("env.FOO", cfg, &p);
+        assert!(
+            unchanged.contains(p.dim),
+            "a no-op config write must take the dim hue:\n{unchanged}"
+        );
+        let retrust = render_trusted_whole_file(cfg, &p);
+        assert!(retrust.contains(&format!("{}trusted{}", p.ok, p.reset)));
+    }
+
+    /// A representative resolved view: an untrusted project that withholds a `nix:` package and its
+    /// mise file, a project-pinned base channel (with a locked revision) beside the default engine,
+    /// and an allowlist carrying a deny rule. Built by hand so the render tests need no I/O.
+    fn sample_config_view() -> config::view::ConfigView {
+        use config::view::*;
+        ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![PackageView {
+                name: "jq".into(),
+                backend: "nix".into(),
+                locator: "jq".into(),
+                realised: "host-side, durable".into(),
+                trusted: false,
+                withheld_reason: Some("the project is untrusted".into()),
+            }],
+            mise: Some(MiseView {
+                name: ".mise.toml".into(),
+                trusted: false,
+                withheld_reason: Some("the project is untrusted".into()),
+            }),
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-23.11".into(),
+                origin: "project pin".into(),
+                locked_rev: Some("9ae611a455b90cf061d8f332b977e387bda8e1ca".into()),
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Allowlist {
+                allow: vec!["github.com".into()],
+                deny: vec!["evil.com".into()],
+                builtin: vec!["cache.nixos.org".into()],
+            },
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn config_render_is_plain_text_when_uncolored() {
+        // The OFF path the `ops config show` integration assertions stand on: empty spans, so the
+        // wording and spacing are exactly today's — a withheld note, a channel line (with and
+        // without a locked revision), and a deny rule.
+        let out = render_config(&sample_config_view(), &style::Palette::plain());
+        assert!(
+            out.contains("    jq -> nix:jq  (withheld: the project is untrusted)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  mise:  .mise.toml (withheld: the project is untrusted)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  nixpkgs: nixos-23.11 @ 9ae611a  (project pin)"),
+            "{out}"
+        );
+        assert!(out.contains("  engine: nixos-unstable  (default)"), "{out}");
+        assert!(out.contains("    deny  evil.com"), "{out}");
+    }
+
+    #[test]
+    fn config_render_colors_the_gating_outcome_and_the_channel_provenance() {
+        // The ON path: a withheld value takes the warn hue (the trust gate dropped it), a channel's
+        // provenance origin is bold and its source rides the name span, its short revision is dim,
+        // and the deny keyword is warn — the inheritance/gating story a swapped hue would hide.
+        let p = style::Palette::colored();
+        let out = render_config(&sample_config_view(), &p);
+        assert!(
+            out.contains(&format!(
+                "{}(withheld: the project is untrusted){}",
+                p.warn, p.reset
+            )),
+            "a withheld package must take the warn hue:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{}nixos-23.11{}", p.name, p.reset)),
+            "a channel source must ride the name span:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("({}project pin{})", p.head, p.reset)),
+            "a channel origin (provenance) must be bold:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{}9ae611a{}", p.dim, p.reset)),
+            "a locked revision must be dimmed:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{}deny{}", p.warn, p.reset)),
+            "the deny keyword must take the caution hue:\n{out}"
+        );
     }
 }

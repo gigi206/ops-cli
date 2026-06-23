@@ -51,6 +51,20 @@ fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
         .expect("spawn ops")
 }
 
+/// Assert a captured invocation carries no ANSI escape on either stream.
+fn assert_no_ansi(out: &std::process::Output, label: &str) {
+    assert!(
+        !out.stdout.contains(&0x1b),
+        "`{label}` emitted an ANSI escape on a captured stream:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.stderr.contains(&0x1b),
+        "`{label}` emitted an ANSI escape on captured stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn captured_output_carries_no_ansi_escapes() {
     let home = TmpDir::new();
@@ -92,4 +106,85 @@ fn captured_output_carries_no_ansi_escapes() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn transactional_confirmations_are_plain_when_captured() {
+    // The read commands above are stateless; the *transactional* confirmations (import, install,
+    // …) only take their colored path after a side effect, so the flat loop cannot reach them.
+    // Drive each cheap, host-agnostic one end to end (no nix, no network) so a miswired caller —
+    // one that prints raw ANSI, or derives a stderr line's palette from the wrong stream — cannot
+    // slip past with the presenter unit tests alone.
+    let home = TmpDir::new();
+    let cwd = TmpDir::new();
+    // A minimal importable profile: a top-level app with a command.
+    std::fs::write(cwd.path().join("probe.toml"), "cmd = \"true\"\n").unwrap();
+
+    // app: import → export (to a file, so the confirmation is the stderr line) → rm.
+    let imported = run(&["app", "import", "./probe.toml"], home.path(), cwd.path());
+    assert!(
+        imported.status.success(),
+        "import must succeed:\n{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    assert_no_ansi(&imported, "app import");
+
+    let out_file = cwd.path().join("exported.toml");
+    let exported = run(
+        &[
+            "app",
+            "export",
+            "probe",
+            "--out",
+            out_file.to_str().unwrap(),
+        ],
+        home.path(),
+        cwd.path(),
+    );
+    assert!(
+        exported.status.success(),
+        "export must succeed:\n{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert_no_ansi(&exported, "app export --out");
+
+    let removed = run(&["app", "rm", "probe"], home.path(), cwd.path());
+    assert!(removed.status.success(), "app rm must succeed");
+    assert_no_ansi(&removed, "app rm");
+
+    // plugins: install a built-in by name (compiled in, no network), then remove it.
+    let pinstall = run(&["plugins", "install", "vault"], home.path(), cwd.path());
+    assert!(
+        pinstall.status.success(),
+        "plugin install must succeed:\n{}",
+        String::from_utf8_lossy(&pinstall.stderr)
+    );
+    assert_no_ansi(&pinstall, "plugins install vault");
+
+    let prm = run(&["plugins", "rm", "vault"], home.path(), cwd.path());
+    assert!(prm.status.success(), "plugin rm must succeed");
+    assert_no_ansi(&prm, "plugins rm vault");
+
+    // plugins store update with nothing configured: the dimmed "no stores" message. Exit status
+    // depends on whether git is on PATH (host-dependent), so only the no-ANSI invariant is pinned.
+    let update = run(&["plugins", "store", "update"], home.path(), cwd.path());
+    assert_no_ansi(&update, "plugins store update");
+
+    // config writes: set (creates the local .ops.toml), then unset (removes the key). Both print a
+    // confirmation on stdout; no nix, no network.
+    let set = run(
+        &["config", "set", "env.FOO", "bar"],
+        home.path(),
+        cwd.path(),
+    );
+    assert!(
+        set.status.success(),
+        "config set must succeed:\n{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert_no_ansi(&set, "config set");
+
+    let unset = run(&["config", "unset", "env.FOO"], home.path(), cwd.path());
+    assert!(unset.status.success(), "config unset must succeed");
+    assert_no_ansi(&unset, "config unset");
 }
