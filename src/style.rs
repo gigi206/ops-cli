@@ -6,22 +6,35 @@
 /// ANSI styling for one output stream. Empty strings when color is off, so the render code is
 /// unconditional and a non-terminal (a pipe, a captured test) is plain text.
 pub(crate) struct Palette {
-    /// Command and subcommand names, configuration keys, identifiers.
+    /// Command and subcommand names, configuration keys, identifiers, rules.
     pub(crate) name: &'static str,
     /// Option and operand flags.
     pub(crate) flag: &'static str,
     /// Section headers (`Usage:`, `Options:`, `env:`, …).
     pub(crate) head: &'static str,
+    /// A success status (`[ ok ]`, `ALLOWED`).
+    pub(crate) ok: &'static str,
+    /// A warning status (`[warn]`).
+    pub(crate) warn: &'static str,
+    /// A failure status (`[FAIL]`, `DENIED`, a not-runnable note).
+    pub(crate) err: &'static str,
+    /// De-emphasized prose — secondary detail lines, never an identifier.
+    pub(crate) dim: &'static str,
     pub(crate) reset: &'static str,
 }
 
 impl Palette {
-    /// The active ANSI styling — names in bold cyan, flags in bold green, headers in bold.
+    /// The active ANSI styling — names in bold cyan, flags in bold green, headers in bold, and
+    /// the conventional status hues (green ok, yellow warn, red fail) with dim secondary text.
     pub(crate) fn colored() -> Self {
         Palette {
             name: "\x1b[1;36m",
             flag: "\x1b[1;32m",
             head: "\x1b[1m",
+            ok: "\x1b[32m",
+            warn: "\x1b[33m",
+            err: "\x1b[1;31m",
+            dim: "\x1b[2m",
             reset: "\x1b[0m",
         }
     }
@@ -33,6 +46,10 @@ impl Palette {
             name: "",
             flag: "",
             head: "",
+            ok: "",
+            warn: "",
+            err: "",
+            dim: "",
             reset: "",
         }
     }
@@ -49,5 +66,38 @@ impl Palette {
         } else {
             Self::plain()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Palette;
+
+    #[test]
+    fn plain_spans_are_all_empty_so_captured_output_is_byte_for_byte_plain() {
+        let p = Palette::plain();
+        for span in [p.name, p.flag, p.head, p.ok, p.warn, p.err, p.dim, p.reset] {
+            assert!(span.is_empty(), "a plain span must be empty");
+        }
+    }
+
+    #[test]
+    fn colored_spans_are_all_non_empty_escapes_with_a_reset() {
+        let p = Palette::colored();
+        for span in [p.name, p.flag, p.head, p.ok, p.warn, p.err, p.dim] {
+            assert!(
+                span.starts_with('\x1b'),
+                "a colored span must be an ANSI escape"
+            );
+        }
+        assert_eq!(p.reset, "\x1b[0m", "reset must clear styling");
+    }
+
+    #[test]
+    fn a_non_terminal_is_never_colored() {
+        // The load-bearing invariant: a captured (non-terminal) stream is plain, so every
+        // `.output()` test asserts byte-identical plain text regardless of the host's $TERM.
+        let p = Palette::for_stream(false);
+        assert!(p.name.is_empty() && p.reset.is_empty());
     }
 }

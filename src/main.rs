@@ -130,8 +130,25 @@ namespaces (not a setuid helper) and review the messages above";
 /// Report the runtime prerequisites and fail hard if a load-bearing one is
 /// missing. Each failing check contributes its own remediation hint, so the
 /// summary never points at the wrong cause.
+/// A colored `[ ok ]` status tag (green when the stream is a terminal, plain otherwise).
+fn tag_ok(p: &style::Palette) -> String {
+    format!("{}[ ok ]{}", p.ok, p.reset)
+}
+
+/// A colored `[warn]` status tag (yellow when colored).
+fn tag_warn(p: &style::Palette) -> String {
+    format!("{}[warn]{}", p.warn, p.reset)
+}
+
+/// A colored `[FAIL]` status tag (bold red when colored).
+fn tag_fail(p: &style::Palette) -> String {
+    format!("{}[FAIL]{}", p.err, p.reset)
+}
+
 fn doctor() -> ExitCode {
-    println!("ops doctor — runtime preflight\n");
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, r) = (pal.head, pal.reset);
+    println!("{h}ops doctor{r} — runtime preflight\n");
 
     let mut remediation: Vec<&str> = Vec::new();
 
@@ -139,9 +156,9 @@ fn doctor() -> ExitCode {
     // boundary be proven by a real launch rather than a stand-in.
     let bwrap = pathfind::find_on_path("bwrap");
     match &bwrap {
-        Some(p) => println!("  [ ok ] bubblewrap        {}", p.display()),
+        Some(p) => println!("  {} bubblewrap        {}", tag_ok(&pal), p.display()),
         None => {
-            println!("  [FAIL] bubblewrap        not found on PATH");
+            println!("  {} bubblewrap        not found on PATH", tag_fail(&pal));
             remediation.push("install bubblewrap (the sandbox engine)");
         }
     }
@@ -153,26 +170,32 @@ fn doctor() -> ExitCode {
     // namespaces on a cap-stripped one. The `unshare` stand-in survives only to
     // classify a failure (and as the fast gate the launch path uses). The
     // sysctls below are advisory context for the remediation hint.
-    report_security_boundary(bwrap.as_deref(), &mut remediation);
+    report_security_boundary(&pal, bwrap.as_deref(), &mut remediation);
     if let Some(v) = read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
-        println!("         · kernel.apparmor_restrict_unprivileged_userns = {v}");
+        println!(
+            "         {dim}· kernel.apparmor_restrict_unprivileged_userns = {v}{r}",
+            dim = pal.dim
+        );
     }
     if let Some(v) = read_sysctl("/proc/sys/kernel/unprivileged_userns_clone") {
-        println!("         · kernel.unprivileged_userns_clone = {v}");
+        println!(
+            "         {dim}· kernel.unprivileged_userns_clone = {v}{r}",
+            dim = pal.dim
+        );
     }
-    report_resource_limits();
+    report_resource_limits(&pal);
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, ops cannot provision a project's tools.
     match store::resolve_nix() {
         Some(nix) => {
-            println!("  [ ok ] nix               {}", nix.display());
+            println!("  {} nix               {}", tag_ok(&pal), nix.display());
             if let Some(v) = nix_version(&nix) {
-                println!("         · {v}");
+                println!("         {dim}· {v}{r}", dim = pal.dim);
             }
         }
         None => {
-            println!("  [FAIL] nix               not found on PATH");
+            println!("  {} nix               not found on PATH", tag_fail(&pal));
             remediation.push("install nix (the store engine ops drives daemonlessly)");
         }
     }
@@ -181,9 +204,10 @@ fn doctor() -> ExitCode {
     // path — a sandbox runs without it — so its absence is a feature gap reported for
     // context, never a boundary failure that blocks `ops run`.
     match store::resolve_git() {
-        Some(git) => println!("  [ ok ] git               {}", git.display()),
+        Some(git) => println!("  {} git               {}", tag_ok(&pal), git.display()),
         None => println!(
-            "  [warn] git               not found on PATH — needed only for `ops plugins store`"
+            "  {} git               not found on PATH — needed only for `ops plugins store`",
+            tag_warn(&pal)
         ),
     }
 
@@ -200,20 +224,34 @@ fn doctor() -> ExitCode {
             } else {
                 "absent — created on first use"
             };
-            println!("  [ ok ] store             {} ({state})", dir.display());
+            println!(
+                "  {} store             {} ({state})",
+                tag_ok(&pal),
+                dir.display()
+            );
             match store::read_global_lock(&layout) {
                 Some((source, rev)) => println!(
-                    "  [ ok ] channel           {source} @ {} (locked)",
+                    "  {} channel           {source} @ {} (locked)",
+                    tag_ok(&pal),
                     short_rev(&rev)
                 ),
                 None => {
-                    println!("  [ ok ] channel           not yet resolved — seeded on first launch")
+                    println!(
+                        "  {} channel           not yet resolved — seeded on first launch",
+                        tag_ok(&pal)
+                    )
                 }
             }
         }
         None => {
-            println!("  [warn] store             unresolved (no $HOME or $XDG_DATA_HOME)");
-            println!("  [warn] channel           unresolved (no data directory)");
+            println!(
+                "  {} store             unresolved (no $HOME or $XDG_DATA_HOME)",
+                tag_warn(&pal)
+            );
+            println!(
+                "  {} channel           unresolved (no data directory)",
+                tag_warn(&pal)
+            );
         }
     }
 
@@ -222,9 +260,13 @@ fn doctor() -> ExitCode {
         println!("ops: prerequisites OK.");
         ExitCode::SUCCESS
     } else {
-        eprintln!("ops: missing prerequisite(s) — ops CANNOT run until these are resolved:");
+        let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
+        eprintln!(
+            "{}ops: missing prerequisite(s) — ops CANNOT run until these are resolved:{}",
+            epal.err, epal.reset
+        );
         for hint in remediation {
-            eprintln!("       • {hint}");
+            eprintln!("       {}•{} {hint}", epal.err, epal.reset);
         }
         ExitCode::FAILURE
     }
@@ -235,15 +277,16 @@ fn doctor() -> ExitCode {
 /// still runs, so an unavailable limiter is reported for context and never
 /// recorded as a missing prerequisite. The probe launches a real transient scope,
 /// so a green line means limiting actually works on this host.
-fn report_resource_limits() {
+fn report_resource_limits(pal: &style::Palette) {
     let report: sandbox::LimitReport = sandbox::resource_limits();
     if report.verified {
         println!(
-            "  [ ok ] resource limits   cage capped via a systemd scope ({})",
+            "  {} resource limits   cage capped via a systemd scope ({})",
+            tag_ok(pal),
             report.properties.join(", ")
         );
     } else if let Some(note) = report.note {
-        println!("  [warn] resource limits   {note}");
+        println!("  {} resource limits   {note}", tag_warn(pal));
     }
 }
 
@@ -251,36 +294,48 @@ fn report_resource_limits() {
 /// decides the green path and the `unshare` stand-in does not run at all. On
 /// failure — or when there is no engine to launch — the stand-in classifies the
 /// cause so the report blames the right layer and never the wrong one.
-fn report_security_boundary(bwrap: Option<&Path>, remediation: &mut Vec<&'static str>) {
+fn report_security_boundary(
+    pal: &style::Palette,
+    bwrap: Option<&Path>,
+    remediation: &mut Vec<&'static str>,
+) {
+    let (dim, r) = (pal.dim, pal.reset);
     let Some(bwrap) = bwrap else {
         // No engine to launch: the stand-in is the only available signal for the
         // boundary. Report it for context (the missing-engine remediation is
         // already recorded), and still flag a broken namespace as its own fault.
         match probe_userns() {
             Userns::Ok => println!(
-                "         · user namespaces: capability-bearing (cannot prove without bubblewrap)"
+                "         {dim}· user namespaces: capability-bearing (cannot prove without bubblewrap){r}"
             ),
-            other => classify_namespace_failure(other, remediation),
+            other => classify_namespace_failure(pal, other, remediation),
         }
         return;
     };
 
     match sandbox::smoke(bwrap) {
         Ok(report) if report.is_hardened() => {
-            println!("  [ ok ] sandbox           bubblewrap launched a hardened process");
-            println!("         · user namespaces: capability-bearing — proven by the launch");
-            println!("         · no_new_privs set, every capability dropped");
+            println!(
+                "  {} sandbox           bubblewrap launched a hardened process",
+                tag_ok(pal)
+            );
+            println!(
+                "         {dim}· user namespaces: capability-bearing — proven by the launch{r}"
+            );
+            println!("         {dim}· no_new_privs set, every capability dropped{r}");
             if report.host_home_absent {
-                println!("         · host $HOME absent — the bind layout did not leak it");
+                println!("         {dim}· host $HOME absent — the bind layout did not leak it{r}");
             } else {
-                println!("         · note: the host $HOME was visible inside the probe sandbox");
+                println!(
+                    "         {dim}· note: the host $HOME was visible inside the probe sandbox{r}"
+                );
             }
         }
-        Ok(report) => classify_launch_failure(Some(&report.stderr), remediation),
+        Ok(report) => classify_launch_failure(pal, Some(&report.stderr), remediation),
         Err(e) => {
             // The probe could not even spawn bwrap; surface why, then classify.
-            println!("         · could not run the launch probe: {e}");
-            classify_launch_failure(None, remediation);
+            println!("         {dim}· could not run the launch probe: {e}{r}");
+            classify_launch_failure(pal, None, remediation);
         }
     }
 }
@@ -288,11 +343,19 @@ fn report_security_boundary(bwrap: Option<&Path>, remediation: &mut Vec<&'static
 /// A real launch did not yield a hardened process. A capability-bearing namespace
 /// means the engine itself failed, so blame bubblewrap and surface its own
 /// diagnosis; otherwise the namespace is the cause and is classified as such.
-fn classify_launch_failure(bwrap_stderr: Option<&str>, remediation: &mut Vec<&'static str>) {
+fn classify_launch_failure(
+    pal: &style::Palette,
+    bwrap_stderr: Option<&str>,
+    remediation: &mut Vec<&'static str>,
+) {
+    let (dim, r) = (pal.dim, pal.reset);
     match probe_userns() {
         Userns::Ok => {
-            println!("  [FAIL] sandbox           bubblewrap could not launch a hardened process");
-            println!("         · user namespaces: capability-bearing (the failure is in bubblewrap, not the namespace)");
+            println!(
+                "  {} sandbox           bubblewrap could not launch a hardened process",
+                tag_fail(pal)
+            );
+            println!("         {dim}· user namespaces: capability-bearing (the failure is in bubblewrap, not the namespace){r}");
             for line in bwrap_stderr
                 .unwrap_or_default()
                 .lines()
@@ -300,11 +363,11 @@ fn classify_launch_failure(bwrap_stderr: Option<&str>, remediation: &mut Vec<&'s
                 .filter(|l| !l.is_empty())
                 .take(3)
             {
-                println!("         · {line}");
+                println!("         {dim}· {line}{r}");
             }
             remediation.push(BWRAP_LAUNCH_REMEDIATION);
         }
-        other => classify_namespace_failure(other, remediation),
+        other => classify_namespace_failure(pal, other, remediation),
     }
 }
 
@@ -312,19 +375,24 @@ fn classify_launch_failure(bwrap_stderr: Option<&str>, remediation: &mut Vec<&'s
 /// distinguishing outright absence from the capability-stripped case so the
 /// remediation points at the real cause. The caller has already established the
 /// namespace is not `Ok`.
-fn classify_namespace_failure(userns: Userns, remediation: &mut Vec<&'static str>) {
+fn classify_namespace_failure(
+    pal: &style::Palette,
+    userns: Userns,
+    remediation: &mut Vec<&'static str>,
+) {
+    let fail = tag_fail(pal);
     match userns {
         Userns::Unsupported => {
-            println!("  [FAIL] user namespaces   cannot create one without privilege");
+            println!("  {fail} user namespaces   cannot create one without privilege");
         }
         Userns::CapStripped => {
             println!(
-                "  [FAIL] user namespaces   created but stripped of capabilities (restricted)"
+                "  {fail} user namespaces   created but stripped of capabilities (restricted)"
             );
         }
         // The caller only reaches here with a non-`Ok` namespace; a transient
         // flip to `Ok` is still a failure to launch, so it is flagged, not hidden.
-        Userns::Ok => println!("  [FAIL] user namespaces   transient namespace probe failure"),
+        Userns::Ok => println!("  {fail} user namespaces   transient namespace probe failure"),
     }
     remediation.push(USERNS_REMEDIATION);
 }
