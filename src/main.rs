@@ -1619,14 +1619,18 @@ fn app_list() -> ExitCode {
         }
     }
     names.sort();
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     if names.is_empty() {
-        println!("no imported app profiles (import one with: ops app import <file>)");
+        println!("{dim}no imported app profiles (import one with: ops app import <file>){r}");
     } else {
-        println!("imported app profiles (in {}):", dir.display());
-        for n in &names {
-            println!("  {n}");
+        println!("{h}imported app profiles{r} (in {n}{}{r}):", dir.display());
+        for name in &names {
+            println!("  {n}{name}{r}");
         }
-        println!("(remove one with: ops app rm <name>; see all resolved apps with: ops config)");
+        println!(
+            "{dim}(remove one with: ops app rm <name>; see all resolved apps with: ops config show){r}"
+        );
     }
     ExitCode::SUCCESS
 }
@@ -2518,13 +2522,14 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // `[packages]` (in-cage, trusted-only). Rolling them as separate, unconditional calls keeps
     // the engine's trust-independence structural rather than dependent on an earlier path not
     // early-returning.
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut ok = true;
     if matches!(what, "nix" | "all") {
-        ok &= upgrade_nix_channel(&nix, &layout, &cwd, &cfg);
+        ok &= upgrade_nix_channel(&nix, &layout, &cwd, &cfg, &pal);
     }
     if matches!(what, "mise" | "all") {
-        ok &= upgrade_mise_engine(&nix, &layout, &cfg);
-        ok &= upgrade_mise_tools(&nix, &layout, &cwd, &cfg);
+        ok &= upgrade_mise_engine(&nix, &layout, &cfg, &pal);
+        ok &= upgrade_mise_tools(&nix, &layout, &cwd, &cfg, &pal);
         // The project's and apps' `mise:` `[packages]` are equipped in-cage, not host-side, so
         // their roll runs `mise upgrade` inside a cage (per home) rather than rewriting a lock.
         // Pass the already-loaded config: the groups are computed from it before any sandbox
@@ -2535,7 +2540,7 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the
         // per-project flake lock is rewritten — a host-side lock rewrite (the new pin builds
         // in-cage at the next launch), like the `nix:` tools.
-        ok &= upgrade_flake_packages(&nix, &layout, &cwd, &cfg);
+        ok &= upgrade_flake_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
     if ok {
         ExitCode::SUCCESS
@@ -2561,7 +2566,8 @@ fn gc_cmd(args: Vec<OsString>) -> ExitCode {
             }
         }
     }
-    sandbox::gc(prune, all)
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    sandbox::gc(prune, all, &pal)
 }
 
 /// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else
@@ -2572,6 +2578,7 @@ fn upgrade_nix_channel(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    pal: &style::Palette,
 ) -> bool {
     let target = match sandbox::effective_lock_target(cwd, layout, cfg) {
         Ok(t) => t,
@@ -2593,6 +2600,7 @@ fn upgrade_nix_channel(
         "the new base and tools download",
         target.origin().label(),
         &upgrade,
+        pal,
     ) {
         println!("{line}");
     }
@@ -2605,7 +2613,12 @@ fn upgrade_nix_channel(
 /// present in every cage, so it rolls regardless of any project's trust — unlike the
 /// project's `nix:` tools. Returns whether it succeeded; the new engine is provisioned
 /// on the next launch.
-fn upgrade_mise_engine(nix: &Path, layout: &store::Layout, cfg: &config::Resolved) -> bool {
+fn upgrade_mise_engine(
+    nix: &Path,
+    layout: &store::Layout,
+    cfg: &config::Resolved,
+    pal: &style::Palette,
+) -> bool {
     let target = store::LockTarget::engine(layout, cfg.nixpkgs_global.as_deref());
     let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
@@ -2620,6 +2633,7 @@ fn upgrade_mise_engine(nix: &Path, layout: &store::Layout, cfg: &config::Resolve
         "the new engine is provisioned",
         target.origin().label(),
         &upgrade,
+        pal,
     ) {
         println!("{line}");
     }
@@ -2636,9 +2650,10 @@ fn upgrade_mise_tools(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    pal: &style::Palette,
 ) -> bool {
     let Some(mise) = &cfg.mise else {
-        for line in upgrade_tools_summary(&[]) {
+        for line in upgrade_tools_summary(&[], pal) {
             println!("{line}");
         }
         return true;
@@ -2659,7 +2674,7 @@ fn upgrade_mise_tools(
                 return false;
             }
         };
-    for line in upgrade_tools_summary(&outcomes) {
+    for line in upgrade_tools_summary(&outcomes, pal) {
         println!("{line}");
     }
     !outcomes
@@ -2670,35 +2685,46 @@ fn upgrade_mise_tools(
 /// The human-readable summary of a mise tools roll: one line per declared tool (rolled,
 /// unchanged, newly pinned, or failed), the entries pruned, and any token ops does not
 /// handle. Pure, so every outcome is unit-tested without invoking nix.
-fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade]) -> Vec<String> {
+fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette) -> Vec<String> {
     use sandbox::ToolUpgrade::*;
-    let mut lines = vec!["ops upgrade — mise tools".to_string()];
+    let (h, n, ok, warn, err, dim, r) = (
+        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
+    );
+    let mut lines = vec![format!("{h}ops upgrade — mise tools{r}")];
     if outcomes.is_empty() {
-        lines.push("  no nix: tools to roll.".to_string());
+        lines.push(format!("  {dim}no nix: tools to roll.{r}"));
         return lines;
     }
     for outcome in outcomes {
         lines.push(match outcome {
-            Unchanged { pkg, version, .. } => format!("  nix:{pkg}: {version} — unchanged."),
-            Rolled { pkg, from, to, .. } => format!("  nix:{pkg}: {from} → {to} — rolled forward."),
-            Pinned { pkg, version, .. } => format!("  nix:{pkg}: {version} — newly pinned."),
+            Unchanged { pkg, version, .. } => {
+                format!("  {n}nix:{pkg}{r}: {n}{version}{r} — {dim}unchanged.{r}")
+            }
+            Rolled { pkg, from, to, .. } => {
+                format!("  {n}nix:{pkg}{r}: {n}{from}{r} → {n}{to}{r} — {ok}rolled forward.{r}")
+            }
+            Pinned { pkg, version, .. } => {
+                format!("  {n}nix:{pkg}{r}: {n}{version}{r} — {ok}newly pinned.{r}")
+            }
             Failed {
                 pkg, error, kept, ..
             } => match kept {
-                Some(v) => format!("  nix:{pkg}: re-resolve failed, kept {v} — {error}"),
-                None => format!("  nix:{pkg}: re-resolve failed — {error}"),
+                Some(v) => format!(
+                    "  {n}nix:{pkg}{r}: {err}re-resolve failed{r}, kept {n}{v}{r} — {error}"
+                ),
+                None => format!("  {n}nix:{pkg}{r}: {err}re-resolve failed{r} — {error}"),
             },
-            Pruned { pkg, request } => {
-                format!("  nix:{pkg} ({request}): removed from the lock (no longer declared).")
-            }
+            Pruned { pkg, request } => format!(
+                "  {n}nix:{pkg}{r} ({request}): {dim}removed from the lock (no longer declared).{r}"
+            ),
             Ignored {
                 token,
                 mise_managed,
             } => {
                 if *mise_managed {
-                    format!("  {token}: equipped in-cage by mise — not rolled here.")
+                    format!("  {n}{token}{r}: {dim}equipped in-cage by mise — not rolled here.{r}")
                 } else {
-                    format!("  {token}: malformed nix: token — cannot resolve.")
+                    format!("  {n}{token}{r}: {warn}malformed nix: token{r} — cannot resolve.")
                 }
             }
         });
@@ -2717,6 +2743,7 @@ fn upgrade_flake_packages(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    pal: &style::Palette,
 ) -> bool {
     let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg) {
         Ok(o) => o,
@@ -2725,7 +2752,7 @@ fn upgrade_flake_packages(
             return false;
         }
     };
-    for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg)) {
+    for line in flake_upgrade_summary(&outcomes, sandbox::withheld_flake_packages(cfg), pal) {
         println!("{line}");
     }
     !outcomes
@@ -2737,52 +2764,63 @@ fn upgrade_flake_packages(
 /// rolled, unchanged, or failed) plus the entries pruned, and a note for any reference withheld
 /// for being untrusted (so an untrusted project does not read as "none declared" — parity with
 /// the `nix:` tools path). Pure, so every outcome is unit-tested without invoking nix.
-fn flake_upgrade_summary(outcomes: &[sandbox::FlakeUpgrade], withheld: usize) -> Vec<String> {
+fn flake_upgrade_summary(
+    outcomes: &[sandbox::FlakeUpgrade],
+    withheld: usize,
+    pal: &style::Palette,
+) -> Vec<String> {
     use sandbox::FlakeUpgrade::*;
-    let mut lines = vec!["ops upgrade — flake packages".to_string()];
+    let (h, n, ok, warn, err, dim, r) = (
+        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
+    );
+    let mut lines = vec![format!("{h}ops upgrade — flake packages{r}")];
     let withheld_note = || {
         format!(
-            "  {withheld} flake: package(s) withheld (untrusted) — not rolled; run `ops trust`."
+            "  {warn}{withheld} flake: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
         )
     };
     if outcomes.is_empty() {
         lines.push(if withheld > 0 {
             withheld_note()
         } else {
-            "  no flake: packages to roll.".to_string()
+            format!("  {dim}no flake: packages to roll.{r}")
         });
         return lines;
     }
     for outcome in outcomes {
         lines.push(match outcome {
-            Unchanged { reference, rev } => {
-                format!("  flake:{reference}: {} — unchanged.", short_rev(rev))
-            }
+            Unchanged { reference, rev } => format!(
+                "  {n}flake:{reference}{r}: {n}{}{r} — {dim}unchanged.{r}",
+                short_rev(rev)
+            ),
             Rolled {
                 reference,
                 from,
                 to,
             } => format!(
-                "  flake:{reference}: {} → {} — rolled forward.",
+                "  {n}flake:{reference}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
                 short_rev(from),
                 short_rev(to)
             ),
-            Pinned { reference, rev } => {
-                format!("  flake:{reference}: {} — newly pinned.", short_rev(rev))
-            }
-            Pruned { reference } => {
-                format!("  flake:{reference}: removed from the lock (no longer declared).")
-            }
+            Pinned { reference, rev } => format!(
+                "  {n}flake:{reference}{r}: {n}{}{r} — {ok}newly pinned.{r}",
+                short_rev(rev)
+            ),
+            Pruned { reference } => format!(
+                "  {n}flake:{reference}{r}: {dim}removed from the lock (no longer declared).{r}"
+            ),
             Failed {
                 reference,
                 error,
                 kept,
             } => match kept {
                 Some(rev) => format!(
-                    "  flake:{reference}: re-resolve failed, kept {} — {error}",
+                    "  {n}flake:{reference}{r}: {err}re-resolve failed{r}, kept {n}{}{r} — {error}",
                     short_rev(rev)
                 ),
-                None => format!("  flake:{reference}: re-resolve failed — {error}"),
+                None => {
+                    format!("  {n}flake:{reference}{r}: {err}re-resolve failed{r} — {error}")
+                }
             },
         });
     }
@@ -2803,26 +2841,28 @@ fn channel_upgrade_summary(
     downloads: &str,
     origin: &str,
     up: &store::Upgrade,
+    pal: &style::Palette,
 ) -> Vec<String> {
+    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
     let mut lines = vec![
-        heading.to_string(),
-        format!("  {item}: {}  ({origin})", up.source),
+        format!("{h}{heading}{r}"),
+        format!("  {item}: {n}{}{r}  ({dim}{origin}{r})", up.source),
     ];
     let outcome = match &up.previous {
         None => format!(
-            "  resolved to {} (first pin) — {downloads} on the next launch.",
+            "  resolved to {n}{}{r} {ok}(first pin){r} — {downloads} on the next launch.",
             short_rev(&up.revision)
         ),
         Some(prev) if prev == &up.revision && store::is_pinned_revision(&up.source) => format!(
-            "  pinned to a fixed revision {} — nothing to roll.",
+            "  pinned to a fixed revision {n}{}{r} — {dim}nothing to roll.{r}",
             short_rev(&up.revision)
         ),
         Some(prev) if prev == &up.revision => format!(
-            "  already at the latest revision {} — nothing to do.",
+            "  already at the latest revision {n}{}{r} — {dim}nothing to do.{r}",
             short_rev(&up.revision)
         ),
         Some(prev) => format!(
-            "  rolled forward {} → {} — {downloads} on the next launch.",
+            "  {ok}rolled forward{r} {n}{}{r} → {n}{}{r} — {downloads} on the next launch.",
             short_rev(prev),
             short_rev(&up.revision)
         ),
@@ -3081,6 +3121,7 @@ mod tests {
                 "the new base and tools download",
                 "default",
                 &up,
+                &style::Palette::plain(),
             )
             .join("\n")
         };
@@ -3131,12 +3172,32 @@ mod tests {
                 previous: Some(rev.into()),
                 revision: newer.into(),
             },
+            &style::Palette::plain(),
         )
         .join("\n");
         assert!(engine.contains("mise engine"));
         assert!(engine.contains("engine: nixos-unstable"));
         assert!(engine.contains("the new engine is provisioned"));
         assert!(!engine.contains("base and tools"));
+
+        // Colored: the heading rides the head span and the roll-forward outcome the ok span,
+        // each closed by a reset — the feature a captured (plain) stream never exercises.
+        let p = style::Palette::colored();
+        let colored = channel_upgrade_summary(
+            "ops upgrade — nix channel",
+            "channel",
+            "the new base and tools download",
+            "default",
+            &store::Upgrade {
+                source: "nixos-unstable".into(),
+                previous: Some(rev.into()),
+                revision: newer.into(),
+            },
+            &p,
+        )
+        .join("\n");
+        assert!(colored.contains(&format!("{}ops upgrade — nix channel{}", p.head, p.reset)));
+        assert!(colored.contains(&format!("{}rolled forward{}", p.ok, p.reset)));
     }
 
     #[test]
@@ -3172,17 +3233,29 @@ mod tests {
         let engine_lock = layout.data_dir().join("mise-engine.lock");
 
         // seed both locks at REV_A (same global override, so each resolves REV_A with no nix)
-        assert!(upgrade_mise_engine(bogus_nix, &layout, &cfg(&rev_a)));
+        let plain = style::Palette::plain();
+        assert!(upgrade_mise_engine(
+            bogus_nix,
+            &layout,
+            &cfg(&rev_a),
+            &plain
+        ));
         assert!(upgrade_nix_channel(
             bogus_nix,
             &layout,
             data.path(),
-            &cfg(&rev_a)
+            &cfg(&rev_a),
+            &plain
         ));
         let nix_seed = std::fs::read(&nix_lock).unwrap();
 
         // roll ONLY the engine to REV_B: the base lock is untouched, the engine advanced
-        assert!(upgrade_mise_engine(bogus_nix, &layout, &cfg(&rev_b)));
+        assert!(upgrade_mise_engine(
+            bogus_nix,
+            &layout,
+            &cfg(&rev_b),
+            &plain
+        ));
         assert_eq!(
             std::fs::read(&nix_lock).unwrap(),
             nix_seed,
@@ -3197,13 +3270,19 @@ mod tests {
 
         // re-seed the engine at REV_A, then roll ONLY the base to REV_B: now the engine
         // lock is untouched and the base advanced
-        assert!(upgrade_mise_engine(bogus_nix, &layout, &cfg(&rev_a)));
+        assert!(upgrade_mise_engine(
+            bogus_nix,
+            &layout,
+            &cfg(&rev_a),
+            &plain
+        ));
         let engine_reseed = std::fs::read(&engine_lock).unwrap();
         assert!(upgrade_nix_channel(
             bogus_nix,
             &layout,
             data.path(),
-            &cfg(&rev_b)
+            &cfg(&rev_b),
+            &plain
         ));
         assert_eq!(
             std::fs::read(&engine_lock).unwrap(),
@@ -3221,51 +3300,54 @@ mod tests {
         use sandbox::ToolUpgrade::*;
 
         // an empty roll (no nix: tools, or no mise file) says so plainly
-        let empty = upgrade_tools_summary(&[]).join("\n");
+        let empty = upgrade_tools_summary(&[], &style::Palette::plain()).join("\n");
         assert!(empty.contains("no nix: tools"));
 
-        let text = upgrade_tools_summary(&[
-            Unchanged {
-                pkg: "jq".into(),
-                request: "1.7.1".into(),
-                version: "1.7.1".into(),
-            },
-            Rolled {
-                pkg: "ripgrep".into(),
-                request: "latest".into(),
-                from: "14.1.0".into(),
-                to: "14.1.1".into(),
-            },
-            Pinned {
-                pkg: "nodejs".into(),
-                request: "20".into(),
-                version: "20.11.0".into(),
-            },
-            Failed {
-                pkg: "fd".into(),
-                request: "latest".into(),
-                error: "nixhub unreachable".into(),
-                kept: Some("9.0.0".into()),
-            },
-            Failed {
-                pkg: "bat".into(),
-                request: "latest".into(),
-                error: "nixhub unreachable".into(),
-                kept: None,
-            },
-            Pruned {
-                pkg: "oldtool".into(),
-                request: "1.0".into(),
-            },
-            Ignored {
-                token: "node".into(),
-                mise_managed: true,
-            },
-            Ignored {
-                token: "nix:bad name".into(),
-                mise_managed: false,
-            },
-        ])
+        let text = upgrade_tools_summary(
+            &[
+                Unchanged {
+                    pkg: "jq".into(),
+                    request: "1.7.1".into(),
+                    version: "1.7.1".into(),
+                },
+                Rolled {
+                    pkg: "ripgrep".into(),
+                    request: "latest".into(),
+                    from: "14.1.0".into(),
+                    to: "14.1.1".into(),
+                },
+                Pinned {
+                    pkg: "nodejs".into(),
+                    request: "20".into(),
+                    version: "20.11.0".into(),
+                },
+                Failed {
+                    pkg: "fd".into(),
+                    request: "latest".into(),
+                    error: "nixhub unreachable".into(),
+                    kept: Some("9.0.0".into()),
+                },
+                Failed {
+                    pkg: "bat".into(),
+                    request: "latest".into(),
+                    error: "nixhub unreachable".into(),
+                    kept: None,
+                },
+                Pruned {
+                    pkg: "oldtool".into(),
+                    request: "1.0".into(),
+                },
+                Ignored {
+                    token: "node".into(),
+                    mise_managed: true,
+                },
+                Ignored {
+                    token: "nix:bad name".into(),
+                    mise_managed: false,
+                },
+            ],
+            &style::Palette::plain(),
+        )
         .join("\n");
 
         assert!(text.contains("nix:jq: 1.7.1 — unchanged"));
@@ -3276,6 +3358,21 @@ mod tests {
         assert!(text.contains("nix:oldtool (1.0): removed from the lock"));
         assert!(text.contains("node: equipped in-cage by mise — not rolled here"));
         assert!(text.contains("nix:bad name: malformed nix: token — cannot resolve"));
+
+        // Colored: the package identifier rides the name span and the failure rides err.
+        let p = style::Palette::colored();
+        let colored = upgrade_tools_summary(
+            &[Failed {
+                pkg: "fd".into(),
+                request: "latest".into(),
+                error: "nixhub unreachable".into(),
+                kept: None,
+            }],
+            &p,
+        )
+        .join("\n");
+        assert!(colored.contains(&format!("{}nix:fd{}", p.name, p.reset)));
+        assert!(colored.contains(&format!("{}re-resolve failed{}", p.err, p.reset)));
     }
 
     #[test]
@@ -3283,11 +3380,11 @@ mod tests {
         use sandbox::FlakeUpgrade::*;
 
         // an empty roll (no flake: packages) says so plainly
-        let empty = flake_upgrade_summary(&[], 0).join("\n");
+        let empty = flake_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
         assert!(empty.contains("no flake: packages"));
 
         // an empty roll on an untrusted project names the withheld package instead of "none"
-        let withheld = flake_upgrade_summary(&[], 2).join("\n");
+        let withheld = flake_upgrade_summary(&[], 2, &style::Palette::plain()).join("\n");
         assert!(withheld.contains("2 flake: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no flake: packages"));
 
@@ -3323,6 +3420,7 @@ mod tests {
                 },
             ],
             0,
+            &style::Palette::plain(),
         )
         .join("\n");
 
@@ -3333,5 +3431,23 @@ mod tests {
         assert!(text.contains("flake:github:o/old#x: removed from the lock"));
         assert!(text.contains("flake:github:o/d#default: re-resolve failed, kept 11707dc"));
         assert!(text.contains("flake:github:o/e#default: re-resolve failed — metadata unreachable"));
+
+        // Colored: the reference rides the name span and the withheld note rides warn.
+        let p = style::Palette::colored();
+        let colored = flake_upgrade_summary(
+            &[Pinned {
+                reference: "github:o/c".into(),
+                rev: rev_b.into(),
+            }],
+            2,
+            &p,
+        )
+        .join("\n");
+        assert!(colored.contains(&format!("{}flake:github:o/c{}", p.name, p.reset)));
+        assert!(colored.contains(&format!("{}newly pinned.{}", p.ok, p.reset)));
+        assert!(colored.contains(&format!(
+            "{}2 flake: package(s) withheld (untrusted){}",
+            p.warn, p.reset
+        )));
     }
 }

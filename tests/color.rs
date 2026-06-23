@@ -68,6 +68,7 @@ fn captured_output_carries_no_ansi_escapes() {
         // too must be plain.
         &["config"],
         &["ls"],
+        &["app", "list"],
         &["plugins", "list"],
         &["plugins", "store", "list"],
         &["test", "net", "https://example.com/x"],

@@ -651,20 +651,20 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
 /// current-project sweep needs — so `ops gc --all` reclaims even from a directory that is not a
 /// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
 /// the destructive form.
-pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
+pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCode {
     if all {
         match crate::store::Layout::from_env() {
             Some(layout) => {
-                let live_ids = session_housekeeping(&layout);
-                reap_dead_trees(&layout, &live_ids, prune);
-                shared_store_gc(&layout, prune);
+                let live_ids = session_housekeeping(&layout, pal);
+                reap_dead_trees(&layout, &live_ids, prune, pal);
+                shared_store_gc(&layout, prune, pal);
             }
             None => eprintln!(
                 "ops gc: cannot locate ops's data directory; skipping the cross-project housekeeping."
             ),
         }
     }
-    match sweep_current(prune) {
+    match sweep_current(prune, pal) {
         Ok(()) => ExitCode::SUCCESS,
         // Under `--all` the reap above already ran, so a current-project sweep that could not run
         // (the host cannot sandbox, nix is unavailable) — or that hit an error — must not fail the
@@ -683,12 +683,19 @@ pub(crate) fn gc(prune: bool, all: bool) -> ExitCode {
 /// an `ops run` record with no post-exec hook lingered until the next `ops ls`). Returns the ids of
 /// projects with a *live* session — hashing each recorded canonical path — so the dead-tree reap
 /// can skip a tree a session still holds without scanning the registry a second time.
-fn session_housekeeping(layout: &crate::store::Layout) -> std::collections::BTreeSet<String> {
+fn session_housekeeping(
+    layout: &crate::store::Layout,
+    pal: &crate::style::Palette,
+) -> std::collections::BTreeSet<String> {
     match session::Registry::at(layout.data_dir()).housekeep() {
         Ok((live, pruned)) => {
             if pruned > 0 {
                 println!(
-                    "ops gc --all: pruned {pruned} stale session record(s); {} live.",
+                    "{}ops gc --all:{} pruned {}{pruned}{} stale session record(s); {} live.",
+                    pal.head,
+                    pal.reset,
+                    pal.name,
+                    pal.reset,
                     live.len()
                 );
             }
@@ -715,20 +722,27 @@ fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
     prune: bool,
+    pal: &crate::style::Palette,
 ) {
+    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
     let report = super::gc::reap_dead_projects(&projects_dir, live_ids, prune);
     if report.dead.is_empty() && report.unidentified.is_empty() {
-        println!("ops gc --all: no dead project trees to reclaim.");
+        println!("{h}ops gc --all:{r} {dim}no dead project trees to reclaim.{r}");
         return;
     }
 
     let mut freed = 0u64;
     for tree in &report.dead {
         freed += tree.bytes;
-        let verb = if prune { "reclaimed" } else { "reclaimable" };
+        // Done (green) when actually reclaimed; a dry-run "reclaimable" is dim (nothing changed).
+        let verb = if prune {
+            format!("{ok}reclaimed{r}")
+        } else {
+            format!("{dim}reclaimable{r}")
+        };
         println!(
-            "  {verb}: {} ({})",
+            "  {verb}: {n}{}{r} ({})",
             tree.path.display(),
             super::gc::human_bytes(tree.bytes)
         );
@@ -736,13 +750,13 @@ fn reap_dead_trees(
     if !report.dead.is_empty() {
         if prune {
             println!(
-                "ops gc --all: reclaimed {} dead project tree(s), freed up to {}.",
+                "{h}ops gc --all:{r} reclaimed {} dead project tree(s), freed up to {}.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
         } else {
             println!(
-                "ops gc --all: {} dead project tree(s) reclaimable (up to {}) — \
+                "{h}ops gc --all:{r} {} dead project tree(s) reclaimable (up to {}) — \
                  run `ops gc --all --prune` to reclaim.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
@@ -753,7 +767,7 @@ fn reap_dead_trees(
     // be verified and they are never auto-reclaimed — only surfaced for a manual decision.
     for tree in &report.unidentified {
         println!(
-            "  unidentified (no marker, project path unknown): {} ({}) — remove by hand if unwanted",
+            "  {warn}unidentified{r} (no marker, project path unknown): {n}{}{r} ({}) — remove by hand if unwanted",
             tree.dir.display(),
             super::gc::human_bytes(tree.bytes)
         );
@@ -778,7 +792,8 @@ fn reap_dead_trees(
 /// it is never corruption. Widening the ops lock to cover provisioning would make this collector
 /// wait behind minutes-long builds, so the narrow lock plus this named residual is the deliberate
 /// trade.
-fn shared_store_gc(layout: &crate::store::Layout, prune: bool) {
+fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
+    let (h, r) = (pal.head, pal.reset);
     let Some(nix_store) = crate::store::resolve_nix_store() else {
         eprintln!("ops gc: nix-store not found; skipping the shared-store gc.");
         return;
@@ -817,7 +832,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool) {
 
     if prune {
         println!(
-            "ops gc --all: shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
+            "{h}ops gc --all:{r} shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
             stale.len(),
             report.paths,
             super::gc::human_bytes(report.bytes)
@@ -827,7 +842,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool) {
         // yet counted as collectable; the count of stale roots is the signal, and `--prune` frees
         // their closures on top of the orphans reported here (a lower bound).
         println!(
-            "ops gc --all: shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
+            "{h}ops gc --all:{r} shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
              reclaimable now ({}). Run `ops gc --all --prune` to drop the roots and reclaim their closures.",
             stale.len(),
             report.paths,
@@ -862,7 +877,8 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool) {
 /// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`ops mise`,
 /// `nix profile`, declared `flake:` packages) — is not seen host-side and would be collected. The
 /// supported self-equip paths all root by store path, so they survive.
-fn sweep_current(prune: bool) -> Result<(), ExitCode> {
+fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let prep = prepare()?;
 
     let (id, project) = match binds::project_identity(&prep.cwd) {
@@ -878,7 +894,7 @@ fn sweep_current(prune: bool) -> Result<(), ExitCode> {
     // `ops gc --all` safe to run from any directory: a non-project cwd is skipped, never seeded.
     if !super::projectstore::store_exists(&prep.layout, &id) {
         println!(
-            "ops gc — {}: no per-project store yet, nothing to reclaim.",
+            "{h}ops gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
             project.display()
         );
         return Ok(());
@@ -927,7 +943,7 @@ fn sweep_current(prune: bool) -> Result<(), ExitCode> {
     }
     let pruned = super::gc::prune_flake_roots(&store_dir, &flake_names, prune).len();
 
-    println!("ops gc — {}", project.display());
+    println!("{h}ops gc{r} — {n}{}{r}", project.display());
     let report = match super::gc::collect(&prep.nix_store, &store_dir, prune) {
         Ok(r) => r,
         Err(e) => {
@@ -939,7 +955,9 @@ fn sweep_current(prune: bool) -> Result<(), ExitCode> {
         // The pruned roots' builds were unrooted before the sweep, so they are already counted in
         // `report.paths`; name how many removed-package builds that included.
         println!(
-            "  collected {} store path(s) ({} from removed package(s)), freed {}.",
+            "  {}collected{} {} store path(s) ({} from removed package(s)), freed {}.",
+            pal.ok,
+            r,
             report.paths,
             pruned,
             super::gc::human_bytes(report.bytes)
@@ -948,12 +966,14 @@ fn sweep_current(prune: bool) -> Result<(), ExitCode> {
         // A dry run cannot size the removed-package builds (their roots still hold them, so they are
         // not yet in the dead set), so report their count separately from the currently-dead total.
         println!(
-            "  {} store path(s) collectable now, {} would be freed — run `ops gc --prune` to reclaim.",
+            "  {dim}{} store path(s) collectable now, {} would be freed — run `ops gc --prune` to reclaim.{r}",
             report.paths,
             super::gc::human_bytes(report.bytes)
         );
         if pruned > 0 {
-            println!("  and {pruned} removed-package flake build(s) would also be reclaimed.");
+            println!(
+                "  {dim}and {pruned} removed-package flake build(s) would also be reclaimed.{r}"
+            );
         }
     }
     Ok(())
