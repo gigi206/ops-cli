@@ -27,6 +27,17 @@ pub(crate) fn note(msg: &str) {
     );
 }
 
+/// Print an already-indented continuation line for a preceding [`warn`]/[`note`] (stderr) — no
+/// prefix, but its `` `identifiers` `` highlighted like the family, so a multi-line diagnostic does
+/// not mix the family's cyan with literal backticks. The caller owns the indent (it is part of
+/// `line`), which is preserved verbatim in plain mode.
+pub(crate) fn hint(line: &str) {
+    eprintln!(
+        "{}",
+        highlight(line, &Palette::for_stream(std::io::stderr().is_terminal()))
+    );
+}
+
 /// The `ops: warning: <msg>` line. Pure, so the prefix and highlighting are unit-testable without
 /// capturing stderr.
 fn warning_line(msg: &str, pal: &Palette) -> String {
@@ -126,5 +137,21 @@ mod tests {
         let out = highlight("a `real` span then a lone ` tick", &p);
         assert!(out.contains(&format!("{}real{}", p.name, p.reset)));
         assert!(out.contains("` tick"));
+    }
+
+    #[test]
+    fn a_hint_line_keeps_its_indent_and_lifts_identifiers() {
+        // A continuation line (the `hint` body) keeps its caller-owned indent and gets the family's
+        // identifier hue, so a multi-line diagnostic is uniform rather than mixing cyan with literal
+        // backticks.
+        let plain = Palette::plain();
+        assert_eq!(
+            highlight("       run `ops trust /p`", &plain),
+            "       run `ops trust /p`"
+        );
+        let p = Palette::colored();
+        let out = highlight("       run `ops trust /p`", &p);
+        assert!(out.starts_with("       run "));
+        assert!(out.contains(&format!("{}ops trust /p{}", p.name, p.reset)));
     }
 }

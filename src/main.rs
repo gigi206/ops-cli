@@ -1316,10 +1316,10 @@ fn config_edit(args: &[OsString]) -> ExitCode {
                 "your edit re-armed the trust gate for {}",
                 path.display()
             ));
-            eprintln!(
+            diag::hint(&format!(
                 "       run `ops trust {}` to re-apply its security fields",
                 path.display()
-            );
+            ));
         }
     }
     ExitCode::SUCCESS
@@ -1355,10 +1355,10 @@ fn report_write_trust(
             "this edit re-armed the trust gate for {}",
             path.display()
         ));
-        eprintln!(
+        diag::hint(&format!(
             "       its security fields will not apply until you run `ops trust {}`",
             path.display()
-        );
+        ));
     } else if is_security_key(key) {
         diag::note(&format!(
             "`{key}` is a security field; it applies only once {} is trusted (`ops trust`)",
