@@ -16,6 +16,7 @@
 
 pub(crate) mod safety;
 mod schema;
+pub(crate) mod view;
 
 use crate::allowlist::Rule;
 use crate::plugins::PluginRegistry;

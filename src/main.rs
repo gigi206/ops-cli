@@ -17,11 +17,13 @@ mod sandbox;
 mod session;
 mod store;
 mod stores;
+mod style;
 #[cfg(test)]
 mod testutil;
 mod trust;
 
 use std::ffi::{OsStr, OsString};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -543,235 +545,232 @@ fn config_cmd() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let resolved = config::load(&cwd);
-
-    println!("ops config — resolved for {}", cwd.display());
-    if resolved.env.is_empty() {
-        println!("  env:   (none)");
-    } else {
-        println!("  env:");
-        for (k, v) in &resolved.env {
-            println!("    {k}={v}");
-        }
-    }
-    if resolved.ro_binds.is_empty() {
-        println!("  binds: (none)");
-    } else {
-        println!("  binds (read-only):");
-        for b in &resolved.ro_binds {
-            println!("    {}", b.display());
-        }
-    }
-    // Declared tools, each with its trust verdict. The launcher provisions the
-    // trusted ones onto PATH and withholds the rest; this shows that decision
-    // without realising anything (no nix, no network).
-    if resolved.packages.is_empty() {
-        println!("  packages: (none)");
-    } else {
-        println!("  packages:");
-        for p in &resolved.packages {
-            // Show the provider and how it is realised: a `nix:` package is provisioned
-            // host-side into ops's store (durable, offline-reusable); a `mise:` package is
-            // equipped in-cage globally via `mise use -g` (fetched at launch); a `flake:`
-            // package is built in-cage with `nix build` (an uncurated flake, contained by the
-            // cage). All are trusted-only — an untrusted layer's package is withheld whatever
-            // its backend.
-            let realised = match p.backend {
-                config::Backend::Nix(_) => "host-side, durable",
-                config::Backend::Mise(_) => "in-cage via mise, fetched at launch",
-                config::Backend::Flake(_) => "in-cage via nix build, fetched at launch",
-            };
-            if p.state == trust::TrustState::Trusted {
-                println!(
-                    "    {} -> {}:{}  ({realised})",
-                    p.name,
-                    p.backend.label(),
-                    p.backend.locator()
-                );
-            } else {
-                println!(
-                    "    {} -> {}:{}  (withheld: {})",
-                    p.name,
-                    p.backend.label(),
-                    p.backend.locator(),
-                    config::untrusted_reason(p.state)
-                );
-            }
-        }
-    }
-    // The project's mise file and whether it would be honored — a tool source like
-    // `packages`, gated trusted-only. Its tools are not resolved here (no mise run,
-    // no nix, no network); this reports presence and the gating verdict only.
-    match &resolved.mise {
-        None => println!("  mise:  (none)"),
-        Some(m) if m.state == trust::TrustState::Trusted => {
-            println!("  mise:  {} (trusted)", m.name)
-        }
-        Some(m) => println!(
-            "  mise:  {} (withheld: {})",
-            m.name,
-            config::untrusted_reason(m.state)
-        ),
-    }
-    // The tools the project's mise file declares — parsed only (no nixhub query, no
-    // realisation). `nix:` tools are host-provisioned and gated by the mise file's trust;
-    // a tool for another backend is auto-equipped in-cage by mise (so it appears regardless
-    // of trust); a malformed `nix:` token is shown as unresolvable. Like `packages`, this
-    // reflects the launcher's decision without doing the work.
-    if let Some(m) = &resolved.mise {
-        let declared = sandbox::parse_nix_tools(&m.files);
-        if !declared.nix.is_empty()
-            || !declared.non_nix.is_empty()
-            || !declared.malformed.is_empty()
-        {
-            println!("  tools:");
-            let trusted = m.state == trust::TrustState::Trusted;
-            for t in &declared.nix {
-                if trusted {
-                    println!("    nix:{} = {}", t.pkg, t.version);
-                } else {
-                    println!(
-                        "    nix:{} = {}  (withheld: {})",
-                        t.pkg,
-                        t.version,
-                        config::untrusted_reason(m.state)
-                    );
-                }
-            }
-            // A non-`nix:` tool is equipped in-cage by mise at launch, not host-provisioned —
-            // so it is honored even for an untrusted project (the open self-equip path). Under
-            // `network = "none"` the launch cannot fetch it, so say so rather than over-claim.
-            let net_none = matches!(resolved.network, config::NetworkPolicy::Isolated);
-            for t in &declared.non_nix {
-                if net_none {
-                    println!(
-                        "    {} = {}  (needs network — not equipped under `network = \"none\"`)",
-                        t.token, t.version
-                    );
-                } else {
-                    println!(
-                        "    {} = {}  (equipped in-cage via mise)",
-                        t.token, t.version
-                    );
-                }
-            }
-            // A malformed `nix:` token cannot be resolved; show it so it is not silently absent.
-            for token in &declared.malformed {
-                println!("    {token}  (ignored: malformed nix: token)");
-            }
-        }
-    }
-    // The nixpkgs source the tools resolve against — a trusted project pin, else the
-    // global override, else the default rolling channel — and the revision it is
-    // currently locked to, if one has been resolved. Routed through the same channel
-    // decision the launch uses, so it shows exactly the lock a launch would consult
-    // (a stale per-project lock is never surfaced). Shown without resolving anything
-    // (no nix, no network): an unlocked source simply omits the revision.
-    println!("  {}", nixpkgs_line(&cwd, &resolved));
-    // The mise engine's own channel and locked revision, from its dedicated lock — shown
-    // so the decoupling from the base channel is visible: `ops upgrade mise` advances this
-    // without moving `nixpkgs`, and `ops upgrade nix` the reverse.
-    println!("  {}", engine_line(&resolved));
-    // The network posture — a security field, gated like the binds: an untrusted
-    // project's choice never reaches here. `shared` keeps the host network (the
-    // default, no confidentiality guarantee yet); `none` cuts it off entirely; an
-    // `allowlist` lists exactly what egress is permitted, enforced by the host filtering
-    // proxy through an empty-netns cage.
-    match &resolved.network {
-        config::NetworkPolicy::Shared => println!("  network: shared (host network)"),
-        config::NetworkPolicy::Isolated => println!("  network: none (isolated — no network)"),
-        config::NetworkPolicy::Allowlist(a) => {
-            println!("  network: allowlist");
-            if a.allow_rules().is_empty() {
-                println!("    allow: (none declared)");
-            } else {
-                for rule in a.allow_rules() {
-                    println!("    allow {rule}");
-                }
-            }
-            // Deny carve-outs always win over allow; show them so the effective policy is
-            // visible at a glance.
-            for rule in a.deny_rules() {
-                println!("    deny  {rule}");
-            }
-            // The built-in nix-cache allow-set is unioned into every allowlist regardless of
-            // trust, so a project can self-equip its nix toolchain; show it so it is never a
-            // silent allowance (a user `deny` still carves it).
-            println!("    built-in (always allowed, so self-equip works):");
-            for host in sandbox::nix_cache_hosts() {
-                println!("      allow {host}");
-            }
-            println!("    (deny wins over allow)");
-        }
-    }
-    // The GUI posture — a security field, gated like the network. Shown only when opened
-    // (`wayland`), so a non-GUI config stays uncluttered; the default exposes no display. The
-    // exposure depends on the host's compositor: a well-behaved one isolates clients, but some
-    // expose screen capture or input injection to ordinary clients — the line says so.
-    if matches!(resolved.gui, config::GuiPolicy::Wayland) {
-        println!("  gui: wayland (exposure depends on your compositor)");
-    }
-    // Credentials the egress proxy injects into matching requests — a security field, gated
-    // like the binds (an untrusted project's are dropped). The source is shown by locator (the
-    // variable name or file path), never the value, which ops reads only host-side at launch.
-    if !resolved.secrets.is_empty() {
-        println!("  secrets (injected host-side by the egress proxy):");
-        for s in &resolved.secrets {
-            println!(
-                "    {} -> {}  ({}, from {})",
-                s.header,
-                s.to,
-                s.shape.describe(),
-                s.describe_sources()
-            );
-        }
-    }
-    // Named application profiles (`[app.<name>]`), each a gated overlay over the baseline.
-    // Shown without launching: the command it runs and what its overlay adds, plus each
-    // app's own dropped-field notes (so `ops app <name>` holds no surprises). The overlay's
-    // security fields appear only when their source was trusted, exactly as at launch.
-    if !resolved.apps.is_empty() {
-        println!("  apps:");
-        for (name, app) in &resolved.apps {
-            let cmd = if app.cmd.is_empty() {
-                "(no command)".to_string()
-            } else {
-                app.cmd.join(" ")
-            };
-            println!("    {name}: {cmd}");
-            match app.home_scope {
-                config::AppHomeScope::Global => {
-                    println!("      home: global (shared across projects)")
-                }
-                config::AppHomeScope::Project => println!("      home: per-project"),
-            }
-            if !app.packages.is_empty() {
-                let names: Vec<&str> = app.packages.iter().map(|p| p.name.as_str()).collect();
-                println!("      packages: {}", names.join(", "));
-            }
-            match &app.network {
-                Some(config::NetworkPolicy::Shared) => println!("      network: shared"),
-                Some(config::NetworkPolicy::Isolated) => println!("      network: none"),
-                Some(config::NetworkPolicy::Allowlist(_)) => println!("      network: allowlist"),
-                None => {}
-            }
-            match app.gui {
-                Some(config::GuiPolicy::Wayland) => println!("      gui: wayland"),
-                Some(config::GuiPolicy::None) => println!("      gui: none"),
-                None => {}
-            }
-            if !app.secrets.is_empty() {
-                println!("      secrets: {} injected host-side", app.secrets.len());
-            }
-            for w in &app.warnings {
-                println!("      note: {w}");
-            }
-        }
-    }
-    for w in &resolved.warnings {
+    let view = config::view::build(&cwd);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_config(&view, &pal));
+    // Warnings go to stderr, out of band from the resolved view, so the body stays a clean
+    // capturable document and a warning never pollutes a future `--json` payload.
+    for w in &view.warnings {
         eprintln!("ops: warning: {w}");
     }
     ExitCode::SUCCESS
+}
+
+/// Render the resolved configuration for display — a pure presenter over [`config::view`]. It
+/// adds only color and layout, so the management core stays presentation-agnostic and a future
+/// front-end can render the same model differently. Every color span is empty under a
+/// non-terminal, so captured output is byte-for-byte the plain text the integration tests pin.
+fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> String {
+    use config::view::{GuiView, NetworkView};
+    use std::fmt::Write as _;
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    let mut o = String::new();
+
+    let _ = writeln!(o, "{h}ops config{r} — resolved for {}", view.cwd);
+
+    // The layered environment and read-only binds, after the trust gate.
+    if view.env.is_empty() {
+        let _ = writeln!(o, "  {h}env:{r}   (none)");
+    } else {
+        let _ = writeln!(o, "  {h}env:{r}");
+        for e in &view.env {
+            let _ = writeln!(o, "    {n}{}{r}={}", e.key, e.value);
+        }
+    }
+    if view.binds.is_empty() {
+        let _ = writeln!(o, "  {h}binds:{r} (none)");
+    } else {
+        let _ = writeln!(o, "  {h}binds (read-only):{r}");
+        for b in &view.binds {
+            let _ = writeln!(o, "    {b}");
+        }
+    }
+
+    // Declared tools, each with its backend and trust verdict — the launcher's decision, shown
+    // without realising anything (no nix, no network).
+    if view.packages.is_empty() {
+        let _ = writeln!(o, "  {h}packages:{r} (none)");
+    } else {
+        let _ = writeln!(o, "  {h}packages:{r}");
+        for p in &view.packages {
+            match &p.withheld_reason {
+                Some(reason) => {
+                    let _ = writeln!(
+                        o,
+                        "    {n}{}{r} -> {}:{}  (withheld: {reason})",
+                        p.name, p.backend, p.locator
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        o,
+                        "    {n}{}{r} -> {}:{}  ({})",
+                        p.name, p.backend, p.locator, p.realised
+                    );
+                }
+            }
+        }
+    }
+
+    // The project's mise file and whether it would be honored — a tool source gated like
+    // `packages`, reported as presence + verdict (no mise run).
+    match &view.mise {
+        None => {
+            let _ = writeln!(o, "  {h}mise:{r}  (none)");
+        }
+        Some(m) if m.trusted => {
+            let _ = writeln!(o, "  {h}mise:{r}  {n}{}{r} (trusted)", m.name);
+        }
+        Some(m) => {
+            let _ = writeln!(
+                o,
+                "  {h}mise:{r}  {n}{}{r} (withheld: {})",
+                m.name,
+                m.withheld_reason.as_deref().unwrap_or_default()
+            );
+        }
+    }
+
+    // The tools that file declares — parsed only. `nix:` tools carry the file's trust; a
+    // non-`nix:` tool is equipped in-cage (so honored regardless of trust) unless `network =
+    // "none"` prevents the fetch; a malformed `nix:` token is shown so it is not silently absent.
+    if !view.tools.is_empty() {
+        let _ = writeln!(o, "  {h}tools:{r}");
+        for t in &view.tools.nix {
+            match &t.withheld_reason {
+                Some(reason) => {
+                    let _ = writeln!(
+                        o,
+                        "    {n}nix:{}{r} = {}  (withheld: {reason})",
+                        t.pkg, t.version
+                    );
+                }
+                None => {
+                    let _ = writeln!(o, "    {n}nix:{}{r} = {}", t.pkg, t.version);
+                }
+            }
+        }
+        for t in &view.tools.non_nix {
+            if t.equipped {
+                let _ = writeln!(
+                    o,
+                    "    {n}{}{r} = {}  (equipped in-cage via mise)",
+                    t.token, t.version
+                );
+            } else {
+                let _ = writeln!(
+                    o,
+                    "    {n}{}{r} = {}  (needs network — not equipped under `network = \"none\"`)",
+                    t.token, t.version
+                );
+            }
+        }
+        for token in &view.tools.malformed {
+            let _ = writeln!(o, "    {token}  (ignored: malformed nix: token)");
+        }
+    }
+
+    // The nixpkgs source the tools resolve against and its locked revision, then the mise
+    // engine's own channel — shown so the engine's decoupling from the base channel is visible.
+    // Routed through the launch's own channel decision; an unlocked source omits the revision.
+    let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs));
+    let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine));
+
+    // The network posture — a security field. `shared` keeps the host network; `none` cuts it
+    // off; an `allowlist` lists exactly what egress is permitted (deny wins over allow), plus the
+    // always-allowed nix-cache set so the self-equip allowance is never silent.
+    match &view.network {
+        NetworkView::Shared => {
+            let _ = writeln!(o, "  {h}network:{r} shared (host network)");
+        }
+        NetworkView::Isolated => {
+            let _ = writeln!(o, "  {h}network:{r} none (isolated — no network)");
+        }
+        NetworkView::Allowlist {
+            allow,
+            deny,
+            builtin,
+        } => {
+            let _ = writeln!(o, "  {h}network:{r} allowlist");
+            if allow.is_empty() {
+                let _ = writeln!(o, "    allow: (none declared)");
+            } else {
+                for rule in allow {
+                    let _ = writeln!(o, "    allow {n}{rule}{r}");
+                }
+            }
+            for rule in deny {
+                let _ = writeln!(o, "    deny  {n}{rule}{r}");
+            }
+            let _ = writeln!(o, "    built-in (always allowed, so self-equip works):");
+            for host in builtin {
+                let _ = writeln!(o, "      allow {n}{host}{r}");
+            }
+            let _ = writeln!(o, "    (deny wins over allow)");
+        }
+    }
+
+    // The GUI posture — shown only when opened (`wayland`), so a non-GUI config stays uncluttered.
+    if matches!(view.gui, GuiView::Wayland) {
+        let _ = writeln!(
+            o,
+            "  {h}gui:{r} wayland (exposure depends on your compositor)"
+        );
+    }
+
+    // Credentials the egress proxy injects — by destination and source locator, never the value.
+    if !view.secrets.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}secrets (injected host-side by the egress proxy):{r}"
+        );
+        for s in &view.secrets {
+            let _ = writeln!(
+                o,
+                "    {n}{}{r} -> {}  ({}, from {})",
+                s.header, s.to, s.shape, s.sources
+            );
+        }
+    }
+
+    // Named application profiles, each a gated overlay over the baseline: the command it runs,
+    // what its overlay adds, and its own dropped-field notes (so `ops app <name>` holds no
+    // surprises). Security fields appear only when their source was trusted, exactly as at launch.
+    if !view.apps.is_empty() {
+        let _ = writeln!(o, "  {h}apps:{r}");
+        for app in &view.apps {
+            let cmd = app.cmd.as_deref().unwrap_or("(no command)");
+            let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
+            let _ = writeln!(o, "      home: {}", app.home_scope);
+            if !app.packages.is_empty() {
+                let _ = writeln!(o, "      packages: {}", app.packages.join(", "));
+            }
+            if let Some(net) = &app.network {
+                let _ = writeln!(o, "      network: {net}");
+            }
+            if let Some(gui) = &app.gui {
+                let _ = writeln!(o, "      gui: {gui}");
+            }
+            if app.secret_count > 0 {
+                let _ = writeln!(o, "      secrets: {} injected host-side", app.secret_count);
+            }
+            for note in &app.notes {
+                let _ = writeln!(o, "      note: {note}");
+            }
+        }
+    }
+
+    o
+}
+
+/// One channel line's text (without the colored label): `<source> @ <short-rev>  (<origin>)`, or
+/// `<source>  (<origin>)` when no revision has been locked. The revision is shortened here, a
+/// presentation choice — the view model carries the full revision.
+fn channel_text(c: &config::view::ChannelView) -> String {
+    match &c.locked_rev {
+        Some(rev) => format!("{} @ {}  ({})", c.source, short_rev(rev), c.origin),
+        None => format!("{}  ({})", c.source, c.origin),
+    }
 }
 
 /// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the global
@@ -1900,58 +1899,6 @@ fn print_grant_env(label: &str, keys: &[String]) {
     } else {
         println!("    {label}:    {}", keys.join(", "));
     }
-}
-
-/// The `ops config` nixpkgs line: the effective source and where it came from, plus
-/// the revision it is currently locked to when one has been resolved. Routed through
-/// the launch's own channel decision so it reports exactly the lock a launch would
-/// consult. Best-effort: if the data directory or project identity cannot be
-/// resolved, it falls back to the source and origin alone.
-fn nixpkgs_line(cwd: &Path, resolved: &config::Resolved) -> String {
-    if let Some(layout) = store::Layout::from_env() {
-        if let Ok(target) = sandbox::effective_lock_target(cwd, &layout, resolved) {
-            let origin = target.origin().label();
-            return match target.locked_revision() {
-                Some(rev) => format!(
-                    "nixpkgs: {} @ {}  ({origin})",
-                    target.source(),
-                    short_rev(&rev)
-                ),
-                None => format!("nixpkgs: {}  ({origin})", target.source()),
-            };
-        }
-    }
-    let (source, origin) = match (&resolved.nixpkgs_project, &resolved.nixpkgs_global) {
-        (Some(p), _) => (p.as_str(), "project pin"),
-        (None, Some(g)) => (g.as_str(), "global"),
-        (None, None) => ("nixos-unstable", "default"),
-    };
-    format!("nixpkgs: {source}  ({origin})")
-}
-
-/// The `ops config` mise-engine line: the engine's source (the global channel — a project
-/// pin never moves it) and the revision its dedicated lock is currently pinned to, when
-/// one has been resolved. Shown so the engine's independence from the base channel is
-/// visible. Best-effort, like [`nixpkgs_line`]: if the data directory cannot be resolved,
-/// it falls back to the source and origin alone. Resolves nothing (no nix, no network).
-fn engine_line(resolved: &config::Resolved) -> String {
-    if let Some(layout) = store::Layout::from_env() {
-        let target = store::LockTarget::engine(&layout, resolved.nixpkgs_global.as_deref());
-        let origin = target.origin().label();
-        return match target.locked_revision() {
-            Some(rev) => format!(
-                "engine: {} @ {}  ({origin})",
-                target.source(),
-                short_rev(&rev)
-            ),
-            None => format!("engine: {}  ({origin})", target.source()),
-        };
-    }
-    let (source, origin) = match &resolved.nixpkgs_global {
-        Some(g) => (g.as_str(), "global"),
-        None => ("nixos-unstable", "default"),
-    };
-    format!("engine: {source}  ({origin})")
 }
 
 /// `ops upgrade [all|nix|mise]`: roll managed channels forward by re-resolving and

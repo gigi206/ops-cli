@@ -21,6 +21,8 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use crate::style::Palette;
+
 /// One option or operand line: the flag/operand token and its one-line description.
 type Opt = (&'static str, &'static str);
 
@@ -448,55 +450,6 @@ const PAGES: &[Page] = &[
         details: "",
     },
 ];
-
-/// ANSI styling for one output stream. Empty strings when color is off, so the render
-/// code is unconditional and a non-terminal (a pipe, a captured test) is plain text.
-struct Palette {
-    /// Command and subcommand names.
-    name: &'static str,
-    /// Option and operand flags.
-    flag: &'static str,
-    /// Section headers (`Usage:`, `Options:`, …).
-    head: &'static str,
-    reset: &'static str,
-}
-
-impl Palette {
-    /// The active ANSI styling — command/subcommand names in bold cyan, option flags in bold
-    /// green, section headers in bold.
-    fn colored() -> Self {
-        Palette {
-            name: "\x1b[1;36m",
-            flag: "\x1b[1;32m",
-            head: "\x1b[1m",
-            reset: "\x1b[0m",
-        }
-    }
-
-    /// No styling — every span is empty, so the render code is unconditional and the output is
-    /// plain text (a pipe, a captured test, `NO_COLOR`, a `dumb` terminal).
-    fn plain() -> Self {
-        Palette {
-            name: "",
-            flag: "",
-            head: "",
-            reset: "",
-        }
-    }
-
-    /// Decide color for a stream — the conventional auto-detection: colored only when the stream
-    /// is a terminal, `NO_COLOR` is unset, and the terminal is not `dumb`.
-    fn for_stream(is_tty: bool) -> Self {
-        let on = is_tty
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
-        if on {
-            Self::colored()
-        } else {
-            Self::plain()
-        }
-    }
-}
 
 /// Find the page for an exact command path.
 fn find(path: &[&str]) -> Option<&'static Page> {
