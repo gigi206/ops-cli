@@ -167,6 +167,45 @@ fn no_config_files_resolves_to_empty_defaults() {
 }
 
 #[test]
+fn config_json_is_a_valid_document_carrying_the_resolved_model() {
+    // The machine-readable surface a script or a future management front-end consumes: the same
+    // resolved model the human render shows, as one parseable JSON document on stdout.
+    let fx = Fixture::new();
+    fx.write_project("[env]\nFOO = \"bar\"\n\n[packages]\njq = \"nix:jq\"\n");
+
+    let out = fx.run(&["config", "--json"]);
+    assert!(out.status.success(), "`ops config --json` should exit 0");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
+
+    assert_eq!(doc["env"][0]["key"], "FOO");
+    assert_eq!(doc["env"][0]["value"], "bar");
+    assert_eq!(doc["packages"][0]["name"], "jq");
+    assert_eq!(doc["packages"][0]["backend"], "nix");
+    // An untrusted project withholds its package — the JSON carries the same verdict the human
+    // render shows (the field is the model, not a re-derivation).
+    assert_eq!(doc["packages"][0]["trusted"], false);
+    assert_eq!(doc["network"], "Shared");
+}
+
+#[test]
+fn config_rejects_an_unknown_argument() {
+    let fx = Fixture::new();
+    let out = fx.run(&["config", "--bogus"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unknown argument is a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unexpected argument"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("ops config"),
+        "should print the usage synopsis:\n{stderr}"
+    );
+}
+
+#[test]
 fn a_mise_file_is_withheld_until_the_project_is_trusted() {
     let fx = Fixture::new();
     fx.write_project("[env]\nA = \"1\"\n");

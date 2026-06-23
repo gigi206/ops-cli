@@ -197,14 +197,20 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config"],
-        synopsis: "ops config",
+        synopsis: "ops config [--json]",
         summary: "show the resolved configuration for the current project",
-        options: &[],
+        options: &[(
+            "--json",
+            "print the resolved configuration as JSON (for scripts and tooling)",
+        )],
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
             project environment, binds, packages, tools, network, GUI, secrets, and app\n\
             profiles, after the trust gate has dropped anything an untrusted project may not\n\
-            set. Warnings explain what was dropped and why. No launch, no nix, no network.",
+            set. Warnings explain what was dropped and why. No launch, no nix, no network.\n\
+            \n\
+            With --json, the same resolved model is printed as a JSON document (warnings\n\
+            included as a field) — the machine-readable form the human output renders.",
     },
     Page {
         path: &["upgrade"],

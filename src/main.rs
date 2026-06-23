@@ -64,7 +64,7 @@ fn main() -> ExitCode {
         "stop" => stop_cmd(rest),
         "trust" => trust_cmd(rest),
         "untrust" => untrust_cmd(rest.into_iter().next()),
-        "config" => config_cmd(),
+        "config" => config_cmd(rest),
         "upgrade" => upgrade_cmd(rest),
         "gc" => gc_cmd(rest),
         "run" => {
@@ -533,11 +533,28 @@ fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
     }
 }
 
-/// `ops config`: show the resolved configuration for the current project — the
-/// layered global + project environment and read-only binds, after the trust gate
-/// has dropped anything an untrusted project may not set. Warnings explain what
-/// was dropped and why.
-fn config_cmd() -> ExitCode {
+/// `ops config [--json]`: show the resolved configuration for the current project — the
+/// layered global + project environment and read-only binds, after the trust gate has
+/// dropped anything an untrusted project may not set. The human form renders a colored
+/// document with warnings on stderr; `--json` prints the same resolved model as a JSON
+/// document (warnings included as a field), the machine-readable surface a script or a
+/// management front-end consumes.
+fn config_cmd(args: Vec<OsString>) -> ExitCode {
+    let mut json = false;
+    for arg in &args {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            _ => {
+                eprintln!(
+                    "ops: config: unexpected argument {:?}",
+                    arg.to_string_lossy()
+                );
+                eprintln!("ops: usage: {}", help::synopsis("config"));
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -546,10 +563,24 @@ fn config_cmd() -> ExitCode {
         }
     };
     let view = config::view::build(&cwd);
+
+    if json {
+        // The whole resolved model, warnings and all, as one JSON document. Nothing goes to
+        // stderr — stdout stays pure JSON, the contract a consuming tool relies on.
+        match serde_json::to_string_pretty(&view) {
+            Ok(doc) => println!("{doc}"),
+            Err(e) => {
+                eprintln!("ops: cannot serialize the configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_config(&view, &pal));
     // Warnings go to stderr, out of band from the resolved view, so the body stays a clean
-    // capturable document and a warning never pollutes a future `--json` payload.
+    // capturable document and a warning never pollutes a piped human render.
     for w in &view.warnings {
         eprintln!("ops: warning: {w}");
     }
