@@ -1716,6 +1716,22 @@ fn config_path_reports_the_target_file_per_scope() {
 }
 
 #[test]
+fn config_set_global_creates_a_missing_config_dir() {
+    // A fresh fixture has no <config>/ops/ directory yet: the first `set --global` must create it,
+    // not fail to write.
+    let fx = Fixture::new();
+    let out = fx.run(&["config", "set", "env.G", "1", "--global"]);
+    assert!(
+        out.status.success(),
+        "set --global on a fresh config dir:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = fx.run(&["config", "get", "env.G", "--global"]);
+    assert!(got.status.success());
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "1");
+}
+
+#[test]
 fn config_set_into_a_non_scalar_field_is_refused() {
     let fx = Fixture::new();
     fx.write_project("binds = [\"/tmp\"]\n");
@@ -1727,5 +1743,42 @@ fn config_set_into_a_non_scalar_field_is_refused() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("edit"),
         "the error should point at `ops config edit`"
+    );
+}
+
+#[test]
+fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // A non-interactive "editor": a script that appends a line to its file argument, standing in
+    // for a real $EDITOR so the test stays headless.
+    let editor = fx.bind_dir.path().join("fake-editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = fx
+        .ops(&["config", "edit"])
+        .env("EDITOR", &editor)
+        .env_remove("VISUAL")
+        .output()
+        .expect("spawn ops");
+    assert!(out.status.success(), "edit should exit 0");
+
+    let after = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        after.contains("EDITED = \"yes\""),
+        "the editor ran:\n{after}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("re-armed the trust gate"),
+        "changing a trusted file must warn:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

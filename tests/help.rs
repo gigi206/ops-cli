@@ -43,6 +43,7 @@ const PATHS: &[&[&str]] = &[
     &["config", "set"],
     &["config", "unset"],
     &["config", "path"],
+    &["config", "edit"],
     &["upgrade"],
     &["gc"],
     &["app", "import"],

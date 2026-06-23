@@ -179,10 +179,13 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
 }
 
 /// Write the document atomically (temp sibling then rename), so a crash mid-write never leaves a
-/// truncated config a launch would then fail to parse.
+/// truncated config a launch would then fail to parse. Creates the parent directory as needed —
+/// the global config dir (or an explicit `-c dir/file.toml` whose directory does not exist yet)
+/// may be absent on a first write.
 fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
     let err = |e: std::io::Error| ManageError::Write(path.to_path_buf(), e.to_string());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(err)?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -257,6 +260,16 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".ops.toml");
         assert!(set(&p, "env.A", "1").unwrap(), "created in a new file");
+        assert_eq!(get(&p, "env.A").unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn set_creates_a_missing_parent_directory() {
+        // The global config dir, or an explicit `-c nested/dir/file.toml`, may not exist on a
+        // first write — the atomic placement must create the directory, not fail on it.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join("nested").join("dir").join("ops.toml");
+        assert!(set(&p, "env.A", "1").unwrap(), "created under a new dir");
         assert_eq!(get(&p, "env.A").unwrap().as_deref(), Some("1"));
     }
 

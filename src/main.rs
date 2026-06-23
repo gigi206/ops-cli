@@ -545,6 +545,7 @@ fn config_cmd(args: Vec<OsString>) -> ExitCode {
         Some("set") => return config_set(&args[1..]),
         Some("unset") => return config_unset(&args[1..]),
         Some("path") => return config_path_cmd(&args[1..]),
+        Some("edit") => return config_edit(&args[1..]),
         _ => {}
     }
 
@@ -1030,6 +1031,95 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ops config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
+/// The escape hatch for what `set` does not handle — arrays, secrets, and app tables. Runs through
+/// a shell so an editor carrying arguments (e.g. `code --wait`) works, with the path passed as a
+/// positional so it needs no quoting. Because the trust gate hashes the whole file, an edit that
+/// changes a trusted file re-arms it — detected after the editor exits (the verdict becomes
+/// Changed) and warned, or applied at once with `--trust`.
+fn config_edit(args: &[OsString]) -> ExitCode {
+    let (positionals, scope, trust_flag) = match split_scope(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("ops: config edit: {e}");
+            return config_usage("edit");
+        }
+    };
+    if !positionals.is_empty() {
+        return config_usage("edit");
+    }
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let path = match config::manage::scope_path(&scope, &cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Make sure the parent directory exists so the editor can save a new file (the global config
+    // directory may not exist yet).
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("ops: config: cannot create {}: {e}", parent.display());
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let store_dir = trust::default_store_dir();
+    let was_trusted = store_dir
+        .as_deref()
+        .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+
+    let editor_os = std::env::var_os("VISUAL")
+        .or_else(|| std::env::var_os("EDITOR"))
+        .unwrap_or_else(|| OsString::from("vi"));
+    let editor = editor_os.to_string_lossy();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg("sh")
+        .arg(&path)
+        .status();
+    match status {
+        // The editor ran (whatever its exit) — the file is now whatever the user saved.
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("ops: config: could not launch the editor `{editor}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if trust_flag {
+        match store_dir.as_deref() {
+            Some(dir) => match trust::trust(dir, &path) {
+                Ok(()) => println!(
+                    "ops: trusted {} (the whole file is now trusted)",
+                    path.display()
+                ),
+                Err(e) => eprintln!("ops: warning: could not trust {}: {e}", path.display()),
+            },
+            None => eprintln!("ops: warning: no trust store available; cannot --trust"),
+        }
+    } else if was_trusted {
+        // Only warn if the edit actually changed the file (the verdict is now Changed).
+        let now = store_dir.as_deref().map(|d| trust::state(d, &path));
+        if now == Some(trust::TrustState::Changed) {
+            eprintln!(
+                "ops: warning: your edit re-armed the trust gate for {}",
+                path.display()
+            );
+            eprintln!(
+                "       run `ops trust {}` to re-apply its security fields",
+                path.display()
+            );
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Report the trust consequence of a write, the load-bearing UX of `set`/`unset`: the whole-file

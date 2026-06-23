@@ -285,6 +285,22 @@ const PAGES: &[Page] = &[
             would read or edit. Useful for scripting and for locating the global config.",
     },
     Page {
+        path: &["config", "edit"],
+        synopsis: "ops config edit [--local|--global|-c <file>] [--trust]",
+        summary: "open a config file in your editor",
+        options: &[
+            ("--local", "the project .ops.toml (the default)"),
+            ("--global", "the global ops.toml"),
+            ("-c <file>", "an explicit config file"),
+            ("--trust", "re-trust the file after editing"),
+        ],
+        details:
+            "Opens the target file in $VISUAL or $EDITOR (falling back to vi) — the way to edit\n\
+            fields `set` does not handle as a single value, such as binds, an allowlist, secrets,\n\
+            or app tables. An edit that changes a file you had trusted re-arms its trust gate, so\n\
+            it warns to re-run `ops trust`; pass --trust to re-trust as the editor closes.",
+    },
+    Page {
         path: &["upgrade"],
         synopsis: "ops upgrade [all|nix|mise|flake]",
         summary: "roll managed channels forward (versions move only here)",
