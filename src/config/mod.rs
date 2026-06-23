@@ -2077,8 +2077,8 @@ fn mise_status(
         None => {
             if !cwd.join(PROJECT_CONFIG).exists() {
                 warnings.push(format!(
-                    "found a mise file ({name}) but no {PROJECT_CONFIG}: mise is anchored on \
-                     {PROJECT_CONFIG} — add one (it may be empty) to enable it"
+                    "mise file ({name}) ignored: mise is anchored on `{PROJECT_CONFIG}`, \
+                     which is missing — add one (it may be empty) to enable it"
                 ));
             }
             None

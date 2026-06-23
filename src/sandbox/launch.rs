@@ -1493,7 +1493,7 @@ fn build(
             Ok(layer) => Some(layer),
             Err(e) => {
                 crate::diag::warn(&format!(
-                    "gui = \"wayland\" but the font set could not be provisioned \
+                    "`gui = \"wayland\"` but the font set could not be provisioned \
                      ({e}) — text may not render"
                 ));
                 None
@@ -1546,7 +1546,7 @@ fn build(
                 .map(String::as_str)
                 .collect();
             crate::diag::warn(&format!(
-                "mise tools [{}] are declared but network = \"none\" — they \
+                "mise tools [{}] are declared but `network = \"none\"` — they \
                  cannot be fetched and will be absent unless already equipped",
                 declared.join(", ")
             ));
@@ -1601,7 +1601,7 @@ fn build(
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
             let names: Vec<&str> = flake_pkgs.iter().map(|(n, _)| n.as_str()).collect();
             crate::diag::warn(&format!(
-                "flake packages [{}] are declared but network = \"none\" — they \
+                "flake packages [{}] are declared but `network = \"none\"` — they \
                  cannot be built and will be absent unless already present",
                 names.join(", ")
             ));
@@ -1678,12 +1678,12 @@ fn build(
                 gui_env = env;
             }
             Ok((socket, _)) => crate::diag::warn(&format!(
-                "gui = \"wayland\" but the compositor socket {} does not exist — \
+                "`gui = \"wayland\"` but the compositor socket `{}` does not exist — \
                  running without a display",
                 socket.display()
             )),
             Err(reason) => crate::diag::warn(&format!(
-                "gui = \"wayland\" but {reason} — running without a display"
+                "`gui = \"wayland\"` but {reason} — running without a display"
             )),
         }
 
@@ -1711,7 +1711,7 @@ fn build(
                     ));
                 }
                 Err(e) => crate::diag::warn(&format!(
-                    "gui = \"wayland\" but the font configuration could not be \
+                    "`gui = \"wayland\"` but the font configuration could not be \
                      staged ({e}) — text may not render"
                 )),
             }
