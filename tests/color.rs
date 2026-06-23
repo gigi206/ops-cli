@@ -34,14 +34,17 @@ impl Drop for TmpDir {
     }
 }
 
-/// Run `ops <args>` with a throwaway data dir and a clean cwd, capturing stdout (a pipe — so color
-/// must be off). `NO_COLOR`/`TERM` are also neutralised so the result does not depend on the
-/// host's environment leaking in.
-fn run(args: &[&str], data: &Path, cwd: &Path) -> std::process::Output {
+/// Run `ops <args>` with a throwaway home (data, state, config all redirected) and a clean cwd,
+/// capturing stdout (a pipe — so color must be off). `NO_COLOR`/`TERM` are also neutralised so the
+/// result does not depend on the host's environment leaking in.
+fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ops"))
         .args(args)
         .current_dir(cwd)
-        .env("XDG_DATA_HOME", data)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home)
+        .env("XDG_STATE_HOME", home)
+        .env("XDG_CONFIG_HOME", home)
         .env_remove("NO_COLOR")
         .env_remove("TERM")
         .output()
@@ -50,7 +53,7 @@ fn run(args: &[&str], data: &Path, cwd: &Path) -> std::process::Output {
 
 #[test]
 fn captured_output_carries_no_ansi_escapes() {
-    let data = TmpDir::new();
+    let home = TmpDir::new();
     let cwd = TmpDir::new();
     // Each is a renderer the color pass touched; all are cheap and host-agnostic. `doctor` is
     // included even though it probes the host — its output is captured, so it too must be plain.
@@ -60,10 +63,11 @@ fn captured_output_carries_no_ansi_escapes() {
         &["plugins", "list"],
         &["plugins", "store", "list"],
         &["test", "net", "https://example.com/x"],
+        &["trust", "--show"],
         &["doctor"],
     ];
     for args in invocations {
-        let out = run(args, data.path(), cwd.path());
+        let out = run(args, home.path(), cwd.path());
         assert!(
             !out.stdout.contains(&0x1b),
             "`ops {}` emitted an ANSI escape on a captured stream:\n{}",

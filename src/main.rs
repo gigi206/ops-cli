@@ -572,15 +572,27 @@ fn show_trust(path: std::path::PathBuf) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let verdict = match trust::state(&store_dir, &path) {
-        trust::TrustState::Trusted => "trusted",
-        trust::TrustState::Untrusted => "untrusted",
+    let state = trust::state(&store_dir, &path);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    println!("{}", render_trust_verdict(&path, state, &pal));
+    ExitCode::SUCCESS
+}
+
+/// Render a trust verdict — a pure presenter (so its colored layout is asserted in a test). The
+/// state word carries the conventional hue: `trusted` green, `untrusted` yellow (the default
+/// state, security fields simply not applied — a caution, not an error), and `changed` red (it
+/// was trusted and has since drifted, so re-approval is needed). Only the state word is colored;
+/// the re-approval hint stays plain. Every span is empty under a non-terminal.
+fn render_trust_verdict(path: &Path, state: trust::TrustState, pal: &style::Palette) -> String {
+    let (ok, warn, err, r) = (pal.ok, pal.warn, pal.err, pal.reset);
+    let verdict = match state {
+        trust::TrustState::Trusted => format!("{ok}trusted{r}"),
+        trust::TrustState::Untrusted => format!("{warn}untrusted{r}"),
         trust::TrustState::Changed => {
-            "changed since it was trusted — re-run `ops trust` to re-approve"
+            format!("{err}changed{r} since it was trusted — re-run `ops trust` to re-approve")
         }
     };
-    println!("ops: {} is {verdict}", path.display());
-    ExitCode::SUCCESS
+    format!("ops: {} is {verdict}", path.display())
 }
 
 /// `ops untrust [path]`: revoke a project config's trust, so its security-relevant
@@ -2931,6 +2943,44 @@ mod tests {
             denied.contains(&format!("{}https://x/y{}", p.name, p.reset)),
             "the URL must be wrapped in the name span:\n{denied}"
         );
+    }
+
+    #[test]
+    fn trust_verdict_is_plain_text_when_uncolored() {
+        let p = style::Palette::plain();
+        let path = Path::new("/p/.ops.toml");
+        assert_eq!(
+            render_trust_verdict(path, trust::TrustState::Trusted, &p),
+            "ops: /p/.ops.toml is trusted"
+        );
+        assert_eq!(
+            render_trust_verdict(path, trust::TrustState::Untrusted, &p),
+            "ops: /p/.ops.toml is untrusted"
+        );
+        assert_eq!(
+            render_trust_verdict(path, trust::TrustState::Changed, &p),
+            "ops: /p/.ops.toml is changed since it was trusted — re-run `ops trust` to re-approve"
+        );
+    }
+
+    #[test]
+    fn trust_verdict_maps_each_state_to_its_hue_and_resets() {
+        // The ON path: each state word takes its own span (green/yellow/red) and resets — a
+        // swapped hue (the failure plain output cannot see) is caught here.
+        let p = style::Palette::colored();
+        let path = Path::new("/p/.ops.toml");
+        let cases = [
+            (trust::TrustState::Trusted, p.ok, "trusted"),
+            (trust::TrustState::Untrusted, p.warn, "untrusted"),
+            (trust::TrustState::Changed, p.err, "changed"),
+        ];
+        for (state, span, word) in cases {
+            let out = render_trust_verdict(path, state, &p);
+            assert!(
+                out.contains(&format!("{span}{word}{}", p.reset)),
+                "{word} must be wrapped in its own span and reset:\n{out}"
+            );
+        }
     }
 
     #[test]
