@@ -652,24 +652,49 @@ fn render_untrust_result(path: &Path, existed: bool, pal: &style::Palette) -> St
 /// raw layer file (the project `.ops.toml`, the global config, or an explicit path).
 fn config_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
-        Some("get") => return config_get(&args[1..]),
-        Some("set") => return config_set(&args[1..]),
-        Some("unset") => return config_unset(&args[1..]),
-        Some("path") => return config_path_cmd(&args[1..]),
-        Some("edit") => return config_edit(&args[1..]),
-        _ => {}
+        Some("show") => config_show(&args[1..]),
+        Some("get") => config_get(&args[1..]),
+        Some("set") => config_set(&args[1..]),
+        Some("unset") => config_unset(&args[1..]),
+        Some("path") => config_path_cmd(&args[1..]),
+        Some("edit") => config_edit(&args[1..]),
+        // No subcommand — or an unknown one. Print the config page (which lists the subcommands)
+        // to stderr and exit non-zero, so `ops config` reveals `show`/`get`/… instead of silently
+        // doing one of them. Mirrors the no-command usage of bare `ops`.
+        other => {
+            match other {
+                // The old `ops config --json` muscle memory: the resolved view (and its --json) is
+                // now `show`, so point straight at it. Other flags belong to a specific subcommand
+                // (get/set/… take -c/--local/--trust), so name no verb and let the page below guide.
+                Some("--json") => {
+                    eprintln!("ops: config: --json is now `ops config show --json`")
+                }
+                Some(tok) if tok.starts_with('-') => eprintln!(
+                    "ops: config: {tok:?} is an option of a subcommand — pick one from the list below"
+                ),
+                Some(tok) => eprintln!("ops: config: unknown subcommand {tok:?}"),
+                None => {}
+            }
+            eprint!("{}", help::page_usage(&["config"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
     }
+}
 
+/// `ops config show [--json]`: show the resolved configuration for the current project — the
+/// layered, trust-gated view a launch would use. The human render is colored when stdout is a
+/// terminal; `--json` emits the whole resolved model for tooling.
+fn config_show(args: &[OsString]) -> ExitCode {
     let mut json = false;
-    for arg in &args {
+    for arg in args {
         match arg.to_str() {
             Some("--json") => json = true,
             _ => {
                 eprintln!(
-                    "ops: config: unexpected argument {:?}",
+                    "ops: config show: unexpected argument {:?}",
                     arg.to_string_lossy()
                 );
-                eprintln!("ops: usage: {}", help::synopsis("config"));
+                eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
                 return ExitCode::from(2);
             }
         }
@@ -975,7 +1000,7 @@ fn config_cwd() -> Result<PathBuf, ExitCode> {
 
 /// `ops config get <key>`: print the value declared at a dotted key in the target layer file
 /// (`--local` by default). This reads the *raw declared* value in that one file; for the
-/// *effective resolved* value across layers, use `ops config` / `ops config --json`. An unset key
+/// *effective resolved* value across layers, use `ops config show` / `ops config show --json`. An unset key
 /// exits 1 (so a script can tell "absent" from a real error), a usage problem exits 2.
 fn config_get(args: &[OsString]) -> ExitCode {
     let (positionals, scope, _trust) = match split_scope(args) {

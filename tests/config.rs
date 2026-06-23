@@ -158,7 +158,7 @@ impl Fixture {
 #[test]
 fn no_config_files_resolves_to_empty_defaults() {
     let fx = Fixture::new();
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "config must succeed with no files");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("env:   (none)"), "stdout:\n{stdout}");
@@ -173,8 +173,11 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
     let fx = Fixture::new();
     fx.write_project("[env]\nFOO = \"bar\"\n\n[packages]\njq = \"nix:jq\"\n");
 
-    let out = fx.run(&["config", "--json"]);
-    assert!(out.status.success(), "`ops config --json` should exit 0");
+    let out = fx.run(&["config", "show", "--json"]);
+    assert!(
+        out.status.success(),
+        "`ops config show --json` should exit 0"
+    );
     let doc: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
 
@@ -189,9 +192,9 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
 }
 
 #[test]
-fn config_rejects_an_unknown_argument() {
+fn config_show_rejects_an_unknown_argument() {
     let fx = Fixture::new();
-    let out = fx.run(&["config", "--bogus"]);
+    let out = fx.run(&["config", "show", "--bogus"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -200,8 +203,46 @@ fn config_rejects_an_unknown_argument() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unexpected argument"), "stderr:\n{stderr}");
     assert!(
-        stderr.contains("ops config"),
+        stderr.contains("ops config show"),
         "should print the usage synopsis:\n{stderr}"
+    );
+}
+
+#[test]
+fn bare_config_reveals_its_subcommands() {
+    // `ops config` with no subcommand must not silently render the resolved view (which would
+    // hide that `show`/`get`/set/… exist) — it prints the config page, listing the subcommands,
+    // to stderr and exits non-zero, the way bare `ops` does.
+    let fx = Fixture::new();
+    let out = fx.run(&["config"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bare `ops config` is a no-subcommand usage error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Subcommands:") && stderr.contains("show") && stderr.contains("get"),
+        "bare config must list its subcommands:\n{stderr}"
+    );
+    // The resolved view never lands on stdout for a bare invocation — that is `ops config show`.
+    assert!(
+        out.stdout.is_empty(),
+        "bare config must not print the resolved view to stdout"
+    );
+}
+
+#[test]
+fn config_a_misplaced_flag_points_at_show() {
+    // A flag with no subcommand (the old `ops config --json` muscle memory) is a usage error that
+    // names the right form, rather than being silently accepted.
+    let fx = Fixture::new();
+    let out = fx.run(&["config", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "a bare flag is a usage error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ops config show --json"),
+        "a misplaced flag must point at `ops config show`:\n{stderr}"
     );
 }
 
@@ -212,7 +253,7 @@ fn a_mise_file_is_withheld_until_the_project_is_trusted() {
     fx.write_mise("[tools]\nnode = \"20\"\n");
 
     // Untrusted: the mise file is present but would not be honored.
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -222,7 +263,7 @@ fn a_mise_file_is_withheld_until_the_project_is_trusted() {
 
     // Trusting the project (which hashes both files) honors it.
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("mise:  .mise.toml (trusted)"),
@@ -241,7 +282,7 @@ fn editing_the_mise_file_re_arms_the_project_trust() {
     // The project declares no security field to drop, so the "changed" signal rides
     // the mise line's withheld reason (stdout), not a dropped-bind warning (stderr).
     fx.write_mise("[tools]\nnode = \"22\"\n");
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("mise:  .mise.toml (withheld: changed since it was trusted"),
@@ -254,7 +295,7 @@ fn a_mise_file_without_an_ops_toml_warns_and_is_not_honored() {
     let fx = Fixture::new();
     fx.write_mise("[tools]\nnode = \"20\"\n");
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(
         out.status.success(),
         "an orphan mise file must not hard-fail"
@@ -278,7 +319,7 @@ fn the_global_config_is_honored_in_full() {
         "binds = [\"{}\"]\n[env]\nGLOBALVAR = \"g\"\n",
         shared.display()
     ));
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("GLOBALVAR=g"), "stdout:\n{stdout}");
@@ -294,7 +335,7 @@ fn an_untrusted_project_keeps_env_but_drops_binds() {
     let fx = Fixture::new();
     fx.write_project("binds = [\"/etc/ssh\"]\n[env]\nPROJVAR = \"p\"\n");
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -328,7 +369,7 @@ fn trusting_the_project_applies_its_binds() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     // now the security bind is honored
@@ -347,7 +388,7 @@ fn the_network_posture_is_a_trust_gated_security_field() {
 
     // Untrusted: the posture is dropped to the default (shared), and the drop is
     // explained — an untrusted project may not cut (or reopen) the network.
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -362,7 +403,7 @@ fn the_network_posture_is_a_trust_gated_security_field() {
 
     // Trusted: the posture is honored — the cage would isolate the network.
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("network: none"),
@@ -378,7 +419,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
     );
 
     // Untrusted: the allowlist is dropped to the default (shared), with an explanation.
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -393,7 +434,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
 
     // Trusted: the allowlist is honored and its classified rules are shown.
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("network: allowlist"), "stdout:\n{stdout}");
     assert!(stdout.contains("allow github.com"), "stdout:\n{stdout}");
@@ -423,7 +464,7 @@ fn editing_a_trusted_project_re_arms_the_gate() {
 
     // an edit changes the content hash; the binds must drop again until re-trusted
     fx.write_project("binds = [\"/etc/ssh\", \"/opt/extra\"]\n");
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -442,7 +483,7 @@ fn a_malformed_project_config_is_ignored_not_fatal() {
     // neither crash the command nor apply anything — just warn, naming the file.
     let fx = Fixture::new();
     fx.write_project("binds = = not toml\n");
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(
         out.status.success(),
         "a malformed config must not hard-fail"
@@ -467,7 +508,7 @@ fn a_world_writable_project_config_is_skipped() {
     let cfg = fx.proj.path().join(".ops.toml");
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "an unsafe config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -538,7 +579,7 @@ fn config_shows_packages_with_their_trust_verdict() {
     fx.write_project("[packages]\nnode = \"nix:nodejs_20\"\n");
 
     // Untrusted: shown, but marked withheld.
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -552,7 +593,7 @@ fn config_shows_packages_with_their_trust_verdict() {
 
     // Trusted: shown plainly, no longer withheld.
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("node -> nix:nodejs_20"),
@@ -651,7 +692,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
     let fx = Fixture::new();
 
     // default when nothing overrides it
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("nixpkgs: nixos-unstable  (default)"),
         "stdout:\n{}",
@@ -661,7 +702,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
     // an untrusted project override is a security field: ignored (still default),
     // and not silently
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -675,7 +716,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
 
     // trusting the project applies the pin
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("nixpkgs: nixos-23.11  (project pin)"),
         "a trusted pin must apply:\n{}",
@@ -698,7 +739,7 @@ fn config_shows_the_locked_revision_once_resolved() {
     )
     .unwrap();
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout)
             .contains("nixpkgs: nixos-unstable @ 9ae611a  (default)"),
@@ -850,7 +891,7 @@ fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("Authorization -> api.github.com"),
@@ -874,7 +915,7 @@ fn an_unregistered_resolver_scheme_drops_the_secret_with_a_warning() {
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "an unknown scheme must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1309,7 +1350,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
 
     // Untrusted: the app shows with its command and package, but its bind is a security
     // field — dropped, with a note on the app.
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "config must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("apps:"), "apps section missing:\n{stdout}");
@@ -1338,7 +1379,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
 
     // Trusted: the bind is honored — no drop note remains.
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("probe: id"),
@@ -1359,7 +1400,7 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
         "claude",
         "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n",
     );
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -1384,7 +1425,7 @@ fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project(
     // An untrusted project tries to override the very same app's command and widen its network.
     fx.write_project("[app.claude]\ncmd = [\"evil\"]\nnetwork = \"shared\"\n");
 
-    let out = fx.run(&["config"]);
+    let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The profile's command stands; the untrusted override is refused.
@@ -1439,7 +1480,7 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
     );
 
     // It now resolves as a trusted-by-location app.
-    let cfg = String::from_utf8_lossy(&fx.run(&["config"]).stdout).to_string();
+    let cfg = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
     assert!(cfg.contains("claude: claude"), "{cfg}");
 
     // A second import without --force refuses to clobber.
@@ -1466,7 +1507,7 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
         "rm failed: {}",
         String::from_utf8_lossy(&rm.stderr)
     );
-    let after = String::from_utf8_lossy(&fx.run(&["config"]).stdout).to_string();
+    let after = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
     assert!(
         !after.contains("claude: claude"),
         "removed app lingers:\n{after}"
@@ -1597,7 +1638,7 @@ fn the_shipped_profiles_import_and_resolve() {
         dir.display()
     );
     // Each imported profile now resolves as an app (`ops config` lists it by name).
-    let cfg = String::from_utf8_lossy(&fx.run(&["config"]).stdout).to_string();
+    let cfg = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
     for name in &imported {
         assert!(
             cfg.contains(&format!("{name}:")),
@@ -1672,7 +1713,7 @@ fn config_set_with_trust_applies_a_security_field_at_once() {
         "--trust should report the file is now trusted"
     );
 
-    let view = fx.run(&["config"]);
+    let view = fx.run(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&view.stdout).contains("network: none"),
         "the trusted security field must apply:\n{}",
@@ -1690,7 +1731,7 @@ fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
         "an untrusted security write should note it needs trust"
     );
     // And the launch would not honor it: the resolved view still shows the default.
-    let view = fx.run(&["config"]);
+    let view = fx.run(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&view.stdout).contains("network: shared"),
         "an untrusted network choice is withheld"

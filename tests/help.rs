@@ -39,6 +39,7 @@ const PATHS: &[&[&str]] = &[
     &["trust"],
     &["untrust"],
     &["config"],
+    &["config", "show"],
     &["config", "get"],
     &["config", "set"],
     &["config", "unset"],

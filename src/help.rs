@@ -197,23 +197,16 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config"],
-        synopsis: "ops config [--json]",
-        summary: "show the resolved configuration for the current project",
-        options: &[(
-            "--json",
-            "print the resolved configuration as JSON (for scripts and tooling)",
-        )],
+        synopsis: "ops config <subcommand>",
+        summary: "inspect and edit the project configuration",
+        options: &[],
         details:
-            "Shows the resolved configuration for the current project — the layered global and\n\
-            project environment, binds, packages, tools, network, GUI, secrets, and app\n\
-            profiles, after the trust gate has dropped anything an untrusted project may not\n\
-            set. Warnings explain what was dropped and why. No launch, no nix, no network.\n\
+            "Inspect or edit the configuration for the current project. `ops config show` prints\n\
+            the resolved, trust-gated view a launch would use (add --json for the machine-readable\n\
+            model); get/set/unset read and edit a single raw layer file; path prints which file a\n\
+            scope targets; and edit opens it in your editor.\n\
             \n\
-            With --json, the same resolved model is printed as a JSON document (warnings\n\
-            included as a field) — the machine-readable form the human output renders.\n\
-            \n\
-            The verbs get/set/unset read and edit a single raw layer file; path prints which\n\
-            file a scope targets.",
+            Run `ops config show` for the resolved configuration, or one of the subcommands below.",
     },
     Page {
         path: &["config", "get"],
@@ -227,9 +220,9 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Prints the value declared at a dotted key in one layer file. This is the raw declared\n\
-            value in that file — for the effective resolved value across layers, use `ops config`\n\
-            or `ops config --json`. An unset key exits 1; an array or table value is edited with\n\
-            `ops config edit`, not read as a single value.",
+            value in that file — for the effective resolved value across layers, use `ops config\n\
+            show` (or `ops config show --json`). An unset key exits 1; an array or table value is\n\
+            edited with `ops config edit`, not read as a single value.",
     },
     Page {
         path: &["config", "set"],
@@ -299,6 +292,23 @@ const PAGES: &[Page] = &[
             fields `set` does not handle as a single value, such as binds, an allowlist, secrets,\n\
             or app tables. An edit that changes a file you had trusted re-arms its trust gate, so\n\
             it warns to re-run `ops trust`; pass --trust to re-trust as the editor closes.",
+    },
+    Page {
+        path: &["config", "show"],
+        synopsis: "ops config show [--json]",
+        summary: "show the resolved configuration for the current project",
+        options: &[(
+            "--json",
+            "print the resolved configuration as JSON (for scripts and tooling)",
+        )],
+        details:
+            "Shows the resolved configuration for the current project — the layered global and\n\
+            project environment, binds, packages, tools, network, GUI, secrets, and app\n\
+            profiles, after the trust gate has dropped anything an untrusted project may not\n\
+            set. Warnings explain what was dropped and why. No launch, no nix, no network.\n\
+            \n\
+            With --json, the same resolved model is printed as a JSON document (warnings\n\
+            included as a field) — the machine-readable form the human output renders.",
     },
     Page {
         path: &["upgrade"],
@@ -389,7 +399,7 @@ const PAGES: &[Page] = &[
         options: &[],
         details:
             "The imported profiles `import`/`rm` manage, by name. The full resolved app set —\n\
-            inline, project, and profile apps with their gating — is `ops config`.",
+            inline, project, and profile apps with their gating — is `ops config show`.",
     },
     // ---- test subcommands ---------------------------------------------------------
     Page {
@@ -744,6 +754,14 @@ pub fn dispatch(args: Vec<OsString>) -> ExitCode {
 /// it to stderr and exits non-zero). Color is decided for stderr.
 pub fn top_level_usage() -> String {
     top_level(&Palette::for_stream(std::io::stderr().is_terminal()))
+}
+
+/// Render a command's page to a string for a no-subcommand usage error — the caller writes it to
+/// stderr and exits non-zero, the way bare `ops` writes [`top_level_usage`]. The page lists the
+/// command's subcommands, so `ops config` reveals `show`/`get`/… instead of silently acting. An
+/// unknown path (only an internal caller can pass one) yields `None`. Color is decided for stderr.
+pub fn page_usage(path: &[&str]) -> Option<String> {
+    find(path).map(|page| render(page, &Palette::for_stream(std::io::stderr().is_terminal())))
 }
 
 #[cfg(test)]

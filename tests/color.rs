@@ -63,6 +63,9 @@ fn captured_output_carries_no_ansi_escapes() {
     // included even though it probes the host — its output is captured, so it too must be plain.
     // `trust` precedes `untrust` so the revoke finds the marker it recorded (the `existed` path).
     let invocations: &[&[&str]] = &[
+        &["config", "show"],
+        // Bare `config` prints its page to stderr (a no-subcommand usage error) — captured, so it
+        // too must be plain.
         &["config"],
         &["ls"],
         &["plugins", "list"],

@@ -1959,7 +1959,12 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
 
     // `ops config` confirms the secret is honored host-side (not silently dropped), so the
     // cage-absence below is meaningful — and it must show the source by locator, never a value.
-    let cfg = ops_in(project.path(), data.path(), state.path(), &["config"]);
+    let cfg = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["config", "show"],
+    );
     let cfg_out = String::from_utf8_lossy(&cfg.stdout);
     assert!(
         cfg_out.contains("Authorization -> cache.nixos.org")
@@ -2054,7 +2059,12 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     );
 
     // `ops config` shows the plugin-backed source honored, by scheme + locator (never a value).
-    let cfg = ops_in(project.path(), data.path(), state.path(), &["config"]);
+    let cfg = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["config", "show"],
+    );
     let cfg_out = String::from_utf8_lossy(&cfg.stdout);
     assert!(
         cfg_out.contains("Authorization -> cache.nixos.org")
