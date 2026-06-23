@@ -2789,7 +2789,7 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // their roll runs `mise upgrade` inside a cage (per home) rather than rewriting a lock.
         // Pass the already-loaded config: the groups are computed from it before any sandbox
         // work, so a project with no `mise:` package keeps this cheap and sandbox-free.
-        ok &= sandbox::upgrade_mise_packages(&cfg);
+        ok &= sandbox::upgrade_mise_packages(&cfg, &pal);
     }
     if matches!(what, "flake" | "all") {
         // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the

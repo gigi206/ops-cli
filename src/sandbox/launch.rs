@@ -565,20 +565,24 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
 /// `ops upgrade nix`/`all` keeps its cheap, sandbox-free common path. With work to do, a host
 /// that cannot sandbox warns and rolls nothing rather than failing (best-effort, like the
 /// cgroup limits).
-pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
-    println!("ops upgrade — mise packages");
+pub(crate) fn upgrade_mise_packages(
+    cfg: &crate::config::Resolved,
+    pal: &crate::style::Palette,
+) -> bool {
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    println!("{h}ops upgrade — mise packages{r}");
     let groups = mise_package_groups(cfg);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
     // read as "nothing declared" — parity with the `nix:` tools path, which warns the same.
     let withheld = withheld_mise_packages(cfg);
     if withheld > 0 {
         println!(
-            "  {withheld} mise: package(s) withheld (untrusted) — not rolled; run `ops trust`."
+            "  {warn}{withheld} mise: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
         );
     }
     if groups.is_empty() {
         if withheld == 0 {
-            println!("  no mise: packages to roll.");
+            println!("  {dim}no mise: packages to roll.{r}");
         }
         return true;
     }
@@ -588,9 +592,7 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
         Ok(p) => p,
         Err(_) => {
             // prepare() already printed the pointed reason (missing bwrap/userns/nix).
-            eprintln!(
-                "ops upgrade — mise packages: skipped (no usable sandbox; see `ops doctor`)."
-            );
+            crate::diag::warn("mise packages: skipped — no usable sandbox; see `ops doctor`");
             return true;
         }
     };
@@ -602,10 +604,10 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
         // `network = "none"` cannot fetch — the launch skips the equip there — so skip the roll
         // too (the tool stays at its persisted version). Not a failure: it is the declared posture.
         if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
-            println!("  [{label}] network = \"none\" — cannot fetch, skipped.");
+            println!("  [{n}{label}{r}] network = \"none\" — cannot fetch, {dim}skipped.{r}");
             continue;
         }
-        println!("  [{label}] mise upgrade {}", tokens.join(", "));
+        println!("  [{n}{label}{r}] mise upgrade {n}{}{r}", tokens.join(", "));
 
         // Launch a cage in this group's home with its merged config so `build` sees the right
         // network/packages/home. The baseline warnings were already surfaced by `upgrade_cmd`,
@@ -635,7 +637,7 @@ pub(crate) fn upgrade_mise_packages(cfg: &crate::config::Resolved) -> bool {
         let code = run_status(&prep.bwrap, &spec);
         drop(egress);
         if code != 0 {
-            eprintln!("  [{label}] mise upgrade exited {code}");
+            crate::diag::warn(&format!("`{label}`: mise upgrade exited {code}"));
             ok = false;
         }
     }
