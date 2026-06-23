@@ -187,4 +187,17 @@ fn transactional_confirmations_are_plain_when_captured() {
     let unset = run(&["config", "unset", "env.FOO"], home.path(), cwd.path());
     assert!(unset.status.success(), "config unset must succeed");
     assert_no_ansi(&unset, "config unset");
+
+    // session verbs: `stop --all` on an empty registry hits the dimmed "no active sessions" stdout
+    // line with no live session, no nix, no network — exactly as cheap as the cases above, and the
+    // one session-verb confirmation reachable end to end (the stop-outcome and attach lines need a
+    // live cage, so they stay presenter-unit-tested). This proves `stop` built its palette from the
+    // captured stream rather than hardcoding `colored()`.
+    let stop_all = run(&["stop", "--all"], home.path(), cwd.path());
+    assert!(
+        stop_all.status.success(),
+        "stop --all on an empty registry must exit 0:\n{}",
+        String::from_utf8_lossy(&stop_all.stderr)
+    );
+    assert_no_ansi(&stop_all, "stop --all");
 }

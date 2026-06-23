@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io;
+use std::io::IsTerminal;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
@@ -1077,6 +1078,25 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
     }
 }
 
+/// Render the line `ops attach` prints before opening a second terminal in a plain session's
+/// project (stderr). Attaching is an announcement, not a completed change, so the verb stays plain;
+/// the project path is the identifier (cyan) and the parenthetical is secondary detail (dim).
+fn render_attaching_project(project: &Path, pal: &crate::style::Palette) -> String {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    format!(
+        "ops: attaching a shell to {n}{}{r} {dim}(a second terminal in the same sandbox){r}",
+        project.display()
+    )
+}
+
+/// Render the line `ops attach` prints before opening a shell in an app's isolated environment
+/// (stderr). Same restraint as [`render_attaching_project`]: the app name is the identifier (cyan),
+/// the parenthetical secondary (dim), the verb plain.
+fn render_attaching_app(name: &str, pal: &crate::style::Palette) -> String {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    format!("ops: attaching a shell to app `{n}{name}{r}` {dim}(its isolated home and posture){r}")
+}
+
 /// `ops attach <id>`: open an interactive shell in a running session's environment — a second
 /// terminal sharing that session's persistent home and store (the deterministic per-project
 /// runtime), **not** a join of the running process (there is no setns). `<id>` is the PID `ops ls`
@@ -1125,15 +1145,20 @@ pub(crate) fn attach(id: &str) -> ExitCode {
     };
     match runtime {
         session::SessionRuntime::Project => {
-            eprintln!(
-                "ops: attaching a shell to {} (a second terminal in the same sandbox)",
-                project.display()
-            );
+            let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
+            eprintln!("{}", render_attaching_project(&project, &epal));
             launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
         }
         session::SessionRuntime::GlobalApp(name) => attach_app_shell(prep, &name, true),
         session::SessionRuntime::ProjectApp(name) => attach_app_shell(prep, &name, false),
     }
+}
+
+/// Render the `ops stop --all` line for an empty registry (stdout): nothing to stop is a no-op
+/// success, so the message is secondary detail (dim).
+fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
+    let (dim, r) = (pal.dim, pal.reset);
+    format!("ops stop: {dim}no active sessions to stop.{r}")
 }
 
 /// `ops stop <id>...` / `ops stop --all`: stop running sessions. With ids, stop the named ones (the
@@ -1170,16 +1195,21 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
         }
     };
 
+    // The outcome lines go to stderr, so they take their hue from stderr — built once, not per
+    // session in the `--all` loop.
+    let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
+
     if all {
         if sessions.is_empty() {
-            println!("ops stop: no active sessions to stop.");
+            let pal = crate::style::Palette::for_stream(io::stdout().is_terminal());
+            println!("{}", render_no_active_sessions(&pal));
             return ExitCode::SUCCESS;
         }
         // Sessions are independent cages (separate pid namespaces), so they are torn down one after
         // another — never interfering. A well-behaved agent exits on SIGTERM well before its grace
         // window elapses, so this is not grace-per-session in practice.
         for target in &sessions {
-            stop_session(&registry, target, grace);
+            stop_session(&registry, target, grace, &epal);
         }
         return ExitCode::SUCCESS;
     }
@@ -1191,7 +1221,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
             any_missing = true;
             continue;
         };
-        stop_session(&registry, target, grace);
+        stop_session(&registry, target, grace, &epal);
     }
 
     if any_missing {
@@ -1201,26 +1231,48 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     }
 }
 
+/// Render one session's stop outcome (stderr): a clean SIGTERM stop is a real change (green
+/// `stopped`), an already-exited session is a no-op (dim), and a forced SIGKILL is the caution hue
+/// (yellow). The pid and label identify the session (cyan).
+fn render_stop_outcome(
+    pid: u32,
+    label: &str,
+    outcome: &session::StopOutcome,
+    grace: Duration,
+    pal: &crate::style::Palette,
+) -> String {
+    let (n, ok, warn, dim, r) = (pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    match outcome {
+        session::StopOutcome::AlreadyGone => {
+            format!("ops stop: session {n}{pid}{r} ({n}{label}{r}) {dim}had already exited{r}.")
+        }
+        session::StopOutcome::Terminated => {
+            format!("ops stop: {ok}stopped{r} session {n}{pid}{r} ({n}{label}{r}).")
+        }
+        session::StopOutcome::Killed => {
+            format!(
+                "ops stop: session {n}{pid}{r} ({n}{label}{r}) did not exit within {}s — \
+                 {warn}sent SIGKILL{r}.",
+                grace.as_secs()
+            )
+        }
+    }
+}
+
 /// Stop one resolved session and reap its record: SIGTERM, then SIGKILL after `grace`, report the
 /// outcome by pid and label, and drop the record so `ops ls` is clean at once rather than waiting
 /// for the killed process to stop reading as a zombie.
-fn stop_session(registry: &session::Registry, target: &session::Session, grace: Duration) {
-    let pid = target.pid;
-    let label = target.label();
-    match target.stop(grace) {
-        session::StopOutcome::AlreadyGone => {
-            eprintln!("ops stop: session {pid} ({label}) had already exited.");
-        }
-        session::StopOutcome::Terminated => {
-            eprintln!("ops stop: stopped session {pid} ({label}).");
-        }
-        session::StopOutcome::Killed => {
-            eprintln!(
-                "ops stop: session {pid} ({label}) did not exit within {}s — sent SIGKILL.",
-                grace.as_secs()
-            );
-        }
-    }
+fn stop_session(
+    registry: &session::Registry,
+    target: &session::Session,
+    grace: Duration,
+    pal: &crate::style::Palette,
+) {
+    let outcome = target.stop(grace);
+    eprintln!(
+        "{}",
+        render_stop_outcome(target.pid, &target.label(), &outcome, grace, pal)
+    );
     registry.reap(target);
 }
 
@@ -1251,7 +1303,8 @@ fn attach_app_shell(mut prep: Prepared, name: &str, global_home: bool) -> ExitCo
     } else {
         binds::Runtime::ProjectApp(name)
     };
-    eprintln!("ops: attaching a shell to app `{name}` (its isolated home and posture)");
+    let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
+    eprintln!("{}", render_attaching_app(name, &epal));
     launch_interactive_shell(&prep, runtime)
 }
 
@@ -2417,6 +2470,77 @@ mod tests {
             session_runtime(binds::Runtime::ProjectApp("agent")),
             session::SessionRuntime::ProjectApp("agent".to_string())
         );
+    }
+
+    #[test]
+    fn session_verb_confirmations_are_plain_text_when_uncolored() {
+        // A plain palette must leave every confirmation byte-for-byte plain, so a captured stream
+        // (and the existing `ops stop --all` substring assertion) stays unchanged.
+        let p = crate::style::Palette::plain();
+        let grace = Duration::from_secs(10);
+        assert_eq!(
+            render_attaching_project(Path::new("/home/me/proj"), &p),
+            "ops: attaching a shell to /home/me/proj (a second terminal in the same sandbox)"
+        );
+        assert_eq!(
+            render_attaching_app("claude-code", &p),
+            "ops: attaching a shell to app `claude-code` (its isolated home and posture)"
+        );
+        assert_eq!(
+            render_no_active_sessions(&p),
+            "ops stop: no active sessions to stop."
+        );
+        assert_eq!(
+            render_stop_outcome(4242, "run", &session::StopOutcome::Terminated, grace, &p),
+            "ops stop: stopped session 4242 (run)."
+        );
+        assert_eq!(
+            render_stop_outcome(
+                7,
+                "app:agent",
+                &session::StopOutcome::AlreadyGone,
+                grace,
+                &p
+            ),
+            "ops stop: session 7 (app:agent) had already exited."
+        );
+        assert_eq!(
+            render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p),
+            "ops stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
+        );
+    }
+
+    #[test]
+    fn session_verb_confirmations_color_their_outcome_and_identifier_spans() {
+        // The hue carries the meaning: a clean stop is a real change (green), a forced kill is the
+        // caution hue (yellow), a no-op is dim, and an identifier is cyan. The verb of an attach
+        // announcement stays plain (it is not a completed state change).
+        let p = crate::style::Palette::colored();
+        let grace = Duration::from_secs(10);
+
+        let stopped =
+            render_stop_outcome(4242, "run", &session::StopOutcome::Terminated, grace, &p);
+        assert!(stopped.contains(&format!("{}stopped{}", p.ok, p.reset)));
+        assert!(stopped.contains(&format!("{}4242{}", p.name, p.reset)));
+
+        let gone = render_stop_outcome(
+            7,
+            "app:agent",
+            &session::StopOutcome::AlreadyGone,
+            grace,
+            &p,
+        );
+        assert!(gone.contains(&format!("{}had already exited{}", p.dim, p.reset)));
+
+        let killed = render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p);
+        assert!(killed.contains(&format!("{}sent SIGKILL{}", p.warn, p.reset)));
+
+        let attach = render_attaching_app("claude-code", &p);
+        assert!(attach.contains(&format!("{}claude-code{}", p.name, p.reset)));
+        // The announcement verb is not green — only a completed change earns that.
+        assert!(!attach.contains(&format!("{}attaching", p.ok)));
+
+        assert!(render_no_active_sessions(&p).contains(p.dim));
     }
 
     /// A minimal resolved config carrying only the channel choices the builder reads.
