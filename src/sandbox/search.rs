@@ -17,6 +17,7 @@
 //! rendering are split from the single impure fetch so the policy is testable offline.
 
 use crate::store::Layout;
+use crate::style::Palette;
 use std::io;
 use std::path::Path;
 
@@ -72,7 +73,13 @@ enum Exact {
 /// Run a search: fetch the fuzzy matches, and when the query names a package exactly,
 /// its versions too, then render the report. The only impure steps are the two GETs,
 /// both through the shared nix fetcher.
-pub(crate) fn run(nix: &Path, layout: &Layout, query: &str, system: &str) -> io::Result<String> {
+pub(crate) fn run(
+    nix: &Path,
+    layout: &Layout,
+    query: &str,
+    system: &str,
+    pal: &Palette,
+) -> io::Result<String> {
     let url = format!(
         "{}{}",
         super::nixhub::NIXHUB_SEARCH_BASE,
@@ -102,7 +109,7 @@ pub(crate) fn run(nix: &Path, layout: &Layout, query: &str, system: &str) -> io:
             },
         );
 
-    Ok(render(query, &matches, exact.as_ref(), system))
+    Ok(render(query, &matches, exact.as_ref(), system, pal))
 }
 
 /// Percent-encode a free-form query for a URL query value: keep the RFC 3986 unreserved
@@ -171,11 +178,18 @@ fn parse_versions(metadata: &serde_json::Value, system: &str) -> Vec<VersionRow>
 /// versions and the lines to declare it (what the user came for), then a compact footer
 /// of the sibling hits; otherwise list the fuzzy matches and nudge toward an exact name.
 /// Pure, so the exact layout is asserted in a test.
-fn render(query: &str, matches: &[Match], exact: Option<&Exact>, system: &str) -> String {
+fn render(
+    query: &str,
+    matches: &[Match],
+    exact: Option<&Exact>,
+    system: &str,
+    pal: &Palette,
+) -> String {
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut out = String::new();
     if matches.is_empty() {
         out.push_str(&format!(
-            "ops search \"{query}\" — no packages found on nixhub\n"
+            "{h}ops search{r} \"{query}\" — no packages found on nixhub\n"
         ));
         return out;
     }
@@ -187,14 +201,16 @@ fn render(query: &str, matches: &[Match], exact: Option<&Exact>, system: &str) -
             versions,
         }) if !versions.is_empty() => {
             if summary.is_empty() {
-                out.push_str(&format!("ops search \"{query}\" — `{pkg}`\n\n"));
+                out.push_str(&format!("{h}ops search{r} \"{query}\" — `{n}{pkg}{r}`\n\n"));
             } else {
-                out.push_str(&format!("ops search \"{query}\" — `{pkg}`: {summary}\n\n"));
+                out.push_str(&format!(
+                    "{h}ops search{r} \"{query}\" — `{n}{pkg}{r}`: {summary}\n\n"
+                ));
             }
-            out.push_str(&format!("versions for {system} (newest first):\n"));
+            out.push_str(&format!("{h}versions for {system} (newest first):{r}\n"));
             for row in versions.iter().take(MAX_VERSIONS) {
                 let short = row.commit.get(..7).unwrap_or(row.commit.as_str());
-                out.push_str(&format!("  {:<12} {short}\n", row.version));
+                out.push_str(&format!("  {n}{:<12}{r} {dim}{short}{r}\n", row.version));
             }
             if versions.len() > MAX_VERSIONS {
                 out.push_str(&format!(
@@ -205,29 +221,33 @@ fn render(query: &str, matches: &[Match], exact: Option<&Exact>, system: &str) -
             // The attribute is usually the package name but not always, so quote the real
             // one from the newest release for the `[packages]` form.
             let (latest, attr) = (&versions[0].version, &versions[0].attr);
-            out.push_str("\ndeclare it:\n");
+            out.push_str(&format!("\n{h}declare it:{r}\n"));
             out.push_str(&format!(
-                "  [tools]     \"nix:{pkg}\" = \"{latest}\"   (or \"latest\")\n"
+                "  [tools]     \"{n}nix:{pkg}{r}\" = \"{n}{latest}{r}\"   (or \"latest\")\n"
             ));
-            out.push_str(&format!("  [packages]  {pkg} = \"nix:{attr}\"\n"));
-            push_related(&mut out, pkg, matches);
+            out.push_str(&format!(
+                "  [packages]  {n}{pkg}{r} = \"{n}nix:{attr}{r}\"\n"
+            ));
+            push_related(&mut out, pkg, matches, pal);
         }
         // The query named a real package, but it ships no build for this host.
         Some(Exact::Resolved { pkg, .. }) => {
-            push_match_table(&mut out, query, matches);
-            out.push_str(&format!("\n`{pkg}` has no release built for {system}.\n"));
+            push_match_table(&mut out, query, matches, pal);
+            out.push_str(&format!(
+                "\n`{n}{pkg}{r}` has no release built for {system}.\n"
+            ));
         }
         // The exact name was found, but its version fetch failed — the list still stands,
         // so show it and say why the version block is missing (never the "name a package
         // exactly" nudge: the user already named one).
         Some(Exact::Unavailable { pkg }) => {
-            push_match_table(&mut out, query, matches);
+            push_match_table(&mut out, query, matches, pal);
             out.push_str(&format!(
-                "\ncould not fetch versions for `{pkg}` — try `ops search {pkg}` again.\n"
+                "\ncould not fetch versions for `{n}{pkg}{r}` — try `ops search {pkg}` again.\n"
             ));
         }
         None => {
-            push_match_table(&mut out, query, matches);
+            push_match_table(&mut out, query, matches, pal);
             out.push_str(&format!(
                 "\nname a package exactly to see its versions, e.g. `ops search {}`\n",
                 matches[0].name
@@ -239,9 +259,10 @@ fn render(query: &str, matches: &[Match], exact: Option<&Exact>, system: &str) -
 
 /// The fuzzy matches as an aligned `name  summary` table, capped so a large result set
 /// stays scannable and one long attribute path does not blow out the column.
-fn push_match_table(out: &mut String, query: &str, matches: &[Match]) {
+fn push_match_table(out: &mut String, query: &str, matches: &[Match], pal: &Palette) {
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
     out.push_str(&format!(
-        "ops search \"{query}\" — {} match{} on nixhub\n\n",
+        "{h}ops search{r} \"{query}\" — {} match{} on nixhub\n\n",
         matches.len(),
         if matches.len() == 1 { "" } else { "es" }
     ));
@@ -254,9 +275,9 @@ fn push_match_table(out: &mut String, query: &str, matches: &[Match]) {
         .min(NAME_COL);
     for m in &matches[..shown] {
         if m.summary.is_empty() {
-            out.push_str(&format!("  {}\n", m.name));
+            out.push_str(&format!("  {n}{}{r}\n", m.name));
         } else {
-            out.push_str(&format!("  {:<width$}  {}\n", m.name, m.summary));
+            out.push_str(&format!("  {n}{:<width$}{r}  {}\n", m.name, m.summary));
         }
     }
     if matches.len() > shown {
@@ -265,17 +286,23 @@ fn push_match_table(out: &mut String, query: &str, matches: &[Match]) {
 }
 
 /// The sibling hits (every match but the exact one), names only, on one footer line.
-fn push_related(out: &mut String, pkg: &str, matches: &[Match]) {
+fn push_related(out: &mut String, pkg: &str, matches: &[Match], pal: &Palette) {
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
     let related: Vec<&str> = matches
         .iter()
         .map(|m| m.name.as_str())
-        .filter(|n| *n != pkg)
+        .filter(|name| *name != pkg)
         .collect();
     if related.is_empty() {
         return;
     }
     let shown = related.len().min(RELATED);
-    out.push_str(&format!("\nrelated: {}", related[..shown].join(", ")));
+    let names = related[..shown]
+        .iter()
+        .map(|name| format!("{n}{name}{r}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!("\n{h}related:{r} {names}"));
     if related.len() > shown {
         out.push_str(&format!(", … ({} more)", related.len() - shown));
     }
@@ -372,7 +399,7 @@ mod tests {
     #[test]
     fn render_lists_matches_and_points_at_an_exact_name_when_none_matches() {
         let matches = parse_matches(&search_json());
-        let out = render("js", &matches, None, "x86_64-linux");
+        let out = render("js", &matches, None, "x86_64-linux", &Palette::plain());
         assert!(out.contains("3 matches on nixhub"));
         assert!(out.contains("jq-lsp") && out.contains("jq language server"));
         // no exact hit -> it nudges toward a concrete name, shows no versions block
@@ -389,7 +416,13 @@ mod tests {
             summary: "JSON processor".to_string(),
             versions,
         };
-        let out = render("jq", &matches, Some(&exact), "x86_64-linux");
+        let out = render(
+            "jq",
+            &matches,
+            Some(&exact),
+            "x86_64-linux",
+            &Palette::plain(),
+        );
         // leads with the exact package's versions and short commit
         assert!(out.contains("`jq`: JSON processor"));
         assert!(out.contains("versions for x86_64-linux"));
@@ -414,7 +447,13 @@ mod tests {
             summary: "summary".to_string(),
             versions: Vec::new(),
         };
-        let out = render("jq", &matches, Some(&exact), "riscv64-linux");
+        let out = render(
+            "jq",
+            &matches,
+            Some(&exact),
+            "riscv64-linux",
+            &Palette::plain(),
+        );
         assert!(out.contains("no release built for riscv64-linux"));
         assert!(!out.contains("declare it:"));
     }
@@ -428,7 +467,13 @@ mod tests {
         let exact = Exact::Unavailable {
             pkg: "jq".to_string(),
         };
-        let out = render("jq", &matches, Some(&exact), "x86_64-linux");
+        let out = render(
+            "jq",
+            &matches,
+            Some(&exact),
+            "x86_64-linux",
+            &Palette::plain(),
+        );
         assert!(out.contains("3 matches on nixhub") && out.contains("jq-lsp"));
         assert!(out.contains("could not fetch versions for `jq`"));
         assert!(!out.contains("name a package exactly"));
@@ -438,8 +483,35 @@ mod tests {
 
     #[test]
     fn render_handles_no_results() {
-        let out = render("zzzznotarealpkg", &[], None, "x86_64-linux");
+        let out = render(
+            "zzzznotarealpkg",
+            &[],
+            None,
+            "x86_64-linux",
+            &Palette::plain(),
+        );
         assert!(out.contains("no packages found"));
+    }
+
+    #[test]
+    fn a_colored_render_wraps_the_package_name_and_resets() {
+        // The ON path the plain-output tests cannot see: the package name is wrapped in the
+        // name span and the styling is closed with a reset (catches a wrong span or a missing
+        // reset that would only ever manifest on a terminal).
+        let matches = parse_matches(&search_json());
+        let versions = parse_versions(&metadata(), "x86_64-linux");
+        let exact = Exact::Resolved {
+            pkg: "jq".to_string(),
+            summary: "JSON processor".to_string(),
+            versions,
+        };
+        let pal = Palette::colored();
+        let out = render("jq", &matches, Some(&exact), "x86_64-linux", &pal);
+        assert!(
+            out.contains(&format!("{}jq{}", pal.name, pal.reset)),
+            "the package name must be wrapped in the name span and reset:\n{out}"
+        );
+        assert!(out.contains(pal.head), "the headers must be styled:\n{out}");
     }
 }
 
@@ -462,7 +534,13 @@ mod search_tests {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
 
-        let out = match run(&nix, &layout, "jq", &super::super::nixhub::current_system()) {
+        let out = match run(
+            &nix,
+            &layout,
+            "jq",
+            &super::super::nixhub::current_system(),
+            &Palette::plain(),
+        ) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("skipping nixhub search: {e}");

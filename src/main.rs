@@ -417,7 +417,12 @@ fn list_sessions() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    println!("{:<14}  {:>8}  {:>8}  PROJECT", "KIND", "PID", "AGE");
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    // The header is padded first, then wrapped, so the color spans never count toward the
+    // column widths and the alignment is identical with or without color.
+    let header = format!("{:<14}  {:>8}  {:>8}  PROJECT", "KIND", "PID", "AGE");
+    println!("{h}{header}{r}");
     let uptime = uptime_seconds();
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     for s in &sessions {
@@ -429,10 +434,11 @@ fn list_sessions() -> ExitCode {
             _ => "?".to_string(),
         };
         // An app session shows its app name (`app:<name>`), so the user can tell which sessions are
-        // agents — and that `ops attach`/`ops stop` act on that app's isolated environment.
+        // agents — and that `ops attach`/`ops stop` act on that app's isolated environment. The
+        // label is padded before coloring so the spans do not disturb the column width.
+        let label = format!("{:<14}", s.label());
         println!(
-            "{:<14}  {:>8}  {:>8}  {}",
-            s.label(),
+            "{n}{label}{r}  {:>8}  {:>8}  {}",
             s.pid,
             age,
             s.project.display()
@@ -1587,7 +1593,8 @@ fn search_cmd(args: Vec<OsString>) -> ExitCode {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
-    match sandbox::search(&nix, &layout, query, &sandbox::current_system()) {
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    match sandbox::search(&nix, &layout, query, &sandbox::current_system(), &pal) {
         Ok(report) => {
             print!("{report}");
             ExitCode::SUCCESS
@@ -1637,15 +1644,17 @@ fn net_test(args: &[OsString]) -> ExitCode {
     for w in &resolved.warnings {
         eprintln!("ops: warning: {w}");
     }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, r) = (pal.head, pal.reset);
     match &resolved.network {
         config::NetworkPolicy::Shared => {
             println!(
-                "network: shared (host network) — every URL is reachable; no allowlist to test"
+                "{h}network:{r} shared (host network) — every URL is reachable; no allowlist to test"
             );
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Isolated => {
-            println!("network: none (isolated) — no URL is reachable");
+            println!("{h}network:{r} none (isolated) — no URL is reachable");
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Allowlist(policy) => {
@@ -1656,23 +1665,36 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match policy.explain(&host, port, &path) {
-                allowlist::Decision::AllowedBy(rule) => {
-                    println!("ALLOWED  {url}");
-                    println!("  by allow rule: {rule}");
-                }
-                allowlist::Decision::DeniedBy(rule) => {
-                    println!("DENIED   {url}");
-                    println!("  by deny rule (deny wins): {rule}");
-                }
-                allowlist::Decision::DeniedDefault => {
-                    println!("DENIED   {url}");
-                    println!("  no allow rule matches (deny-by-default)");
-                }
-            }
+            let decision = policy.explain(&host, port, &path);
+            print!("{}", render_net_decision(url, &decision, &pal));
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Render an egress allowlist decision — a pure presenter (so its colored layout is asserted in a
+/// test): the verdict (`ALLOWED` green / `DENIED` red), the URL and the deciding rule as
+/// identifiers (cyan, matching how `ops config` renders allow/deny rules), and the reason as
+/// de-emphasized prose. Every span is empty under a non-terminal, so a capture is plain text.
+fn render_net_decision(url: &str, decision: &allowlist::Decision, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (n, ok, err, dim, r) = (pal.name, pal.ok, pal.err, pal.dim, pal.reset);
+    let mut o = String::new();
+    match decision {
+        allowlist::Decision::AllowedBy(rule) => {
+            let _ = writeln!(o, "{ok}ALLOWED{r}  {n}{url}{r}");
+            let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+        }
+        allowlist::Decision::DeniedBy(rule) => {
+            let _ = writeln!(o, "{err}DENIED{r}   {n}{url}{r}");
+            let _ = writeln!(o, "  {dim}by deny rule (deny wins):{r} {n}{rule}{r}");
+        }
+        allowlist::Decision::DeniedDefault => {
+            let _ = writeln!(o, "{err}DENIED{r}   {n}{url}{r}");
+            let _ = writeln!(o, "  {dim}no allow rule matches (deny-by-default){r}");
+        }
+    }
+    o
 }
 
 /// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
@@ -1721,36 +1743,38 @@ fn plugins_list() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, dim, err, r) = (pal.head, pal.name, pal.dim, pal.err, pal.reset);
     println!(
-        "built-in schemes (always resolve, never a plugin): {}",
+        "{h}built-in schemes{r} (always resolve, never a plugin): {n}{}{r}",
         plugins::builtin_schemes().join(", ")
     );
     if registry.is_empty() {
-        println!("installed resolver plugins: (none)");
+        println!("{h}installed resolver plugins:{r} (none)");
     } else {
-        println!("installed resolver plugins:");
+        println!("{h}installed resolver plugins:{r}");
         for p in registry.resolvers() {
             let net = if p.sandbox.network {
                 "network"
             } else {
                 "no-network"
             };
-            print!("  {}://  {}", p.scheme, p.name);
+            print!("  {n}{}://{r}  {n}{}{r}", p.scheme, p.name);
             if let Some(v) = &p.version {
                 print!("  v{v}");
             }
-            print!("  {net}");
+            print!("  {dim}{net}{r}");
             if let Err(why) = p.check_exec() {
-                print!("  [not runnable: {why}]");
+                print!("  {err}[not runnable: {why}]{r}");
             }
             println!();
             if let Some(desc) = &p.description {
-                println!("    {desc}");
+                println!("    {dim}{desc}{r}");
             }
         }
-        println!("(remove one with: ops plugins rm <name>)");
+        println!("{dim}(remove one with: ops plugins rm <name>){r}");
     }
-    println!("(browse the built-in store with: ops plugins store list)");
+    println!("{dim}(browse the built-in store with: ops plugins store list){r}");
     for w in &warnings {
         eprintln!("ops: warning: {w}");
     }
@@ -2162,7 +2186,9 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
         }
     };
 
-    println!("store '{}'", cfg.name);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    println!("{h}store{r} {n}'{}'{r}", cfg.name);
     println!("  url:      {}", cfg.url);
     println!("  key:      {}", plugin_store::to_hex(&cfg.pubkey));
     println!(
@@ -2179,13 +2205,13 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
         Ok(cat) => {
             println!("  plugins:");
             for (pname, entry) in &cat.plugins {
-                print!("    {pname}  ({}://)", entry.scheme);
+                print!("    {n}{pname}{r}  {dim}({}://){r}", entry.scheme);
                 if !entry.version.is_empty() {
                     print!("  v{}", entry.version);
                 }
                 println!();
                 if !entry.description.is_empty() {
-                    println!("      {}", entry.description);
+                    println!("      {dim}{}{r}", entry.description);
                 }
             }
         }
@@ -2226,10 +2252,12 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
 fn plugins_store_list() -> ExitCode {
     let layout = store::Layout::from_env();
     let installed_dir = layout.as_ref().map(|l| l.plugins_dir());
-    println!("built-in plugin store (install one with: ops plugins install <name>):");
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    println!("{h}built-in plugin store{r} (install one with: ops plugins install <name>):");
     for entry in plugins::embedded_listing() {
         let scheme = entry.scheme.as_deref().unwrap_or("?");
-        print!("  {}  ({scheme}://)", entry.name);
+        print!("  {n}{}{r}  {dim}({scheme}://){r}", entry.name);
         if let Some(v) = &entry.version {
             print!("  v{v}");
         }
@@ -2237,11 +2265,11 @@ fn plugins_store_list() -> ExitCode {
             .as_ref()
             .is_some_and(|d| d.join(&entry.name).is_dir());
         if is_installed {
-            print!("  [installed]");
+            print!("  {}[installed]{r}", pal.ok);
         }
         println!();
         if let Some(desc) = &entry.description {
-            println!("    {desc}");
+            println!("    {dim}{desc}{r}");
         }
     }
 
@@ -2249,19 +2277,28 @@ fn plugins_store_list() -> ExitCode {
     if let Some(layout) = &layout {
         let names = stores::list(layout);
         if !names.is_empty() {
-            println!("configured remote stores (update with: ops plugins store update <name>):");
+            println!(
+                "{h}configured remote stores{r} (update with: ops plugins store update <name>):"
+            );
             for name in &names {
                 match stores::read_configured(layout, name) {
                     Ok(cfg) => {
                         let detail = match stores::cached_catalogue(layout, name) {
                             Ok(cat) => {
-                                let n = cat.plugins.len();
-                                format!("{n} plugin{}", if n == 1 { "" } else { "s" })
+                                let count = cat.plugins.len();
+                                format!("{count} plugin{}", if count == 1 { "" } else { "s" })
                             }
                             Err(_) => "catalogue unreadable".to_string(),
                         };
-                        let marker = if cfg.tofu { "  [tofu]" } else { "" };
-                        println!("  {name}  (rev {}, {detail}){marker}", cfg.locked_rev);
+                        let marker = if cfg.tofu {
+                            format!("  {}[tofu]{r}", pal.warn)
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "  {n}{name}{r}  {dim}(rev {}, {detail}){r}{marker}",
+                            cfg.locked_rev
+                        );
                     }
                     Err(why) => eprintln!("ops: warning: store '{name}': {why}"),
                 }
@@ -2321,8 +2358,10 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         eprintln!("ops: no installed resolver plugin claims the scheme '{scheme}'");
         return ExitCode::FAILURE;
     };
-    println!("resolver plugin: {}", p.name);
-    println!("  scheme:      {}://", p.scheme);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
+    println!("{h}resolver plugin:{r} {n}{}{r}", p.name);
+    println!("  scheme:      {n}{}://{r}", p.scheme);
     println!(
         "  version:     {}",
         p.version.as_deref().unwrap_or("(unset)")
@@ -2334,7 +2373,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     print!("  exec:        {}", p.exec.display());
     match p.check_exec() {
         Ok(()) => println!(),
-        Err(why) => println!("  [not runnable: {why}]"),
+        Err(why) => println!("  {err}[not runnable: {why}]{r}"),
     }
     println!("  sandbox grant:");
     println!("    network:     {}", p.sandbox.network);
@@ -2865,6 +2904,33 @@ mod tests {
             "9ae611a"
         );
         assert_eq!(short_rev("abc"), "abc"); // shorter than seven is returned whole
+    }
+
+    #[test]
+    fn net_decision_is_plain_text_when_uncolored() {
+        // The OFF path the integration capture relies on: empty spans, byte-identical plain text.
+        let p = style::Palette::plain();
+        let allowed = render_net_decision("https://x/y", &allowlist::Decision::DeniedDefault, &p);
+        assert_eq!(
+            allowed,
+            "DENIED   https://x/y\n  no allow rule matches (deny-by-default)\n"
+        );
+    }
+
+    #[test]
+    fn net_decision_colors_the_verdict_and_resets() {
+        // The ON path: DENIED is wrapped in the error span and closed with a reset, the URL in
+        // the name span — a mis-mapped verdict or a dropped reset would only ever show here.
+        let p = style::Palette::colored();
+        let denied = render_net_decision("https://x/y", &allowlist::Decision::DeniedDefault, &p);
+        assert!(
+            denied.contains(&format!("{}DENIED{}", p.err, p.reset)),
+            "DENIED must be wrapped in the error span and reset:\n{denied}"
+        );
+        assert!(
+            denied.contains(&format!("{}https://x/y{}", p.name, p.reset)),
+            "the URL must be wrapped in the name span:\n{denied}"
+        );
     }
 
     #[test]
