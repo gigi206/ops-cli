@@ -210,7 +210,79 @@ const PAGES: &[Page] = &[
             set. Warnings explain what was dropped and why. No launch, no nix, no network.\n\
             \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
-            included as a field) — the machine-readable form the human output renders.",
+            included as a field) — the machine-readable form the human output renders.\n\
+            \n\
+            The verbs get/set/unset read and edit a single raw layer file; path prints which\n\
+            file a scope targets.",
+    },
+    Page {
+        path: &["config", "get"],
+        synopsis: "ops config get <key> [--local|--global|-c <file>]",
+        summary: "read a value from a single config file",
+        options: &[
+            ("<key>", "a dotted key, e.g. env.FOO or nixpkgs"),
+            ("--local", "the project .ops.toml (the default)"),
+            ("--global", "the global ops.toml"),
+            ("-c <file>", "an explicit config file"),
+        ],
+        details:
+            "Prints the value declared at a dotted key in one layer file. This is the raw declared\n\
+            value in that file — for the effective resolved value across layers, use `ops config`\n\
+            or `ops config --json`. An unset key exits 1; an array or table value is edited with\n\
+            `ops config edit`, not read as a single value.",
+    },
+    Page {
+        path: &["config", "set"],
+        synopsis: "ops config set <key> <value> [--local|--global|-c <file>] [--trust]",
+        summary: "set a value in a config file (comments preserved)",
+        options: &[
+            ("<key>", "a dotted key, e.g. env.FOO or network"),
+            ("<value>", "the string value to set"),
+            ("--local", "the project .ops.toml (the default)"),
+            ("--global", "the global ops.toml"),
+            ("-c <file>", "an explicit config file"),
+            (
+                "--trust",
+                "re-trust the file after writing (applies its security fields at once)",
+            ),
+        ],
+        details:
+            "Writes a string value at a dotted key, preserving the file's other keys, comments,\n\
+            and formatting. Creates the file and intermediate tables as needed.\n\
+            \n\
+            The trust gate hashes the whole file, so any edit re-arms it: after writing a file\n\
+            you had trusted, its security fields stop applying until you run `ops trust`. Pass\n\
+            --trust to re-trust in one step (this blesses the whole current file). A free env\n\
+            value needs no trust. Array and table fields (binds, an allowlist, secrets, apps) are\n\
+            edited with `ops config edit`.",
+    },
+    Page {
+        path: &["config", "unset"],
+        synopsis: "ops config unset <key> [--local|--global|-c <file>] [--trust]",
+        summary: "remove a key from a config file",
+        options: &[
+            ("<key>", "a dotted key to remove, e.g. env.FOO"),
+            ("--local", "the project .ops.toml (the default)"),
+            ("--global", "the global ops.toml"),
+            ("-c <file>", "an explicit config file"),
+            ("--trust", "re-trust the file after writing"),
+        ],
+        details:
+            "Removes a dotted key from one layer file. Removing a key that is not set changes\n\
+            nothing (and so never re-arms trust). A removal that does change a trusted file\n\
+            re-arms its trust gate, the same as `set`.",
+    },
+    Page {
+        path: &["config", "path"],
+        synopsis: "ops config path [--local|--global|-c <file>]",
+        summary: "print the path of the config file a scope targets",
+        options: &[
+            ("--local", "the project .ops.toml (the default)"),
+            ("--global", "the global ops.toml"),
+            ("-c <file>", "an explicit config file"),
+        ],
+        details: "Prints the path of the file the given scope targets — the file get/set/unset\n\
+            would read or edit. Useful for scripting and for locating the global config.",
     },
     Page {
         path: &["upgrade"],

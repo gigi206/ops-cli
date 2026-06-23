@@ -1613,3 +1613,119 @@ fn ops_app_rm_of_an_absent_profile_points_at_ops_toml() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("ops.toml"));
 }
+
+#[test]
+fn config_get_set_unset_round_trip() {
+    let fx = Fixture::new();
+    // set creates the file; get reads it back; unset removes it; get then exits 1.
+    assert!(fx
+        .run(&["config", "set", "env.FOO", "bar"])
+        .status
+        .success());
+    let got = fx.run(&["config", "get", "env.FOO"]);
+    assert!(got.status.success());
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "bar");
+
+    assert!(fx.run(&["config", "unset", "env.FOO"]).status.success());
+    let missing = fx.run(&["config", "get", "env.FOO"]);
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "an unset key exits 1 (distinct from a usage error)"
+    );
+}
+
+#[test]
+fn config_set_preserves_comments_and_warns_when_it_re_arms_trust() {
+    let fx = Fixture::new();
+    fx.write_project("# a comment to keep\nnixpkgs = \"nixos-23.11\"\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config", "set", "nixpkgs", "nixos-24.05"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("re-armed the trust gate"),
+        "a write to a trusted file must warn:\n{stderr}"
+    );
+    assert!(stderr.contains("ops trust"), "and point at re-trusting");
+
+    let after = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        after.contains("# a comment to keep"),
+        "comment kept:\n{after}"
+    );
+    assert!(
+        after.contains("nixpkgs = \"nixos-24.05\""),
+        "value set:\n{after}"
+    );
+}
+
+#[test]
+fn config_set_with_trust_applies_a_security_field_at_once() {
+    let fx = Fixture::new();
+    // Setting a security field then trusting in one step: the resolved view honors it.
+    let out = fx.run(&["config", "set", "network", "none", "--trust"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("trusted"),
+        "--trust should report the file is now trusted"
+    );
+
+    let view = fx.run(&["config"]);
+    assert!(
+        String::from_utf8_lossy(&view.stdout).contains("network: none"),
+        "the trusted security field must apply:\n{}",
+        String::from_utf8_lossy(&view.stdout)
+    );
+}
+
+#[test]
+fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
+    let fx = Fixture::new();
+    let out = fx.run(&["config", "set", "network", "none"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("security field"),
+        "an untrusted security write should note it needs trust"
+    );
+    // And the launch would not honor it: the resolved view still shows the default.
+    let view = fx.run(&["config"]);
+    assert!(
+        String::from_utf8_lossy(&view.stdout).contains("network: shared"),
+        "an untrusted network choice is withheld"
+    );
+}
+
+#[test]
+fn config_path_reports_the_target_file_per_scope() {
+    let fx = Fixture::new();
+    let local = fx.run(&["config", "path"]);
+    assert!(local.status.success());
+    assert!(String::from_utf8_lossy(&local.stdout)
+        .trim()
+        .ends_with(".ops.toml"));
+
+    let global = fx.run(&["config", "path", "--global"]);
+    assert!(global.status.success());
+    let g = String::from_utf8_lossy(&global.stdout);
+    assert!(
+        g.contains("ops.toml") && !g.contains(".ops.toml"),
+        "global path:\n{g}"
+    );
+}
+
+#[test]
+fn config_set_into_a_non_scalar_field_is_refused() {
+    let fx = Fixture::new();
+    fx.write_project("binds = [\"/tmp\"]\n");
+    let out = fx.run(&["config", "set", "binds", "/var"]);
+    assert!(
+        !out.status.success(),
+        "setting an array as a scalar must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("edit"),
+        "the error should point at `ops config edit`"
+    );
+}

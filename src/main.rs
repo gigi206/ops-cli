@@ -533,13 +533,21 @@ fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
     }
 }
 
-/// `ops config [--json]`: show the resolved configuration for the current project — the
-/// layered global + project environment and read-only binds, after the trust gate has
-/// dropped anything an untrusted project may not set. The human form renders a colored
-/// document with warnings on stderr; `--json` prints the same resolved model as a JSON
-/// document (warnings included as a field), the machine-readable surface a script or a
-/// management front-end consumes.
+/// `ops config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
+/// shows the resolved configuration for the current project — the layered global + project
+/// environment and read-only binds, after the trust gate has dropped anything an untrusted
+/// project may not set. The human form renders a colored document with warnings on stderr;
+/// `--json` prints the same resolved model as a JSON document. The verbs read and edit a single
+/// raw layer file (the project `.ops.toml`, the global config, or an explicit path).
 fn config_cmd(args: Vec<OsString>) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("get") => return config_get(&args[1..]),
+        Some("set") => return config_set(&args[1..]),
+        Some("unset") => return config_unset(&args[1..]),
+        Some("path") => return config_path_cmd(&args[1..]),
+        _ => {}
+    }
+
     let mut json = false;
     for arg in &args {
         match arg.to_str() {
@@ -802,6 +810,274 @@ fn channel_text(c: &config::view::ChannelView) -> String {
         Some(rev) => format!("{} @ {}  ({})", c.source, short_rev(rev), c.origin),
         None => format!("{}  ({})", c.source, c.origin),
     }
+}
+
+/// Parse the management verbs' trailing flags — the scope (`--local` default, `--global`,
+/// `-c`/`--config <file>`) and `--trust` — out of `args`, returning the leftover positionals and
+/// the scope. `--` ends flag parsing, so a value that begins with `-` can still be passed.
+fn split_scope(args: &[OsString]) -> Result<(Vec<String>, config::manage::Scope, bool), String> {
+    use config::manage::Scope;
+    let mut positionals = Vec::new();
+    let mut scope = Scope::Local;
+    let mut trust = false;
+    let mut only_positional = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if only_positional {
+            positionals.push(arg.to_string_lossy().into_owned());
+            continue;
+        }
+        match arg.to_str() {
+            Some("--") => only_positional = true,
+            Some("--local") => scope = Scope::Local,
+            Some("--global") => scope = Scope::Global,
+            Some("-c") | Some("--config") => {
+                let file = it
+                    .next()
+                    .ok_or_else(|| "`-c` needs a file path".to_string())?;
+                scope = Scope::File(PathBuf::from(file));
+            }
+            Some("--trust") => trust = true,
+            Some(flag) if flag.starts_with('-') && flag != "-" => {
+                return Err(format!("unknown flag `{flag}`"));
+            }
+            _ => positionals.push(arg.to_string_lossy().into_owned()),
+        }
+    }
+    Ok((positionals, scope, trust))
+}
+
+/// Print the usage synopsis for a `config` verb and return the usage exit code.
+fn config_usage(verb: &str) -> ExitCode {
+    eprintln!("ops: usage: {}", help::synopsis_of(&["config", verb]));
+    ExitCode::from(2)
+}
+
+/// Resolve the working directory, mapping a failure to an error exit. Shared by the verbs.
+fn config_cwd() -> Result<PathBuf, ExitCode> {
+    std::env::current_dir().map_err(|e| {
+        eprintln!("ops: cannot read the current directory: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+/// `ops config get <key>`: print the value declared at a dotted key in the target layer file
+/// (`--local` by default). This reads the *raw declared* value in that one file; for the
+/// *effective resolved* value across layers, use `ops config` / `ops config --json`. An unset key
+/// exits 1 (so a script can tell "absent" from a real error), a usage problem exits 2.
+fn config_get(args: &[OsString]) -> ExitCode {
+    let (positionals, scope, _trust) = match split_scope(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("ops: config get: {e}");
+            return config_usage("get");
+        }
+    };
+    if positionals.len() != 1 {
+        return config_usage("get");
+    }
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let path = match config::manage::scope_path(&scope, &cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match config::manage::get(&path, &positionals[0]) {
+        Ok(Some(v)) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!(
+                "ops: config: `{}` is not set in {}",
+                positionals[0],
+                path.display()
+            );
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops config set <key> <value>`: write a string value at a dotted key in the target layer file
+/// (`--local` by default), preserving the rest of the file's comments and formatting. Because the
+/// trust gate hashes the whole file, any edit re-arms it — so a write to a trusted file warns that
+/// its security fields will not apply until `ops trust`, and `--trust` re-trusts in one step.
+fn config_set(args: &[OsString]) -> ExitCode {
+    let (positionals, scope, trust) = match split_scope(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("ops: config set: {e}");
+            return config_usage("set");
+        }
+    };
+    if positionals.len() != 2 {
+        return config_usage("set");
+    }
+    let (key, val) = (&positionals[0], &positionals[1]);
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let path = match config::manage::scope_path(&scope, &cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Capture the trust state before the write — the write itself changes the file and so its
+    // verdict, so "was it trusted" must be read first.
+    let store_dir = trust::default_store_dir();
+    let was_trusted = store_dir
+        .as_deref()
+        .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+
+    match config::manage::set(&path, key, val) {
+        Ok(created) => {
+            let verb = if created { "set" } else { "updated" };
+            println!("ops: {verb} `{key}` in {}", path.display());
+            report_write_trust(&path, key, was_trusted, trust, store_dir.as_deref());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops config unset <key>`: remove a dotted key from the target layer file. Removing a key that
+/// was not set is a no-op (exit 0) that changes nothing — so it never re-arms trust. A removal
+/// that does change a trusted file re-arms it, with the same warning as `set`.
+fn config_unset(args: &[OsString]) -> ExitCode {
+    let (positionals, scope, trust) = match split_scope(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("ops: config unset: {e}");
+            return config_usage("unset");
+        }
+    };
+    if positionals.len() != 1 {
+        return config_usage("unset");
+    }
+    let key = &positionals[0];
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let path = match config::manage::scope_path(&scope, &cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store_dir = trust::default_store_dir();
+    let was_trusted = store_dir
+        .as_deref()
+        .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+
+    match config::manage::unset(&path, key) {
+        Ok(true) => {
+            println!("ops: unset `{key}` in {}", path.display());
+            report_write_trust(&path, key, was_trusted, trust, store_dir.as_deref());
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("ops: `{key}` was not set in {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ops config path`: print the path of the target layer file (`--local` by default) — the file
+/// `set`/`unset`/`edit` would touch. Useful for scripting and for finding the global config.
+fn config_path_cmd(args: &[OsString]) -> ExitCode {
+    let (positionals, scope, _trust) = match split_scope(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("ops: config path: {e}");
+            return config_usage("path");
+        }
+    };
+    if !positionals.is_empty() {
+        return config_usage("path");
+    }
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    match config::manage::scope_path(&scope, &cwd) {
+        Ok(p) => {
+            println!("{}", p.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ops: config: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Report the trust consequence of a write, the load-bearing UX of `set`/`unset`: the whole-file
+/// trust hash means any edit re-arms the gate. `--trust` re-trusts in one step (blessing the whole
+/// current file); otherwise a write to a previously-trusted file warns that its security fields
+/// will not apply until `ops trust`, and a write of a security field to an untrusted file notes it
+/// needs trust to take effect. A free `env` write to an untrusted file needs neither.
+fn report_write_trust(
+    path: &Path,
+    key: &str,
+    was_trusted: bool,
+    trust_flag: bool,
+    store_dir: Option<&Path>,
+) {
+    if trust_flag {
+        match store_dir {
+            Some(dir) => match trust::trust(dir, path) {
+                Ok(()) => println!(
+                    "ops: trusted {} (the whole file is now trusted)",
+                    path.display()
+                ),
+                Err(e) => eprintln!("ops: warning: could not trust {}: {e}", path.display()),
+            },
+            None => eprintln!("ops: warning: no trust store available; cannot --trust"),
+        }
+        return;
+    }
+    if was_trusted {
+        eprintln!(
+            "ops: warning: this edit re-armed the trust gate for {}",
+            path.display()
+        );
+        eprintln!(
+            "       its security fields will not apply until you run `ops trust {}`",
+            path.display()
+        );
+    } else if is_security_key(key) {
+        eprintln!(
+            "ops: note: `{key}` is a security field; it applies only once {} is trusted (`ops trust`)",
+            path.display()
+        );
+    }
+}
+
+/// Whether a dotted config key names a security-relevant field. Everything but the free `env`
+/// table is gated on trust, so setting one on an untrusted file is worth a note.
+fn is_security_key(key: &str) -> bool {
+    key.split('.').next() != Some("env")
 }
 
 /// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the global

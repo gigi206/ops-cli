@@ -14,6 +14,7 @@
 //! a project's bytes, its trust verdict, and its parse together so all three act
 //! on the same inode.
 
+pub(crate) mod manage;
 pub(crate) mod safety;
 mod schema;
 pub(crate) mod view;
