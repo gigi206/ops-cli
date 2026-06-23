@@ -555,7 +555,8 @@ fn record_trust(path: std::path::PathBuf) -> ExitCode {
     };
     match trust::trust(&store_dir, &path) {
         Ok(()) => {
-            println!("ops: trusted {}", path.display());
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_trust_recorded(&path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -563,6 +564,13 @@ fn record_trust(path: std::path::PathBuf) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The confirmation line for a recorded trust — the resulting `trusted` state word in green,
+/// matching how `ops trust --show` renders that state. A pure presenter (its colored layout is
+/// asserted in a test); every span is empty under a non-terminal.
+fn render_trust_recorded(path: &Path, pal: &style::Palette) -> String {
+    format!("ops: {}trusted{} {}", pal.ok, pal.reset, path.display())
 }
 
 /// Report a config's current trust state. A query never changes anything, so it
@@ -603,19 +611,36 @@ fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
-    match trust::untrust(&store_dir, &path) {
-        Ok(true) => {
-            println!("ops: revoked trust for {}", path.display());
-            ExitCode::SUCCESS
-        }
-        Ok(false) => {
-            println!("ops: {} was not trusted; nothing to revoke", path.display());
-            ExitCode::SUCCESS
-        }
+    let result = match trust::untrust(&store_dir, &path) {
+        Ok(existed) => existed,
         Err(e) => {
             eprintln!("ops: cannot revoke trust for {}: {e}", path.display());
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    println!("{}", render_untrust_result(&path, result, &pal));
+    ExitCode::SUCCESS
+}
+
+/// The confirmation line for `ops untrust`. When a marker existed it is revoked — the result is
+/// the untrusted default, so `revoked` takes the caution hue that `--show` gives that state; when
+/// none existed it is a benign no-op, with the note dimmed. A pure presenter, asserted in a test.
+fn render_untrust_result(path: &Path, existed: bool, pal: &style::Palette) -> String {
+    if existed {
+        format!(
+            "ops: {}revoked{} trust for {}",
+            pal.warn,
+            pal.reset,
+            path.display()
+        )
+    } else {
+        format!(
+            "ops: {} was not trusted; {}nothing to revoke{}",
+            path.display(),
+            pal.dim,
+            pal.reset
+        )
     }
 }
 
@@ -2981,6 +3006,43 @@ mod tests {
                 "{word} must be wrapped in its own span and reset:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn trust_confirmations_are_plain_text_when_uncolored() {
+        let p = style::Palette::plain();
+        let path = Path::new("/p/.ops.toml");
+        assert_eq!(render_trust_recorded(path, &p), "ops: trusted /p/.ops.toml");
+        assert_eq!(
+            render_untrust_result(path, true, &p),
+            "ops: revoked trust for /p/.ops.toml"
+        );
+        assert_eq!(
+            render_untrust_result(path, false, &p),
+            "ops: /p/.ops.toml was not trusted; nothing to revoke"
+        );
+    }
+
+    #[test]
+    fn trust_confirmations_carry_the_resulting_state_hue() {
+        // The ON path: `trusted` green (matching the verdict), `revoked` yellow (the result is the
+        // untrusted default), and the no-op note dimmed — each closed with a reset.
+        let p = style::Palette::colored();
+        let path = Path::new("/p/.ops.toml");
+        assert!(
+            render_trust_recorded(path, &p).contains(&format!("{}trusted{}", p.ok, p.reset)),
+            "a recorded trust must show `trusted` in green"
+        );
+        assert!(
+            render_untrust_result(path, true, &p)
+                .contains(&format!("{}revoked{}", p.warn, p.reset)),
+            "a revocation must show `revoked` in the caution hue"
+        );
+        assert!(
+            render_untrust_result(path, false, &p)
+                .contains(&format!("{}nothing to revoke{}", p.dim, p.reset)),
+            "a no-op revocation must dim the note"
+        );
     }
 
     #[test]

@@ -55,8 +55,13 @@ fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
 fn captured_output_carries_no_ansi_escapes() {
     let home = TmpDir::new();
     let cwd = TmpDir::new();
+    // A real project config so `trust`/`untrust` take their confirmation path (recording then
+    // revoking a marker), not an early read error — the colored confirmation lines must still be
+    // plain when captured.
+    std::fs::write(cwd.path().join(".ops.toml"), "env = { A = \"1\" }\n").unwrap();
     // Each is a renderer the color pass touched; all are cheap and host-agnostic. `doctor` is
     // included even though it probes the host — its output is captured, so it too must be plain.
+    // `trust` precedes `untrust` so the revoke finds the marker it recorded (the `existed` path).
     let invocations: &[&[&str]] = &[
         &["config"],
         &["ls"],
@@ -64,6 +69,8 @@ fn captured_output_carries_no_ansi_escapes() {
         &["plugins", "store", "list"],
         &["test", "net", "https://example.com/x"],
         &["trust", "--show"],
+        &["trust", ".ops.toml"],
+        &["untrust", ".ops.toml"],
         &["doctor"],
     ];
     for args in invocations {
