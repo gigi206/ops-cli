@@ -114,9 +114,9 @@ fn resolve_allow_env(keys: &[String]) -> Vec<(String, String)> {
             Ok(v) => out.push((key.clone(), v)),
             Err(std::env::VarError::NotPresent) => {}
             Err(std::env::VarError::NotUnicode(_)) => {
-                eprintln!(
-                    "ops: warning: not passing ${key} to a resolver plugin — its value is not valid Unicode"
-                );
+                crate::diag::warn(&format!(
+                    "not passing ${key} to a resolver plugin — its value is not valid Unicode"
+                ));
             }
         }
     }

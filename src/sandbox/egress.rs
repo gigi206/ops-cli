@@ -287,12 +287,12 @@ fn resolve_one(
     let trimmed = trimmed.as_str();
 
     let needles = if trimmed.len() < REDACT_MIN_LEN {
-        eprintln!(
-            "ops: warning: the secret for `{}` is too short ({} bytes) to redact from outbound \
+        crate::diag::warn(&format!(
+            "the secret for `{}` is too short ({} bytes) to redact from outbound \
              requests safely; outbound leak-blocking is disabled for it (the injection still applies)",
             secret.header,
             trimmed.len()
-        );
+        ));
         Vec::new()
     } else {
         secret

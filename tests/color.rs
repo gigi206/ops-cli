@@ -201,3 +201,35 @@ fn transactional_confirmations_are_plain_when_captured() {
     );
     assert_no_ansi(&stop_all, "stop --all");
 }
+
+#[test]
+fn a_captured_warning_is_plain_with_exactly_one_prefix() {
+    // The `ops: warning:` / `ops: note:` family routes through the diag chokepoint. Drive a real
+    // warning (an orphan mise file with no `.ops.toml`, the anchoring warning) and assert the
+    // captured stream is plain AND carries exactly one `warning:` prefix. The count is the guard a
+    // plain `.contains("warning:")` cannot give: the mechanical conversion stripped the literal
+    // `ops: warning:` from ~30 sites, and a missed strip would double the prefix while every
+    // substring assertion still passed.
+    let home = TmpDir::new();
+    let cwd = TmpDir::new();
+    std::fs::write(cwd.path().join("mise.toml"), "[tools]\nnode = \"20\"\n").unwrap();
+
+    let out = run(&["config", "show"], home.path(), cwd.path());
+    assert!(
+        out.status.success(),
+        "config show on an orphan mise must not hard-fail:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_no_ansi(&out, "config show (orphan-mise warning)");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("mise file"),
+        "the orphan-mise anchoring warning must fire on stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("warning:").count(),
+        1,
+        "exactly one `warning:` prefix — a double prefix means a site kept its literal:\n{stderr}"
+    );
+}

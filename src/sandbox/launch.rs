@@ -914,7 +914,7 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
 
     // Surface what the trust gate dropped or withheld, exactly as a launch would.
     for warning in &prep.cfg.warnings {
-        eprintln!("ops: warning: {warning}");
+        crate::diag::warn(warning);
     }
 
     // Provision the project's declared tools and seed its store: the seed gc-roots the base and
@@ -1004,12 +1004,12 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ExitCode::FAILURE
     })?;
     for warning in &packages.warnings {
-        eprintln!("ops: warning: {warning}");
+        crate::diag::warn(warning);
     }
 
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
-        eprintln!("ops: warning: {warning}");
+        crate::diag::warn(warning);
     }
 
     let font_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
@@ -1422,7 +1422,7 @@ fn build(
     cmd: Vec<OsString>,
 ) -> Result<(SandboxSpec, Option<egress::Egress>), ExitCode> {
     for warning in &prep.cfg.warnings {
-        eprintln!("ops: warning: {warning}");
+        crate::diag::warn(warning);
     }
 
     // Provision the project's declared tools into ops's store, against the project's
@@ -1443,7 +1443,7 @@ fn build(
         }
     };
     for warning in &packages.warnings {
-        eprintln!("ops: warning: {warning}");
+        crate::diag::warn(warning);
     }
 
     // Provision a trusted project's `nix:` mise tools — the exact-pinned dev toolchain.
@@ -1451,7 +1451,7 @@ fn build(
     // tool wins over the coarser package layer on a name clash.
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
-        eprintln!("ops: warning: {warning}");
+        crate::diag::warn(warning);
     }
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
@@ -1492,10 +1492,10 @@ fn build(
         match super::fonts::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             Ok(layer) => Some(layer),
             Err(e) => {
-                eprintln!(
-                    "ops: warning: gui = \"wayland\" but the font set could not be provisioned \
+                crate::diag::warn(&format!(
+                    "gui = \"wayland\" but the font set could not be provisioned \
                      ({e}) — text may not render"
-                );
+                ));
                 None
             }
         }
@@ -1545,11 +1545,11 @@ fn build(
                 .chain(auto_equip.iter())
                 .map(String::as_str)
                 .collect();
-            eprintln!(
-                "ops: warning: mise tools [{}] are declared but network = \"none\" — they \
+            crate::diag::warn(&format!(
+                "mise tools [{}] are declared but network = \"none\" — they \
                  cannot be fetched and will be absent unless already equipped",
                 declared.join(", ")
-            );
+            ));
         } else {
             if !auto_equip.is_empty() {
                 eprintln!(
@@ -1600,11 +1600,11 @@ fn build(
     if !flake_pairs.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
             let names: Vec<&str> = flake_pkgs.iter().map(|(n, _)| n.as_str()).collect();
-            eprintln!(
-                "ops: warning: flake packages [{}] are declared but network = \"none\" — they \
+            crate::diag::warn(&format!(
+                "flake packages [{}] are declared but network = \"none\" — they \
                  cannot be built and will be absent unless already present",
                 names.join(", ")
-            );
+            ));
         } else {
             eprintln!(
                 "ops: building flake packages in-cage via nix build: {} (each flake's fetch \
@@ -1677,14 +1677,14 @@ fn build(
                 });
                 gui_env = env;
             }
-            Ok((socket, _)) => eprintln!(
-                "ops: warning: gui = \"wayland\" but the compositor socket {} does not exist — \
+            Ok((socket, _)) => crate::diag::warn(&format!(
+                "gui = \"wayland\" but the compositor socket {} does not exist — \
                  running without a display",
                 socket.display()
-            ),
-            Err(reason) => eprintln!(
-                "ops: warning: gui = \"wayland\" but {reason} — running without a display"
-            ),
+            )),
+            Err(reason) => crate::diag::warn(&format!(
+                "gui = \"wayland\" but {reason} — running without a display"
+            )),
         }
 
         // Fonts: bind the generated fontconfig configuration read-only and name it to the
@@ -1710,10 +1710,10 @@ fn build(
                         super::fonts::FONTS_CONF_INCAGE.to_string(),
                     ));
                 }
-                Err(e) => eprintln!(
-                    "ops: warning: gui = \"wayland\" but the font configuration could not be \
+                Err(e) => crate::diag::warn(&format!(
+                    "gui = \"wayland\" but the font configuration could not be \
                      staged ({e}) — text may not render"
-                ),
+                )),
             }
         }
     }
@@ -1831,7 +1831,7 @@ fn seed_project_store(
     // Record the project's canonical path so a later `ops gc` can recognise this tree and reclaim
     // it once the project is gone. Best-effort: a housekeeping marker must never fail a launch.
     if let Err(e) = super::projectstore::write_marker(&prep.layout, &id, &canonical) {
-        eprintln!("ops: warning: could not record the project marker: {e}");
+        crate::diag::warn(&format!("could not record the project marker: {e}"));
     }
     Ok(store)
 }
@@ -1900,11 +1900,11 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
         return Ok(Vec::new());
     };
     if mise_cfg.state != crate::trust::TrustState::Trusted {
-        eprintln!(
-            "ops: warning: mise file {} withheld ({}): its [env] is not applied",
+        crate::diag::warn(&format!(
+            "mise file {} withheld ({}): its [env] is not applied",
             mise_cfg.name,
             crate::config::untrusted_reason(mise_cfg.state)
-        );
+        ));
         return Ok(Vec::new());
     }
 

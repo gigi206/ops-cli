@@ -9,6 +9,7 @@
 
 mod allowlist;
 mod config;
+mod diag;
 mod help;
 mod pathfind;
 mod plugin_store;
@@ -727,7 +728,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
     // Warnings go to stderr, out of band from the resolved view, so the body stays a clean
     // capturable document and a warning never pollutes a piped human render.
     for w in &view.warnings {
-        eprintln!("ops: warning: {w}");
+        diag::warn(w);
     }
     ExitCode::SUCCESS
 }
@@ -1303,18 +1304,18 @@ fn config_edit(args: &[OsString]) -> ExitCode {
                     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                     println!("{}", render_trusted_whole_file(&path, &pal));
                 }
-                Err(e) => eprintln!("ops: warning: could not trust {}: {e}", path.display()),
+                Err(e) => diag::warn(&format!("could not trust {}: {e}", path.display())),
             },
-            None => eprintln!("ops: warning: no trust store available; cannot --trust"),
+            None => diag::warn("no trust store available; cannot --trust"),
         }
     } else if was_trusted {
         // Only warn if the edit actually changed the file (the verdict is now Changed).
         let now = store_dir.as_deref().map(|d| trust::state(d, &path));
         if now == Some(trust::TrustState::Changed) {
-            eprintln!(
-                "ops: warning: your edit re-armed the trust gate for {}",
+            diag::warn(&format!(
+                "your edit re-armed the trust gate for {}",
                 path.display()
-            );
+            ));
             eprintln!(
                 "       run `ops trust {}` to re-apply its security fields",
                 path.display()
@@ -1343,26 +1344,26 @@ fn report_write_trust(
                     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                     println!("{}", render_trusted_whole_file(path, &pal));
                 }
-                Err(e) => eprintln!("ops: warning: could not trust {}: {e}", path.display()),
+                Err(e) => diag::warn(&format!("could not trust {}: {e}", path.display())),
             },
-            None => eprintln!("ops: warning: no trust store available; cannot --trust"),
+            None => diag::warn("no trust store available; cannot --trust"),
         }
         return;
     }
     if was_trusted {
-        eprintln!(
-            "ops: warning: this edit re-armed the trust gate for {}",
+        diag::warn(&format!(
+            "this edit re-armed the trust gate for {}",
             path.display()
-        );
+        ));
         eprintln!(
             "       its security fields will not apply until you run `ops trust {}`",
             path.display()
         );
     } else if is_security_key(key) {
-        eprintln!(
-            "ops: note: `{key}` is a security field; it applies only once {} is trusted (`ops trust`)",
+        diag::note(&format!(
+            "`{key}` is a security field; it applies only once {} is trusted (`ops trust`)",
             path.display()
-        );
+        ));
     }
 }
 
@@ -1817,7 +1818,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
     };
     let resolved = config::load(&cwd);
     for w in &resolved.warnings {
-        eprintln!("ops: warning: {w}");
+        diag::warn(w);
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);
@@ -1951,7 +1952,7 @@ fn plugins_list() -> ExitCode {
     }
     println!("{dim}(browse the built-in store with: ops plugins store list){r}");
     for w in &warnings {
-        eprintln!("ops: warning: {w}");
+        diag::warn(w);
     }
     ExitCode::SUCCESS
 }
@@ -2515,7 +2516,7 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
                 }
             }
         }
-        Err(why) => eprintln!("ops: warning: cannot read the cached catalogue: {why}"),
+        Err(why) => diag::warn(&format!("cannot read the cached catalogue: {why}")),
     }
     ExitCode::SUCCESS
 }
@@ -2601,7 +2602,7 @@ fn plugins_store_list() -> ExitCode {
                             cfg.locked_rev
                         );
                     }
-                    Err(why) => eprintln!("ops: warning: store '{name}': {why}"),
+                    Err(why) => diag::warn(&format!("store '{name}': {why}")),
                 }
             }
         }
@@ -2655,7 +2656,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         // warnings, and `info <scheme>` is exactly the command a user runs to learn why their
         // plugin is not picked up, so re-emit them before the generic miss.
         for w in &warnings {
-            eprintln!("ops: warning: {w}");
+            diag::warn(w);
         }
         eprintln!("ops: no installed resolver plugin claims the scheme '{scheme}'");
         return ExitCode::FAILURE;
@@ -2748,7 +2749,7 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // take (so an untrusted pin silently rolling the global channel is never a mystery).
     let cfg = config::load(&cwd);
     for warning in &cfg.warnings {
-        eprintln!("ops: warning: {warning}");
+        diag::warn(warning);
     }
 
     // `all` rolls every managed channel and reports the worst exit — a tool that fails to
@@ -2895,11 +2896,11 @@ fn upgrade_mise_tools(
         return true;
     };
     if mise.state != trust::TrustState::Trusted {
-        eprintln!(
-            "ops: warning: mise file {} withheld ({}): its nix: tools are not rolled",
+        diag::warn(&format!(
+            "mise file {} withheld ({}): its nix: tools are not rolled",
             mise.name,
             config::untrusted_reason(mise.state)
-        );
+        ));
         return true;
     }
     let outcomes =
