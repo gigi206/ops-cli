@@ -201,6 +201,23 @@ pub(crate) struct AppPackageView {
     pub(crate) pinned_rev: Option<String>,
 }
 
+/// An app overlay's own network posture, projected for display. An allowlist carries its declared
+/// allow/deny rules and the always-allowed built-in nix-cache set: the proxy unions that set into
+/// whatever policy is in effect at launch, so for an app it is part of what `ops app <name>` can
+/// reach — and the baseline `network` section shows it only when the *baseline* is an allowlist, so
+/// a profile that puts its allowlist in the app overlay (the common case) would otherwise show it
+/// nowhere. The CLI shows this compactly by default and expands the rules under `--details`.
+#[derive(Serialize)]
+pub(crate) enum AppNetworkView {
+    Shared,
+    Isolated,
+    Allowlist {
+        allow: Vec<String>,
+        deny: Vec<String>,
+        builtin: Vec<String>,
+    },
+}
+
 /// A named application profile: the command it runs and what its gated overlay adds.
 #[derive(Serialize)]
 pub(crate) struct AppView {
@@ -210,8 +227,8 @@ pub(crate) struct AppView {
     /// Where the app's persistent home is keyed, as a human phrase.
     pub(crate) home_scope: String,
     pub(crate) packages: Vec<AppPackageView>,
-    /// The app's own network posture as a word (`shared`/`none`/`allowlist`), when it set one.
-    pub(crate) network: Option<String>,
+    /// The app's own network posture, with an allowlist's rules, when it set one.
+    pub(crate) network: Option<AppNetworkView>,
     /// The app's own GUI posture as a word (`wayland`/`none`), when it set one.
     pub(crate) gui: Option<String>,
     pub(crate) secret_count: usize,
@@ -456,9 +473,16 @@ fn app_view(
             })
             .collect(),
         network: app.network.as_ref().map(|n| match n {
-            NetworkPolicy::Shared => "shared".to_string(),
-            NetworkPolicy::Isolated => "none".to_string(),
-            NetworkPolicy::Allowlist(_) => "allowlist".to_string(),
+            NetworkPolicy::Shared => AppNetworkView::Shared,
+            NetworkPolicy::Isolated => AppNetworkView::Isolated,
+            NetworkPolicy::Allowlist(a) => AppNetworkView::Allowlist {
+                allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
+                deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
+                builtin: sandbox::nix_cache_hosts()
+                    .iter()
+                    .map(|h| h.to_string())
+                    .collect(),
+            },
         }),
         gui: app.gui.as_ref().map(|g| match g {
             super::GuiPolicy::Wayland => "wayland".to_string(),
@@ -523,7 +547,20 @@ mod tests {
             },
             gui: GuiView::Wayland,
             secrets: vec![],
-            apps: vec![],
+            apps: vec![AppView {
+                name: "claude".into(),
+                cmd: Some("claude".into()),
+                home_scope: "global (shared across projects)".into(),
+                packages: vec![],
+                network: Some(AppNetworkView::Allowlist {
+                    allow: vec!["api.anthropic.com".into()],
+                    deny: vec!["api.anthropic.com/admin".into()],
+                    builtin: vec!["cache.nixos.org".into()],
+                }),
+                gui: None,
+                secret_count: 1,
+                notes: vec![],
+            }],
             warnings: vec!["a note".into()],
         };
 
@@ -542,6 +579,12 @@ mod tests {
         // A struct enum variant is externally tagged; a unit variant is its name as a string.
         assert!(json["network"]["Allowlist"]["allow"][0] == "github.com");
         assert_eq!(json["gui"], "Wayland");
+        // An app overlay's allowlist serializes its rules and the built-in set in full, so the
+        // JSON form carries what `ops app <name>` can reach without a `--details` equivalent.
+        let app_net = &json["apps"][0]["network"]["Allowlist"];
+        assert_eq!(app_net["allow"][0], "api.anthropic.com");
+        assert_eq!(app_net["deny"][0], "api.anthropic.com/admin");
+        assert_eq!(app_net["builtin"][0], "cache.nixos.org");
     }
 
     /// A `flake:` package's pinned revision surfaces in its view, looked up by the package locator

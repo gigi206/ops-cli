@@ -687,9 +687,11 @@ fn config_cmd(args: Vec<OsString>) -> ExitCode {
 /// terminal; `--json` emits the whole resolved model for tooling.
 fn config_show(args: &[OsString]) -> ExitCode {
     let mut json = false;
+    let mut details = false;
     for arg in args {
         match arg.to_str() {
             Some("--json") => json = true,
+            Some("--details") => details = true,
             _ => {
                 eprintln!(
                     "ops: config show: unexpected argument {:?}",
@@ -711,8 +713,9 @@ fn config_show(args: &[OsString]) -> ExitCode {
     let view = config::view::build(&cwd);
 
     if json {
-        // The whole resolved model, warnings and all, as one JSON document. Nothing goes to
-        // stderr — stdout stays pure JSON, the contract a consuming tool relies on.
+        // The whole resolved model, warnings and all, as one JSON document — already exhaustive
+        // (every app's rules in full), so `--details` is moot here whatever order the flags came.
+        // Nothing goes to stderr — stdout stays pure JSON, the contract a consuming tool relies on.
         match serde_json::to_string_pretty(&view) {
             Ok(doc) => println!("{doc}"),
             Err(e) => {
@@ -724,7 +727,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_config(&view, &pal));
+    print!("{}", render_config(&view, &pal, details));
     // Warnings go to stderr, out of band from the resolved view, so the body stays a clean
     // capturable document and a warning never pollutes a piped human render.
     for w in &view.warnings {
@@ -749,8 +752,8 @@ fn layer_tag(layer: Option<config::view::LayerView>, dim: &str, r: &str) -> Stri
     }
 }
 
-fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> String {
-    use config::view::{GuiView, NetworkView};
+fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
+    use config::view::{AppNetworkView, GuiView, NetworkView};
     use std::fmt::Write as _;
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
@@ -994,8 +997,48 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
                     .join(", ");
                 let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
             }
+            // An overlay is a compact summary by default — one line per field; an allowlist shows
+            // just its rule counts. `--details` expands that to the individual allow/deny rules
+            // and the always-allowed built-in hosts, so what `ops app <name>` can reach is visible
+            // here (the baseline `network` section shows the built-in set only when the *baseline*
+            // is an allowlist, which a profile's app-overlay allowlist is not).
             if let Some(net) = &app.network {
-                let _ = writeln!(o, "      {dim}network:{r} {net}");
+                match net {
+                    AppNetworkView::Shared => {
+                        let _ = writeln!(o, "      {dim}network:{r} shared");
+                    }
+                    AppNetworkView::Isolated => {
+                        let _ = writeln!(o, "      {dim}network:{r} none");
+                    }
+                    AppNetworkView::Allowlist {
+                        allow,
+                        deny,
+                        builtin,
+                    } if details => {
+                        let _ = writeln!(o, "      {dim}network:{r} allowlist");
+                        for rule in allow {
+                            let _ = writeln!(o, "        allow {n}{rule}{r}");
+                        }
+                        for rule in deny {
+                            let _ = writeln!(o, "        {warn}deny{r}  {n}{rule}{r}");
+                        }
+                        let _ = writeln!(
+                            o,
+                            "        {dim}built-in (always allowed, so self-equip works):{r}"
+                        );
+                        for host in builtin {
+                            let _ = writeln!(o, "          allow {n}{host}{r}");
+                        }
+                    }
+                    AppNetworkView::Allowlist { allow, deny, .. } => {
+                        let _ = writeln!(
+                            o,
+                            "      {dim}network:{r} allowlist {dim}({} allow, {} deny){r}",
+                            allow.len(),
+                            deny.len()
+                        );
+                    }
+                }
             }
             if let Some(gui) = &app.gui {
                 let _ = writeln!(o, "      {dim}gui:{r} {gui}");
@@ -3947,7 +3990,7 @@ mod tests {
         // The OFF path the `ops config show` integration assertions stand on: empty spans, so the
         // wording and spacing are exactly today's — a withheld note, a channel line (with and
         // without a locked revision), and a deny rule.
-        let out = render_config(&sample_config_view(), &style::Palette::plain());
+        let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
         assert!(
             out.contains("    jq -> nix:jq  (withheld: the project is untrusted)"),
             "{out}"
@@ -3973,7 +4016,7 @@ mod tests {
         // provenance origin is bold and its source rides the name span, its short revision is dim,
         // and the deny keyword is warn — the inheritance/gating story a swapped hue would hide.
         let p = style::Palette::colored();
-        let out = render_config(&sample_config_view(), &p);
+        let out = render_config(&sample_config_view(), &p, false);
         assert!(
             out.contains(&format!(
                 "{}(withheld: the project is untrusted){}",
@@ -4070,7 +4113,7 @@ mod tests {
             }],
             warnings: vec![],
         };
-        let out = render_config(&view, &style::Palette::plain());
+        let out = render_config(&view, &style::Palette::plain(), false);
         assert!(
             out.contains(
                 "    hermes -> flake:github:NousResearch/hermes-agent#default  \
@@ -4088,6 +4131,79 @@ mod tests {
         assert!(
             out.contains("      packages: hermes @ a1b2c3d"),
             "an app's pinned flake package must show its rev compactly:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_render_shows_an_app_allowlist_compactly_then_expands_under_details() {
+        // An app overlay's allowlist is a one-line count by default and expands to its rules under
+        // `--details`. The expansion includes the built-in nix-cache set, which the baseline
+        // `network` section does not show here (the baseline is `shared`), so this is the only place
+        // a profile's app-overlay allowlist surfaces what `ops app <name>` can actually reach.
+        use config::view::*;
+        let view = ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            mise: None,
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Shared,
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![AppView {
+                name: "claude".into(),
+                cmd: Some("claude".into()),
+                home_scope: "global (shared across projects)".into(),
+                packages: vec![],
+                network: Some(AppNetworkView::Allowlist {
+                    allow: vec!["api.anthropic.com".into(), "github.com".into()],
+                    deny: vec!["github.com/secret".into()],
+                    builtin: vec!["cache.nixos.org".into()],
+                }),
+                gui: None,
+                secret_count: 0,
+                notes: vec![],
+            }],
+            warnings: vec![],
+        };
+
+        // Default: a compact count, both numbers present even at zero deny, no expanded rule.
+        let compact = render_config(&view, &style::Palette::plain(), false);
+        assert!(
+            compact.contains("      network: allowlist (2 allow, 1 deny)"),
+            "the default app allowlist must read as compact counts:\n{compact}"
+        );
+        assert!(
+            !compact.contains("allow api.anthropic.com"),
+            "the default must not expand the rules:\n{compact}"
+        );
+
+        // --details: the individual rules and the always-allowed built-in set.
+        let expanded = render_config(&view, &style::Palette::plain(), true);
+        assert!(
+            expanded.contains("        allow api.anthropic.com")
+                && expanded.contains("        allow github.com"),
+            "--details must list the allow rules:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("        deny  github.com/secret"),
+            "--details must list the deny rules:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("built-in (always allowed, so self-equip works):")
+                && expanded.contains("          allow cache.nixos.org"),
+            "--details must surface the always-allowed built-in set:\n{expanded}"
         );
     }
 }

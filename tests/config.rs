@@ -1457,6 +1457,50 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
 }
 
 #[test]
+fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
+    let fx = Fixture::new();
+    // A profile (trusted by location) whose allowlist lives in the app overlay — the common case,
+    // since the baseline stays `shared`. The compact view shows the rule counts; `--details`
+    // expands the individual rules plus the always-allowed built-in nix-cache set (which the
+    // baseline `network` section never prints here, because the baseline is not an allowlist).
+    fx.write_profile(
+        "claude",
+        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\n\
+         allow = [\"api.anthropic.com\", \"github.com\"]\ndeny = [\"github.com/secret\"]\n",
+    );
+
+    // Default: the compact one-line count, both numbers present.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("network: allowlist (2 allow, 1 deny)"),
+        "the default must show compact rule counts:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("allow api.anthropic.com"),
+        "the default must not expand the rules:\n{stdout}"
+    );
+
+    // --details: the rules themselves, the deny carve-out, and the built-in set.
+    let out = fx.run(&["config", "show", "--details"]);
+    assert!(out.status.success(), "config show --details must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("allow api.anthropic.com") && stdout.contains("allow github.com"),
+        "--details must list the allow rules:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("deny") && stdout.contains("github.com/secret"),
+        "--details must list the deny rule:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("built-in") && stdout.contains("cache.nixos.org"),
+        "--details must surface the always-allowed built-in nix-cache set:\n{stdout}"
+    );
+}
+
+#[test]
 fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project() {
     let fx = Fixture::new();
     // The flagship case: an imported profile (trusted by location) runs *on* untrusted code without

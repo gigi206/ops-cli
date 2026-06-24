@@ -295,20 +295,31 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "show"],
-        synopsis: "ops config show [--json]",
+        synopsis: "ops config show [--json] [--details]",
         summary: "show the resolved configuration for the current project",
-        options: &[(
-            "--json",
-            "print the resolved configuration as JSON (for scripts and tooling)",
-        )],
+        options: &[
+            (
+                "--json",
+                "print the resolved configuration as JSON (for scripts and tooling)",
+            ),
+            (
+                "--details",
+                "expand each app overlay's compact summary (the full allowlist rules)",
+            ),
+        ],
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
             project environment, binds, packages, tools, network, GUI, secrets, and app\n\
             profiles, after the trust gate has dropped anything an untrusted project may not\n\
             set. Warnings explain what was dropped and why. No launch, no nix, no network.\n\
             \n\
+            An app profile is shown as a compact summary (one line per field); with --details\n\
+            its allowlist is expanded to the individual allow/deny rules plus the always-allowed\n\
+            built-in hosts, so what `ops app <name>` can reach is visible at a glance.\n\
+            \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
-            included as a field) — the machine-readable form the human output renders.",
+            included as a field) — the machine-readable form the human output renders, already\n\
+            carrying every app's rules in full.",
     },
     Page {
         path: &["upgrade"],
