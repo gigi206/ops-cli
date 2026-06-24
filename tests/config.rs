@@ -1549,8 +1549,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("x-api-key -> api.example.com")
-            && stdout.contains("from env DEMO_API_KEY"),
+        stdout.contains("x-api-key -> api.example.com") && stdout.contains("from env DEMO_API_KEY"),
         "--details must show the credential by destination and source locator:\n{stdout}"
     );
 }
