@@ -2587,9 +2587,9 @@ mod tests {
     #[test]
     fn an_app_layers_global_under_project_overriding_the_command_and_unioning_fields() {
         let global = raw_with_app(
-            "claude",
+            "demo-app",
             raw_app(
-                &["claude"],
+                &["demo-app"],
                 &[("BASE", "g")],
                 &[],
                 &[("tool", "nix:ripgrep")],
@@ -2597,13 +2597,16 @@ mod tests {
             ),
         );
         let project = raw_with_app(
-            "claude",
-            raw_app(&["claude", "--resume"], &[("EXTRA", "p")], &[], &[], None),
+            "demo-app",
+            raw_app(&["demo-app", "--resume"], &[("EXTRA", "p")], &[], &[], None),
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
-        let app = &r.apps["claude"];
+        let app = &r.apps["demo-app"];
         // The project's command wins; the global one is replaced, not appended.
-        assert_eq!(app.cmd, vec!["claude".to_string(), "--resume".to_string()]);
+        assert_eq!(
+            app.cmd,
+            vec!["demo-app".to_string(), "--resume".to_string()]
+        );
         // Free env is unioned across both layers.
         assert!(app.env.iter().any(|(k, v)| k == "BASE" && v == "g"));
         assert!(app.env.iter().any(|(k, v)| k == "EXTRA" && v == "p"));
@@ -2761,20 +2764,20 @@ mod tests {
         // A globally-declared app keeps its posture even when launched under an untrusted
         // project — the flagship use case: run an agent *on* untrusted code, safely.
         let global = raw_with_app(
-            "claude",
+            "demo-app",
             raw_app(
-                &["claude"],
+                &["demo-app"],
                 &[],
                 &[],
                 &[],
-                allowlist_net(&["api.anthropic.com"]),
+                allowlist_net(&["api.example.com"]),
             ),
         );
         let mut widen = raw_app(&[], &[], &[], &[], None);
         widen.network = Some(NetworkField::Posture("shared".into()));
-        let project = raw_with_app("claude", widen);
+        let project = raw_with_app("demo-app", widen);
         let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
-        let app = &r.apps["claude"];
+        let app = &r.apps["demo-app"];
         assert!(matches!(app.network, Some(NetworkPolicy::Allowlist(_))));
         assert!(app.warnings.iter().any(|w| w.contains("network")));
     }
@@ -2826,15 +2829,15 @@ mod tests {
     #[test]
     fn an_app_home_scope_defaults_to_global_and_a_trusted_layer_may_set_project() {
         // Unset → the global default. A trusted layer (here the global config) may pin it.
-        let plain = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
+        let plain = raw_with_app("demo-app", raw_app(&["demo-app"], &[], &[], &[], None));
         let r = resolve_no_plugins(plain, None);
-        assert_eq!(r.apps["claude"].home_scope, AppHomeScope::Global);
+        assert_eq!(r.apps["demo-app"].home_scope, AppHomeScope::Global);
 
         let scoped = raw_with_app(
             "review",
             RawApp {
                 home_scope: Some("project".into()),
-                ..raw_app(&["claude"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         let r = resolve_no_plugins(scoped, None);
@@ -2848,21 +2851,21 @@ mod tests {
         // vector). The safe direction — narrowing to `project` — and an untrusted project's own
         // app are both allowed.
         let global = raw_with_app(
-            "claude",
+            "demo-app",
             RawApp {
                 home_scope: Some("project".into()),
-                ..raw_app(&["claude"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         let project = raw_with_app(
-            "claude",
+            "demo-app",
             RawApp {
                 home_scope: Some("global".into()),
                 ..raw_app(&[], &[], &[], &[], None)
             },
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
-        let app = &r.apps["claude"];
+        let app = &r.apps["demo-app"];
         assert_eq!(
             app.home_scope,
             AppHomeScope::Project,
@@ -2885,14 +2888,14 @@ mod tests {
     #[test]
     fn an_unknown_home_scope_defaults_to_global_with_a_warning() {
         let global = raw_with_app(
-            "claude",
+            "demo-app",
             RawApp {
                 home_scope: Some("frobnicate".into()),
-                ..raw_app(&["claude"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         let r = resolve_no_plugins(global, None);
-        let app = &r.apps["claude"];
+        let app = &r.apps["demo-app"];
         assert_eq!(app.home_scope, AppHomeScope::Global);
         assert!(app.warnings.iter().any(|w| w.contains("home_scope")));
     }
@@ -2914,8 +2917,8 @@ mod tests {
             );
         }
         // A conventional name survives.
-        assert!(is_valid_app_name("claude"));
-        assert!(is_valid_app_name("opencode-2.dev_x"));
+        assert!(is_valid_app_name("demo-app"));
+        assert!(is_valid_app_name("other-tool-2.dev_x"));
     }
 
     #[test]
@@ -2940,7 +2943,7 @@ mod tests {
                 "a dropped reserved-verb app `{verb}` must say so"
             );
         }
-        assert!(!is_reserved_app_verb("claude"));
+        assert!(!is_reserved_app_verb("demo-app"));
     }
 
     #[test]
@@ -2948,8 +2951,8 @@ mod tests {
         // A profile file is a top-level app; its filename (stem) is the app name.
         let dir = TmpDir::new();
         std::fs::write(
-            dir.path().join("claude.toml"),
-            b"cmd = \"claude\"\n[env]\nA = \"1\"\n",
+            dir.path().join("demo-app.toml"),
+            b"cmd = \"demo-app\"\n[env]\nA = \"1\"\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("review.toml"), b"cmd = [\"review\"]\n").unwrap();
@@ -2960,7 +2963,7 @@ mod tests {
 
         let mut warnings = Vec::new();
         let apps = read_profile_apps_from(dir.path(), &mut warnings);
-        assert!(apps.contains_key("claude") && apps.contains_key("review"));
+        assert!(apps.contains_key("demo-app") && apps.contains_key("review"));
         assert!(
             !apps.contains_key("import"),
             "a reserved-verb profile is dropped"
@@ -2987,10 +2990,10 @@ mod tests {
     fn an_inline_app_shadows_a_profile_of_the_same_name() {
         // On a name collision the hand-authored inline app wins, loudly; the unique profile is
         // folded in.
-        let mut global = raw_with_app("claude", raw_app(&["inline"], &[], &[], &[], None));
+        let mut global = raw_with_app("demo-app", raw_app(&["inline"], &[], &[], &[], None));
         let profiles: BTreeMap<String, RawApp> = [
             (
-                "claude".to_string(),
+                "demo-app".to_string(),
                 raw_app(&["profile"], &[], &[], &[], None),
             ),
             (
@@ -3004,7 +3007,7 @@ mod tests {
         fold_profile_apps(&mut global, profiles, &mut warnings);
         // The inline definition is untouched; the non-colliding profile is added.
         assert_eq!(
-            global.app["claude"]
+            global.app["demo-app"]
                 .cmd
                 .as_ref()
                 .map(|c| c.clone().into_argv()),
@@ -3022,30 +3025,30 @@ mod tests {
         // A complete profile validates and its granted posture is summarized for display.
         let ok = validate_profile(
             br#"
-            cmd = "claude"
+            cmd = "demo-app"
             [network]
             mode = "allowlist"
-            allow = ["api.anthropic.com"]
-            [secret."api.anthropic.com"]
-            from = "env://ANTHROPIC_API_KEY"
+            allow = ["api.example.com"]
+            [secret."api.example.com"]
+            from = "env://DEMO_API_KEY"
             header = "x-api-key"
             type = "raw"
             "#,
         )
         .unwrap();
         let joined = ok.summary.join("\n");
-        assert!(joined.contains("command: claude"), "{joined}");
+        assert!(joined.contains("command: demo-app"), "{joined}");
         assert!(joined.contains("network: allowlist"), "{joined}");
         // The secret shows its destination and source locator — never a value (a profile has none).
         assert!(
-            joined.contains("api.anthropic.com") && joined.contains("env://ANTHROPIC_API_KEY"),
+            joined.contains("api.example.com") && joined.contains("env://DEMO_API_KEY"),
             "{joined}"
         );
 
         // A profile with no command is refused — and so is a file wrapped in `[app.<name>]` (it
         // parses as an empty app, so it trips the same gate with a helpful hint).
         assert!(validate_profile(b"[env]\nA = \"1\"\n").is_err());
-        let wrapped = validate_profile(b"[app.claude]\ncmd = \"claude\"\n").unwrap_err();
+        let wrapped = validate_profile(b"[app.demo-app]\ncmd = \"demo-app\"\n").unwrap_err();
         assert!(wrapped.contains("cmd"), "{wrapped}");
     }
 
@@ -3418,19 +3421,19 @@ mod tests {
         // a `nix:`-prefixed nixhub token (`mise:nix:...`), which is mise's concern.
         let r = resolve_no_plugins(
             raw_packages(&[
-                ("claude-code", "mise:aqua:anthropics/claude-code"),
-                ("opencode", "mise:opencode"),
+                ("demo-tool", "mise:aqua:example/demo-tool"),
+                ("other-tool", "mise:other-tool"),
                 ("nixhub", "mise:nix:jq"),
             ]),
             None,
         );
         assert_eq!(
-            pkg(&r.packages, "claude-code").unwrap().backend,
-            Backend::Mise("aqua:anthropics/claude-code".into())
+            pkg(&r.packages, "demo-tool").unwrap().backend,
+            Backend::Mise("aqua:example/demo-tool".into())
         );
         assert_eq!(
-            pkg(&r.packages, "opencode").unwrap().backend,
-            Backend::Mise("opencode".into())
+            pkg(&r.packages, "other-tool").unwrap().backend,
+            Backend::Mise("other-tool".into())
         );
         assert_eq!(
             pkg(&r.packages, "nixhub").unwrap().backend,
@@ -3446,7 +3449,7 @@ mod tests {
         // the host filesystem.
         let r = resolve_no_plugins(
             raw_packages(&[
-                ("hermes", "flake:github:NousResearch/hermes-agent#tui"),
+                ("flake-tool", "flake:github:example/flake-tool#tui"),
                 ("pinned", "flake:github:o/r/abc123#default"),
                 ("local", "flake:path:/etc"), // local scheme: refused
                 ("localgit", "flake:git+file:///etc"), // local git scheme: refused
@@ -3459,8 +3462,8 @@ mod tests {
             None,
         );
         assert_eq!(
-            pkg(&r.packages, "hermes").unwrap().backend,
-            Backend::Flake("github:NousResearch/hermes-agent#tui".into())
+            pkg(&r.packages, "flake-tool").unwrap().backend,
+            Backend::Flake("github:example/flake-tool#tui".into())
         );
         assert_eq!(
             pkg(&r.packages, "pinned").unwrap().backend,
@@ -4398,8 +4401,8 @@ mod tests {
                 }),
             );
             hosts.insert(
-                "api.openai.com".to_string(),
-                RawHostSecrets::One(terse("openai_key")),
+                "api2.example.com".to_string(),
+                RawHostSecrets::One(terse("demo_key")),
             );
             let proj = RawConfig {
                 secret: Some(RawSecretSection {
@@ -4414,7 +4417,7 @@ mod tests {
                 ..RawConfig::default()
             };
             let global = RawConfig {
-                network: allowlist_net(&["api.github.com", "api.openai.com"]),
+                network: allowlist_net(&["api.github.com", "api2.example.com"]),
                 ..RawConfig::default()
             };
             let r = resolve_no_plugins(global, Some((proj, state)));

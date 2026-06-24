@@ -334,11 +334,11 @@ mod tests {
     fn parses_an_app_table_with_a_string_or_array_command() {
         let cfg = parse(
             br#"
-            [app.claude]
-            cmd = "claude"
+            [app.demo-app]
+            cmd = "demo-app"
             home_scope = "project"
-            [app.claude.packages]
-            claude-code = "claude-code"
+            [app.demo-app.packages]
+            demo-tool = "demo-tool"
 
             [app.build]
             cmd = ["make", "-j4"]
@@ -347,21 +347,21 @@ mod tests {
         .unwrap();
         // A bare string is a single-element argv; an array is taken verbatim.
         assert_eq!(
-            cfg.app["claude"]
+            cfg.app["demo-app"]
                 .cmd
                 .as_ref()
                 .map(|c| c.clone().into_argv()),
-            Some(vec!["claude".to_string()])
+            Some(vec!["demo-app".to_string()])
         );
         // the optional home scope parses as a bare string; an app without it leaves it unset
-        assert_eq!(cfg.app["claude"].home_scope.as_deref(), Some("project"));
+        assert_eq!(cfg.app["demo-app"].home_scope.as_deref(), Some("project"));
         assert_eq!(cfg.app["build"].home_scope, None);
         assert_eq!(
-            cfg.app["claude"]
+            cfg.app["demo-app"]
                 .packages
-                .get("claude-code")
+                .get("demo-tool")
                 .map(String::as_str),
-            Some("claude-code")
+            Some("demo-tool")
         );
         assert_eq!(
             cfg.app["build"].cmd.as_ref().map(|c| c.clone().into_argv()),
@@ -375,24 +375,24 @@ mod tests {
         // wrapper. The name lives in the filename, so the contents are name-agnostic.
         let app = parse_app(
             br#"
-            cmd = "claude"
+            cmd = "demo-app"
             home_scope = "global"
             [packages]
-            claude-code = "claude-code"
+            demo-tool = "demo-tool"
             [network]
             mode = "allowlist"
-            allow = ["api.anthropic.com"]
+            allow = ["api.example.com"]
             "#,
         )
         .unwrap();
         assert_eq!(
             app.cmd.map(|c| c.into_argv()),
-            Some(vec!["claude".to_string()])
+            Some(vec!["demo-app".to_string()])
         );
         assert_eq!(app.home_scope.as_deref(), Some("global"));
         assert_eq!(
-            app.packages.get("claude-code").map(String::as_str),
-            Some("claude-code")
+            app.packages.get("demo-tool").map(String::as_str),
+            Some("demo-tool")
         );
         assert!(matches!(app.network, Some(NetworkField::Table(_))));
     }
@@ -401,7 +401,7 @@ mod tests {
     fn an_inline_wrapped_profile_parses_as_an_empty_app() {
         // A file mistakenly written in the inline `[app.<name>]` shape has no top-level `cmd`,
         // so it parses as an empty app — the tell-tale the import path refuses on.
-        let app = parse_app(b"[app.claude]\ncmd = \"claude\"\n").unwrap();
+        let app = parse_app(b"[app.demo-app]\ncmd = \"demo-app\"\n").unwrap();
         assert_eq!(app.cmd, None);
     }
 
@@ -412,22 +412,22 @@ mod tests {
         // (with a `defaults` table and an array-of-tables host) and the untagged `cmd`/`network`/
         // `from` enums.
         let src = br#"
-            cmd = ["claude", "--resume"]
+            cmd = ["demo-app", "--resume"]
             home_scope = "global"
             gui = "wayland"
             binds = ["/opt/data"]
             [env]
             FOO = "bar"
             [packages]
-            claude-code = "mise:aqua:anthropics/claude-code"
+            demo-tool = "mise:aqua:example/demo-tool"
             [network]
             mode = "allowlist"
-            allow = ["api.anthropic.com", "*.nixos.org"]
+            allow = ["api.example.com", "*.nixos.org"]
             deny = ["evil.example.com"]
             [secret.defaults]
             order = ["env", "sops"]
-            [secret."api.anthropic.com"]
-            from = "env://ANTHROPIC_API_KEY"
+            [secret."api.example.com"]
+            from = "env://DEMO_API_KEY"
             header = "x-api-key"
             type = "raw"
             [[secret."api.npmjs.org"]]
@@ -449,7 +449,7 @@ mod tests {
     fn serializing_skips_empty_collections_and_round_trips_a_bare_command() {
         // A minimal app serializes to a minimal profile — no noise `[env]`/`[packages]` tables or
         // `binds = []`, and an unset option is omitted entirely.
-        let app = parse_app(b"cmd = \"claude\"\n").unwrap();
+        let app = parse_app(b"cmd = \"demo-app\"\n").unwrap();
         let out = serialize_app(&app).unwrap();
         assert!(out.contains("cmd"), "{out}");
         assert!(!out.contains("[env]"), "empty env must be skipped:\n{out}");
@@ -473,7 +473,7 @@ mod tests {
         // A bare-string command (`RawCmd::Line`) round-trips as itself — not silently promoted to a
         // one-element array — so an exported minimal profile re-imports identically.
         let reparsed = parse_app(out.as_bytes()).unwrap();
-        assert_eq!(reparsed.cmd, Some(RawCmd::Line("claude".into())));
+        assert_eq!(reparsed.cmd, Some(RawCmd::Line("demo-app".into())));
         assert_eq!(app, reparsed);
     }
 

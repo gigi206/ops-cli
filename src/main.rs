@@ -798,45 +798,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     } else {
         let _ = writeln!(o, "  {h}packages:{r}");
         for p in &view.packages {
-            match &p.withheld_reason {
-                Some(reason) => {
-                    let _ = writeln!(
-                        o,
-                        "    {n}{}{r} -> {}:{}  {warn}(withheld: {reason}){r}",
-                        p.name, p.backend, p.locator
-                    );
-                }
-                // A pinned `flake:` package shows its locked revision and `pinned`; an unpinned
-                // one shows `floating` so the absence of a rev reads as a state, not a gap. Every
-                // other backend keeps the plain realisation line.
-                None => match &p.pinned_rev {
-                    Some(rev) => {
-                        let _ = writeln!(
-                            o,
-                            "    {n}{}{r} -> {}:{}  {dim}@ {} ({}, pinned){r}",
-                            p.name,
-                            p.backend,
-                            p.locator,
-                            short_rev(rev),
-                            p.realised
-                        );
-                    }
-                    None if p.backend == "flake" => {
-                        let _ = writeln!(
-                            o,
-                            "    {n}{}{r} -> {}:{}  {dim}({}, floating){r}",
-                            p.name, p.backend, p.locator, p.realised
-                        );
-                    }
-                    None => {
-                        let _ = writeln!(
-                            o,
-                            "    {n}{}{r} -> {}:{}  {dim}({}){r}",
-                            p.name, p.backend, p.locator, p.realised
-                        );
-                    }
-                },
-            }
+            let _ = writeln!(o, "{}", package_line(p, pal, "    "));
         }
     }
 
@@ -1010,19 +972,37 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
                 }
             }
+            // The packages this overlay declares. Compact by default — names with ` @ <rev>` for a
+            // pinned `flake:` one and ` (withheld)` for one the trust gate would withhold at launch,
+            // so an untrusted app package reads as withheld here without `--details`. `--details`
+            // expands to one full line per package (backend, locator, realisation), the same line
+            // the baseline `packages` section renders, so the two never drift.
             if !app.packages.is_empty() {
-                // Each package by name, with ` @ <rev>` appended when it is a pinned `flake:` one —
-                // the pin shown compactly here rather than the baseline section's full line.
-                let pkgs = app
-                    .packages
-                    .iter()
-                    .map(|p| match &p.pinned_rev {
-                        Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
-                        None => p.name.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
+                if details {
+                    let _ = writeln!(o, "      {dim}packages:{r}");
+                    for p in &app.packages {
+                        let _ = writeln!(o, "{}", package_line(p, pal, "        "));
+                    }
+                } else {
+                    let pkgs = app
+                        .packages
+                        .iter()
+                        .map(|p| {
+                            // A withheld package stands as its name plus the marker — neither its
+                            // pin nor its realisation, since it is not built; the same short-circuit
+                            // the full `--details` line takes, so the two paths agree.
+                            if p.withheld_reason.is_some() {
+                                return format!("{} {warn}(withheld){r}", p.name);
+                            }
+                            match &p.pinned_rev {
+                                Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
+                                None => p.name.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
+                }
             }
             // An overlay is a compact summary by default — one line per field; an allowlist shows
             // just its rule counts. `--details` expands that to the individual allow/deny rules
@@ -1099,6 +1079,41 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     }
 
     o
+}
+
+/// One package's detail line, indented by `indent`: `<name> -> <backend>:<locator>  (<detail>)`,
+/// with the trust verdict and any `flake:` pin folded in. A withheld package takes the caution hue
+/// and carries its reason; an admitted `flake:` package shows its pinned revision and `pinned`, or
+/// `floating` when unpinned; every other backend shows its plain realisation. Shared by the
+/// baseline `packages` section (indented four spaces) and an app overlay's `--details` expansion
+/// (eight), so the two render identically and cannot drift. The identifier rides the name span, a
+/// secondary detail is dimmed, a withheld reason is yellow — every span empty under a non-terminal.
+fn package_line(p: &config::view::PackageView, pal: &style::Palette, indent: &str) -> String {
+    let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
+    match &p.withheld_reason {
+        Some(reason) => format!(
+            "{indent}{n}{}{r} -> {}:{}  {warn}(withheld: {reason}){r}",
+            p.name, p.backend, p.locator
+        ),
+        None => match &p.pinned_rev {
+            Some(rev) => format!(
+                "{indent}{n}{}{r} -> {}:{}  {dim}@ {} ({}, pinned){r}",
+                p.name,
+                p.backend,
+                p.locator,
+                short_rev(rev),
+                p.realised
+            ),
+            None if p.backend == "flake" => format!(
+                "{indent}{n}{}{r} -> {}:{}  {dim}({}, floating){r}",
+                p.name, p.backend, p.locator, p.realised
+            ),
+            None => format!(
+                "{indent}{n}{}{r} -> {}:{}  {dim}({}){r}",
+                p.name, p.backend, p.locator, p.realised
+            ),
+        },
+    }
 }
 
 /// One channel line's text (without the colored label): `<source> @ <short-rev>  (<origin>)`, or
@@ -3846,8 +3861,8 @@ mod tests {
             "removed store 'hub'"
         );
         assert_eq!(
-            render_removed(Some("app profile"), "claude", &p),
-            "removed app profile 'claude'"
+            render_removed(Some("app profile"), "demo-app", &p),
+            "removed app profile 'demo-app'"
         );
         assert_eq!(
             render_store_tofu("ab12", "hub", &p),
@@ -3879,18 +3894,18 @@ mod tests {
         );
         assert_eq!(
             render_app_imported(
-                "claude",
-                Path::new("/c/claude.toml"),
+                "demo-app",
+                Path::new("/c/demo-app.toml"),
                 &["command: x".into(), "network: allowlist".into()],
                 &p
             ),
-            "imported app profile 'claude' -> /c/claude.toml\n  \
+            "imported app profile 'demo-app' -> /c/demo-app.toml\n  \
              granted posture (trusted by location — honored even on an untrusted project):\n    \
-             command: x\n    network: allowlist\n  launch it with: ops app claude"
+             command: x\n    network: allowlist\n  launch it with: ops app demo-app"
         );
         assert_eq!(
-            render_app_exported("claude", Path::new("/c/out.toml"), &p),
-            "exported app `claude` -> /c/out.toml"
+            render_app_exported("demo-app", Path::new("/c/out.toml"), &p),
+            "exported app `demo-app` -> /c/out.toml"
         );
         let cfg = Path::new("/p/.ops.toml");
         assert_eq!(
@@ -3954,11 +3969,11 @@ mod tests {
             "a no-op update must take the dim hue:\n{noop}"
         );
 
-        let imported = render_app_imported("claude", Path::new("/c/claude.toml"), &[], &p);
+        let imported = render_app_imported("demo-app", Path::new("/c/demo-app.toml"), &[], &p);
         assert!(imported.contains(&format!("{}imported{}", p.ok, p.reset)));
-        assert!(imported.contains(&format!("'{}claude{}'", p.name, p.reset)));
+        assert!(imported.contains(&format!("'{}demo-app{}'", p.name, p.reset)));
 
-        let exported = render_app_exported("claude", Path::new("/c/out.toml"), &p);
+        let exported = render_app_exported("demo-app", Path::new("/c/out.toml"), &p);
         assert!(exported.contains(&format!("{}exported{}", p.ok, p.reset)));
 
         let cfg = Path::new("/p/.ops.toml");
@@ -4107,18 +4122,18 @@ mod tests {
             binds: vec![],
             packages: vec![
                 PackageView {
-                    name: "hermes".into(),
+                    name: "pinned-tool".into(),
                     backend: "flake".into(),
-                    locator: "github:NousResearch/hermes-agent#default".into(),
+                    locator: "github:example/pinned-tool#default".into(),
                     realised: "in-cage via nix build, fetched at launch".into(),
                     trusted: true,
                     withheld_reason: None,
                     pinned_rev: Some(rev.into()),
                 },
                 PackageView {
-                    name: "futil".into(),
+                    name: "floating-tool".into(),
                     backend: "flake".into(),
-                    locator: "github:numtide/flake-utils".into(),
+                    locator: "github:example/floating-tool".into(),
                     realised: "in-cage via nix build, fetched at launch".into(),
                     trusted: true,
                     withheld_reason: None,
@@ -4141,13 +4156,18 @@ mod tests {
             gui: GuiView::None,
             secrets: vec![],
             apps: vec![AppView {
-                name: "hermes".into(),
-                cmd: Some("hermes".into()),
+                name: "demo-app".into(),
+                cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
                 env: vec![],
                 binds: vec![],
-                packages: vec![AppPackageView {
-                    name: "hermes".into(),
+                packages: vec![PackageView {
+                    name: "pinned-tool".into(),
+                    backend: "flake".into(),
+                    locator: "github:example/pinned-tool#default".into(),
+                    realised: "in-cage via nix build, fetched at launch".into(),
+                    trusted: true,
+                    withheld_reason: None,
                     pinned_rev: Some(rev.into()),
                 }],
                 network: None,
@@ -4160,20 +4180,20 @@ mod tests {
         let out = render_config(&view, &style::Palette::plain(), false);
         assert!(
             out.contains(
-                "    hermes -> flake:github:NousResearch/hermes-agent#default  \
+                "    pinned-tool -> flake:github:example/pinned-tool#default  \
                  @ a1b2c3d (in-cage via nix build, fetched at launch, pinned)"
             ),
             "a pinned flake package must show its short rev and `pinned`:\n{out}"
         );
         assert!(
             out.contains(
-                "    futil -> flake:github:numtide/flake-utils  \
+                "    floating-tool -> flake:github:example/floating-tool  \
                  (in-cage via nix build, fetched at launch, floating)"
             ),
             "an unpinned flake package must read as `floating`:\n{out}"
         );
         assert!(
-            out.contains("      packages: hermes @ a1b2c3d"),
+            out.contains("      packages: pinned-tool @ a1b2c3d"),
             "an app's pinned flake package must show its rev compactly:\n{out}"
         );
     }
@@ -4206,14 +4226,14 @@ mod tests {
             gui: GuiView::None,
             secrets: vec![],
             apps: vec![AppView {
-                name: "claude".into(),
-                cmd: Some("claude".into()),
+                name: "demo-app".into(),
+                cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
                 env: vec![],
                 binds: vec![],
                 packages: vec![],
                 network: Some(AppNetworkView::Allowlist {
-                    allow: vec!["api.anthropic.com".into(), "github.com".into()],
+                    allow: vec!["api.example.com".into(), "github.com".into()],
                     deny: vec!["github.com/secret".into()],
                     builtin: vec!["cache.nixos.org".into()],
                 }),
@@ -4231,14 +4251,14 @@ mod tests {
             "the default app allowlist must read as compact counts:\n{compact}"
         );
         assert!(
-            !compact.contains("allow api.anthropic.com"),
+            !compact.contains("allow api.example.com"),
             "the default must not expand the rules:\n{compact}"
         );
 
         // --details: the individual rules and the always-allowed built-in set.
         let expanded = render_config(&view, &style::Palette::plain(), true);
         assert!(
-            expanded.contains("        allow api.anthropic.com")
+            expanded.contains("        allow api.example.com")
                 && expanded.contains("        allow github.com"),
             "--details must list the allow rules:\n{expanded}"
         );
@@ -4281,8 +4301,8 @@ mod tests {
             gui: GuiView::None,
             secrets: vec![],
             apps: vec![AppView {
-                name: "claude".into(),
-                cmd: Some("claude".into()),
+                name: "demo-app".into(),
+                cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
                 env: vec![],
                 binds: vec![],
@@ -4292,15 +4312,15 @@ mod tests {
                 secrets: vec![
                     SecretView {
                         header: "x-api-key".into(),
-                        to: "api.anthropic.com".into(),
+                        to: "api.example.com".into(),
                         shape: "raw".into(),
-                        sources: "env ANTHROPIC_API_KEY".into(),
+                        sources: "env DEMO_API_KEY".into(),
                     },
                     SecretView {
                         header: "authorization".into(),
-                        to: "api.openai.com".into(),
+                        to: "api2.example.com".into(),
                         shape: "bearer".into(),
-                        sources: "env OPENAI_API_KEY".into(),
+                        sources: "env DEMO_TOKEN".into(),
                     },
                 ],
                 notes: vec![],
@@ -4315,7 +4335,7 @@ mod tests {
             "the default app secrets line must read as a compact count:\n{compact}"
         );
         assert!(
-            !compact.contains("api.anthropic.com"),
+            !compact.contains("api.example.com"),
             "the default must not expand the destinations:\n{compact}"
         );
 
@@ -4326,11 +4346,10 @@ mod tests {
             "--details must head the expanded secrets block:\n{expanded}"
         );
         assert!(
-            expanded.contains(
-                "        x-api-key -> api.anthropic.com  (raw, from env ANTHROPIC_API_KEY)"
-            ) && expanded.contains(
-                "        authorization -> api.openai.com  (bearer, from env OPENAI_API_KEY)"
-            ),
+            expanded.contains("        x-api-key -> api.example.com  (raw, from env DEMO_API_KEY)")
+                && expanded.contains(
+                    "        authorization -> api2.example.com  (bearer, from env DEMO_TOKEN)"
+                ),
             "--details must list each credential by destination and source:\n{expanded}"
         );
     }
@@ -4363,12 +4382,12 @@ mod tests {
             gui: GuiView::None,
             secrets: vec![],
             apps: vec![AppView {
-                name: "claude".into(),
-                cmd: Some("claude".into()),
+                name: "demo-app".into(),
+                cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
                 env: vec![
                     AppEnvVar {
-                        key: "ANTHROPIC_API_KEY".into(),
+                        key: "DEMO_API_KEY".into(),
                         value: "placeholder".into(),
                     },
                     AppEnvVar {
@@ -4393,14 +4412,14 @@ mod tests {
             "the default must show compact env and bind counts:\n{compact}"
         );
         assert!(
-            !compact.contains("ANTHROPIC_API_KEY=placeholder") && !compact.contains("/data/cache"),
+            !compact.contains("DEMO_API_KEY=placeholder") && !compact.contains("/data/cache"),
             "the default must not expand the env values or bind paths:\n{compact}"
         );
 
         // --details: each env entry by `KEY=value` and each bind path.
         let expanded = render_config(&view, &style::Palette::plain(), true);
         assert!(
-            expanded.contains("        ANTHROPIC_API_KEY=placeholder")
+            expanded.contains("        DEMO_API_KEY=placeholder")
                 && expanded.contains("        EDITOR=vim"),
             "--details must list each env entry as KEY=value:\n{expanded}"
         );
@@ -4408,6 +4427,112 @@ mod tests {
             expanded.contains("      binds (read-only):")
                 && expanded.contains("        /data/cache"),
             "--details must list each bind path:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn config_render_shows_app_packages_compactly_then_expands_under_details() {
+        // An app overlay's packages are a compact name list by default — a withheld one marked
+        // `(withheld)` and a pinned `flake:` one carrying ` @ <rev>`, so the trust verdict (which
+        // governs whether the package is admitted at launch) and the pin are visible without
+        // `--details`. `--details` expands to the full per-package line — the same one the baseline
+        // `packages` section renders, just indented under the app — so the backend is visible there.
+        use config::view::*;
+        let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+        let view = ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            mise: None,
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Shared,
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![AppView {
+                name: "demo-app".into(),
+                cmd: Some("demo-app".into()),
+                home_scope: "global (shared across projects)".into(),
+                env: vec![],
+                binds: vec![],
+                packages: vec![
+                    PackageView {
+                        name: "admitted-tool".into(),
+                        backend: "nix".into(),
+                        locator: "ripgrep".into(),
+                        realised: "host-side, durable".into(),
+                        trusted: true,
+                        withheld_reason: None,
+                        pinned_rev: None,
+                    },
+                    PackageView {
+                        name: "withheld-tool".into(),
+                        backend: "nix".into(),
+                        locator: "foo".into(),
+                        realised: "host-side, durable".into(),
+                        trusted: false,
+                        withheld_reason: Some("the project is untrusted".into()),
+                        pinned_rev: None,
+                    },
+                    PackageView {
+                        name: "pinned-tool".into(),
+                        backend: "flake".into(),
+                        locator: "github:example/pinned-tool#default".into(),
+                        realised: "in-cage via nix build, fetched at launch".into(),
+                        trusted: true,
+                        withheld_reason: None,
+                        pinned_rev: Some(rev.into()),
+                    },
+                ],
+                network: None,
+                gui: None,
+                secrets: vec![],
+                notes: vec![],
+            }],
+            warnings: vec![],
+        };
+
+        // Default: one compact line — the withheld marker and the flake pin inline, no full lines.
+        let compact = render_config(&view, &style::Palette::plain(), false);
+        assert!(
+            compact.contains(
+                "      packages: admitted-tool, withheld-tool (withheld), pinned-tool @ a1b2c3d"
+            ),
+            "the default must show a compact name list with the withheld marker and the pin:\n{compact}"
+        );
+        assert!(
+            !compact.contains("-> nix:ripgrep"),
+            "the default must not expand to the full package line:\n{compact}"
+        );
+
+        // --details: each package on its own full line, mirroring the baseline section — a withheld
+        // one carries its reason, the flake one its pin, every other its realisation.
+        let expanded = render_config(&view, &style::Palette::plain(), true);
+        assert!(
+            expanded.contains("        admitted-tool -> nix:ripgrep  (host-side, durable)"),
+            "--details must expand an admitted package to its full backend line:\n{expanded}"
+        );
+        assert!(
+            expanded
+                .contains("        withheld-tool -> nix:foo  (withheld: the project is untrusted)"),
+            "--details must show a withheld package's reason:\n{expanded}"
+        );
+        assert!(
+            expanded.contains(
+                "        pinned-tool -> flake:github:example/pinned-tool#default  \
+                 @ a1b2c3d (in-cage via nix build, fetched at launch, pinned)"
+            ),
+            "--details must show a pinned flake package's rev:\n{expanded}"
         );
     }
 }

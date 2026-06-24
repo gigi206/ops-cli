@@ -212,34 +212,30 @@ mod tests {
     #[test]
     fn mise_packages_returns_only_trusted_mise_tokens() {
         let pkgs = [
-            mise_package(
-                "claude-code",
-                "aqua:anthropics/claude-code",
-                TrustState::Trusted,
-            ),
+            mise_package("demo-tool", "aqua:example/demo-tool", TrustState::Trusted),
             package("node", "nodejs_20", TrustState::Trusted), // a nix package is not a mise token
             mise_package("evil", "aqua:attacker/x", TrustState::Untrusted), // untrusted: dropped
-            mise_package("opencode", "opencode", TrustState::Trusted),
+            mise_package("other-tool", "other-tool", TrustState::Trusted),
         ];
         // Trusted `mise:` tokens only, in declaration order; nix, flake, and untrusted are excluded.
         let pkgs_with_flake = [
             pkgs[0].clone(),
             flake_package(
-                "hermes",
-                "github:NousResearch/hermes-agent#tui",
+                "flake-tool",
+                "github:example/flake-tool#tui",
                 TrustState::Trusted,
             ),
         ];
         assert_eq!(
             mise_packages(&pkgs),
             vec![
-                "aqua:anthropics/claude-code".to_string(),
-                "opencode".to_string()
+                "aqua:example/demo-tool".to_string(),
+                "other-tool".to_string()
             ]
         );
         assert_eq!(
             mise_packages(&pkgs_with_flake),
-            vec!["aqua:anthropics/claude-code".to_string()],
+            vec!["aqua:example/demo-tool".to_string()],
             "a flake package is not a mise token"
         );
     }
@@ -248,12 +244,12 @@ mod tests {
     fn flake_packages_returns_only_trusted_flake_refs_by_name() {
         let pkgs = [
             flake_package(
-                "hermes",
-                "github:NousResearch/hermes-agent#tui",
+                "flake-tool",
+                "github:example/flake-tool#tui",
                 TrustState::Trusted,
             ),
             package("node", "nodejs_20", TrustState::Trusted), // a nix package is not a flake ref
-            mise_package("opencode", "opencode", TrustState::Trusted), // nor a mise token
+            mise_package("other-tool", "other-tool", TrustState::Trusted), // nor a mise token
             flake_package("evil", "github:attacker/x#bin", TrustState::Untrusted), // untrusted: dropped
         ];
         // Trusted `flake:` (name, ref) pairs only, in declaration order; nix, mise, and
@@ -261,8 +257,8 @@ mod tests {
         assert_eq!(
             flake_packages(&pkgs),
             vec![(
-                "hermes".to_string(),
-                "github:NousResearch/hermes-agent#tui".to_string()
+                "flake-tool".to_string(),
+                "github:example/flake-tool#tui".to_string()
             )]
         );
     }

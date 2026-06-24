@@ -709,15 +709,15 @@ mod tests {
         // rebuild. Each revision — and the floating (unpinned) form — is its own path.
         let rev_a = "11707dc2f618dd54ca8739b309ec4fc024de578b";
         let rev_b = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
-        let a = flake_out_link_rev("hermes", rev_a);
-        let b = flake_out_link_rev("hermes", rev_b);
-        let floating = flake_out_link("hermes");
+        let a = flake_out_link_rev("flake-tool", rev_a);
+        let b = flake_out_link_rev("flake-tool", rev_b);
+        let floating = flake_out_link("flake-tool");
         assert_ne!(a, b, "a different revision is a different out-link");
         assert_ne!(
             a, floating,
             "a pinned out-link differs from the floating one"
         );
-        assert!(a.ends_with(format!("hermes-{rev_a}")));
+        assert!(a.ends_with(format!("flake-tool-{rev_a}")));
     }
 
     fn userland() -> Userland {
@@ -1204,8 +1204,8 @@ mod tests {
         let project = Path::new("/home/u/proj");
         for runtime in [
             Runtime::ProjectDefault,
-            Runtime::GlobalApp("claude"),
-            Runtime::ProjectApp("claude"),
+            Runtime::GlobalApp("demo-app"),
+            Runtime::ProjectApp("demo-app"),
         ] {
             let pr = project_runtime(data, project, runtime);
             assert!(
@@ -1231,9 +1231,9 @@ mod tests {
         let home = |project: &Path, rt| project_runtime(data, project, rt).home_src;
 
         let default = home(p1, Runtime::ProjectDefault);
-        let global_a = home(p1, Runtime::GlobalApp("claude"));
-        let global_b = home(p1, Runtime::GlobalApp("opencode"));
-        let proj_a = home(p1, Runtime::ProjectApp("claude"));
+        let global_a = home(p1, Runtime::GlobalApp("demo-app"));
+        let global_b = home(p1, Runtime::GlobalApp("other-app"));
+        let proj_a = home(p1, Runtime::ProjectApp("demo-app"));
 
         // all four are distinct
         for (x, y) in [
@@ -1245,8 +1245,8 @@ mod tests {
             assert_ne!(x, y, "runtime homes must not collide");
         }
         // a global app keeps the same home across projects; a per-project one does not
-        assert_eq!(global_a, home(p2, Runtime::GlobalApp("claude")));
-        assert_ne!(proj_a, home(p2, Runtime::ProjectApp("claude")));
+        assert_eq!(global_a, home(p2, Runtime::GlobalApp("demo-app")));
+        assert_ne!(proj_a, home(p2, Runtime::ProjectApp("demo-app")));
         // the project default and a per-project app both nest under the same project dir
         let project_dir = data.join("projects").join(project_id(p1));
         assert!(default.starts_with(&project_dir));

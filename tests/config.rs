@@ -1391,8 +1391,9 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
         bind = bind.display().to_string()
     ));
 
-    // Untrusted: the app shows with its command and package, but its bind is a security
-    // field — dropped, with a note on the app.
+    // Untrusted: the app shows with its command, but its security fields read as the launch would
+    // treat them — the bind is dropped with a note, and the package shows `(withheld)` (an
+    // untrusted layer's `[packages]` is withheld at launch, so the view must not show it as plain).
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "config must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1412,15 +1413,16 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
         "an opted-in per-project home scope must show:\n{stdout}"
     );
     assert!(
-        stdout.contains("packages: tool"),
-        "app package missing:\n{stdout}"
+        stdout.contains("packages: tool (withheld)"),
+        "an untrusted app package must read as withheld (it is withheld at launch):\n{stdout}"
     );
     assert!(
         stdout.to_lowercase().contains("note:") && stdout.to_lowercase().contains("bind"),
         "an untrusted app's bind must be dropped with a note:\n{stdout}"
     );
 
-    // Trusted: the bind is honored — no drop note remains.
+    // Trusted: the bind is honored — no drop note remains — and the package is admitted, so it
+    // shows plainly, no longer marked `(withheld)`.
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1432,6 +1434,19 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
         !stdout.contains("note:"),
         "a trusted app must not drop its bind:\n{stdout}"
     );
+    assert!(
+        stdout.contains("packages: tool") && !stdout.contains("(withheld)"),
+        "a trusted app package must show plainly, not withheld:\n{stdout}"
+    );
+
+    // `--details` expands the compact list to the full per-package line, surfacing the backend the
+    // baseline `packages` section shows — the same line, just indented under the app.
+    let out = fx.run(&["config", "show", "--details"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tool -> nix:ripgrep"),
+        "--details must expand an app package to its full backend line:\n{stdout}"
+    );
 }
 
 #[test]
@@ -1440,14 +1455,14 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
     // A profile dropped beside the global config is honored in full — its security `network`
     // field included — even with no project trust, exactly like a global `[app.<name>]`.
     fx.write_profile(
-        "claude",
-        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n",
+        "demo-app",
+        "cmd = \"demo-app\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n",
     );
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("claude: claude"),
+        stdout.contains("demo-app: demo-app"),
         "the imported profile must resolve as an app:\n{stdout}"
     );
     assert!(
@@ -1464,9 +1479,9 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     // expands the individual rules plus the always-allowed built-in nix-cache set (which the
     // baseline `network` section never prints here, because the baseline is not an allowlist).
     fx.write_profile(
-        "claude",
-        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\n\
-         allow = [\"api.anthropic.com\", \"github.com\"]\ndeny = [\"github.com/secret\"]\n",
+        "demo-app",
+        "cmd = \"demo-app\"\n[network]\nmode = \"allowlist\"\n\
+         allow = [\"api.example.com\", \"github.com\"]\ndeny = [\"github.com/secret\"]\n",
     );
 
     // Default: the compact one-line count, both numbers present.
@@ -1478,7 +1493,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
         "the default must show compact rule counts:\n{stdout}"
     );
     assert!(
-        !stdout.contains("allow api.anthropic.com"),
+        !stdout.contains("allow api.example.com"),
         "the default must not expand the rules:\n{stdout}"
     );
 
@@ -1487,7 +1502,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("allow api.anthropic.com") && stdout.contains("allow github.com"),
+        stdout.contains("allow api.example.com") && stdout.contains("allow github.com"),
         "--details must list the allow rules:\n{stdout}"
     );
     assert!(
@@ -1507,11 +1522,11 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     // profiles inject host-side from the overlay while the baseline carries no secret. The compact
     // view shows a count; `--details` expands each by destination and source. The value never
     // appears (ops reads it host-side at launch, and never resolves it here) — only the header,
-    // host, shape, and the source *locator* (the variable name, `env ANTHROPIC_API_KEY`).
+    // host, shape, and the source *locator* (the variable name, `env DEMO_API_KEY`).
     fx.write_profile(
-        "claude",
-        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n\
-         [secret.\"api.anthropic.com\"]\nfrom = \"env://ANTHROPIC_API_KEY\"\n\
+        "demo-app",
+        "cmd = \"demo-app\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [secret.\"api.example.com\"]\nfrom = \"env://DEMO_API_KEY\"\n\
          header = \"x-api-key\"\ntype = \"raw\"\n",
     );
 
@@ -1524,7 +1539,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
         "the default must show a compact secret count:\n{stdout}"
     );
     assert!(
-        !stdout.contains("x-api-key -> api.anthropic.com"),
+        !stdout.contains("x-api-key -> api.example.com"),
         "the default must not expand the credential:\n{stdout}"
     );
 
@@ -1534,8 +1549,8 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("x-api-key -> api.anthropic.com")
-            && stdout.contains("from env ANTHROPIC_API_KEY"),
+        stdout.contains("x-api-key -> api.example.com")
+            && stdout.contains("from env DEMO_API_KEY"),
         "--details must show the credential by destination and source locator:\n{stdout}"
     );
 }
@@ -1556,9 +1571,9 @@ fn an_app_env_and_binds_show_counts_by_default_and_expand_under_details() {
     // The top-level keys (`cmd`, `binds`) precede the `[env]` table, or TOML would fold `binds`
     // into `[env]` (an array where a string is expected → a parse error, a silently dropped app).
     fx.write_profile(
-        "claude",
+        "demo-app",
         &format!(
-            "cmd = \"claude\"\nbinds = [\"{}\"]\n[env]\nSHARED = \"app\"\nAPP_ONLY = \"app\"\n",
+            "cmd = \"demo-app\"\nbinds = [\"{}\"]\n[env]\nSHARED = \"app\"\nAPP_ONLY = \"app\"\n",
             bind.display()
         ),
     );
@@ -1642,37 +1657,37 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
     let fx = Fixture::new();
     // A portable profile authored as a standalone file (the app's fields at the top level).
     std::fs::write(
-        fx.proj.path().join("claude.toml"),
-        "cmd = \"claude\"\n\
-         [network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n\
-         [secret.\"api.anthropic.com\"]\nfrom = \"env://ANTHROPIC_API_KEY\"\n\
+        fx.proj.path().join("demo-app.toml"),
+        "cmd = \"demo-app\"\n\
+         [network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [secret.\"api.example.com\"]\nfrom = \"env://DEMO_API_KEY\"\n\
          header = \"x-api-key\"\ntype = \"raw\"\n",
     )
     .unwrap();
 
     // Import names it by the file stem, validates it, prints the granted posture, and places it.
-    let imp = fx.run(&["app", "import", "claude.toml"]);
+    let imp = fx.run(&["app", "import", "demo-app.toml"]);
     assert!(
         imp.status.success(),
         "import failed: {}",
         String::from_utf8_lossy(&imp.stderr)
     );
     let out = String::from_utf8_lossy(&imp.stdout);
-    assert!(out.contains("imported app profile 'claude'"), "{out}");
+    assert!(out.contains("imported app profile 'demo-app'"), "{out}");
     assert!(out.contains("granted posture"), "{out}");
-    assert!(out.contains("command: claude"), "{out}");
+    assert!(out.contains("command: demo-app"), "{out}");
     // The secret is shown by destination + source locator, never a value.
     assert!(
-        out.contains("api.anthropic.com") && out.contains("env://ANTHROPIC_API_KEY"),
+        out.contains("api.example.com") && out.contains("env://DEMO_API_KEY"),
         "{out}"
     );
 
     // It now resolves as a trusted-by-location app.
     let cfg = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
-    assert!(cfg.contains("claude: claude"), "{cfg}");
+    assert!(cfg.contains("demo-app: demo-app"), "{cfg}");
 
     // A second import without --force refuses to clobber.
-    let again = fx.run(&["app", "import", "claude.toml"]);
+    let again = fx.run(&["app", "import", "demo-app.toml"]);
     assert!(
         !again.status.success(),
         "a second import must refuse without --force"
@@ -1680,16 +1695,16 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
     assert!(String::from_utf8_lossy(&again.stderr).contains("--force"));
 
     // `--as` re-keys to a different name (the contents are name-agnostic), and `list` shows both.
-    let renamed = fx.run(&["app", "import", "claude.toml", "--as", "agent"]);
+    let renamed = fx.run(&["app", "import", "demo-app.toml", "--as", "agent"]);
     assert!(renamed.status.success());
     let listed = String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).to_string();
     assert!(
-        listed.contains("agent") && listed.contains("claude"),
+        listed.contains("agent") && listed.contains("demo-app"),
         "{listed}"
     );
 
     // Remove an imported profile; the other remains.
-    let rm = fx.run(&["app", "rm", "claude"]);
+    let rm = fx.run(&["app", "rm", "demo-app"]);
     assert!(
         rm.status.success(),
         "rm failed: {}",
@@ -1697,11 +1712,11 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
     );
     let after = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
     assert!(
-        !after.contains("claude: claude"),
+        !after.contains("demo-app: demo-app"),
         "removed app lingers:\n{after}"
     );
     assert!(
-        after.contains("agent: claude"),
+        after.contains("agent: demo-app"),
         "the other app must remain:\n{after}"
     );
 }
@@ -1712,7 +1727,7 @@ fn ops_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
     // A file mistakenly wrapped in `[app.<name>]` has no top-level cmd → refused with a hint.
     std::fs::write(
         fx.proj.path().join("wrapped.toml"),
-        "[app.claude]\ncmd = \"claude\"\n",
+        "[app.demo-app]\ncmd = \"demo-app\"\n",
     )
     .unwrap();
     let wrapped = fx.run(&["app", "import", "wrapped.toml"]);
@@ -1737,11 +1752,11 @@ fn ops_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
     let fx = Fixture::new();
 
     // (a) An imported profile exports verbatim — comments and formatting survive.
-    let profile_body = "# my claude profile\n\
-                        cmd = \"claude\"\n\
-                        [network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n";
-    fx.write_profile("claude", profile_body);
-    let exp = fx.run(&["app", "export", "claude"]);
+    let profile_body = "# my demo-app profile\n\
+                        cmd = \"demo-app\"\n\
+                        [network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n";
+    fx.write_profile("demo-app", profile_body);
+    let exp = fx.run(&["app", "export", "demo-app"]);
     assert!(
         exp.status.success(),
         "export failed: {}",

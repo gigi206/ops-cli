@@ -2465,8 +2465,8 @@ mod tests {
             session::SessionRuntime::Project
         );
         assert_eq!(
-            session_runtime(binds::Runtime::GlobalApp("claude-code")),
-            session::SessionRuntime::GlobalApp("claude-code".to_string())
+            session_runtime(binds::Runtime::GlobalApp("demo-app")),
+            session::SessionRuntime::GlobalApp("demo-app".to_string())
         );
         assert_eq!(
             session_runtime(binds::Runtime::ProjectApp("agent")),
@@ -2485,8 +2485,8 @@ mod tests {
             "ops: attaching a shell to /home/me/proj (a second terminal in the same sandbox)"
         );
         assert_eq!(
-            render_attaching_app("claude-code", &p),
-            "ops: attaching a shell to app `claude-code` (its isolated home and posture)"
+            render_attaching_app("demo-app", &p),
+            "ops: attaching a shell to app `demo-app` (its isolated home and posture)"
         );
         assert_eq!(
             render_no_active_sessions(&p),
@@ -2537,8 +2537,8 @@ mod tests {
         let killed = render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p);
         assert!(killed.contains(&format!("{}sent SIGKILL{}", p.warn, p.reset)));
 
-        let attach = render_attaching_app("claude-code", &p);
-        assert!(attach.contains(&format!("{}claude-code{}", p.name, p.reset)));
+        let attach = render_attaching_app("demo-app", &p);
+        assert!(attach.contains(&format!("{}demo-app{}", p.name, p.reset)));
         // The announcement verb is not green — only a completed change earns that.
         assert!(!attach.contains(&format!("{}attaching", p.ok)));
 
@@ -2607,7 +2607,7 @@ mod tests {
         use crate::config::AppHomeScope;
         let mut cfg = resolved(None, None);
         cfg.packages = vec![
-            mise_pkg("opencode", "opencode", true),
+            mise_pkg("other-tool", "other-tool", true),
             nix_pkg("jq", "jq"), // a nix package is not a mise token
             mise_pkg("evil", "aqua:attacker/x", false), // untrusted: dropped
         ];
@@ -2650,14 +2650,14 @@ mod tests {
         // The baseline group rolls only the trusted mise token, in the default home.
         let base = &groups[0];
         assert!(matches!(base.home, GroupHome::ProjectDefault));
-        assert_eq!(base.tokens, vec!["opencode".to_string()]);
+        assert_eq!(base.tokens, vec!["other-tool".to_string()]);
 
         // alpha rolls in its own (global) home; its tokens are the merged set (baseline + app).
         let alpha = groups
             .iter()
             .find(|g| matches!(&g.home, GroupHome::GlobalApp(n) if n == "alpha"))
             .expect("alpha has a global-home group");
-        assert!(alpha.tokens.contains(&"opencode".to_string()));
+        assert!(alpha.tokens.contains(&"other-tool".to_string()));
         assert!(alpha.tokens.contains(&"aqua:foo".to_string()));
 
         // beta rolls in its own per-project home, inheriting only the baseline mise tool.
@@ -2665,7 +2665,7 @@ mod tests {
             .iter()
             .find(|g| matches!(&g.home, GroupHome::ProjectApp(n) if n == "beta"))
             .expect("beta inherits the baseline mise tool in its per-project home");
-        assert_eq!(beta.tokens, vec!["opencode".to_string()]);
+        assert_eq!(beta.tokens, vec!["other-tool".to_string()]);
 
         // The command-less app produced no group.
         assert!(!groups.iter().any(|g| g.home.label().contains("gamma")));
@@ -2874,7 +2874,7 @@ mod tests {
             // a hostile token must stay a single positional arg, never reach the script
             "node@20; rm -rf /".to_string(),
         ];
-        let cmd = vec![OsString::from("claude"), OsString::from("--print")];
+        let cmd = vec![OsString::from("demo-app"), OsString::from("--print")];
 
         let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, cmd);
 
@@ -2894,7 +2894,7 @@ mod tests {
         assert_eq!(argv[3], OsString::from("ops-mise-equip"));
         assert_eq!(argv[4], OsString::from("aqua:BurntSushi/ripgrep@latest"));
         assert_eq!(argv[5], OsString::from("node@20; rm -rf /"));
-        assert_eq!(argv[6], OsString::from("claude"));
+        assert_eq!(argv[6], OsString::from("demo-app"));
         assert_eq!(argv[7], OsString::from("--print"));
     }
 
@@ -2905,8 +2905,8 @@ mod tests {
         // positional — proving the same no-shell-injection shape for the global lane.
         let mise = PathBuf::from("/nix/store/mise/bin/mise");
         let bash = PathBuf::from("/nix/store/bash/bin/bash");
-        let tokens = vec!["aqua:anthropics/claude-code".to_string()];
-        let cmd = vec![OsString::from("claude")];
+        let tokens = vec!["aqua:example/demo-tool".to_string()];
+        let cmd = vec![OsString::from("demo-app")];
 
         let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, cmd);
 
@@ -2914,8 +2914,8 @@ mod tests {
         assert!(script.contains("/nix/store/mise/bin/mise use -g \"${@:1:1}\""));
         assert!(script.contains("shift 1;"));
         // the token is a positional arg, never in the script
-        assert_eq!(argv[4], OsString::from("aqua:anthropics/claude-code"));
-        assert_eq!(argv[5], OsString::from("claude"));
+        assert_eq!(argv[4], OsString::from("aqua:example/demo-tool"));
+        assert_eq!(argv[5], OsString::from("demo-app"));
     }
 
     #[test]
@@ -2930,9 +2930,9 @@ mod tests {
         let dir = PathBuf::from("/home/sandbox/.local/state/ops/flake");
         let triples = vec![
             (
-                "github:NousResearch/hermes-agent#tui".to_string(),
-                PathBuf::from("/home/sandbox/.local/state/ops/flake/hermes"),
-                "hermes".to_string(),
+                "github:example/flake-tool#tui".to_string(),
+                PathBuf::from("/home/sandbox/.local/state/ops/flake/flake-tool"),
+                "flake-tool".to_string(),
             ),
             // a hostile ref must stay a single positional arg, never reach the script
             (
@@ -2941,7 +2941,7 @@ mod tests {
                 "evil".to_string(),
             ),
         ];
-        let cmd = vec![OsString::from("hermes"), OsString::from("-z")];
+        let cmd = vec![OsString::from("flake-tool"), OsString::from("-z")];
 
         let argv = wrap_flake_equip(&nix, &bash, &dir, &triples, cmd);
 
@@ -2966,22 +2966,19 @@ mod tests {
         );
         // label, then interleaved (ref, out-link, key) triples, then the command — all positional
         assert_eq!(argv[3], OsString::from("ops-flake-equip"));
-        assert_eq!(
-            argv[4],
-            OsString::from("github:NousResearch/hermes-agent#tui")
-        );
+        assert_eq!(argv[4], OsString::from("github:example/flake-tool#tui"));
         assert_eq!(
             argv[5],
-            OsString::from("/home/sandbox/.local/state/ops/flake/hermes")
+            OsString::from("/home/sandbox/.local/state/ops/flake/flake-tool")
         );
-        assert_eq!(argv[6], OsString::from("hermes"));
+        assert_eq!(argv[6], OsString::from("flake-tool"));
         assert_eq!(argv[7], OsString::from("github:evil/x#bin; rm -rf /"));
         assert_eq!(
             argv[8],
             OsString::from("/home/sandbox/.local/state/ops/flake/evil")
         );
         assert_eq!(argv[9], OsString::from("evil"));
-        assert_eq!(argv[10], OsString::from("hermes"));
+        assert_eq!(argv[10], OsString::from("flake-tool"));
         assert_eq!(argv[11], OsString::from("-z"));
     }
 

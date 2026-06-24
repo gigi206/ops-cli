@@ -203,15 +203,6 @@ pub(crate) struct AppEnvVar {
     pub(crate) value: String,
 }
 
-/// One package an app's overlay declares: its name and, when it is a `flake:` package pinned by
-/// `ops upgrade flake`, the locked revision — so the app's compact package list can show the pin
-/// beside the name without expanding to the baseline section's full backend/realisation line.
-#[derive(Serialize)]
-pub(crate) struct AppPackageView {
-    pub(crate) name: String,
-    pub(crate) pinned_rev: Option<String>,
-}
-
 /// An app overlay's own network posture, projected for display. An allowlist carries its declared
 /// allow/deny rules and the always-allowed built-in nix-cache set: the proxy unions that set into
 /// whatever policy is in effect at launch, so for an app it is part of what `ops app <name>` can
@@ -245,7 +236,12 @@ pub(crate) struct AppView {
     /// the baseline binds. The overlay's own paths, canonicalized to what a launch would mount. A
     /// count by default, each path under `--details`.
     pub(crate) binds: Vec<String>,
-    pub(crate) packages: Vec<AppPackageView>,
+    /// The packages this overlay declares — the same projection the baseline `packages` section
+    /// carries (backend, locator, realisation, trust verdict, and a `flake:` pin), so an untrusted
+    /// app package reads as withheld here exactly as it would be withheld at launch, and the
+    /// backend is visible under `--details`. The overlay's own packages, not the baseline-merged
+    /// set. A compact name list by default; each full line under `--details`.
+    pub(crate) packages: Vec<PackageView>,
     /// The app's own network posture, with an allowlist's rules, when it set one.
     pub(crate) network: Option<AppNetworkView>,
     /// The app's own GUI posture as a word (`wayland`/`none`), when it set one.
@@ -504,10 +500,7 @@ fn app_view(
         packages: app
             .packages
             .iter()
-            .map(|p| AppPackageView {
-                name: p.name.clone(),
-                pinned_rev: flake_pinned_rev(&p.backend, flake_pins),
-            })
+            .map(|p| package_view(p, flake_pins))
             .collect(),
         network: app.network.as_ref().map(|n| match n {
             NetworkPolicy::Shared => AppNetworkView::Shared,
@@ -594,26 +587,34 @@ mod tests {
             gui: GuiView::Wayland,
             secrets: vec![],
             apps: vec![AppView {
-                name: "claude".into(),
-                cmd: Some("claude".into()),
+                name: "demo-app".into(),
+                cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
                 env: vec![AppEnvVar {
-                    key: "ANTHROPIC_API_KEY".into(),
+                    key: "DEMO_API_KEY".into(),
                     value: "placeholder".into(),
                 }],
                 binds: vec!["/data/cache".into()],
-                packages: vec![],
+                packages: vec![PackageView {
+                    name: "demo-tool".into(),
+                    backend: "mise".into(),
+                    locator: "aqua:example/demo-tool".into(),
+                    realised: "in-cage via mise, fetched at launch".into(),
+                    trusted: true,
+                    withheld_reason: None,
+                    pinned_rev: None,
+                }],
                 network: Some(AppNetworkView::Allowlist {
-                    allow: vec!["api.anthropic.com".into()],
-                    deny: vec!["api.anthropic.com/admin".into()],
+                    allow: vec!["api.example.com".into()],
+                    deny: vec!["api.example.com/admin".into()],
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
                 secrets: vec![SecretView {
                     header: "x-api-key".into(),
-                    to: "api.anthropic.com".into(),
+                    to: "api.example.com".into(),
                     shape: "raw".into(),
-                    sources: "env ANTHROPIC_API_KEY".into(),
+                    sources: "env DEMO_API_KEY".into(),
                 }],
                 notes: vec![],
             }],
@@ -638,39 +639,45 @@ mod tests {
         // An app overlay's allowlist serializes its rules and the built-in set in full, so the
         // JSON form carries what `ops app <name>` can reach without a `--details` equivalent.
         let app_net = &json["apps"][0]["network"]["Allowlist"];
-        assert_eq!(app_net["allow"][0], "api.anthropic.com");
-        assert_eq!(app_net["deny"][0], "api.anthropic.com/admin");
+        assert_eq!(app_net["allow"][0], "api.example.com");
+        assert_eq!(app_net["deny"][0], "api.example.com/admin");
         assert_eq!(app_net["builtin"][0], "cache.nixos.org");
         // An app overlay's env and binds serialize in full — the overlay's own additions, the same
         // metadata the baseline `env`/`binds` sections carry (no per-entry layer, since the overlay
         // is flattened). The env value is the placeholder, a free field, never an injected secret.
-        assert_eq!(json["apps"][0]["env"][0]["key"], "ANTHROPIC_API_KEY");
+        assert_eq!(json["apps"][0]["env"][0]["key"], "DEMO_API_KEY");
         assert_eq!(json["apps"][0]["env"][0]["value"], "placeholder");
         assert_eq!(json["apps"][0]["binds"][0], "/data/cache");
+        // An app overlay's packages serialize as the full package projection — the backend and
+        // trust verdict the baseline `packages` carries — so the JSON form shows an untrusted app
+        // package as withheld without a `--details` equivalent.
+        assert_eq!(json["apps"][0]["packages"][0]["name"], "demo-tool");
+        assert_eq!(json["apps"][0]["packages"][0]["backend"], "mise");
+        assert_eq!(json["apps"][0]["packages"][0]["trusted"], true);
         // An app overlay's injected credentials serialize by destination and source — never the
         // value — so the JSON form carries what `ops app <name>` injects without a `--details` flag.
         let app_secret = &json["apps"][0]["secrets"][0];
         assert_eq!(app_secret["header"], "x-api-key");
-        assert_eq!(app_secret["to"], "api.anthropic.com");
-        assert_eq!(app_secret["sources"], "env ANTHROPIC_API_KEY");
+        assert_eq!(app_secret["to"], "api.example.com");
+        assert_eq!(app_secret["sources"], "env DEMO_API_KEY");
     }
 
     /// A `flake:` package's pinned revision surfaces in its view, looked up by the package locator
     /// — and a floating package (no lock entry) shows none. The lookup key is the declared
     /// reference, which is byte-identical to the locator; asserting that here guards the silent
     /// miss the projection would otherwise hide if the two ever diverged. Covers both the baseline
-    /// `packages:` line and an app's compact package list, since the motivating profile (hermes)
-    /// declares its flake package in an app overlay, not the baseline.
+    /// `packages:` line and an app's compact package list, since a profile may declare its flake
+    /// package in an app overlay rather than the baseline.
     #[test]
     fn a_pinned_flake_revision_surfaces_keyed_by_the_locator() {
         use crate::config::{AppHomeScope, Package, ResolvedApp};
 
-        let reference = "github:NousResearch/hermes-agent#default";
+        let reference = "github:example/pinned-tool#default";
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let pins = BTreeMap::from([(reference.to_string(), rev.to_string())]);
 
         let flake = Package {
-            name: "hermes".into(),
+            name: "pinned-tool".into(),
             backend: Backend::Flake(reference.into()),
             state: TrustState::Trusted,
         };
@@ -693,7 +700,7 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
-            cmd: vec!["hermes".into()],
+            cmd: vec!["pinned-tool".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
             ro_binds: vec![],
@@ -703,8 +710,8 @@ mod tests {
             secrets: vec![],
             warnings: vec![],
         };
-        let view = app_view("hermes", &app, &pins);
-        assert_eq!(view.packages[0].name, "hermes");
+        let view = app_view("demo-app", &app, &pins);
+        assert_eq!(view.packages[0].name, "pinned-tool");
         assert_eq!(view.packages[0].pinned_rev.as_deref(), Some(rev));
     }
 }

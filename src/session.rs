@@ -630,7 +630,7 @@ mod tests {
             start_ticks: 99887766,
             kind: Kind::Shell,
             // an app runtime must round-trip too, so attach can reproduce the app's home
-            runtime: SessionRuntime::GlobalApp("claude-code".to_string()),
+            runtime: SessionRuntime::GlobalApp("demo-tool".to_string()),
         };
         let dir = TmpDir::new();
         let path = dir.join("rec");
@@ -737,8 +737,8 @@ mod tests {
         assert_eq!(session_at("/p", 1, 1, Kind::Run).label(), "run");
         let mut s = session_at("/p", 1, 1, Kind::Shell);
         assert_eq!(s.label(), "shell");
-        s.runtime = SessionRuntime::GlobalApp("claude".into());
-        assert_eq!(s.label(), "app:claude");
+        s.runtime = SessionRuntime::GlobalApp("demo-app".into());
+        assert_eq!(s.label(), "app:demo-app");
         s.runtime = SessionRuntime::ProjectApp("agent".into());
         assert_eq!(s.label(), "app:agent");
     }
