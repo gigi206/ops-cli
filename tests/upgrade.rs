@@ -150,6 +150,31 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
         "the lock revision must be 40-hex, got {rev1}"
     );
 
+    // `ops config show` surfaces the pin the upgrade just wrote — host-side, no nix, no network.
+    // This is the make-or-break for the display: the lock key the upgrade wrote must be the
+    // locator the view looks up by, or no rev would ever show. The project is trusted, so the
+    // flake package is admitted (not withheld).
+    let shown = ops()
+        .args(["config", "show"])
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("spawn ops config show");
+    assert!(
+        shown.status.success(),
+        "ops config show failed: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let out = String::from_utf8_lossy(&shown.stdout);
+    let short = &rev1[..7];
+    assert!(
+        out.contains(&format!("futil -> flake:{reference}"))
+            && out.contains(&format!("@ {short}"))
+            && out.contains("pinned"),
+        "ops config show must display the pinned flake revision {short}:\n{out}"
+    );
+
     // A second upgrade moments later resolves the same HEAD — an idempotent no-op.
     let again = run();
     assert!(again.status.success());

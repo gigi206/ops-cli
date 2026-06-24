@@ -29,7 +29,8 @@ mod spec;
 
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use flake::{
-    upgrade as upgrade_flake, withheld as withheld_flake_packages, FlakeUpgrade,
+    pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
+    withheld as withheld_flake_packages, FlakeUpgrade,
 };
 pub(crate) use launch::{
     app, attach, effective_lock_target, gc, run, run_mise, shell, stop, upgrade_mise_packages,

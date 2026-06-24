@@ -803,13 +803,36 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
                         p.name, p.backend, p.locator
                     );
                 }
-                None => {
-                    let _ = writeln!(
-                        o,
-                        "    {n}{}{r} -> {}:{}  {dim}({}){r}",
-                        p.name, p.backend, p.locator, p.realised
-                    );
-                }
+                // A pinned `flake:` package shows its locked revision and `pinned`; an unpinned
+                // one shows `floating` so the absence of a rev reads as a state, not a gap. Every
+                // other backend keeps the plain realisation line.
+                None => match &p.pinned_rev {
+                    Some(rev) => {
+                        let _ = writeln!(
+                            o,
+                            "    {n}{}{r} -> {}:{}  {dim}@ {} ({}, pinned){r}",
+                            p.name,
+                            p.backend,
+                            p.locator,
+                            short_rev(rev),
+                            p.realised
+                        );
+                    }
+                    None if p.backend == "flake" => {
+                        let _ = writeln!(
+                            o,
+                            "    {n}{}{r} -> {}:{}  {dim}({}, floating){r}",
+                            p.name, p.backend, p.locator, p.realised
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            o,
+                            "    {n}{}{r} -> {}:{}  {dim}({}){r}",
+                            p.name, p.backend, p.locator, p.realised
+                        );
+                    }
+                },
             }
         }
     }
@@ -958,7 +981,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette) -> Strin
             }
             let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
             if !app.packages.is_empty() {
-                let _ = writeln!(o, "      {dim}packages:{r} {}", app.packages.join(", "));
+                // Each package by name, with ` @ <rev>` appended when it is a pinned `flake:` one —
+                // the pin shown compactly here rather than the baseline section's full line.
+                let pkgs = app
+                    .packages
+                    .iter()
+                    .map(|p| match &p.pinned_rev {
+                        Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
+                        None => p.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
             }
             if let Some(net) = &app.network {
                 let _ = writeln!(o, "      {dim}network:{r} {net}");
@@ -3878,6 +3912,7 @@ mod tests {
                 realised: "host-side, durable".into(),
                 trusted: false,
                 withheld_reason: Some("the project is untrusted".into()),
+                pinned_rev: None,
             }],
             mise: Some(MiseView {
                 name: ".mise.toml".into(),
@@ -3970,6 +4005,89 @@ mod tests {
         assert!(
             out.contains(&format!("{}(global){}", p.dim, p.reset)),
             "the bind provenance tag must be dim:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_render_shows_flake_pins_and_floating_state() {
+        // A pinned `flake:` package shows its short revision and `pinned`; an unpinned one shows
+        // `floating`, so the absence of a rev reads as a state, not a gap. The same pin appears
+        // compactly in an app's package list — the motivating case (a flake package in an app
+        // overlay, not the baseline).
+        use config::view::*;
+        let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+        let view = ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![
+                PackageView {
+                    name: "hermes".into(),
+                    backend: "flake".into(),
+                    locator: "github:NousResearch/hermes-agent#default".into(),
+                    realised: "in-cage via nix build, fetched at launch".into(),
+                    trusted: true,
+                    withheld_reason: None,
+                    pinned_rev: Some(rev.into()),
+                },
+                PackageView {
+                    name: "futil".into(),
+                    backend: "flake".into(),
+                    locator: "github:numtide/flake-utils".into(),
+                    realised: "in-cage via nix build, fetched at launch".into(),
+                    trusted: true,
+                    withheld_reason: None,
+                    pinned_rev: None,
+                },
+            ],
+            mise: None,
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Shared,
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![AppView {
+                name: "hermes".into(),
+                cmd: Some("hermes".into()),
+                home_scope: "global (shared across projects)".into(),
+                packages: vec![AppPackageView {
+                    name: "hermes".into(),
+                    pinned_rev: Some(rev.into()),
+                }],
+                network: None,
+                gui: None,
+                secret_count: 0,
+                notes: vec![],
+            }],
+            warnings: vec![],
+        };
+        let out = render_config(&view, &style::Palette::plain());
+        assert!(
+            out.contains(
+                "    hermes -> flake:github:NousResearch/hermes-agent#default  \
+                 @ a1b2c3d (in-cage via nix build, fetched at launch, pinned)"
+            ),
+            "a pinned flake package must show its short rev and `pinned`:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "    futil -> flake:github:numtide/flake-utils  \
+                 (in-cage via nix build, fetched at launch, floating)"
+            ),
+            "an unpinned flake package must read as `floating`:\n{out}"
+        );
+        assert!(
+            out.contains("      packages: hermes @ a1b2c3d"),
+            "an app's pinned flake package must show its rev compactly:\n{out}"
         );
     }
 }

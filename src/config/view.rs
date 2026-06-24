@@ -12,6 +12,7 @@
 //! does *not* carry: a queryable schema, an affordance for a management UI that does not yet
 //! exist; it is added when that consumer is concrete, against its real shape.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -100,6 +101,9 @@ pub(crate) struct PackageView {
     pub(crate) trusted: bool,
     /// Why it was withheld, when it was (`None` for a trusted, admitted package).
     pub(crate) withheld_reason: Option<String>,
+    /// The locked revision when this is a `flake:` package `ops upgrade flake` has pinned; `None`
+    /// for a floating flake package (no lock entry) or any non-flake backend.
+    pub(crate) pinned_rev: Option<String>,
 }
 
 /// The project's mise file: its name and whether the project's trust would honor it.
@@ -188,6 +192,15 @@ pub(crate) struct SecretView {
     pub(crate) sources: String,
 }
 
+/// One package an app's overlay declares: its name and, when it is a `flake:` package pinned by
+/// `ops upgrade flake`, the locked revision — so the app's compact package list can show the pin
+/// beside the name without expanding to the baseline section's full backend/realisation line.
+#[derive(Serialize)]
+pub(crate) struct AppPackageView {
+    pub(crate) name: String,
+    pub(crate) pinned_rev: Option<String>,
+}
+
 /// A named application profile: the command it runs and what its gated overlay adds.
 #[derive(Serialize)]
 pub(crate) struct AppView {
@@ -196,7 +209,7 @@ pub(crate) struct AppView {
     pub(crate) cmd: Option<String>,
     /// Where the app's persistent home is keyed, as a human phrase.
     pub(crate) home_scope: String,
-    pub(crate) packages: Vec<String>,
+    pub(crate) packages: Vec<AppPackageView>,
     /// The app's own network posture as a word (`shared`/`none`/`allowlist`), when it set one.
     pub(crate) network: Option<String>,
     /// The app's own GUI posture as a word (`wayland`/`none`), when it set one.
@@ -231,7 +244,15 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         })
         .collect();
 
-    let packages = resolved.packages.iter().map(package_view).collect();
+    // The pinned revisions of any `flake:` packages, read network-free from the per-project lock —
+    // the same source the launch consults — so the view can show a pin without resolving anything.
+    let flake_pins = sandbox::flake_pinned_revs(cwd);
+
+    let packages = resolved
+        .packages
+        .iter()
+        .map(|p| package_view(p, &flake_pins))
+        .collect();
 
     let mise = resolved.mise.as_ref().map(|m| MiseView {
         name: m.name.clone(),
@@ -268,7 +289,7 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
     let apps = resolved
         .apps
         .iter()
-        .map(|(name, app)| app_view(name, app))
+        .map(|(name, app)| app_view(name, app, &flake_pins))
         .collect();
 
     ConfigView {
@@ -288,8 +309,9 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
     }
 }
 
-/// Project one declared package, recording its backend, how it is realised, and the trust verdict.
-fn package_view(p: &super::Package) -> PackageView {
+/// Project one declared package, recording its backend, how it is realised, the trust verdict,
+/// and — for a `flake:` package — its locked revision from the per-project lock (`None` floats).
+fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> PackageView {
     let realised = match p.backend {
         Backend::Nix(_) => "host-side, durable",
         Backend::Mise(_) => "in-cage via mise, fetched at launch",
@@ -303,6 +325,16 @@ fn package_view(p: &super::Package) -> PackageView {
         realised: realised.to_string(),
         trusted,
         withheld_reason: (!trusted).then(|| super::untrusted_reason(p.state).to_string()),
+        pinned_rev: flake_pinned_rev(&p.backend, flake_pins),
+    }
+}
+
+/// The locked revision for a `flake:` package, looked up by its declared reference (the lock key,
+/// byte-identical to the locator); `None` for a floating flake package or any other backend.
+fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) -> Option<String> {
+    match backend {
+        Backend::Flake(reference) => flake_pins.get(reference).cloned(),
+        Backend::Nix(_) | Backend::Mise(_) => None,
     }
 }
 
@@ -403,7 +435,11 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
 }
 
 /// Project one app overlay for display: its command, home scope, and the gated fields it adds.
-fn app_view(name: &str, app: &super::ResolvedApp) -> AppView {
+fn app_view(
+    name: &str,
+    app: &super::ResolvedApp,
+    flake_pins: &BTreeMap<String, String>,
+) -> AppView {
     AppView {
         name: name.to_string(),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
@@ -411,7 +447,14 @@ fn app_view(name: &str, app: &super::ResolvedApp) -> AppView {
             super::AppHomeScope::Global => "global (shared across projects)".to_string(),
             super::AppHomeScope::Project => "per-project".to_string(),
         },
-        packages: app.packages.iter().map(|p| p.name.clone()).collect(),
+        packages: app
+            .packages
+            .iter()
+            .map(|p| AppPackageView {
+                name: p.name.clone(),
+                pinned_rev: flake_pinned_rev(&p.backend, flake_pins),
+            })
+            .collect(),
         network: app.network.as_ref().map(|n| match n {
             NetworkPolicy::Shared => "shared".to_string(),
             NetworkPolicy::Isolated => "none".to_string(),
@@ -455,6 +498,7 @@ mod tests {
                 realised: "host-side, durable".into(),
                 trusted: true,
                 withheld_reason: None,
+                pinned_rev: None,
             }],
             mise: Some(MiseView {
                 name: ".mise.toml".into(),
@@ -498,5 +542,58 @@ mod tests {
         // A struct enum variant is externally tagged; a unit variant is its name as a string.
         assert!(json["network"]["Allowlist"]["allow"][0] == "github.com");
         assert_eq!(json["gui"], "Wayland");
+    }
+
+    /// A `flake:` package's pinned revision surfaces in its view, looked up by the package locator
+    /// — and a floating package (no lock entry) shows none. The lookup key is the declared
+    /// reference, which is byte-identical to the locator; asserting that here guards the silent
+    /// miss the projection would otherwise hide if the two ever diverged. Covers both the baseline
+    /// `packages:` line and an app's compact package list, since the motivating profile (hermes)
+    /// declares its flake package in an app overlay, not the baseline.
+    #[test]
+    fn a_pinned_flake_revision_surfaces_keyed_by_the_locator() {
+        use crate::config::{AppHomeScope, Package, ResolvedApp};
+
+        let reference = "github:NousResearch/hermes-agent#default";
+        let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+        let pins = BTreeMap::from([(reference.to_string(), rev.to_string())]);
+
+        let flake = Package {
+            name: "hermes".into(),
+            backend: Backend::Flake(reference.into()),
+            state: TrustState::Trusted,
+        };
+        // The key the upgrade/launch path writes is the package locator, so a view that looks up by
+        // locator hits it. This equality is what makes the lookup work; pin it against drift.
+        assert_eq!(flake.backend.locator(), reference);
+
+        // Baseline projection: a pinned package shows the rev; the same package with an empty lock
+        // floats (`None`), so "no rev" reads as "not pinned", never ambiguous.
+        assert_eq!(package_view(&flake, &pins).pinned_rev.as_deref(), Some(rev));
+        assert_eq!(package_view(&flake, &BTreeMap::new()).pinned_rev, None);
+
+        // A non-flake package never carries a rev, whether or not pins exist.
+        let nixpkg = Package {
+            name: "jq".into(),
+            backend: Backend::Nix("jq".into()),
+            state: TrustState::Trusted,
+        };
+        assert_eq!(package_view(&nixpkg, &pins).pinned_rev, None);
+
+        // App projection: the compact list carries the same pin, keyed identically.
+        let app = ResolvedApp {
+            cmd: vec!["hermes".into()],
+            home_scope: AppHomeScope::Global,
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![flake],
+            network: None,
+            gui: None,
+            secrets: vec![],
+            warnings: vec![],
+        };
+        let view = app_view("hermes", &app, &pins);
+        assert_eq!(view.packages[0].name, "hermes");
+        assert_eq!(view.packages[0].pinned_rev.as_deref(), Some(rev));
     }
 }

@@ -84,6 +84,24 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, FlakeP
     entries
 }
 
+/// The pinned revisions for a project's `flake:` packages, keyed by the declared reference —
+/// which is byte-identical to a package's locator, so a caller can look each up directly. Reads
+/// only the per-project lock, exactly as the launch path does, so surfacing a pin realises and
+/// fetches nothing — the property `ops config` relies on. Empty when the data dir or the project
+/// identity is unavailable, or nothing is pinned (the floating state).
+pub(crate) fn pinned_revs(cwd: &Path) -> BTreeMap<String, String> {
+    let Some(layout) = store::Layout::from_env() else {
+        return BTreeMap::new();
+    };
+    let Ok(id) = super::binds::project_runtime_id(cwd) else {
+        return BTreeMap::new();
+    };
+    pins(&layout, &id)
+        .into_iter()
+        .map(|(declared, pin)| (declared, pin.rev))
+        .collect()
+}
+
 /// Write the lock atomically (temp + rename), creating the owner-only parent — so a concurrent
 /// launch reading it sees the old or the new file, never a torn one.
 fn write_pins(
@@ -412,5 +430,40 @@ mod tests {
         let read = pins(&layout, "proj");
         assert_eq!(read.len(), 1, "only the valid pin survives");
         assert!(read.contains_key("github:o/r#default"));
+    }
+
+    #[test]
+    fn a_pin_is_keyed_by_the_real_project_runtime_id() {
+        // `ops upgrade flake` (the writer) and `ops config`/launch (the readers, via `pinned_revs`)
+        // both key the per-project lock by `binds::project_runtime_id(cwd)` — the same function on
+        // the same project path — so a pin written for a project is read back for it, and never for
+        // a different one. Exercise that shared keying through the real id derivation (no nix, no
+        // network): the silent-miss the display would otherwise hide is a divergence here.
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let proj = TmpDir::new();
+        let other = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(proj.path()).expect("project id");
+        let other_id =
+            super::super::binds::project_runtime_id(other.path()).expect("other project id");
+        assert_ne!(id, other_id, "distinct projects must key to distinct ids");
+
+        let reference = "github:o/r#default".to_string();
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            reference.clone(),
+            FlakePin {
+                rev: REV.to_string(),
+                locked_ref: format!("github:o/r/{REV}?narHash=sha256-x#default"),
+            },
+        );
+        write_pins(&layout, &id, &entries).unwrap();
+
+        // The owning project reads its pin back, the `rev` flattened exactly as `pinned_revs` does.
+        let read = pins(&layout, &id);
+        assert_eq!(read.get(&reference).map(|p| p.rev.as_str()), Some(REV));
+
+        // A different project sees nothing — the lock is project-scoped by the runtime id.
+        assert!(pins(&layout, &other_id).is_empty());
     }
 }
