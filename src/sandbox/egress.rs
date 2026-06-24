@@ -614,6 +614,34 @@ mod tests {
         path
     }
 
+    /// Run [`run_sops`], retrying briefly on a transient spawn failure.
+    ///
+    /// A fake `sops` is written then immediately executed. Under the parallel test runner another
+    /// thread's `fork` can momentarily hold the just-written executable open across the fork→exec
+    /// window, so `execve` transiently fails with ETXTBSY ("text file busy") — a property of
+    /// running a freshly-written binary in a multithreaded process, not of [`run_sops`] (production
+    /// `sops` is an installed binary). Only the spawn-error branch is retried (its message is
+    /// distinct), so a genuine decrypt/extract/classify error surfaces on the first attempt and
+    /// still fails the test.
+    fn run_sops_retrying_spawn(
+        sops: &Path,
+        file: &Path,
+        key: Option<&str>,
+        header: &str,
+    ) -> io::Result<Option<String>> {
+        let mut attempt = run_sops(sops, file, key, header);
+        for _ in 0..100 {
+            match &attempt {
+                Err(e) if e.to_string().contains("could not run sops") => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    attempt = run_sops(sops, file, key, header);
+                }
+                _ => break,
+            }
+        }
+        attempt
+    }
+
     #[test]
     fn sops_extract_expr_brackets_each_dotted_segment() {
         assert_eq!(sops_extract_expr("db"), "[\"db\"]");
@@ -648,23 +676,9 @@ mod tests {
         );
         let file = dir.join("prod.enc.yaml");
         std::fs::write(&file, "anything").unwrap();
-        // The fake `sops` is written then immediately executed. Under the parallel test runner,
-        // another thread's `fork` can momentarily hold the just-written file open for write, so
-        // `execve` transiently fails with ETXTBSY ("text file busy") — a property of running a
-        // freshly-written executable in a multithreaded process, not of `run_sops` (production
-        // `sops` is an installed binary). Retry briefly on that spawn error so the test is
-        // deterministic; a genuine decrypt/extract error persists and still fails.
-        let mut attempt = run_sops(&sops, &file, Some("github.token"), "Authorization");
-        for _ in 0..100 {
-            match &attempt {
-                Err(e) if e.to_string().contains("could not run sops") => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    attempt = run_sops(&sops, &file, Some("github.token"), "Authorization");
-                }
-                _ => break,
-            }
-        }
-        let got = attempt.unwrap().unwrap();
+        let got = run_sops_retrying_spawn(&sops, &file, Some("github.token"), "Authorization")
+            .unwrap()
+            .unwrap();
         assert_eq!(got, "ghp-the-secret-value");
         let args = std::fs::read_to_string(&args_log).unwrap();
         assert!(
@@ -682,7 +696,7 @@ mod tests {
         let sops = fake_sops(&dir, "echo 'no key could decrypt' >&2\nexit 1");
         let file = dir.join("prod.enc.yaml");
         std::fs::write(&file, "anything").unwrap();
-        let err = run_sops(&sops, &file, Some("k"), "Authorization")
+        let err = run_sops_retrying_spawn(&sops, &file, Some("k"), "Authorization")
             .unwrap_err()
             .to_string();
         assert!(
@@ -699,7 +713,7 @@ mod tests {
         let sops = fake_sops(&dir, "printf 'line1\\nline2\\n'");
         let file = dir.join("prod.enc.yaml");
         std::fs::write(&file, "anything").unwrap();
-        let err = run_sops(&sops, &file, None, "Authorization").unwrap_err();
+        let err = run_sops_retrying_spawn(&sops, &file, None, "Authorization").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
