@@ -192,6 +192,17 @@ pub(crate) struct SecretView {
     pub(crate) sources: String,
 }
 
+/// One environment entry an app overlay adds over the baseline. It carries no per-entry layer:
+/// the resolved overlay flattens its global and project sources into one list, so unlike the
+/// baseline `env` there is no single layer to attribute. The value is shown as-is — `env` is a
+/// free field that enters the cage (an in-cage placeholder for a credential profile), not the
+/// injected secret, which never appears.
+#[derive(Serialize)]
+pub(crate) struct AppEnvVar {
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
 /// One package an app's overlay declares: its name and, when it is a `flake:` package pinned by
 /// `ops upgrade flake`, the locked revision — so the app's compact package list can show the pin
 /// beside the name without expanding to the baseline section's full backend/realisation line.
@@ -226,15 +237,24 @@ pub(crate) struct AppView {
     pub(crate) cmd: Option<String>,
     /// Where the app's persistent home is keyed, as a human phrase.
     pub(crate) home_scope: String,
+    /// The environment this overlay adds over the baseline (the app wins on a key collision when
+    /// the two are merged at launch) — the overlay's own entries, not the baseline-merged set. A
+    /// count by default, each `KEY=value` under `--details`.
+    pub(crate) env: Vec<AppEnvVar>,
+    /// The read-only host binds this overlay adds over the baseline — a security field, gated like
+    /// the baseline binds. The overlay's own paths, canonicalized to what a launch would mount. A
+    /// count by default, each path under `--details`.
+    pub(crate) binds: Vec<String>,
     pub(crate) packages: Vec<AppPackageView>,
     /// The app's own network posture, with an allowlist's rules, when it set one.
     pub(crate) network: Option<AppNetworkView>,
     /// The app's own GUI posture as a word (`wayland`/`none`), when it set one.
     pub(crate) gui: Option<String>,
-    /// The credentials this app injects — its overlay plus any inherited baseline secret, since
-    /// secrets are unioned at merge (not overridden, unlike `network`). Each carries only its
-    /// destination, header, shape, and source locator — never the value, which ops reads host-side
-    /// at launch. The CLI shows a count by default and lists each under `--details`.
+    /// The credentials this overlay injects, host-side at launch — its *own* `[secret]` sections
+    /// (global and project), gated, not the baseline's. The merge unions them with the baseline
+    /// only for the launch itself; the view shows the overlay's additions. Each carries only its
+    /// destination, header, shape, and source locator — never the value. The CLI shows a count by
+    /// default and lists each under `--details`.
     pub(crate) secrets: Vec<SecretView>,
     /// Per-app notes about what its resolution dropped or ignored.
     pub(crate) notes: Vec<String>,
@@ -468,6 +488,19 @@ fn app_view(
             super::AppHomeScope::Global => "global (shared across projects)".to_string(),
             super::AppHomeScope::Project => "per-project".to_string(),
         },
+        env: app
+            .env
+            .iter()
+            .map(|(key, value)| AppEnvVar {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        binds: app
+            .ro_binds
+            .iter()
+            .map(|b| b.display().to_string())
+            .collect(),
         packages: app
             .packages
             .iter()
@@ -564,6 +597,11 @@ mod tests {
                 name: "claude".into(),
                 cmd: Some("claude".into()),
                 home_scope: "global (shared across projects)".into(),
+                env: vec![AppEnvVar {
+                    key: "ANTHROPIC_API_KEY".into(),
+                    value: "placeholder".into(),
+                }],
+                binds: vec!["/data/cache".into()],
                 packages: vec![],
                 network: Some(AppNetworkView::Allowlist {
                     allow: vec!["api.anthropic.com".into()],
@@ -603,6 +641,12 @@ mod tests {
         assert_eq!(app_net["allow"][0], "api.anthropic.com");
         assert_eq!(app_net["deny"][0], "api.anthropic.com/admin");
         assert_eq!(app_net["builtin"][0], "cache.nixos.org");
+        // An app overlay's env and binds serialize in full — the overlay's own additions, the same
+        // metadata the baseline `env`/`binds` sections carry (no per-entry layer, since the overlay
+        // is flattened). The env value is the placeholder, a free field, never an injected secret.
+        assert_eq!(json["apps"][0]["env"][0]["key"], "ANTHROPIC_API_KEY");
+        assert_eq!(json["apps"][0]["env"][0]["value"], "placeholder");
+        assert_eq!(json["apps"][0]["binds"][0], "/data/cache");
         // An app overlay's injected credentials serialize by destination and source — never the
         // value — so the JSON form carries what `ops app <name>` injects without a `--details` flag.
         let app_secret = &json["apps"][0]["secrets"][0];

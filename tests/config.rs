@@ -1506,11 +1506,11 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     // A profile whose credential lives in the app overlay — the common case, since the shipped
     // profiles inject host-side from the overlay while the baseline carries no secret. The compact
     // view shows a count; `--details` expands each by destination and source. The value never
-    // appears (ops reads it host-side at launch) — only the header, host, shape, and source locator.
+    // appears (ops reads it host-side at launch, and never resolves it here) — only the header,
+    // host, shape, and the source *locator* (the variable name, `env ANTHROPIC_API_KEY`).
     fx.write_profile(
         "claude",
         "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n\
-         [env]\nANTHROPIC_API_KEY = \"placeholder\"\n\
          [secret.\"api.anthropic.com\"]\nfrom = \"env://ANTHROPIC_API_KEY\"\n\
          header = \"x-api-key\"\ntype = \"raw\"\n",
     );
@@ -1528,18 +1528,76 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
         "the default must not expand the credential:\n{stdout}"
     );
 
-    // --details: the credential by destination, header, shape, and source — never the value.
+    // --details: the credential by destination, header, shape, and source *locator* — the variable
+    // name, a pointer, never a resolved value (ops config does not read the secret's source).
     let out = fx.run(&["config", "show", "--details"]);
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("x-api-key -> api.anthropic.com")
-            && stdout.contains("env ANTHROPIC_API_KEY"),
-        "--details must show the credential by destination and source:\n{stdout}"
+            && stdout.contains("from env ANTHROPIC_API_KEY"),
+        "--details must show the credential by destination and source locator:\n{stdout}"
+    );
+}
+
+#[test]
+fn an_app_env_and_binds_show_counts_by_default_and_expand_under_details() {
+    let fx = Fixture::new();
+    // A baseline (global) env, to prove the app section shows the overlay's *own* additions, not
+    // the baseline-merged set: BASE_ONLY is baseline-only and must not be duplicated into the app
+    // block; SHARED collides on a key and the app shows its own value, not the baseline's.
+    fx.write_global("[env]\nBASE_ONLY = \"base\"\nSHARED = \"base\"\n");
+
+    // A real directory the profile binds read-only (a bind target must exist — binds are
+    // canonicalized and a missing one is dropped).
+    let bind = fx.bind_target("workspace");
+    let canonical = std::fs::canonicalize(&bind).unwrap();
+    // A profile (trusted by location) adding two env entries and one read-only bind in its overlay.
+    // The top-level keys (`cmd`, `binds`) precede the `[env]` table, or TOML would fold `binds`
+    // into `[env]` (an array where a string is expected → a parse error, a silently dropped app).
+    fx.write_profile(
+        "claude",
+        &format!(
+            "cmd = \"claude\"\nbinds = [\"{}\"]\n[env]\nSHARED = \"app\"\nAPP_ONLY = \"app\"\n",
+            bind.display()
+        ),
+    );
+
+    // Default: compact counts. The env count is the overlay's two entries, not the merged three —
+    // proof the view shows the overlay delta. No values or paths expanded.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("env: 2 set"),
+        "the app must show its overlay's env count (2, not the merged 3):\n{stdout}"
     );
     assert!(
-        !stdout.contains("placeholder"),
-        "the credential value must never appear:\n{stdout}"
+        stdout.contains("binds: 1"),
+        "the app must show its bind count:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("APP_ONLY=app") && !stdout.contains(&canonical.display().to_string()),
+        "the default must not expand env values or bind paths:\n{stdout}"
+    );
+
+    // --details: the overlay's own env entries and the bind path. BASE_ONLY is a baseline-only key
+    // — it appears exactly once (in the top-level env section), never duplicated into the app
+    // block, which a merged (not overlay-only) projection would betray.
+    let out = fx.run(&["config", "show", "--details"]);
+    assert!(out.status.success(), "config show --details must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SHARED=app") && stdout.contains("APP_ONLY=app"),
+        "--details must show the app overlay's own env entries:\n{stdout}"
+    );
+    assert!(
+        stdout.matches("BASE_ONLY").count() == 1,
+        "a baseline-only key must not be duplicated into the app block (overlay-only):\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&canonical.display().to_string()),
+        "--details must show the app's bind path:\n{stdout}"
     );
 }
 

@@ -983,6 +983,33 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
             }
             let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
+            // The environment this overlay adds over the baseline — a count by default, each
+            // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
+            // value shown is the one that enters the cage (a placeholder for a credential profile),
+            // never the injected secret, which ops reads host-side and never prints.
+            if !app.env.is_empty() {
+                if details {
+                    let _ = writeln!(o, "      {dim}env:{r}");
+                    for e in &app.env {
+                        let _ = writeln!(o, "        {n}{}{r}={}", e.key, e.value);
+                    }
+                } else {
+                    let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
+                }
+            }
+            // The read-only host binds this overlay adds — a security field, so what host paths
+            // `ops app <name>` exposes is visible here, the same as the baseline `binds` section. A
+            // count by default, each canonical path under `--details`.
+            if !app.binds.is_empty() {
+                if details {
+                    let _ = writeln!(o, "      {dim}binds (read-only):{r}");
+                    for b in &app.binds {
+                        let _ = writeln!(o, "        {n}{b}{r}");
+                    }
+                } else {
+                    let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
+                }
+            }
             if !app.packages.is_empty() {
                 // Each package by name, with ` @ <rev>` appended when it is a pinned `flake:` one —
                 // the pin shown compactly here rather than the baseline section's full line.
@@ -1043,9 +1070,10 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if let Some(gui) = &app.gui {
                 let _ = writeln!(o, "      {dim}gui:{r} {gui}");
             }
-            // The credentials the app injects (its overlay unioned with any inherited baseline) —
-            // a count by default, expanded under `--details` to each by destination and source, the
-            // same metadata the baseline section shows. Never the value; ops reads that host-side.
+            // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
+            // unions them with the baseline only for the launch) — a count by default, expanded
+            // under `--details` to each by destination and source, the same metadata the baseline
+            // section shows. Never the value; ops reads that host-side.
             if !app.secrets.is_empty() {
                 if details {
                     let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
@@ -4116,6 +4144,8 @@ mod tests {
                 name: "hermes".into(),
                 cmd: Some("hermes".into()),
                 home_scope: "global (shared across projects)".into(),
+                env: vec![],
+                binds: vec![],
                 packages: vec![AppPackageView {
                     name: "hermes".into(),
                     pinned_rev: Some(rev.into()),
@@ -4179,6 +4209,8 @@ mod tests {
                 name: "claude".into(),
                 cmd: Some("claude".into()),
                 home_scope: "global (shared across projects)".into(),
+                env: vec![],
+                binds: vec![],
                 packages: vec![],
                 network: Some(AppNetworkView::Allowlist {
                     allow: vec!["api.anthropic.com".into(), "github.com".into()],
@@ -4252,6 +4284,8 @@ mod tests {
                 name: "claude".into(),
                 cmd: Some("claude".into()),
                 home_scope: "global (shared across projects)".into(),
+                env: vec![],
+                binds: vec![],
                 packages: vec![],
                 network: None,
                 gui: None,
@@ -4298,6 +4332,82 @@ mod tests {
                 "        authorization -> api.openai.com  (bearer, from env OPENAI_API_KEY)"
             ),
             "--details must list each credential by destination and source:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn config_render_shows_app_env_and_binds_compactly_then_expands_under_details() {
+        // An app overlay's env and binds are one-line counts by default and expand under
+        // `--details` — env to each `KEY=value` (the value is the in-cage placeholder, a free
+        // field, never an injected secret) and binds to each path. This is the only place a
+        // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
+        use config::view::*;
+        let view = ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            mise: None,
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Shared,
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![AppView {
+                name: "claude".into(),
+                cmd: Some("claude".into()),
+                home_scope: "global (shared across projects)".into(),
+                env: vec![
+                    AppEnvVar {
+                        key: "ANTHROPIC_API_KEY".into(),
+                        value: "placeholder".into(),
+                    },
+                    AppEnvVar {
+                        key: "EDITOR".into(),
+                        value: "vim".into(),
+                    },
+                ],
+                binds: vec!["/data/cache".into()],
+                packages: vec![],
+                network: None,
+                gui: None,
+                secrets: vec![],
+                notes: vec![],
+            }],
+            warnings: vec![],
+        };
+
+        // Default: compact counts, no values or paths expanded.
+        let compact = render_config(&view, &style::Palette::plain(), false);
+        assert!(
+            compact.contains("      env: 2 set") && compact.contains("      binds: 1"),
+            "the default must show compact env and bind counts:\n{compact}"
+        );
+        assert!(
+            !compact.contains("ANTHROPIC_API_KEY=placeholder") && !compact.contains("/data/cache"),
+            "the default must not expand the env values or bind paths:\n{compact}"
+        );
+
+        // --details: each env entry by `KEY=value` and each bind path.
+        let expanded = render_config(&view, &style::Palette::plain(), true);
+        assert!(
+            expanded.contains("        ANTHROPIC_API_KEY=placeholder")
+                && expanded.contains("        EDITOR=vim"),
+            "--details must list each env entry as KEY=value:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("      binds (read-only):")
+                && expanded.contains("        /data/cache"),
+            "--details must list each bind path:\n{expanded}"
         );
     }
 }
