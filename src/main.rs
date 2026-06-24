@@ -1043,12 +1043,26 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if let Some(gui) = &app.gui {
                 let _ = writeln!(o, "      {dim}gui:{r} {gui}");
             }
-            if app.secret_count > 0 {
-                let _ = writeln!(
-                    o,
-                    "      {dim}secrets:{r} {} injected host-side",
-                    app.secret_count
-                );
+            // The credentials the app injects (its overlay unioned with any inherited baseline) —
+            // a count by default, expanded under `--details` to each by destination and source, the
+            // same metadata the baseline section shows. Never the value; ops reads that host-side.
+            if !app.secrets.is_empty() {
+                if details {
+                    let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
+                    for s in &app.secrets {
+                        let _ = writeln!(
+                            o,
+                            "        {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
+                            s.header, s.to, s.shape, s.sources
+                        );
+                    }
+                } else {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}secrets:{r} {} injected host-side",
+                        app.secrets.len()
+                    );
+                }
             }
             for note in &app.notes {
                 let _ = writeln!(o, "      {warn}note: {note}{r}");
@@ -4108,7 +4122,7 @@ mod tests {
                 }],
                 network: None,
                 gui: None,
-                secret_count: 0,
+                secrets: vec![],
                 notes: vec![],
             }],
             warnings: vec![],
@@ -4172,7 +4186,7 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
-                secret_count: 0,
+                secrets: vec![],
                 notes: vec![],
             }],
             warnings: vec![],
@@ -4204,6 +4218,86 @@ mod tests {
             expanded.contains("built-in (always allowed, so self-equip works):")
                 && expanded.contains("          allow cache.nixos.org"),
             "--details must surface the always-allowed built-in set:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn config_render_shows_app_secrets_compactly_then_expands_under_details() {
+        // An app overlay's injected credentials are a one-line count by default and expand to each
+        // by destination and source under `--details` — the same metadata the baseline section
+        // shows. The shipped profiles put their secret in the overlay, so this is the only place a
+        // profile's credential surfaces in `ops config` (the baseline `secrets` section is empty).
+        use config::view::*;
+        let view = ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            mise: None,
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Shared,
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![AppView {
+                name: "claude".into(),
+                cmd: Some("claude".into()),
+                home_scope: "global (shared across projects)".into(),
+                packages: vec![],
+                network: None,
+                gui: None,
+                secrets: vec![
+                    SecretView {
+                        header: "x-api-key".into(),
+                        to: "api.anthropic.com".into(),
+                        shape: "raw".into(),
+                        sources: "env ANTHROPIC_API_KEY".into(),
+                    },
+                    SecretView {
+                        header: "authorization".into(),
+                        to: "api.openai.com".into(),
+                        shape: "bearer".into(),
+                        sources: "env OPENAI_API_KEY".into(),
+                    },
+                ],
+                notes: vec![],
+            }],
+            warnings: vec![],
+        };
+
+        // Default: a compact count, no destination or source expanded.
+        let compact = render_config(&view, &style::Palette::plain(), false);
+        assert!(
+            compact.contains("      secrets: 2 injected host-side"),
+            "the default app secrets line must read as a compact count:\n{compact}"
+        );
+        assert!(
+            !compact.contains("api.anthropic.com"),
+            "the default must not expand the destinations:\n{compact}"
+        );
+
+        // --details: each credential by destination and source — never the value.
+        let expanded = render_config(&view, &style::Palette::plain(), true);
+        assert!(
+            expanded.contains("      secrets (injected host-side):"),
+            "--details must head the expanded secrets block:\n{expanded}"
+        );
+        assert!(
+            expanded.contains(
+                "        x-api-key -> api.anthropic.com  (raw, from env ANTHROPIC_API_KEY)"
+            ) && expanded.contains(
+                "        authorization -> api.openai.com  (bearer, from env OPENAI_API_KEY)"
+            ),
+            "--details must list each credential by destination and source:\n{expanded}"
         );
     }
 }

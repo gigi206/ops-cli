@@ -304,7 +304,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--details",
-                "expand each app overlay's compact summary (the full allowlist rules)",
+                "expand each app overlay's compact summary (allowlist rules and injected credentials)",
             ),
         ],
         details:
@@ -315,11 +315,13 @@ const PAGES: &[Page] = &[
             \n\
             An app profile is shown as a compact summary (one line per field); with --details\n\
             its allowlist is expanded to the individual allow/deny rules plus the always-allowed\n\
-            built-in hosts, so what `ops app <name>` can reach is visible at a glance.\n\
+            built-in hosts, and its injected credentials to each by destination and source — so\n\
+            what `ops app <name>` can reach, and what it injects, is visible at a glance. The\n\
+            credential value is never shown; ops reads it host-side at launch.\n\
             \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
             included as a field) — the machine-readable form the human output renders, already\n\
-            carrying every app's rules in full.",
+            carrying every app's rules and injected credentials in full.",
     },
     Page {
         path: &["upgrade"],

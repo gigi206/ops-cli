@@ -231,7 +231,11 @@ pub(crate) struct AppView {
     pub(crate) network: Option<AppNetworkView>,
     /// The app's own GUI posture as a word (`wayland`/`none`), when it set one.
     pub(crate) gui: Option<String>,
-    pub(crate) secret_count: usize,
+    /// The credentials this app injects — its overlay plus any inherited baseline secret, since
+    /// secrets are unioned at merge (not overridden, unlike `network`). Each carries only its
+    /// destination, header, shape, and source locator — never the value, which ops reads host-side
+    /// at launch. The CLI shows a count by default and lists each under `--details`.
+    pub(crate) secrets: Vec<SecretView>,
     /// Per-app notes about what its resolution dropped or ignored.
     pub(crate) notes: Vec<String>,
 }
@@ -488,7 +492,16 @@ fn app_view(
             super::GuiPolicy::Wayland => "wayland".to_string(),
             super::GuiPolicy::None => "none".to_string(),
         }),
-        secret_count: app.secrets.len(),
+        secrets: app
+            .secrets
+            .iter()
+            .map(|s| SecretView {
+                header: s.header.clone(),
+                to: s.to.to_string(),
+                shape: s.shape.describe(),
+                sources: s.describe_sources(),
+            })
+            .collect(),
         notes: app.warnings.clone(),
     }
 }
@@ -558,7 +571,12 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
-                secret_count: 1,
+                secrets: vec![SecretView {
+                    header: "x-api-key".into(),
+                    to: "api.anthropic.com".into(),
+                    shape: "raw".into(),
+                    sources: "env ANTHROPIC_API_KEY".into(),
+                }],
                 notes: vec![],
             }],
             warnings: vec!["a note".into()],
@@ -585,6 +603,12 @@ mod tests {
         assert_eq!(app_net["allow"][0], "api.anthropic.com");
         assert_eq!(app_net["deny"][0], "api.anthropic.com/admin");
         assert_eq!(app_net["builtin"][0], "cache.nixos.org");
+        // An app overlay's injected credentials serialize by destination and source — never the
+        // value — so the JSON form carries what `ops app <name>` injects without a `--details` flag.
+        let app_secret = &json["apps"][0]["secrets"][0];
+        assert_eq!(app_secret["header"], "x-api-key");
+        assert_eq!(app_secret["to"], "api.anthropic.com");
+        assert_eq!(app_secret["sources"], "env ANTHROPIC_API_KEY");
     }
 
     /// A `flake:` package's pinned revision surfaces in its view, looked up by the package locator

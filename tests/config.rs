@@ -1501,6 +1501,49 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
 }
 
 #[test]
+fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
+    let fx = Fixture::new();
+    // A profile whose credential lives in the app overlay — the common case, since the shipped
+    // profiles inject host-side from the overlay while the baseline carries no secret. The compact
+    // view shows a count; `--details` expands each by destination and source. The value never
+    // appears (ops reads it host-side at launch) — only the header, host, shape, and source locator.
+    fx.write_profile(
+        "claude",
+        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n\
+         [env]\nANTHROPIC_API_KEY = \"placeholder\"\n\
+         [secret.\"api.anthropic.com\"]\nfrom = \"env://ANTHROPIC_API_KEY\"\n\
+         header = \"x-api-key\"\ntype = \"raw\"\n",
+    );
+
+    // Default: the compact count, no destination expanded.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("secrets: 1 injected host-side"),
+        "the default must show a compact secret count:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("x-api-key -> api.anthropic.com"),
+        "the default must not expand the credential:\n{stdout}"
+    );
+
+    // --details: the credential by destination, header, shape, and source — never the value.
+    let out = fx.run(&["config", "show", "--details"]);
+    assert!(out.status.success(), "config show --details must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("x-api-key -> api.anthropic.com")
+            && stdout.contains("env ANTHROPIC_API_KEY"),
+        "--details must show the credential by destination and source:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("placeholder"),
+        "the credential value must never appear:\n{stdout}"
+    );
+}
+
+#[test]
 fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project() {
     let fx = Fixture::new();
     // The flagship case: an imported profile (trusted by location) runs *on* untrusted code without
