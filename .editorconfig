@@ -10,9 +10,3 @@ indent_size = 4
 
 [*.{lua,yml,yaml,md}]
 indent_size = 2
-
-[Makefile]
-indent_style = tab
-
-[*.bats]
-indent_size = 4

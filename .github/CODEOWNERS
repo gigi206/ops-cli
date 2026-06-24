@@ -4,10 +4,7 @@
 
 # Release-sensitive surfaces get an explicit entry. Same owner today, but
 # makes it trivial to hand off a slice later without rewriting the default.
-/ops.sh               @gigi206
-/Dockerfile           @gigi206
-/Dockerfile.debian    @gigi206
+/src/                 @gigi206
 /mise/                @gigi206
-/scripts/             @gigi206
 /.github/workflows/   @gigi206
 /tests/               @gigi206

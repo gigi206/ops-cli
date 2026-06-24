@@ -1,5 +1,5 @@
 name: Bug report
-description: Something in ops-cli does not behave as documented.
+description: Something in ops does not behave as documented.
 title: "[bug] "
 labels: ["bug"]
 body:
@@ -7,27 +7,14 @@ body:
     attributes:
       value: |
         Thanks for taking the time to file a bug. Before submitting, please
-        skim the [README](../blob/main/README.md#troubleshooting) troubleshooting
-        section and existing issues to avoid duplicates.
+        skim the existing issues to avoid duplicates.
 
   - type: input
     id: ops-version
     attributes:
       label: ops version
       description: Output of `ops --version` (or the git SHA if you run from a clone).
-      placeholder: "ops 1.0.0"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: runtime
-    attributes:
-      label: Container runtime
-      options:
-        - docker
-        - podman
-        - nerdctl
-        - other / N/A
+      placeholder: "ops 2.0.0"
     validations:
       required: true
 
@@ -35,9 +22,16 @@ body:
     id: os
     attributes:
       label: Host OS
-      description: e.g. `Ubuntu 24.04`, `Arch`, `macOS 14.5`.
+      description: e.g. `Ubuntu 24.04`, `Arch`.
     validations:
       required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: ops doctor output
+      description: Paste the output of `ops doctor` — it reports the sandbox prerequisites (user namespaces, bwrap, …).
+      render: shell
 
   - type: textarea
     id: expected
@@ -61,8 +55,8 @@ body:
     attributes:
       label: Minimal reproduction
       description: |
-        The exact commands (plus relevant `ops.conf` excerpt or Dockerfile
-        diff) that trigger the bug. Smaller = faster fix.
+        The exact commands (plus a relevant `.ops.toml` excerpt) that trigger
+        the bug. Smaller = faster fix.
       render: bash
     validations:
       required: true
@@ -71,4 +65,4 @@ body:
     id: context
     attributes:
       label: Additional context
-      description: Anything else that might help (related issues, workarounds tried, `ops doctor` output…).
+      description: Anything else that might help (related issues, workarounds tried).

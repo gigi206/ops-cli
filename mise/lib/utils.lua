@@ -386,12 +386,10 @@ local function load_env(options)
       --option warn-dirty false \
       --json 2>>"${STDERR}"
 
-    # Pin the freshly-built profile as a gc-root so subsequent
-    # `nix-collect-garbage` invocations (notably the one wired into the
-    # ops-cli image build under NIX_CLEANUP=true) cannot evict the
-    # devShell's transitive store paths. Without this, every `./ops.sh
-    # build` would silently delete django/python3/... from the shared
-    # ops-share-nix volume and the user's PATH would resolve to broken
+    # Pin the freshly-built profile as a gc-root so a later
+    # `nix-collect-garbage` cannot evict the devShell's transitive store
+    # paths. Without this, garbage collection could delete the tools the
+    # profile provides, leaving the user's PATH resolving to broken
     # /nix/store/* segments at the next shell start.
     #
     # The gc-root is a plain symlink in /nix/var/nix/gcroots/per-user/<uid>/

@@ -1,193 +1,49 @@
-# mise.toml — development toolchain for ops-cli contributors.
+# mise.toml — development toolchain for the ops sandbox launcher.
 #
-# Run once after cloning the repo:
+# Run once after cloning:
 #
 #     mise trust          # allow mise to source this file (first time only)
 #     mise install        # install the tools below
 #
-# Then `mise run lint`, `mise run test`, `mise run ci`, `mise run coverage`.
-# The pinned tools and invocations mirror `.github/workflows/tests.yml` —
-# if CI passes, `mise run ci` locally should too (and vice versa).
-#
-# Backend choices:
-#   aqua:  the comprehensive registry of pre-built binaries (bats, shellcheck,
-#          hadolint, luacheck). Bundled into the mise binary, no extra CLI /
-#          plugin. Works on Linux/macOS/Windows with checksum verification.
-#   core:  ruby is a mise core plugin (ruby-build under the hood).
-#   gem:   installs a Ruby gem as a tool. Depends on `ruby` above being present.
-#
-# Deliberate non-overlap with the image toolchain: the `mise/` sub-directory
-# in this repo is a *plugin* (copied into the container at build time to serve
-# `nix:*` tools inside the image). This mise.toml is for the *host* — editing
-# ops.sh, running tests, linting, coverage. The two never collide.
+# Then `mise run lint`, `mise run test`, `mise run build`, `mise run ci`.
+# The invocations mirror `.github/workflows/tests.yml` — if CI passes,
+# `mise run ci` locally should too (and vice versa).
 
 min_version = "2024.12.0"
 
 [tools]
-# --- Linters + test runner (used by `mise run lint` / `mise run test`) ------
-"aqua:bats-core/bats-core"     = "latest"   # TAP-compatible shell test framework
-"aqua:koalaman/shellcheck"     = "latest"   # ops.sh static analysis
-"aqua:hadolint/hadolint"       = "latest"   # Dockerfile linter
-
-# --- Lua interpreter (used by `mise run test-lua`) --------------------------
-# Pure-Lua test harness under tests/lua/ (no busted dependency); see the
-# task definition below. The vfox-lua backend compiles Lua from source on
-# first install (~1 min cold; cached afterwards under ~/.local/share/mise).
-lua                            = "latest"
-
-# NOTE: luacheck is NOT declared here because the aqua registry does not
-# package it (luacheck is a pure-Lua tool distributed via luarocks; upstream
-# publishes source tarballs only, no binary releases aqua/ubi could use).
-# Install it from your system package manager instead:
-#   Debian/Ubuntu: sudo apt install luacheck
-#   Arch:          sudo pacman -S luacheck
-#   macOS:         brew install luacheck
-# The CI does the same (apt-get install luacheck in tests.yml). The `lint`
-# task below gracefully skips luacheck when it's not on PATH.
-
-# --- bashcov coverage (used by `mise run coverage`) -------------------------
-# bashcov is a Ruby gem; we install ruby via the mise core plugin, then the
-# gem backend takes care of bashcov itself. First `mise install` compiles
-# ruby via ruby-build (~2–3 min on a cold cache), cached under
-# ~/.local/share/mise afterwards. Subsequent installs are free.
-#
-# Caveats of bashcov applied to ops.sh:
-#   - Cannot trace past `exec` calls; ops.sh has ~5 in terminal paths
-#     (cmd_run final exec, cmd_logs, cmd_runtime). Those lines appear
-#     UNCOVERED even though they clearly ran.
-#   - `trap cleanup EXIT INT TERM` body runs AFTER bash tears down the
-#     DEBUG trap — bashcov can't observe it. Marked `# :nocov:` in ops.sh
-#     with a comment pointing at the CI path that does cover it.
-#   - `ensure_buildkitd` / `stop_buildkitd` drive a real rootless buildkitd
-#     (kill -0 on real PIDs, rootlesskit fork). Also marked `# :nocov:` —
-#     covered by the `runtime-build` CI matrix job instead.
-#   - Heredoc bodies (cmd_X --help cat <<EOF blocks) are data, not bash
-#     statements, so bashcov never counts them even when the --help tests
-#     assert their content. NOT marked :nocov: — treat the ~200 heredoc
-#     lines as a honest baseline drag on the overall figure.
-#   - After the :nocov: markers above, the reported figure tracks reality
-#     to within ~1-2 %. Useful as a delta monitor ("this PR dropped us
-#     from 98 % to 88 %") AND as a reasonable absolute number.
-#
-# If you don't want bashcov (skip the ruby compile time), comment the next
-# two lines and remove the `coverage` task below.
-ruby           = "3.3"
-"gem:bashcov"  = "latest"
-
-# --- musl static-link toolchain (the shipping binary is a static musl build;
-# some dependencies carry C/asm, so the musl target needs a musl-targeting C
-# compiler). zig provides a self-contained musl cross-cc and cargo-zigbuild
-# wires it into cargo — no system musl-gcc package required. Build with:
+# The shipping binary is a static musl build; some dependencies carry C/asm, so
+# the musl target needs a musl-targeting C compiler. zig provides a self-contained
+# musl cross-cc and cargo-zigbuild wires it into cargo — no system musl-gcc package
+# required. Build with:
 #   mise exec -- cargo zigbuild --release --target x86_64-unknown-linux-musl
 zig                             = "latest"
 "ubi:rust-cross/cargo-zigbuild" = "latest"
 
-
-
 # ============================================================================
-# Tasks
+# Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you
+# would run before pushing; it mirrors the CI pipeline one-for-one.
 # ============================================================================
-# Invoked via `mise run <name>`. `mise run ci` is the full one-liner you'd
-# run before pushing — it mirrors the CI pipeline one-for-one.
+
+[tasks.fmt]
+description = "Check formatting (rustfmt)"
+run = "cargo fmt --check"
 
 [tasks.lint]
-description = "Run all static analysis (shellcheck + bash -n + luacheck + hadolint)"
-# luacheck is gated on availability: if the contributor hasn't installed it
-# via their system package manager, we warn and continue (instead of failing
-# the whole lint). CI always has it (apt step). Contributors who care about
-# Lua changes will see the warning and install it.
-run = [
-  "shellcheck -S style ops.sh scripts/*.sh",
-  "bash -n ops.sh",
-  "for f in scripts/*.sh; do bash -n \"$f\"; done",
-  """
-  if command -v luacheck >/dev/null 2>&1; then
-    luacheck mise/
-  else
-    echo '⚠ luacheck not found on PATH — skipping. Install via luarocks: sudo apt install -y luarocks && sudo luarocks install luacheck' >&2
-  fi
-  """,
-  # hadolint ignore list mirrors .github/workflows/tests.yml:
-  #   DL3008 — apt/pacman pin (intentional for rolling base images)
-  #   DL3059 — multiple consecutive RUN (batched on purpose for cacheability)
-  #   DL3004 — sudo in RUN (required post-USER via the NOPASSWD sudoers entry)
-  #   SC2028 — echo escape sequences (false positive on the `echo 'alias …'`
-  #            bashrc append block; no escapes actually present)
-  #   SC2086 — intentional word split on ${EXTRA_MISE_TOOLS}
-  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 --ignore SC2086 Dockerfile",
-  "hadolint --ignore DL3008 --ignore DL3059 --ignore DL3004 --ignore SC1091 --ignore SC2028 --ignore SC2086 Dockerfile.debian",
-]
+description = "Run clippy over all targets, denying warnings"
+run = "cargo clippy --all-targets -- -D warnings"
 
 [tasks.test]
-description = "Run the full unit-test suite (mocked bats + pure-Lua)"
-# Contributor-facing one-liner: a single command covers both bash and Lua.
-# CI chains the same two steps; `mise run ci` adds lint + README count
-# verification on top.
-depends = ["test-lua"]
-run = "bats --tap tests/"
+description = "Run the full test suite (the heavy sandbox e2e skip when userns/nix/network are absent)"
+# Locally this runs the integration e2e too where the host can sandbox. CI runs
+# `cargo test --bins` (the unit tests) because the sandbox e2e need userns + nix +
+# network a hosted runner does not provide — there they skip, buying no coverage.
+run = "cargo test"
 
-[tasks.check-test-counts]
-description = "Verify README test counts match reality (use --update to rewrite them)"
-run = "bash scripts/check-test-counts.sh"
-
-[tasks.test-lua]
-description = "Run the pure-Lua unit tests for the mise plugin (no busted required)"
-# The harness under tests/lua/run.lua exercises plugin helpers (shell.shquote,
-# version parsing, flake.is_reference, plugin_matcher). It stubs the native
-# mise modules via package.preload, so any plain `lua5.x` interpreter works.
-#
-# Lua is declared in [tools] above, so `mise install` provides it on PATH as
-# `lua`. The lua5.4 / lua5.3 fallbacks are kept ONLY for contributors who
-# clone the repo and run `mise run test-lua` BEFORE `mise install` finishes
-# — once mise is bootstrapped, the first branch always wins.
-run = """
-if command -v lua >/dev/null 2>&1; then
-  lua tests/lua/run.lua
-elif command -v lua5.4 >/dev/null 2>&1; then
-  lua5.4 tests/lua/run.lua
-elif command -v lua5.3 >/dev/null 2>&1; then
-  lua5.3 tests/lua/run.lua
-else
-  echo "⚠ no lua interpreter on PATH — run 'mise install' (declared in mise.toml [tools]) or use your system package manager (apt install -y lua5.4 / pacman -S lua / brew install lua)" >&2
-  exit 1
-fi
-"""
-
-[tasks.test-image]
-description = "Run the image-integration suite against a locally-built localhost/ops-dev"
-# Separated from `test` because it requires `./ops.sh build` to have run
-# locally first (CI gates this one behind a push-to-main / workflow_dispatch,
-# not on PRs).
-run = "bats --tap tests/test_image_integration.bats"
-
-[tasks.coverage]
-description = "Run bats under bashcov → coverage/index.html + coverage.lcov (opens in any browser)"
-# bashcov wraps the passed command, tracing every bash line executed during
-# the suite. Output lands in ./coverage/ (gitignored). See the [tools]
-# section above for the caveats about under-reporting.
-#
-# The `rm -rf coverage/` step ensures sub-suites from previous runs don't
-# accumulate in .resultset.json (bashcov 3.3 spawns a new SimpleCov suite
-# per `bash -c` child — every test that pipes input via `printf 'Y\n' | ...`
-# creates one). After the run, reported figure is lower than the reality
-# on the main suite alone (~97.2 % vs ~96 % headline). The gap comes from
-# merging across sub-suites; a .simplecov with `use_merging false` was
-# attempted but triggers a SimpleCov TypeError during the HTML formatter
-# step (appears to conflict with bashcov's internal config). Left off.
-run = """
-rm -rf coverage/
-bashcov -- bats tests/
-"""
+[tasks.build]
+description = "Build the shipping static musl binary"
+run = "cargo zigbuild --release --target x86_64-unknown-linux-musl"
 
 [tasks.ci]
-description = "Full local reproduction of the CI pipeline (lint + test-lua + check-test-counts + test)"
-depends = ["lint", "test-lua", "check-test-counts", "test"]
-
-[tasks.smoke]
-description = "Build the CI smoke Dockerfile against the active runtime (exercises build_image end-to-end without pulling the heavy Nix tree)"
-# Mirrors the `runtime-build` matrix job. The fixture lives at
-# tests/fixtures/Dockerfile.cismoke so this task and CI share the
-# same definition (no inline here-doc to drift).
-run = """
-OPS_IMAGE=localhost/ops-ci-smoke OPS_DOCKERFILE=tests/fixtures/Dockerfile.cismoke ./ops.sh build
-"""
+description = "Full local reproduction of the CI pipeline (fmt + lint + test)"
+depends = ["fmt", "lint", "test"]

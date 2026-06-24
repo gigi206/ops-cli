@@ -6,15 +6,15 @@ body:
   - type: markdown
     attributes:
       value: |
-        Scope reminder: `ops.sh` is a single-file bash CLI wrapping
-        docker/podman/nerdctl. Requests that fit stay in scope; rewrites
-        or heavy new deps usually do not.
+        Scope reminder: `ops` is a sandbox launcher (a static Rust binary) that
+        runs tools and AI agents inside a bubblewrap + daemonless-nix sandbox.
+        Requests that fit the sandbox model stay in scope.
 
   - type: textarea
     id: problem
     attributes:
       label: Problem statement
-      description: What are you trying to do that ops-cli makes hard today?
+      description: What are you trying to do that ops makes hard today?
     validations:
       required: true
 
@@ -23,8 +23,8 @@ body:
     attributes:
       label: Proposed solution
       description: |
-        Concrete shape of the change — a new flag, a new subcommand, a
-        Dockerfile knob, etc. Mention edge cases you already thought about.
+        Concrete shape of the change — a new flag, a new subcommand, a config
+        field, etc. Mention edge cases you already thought about.
     validations:
       required: true
 
@@ -32,13 +32,13 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: Existing flags / aliases / external wrappers you tried first.
+      description: Existing flags / config fields / external tools you tried first.
 
   - type: checkboxes
     id: fit
     attributes:
       label: Scope fit
       options:
-        - label: Stays within the "single-file bash CLI" constraint.
-        - label: Does not add a runtime dependency beyond the existing set (docker/podman/nerdctl/mise/nix/curl/tar/…).
-        - label: Can be covered by a bats test (mocked runtime acceptable).
+        - label: Fits the sandbox-launcher model (does not turn ops into a container / orchestration manager).
+        - label: Respects the security model (least privilege, fail-closed, no weakening of the sandbox boundary).
+        - label: Can be covered by a test.

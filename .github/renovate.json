@@ -24,14 +24,6 @@
       "groupName": "github-actions",
       "addLabels": ["ci"],
       "semanticCommitType": "ci"
-    },
-    {
-      "description": "Batch base-image digest/tag bumps into a single weekly PR.",
-      "matchManagers": ["dockerfile"],
-      "groupName": "docker base images",
-      "addLabels": ["docker"],
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "docker"
     }
   ]
 }
