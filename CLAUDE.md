@@ -678,8 +678,10 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (unit ~500 + config 40 + upgrade 3 + run.rs 25 + shell 1), fmt/clippy clean, musl inherited
   (std-only; no new dep). **Named residuals (advisor, deferred):** stale rev-keyed out-links
   accumulate (each roll A→B leaves `<name>-A` + its closure) → **M5-GC class** (re-seed/GC heals,
-  same-tenant disk only); `ops config` does not show a flake's pinned rev (minor parity, would read
-  the lock network-free). The two slices share the `Clone` derive + the upgrade dispatch + re-exports
+  same-tenant disk only). *(The once-named "`ops config` does not show a flake's pinned rev" residual
+  has since shipped — `package_line` renders `@ <short-rev> (…, pinned)` / `(…, floating)`, read
+  network-free from the per-project lock.)* The two slices share the `Clone` derive + the upgrade
+  dispatch + re-exports
   + test helpers, so they shipped as **one cohesive commit** (the message delineates both). See
   [[ops-mise-passthrough]], [[ubi-backend-deprecated]], [[ops-app-framework]].
   **M3.3d.2b — direction LOCKED with the user** (a long design discussion):

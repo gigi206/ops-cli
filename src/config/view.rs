@@ -244,8 +244,9 @@ pub(crate) struct AppView {
     pub(crate) packages: Vec<PackageView>,
     /// The app's own network posture, with an allowlist's rules, when it set one.
     pub(crate) network: Option<AppNetworkView>,
-    /// The app's own GUI posture as a word (`wayland`/`none`), when it set one.
-    pub(crate) gui: Option<String>,
+    /// The app's own GUI posture, when it set one — the same [`GuiView`] the baseline `gui` field
+    /// carries, so the overlay and the baseline render and serialize a display identically.
+    pub(crate) gui: Option<GuiView>,
     /// The credentials this overlay injects, host-side at launch — its *own* `[secret]` sections
     /// (global and project), gated, not the baseline's. The merge unions them with the baseline
     /// only for the launch itself; the view shows the overlay's additions. Each carries only its
@@ -515,8 +516,8 @@ fn app_view(
             },
         }),
         gui: app.gui.as_ref().map(|g| match g {
-            super::GuiPolicy::Wayland => "wayland".to_string(),
-            super::GuiPolicy::None => "none".to_string(),
+            super::GuiPolicy::Wayland => GuiView::Wayland,
+            super::GuiPolicy::None => GuiView::None,
         }),
         secrets: app
             .secrets

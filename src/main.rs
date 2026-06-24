@@ -1012,10 +1012,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if let Some(net) = &app.network {
                 match net {
                     AppNetworkView::Shared => {
-                        let _ = writeln!(o, "      {dim}network:{r} shared");
+                        let _ = writeln!(o, "      {dim}network:{r} shared {dim}(host network){r}");
                     }
                     AppNetworkView::Isolated => {
-                        let _ = writeln!(o, "      {dim}network:{r} none");
+                        let _ = writeln!(
+                            o,
+                            "      {dim}network:{r} none {dim}(isolated — no network){r}"
+                        );
                     }
                     AppNetworkView::Allowlist {
                         allow,
@@ -1036,6 +1039,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                         for host in builtin {
                             let _ = writeln!(o, "          allow {n}{host}{r}");
                         }
+                        let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
                     }
                     AppNetworkView::Allowlist { allow, deny, .. } => {
                         let _ = writeln!(
@@ -1047,8 +1051,21 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     }
                 }
             }
-            if let Some(gui) = &app.gui {
-                let _ = writeln!(o, "      {dim}gui:{r} {gui}");
+            // The GUI posture the overlay sets, matched like the baseline `gui` line: `wayland`
+            // carries the same compositor-exposure caveat, so an app that opens a display explains
+            // it the same way; an explicit `none` (the app closing a display the baseline may open)
+            // stays a bare word — there is nothing to caveat.
+            match &app.gui {
+                Some(GuiView::Wayland) => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
+                    );
+                }
+                Some(GuiView::None) => {
+                    let _ = writeln!(o, "      {dim}gui:{r} none");
+                }
+                None => {}
             }
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
@@ -4270,6 +4287,77 @@ mod tests {
             expanded.contains("built-in (always allowed, so self-equip works):")
                 && expanded.contains("          allow cache.nixos.org"),
             "--details must surface the always-allowed built-in set:\n{expanded}"
+        );
+        // The overlay's allowlist closes with the same `deny wins over allow` reminder the baseline
+        // `network` section shows — security-field parity between the overlay and the baseline.
+        assert!(
+            expanded.contains("        (deny wins over allow)"),
+            "--details must explain that deny wins, as the baseline allowlist does:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn config_render_app_overlay_postures_carry_the_baseline_parentheticals() {
+        // An app overlay's simple postures read with the same parentheticals the baseline sections
+        // carry, so `ops app <name>` explains them identically: `network: shared` notes the host
+        // network, `network: none` notes the isolation, and a `wayland` gui carries the
+        // compositor-exposure caveat. None of these is an expandable list, so they render the same
+        // with or without `--details` — the default render is enough to pin them.
+        use config::view::*;
+        let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
+            name: name.into(),
+            cmd: Some(name.into()),
+            home_scope: "global (shared across projects)".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            network,
+            gui,
+            secrets: vec![],
+            notes: vec![],
+        };
+        let view = ConfigView {
+            cwd: "/proj".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            mise: None,
+            tools: ToolsView::default(),
+            nixpkgs: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            engine: ChannelView {
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
+            },
+            network: NetworkView::Shared,
+            gui: GuiView::None,
+            secrets: vec![],
+            apps: vec![
+                app("shared-app", Some(AppNetworkView::Shared), None),
+                app("none-app", Some(AppNetworkView::Isolated), None),
+                app("gui-app", None, Some(GuiView::Wayland)),
+            ],
+            warnings: vec![],
+        };
+
+        let out = render_config(&view, &style::Palette::plain(), false);
+        // Each app line is six-space-indented, so these substrings match the overlay, not the
+        // two-space baseline `network: shared (host network)` line.
+        assert!(
+            out.contains("      network: shared (host network)"),
+            "an app's shared network must carry the baseline parenthetical:\n{out}"
+        );
+        assert!(
+            out.contains("      network: none (isolated — no network)"),
+            "an app's none network must carry the baseline parenthetical:\n{out}"
+        );
+        assert!(
+            out.contains("      gui: wayland (exposure depends on your compositor)"),
+            "an app's wayland gui must carry the baseline compositor caveat:\n{out}"
         );
     }
 
