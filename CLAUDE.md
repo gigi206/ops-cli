@@ -72,34 +72,24 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 - **Every increment ships with tests** (unit + integration, green), is then
   **reviewed by the advisor**, and finally **validated with the user** before
   moving to the next — incremental, collaborative cadence, no barreling ahead.
-- **Current status: M2 done; M3 in progress (M3.1 + M3.2a + M3.2c + M3.2d done;
-  M3.2b SKIPPED; M3.3 done — M3.3a + M3.3b + M3.3c done; M3.3d done
-  — M3.3d.1 (nix-ld) + M3.3d.2a (widen the honored mise files) done; M3.3d.2b
-  (`[tools]` driver) done — the nixhub resolver + host-side provisioning of
-  declared `nix:` tools landed (trusted-only); the per-project writable store layer
-  shipped and is **WIRED — the cage's `/nix` is a read-write bind of the
-  per-project store by default (the Mode-B posture inversion, 2b.3.2b.1)**;
-  **nix now lives in the cage so the agent self-equips (2b.3.2b.2) — offline
-  reuse from the seeded base proven and in-cage HTTPS to the default cache already
-  works (M3.4 since made its TLS hermetic — done)**; the **concurrency/flock settlement
-  landed (2b.3.3) — no ops lock: atomic per-path placement + nix's own store lock
-  carry concurrent same-project seeds, proven by a concurrent-seed smoke**; and
-  **`ops mise` passthrough shipped (2b.4) — the agent self-equips a project's `nix:`
-  tools live with `ops mise install nix:<pkg>` in the open cage (mise carried in every
-  cage, the embedded `nix:` backend plugin registered per launch), proven e2e + a
-  network smoke**; and **tool activation shipped (2b.5) — a tool the agent *activates*
-  (`mise use [-g] nix:<pkg>`) is auto-on-PATH in later launches: the mise shims dir on
-  PATH for `ops run` (mise's documented non-interactive mechanism) and `mise activate`
-  via a synthetic `--rcfile` for `ops shell` (its interactive mechanism), proven e2e +
-  pty + a network smoke**; and **`ops upgrade mise` shipped (M3.3d.3) — floating `nix:`
-  tool pins roll + prune against nixhub (`tools.lock`), and the mise engine rides its own
-  `mise-engine.lock` decoupled from the base channel (`ops upgrade nix` no longer moves the
-  engine; migration-safe seeding from `nixpkgs.lock` keeps a binary update from moving
-  versions)**; and **the network increment (M6 / "network last") is under
-  way: its safe first slice shipped — a trusted-only `network = "none"` posture (the
-  `NetPolicy::Isolated` an empty netns) gated like `binds`/`nixpkgs`, plus a live
-  P-vs-B spike that LOCKED the egress architecture on **Model B** (deny-by-construction,
-  pending the user's confirmation)).** **M3.4 done — hermetic TLS + a curated base
+- **Current status — the bwrap rewrite is far along: M2 through the main M6 slices have shipped;
+  the genuinely-remaining pieces are blocked on the user.** **Provisioning (M3) complete through
+  M3.5** — the per-project writable store + the Mode-B `/nix` read-write inversion, nix-in-cage
+  self-equip, `ops mise` passthrough + tool activation, `ops upgrade [nix|mise|flake]`, hermetic
+  TLS + a curated base toolset, and `ops search`. **Enforcement (M4) complete** — seccomp denylist
+  (Posture A) + cgroup v2 resource limits (Landlock-FS is a deferred defense-in-depth option, not a
+  gap). **Housekeeping (M5) complete** — `ops gc [--all] [--prune]` (session + per-project +
+  shared-store collection, including the stale rev-keyed flake out-link residual), `ops attach
+  <id>`, `ops stop <id>… | --all`, and a `--detach` background-agent path; the **one open M5 parity
+  hole is ssh-agent forwarding** (`$SSH_AUTH_SOCK`, a scoped trusted-only opt-in, deferred — the
+  `container socket` row is N/A on this branch). **Network + secrets (M6) largely shipped** —
+  Model-B egress (empty netns + an in-cage forwarder → a host MITM allowlisting proxy), host-side
+  credential injection with outbound/inbound redaction, and the resolver / plugin / signed-store
+  layer. **The `ops app` framework + 9 importable profiles shipped** — named agent launchers with a
+  per-app isolated `$HOME`, export/import, and `nix:` / `mise:` / `flake:` package backends. **The
+  two genuinely-remaining pieces are blocked on the user:** the flagship live-auth e2e (a real API
+  key, never the assistant's) and the signed-store *distribution* of profiles (a hosting URL + a
+  long-term signing key). The per-increment history below is the append-only record, kept as-is.** **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
   reqwest), so in-cage TLS no longer depends on the host's `/etc/ssl`; and the base
