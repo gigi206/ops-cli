@@ -7,9 +7,10 @@
 //! has always shown — by loading and projecting the resolved configuration plus the channel
 //! locks. The CLI presenter and a future management UI are both adapters over this one model.
 //!
-//! It carries the per-layer provenance of the free fields (`env`/`binds`) — which layer, global
-//! or project, supplied each value — so `ops config` can show a value's source. What it still
-//! does *not* carry: a queryable schema, an affordance for a management UI that does not yet
+//! It carries the provenance of each baseline value — which layer (`Default`/`Global`/`Project`)
+//! supplied it: per-entry for `env`/`binds`, and per-field for the scalar postures (`network`,
+//! `gui`) and the cgroup `limits` — so `ops config` can show where every value came from. What it
+//! still does *not* carry: a queryable schema, an affordance for a management UI that does not yet
 //! exist; it is added when that consumer is concrete, against its real shape.
 
 use std::collections::BTreeMap;
@@ -45,8 +46,12 @@ pub(crate) struct ConfigView {
     pub(crate) engine: ChannelView,
     /// The resolved network posture.
     pub(crate) network: NetworkView,
+    /// Which layer supplied the network posture (`Default` when neither config set it).
+    pub(crate) network_origin: ProvenanceView,
     /// The resolved GUI posture.
     pub(crate) gui: GuiView,
+    /// Which layer supplied the GUI posture (`Default` when neither config set it).
+    pub(crate) gui_origin: ProvenanceView,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -63,7 +68,7 @@ pub(crate) struct EnvVar {
     pub(crate) key: String,
     pub(crate) value: String,
     /// Which config layer supplied the winning value, when known.
-    pub(crate) layer: Option<LayerView>,
+    pub(crate) layer: Option<ProvenanceView>,
 }
 
 /// One extra read-only bind: the canonical host path and the layer that declared it.
@@ -71,22 +76,25 @@ pub(crate) struct EnvVar {
 pub(crate) struct BindView {
     pub(crate) path: String,
     /// Which config layer declared the bind, when known.
-    pub(crate) layer: Option<LayerView>,
+    pub(crate) layer: Option<ProvenanceView>,
 }
 
-/// Which configuration layer supplied a free-field value — the global `ops.toml` or the
-/// project `.ops.toml`. The presentation-agnostic mirror of [`super::Layer`].
-#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LayerView {
+/// Where a resolved value came from — the presentation-agnostic mirror of [`super::Provenance`].
+/// `Default` is ops's built-in, `Global`/`Project` the two config files.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(crate) enum ProvenanceView {
+    #[default]
+    Default,
     Global,
     Project,
 }
 
-impl From<super::Layer> for LayerView {
-    fn from(l: super::Layer) -> Self {
-        match l {
-            super::Layer::Global => LayerView::Global,
-            super::Layer::Project => LayerView::Project,
+impl From<super::Provenance> for ProvenanceView {
+    fn from(p: super::Provenance) -> Self {
+        match p {
+            super::Provenance::Default => ProvenanceView::Default,
+            super::Provenance::Global => ProvenanceView::Global,
+            super::Provenance::Project => ProvenanceView::Project,
         }
     }
 }
@@ -193,12 +201,12 @@ pub(crate) struct LimitsView {
     pub(crate) tasks_max: LimitView,
 }
 
-/// One effective resource limit: its value and whether a config `[limits]` override supplied it
-/// (as opposed to the built-in default).
+/// One effective resource limit: its value and which layer supplied it (`Default` for the built-in
+/// value, `Global`/`Project` for a config `[limits]` override).
 #[derive(Serialize, Default)]
 pub(crate) struct LimitView {
     pub(crate) value: String,
-    pub(crate) overridden: bool,
+    pub(crate) origin: ProvenanceView,
 }
 
 /// An injected credential, by destination and source — never the plaintext, which ops reads only
@@ -306,7 +314,7 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         .map(|(k, v)| EnvVar {
             key: k.clone(),
             value: v.clone(),
-            layer: resolved.env_layer.get(k).copied().map(LayerView::from),
+            layer: resolved.env_layer.get(k).copied().map(ProvenanceView::from),
         })
         .collect();
 
@@ -315,7 +323,11 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         .iter()
         .map(|b| BindView {
             path: b.display().to_string(),
-            layer: resolved.bind_layer.get(b).copied().map(LayerView::from),
+            layer: resolved
+                .bind_layer
+                .get(b)
+                .copied()
+                .map(ProvenanceView::from),
         })
         .collect();
 
@@ -349,7 +361,7 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         super::GuiPolicy::Wayland => GuiView::Wayland,
         super::GuiPolicy::None => GuiView::None,
     };
-    let limits = limits_view(&resolved.limits);
+    let limits = limits_view(&resolved.limits, &resolved.limits_origin);
 
     let secrets = resolved
         .secrets
@@ -378,7 +390,9 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         nixpkgs,
         engine,
         network,
+        network_origin: resolved.network_origin.into(),
         gui,
+        gui_origin: resolved.gui_origin.into(),
         limits,
         secrets,
         apps,
@@ -512,13 +526,17 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
 }
 
 /// Project the cage's effective resource limits — each the config override when set, or ops's
-/// built-in default — so `ops config` shows what the launch would actually apply.
-fn limits_view(limits: &sandbox::cgroup::Limits) -> LimitsView {
-    let project = |(value, overridden): (String, bool)| LimitView { value, overridden };
+/// built-in default — with the layer that supplied it, so `ops config` shows what the launch would
+/// actually apply and where each limit came from.
+fn limits_view(limits: &sandbox::cgroup::Limits, origin: &super::LimitsOrigin) -> LimitsView {
+    let project = |(value, _overridden): (String, bool), origin: super::Provenance| LimitView {
+        value,
+        origin: origin.into(),
+    };
     LimitsView {
-        memory_high: project(limits.memory_high()),
-        memory_max: project(limits.memory_max()),
-        tasks_max: project(limits.tasks_max()),
+        memory_high: project(limits.memory_high(), origin.memory_high),
+        memory_max: project(limits.memory_max(), origin.memory_max),
+        tasks_max: project(limits.tasks_max(), origin.tasks_max),
     }
 }
 
@@ -612,11 +630,11 @@ mod tests {
             env: vec![EnvVar {
                 key: "A".into(),
                 value: "1".into(),
-                layer: Some(LayerView::Project),
+                layer: Some(ProvenanceView::Project),
             }],
             binds: vec![BindView {
                 path: "/data".into(),
-                layer: Some(LayerView::Global),
+                layer: Some(ProvenanceView::Global),
             }],
             packages: vec![PackageView {
                 name: "jq".into(),
@@ -648,7 +666,9 @@ mod tests {
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
+            network_origin: ProvenanceView::Project,
             gui: GuiView::Wayland,
+            gui_origin: ProvenanceView::Global,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -706,6 +726,10 @@ mod tests {
         // A struct enum variant is externally tagged; a unit variant is its name as a string.
         assert!(json["network"]["Allowlist"]["allow"][0] == "github.com");
         assert_eq!(json["gui"], "Wayland");
+        // The scalar postures' provenance is part of the serialization contract — a value's origin
+        // (default/global/project) travels with it.
+        assert_eq!(json["network_origin"], "Project");
+        assert_eq!(json["gui_origin"], "Global");
         // An app overlay's allowlist serializes its rules and the built-in set in full, so the
         // JSON form carries what `ops app <name>` can reach without a `--details` equivalent.
         let app_net = &json["apps"][0]["network"]["Allowlist"];

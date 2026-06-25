@@ -766,16 +766,39 @@ fn config_show(args: &[OsString]) -> ExitCode {
 /// adds only color and layout, so the management core stays presentation-agnostic and a future
 /// front-end can render the same model differently. Every color span is empty under a
 /// non-terminal, so captured output is byte-for-byte the plain text the integration tests pin.
-/// The dim ` (global)` / ` (project)` provenance tag a free-field line carries — which config
-/// layer supplied the value. Empty when the origin is unknown, and (like every span) empty under
-/// a non-terminal, so captured output keeps the bare `KEY=value` / path the integration tests pin.
-fn layer_tag(layer: Option<config::view::LayerView>, dim: &str, r: &str) -> String {
-    use config::view::LayerView;
-    match layer {
-        Some(LayerView::Global) => format!("  {dim}(global){r}"),
-        Some(LayerView::Project) => format!("  {dim}(project){r}"),
-        None => String::new(),
+/// The ` (default)` / ` (global)` / ` (project)` / ` (inherited)` provenance tag a line carries,
+/// hued by level so a configured source stands out (global cyan, project green) while a built-in
+/// default or an inherited baseline value stays dim. The *label text* is always emitted — color is
+/// additive and (like every span) vanishes under a non-terminal — so captured output keeps the
+/// bare `(global)` the integration tests pin.
+fn provenance_tag(origin: config::view::ProvenanceView, pal: &style::Palette) -> String {
+    let (label, span) = provenance_parts(origin, pal);
+    format!("  {span}({label}){r}", r = pal.reset)
+}
+
+/// The label and color span for a provenance level — the one place the level→hue mapping lives, so
+/// the end-of-line [`provenance_tag`] and any inline use (the per-field `limits` cells) cannot
+/// drift. A configured source is hued (global cyan, project green); a default or inherited value
+/// stays dim.
+fn provenance_parts(
+    origin: config::view::ProvenanceView,
+    pal: &style::Palette,
+) -> (&'static str, &'static str) {
+    use config::view::ProvenanceView;
+    match origin {
+        ProvenanceView::Default => ("default", pal.dim),
+        ProvenanceView::Global => ("global", pal.name),
+        ProvenanceView::Project => ("project", pal.ok),
     }
+}
+
+/// The provenance tag for an optional origin — the free fields (`env`/`binds`) whose value may
+/// carry no recorded layer. Empty when the origin is unknown.
+fn opt_provenance_tag(
+    origin: Option<config::view::ProvenanceView>,
+    pal: &style::Palette,
+) -> String {
+    origin.map_or_else(String::new, |o| provenance_tag(o, pal))
 }
 
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
@@ -786,10 +809,11 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
 
     // The hue carries the layering story the model already holds: a section header is bold, an
     // identifier (a key, a path, a rule, a channel) rides the name span, a value the trust gate
-    // *withheld* is yellow while an admitted one's detail is dimmed, a channel's provenance origin
-    // is bold, and a secondary note is dim. None of this is new data — it is the gating outcome and
-    // the per-channel origin made visible. Every span is empty under a non-terminal, so captured
-    // output stays byte-for-byte the plain text the integration tests pin.
+    // *withheld* is yellow while an admitted one's detail is dimmed, and every value's provenance
+    // tag is hued by level — a built-in default gray, a global source cyan, a project source green
+    // — so where a value came from reads at a glance. None of this is new data; it is the gating
+    // outcome and the per-value origin made visible. Every span is empty under a non-terminal, so
+    // captured output stays byte-for-byte the plain text the integration tests pin.
     let _ = writeln!(o, "{h}ops config{r} — resolved for {n}{}{r}", view.cwd);
 
     // The layered environment and read-only binds, after the trust gate.
@@ -803,7 +827,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 "    {n}{}{r}={}{}",
                 e.key,
                 e.value,
-                layer_tag(e.layer, dim, r)
+                opt_provenance_tag(e.layer, pal)
             );
         }
     }
@@ -812,7 +836,12 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     } else {
         let _ = writeln!(o, "  {h}binds (read-only):{r}");
         for b in &view.binds {
-            let _ = writeln!(o, "    {n}{}{r}{}", b.path, layer_tag(b.layer, dim, r));
+            let _ = writeln!(
+                o,
+                "    {n}{}{r}{}",
+                b.path,
+                opt_provenance_tag(b.layer, pal)
+            );
         }
     }
 
@@ -897,19 +926,23 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     // The network posture — a security field. `shared` keeps the host network; `none` cuts it
     // off; an `allowlist` lists exactly what egress is permitted (deny wins over allow), plus the
     // always-allowed nix-cache set so the self-equip allowance is never silent.
+    let net_tag = provenance_tag(view.network_origin, pal);
     match &view.network {
         NetworkView::Shared => {
-            let _ = writeln!(o, "  {h}network:{r} shared {dim}(host network){r}");
+            let _ = writeln!(o, "  {h}network:{r} shared {dim}(host network){r}{net_tag}");
         }
         NetworkView::Isolated => {
-            let _ = writeln!(o, "  {h}network:{r} none {dim}(isolated — no network){r}");
+            let _ = writeln!(
+                o,
+                "  {h}network:{r} none {dim}(isolated — no network){r}{net_tag}"
+            );
         }
         NetworkView::Allowlist {
             allow,
             deny,
             builtin,
         } => {
-            let _ = writeln!(o, "  {h}network:{r} allowlist");
+            let _ = writeln!(o, "  {h}network:{r} allowlist{net_tag}");
             if allow.is_empty() {
                 let _ = writeln!(o, "    allow: {dim}(none declared){r}");
             } else {
@@ -936,20 +969,21 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     if matches!(view.gui, GuiView::Wayland) {
         let _ = writeln!(
             o,
-            "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
+            "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}{}",
+            provenance_tag(view.gui_origin, pal)
         );
     }
 
     // Resource limits — shown only when a config `[limits]` override customizes one, so a
-    // default-profile config stays uncluttered (the effective defaults are in `ops doctor`).
+    // default-profile config stays uncluttered (the effective defaults are in `ops doctor`). When
+    // shown, each of the three fields carries its own provenance: the overridden ones name their
+    // layer, the untouched ones read `(default)`, so the line tells exactly which limits were tuned.
     let l = &view.limits;
-    if l.memory_high.overridden || l.memory_max.overridden || l.tasks_max.overridden {
+    let overridden = |v: &LimitView| v.origin != config::view::ProvenanceView::Default;
+    if overridden(&l.memory_high) || overridden(&l.memory_max) || overridden(&l.tasks_max) {
         let cell = |name: &str, v: &LimitView| {
-            if v.overridden {
-                format!("{name}={} {dim}(custom){r}", v.value)
-            } else {
-                format!("{name}={}", v.value)
-            }
+            let (label, span) = provenance_parts(v.origin, pal);
+            format!("{name}={} {span}({label}){r}", v.value)
         };
         let _ = writeln!(
             o,
@@ -1198,18 +1232,36 @@ fn package_line(p: &config::view::PackageView, pal: &style::Palette, indent: &st
 /// One channel line's text (without the colored label): `<source> @ <short-rev>  (<origin>)`, or
 /// `<source>  (<origin>)` when no revision has been locked. The source rides the name span (it is
 /// the channel identifier), the shortened revision is dimmed (secondary detail), and the origin —
-/// the per-channel provenance, the inheritance the config makes visible — is bold. The revision is
-/// shortened here, a presentation choice; the view model carries the full revision.
+/// the per-channel provenance — is hued by level like every other provenance tag (default gray,
+/// global cyan, project green), so a channel reads consistently with its neighbors while keeping
+/// its richer wording (`project pin`). The revision is shortened here, a presentation choice; the
+/// view model carries the full revision.
 fn channel_text(c: &config::view::ChannelView, pal: &style::Palette) -> String {
-    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let (_, span) = provenance_parts(channel_origin_kind(&c.origin), pal);
     match &c.locked_rev {
         Some(rev) => format!(
-            "{n}{}{r} @ {dim}{}{r}  ({h}{}{r})",
+            "{n}{}{r} @ {dim}{}{r}  ({span}{}{r})",
             c.source,
             short_rev(rev),
             c.origin
         ),
-        None => format!("{n}{}{r}  ({h}{}{r})", c.source, c.origin),
+        None => format!("{n}{}{r}  ({span}{}{r})", c.source, c.origin),
+    }
+}
+
+/// Map a channel's origin *label* to its provenance level for coloring. The channel view carries
+/// its origin as the richer display string `store::Origin::label` emits (`default`/`global`/`project
+/// pin`), a closed, stable set; this colors it on the same gray/cyan/green scale as the other
+/// provenance tags. The coupling to those exact labels is pinned by a test that routes the real
+/// `Origin::label()` strings through here, so a rename fails loudly rather than silently degrading a
+/// channel's origin to the dim default — which is also the safe fallback for any unrecognized label.
+fn channel_origin_kind(label: &str) -> config::view::ProvenanceView {
+    use config::view::ProvenanceView;
+    match label {
+        "global" => ProvenanceView::Global,
+        "project pin" => ProvenanceView::Project,
+        _ => ProvenanceView::Default,
     }
 }
 
@@ -3690,8 +3742,11 @@ mod tests {
             nixpkgs_project: None,
             mise: None,
             network: config::NetworkPolicy::default(),
+            network_origin: Default::default(),
             gui: config::GuiPolicy::default(),
+            gui_origin: Default::default(),
             limits: Default::default(),
+            limits_origin: Default::default(),
             secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -4079,11 +4134,11 @@ mod tests {
             env: vec![EnvVar {
                 key: "EDITOR".into(),
                 value: "vim".into(),
-                layer: Some(LayerView::Project),
+                layer: Some(ProvenanceView::Project),
             }],
             binds: vec![BindView {
                 path: "/data".into(),
-                layer: Some(LayerView::Global),
+                layer: Some(ProvenanceView::Global),
             }],
             packages: vec![PackageView {
                 name: "jq".into(),
@@ -4115,7 +4170,9 @@ mod tests {
                 deny: vec!["evil.com".into()],
                 builtin: vec!["cache.nixos.org".into()],
             },
+            network_origin: ProvenanceView::Project,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![],
@@ -4151,8 +4208,9 @@ mod tests {
     #[test]
     fn config_render_colors_the_gating_outcome_and_the_channel_provenance() {
         // The ON path: a withheld value takes the warn hue (the trust gate dropped it), a channel's
-        // provenance origin is bold and its source rides the name span, its short revision is dim,
-        // and the deny keyword is warn — the inheritance/gating story a swapped hue would hide.
+        // provenance origin is hued by level (a project pin green) and its source rides the name
+        // span, its short revision is dim, and the deny keyword is warn — the inheritance/gating
+        // story a swapped hue would hide.
         let p = style::Palette::colored();
         let out = render_config(&sample_config_view(), &p, false);
         assert!(
@@ -4167,8 +4225,8 @@ mod tests {
             "a channel source must ride the name span:\n{out}"
         );
         assert!(
-            out.contains(&format!("({}project pin{})", p.head, p.reset)),
-            "a channel origin (provenance) must be bold:\n{out}"
+            out.contains(&format!("({}project pin{})", p.ok, p.reset)),
+            "a channel origin must be hued by provenance level — a project pin is green:\n{out}"
         );
         assert!(
             out.contains(&format!("{}9ae611a{}", p.dim, p.reset)),
@@ -4178,14 +4236,70 @@ mod tests {
             out.contains(&format!("{}deny{}", p.warn, p.reset)),
             "the deny keyword must take the caution hue:\n{out}"
         );
-        // The free-field provenance tag is secondary information — it takes the dim hue.
+        // The provenance tag is hued by level: a project source is green, a global source is cyan
+        // (a default/inherited one stays dim). The env value here is project-supplied, the bind
+        // global-supplied, so the two tags carry their respective hues.
         assert!(
-            out.contains(&format!("{}(project){}", p.dim, p.reset)),
-            "the env provenance tag must be dim:\n{out}"
+            out.contains(&format!("{}(project){}", p.ok, p.reset)),
+            "a project provenance tag must take the green hue:\n{out}"
         );
         assert!(
-            out.contains(&format!("{}(global){}", p.dim, p.reset)),
-            "the bind provenance tag must be dim:\n{out}"
+            out.contains(&format!("{}(global){}", p.name, p.reset)),
+            "a global provenance tag must take the cyan hue:\n{out}"
+        );
+    }
+
+    #[test]
+    fn channel_origin_kind_tracks_the_real_store_origin_labels() {
+        // `channel_origin_kind` colors by matching the channel's origin *label* — a string coupling
+        // to `store::Origin::label()`. Route the REAL labels through it so a rename in store.rs
+        // fails here loudly, instead of silently degrading that channel's origin to the dim default.
+        use config::view::ProvenanceView;
+        assert_eq!(
+            channel_origin_kind(store::Origin::Default.label()),
+            ProvenanceView::Default
+        );
+        assert_eq!(
+            channel_origin_kind(store::Origin::Global.label()),
+            ProvenanceView::Global
+        );
+        assert_eq!(
+            channel_origin_kind(store::Origin::ProjectPin.label()),
+            ProvenanceView::Project
+        );
+    }
+
+    #[test]
+    fn config_render_tags_the_network_and_gui_posture_with_their_origin() {
+        use config::view::{GuiView, ProvenanceView};
+        let plain = style::Palette::plain();
+
+        // The headline of the provenance work: the always-shown `network` line names where its
+        // posture came from. The sample's allowlist is project-supplied, so it reads `(project)`.
+        let out = render_config(&sample_config_view(), &plain, false);
+        assert!(
+            out.contains("network: allowlist  (project)"),
+            "the network posture must carry its project origin:\n{out}"
+        );
+
+        // A posture no config set reads `(default)` — the distinction the user could not see
+        // before (is the network open because I chose it, or because nothing set it?).
+        let mut view = sample_config_view();
+        view.network = config::view::NetworkView::Shared;
+        view.network_origin = ProvenanceView::Default;
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("network: shared (host network)  (default)"),
+            "an unset network posture must read default:\n{out}"
+        );
+
+        // The GUI line, shown only when opened, names its origin too.
+        view.gui = GuiView::Wayland;
+        view.gui_origin = ProvenanceView::Global;
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("gui: wayland (exposure depends on your compositor)  (global)"),
+            "the gui posture must carry its global origin:\n{out}"
         );
     }
 
@@ -4200,21 +4314,23 @@ mod tests {
             "a default profile must not print a limits line:\n{out}"
         );
 
-        // An override of the ceiling and task cap prints the line, marking the customized fields
-        // `(custom)` and filling the untouched throttle with its default value.
+        // An override of the ceiling and task cap prints the line, tagging each field with its
+        // provenance: the overridden ones name their layer (`global`/`project`), the untouched
+        // throttle reads `(default)` and keeps its default value.
+        use config::view::ProvenanceView;
         let mut view = sample_config_view();
         view.limits = config::view::LimitsView {
             memory_high: config::view::LimitView {
                 value: "80%".into(),
-                overridden: false,
+                origin: ProvenanceView::Default,
             },
             memory_max: config::view::LimitView {
                 value: "8G".into(),
-                overridden: true,
+                origin: ProvenanceView::Global,
             },
             tasks_max: config::view::LimitView {
                 value: "4096".into(),
-                overridden: true,
+                origin: ProvenanceView::Project,
             },
         };
         let out = render_config(&view, &p, false);
@@ -4230,13 +4346,19 @@ mod tests {
             out.contains("TasksMax=4096"),
             "the overridden task cap shows:\n{out}"
         );
+        // Each field names its source, hued by level: the global-set ceiling (cyan), the
+        // project-set task cap (green), and the untouched throttle's default (dim).
         assert!(
-            out.contains("(custom)"),
-            "an overridden field is marked custom:\n{out}"
+            out.contains(&format!("MemoryMax=8G {}(global){}", p.name, p.reset)),
+            "the overridden ceiling is tagged global (cyan):\n{out}"
         );
         assert!(
-            out.contains("MemoryHigh=80%"),
-            "the untouched throttle shows its default value:\n{out}"
+            out.contains(&format!("TasksMax=4096 {}(project){}", p.ok, p.reset)),
+            "the overridden task cap is tagged project (green):\n{out}"
+        );
+        assert!(
+            out.contains(&format!("MemoryHigh=80% {}(default){}", p.dim, p.reset)),
+            "the untouched throttle shows its default value, tagged default (dim):\n{out}"
         );
     }
 
@@ -4331,7 +4453,9 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -4403,7 +4527,9 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -4500,7 +4626,9 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![
@@ -4553,7 +4681,9 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -4636,7 +4766,9 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -4716,7 +4848,9 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             gui: GuiView::None,
+            gui_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {

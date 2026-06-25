@@ -266,6 +266,38 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **Named residual (unchanged):** a unit-suffixed-but-too-small value (`"2K"`) or `memory_high` ≥
   `memory_max` stays the self-sabotage-of-a-trusted-field class; the app path reuses the identical
   `validate_limits`, so its config-time drops behave exactly as the baseline's.
+  **`config show` value provenance — baseline (DONE 2026-06-25)** (`src/config/mod.rs` +
+  `config/view.rs` + `main.rs`): `ops config show` now tags **every baseline value** with where it
+  came from — `(default)` (ops built-in), `(global)`, `(project)` — **colored by level** (default
+  gray, global cyan, project green), so a value's origin reads at a glance (the user's ask: "on ne
+  voit pas d'où vient la valeur"). `Layer{Global,Project}` was **migrated to one
+  `Provenance{Default,Global,Project}`** enum (the single origin type, no drift); `env`/`binds`
+  already carried per-entry origin, now extended to the **scalar postures** (`network`/`gui` →
+  `Resolved.network_origin`/`gui_origin`) and **per-field `limits`** (`LimitsOrigin`, set by
+  `mark_limit_origins` once per layer in declaration order). **The load-bearing property:** origin is
+  recorded at **every** assignment **including a value a layer sets to the built-in default** — so
+  `network: shared (global)` is distinguishable from `shared (default)` (the most useful case: open
+  because chosen, or because unset?). This hinges on `validate_network`/`validate_gui` returning
+  `Some(Shared)`/`Some(None)` for an explicit `"shared"`/`"none"`, which they do; pinned by a
+  discriminating unit test on `resolve` (explicit-default-valued `network`/`gui`/`tasks_max = 16384`
+  → origin `Global`, not `Default`; a field no layer set → `Default`). View: `ProvenanceView`
+  mirror + `network_origin`/`gui_origin` on `ConfigView` + `LimitView.origin` (replaced the
+  `overridden` bool). Render: `provenance_tag` (end-of-line) + `provenance_parts` (the **one**
+  level→hue mapping, so the inline per-field `limits` cells cannot drift); the `nixpkgs:`/`engine:`
+  channel lines were **folded into the same per-level coloring** (was bold) via a renderer-side
+  `channel_origin_kind` string-match of the closed `store::Origin::label()` set — **kept a renderer
+  mapping (no `ChannelView` field / ~15 fixture edits) but the string coupling is pinned** by a seam
+  test routing the real `Origin::Default/Global/ProjectPin.label()` through it (a rename in `store.rs`
+  fails loudly instead of silently degrading to gray). **Scope: baseline only** — the `Inherited`
+  provenance + per-app `config show --app <name>` effective-with-inheritance view is the **next
+  increment** (apps), deliberately deferred so `Inherited` is added when it is first constructed (not
+  dead code). **584 `--bins` + 56 config green** (net-new: the discriminating `resolve` origin test,
+  a project-path origin test, the network/gui render-tag test, the channel-origin seam test; the
+  colored render test re-pinned env/bind tags to green/cyan and the channel origin to green), fmt +
+  clippy clean, **std-only (no new dep)**, live-verified (`network: allowlist (global)`,
+  `limits … TasksMax=4096 (global)`), advisor-reviewed (plan AND impl — the impl review added the
+  explicit-default discriminating test and the channel-seam test, and confirmed keeping the renderer
+  mapping over a `ChannelView` field).
   **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's

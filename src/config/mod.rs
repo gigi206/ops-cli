@@ -402,14 +402,29 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Which configuration layer supplied a free-field value (`env`/`binds`) — the global
-/// `ops.toml` (trusted by location) or the project `.ops.toml`. Recorded so `ops config` can
-/// show a value's source; a later layer overrides an earlier one at the same key, so for `env`
-/// this is the *winning* layer. The launcher ignores it (provenance is a display affordance).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Layer {
+/// Where a resolved value came from — the provenance `ops config` surfaces so a value's origin
+/// is never a mystery. `Default` is ops's built-in; `Global`/`Project` are the two config files.
+/// A later layer overrides an earlier one at the same key, so for a value this is the *winning*
+/// source. The launcher ignores it (provenance is a display affordance).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Provenance {
+    /// ops's built-in default — no config layer set this value.
+    #[default]
+    Default,
+    /// The global `ops.toml` (trusted by location).
     Global,
+    /// The project `.ops.toml`.
     Project,
+}
+
+/// The per-field provenance of the cage's cgroup limits. Each of the three limits is a standalone
+/// scalar with its own default, set independently by either config layer (the `env` model), so
+/// each carries its own [`Provenance`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LimitsOrigin {
+    pub(crate) memory_high: Provenance,
+    pub(crate) memory_max: Provenance,
+    pub(crate) tasks_max: Provenance,
 }
 
 /// The resolved configuration the launcher applies: the layered environment and
@@ -424,13 +439,13 @@ pub(crate) struct Resolved {
     /// Which layer each `env` key's winning value came from. Keyed by the env key (stable, so
     /// the lookup matches what `env` lists). A display affordance for `ops config`; only the
     /// baseline resolution records it (an app overlay does not), and the launcher ignores it.
-    pub(crate) env_layer: BTreeMap<String, Layer>,
+    pub(crate) env_layer: BTreeMap<String, Provenance>,
     /// Extra host paths to bind read-only.
     pub(crate) ro_binds: Vec<PathBuf>,
     /// Which layer each effective bind came from, keyed by the *canonical* path `ro_binds`
     /// lists (re-keyed after canonicalization in [`load`], so the lookup matches the displayed
     /// path). A display affordance for `ops config`, recorded only at the baseline.
-    pub(crate) bind_layer: BTreeMap<PathBuf, Layer>,
+    pub(crate) bind_layer: BTreeMap<PathBuf, Provenance>,
     /// Declared tools, in declaration order, each tagged with its source's trust.
     /// Admission (and the nix work it implies) is the launcher's, not decided here.
     pub(crate) packages: Vec<Package>,
@@ -451,15 +466,23 @@ pub(crate) struct Resolved {
     /// or a trusted project asked for `"none"`. An untrusted project's choice is
     /// dropped with a warning — it may not narrow or widen the network.
     pub(crate) network: NetworkPolicy,
+    /// Which layer supplied the winning `network` posture (`Default` when neither config set it).
+    /// A display affordance for `ops config`; the launcher ignores it.
+    pub(crate) network_origin: Provenance,
     /// The resolved GUI posture: the default (`None`) unless the global config or a trusted
     /// project asked for `"wayland"`. An untrusted project's choice is dropped with a warning
     /// — it may not open a display.
     pub(crate) gui: GuiPolicy,
+    /// Which layer supplied the winning `gui` posture (`Default` when neither config set it).
+    pub(crate) gui_origin: Provenance,
     /// The resolved cgroup resource limits (anti-DoS): the built-in defaults, with any field a
     /// trusted `[limits]` table (global or project) overrode. A security field, gated like
     /// `network`/`gui` — an untrusted project may not loosen a limit. Each of the three fields is
     /// layered independently (global under a trusted project), like `env`.
     pub(crate) limits: crate::sandbox::cgroup::Limits,
+    /// The per-field provenance of `limits`: which layer set each of the three, or `Default` for a
+    /// field no config overrode. A display affordance for `ops config`.
+    pub(crate) limits_origin: LimitsOrigin,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -578,9 +601,9 @@ fn resolve(
 
     let mut warnings = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
-    let mut env_layer: BTreeMap<String, Layer> = BTreeMap::new();
+    let mut env_layer: BTreeMap<String, Provenance> = BTreeMap::new();
     let mut binds: Vec<PathBuf> = Vec::new();
-    let mut bind_layer: BTreeMap<PathBuf, Layer> = BTreeMap::new();
+    let mut bind_layer: BTreeMap<PathBuf, Provenance> = BTreeMap::new();
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
 
@@ -588,7 +611,7 @@ fn resolve(
     // denylist, only key validation and the absolute-bind requirement.
     apply_env(
         &mut env,
-        Some((Layer::Global, &mut env_layer)),
+        Some((Provenance::Global, &mut env_layer)),
         &mut warnings,
         GLOBAL_CONFIG,
         global.env,
@@ -596,7 +619,7 @@ fn resolve(
     );
     apply_binds(
         &mut binds,
-        Some((Layer::Global, &mut bind_layer)),
+        Some((Provenance::Global, &mut bind_layer)),
         &mut warnings,
         GLOBAL_CONFIG,
         global.binds,
@@ -613,20 +636,37 @@ fn resolve(
         .nixpkgs
         .and_then(|v| validate_nixpkgs(&mut warnings, GLOBAL_CONFIG, v));
     // The network posture is trusted by location at the global layer; an invalid or
-    // unset value falls back to the default (shared).
-    let mut network = global
+    // unset value falls back to the default (shared). The origin is recorded as `Global` only
+    // when the layer actually supplied a valid posture, so a `Default` is never mistaken for one.
+    let mut network_origin = Provenance::Default;
+    let mut network = match global
         .network
         .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v))
-        .unwrap_or_default();
+    {
+        Some(policy) => {
+            network_origin = Provenance::Global;
+            policy
+        }
+        None => NetworkPolicy::default(),
+    };
     // The GUI posture is trusted by location at the global layer; an invalid or unset value
     // falls back to the default (no display).
-    let mut gui = global
+    let mut gui_origin = Provenance::Default;
+    let mut gui = match global
         .gui
         .and_then(|v| validate_gui(&mut warnings, GLOBAL_CONFIG, v))
-        .unwrap_or_default();
+    {
+        Some(policy) => {
+            gui_origin = Provenance::Global;
+            policy
+        }
+        None => GuiPolicy::default(),
+    };
     // Resource limits are trusted by location at the global layer; each invalid field is dropped
-    // (warned) and the built-in default kept.
+    // (warned) and the built-in default kept. The origin is recorded per field that the layer set.
     let mut limits = validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits);
+    let mut limits_origin = LimitsOrigin::default();
+    mark_limit_origins(&mut limits_origin, &limits, Provenance::Global);
     // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
     // captured for the global hosts and as the base a trusted project may extend.
     let mut secret_defaults = SecretDefaults::default();
@@ -651,7 +691,7 @@ fn resolve(
         // denylist for an untrusted or changed one.
         apply_env(
             &mut env,
-            Some((Layer::Project, &mut env_layer)),
+            Some((Provenance::Project, &mut env_layer)),
             &mut warnings,
             PROJECT_CONFIG,
             proj.env,
@@ -662,7 +702,7 @@ fn resolve(
             if trusted {
                 apply_binds(
                     &mut binds,
-                    Some((Layer::Project, &mut bind_layer)),
+                    Some((Provenance::Project, &mut bind_layer)),
                     &mut warnings,
                     PROJECT_CONFIG,
                     proj.binds,
@@ -701,6 +741,7 @@ fn resolve(
             if trusted {
                 if let Some(policy) = validate_network(&mut warnings, PROJECT_CONFIG, value) {
                     network = policy;
+                    network_origin = Provenance::Project;
                 }
             } else {
                 warnings.push(format!(
@@ -716,6 +757,7 @@ fn resolve(
             if trusted {
                 if let Some(policy) = validate_gui(&mut warnings, PROJECT_CONFIG, value) {
                     gui = policy;
+                    gui_origin = Provenance::Project;
                 }
             } else {
                 warnings.push(format!(
@@ -732,6 +774,7 @@ fn resolve(
         if let Some(raw) = proj.limits {
             if trusted {
                 let project_limits = validate_limits(&mut warnings, PROJECT_CONFIG, Some(raw));
+                mark_limit_origins(&mut limits_origin, &project_limits, Provenance::Project);
                 overlay_limits(&mut limits, project_limits);
             } else {
                 warnings.push(format!(
@@ -791,8 +834,11 @@ fn resolve(
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
         mise: None,
         network,
+        network_origin,
         gui,
+        gui_origin,
         limits,
+        limits_origin,
         secrets,
         apps,
         warnings,
@@ -833,6 +879,26 @@ fn overlay_limits(base: &mut crate::sandbox::cgroup::Limits, over: crate::sandbo
     }
     if over.tasks_max.is_some() {
         base.tasks_max = over.tasks_max;
+    }
+}
+
+/// Record `layer` as the provenance of each limit field that `limits` actually sets (a `Some`
+/// value), leaving the others untouched. Called once per layer in declaration order — global, then
+/// a trusted project overlay — so each field ends attributed to the last layer that set it, which
+/// is exactly the layer whose value [`overlay_limits`] kept.
+fn mark_limit_origins(
+    origin: &mut LimitsOrigin,
+    limits: &crate::sandbox::cgroup::Limits,
+    layer: Provenance,
+) {
+    if limits.memory_high.is_some() {
+        origin.memory_high = layer;
+    }
+    if limits.memory_max.is_some() {
+        origin.memory_max = layer;
+    }
+    if limits.tasks_max.is_some() {
+        origin.tasks_max = layer;
     }
 }
 
@@ -1229,7 +1295,7 @@ fn app_source(config: &str, name: &str) -> String {
 /// so a later layer overrides an earlier one at the same key.
 fn apply_env(
     out: &mut Vec<(String, String)>,
-    mut origin: Option<(Layer, &mut BTreeMap<String, Layer>)>,
+    mut origin: Option<(Provenance, &mut BTreeMap<String, Provenance>)>,
     warnings: &mut Vec<String>,
     source: &str,
     env: BTreeMap<String, String>,
@@ -1263,7 +1329,7 @@ fn apply_env(
 /// relative one against the working directory would be a surprise.
 fn apply_binds(
     out: &mut Vec<PathBuf>,
-    mut origin: Option<(Layer, &mut BTreeMap<PathBuf, Layer>)>,
+    mut origin: Option<(Provenance, &mut BTreeMap<PathBuf, Provenance>)>,
     warnings: &mut Vec<String>,
     source: &str,
     binds: Vec<String>,
@@ -3195,6 +3261,83 @@ mod tests {
         let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
         assert_eq!(r.limits, crate::sandbox::cgroup::Limits::default());
         assert!(r.warnings.iter().any(|w| w.contains("[limits]")));
+    }
+
+    #[test]
+    fn a_value_set_to_its_default_still_records_its_layer_not_default() {
+        // The discriminating provenance property — the whole reason the feature exists. A layer
+        // that sets a value *to the built-in default* is still recorded as the origin, so
+        // `ops config` distinguishes "shared because I chose it" from "shared because nothing set
+        // it". `network = "shared"` and `gui = "none"` ARE the defaults, and `tasks_max = 16384` is
+        // the documented default task cap — all three, set explicitly, must read as `Global`, never
+        // `Default`. (If `validate_network` ever normalized "shared" to "unset", this would fail.)
+        let global = RawConfig {
+            network: Some(NetworkField::Posture("shared".into())),
+            gui: Some("none".into()),
+            limits: Some(schema::RawLimits {
+                memory_high: None,
+                memory_max: None,
+                tasks_max: Some(schema::RawLimit::Number(16384)),
+            }),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(
+            r.network,
+            NetworkPolicy::Shared,
+            "shared is honored as a posture"
+        );
+        assert_eq!(
+            r.network_origin,
+            Provenance::Global,
+            "explicit shared is global-set"
+        );
+        assert_eq!(
+            r.gui_origin,
+            Provenance::Global,
+            "explicit none is global-set"
+        );
+        assert_eq!(
+            r.limits_origin.tasks_max,
+            Provenance::Global,
+            "an explicit default-valued task cap is still global-set"
+        );
+        // The contrast that gives the above its meaning: a field no layer set stays `Default`.
+        assert_eq!(r.limits_origin.memory_high, Provenance::Default);
+
+        // With nothing declared at all, every scalar origin reads `Default`.
+        let bare = resolve_no_plugins(RawConfig::default(), None);
+        assert_eq!(bare.network_origin, Provenance::Default);
+        assert_eq!(bare.gui_origin, Provenance::Default);
+        assert_eq!(bare.limits_origin.tasks_max, Provenance::Default);
+    }
+
+    #[test]
+    fn a_trusted_project_records_its_layer_as_the_origin() {
+        // The project path records origin too, per field: a trusted project sets the network and
+        // the ceiling (attributed `Project`), while a global-set task cap stays `Global`.
+        let global = raw_limits(None, None, Some("8192"));
+        let project = RawConfig {
+            network: Some(NetworkField::Posture("none".into())),
+            limits: Some(schema::RawLimits {
+                memory_high: None,
+                memory_max: Some(schema::RawLimit::Text("8G".into())),
+                tasks_max: None,
+            }),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        assert_eq!(r.network_origin, Provenance::Project);
+        assert_eq!(
+            r.limits_origin.memory_max,
+            Provenance::Project,
+            "the project-set ceiling is attributed to the project"
+        );
+        assert_eq!(
+            r.limits_origin.tasks_max,
+            Provenance::Global,
+            "the global-set task cap the project did not touch stays global"
+        );
     }
 
     #[test]
