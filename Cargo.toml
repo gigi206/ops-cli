@@ -10,6 +10,14 @@ repository = "https://github.com/gigi206/ops-cli"
 name = "ops"
 path = "src/main.rs"
 
+[features]
+# Embed a statically-linked `nix` engine inside the ops binary, so the shipped
+# binary drives its own store with no host nix. Off by default — development and
+# CI builds resolve nix from `OPS_NIX_BIN`/`PATH` and stay fast and offline. On
+# only in the release build (`mise run build-bundled`), which supplies the engine
+# via `OPS_BUNDLED_NIX`.
+bundled-nix = []
+
 [dependencies]
 libc = "0.2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
@@ -23,6 +31,11 @@ serde_json = "1"
 toml = "0.8"
 toml_edit = "0.22"
 webpki-roots = "1"
+
+[build-dependencies]
+# Hash the embedded nix engine at build time (same crate as the runtime dep, so no
+# new third-party surface). Used only when the `bundled-nix` feature is enabled.
+sha2 = "0.10"
 
 [profile.release]
 strip = true

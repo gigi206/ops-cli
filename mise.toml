@@ -44,6 +44,39 @@ run = "cargo test"
 description = "Build the shipping static musl binary"
 run = "cargo zigbuild --release --target x86_64-unknown-linux-musl"
 
+# The pinned static nix engine the `bundled-nix` feature embeds. Pinned by revision for
+# reproducibility; build.rs verifies its sha256, so a drift fails the build loudly. Bump
+# this ref and the `EXPECTED_NIX_SHA256` const in build.rs together.
+[tasks.static-nix]
+description = "Realise the pinned static nix and print the path to its bin/nix"
+hide = true
+run = '''
+set -euo pipefail
+ref='github:NixOS/nixpkgs/89570f24e97e614aa34aa9ab1c927b6578a43775#pkgsStatic.nix'
+for out in $(nix build "$ref" --no-link --print-out-paths); do
+  if [ -e "$out/bin/nix" ]; then echo "$out/bin/nix"; exit 0; fi
+done
+echo "no bin/nix in the pkgsStatic.nix outputs" >&2; exit 1
+'''
+
+[tasks.build-bundled]
+description = "Build the shipping static musl binary WITH the embedded nix engine (needs host nix)"
+run = '''
+set -euo pipefail
+OPS_BUNDLED_NIX="$(mise run static-nix)"
+export OPS_BUNDLED_NIX
+cargo zigbuild --release --target x86_64-unknown-linux-musl --features bundled-nix
+'''
+
+[tasks.lint-bundled]
+description = "Compile + clippy the bundled-nix feature path (not covered by default CI; needs host nix)"
+run = '''
+set -euo pipefail
+OPS_BUNDLED_NIX="$(mise run static-nix)"
+export OPS_BUNDLED_NIX
+cargo clippy --bins --features bundled-nix -- -D warnings
+'''
+
 [tasks.ci]
 description = "Full local reproduction of the CI pipeline (fmt + lint + test)"
 depends = ["fmt", "lint", "test"]

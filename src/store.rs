@@ -173,12 +173,30 @@ pub(crate) fn resolve_nix_store(layout: Option<&Layout>) -> Option<PathBuf> {
     resolve_engine_bin("nix-store", layout)
 }
 
+/// The static nix engine ops ships inside its own binary, embedded by `build.rs` when the
+/// `bundled-nix` feature is on. `NIX_BIN` is the raw bytes of the statically-linked `nix`;
+/// `NIX_SHA256` is their hash, baked at build time so a launch compares the on-disk marker
+/// without re-hashing tens of megabytes. Materialized into the owned engine directory by
+/// [`ensure_owned_engine`].
+#[cfg(feature = "bundled-nix")]
+mod bundled {
+    include!(concat!(env!("OUT_DIR"), "/bundled_nix.rs"));
+}
+
 /// Shared resolution for an engine command `name` (`nix`/`nix-store`), reading the
 /// real environment, data directory, and `PATH`. The precedence is factored into
 /// [`pick_engine_bin`] so it is unit-testable without touching any of them.
 fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
     let override_nix = std::env::var_os(ENGINE_OVERRIDE_ENV).map(PathBuf::from);
     let owned_dir = layout.map(Layout::engine_dir);
+    // When ops ships its own static nix, lay it into the owned engine directory (once;
+    // idempotent thereafter) so the owned tier below resolves it. Best-effort: a failure
+    // leaves that tier empty and resolution falls through to `PATH`, exactly as it would
+    // without the feature. The explicit `OPS_NIX_BIN` override still wins over it.
+    #[cfg(feature = "bundled-nix")]
+    if let Some(dir) = owned_dir.as_deref() {
+        let _ = ensure_owned_engine(dir, bundled::NIX_BIN, bundled::NIX_SHA256);
+    }
     pick_engine_bin(
         name,
         override_nix.as_deref(),
@@ -186,6 +204,56 @@ fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
         &|p| p.is_file(),
         &|n| crate::pathfind::find_on_path(n),
     )
+}
+
+/// Materialize ops's bundled static nix into the owned engine directory, idempotently.
+///
+/// Lays down `<dir>/nix` (the real binary, executable) plus the multi-call sibling
+/// `<dir>/nix-store -> nix` (one binary dispatches both off argv0). A `<dir>/.sha256`
+/// marker records the embedded hash so a launch re-materializes only when the engine
+/// changed (a new ops binary), not on every resolution. The binary lands atomically — a
+/// unique temp sibling written, made executable, then renamed over `nix` — so a
+/// concurrent or interrupted launch never leaves a partial engine at the resolved path,
+/// and a running engine keeps its old inode across a replacement.
+///
+/// `sha256` is the embedded engine's precomputed hash, compared as a string against the
+/// marker; nothing is re-hashed here. Best-effort by contract: every error is returned for
+/// the caller to ignore.
+#[cfg(any(feature = "bundled-nix", test))]
+fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let nix = dir.join("nix");
+    let store_link = dir.join("nix-store");
+    let marker = dir.join(".sha256");
+    // Already fully in place at this exact engine version — the binary, the multi-call
+    // sibling, AND the marker. Checking the sibling too means an interrupted symlink
+    // replacement re-materializes rather than stranding `nix-store` forever behind a
+    // marker that still matches.
+    if nix.is_file()
+        && store_link.exists()
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha256)
+    {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let tmp = dir.join(format!(".nix.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &nix)?;
+    // Place the sibling atomically too: a unique temp link renamed over `nix-store` leaves
+    // no window where it is absent (a concurrent first launch would otherwise see a removed
+    // link); a lost race simply discards an identical link.
+    let tmp_link = dir.join(format!(".nix-store.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp_link);
+    std::os::unix::fs::symlink("nix", &tmp_link)?;
+    std::fs::rename(&tmp_link, &store_link)?;
+    // Stamp the version last: an interrupted run leaves a stale/absent marker and
+    // re-materializes next time rather than trusting a half-written engine.
+    std::fs::write(&marker, sha256)?;
+    Ok(())
 }
 
 /// Pick the engine binary `name` from the three sources, in precedence order: the
@@ -1274,6 +1342,67 @@ mod tests {
         assert_eq!(
             pick_engine_bin("nix", None, None, &none_exist, &no_path),
             None
+        );
+    }
+
+    #[test]
+    fn ensure_owned_engine_lays_down_an_executable_nix_with_a_multicall_symlink() {
+        let base = TmpDir::new();
+        let dir = base.join("engine");
+        let bytes = b"static-nix-binary-bytes";
+        let sha = "deadbeef";
+
+        ensure_owned_engine(&dir, bytes, sha).expect("materialize the engine");
+
+        // the real binary lands with its bytes and an executable bit
+        let nix = dir.join("nix");
+        assert_eq!(std::fs::read(&nix).unwrap(), bytes);
+        assert!(
+            std::fs::metadata(&nix).unwrap().permissions().mode() & 0o111 != 0,
+            "nix is not executable"
+        );
+        // the sibling command is a relative symlink onto the one multi-call binary
+        assert_eq!(
+            std::fs::read_link(dir.join("nix-store")).unwrap(),
+            PathBuf::from("nix")
+        );
+        // the version marker records the embedded hash
+        assert_eq!(std::fs::read_to_string(dir.join(".sha256")).unwrap(), sha);
+        // no temp artifact is left behind
+        assert!(!dir
+            .join(format!(".nix.tmp.{}", std::process::id()))
+            .exists());
+    }
+
+    #[test]
+    fn ensure_owned_engine_is_idempotent_until_the_engine_hash_changes() {
+        let base = TmpDir::new();
+        let dir = base.join("engine");
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("first materialize");
+
+        // Overwrite the placed binary, then call again at the SAME hash: the marker matches
+        // and the sibling is present, so nothing is rewritten and our sentinel survives —
+        // proving the cheap skip path.
+        std::fs::write(dir.join("nix"), b"sentinel").unwrap();
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("idempotent re-call");
+        assert_eq!(std::fs::read(dir.join("nix")).unwrap(), b"sentinel");
+
+        // A missing multi-call sibling heals on the next call even at the same hash: the
+        // fast-path also checks the symlink, so an interrupted replacement cannot strand
+        // `nix-store` behind a still-matching marker.
+        std::fs::remove_file(dir.join("nix-store")).unwrap();
+        ensure_owned_engine(&dir, b"v1-bytes", "hash-v1").expect("heal the missing sibling");
+        assert_eq!(
+            std::fs::read_link(dir.join("nix-store")).unwrap(),
+            PathBuf::from("nix")
+        );
+
+        // A different hash (a new ops binary carrying a newer engine) re-materializes.
+        ensure_owned_engine(&dir, b"v2-bytes", "hash-v2").expect("re-materialize on change");
+        assert_eq!(std::fs::read(dir.join("nix")).unwrap(), b"v2-bytes");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".sha256")).unwrap(),
+            "hash-v2"
         );
     }
 }
