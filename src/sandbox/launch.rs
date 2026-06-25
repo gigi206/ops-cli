@@ -1317,7 +1317,13 @@ fn attach_app_shell(mut prep: Prepared, name: &str, global_home: bool) -> ExitCo
 /// chooses the channel the **whole** launch resolves against — base userland and
 /// tools alike (see [`Prepared`] for why they must be one).
 fn prepare() -> Result<Prepared, ExitCode> {
-    let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
+    // The data directory is resolved first: it is where ops looks for (and, under the
+    // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
+    let Some(layout) = Layout::from_env() else {
+        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return Err(ExitCode::FAILURE);
+    };
+    let Some(bwrap) = crate::store::resolve_bwrap(Some(&layout)).map(|c| c.path) else {
         return Err(missing("bubblewrap (the sandbox engine)"));
     };
     if !matches!(crate::probe_userns(), crate::Userns::Ok) {
@@ -1326,10 +1332,6 @@ fn prepare() -> Result<Prepared, ExitCode> {
         );
         return Err(ExitCode::FAILURE);
     }
-    let Some(layout) = Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
-        return Err(ExitCode::FAILURE);
-    };
     let Some(nix) = crate::store::resolve_nix(Some(&layout)) else {
         return Err(missing("nix (the store engine)"));
     };

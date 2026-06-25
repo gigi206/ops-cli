@@ -6,11 +6,12 @@
 //! 2. The default resolver-plugin store (`plugins/`). The built-in resolvers ship inside the
 //!    binary so `ops plugins install <name>` can place one with no fetch, network, or
 //!    signature — trust is the binary itself.
-//! 3. With the `bundled-nix` feature, a statically-linked `nix` binary, so the shipped ops
-//!    drives its own store with no host nix. The binary is supplied out-of-band via the
-//!    `OPS_BUNDLED_NIX` env var (produced by `mise run build-bundled`), keeping this script
-//!    free of any fetch mechanism, and is verified against a pinned hash so a drift fails
-//!    here, loudly, rather than at a user's first launch.
+//! 3. With the `bundled-nix` / `bundled-bwrap` features, statically-linked `nix` and `bwrap`
+//!    binaries, so the shipped ops drives its own store and launches its own sandbox with no
+//!    host engines. Each binary is supplied out-of-band via an env var (`OPS_BUNDLED_NIX` /
+//!    `OPS_BUNDLED_BWRAP`, produced by `mise run build-bundled`), keeping this script free of
+//!    any fetch mechanism, and is verified against a pinned hash so a drift fails here,
+//!    loudly, rather than at a user's first launch.
 //!
 //! Each tree is walked into a `(path, bytes)` table that a module includes. Both re-run
 //! whenever a source file changes, so the embedded copies never drift.
@@ -19,60 +20,108 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The static nix engine ops embeds under the `bundled-nix` feature, pinned for
-/// reproducibility. Produced by `mise run build-bundled` from
-/// `github:NixOS/nixpkgs/89570f24e97e614aa34aa9ab1c927b6578a43775#pkgsStatic.nix`
-/// (nix 2.34.7, x86_64 static musl). `EXPECTED_NIX_SHA256` is the SHA-256 of that
-/// binary's bytes; the build fails if the supplied engine does not match it.
-const EXPECTED_NIX_SHA256: &str =
-    "8ebec57b2f50bd10e62ac2e4ae27058a22019f8840ae278e2da9a7efe16faf80";
+/// A static engine ops can embed under a `bundled-*` feature, pinned for reproducibility.
+/// Each is produced by `mise run build-bundled` from a pinned `pkgsStatic` attribute and
+/// supplied to this script by path; the build fails if the supplied bytes do not hash to
+/// the pinned `expected_sha`, so a drift is caught here rather than at a user's first launch.
+struct Engine {
+    /// Cargo feature flag that gates the embed (e.g. `CARGO_FEATURE_BUNDLED_NIX`).
+    feature_env: &'static str,
+    /// Env var supplying the path to the prebuilt static binary (e.g. `OPS_BUNDLED_NIX`).
+    src_env: &'static str,
+    /// The SHA-256 the supplied binary's bytes must match.
+    expected_sha: &'static str,
+    /// Basename of the generated blob/module (`bundled_nix` → `bundled_nix.bin`/`.rs`).
+    stem: &'static str,
+    /// Name of the generated `pub static … : &[u8]` bytes constant (e.g. `NIX_BIN`).
+    bytes_const: &'static str,
+    /// Name of the generated `pub const … : &str` hash constant (e.g. `NIX_SHA256`).
+    sha_const: &'static str,
+    /// Human label for diagnostics (e.g. `nix`).
+    human: &'static str,
+}
+
+/// The engines ops can embed. Each `expected_sha` is the SHA-256 of the static binary
+/// `mise run static-<engine>` realises from the pinned nixpkgs ref recorded in `mise.toml`;
+/// bump the ref and this hash together. `nix` is 2.34.7, `bwrap` (bubblewrap) is 0.11.2,
+/// both x86_64 static musl.
+const ENGINES: &[Engine] = &[
+    Engine {
+        feature_env: "CARGO_FEATURE_BUNDLED_NIX",
+        src_env: "OPS_BUNDLED_NIX",
+        expected_sha: "8ebec57b2f50bd10e62ac2e4ae27058a22019f8840ae278e2da9a7efe16faf80",
+        stem: "bundled_nix",
+        bytes_const: "NIX_BIN",
+        sha_const: "NIX_SHA256",
+        human: "nix",
+    },
+    Engine {
+        feature_env: "CARGO_FEATURE_BUNDLED_BWRAP",
+        src_env: "OPS_BUNDLED_BWRAP",
+        expected_sha: "9c58a5a4e81e2295b235cd5179e948b758a430607befd446766665ebb46badaa",
+        stem: "bundled_bwrap",
+        bytes_const: "BWRAP_BIN",
+        sha_const: "BWRAP_SHA256",
+        human: "bwrap",
+    },
+];
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     emit_mise_plugin(&manifest, &out_dir);
     emit_default_store(&manifest, &out_dir);
-    emit_bundled_nix(&out_dir);
+    for engine in ENGINES {
+        emit_bundled_engine(&out_dir, engine);
+    }
 }
 
-/// Embed the static nix engine when the `bundled-nix` feature is on, writing the module
-/// `store::bundled` includes (`NIX_BIN` bytes + their `NIX_SHA256`). The engine is read
-/// from the path in `OPS_BUNDLED_NIX` and verified against [`EXPECTED_NIX_SHA256`]. With
-/// the feature off (the default), this is a no-op: ops resolves nix from `OPS_NIX_BIN`/`PATH`.
-fn emit_bundled_nix(out_dir: &Path) {
+/// Embed `engine`'s static binary when its feature is on, writing the module its `store`
+/// resolver includes (the bytes constant + their hash). The binary is read from the path in
+/// `engine.src_env` and verified against `engine.expected_sha`. With the feature off (the
+/// default), this is a no-op: ops resolves the engine from its override env / `PATH`.
+fn emit_bundled_engine(out_dir: &Path, engine: &Engine) {
     // Re-run if the supplying var changes, so a re-point re-embeds.
-    println!("cargo:rerun-if-env-changed=OPS_BUNDLED_NIX");
-    if env::var_os("CARGO_FEATURE_BUNDLED_NIX").is_none() {
+    println!("cargo:rerun-if-env-changed={}", engine.src_env);
+    if env::var_os(engine.feature_env).is_none() {
         return;
     }
-    let src = env::var_os("OPS_BUNDLED_NIX").unwrap_or_else(|| {
+    let src = env::var_os(engine.src_env).unwrap_or_else(|| {
         panic!(
-            "the `bundled-nix` feature is enabled but OPS_BUNDLED_NIX is unset — point it \
-             at a static `nix` binary (use `mise run build-bundled`, which produces one)"
+            "the bundled-{0} feature is enabled but {1} is unset — point it at a static \
+             `{0}` binary (use `mise run build-bundled`, which produces one)",
+            engine.human, engine.src_env,
         )
     });
     let src = PathBuf::from(src);
     println!("cargo:rerun-if-changed={}", src.display());
     let bytes = fs::read(&src)
-        .unwrap_or_else(|e| panic!("reading OPS_BUNDLED_NIX ({}): {e}", src.display()));
+        .unwrap_or_else(|e| panic!("reading {} ({}): {e}", engine.src_env, src.display()));
     let got = sha256_hex(&bytes);
     assert_eq!(
         got,
-        EXPECTED_NIX_SHA256,
-        "bundled nix sha256 mismatch — OPS_BUNDLED_NIX ({}) is not the pinned engine \
-         (got {got}, expected {EXPECTED_NIX_SHA256}); rebuild it from the pinned nixpkgs \
-         ref or bump the pin in build.rs",
-        src.display(),
+        engine.expected_sha,
+        "bundled {human} sha256 mismatch — {src_env} ({src}) is not the pinned engine \
+         (got {got}, expected {expected}); rebuild it from the pinned nixpkgs ref or bump \
+         the pin in build.rs",
+        human = engine.human,
+        src_env = engine.src_env,
+        src = src.display(),
+        expected = engine.expected_sha,
     );
-    let bin = out_dir.join("bundled_nix.bin");
+    let bin = out_dir.join(format!("{}.bin", engine.stem));
     fs::write(&bin, &bytes).unwrap();
     let generated = format!(
-        "// @generated by build.rs — the embedded static nix engine.\n\
-         pub static NIX_BIN: &[u8] = include_bytes!({:?});\n\
-         pub const NIX_SHA256: &str = {EXPECTED_NIX_SHA256:?};\n",
-        bin.to_str().expect("OUT_DIR path is valid UTF-8"),
+        "// @generated by build.rs — the embedded static {human} engine.\n\
+         pub static {bytes_const}: &[u8] = include_bytes!({path:?});\n\
+         pub const {sha_const}: &str = {sha:?};\n",
+        human = engine.human,
+        bytes_const = engine.bytes_const,
+        path = bin.to_str().expect("OUT_DIR path is valid UTF-8"),
+        sha_const = engine.sha_const,
+        sha = engine.expected_sha,
     );
-    fs::write(out_dir.join("bundled_nix.rs"), generated).unwrap();
+    fs::write(out_dir.join(format!("{}.rs", engine.stem)), generated).unwrap();
 }
 
 /// Hex SHA-256 of `bytes`, for the build-time integrity check on the embedded engine.

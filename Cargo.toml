@@ -18,6 +18,15 @@ path = "src/main.rs"
 # via `OPS_BUNDLED_NIX`.
 bundled-nix = []
 
+# Embed a statically-linked `bwrap` (bubblewrap) engine inside the ops binary, so the
+# shipped binary launches its own sandbox with no host bubblewrap on most hosts, and
+# pins a known-good version (every flag ops relies on is present). Off by default, like
+# `bundled-nix`; on in the release build, which supplies the engine via `OPS_BUNDLED_BWRAP`.
+# Note: on a host enforcing AppArmor unprivileged-userns restriction the embedded engine
+# cannot create a user namespace (the kernel grants that only to the path-profiled
+# `/usr/bin/bwrap`), so ops prefers the host engine there — see `store::resolve_bwrap`.
+bundled-bwrap = []
+
 [dependencies]
 libc = "0.2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
@@ -33,8 +42,8 @@ toml_edit = "0.22"
 webpki-roots = "1"
 
 [build-dependencies]
-# Hash the embedded nix engine at build time (same crate as the runtime dep, so no
-# new third-party surface). Used only when the `bundled-nix` feature is enabled.
+# Hash the embedded engines (nix, bwrap) at build time (same crate as the runtime dep,
+# so no new third-party surface). Used only when a `bundled-*` feature is enabled.
 sha2 = "0.10"
 
 [profile.release]

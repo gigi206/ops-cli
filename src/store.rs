@@ -298,6 +298,177 @@ fn engine_sibling(nix: &Path, name: &str) -> PathBuf {
     }
 }
 
+/// Environment override naming an explicit `bwrap` binary, ahead of every other source —
+/// the testing/escape-hatch tier, mirroring [`ENGINE_OVERRIDE_ENV`] for the sandbox engine.
+/// A value that does not point at an existing file is ignored. Once it resolves it wins
+/// unconditionally: the user (or a test) has taken responsibility for the chosen engine,
+/// including that it is AppArmor-profiled where that matters (see [`resolve_bwrap`]).
+const BWRAP_OVERRIDE_ENV: &str = "OPS_BWRAP_BIN";
+
+/// The kernel sysctl that, when non-zero, restricts unprivileged user-namespace creation to
+/// binaries carrying an AppArmor profile that grants `userns` (Ubuntu 24.04+). The shipped
+/// profile attaches that grant **by path** to `/usr/bin/bwrap`, so a bwrap materialized
+/// elsewhere cannot create a namespace under this restriction — which is why
+/// [`resolve_bwrap`] prefers the host engine when it is in force.
+const APPARMOR_USERNS_RESTRICT: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// The static bwrap (bubblewrap) engine ops ships inside its own binary, embedded by
+/// `build.rs` when the `bundled-bwrap` feature is on. `BWRAP_BIN` is the raw bytes of the
+/// statically-linked `bwrap`; `BWRAP_SHA256` is their hash, baked at build time so a launch
+/// compares the on-disk marker without re-hashing. Materialized by [`ensure_owned_bwrap`].
+#[cfg(feature = "bundled-bwrap")]
+mod bundled_bwrap {
+    include!(concat!(env!("OUT_DIR"), "/bundled_bwrap.rs"));
+}
+
+/// Which source supplied the resolved `bwrap`, for an honest `ops doctor` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BwrapSource {
+    /// The [`BWRAP_OVERRIDE_ENV`] override.
+    Override,
+    /// A bwrap ops owns under `<data>/engine/` (the embedded static engine).
+    Bundled,
+    /// The host's bwrap on `PATH`.
+    HostPath,
+}
+
+impl BwrapSource {
+    /// A short label naming the source.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            BwrapSource::Override => "override (OPS_BWRAP_BIN)",
+            BwrapSource::Bundled => "bundled engine",
+            BwrapSource::HostPath => "host PATH",
+        }
+    }
+}
+
+/// A resolved sandbox engine: its path, where it came from, and whether the host is
+/// enforcing the AppArmor unprivileged-userns restriction (which is *why* the host engine
+/// may have been chosen over the bundled one). Callers that only launch use [`Self::path`];
+/// `ops doctor` reports all three so the user is never surprised which `bwrap` ran.
+#[derive(Debug, Clone)]
+pub(crate) struct BwrapChoice {
+    pub(crate) path: PathBuf,
+    pub(crate) source: BwrapSource,
+    pub(crate) apparmor_restricted: bool,
+}
+
+/// Locate the `bwrap` binary that launches the sandbox.
+///
+/// Resolution precedence: the [`BWRAP_OVERRIDE_ENV`] override always wins; otherwise the
+/// order depends on the host. Where unprivileged user namespaces are **not** AppArmor-path-
+/// restricted (the common case, and every non-Ubuntu distro), the bundled engine ops owns
+/// under `<data>/engine/` leads — self-contained and a known-good pinned version — falling
+/// back to the host `PATH`. Where the restriction **is** in force, only the path-profiled
+/// `/usr/bin/bwrap` can create a namespace, so the host engine leads and the bundled one is
+/// the fallback; ops is **non-regressive by construction** there — it uses exactly the host
+/// bwrap it always has. `layout` is `None` only when the data directory cannot be resolved,
+/// in which case the owned tier is skipped.
+///
+/// Under the `bundled-bwrap` feature this materializes the embedded engine into the owned
+/// directory (once; idempotent) before resolving; best-effort, so a failure simply leaves
+/// that tier empty and resolution falls through.
+pub(crate) fn resolve_bwrap(layout: Option<&Layout>) -> Option<BwrapChoice> {
+    let override_bin = std::env::var_os(BWRAP_OVERRIDE_ENV).map(PathBuf::from);
+    let owned_dir = layout.map(Layout::engine_dir);
+    #[cfg(feature = "bundled-bwrap")]
+    if let Some(dir) = owned_dir.as_deref() {
+        let _ = ensure_owned_bwrap(dir, bundled_bwrap::BWRAP_BIN, bundled_bwrap::BWRAP_SHA256);
+    }
+    let apparmor_restricted = apparmor_userns_restricted();
+    let (path, source) = pick_bwrap(
+        apparmor_restricted,
+        override_bin.as_deref(),
+        owned_dir.as_deref(),
+        &|p| p.is_file(),
+        &|n| crate::pathfind::find_on_path(n),
+    )?;
+    Some(BwrapChoice {
+        path,
+        source,
+        apparmor_restricted,
+    })
+}
+
+/// Whether the host enforces the AppArmor unprivileged-userns restriction: the sysctl
+/// reads a non-zero value. Absent, unreadable, or zero ⇒ not restricted (prefer the bundled
+/// engine). A non-numeric value is treated as not restricted — the sysctl is a 0/1 boolean.
+fn apparmor_userns_restricted() -> bool {
+    match std::fs::read_to_string(APPARMOR_USERNS_RESTRICT) {
+        Ok(s) => s.trim().parse::<i64>().map(|v| v != 0).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Materialize ops's bundled static bwrap into the owned engine directory, idempotently.
+///
+/// Lays down `<dir>/bwrap` (the real binary, executable) atomically — a unique temp sibling
+/// written, made executable, then renamed over `bwrap` — so a concurrent or interrupted
+/// launch never leaves a partial engine at the resolved path, and a running engine keeps its
+/// old inode across a replacement. A `<dir>/.bwrap.sha256` marker records the embedded hash
+/// so a launch re-materializes only when the engine changed, not on every resolution.
+///
+/// The marker is named distinctly from the nix engine's `.sha256` because both engines share
+/// `<data>/engine/`; the two never clobber each other's markers. `sha256` is the embedded
+/// engine's precomputed hash, compared as a string; nothing is re-hashed here. Best-effort by
+/// contract: every error is returned for the caller to ignore.
+#[cfg(any(feature = "bundled-bwrap", test))]
+fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let bwrap = dir.join("bwrap");
+    let marker = dir.join(".bwrap.sha256");
+    if bwrap.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha256) {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let tmp = dir.join(format!(".bwrap.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &bwrap)?;
+    // Stamp the version last: an interrupted run leaves a stale/absent marker and
+    // re-materializes next time rather than trusting a half-written engine.
+    std::fs::write(&marker, sha256)?;
+    Ok(())
+}
+
+/// Pick the `bwrap` binary and its source from the override, the ops-owned engine directory,
+/// and `PATH`, in an order that depends on `restricted` (the AppArmor userns restriction).
+/// File existence and the `PATH` lookup are injected so the precedence — including the
+/// AppArmor branch, which a host without the restriction cannot exercise live — is
+/// unit-testable in isolation.
+///
+/// The override, when it resolves, is authoritative. Otherwise: not restricted ⇒ the owned
+/// engine leads, then `PATH`; restricted ⇒ the host `PATH` engine leads (the same bwrap ops
+/// uses today — on a standard host that is the path-profiled `/usr/bin/bwrap`, the only one
+/// able to create a namespace under the restriction), then the owned engine as a last resort.
+fn pick_bwrap(
+    restricted: bool,
+    override_bin: Option<&Path>,
+    owned_dir: Option<&Path>,
+    exists: &dyn Fn(&Path) -> bool,
+    on_path: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<(PathBuf, BwrapSource)> {
+    if let Some(bin) = override_bin {
+        if exists(bin) {
+            return Some((bin.to_path_buf(), BwrapSource::Override));
+        }
+    }
+    let owned = owned_dir
+        .map(|d| d.join("bwrap"))
+        .filter(|p| exists(p))
+        .map(|p| (p, BwrapSource::Bundled));
+    let host = on_path("bwrap").map(|p| (p, BwrapSource::HostPath));
+    if restricted {
+        host.or(owned)
+    } else {
+        owned.or(host)
+    }
+}
+
 /// Locate the `git` binary that fetches a remote plugin store. Resolved from `PATH`;
 /// needed only by `ops plugins store` (a remote store is a git repository), not by a
 /// launch — so its absence is a feature gap, never a boundary failure.
@@ -1403,6 +1574,115 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join(".sha256")).unwrap(),
             "hash-v2"
+        );
+    }
+
+    #[test]
+    fn pick_bwrap_prefers_bundled_unless_apparmor_restricted() {
+        let over = Path::new("/over/bwrap");
+        let owned = Path::new("/data/engine");
+        let host = |n: &str| Some(PathBuf::from(format!("/usr/bin/{n}")));
+        let owned_bwrap = PathBuf::from("/data/engine/bwrap");
+        let host_bwrap = PathBuf::from("/usr/bin/bwrap");
+
+        // Not restricted, both present: the bundled engine leads (self-contained, pinned).
+        let all = |_: &Path| true;
+        assert_eq!(
+            pick_bwrap(false, None, Some(owned), &all, &host),
+            Some((owned_bwrap.clone(), BwrapSource::Bundled))
+        );
+        // Restricted, both present: the path-profiled host engine leads — the only one able
+        // to create a namespace under the AppArmor restriction. This is the branch a host
+        // without the restriction cannot exercise live, so the unit test is the proof.
+        assert_eq!(
+            pick_bwrap(true, None, Some(owned), &all, &host),
+            Some((host_bwrap.clone(), BwrapSource::HostPath))
+        );
+
+        // The override wins regardless of the restriction — the user owns that choice.
+        assert_eq!(
+            pick_bwrap(false, Some(over), Some(owned), &all, &host),
+            Some((over.to_path_buf(), BwrapSource::Override))
+        );
+        assert_eq!(
+            pick_bwrap(true, Some(over), Some(owned), &all, &host),
+            Some((over.to_path_buf(), BwrapSource::Override))
+        );
+        // An override whose file is absent is treated as unset: the next tier applies.
+        let only_owned = |p: &Path| p.starts_with("/data/engine");
+        assert_eq!(
+            pick_bwrap(false, Some(over), Some(owned), &only_owned, &host),
+            Some((owned_bwrap.clone(), BwrapSource::Bundled))
+        );
+
+        // Not restricted but no bundled engine present → fall back to the host.
+        let none_exist = |_: &Path| false;
+        assert_eq!(
+            pick_bwrap(false, None, Some(owned), &none_exist, &host),
+            Some((host_bwrap.clone(), BwrapSource::HostPath))
+        );
+        // Restricted with no host engine → the bundled one is the last resort (it will fail
+        // at userns creation, but that is a separate, already-reported failure, not a reason
+        // to resolve nothing).
+        let no_host = |_: &str| None;
+        assert_eq!(
+            pick_bwrap(true, None, Some(owned), &all, &no_host),
+            Some((owned_bwrap, BwrapSource::Bundled))
+        );
+        // No layout (no owned dir) simply skips that tier.
+        assert_eq!(
+            pick_bwrap(false, None, None, &none_exist, &host),
+            Some((host_bwrap, BwrapSource::HostPath))
+        );
+        // Nothing anywhere → None; the caller turns it into a pointed error.
+        assert_eq!(pick_bwrap(false, None, None, &none_exist, &no_host), None);
+    }
+
+    #[test]
+    fn ensure_owned_bwrap_lays_down_an_executable_bwrap_beside_an_independent_nix_marker() {
+        let base = TmpDir::new();
+        let dir = base.join("engine");
+
+        ensure_owned_bwrap(&dir, b"static-bwrap-bytes", "bw-hash").expect("materialize bwrap");
+        let bwrap = dir.join("bwrap");
+        assert_eq!(std::fs::read(&bwrap).unwrap(), b"static-bwrap-bytes");
+        assert!(
+            std::fs::metadata(&bwrap).unwrap().permissions().mode() & 0o111 != 0,
+            "bwrap is not executable"
+        );
+        // The marker is the bwrap-specific one, distinct from the nix engine's `.sha256`.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".bwrap.sha256")).unwrap(),
+            "bw-hash"
+        );
+        assert!(
+            !dir.join(".sha256").exists(),
+            "bwrap must not write nix's marker"
+        );
+        assert!(!dir
+            .join(format!(".bwrap.tmp.{}", std::process::id()))
+            .exists());
+
+        // Idempotent at the same hash: a sentinel overwrite survives a re-call.
+        std::fs::write(&bwrap, b"sentinel").unwrap();
+        ensure_owned_bwrap(&dir, b"static-bwrap-bytes", "bw-hash").expect("idempotent re-call");
+        assert_eq!(std::fs::read(&bwrap).unwrap(), b"sentinel");
+        // A new hash re-materializes.
+        ensure_owned_bwrap(&dir, b"v2-bwrap", "bw-hash-2").expect("re-materialize on change");
+        assert_eq!(std::fs::read(&bwrap).unwrap(), b"v2-bwrap");
+
+        // Both engines coexist in the one owned directory with independent markers: laying
+        // nix down does not disturb bwrap's binary or marker, and vice versa.
+        ensure_owned_engine(&dir, b"static-nix", "nix-hash").expect("materialize nix beside it");
+        assert_eq!(std::fs::read(dir.join("nix")).unwrap(), b"static-nix");
+        assert_eq!(std::fs::read(&bwrap).unwrap(), b"v2-bwrap");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".sha256")).unwrap(),
+            "nix-hash"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".bwrap.sha256")).unwrap(),
+            "bw-hash-2"
         );
     }
 }

@@ -59,22 +59,39 @@ done
 echo "no bin/nix in the pkgsStatic.nix outputs" >&2; exit 1
 '''
 
+# The pinned static bwrap (bubblewrap) engine the `bundled-bwrap` feature embeds. Same
+# nixpkgs revision as static-nix; build.rs verifies its sha256. Bump this ref and the
+# `bwrap` `expected_sha` in build.rs together.
+[tasks.static-bwrap]
+description = "Realise the pinned static bwrap and print the path to its bin/bwrap"
+hide = true
+run = '''
+set -euo pipefail
+ref='github:NixOS/nixpkgs/89570f24e97e614aa34aa9ab1c927b6578a43775#pkgsStatic.bubblewrap'
+for out in $(nix build "$ref" --no-link --print-out-paths); do
+  if [ -e "$out/bin/bwrap" ]; then echo "$out/bin/bwrap"; exit 0; fi
+done
+echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
+'''
+
 [tasks.build-bundled]
-description = "Build the shipping static musl binary WITH the embedded nix engine (needs host nix)"
+description = "Build the shipping static musl binary WITH the embedded nix + bwrap engines (needs host nix)"
 run = '''
 set -euo pipefail
 OPS_BUNDLED_NIX="$(mise run static-nix)"
-export OPS_BUNDLED_NIX
-cargo zigbuild --release --target x86_64-unknown-linux-musl --features bundled-nix
+OPS_BUNDLED_BWRAP="$(mise run static-bwrap)"
+export OPS_BUNDLED_NIX OPS_BUNDLED_BWRAP
+cargo zigbuild --release --target x86_64-unknown-linux-musl --features bundled-nix,bundled-bwrap
 '''
 
 [tasks.lint-bundled]
-description = "Compile + clippy the bundled-nix feature path (not covered by default CI; needs host nix)"
+description = "Compile + clippy the bundled-* feature paths (not covered by default CI; needs host nix)"
 run = '''
 set -euo pipefail
 OPS_BUNDLED_NIX="$(mise run static-nix)"
-export OPS_BUNDLED_NIX
-cargo clippy --bins --features bundled-nix -- -D warnings
+OPS_BUNDLED_BWRAP="$(mise run static-bwrap)"
+export OPS_BUNDLED_NIX OPS_BUNDLED_BWRAP
+cargo clippy --bins --features bundled-nix,bundled-bwrap -- -D warnings
 '''
 
 [tasks.ci]

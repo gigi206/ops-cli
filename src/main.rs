@@ -153,13 +153,31 @@ fn doctor() -> ExitCode {
 
     let mut remediation: Vec<&str> = Vec::new();
 
-    // The sandbox engine itself. Hold the path: a present engine is what lets the
-    // boundary be proven by a real launch rather than a stand-in.
-    let bwrap = pathfind::find_on_path("bwrap");
+    // The data directory, resolved once and reused for the engines and the store/channel
+    // report below. Read-only in that it derives paths from the environment; resolving the
+    // engines may materialize one ops ships (the bundled-* builds), which is intended.
+    let layout = store::Layout::from_env();
+
+    // The sandbox engine itself. Hold the choice: a present engine is what lets the
+    // boundary be proven by a real launch rather than a stand-in, and its source explains
+    // which `bwrap` ran and why — the bundled engine, the host's, or an override.
+    let bwrap = store::resolve_bwrap(layout.as_ref());
     match &bwrap {
-        Some(p) => println!("  {} bubblewrap        {}", tag_ok(&pal), p.display()),
+        Some(c) => {
+            println!("  {} bubblewrap        {}", tag_ok(&pal), c.path.display());
+            let note = if c.apparmor_restricted {
+                " — AppArmor userns restriction active (host engine required)"
+            } else {
+                ""
+            };
+            println!(
+                "         {dim}· {}{note}{r}",
+                c.source.label(),
+                dim = pal.dim
+            );
+        }
         None => {
-            println!("  {} bubblewrap        not found on PATH", tag_fail(&pal));
+            println!("  {} bubblewrap        not found", tag_fail(&pal));
             remediation.push("install bubblewrap (the sandbox engine)");
         }
     }
@@ -171,7 +189,11 @@ fn doctor() -> ExitCode {
     // namespaces on a cap-stripped one. The `unshare` stand-in survives only to
     // classify a failure (and as the fast gate the launch path uses). The
     // sysctls below are advisory context for the remediation hint.
-    report_security_boundary(&pal, bwrap.as_deref(), &mut remediation);
+    report_security_boundary(
+        &pal,
+        bwrap.as_ref().map(|c| c.path.as_path()),
+        &mut remediation,
+    );
     if let Some(v) = read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
         println!(
             "         {dim}· kernel.apparmor_restrict_unprivileged_userns = {v}{r}",
@@ -185,10 +207,6 @@ fn doctor() -> ExitCode {
         );
     }
     report_resource_limits(&pal);
-
-    // Resolved once and reused below for the store + channel report. Read-only:
-    // it derives paths from the environment, it does not create anything.
-    let layout = store::Layout::from_env();
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, ops cannot provision a project's tools. Resolution is read-only here
