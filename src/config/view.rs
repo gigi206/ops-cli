@@ -239,6 +239,21 @@ pub(crate) enum AppNetworkView {
     },
 }
 
+/// An app overlay's own cgroup limit overrides, projected for display: only the fields the app
+/// itself tunes, each as its systemd token. Unlike the baseline `limits` view (which shows the
+/// effective value or the built-in default), an app inherits the baseline's *resolved* value for
+/// an unset field — possibly itself an override — so reporting a default here would misstate what
+/// the app changes. `None` overall means the app tunes no limit and inherits the baseline whole.
+#[derive(Serialize)]
+pub(crate) struct AppLimitsView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_high: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_max: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tasks_max: Option<String>,
+}
+
 /// A named application profile: the command it runs and what its gated overlay adds.
 #[derive(Serialize)]
 pub(crate) struct AppView {
@@ -266,6 +281,9 @@ pub(crate) struct AppView {
     /// The app's own GUI posture, when it set one — the same [`GuiView`] the baseline `gui` field
     /// carries, so the overlay and the baseline render and serialize a display identically.
     pub(crate) gui: Option<GuiView>,
+    /// The cgroup limits this overlay overrides, when it tunes any — its *own* fields, not the
+    /// baseline-merged set, so an app that changes nothing shows nothing.
+    pub(crate) limits: Option<AppLimitsView>,
     /// The credentials this overlay injects, host-side at launch — its *own* `[secret]` sections
     /// (global and project), gated, not the baseline's. The merge unions them with the baseline
     /// only for the launch itself; the view shows the overlay's additions. Each carries only its
@@ -551,6 +569,7 @@ fn app_view(
             super::GuiPolicy::Wayland => GuiView::Wayland,
             super::GuiPolicy::None => GuiView::None,
         }),
+        limits: app_limits_view(&app.limits),
         secrets: app
             .secrets
             .iter()
@@ -563,6 +582,18 @@ fn app_view(
             .collect(),
         notes: app.warnings.clone(),
     }
+}
+
+/// Project an app overlay's *own* limit overrides — only the fields it set — or `None` when it
+/// tunes nothing (it then inherits the baseline limits whole).
+fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
+    let overrides_something =
+        limits.memory_high.is_some() || limits.memory_max.is_some() || limits.tasks_max.is_some();
+    overrides_something.then(|| AppLimitsView {
+        memory_high: limits.memory_high.clone(),
+        memory_max: limits.memory_max.clone(),
+        tasks_max: limits.tasks_max.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -644,6 +675,11 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
+                limits: Some(AppLimitsView {
+                    memory_high: None,
+                    memory_max: Some("8G".into()),
+                    tasks_max: None,
+                }),
                 secrets: vec![SecretView {
                     header: "x-api-key".into(),
                     to: "api.example.com".into(),
@@ -694,6 +730,13 @@ mod tests {
         assert_eq!(app_secret["header"], "x-api-key");
         assert_eq!(app_secret["to"], "api.example.com");
         assert_eq!(app_secret["sources"], "env DEMO_API_KEY");
+        // An app overlay's own limit overrides serialize as only the fields it tunes — the ceiling
+        // here — and an unset field (the throttle) is omitted, so the JSON shows exactly what the
+        // app changes, not a misleading default it actually inherits from the baseline.
+        let app_limits = &json["apps"][0]["limits"];
+        assert_eq!(app_limits["memory_max"], "8G");
+        assert_eq!(app_limits["memory_high"], serde_json::Value::Null);
+        assert_eq!(app_limits["tasks_max"], serde_json::Value::Null);
     }
 
     /// A `flake:` package's pinned revision surfaces in its view, looked up by the package locator
@@ -741,6 +784,7 @@ mod tests {
             packages: vec![flake],
             network: None,
             gui: None,
+            limits: Default::default(),
             secrets: vec![],
             warnings: vec![],
         };

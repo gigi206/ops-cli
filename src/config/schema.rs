@@ -141,6 +141,11 @@ pub(crate) struct RawApp {
     /// Credentials the egress proxy injects for this app. A security field, effective only
     /// under a network allowlist, like the baseline `[secret]` section.
     pub(crate) secret: Option<RawSecretSection>,
+    /// The app's cgroup resource limits, overriding the baseline's per field. A security field,
+    /// gated like the baseline `[limits]` (loosening them weakens the anti-DoS control), so an
+    /// untrusted project's app `[limits]` is dropped whole. An unset `Option` is omitted on
+    /// export, so an app that tunes nothing carries no `[limits]` table.
+    pub(crate) limits: Option<RawLimits>,
     /// Where this app's persistent `$HOME` (its config, login state, history) lives:
     /// `"global"` (the default) — one home per app, shared across every project, so the app
     /// keeps a single identity wherever it runs; or `"project"` — a home per (project, app),
@@ -468,6 +473,9 @@ mod tests {
             mode = "allowlist"
             allow = ["api.example.com", "*.nixos.org"]
             deny = ["evil.example.com"]
+            [limits]
+            memory_max = "8G"
+            tasks_max = 4096
             [secret.defaults]
             order = ["env", "sops"]
             [secret."api.example.com"]
@@ -484,6 +492,21 @@ mod tests {
             type = "raw"
             "#;
         let app = parse_app(src).unwrap();
+        // The app's `[limits]` overlay parses with the same number-or-string forms as the baseline.
+        let limits = app.limits.as_ref().expect("the [limits] overlay parses");
+        assert_eq!(
+            limits
+                .memory_max
+                .as_ref()
+                .map(RawLimit::as_token)
+                .as_deref(),
+            Some("8G")
+        );
+        assert_eq!(
+            limits.tasks_max.as_ref().map(RawLimit::as_token).as_deref(),
+            Some("4096")
+        );
+        assert_eq!(limits.memory_high, None);
         let serialized = serialize_app(&app).unwrap();
         let reparsed = parse_app(serialized.as_bytes()).unwrap();
         assert_eq!(app, reparsed, "export must round-trip losslessly");
@@ -514,6 +537,10 @@ mod tests {
             "unset home_scope must be omitted:\n{out}"
         );
         assert!(!out.contains("gui"), "unset gui must be omitted:\n{out}");
+        assert!(
+            !out.contains("limits"),
+            "unset limits must be omitted:\n{out}"
+        );
         // A bare-string command (`RawCmd::Line`) round-trips as itself — not silently promoted to a
         // one-element array — so an exported minimal profile re-imports identically.
         let reparsed = parse_app(out.as_bytes()).unwrap();

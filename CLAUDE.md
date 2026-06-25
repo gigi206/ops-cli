@@ -222,9 +222,50 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (accepted, documented not guarded):** a unit-suffixed-but-too-small memory value (`"2K"`) or
   `memory_high` ≥ `memory_max` is still a syntactically-valid value systemd rejects — the
   already-accepted **self-sabotage-of-a-trusted-field** class (like a bad `nixpkgs`/`cmd`).
-  **Scope: baseline-only** (global + project); per-`app` limits are a named future extension (apps
-  inherit the baseline via `merge_app`). **579 tests green (577 `--bins` + the full 27 `run.rs` e2e
-  re-run, incl. the headline override e2e).**
+  **Scope: baseline-only** (global + project); per-`app` limits shipped as the **next increment
+  (below)** — an app without its own `[limits]` still inherits the baseline via `merge_app`. **579
+  tests green (577 `--bins` + the full 27 `run.rs` e2e re-run, incl. the headline override e2e).**
+  **Per-app `[limits]` overlay (DONE 2026-06-25)** (`src/config/schema.rs` + `config/mod.rs` +
+  `config/view.rs` + `main.rs` + `tests/run.rs`): the named-future extension delivered — a
+  `[app.<name>.limits]` table (or a `[limits]` table in an imported profile) overrides the baseline
+  cgroup limits **for that app's launches**, gated and layered exactly like the per-app
+  `network`/`gui`. `RawApp` gains `limits: Option<RawLimits>` (reusing the baseline shape, so the
+  number-or-string `RawLimit` forms and the systemd-grammar validation apply unchanged);
+  `ResolvedApp.limits: cgroup::Limits` carries the app's **own** per-field overrides (all-`None` =
+  inherits the baseline whole). **Gating mirrors `network`/`gui`, NOT the `cmd`/`packages`
+  integrity-gate** (the advisor's call, airtight by construction): an untrusted project has no
+  legitimate need to set a limit on its own app — the safe default is inherit-baseline, which still
+  bounds it, and the only dangerous direction is loosening — so an untrusted layer's app `[limits]`
+  is **dropped whole** in `resolve_app` *before* any overlay. The flagship therefore holds by
+  construction: a globally-declared app's tight `tasks_max` cannot be loosened by an untrusted
+  project (the untrusted contribution is gone before `overlay_limits` runs). Layering is the `env`
+  model via one DRY helper **`overlay_limits(&mut base, over)`** (a `Some` field replaces, a `None`
+  keeps base), shared by **three** call sites — the baseline project-over-global merge (refactored
+  from its inline three-`if` block, behaviour-preserving), the app's global→project resolution, and
+  `merge_app`'s overlay onto the baseline — so the per-field semantics cannot drift between them. The
+  launch path needs **zero new wiring**: `ops app` already does `prep.cfg.merge_app(app)` *before*
+  `launch` reads `prep.cfg.limits` for `cgroup::wrap`, so the merged limits flow to the scope for
+  free. `ops config` shows a per-app `limits:` line listing **only the fields the app tunes** (an
+  `Option<AppLimitsView>`, `None` when it tunes nothing) — *not* the effective-or-default the
+  baseline `limits:` line shows, since an app inherits the baseline's *resolved* value (possibly
+  itself an override) for an unset field, so a default would misreport what the app changes. **doctor
+  stays baseline-only by design** (host-level, no app context). The `[limits]` table round-trips
+  through `serialize_app`/`parse_app` (extended the existing multi-table round-trip test, which
+  catches a scalar-before-table ordering bug a limits-only test would miss; the minimal-app test
+  asserts an unset `limits` is omitted). **583 tests green** (**580 `--bins`** — net +3: per-field
+  overlay-precedence merge_app test, two app gating tests [trusted per-field override; the flagship
+  untrusted-drop both directions], the `ops config` per-app render test, plus the extended schema
+  round-trip + view JSON-contract assertions; **3 `run.rs` cgroup e2e** incl. the net-new
+  **`a_trusted_app_limits_override_lands_in_the_cage_scope`**: a trusted `[app.cap.limits] tasks_max
+  = 2048` → `ops app cap` → host `pids.max` **measured 2048**, closing the one seam a `merge_app`
+  unit test cannot — that the real dispatch merges the overlay *before* consuming limits; teeth = a
+  default-16384 leak panics, no scope skips). fmt/clippy clean, **std-only (no new dep)**,
+  advisor-reviewed (plan AND impl — the plan review made the app e2e mandatory over a merge_app unit
+  test alone, confirmed the gating-by-construction flagship, and chose the app-own-overrides view
+  shape; the impl review confirmed the gating is airtight and the e2e has teeth on both new seams).
+  **Named residual (unchanged):** a unit-suffixed-but-too-small value (`"2K"`) or `memory_high` ≥
+  `memory_max` stays the self-sabotage-of-a-trusted-field class; the app path reuses the identical
+  `validate_limits`, so its config-time drops behave exactly as the baseline's.
   **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's

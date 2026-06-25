@@ -2600,6 +2600,7 @@ mod tests {
             packages,
             network: None,
             gui: None,
+            limits: Default::default(),
             secrets: vec![],
             warnings: vec![],
         }

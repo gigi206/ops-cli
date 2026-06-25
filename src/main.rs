@@ -1113,6 +1113,22 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
                 None => {}
             }
+            // The cgroup limits this overlay overrides — only the fields it tunes, since an app
+            // does not carry the full effective set (an unset field inherits the baseline, shown in
+            // `ops doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
+            if let Some(limits) = &app.limits {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = &limits.memory_high {
+                    parts.push(format!("MemoryHigh={v}"));
+                }
+                if let Some(v) = &limits.memory_max {
+                    parts.push(format!("MemoryMax={v}"));
+                }
+                if let Some(v) = &limits.tasks_max {
+                    parts.push(format!("TasksMax={v}"));
+                }
+                let _ = writeln!(o, "      {dim}limits:{r} {}", parts.join(", "));
+            }
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
             // under `--details` to each by destination and source, the same metadata the baseline
@@ -4225,6 +4241,52 @@ mod tests {
     }
 
     #[test]
+    fn config_render_shows_an_app_limits_override() {
+        use config::view::*;
+        let p = style::Palette::plain();
+        let app = |name: &str, limits: Option<AppLimitsView>| AppView {
+            name: name.into(),
+            cmd: Some(name.into()),
+            home_scope: "global (shared across projects)".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            network: None,
+            gui: None,
+            limits,
+            secrets: vec![],
+            notes: vec![],
+        };
+        let mut view = sample_config_view();
+        view.apps = vec![
+            app(
+                "capped",
+                Some(AppLimitsView {
+                    memory_high: None,
+                    memory_max: None,
+                    tasks_max: Some("4096".into()),
+                }),
+            ),
+            app("plain", None),
+        ];
+        let out = render_config(&view, &p, false);
+        // The tuning app prints only the field it set — its task cap.
+        assert!(out.contains("      limits: TasksMax=4096"), "{out}");
+        // A field the app left unset is absent (it inherits the baseline, not shown per-app); the
+        // baseline itself is default here, so it prints no limits line either.
+        assert!(
+            !out.contains("MemoryHigh"),
+            "an unset app field is not rendered:\n{out}"
+        );
+        // Exactly one app limits line: the app that tunes nothing prints none.
+        assert_eq!(
+            out.matches("      limits:").count(),
+            1,
+            "only the tuning app shows a limits line:\n{out}"
+        );
+    }
+
+    #[test]
     fn config_render_shows_flake_pins_and_floating_state() {
         // A pinned `flake:` package shows its short revision and `pinned`; an unpinned one shows
         // `floating`, so the absence of a rev reads as a state, not a gap. The same pin appears
@@ -4289,6 +4351,7 @@ mod tests {
                 }],
                 network: None,
                 gui: None,
+                limits: None,
                 secrets: vec![],
                 notes: vec![],
             }],
@@ -4356,6 +4419,7 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
+                limits: None,
                 secrets: vec![],
                 notes: vec![],
             }],
@@ -4414,6 +4478,7 @@ mod tests {
             packages: vec![],
             network,
             gui,
+            limits: None,
             secrets: vec![],
             notes: vec![],
         };
@@ -4500,6 +4565,7 @@ mod tests {
                 packages: vec![],
                 network: None,
                 gui: None,
+                limits: None,
                 secrets: vec![
                     SecretView {
                         header: "x-api-key".into(),
@@ -4591,6 +4657,7 @@ mod tests {
                 packages: vec![],
                 network: None,
                 gui: None,
+                limits: None,
                 secrets: vec![],
                 notes: vec![],
             }],
@@ -4689,6 +4756,7 @@ mod tests {
                 ],
                 network: None,
                 gui: None,
+                limits: None,
                 secrets: vec![],
                 notes: vec![],
             }],

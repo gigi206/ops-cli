@@ -512,6 +512,11 @@ pub(crate) struct ResolvedApp {
     /// The app's own GUI posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place.
     pub(crate) gui: Option<GuiPolicy>,
+    /// The app's own cgroup limit overrides, set only from a trusted source (an untrusted
+    /// project's app `[limits]` is dropped whole, like its `network`/`gui`). Each set field
+    /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
+    /// means the app tunes nothing and inherits the baseline limits.
+    pub(crate) limits: crate::sandbox::cgroup::Limits,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
@@ -522,10 +527,11 @@ pub(crate) struct ResolvedApp {
 impl Resolved {
     /// Fold an app's overlay onto this baseline with precedence **app > baseline**: the
     /// app's environment upserts over the baseline's, its packages override by name, its
-    /// binds and credentials add, and its network posture (when it set one) replaces the
-    /// baseline's. Every value was gated at resolve time, so this is a pure merge — no
-    /// re-gating. The secret-vs-posture consistency is re-checked at the end, since the
-    /// overlay can add secrets or change the posture.
+    /// binds and credentials add, its network/GUI posture (when it set one) replaces the
+    /// baseline's, and its cgroup limits override the baseline's per field. Every value was
+    /// gated at resolve time, so this is a pure merge — no re-gating. The secret-vs-posture
+    /// consistency is re-checked at the end, since the overlay can add secrets or change the
+    /// posture.
     pub(crate) fn merge_app(&mut self, app: ResolvedApp) {
         for (key, val) in app.env {
             upsert(&mut self.env, key, val);
@@ -544,6 +550,7 @@ impl Resolved {
         if let Some(gui) = app.gui {
             self.gui = gui;
         }
+        overlay_limits(&mut self.limits, app.limits);
         self.secrets.extend(app.secrets);
         self.warnings.extend(app.warnings);
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
@@ -725,15 +732,7 @@ fn resolve(
         if let Some(raw) = proj.limits {
             if trusted {
                 let project_limits = validate_limits(&mut warnings, PROJECT_CONFIG, Some(raw));
-                if project_limits.memory_high.is_some() {
-                    limits.memory_high = project_limits.memory_high;
-                }
-                if project_limits.memory_max.is_some() {
-                    limits.memory_max = project_limits.memory_max;
-                }
-                if project_limits.tasks_max.is_some() {
-                    limits.tasks_max = project_limits.tasks_max;
-                }
+                overlay_limits(&mut limits, project_limits);
             } else {
                 warnings.push(format!(
                     "{PROJECT_CONFIG}: ignoring `[limits]` ({})",
@@ -818,6 +817,23 @@ fn validate_limits(
     out.memory_max = validate_memory_limit(warnings, source, "memory_max", raw.memory_max);
     out.tasks_max = validate_tasks_limit(warnings, source, raw.tasks_max);
     out
+}
+
+/// Overlay one set of limit overrides onto another, per field: a `Some` field in `over` replaces
+/// the matching field in `base`; an unset (`None`) one leaves `base`'s value in place. The `env`
+/// model — each limit is a standalone scalar with its own default — shared by every `[limits]`
+/// layering: the baseline project-over-global merge, an app's project-over-global resolution, and
+/// the app overlay onto the baseline.
+fn overlay_limits(base: &mut crate::sandbox::cgroup::Limits, over: crate::sandbox::cgroup::Limits) {
+    if over.memory_high.is_some() {
+        base.memory_high = over.memory_high;
+    }
+    if over.memory_max.is_some() {
+        base.memory_max = over.memory_max;
+    }
+    if over.tasks_max.is_some() {
+        base.tasks_max = over.tasks_max;
+    }
 }
 
 /// Validate one memory limit (`memory_high`/`memory_max`): reject a value systemd would not
@@ -976,6 +992,9 @@ fn resolve_app(
     let mut secrets: Vec<HeaderSecret> = Vec::new();
     let mut network: Option<NetworkPolicy> = None;
     let mut gui: Option<GuiPolicy> = None;
+    // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
+    // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
+    let mut limits = crate::sandbox::cgroup::Limits::default();
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
@@ -1008,6 +1027,10 @@ fn resolve_app(
         if let Some(value) = app.gui {
             gui = validate_gui(&mut warnings, &source, value);
         }
+        overlay_limits(
+            &mut limits,
+            validate_limits(&mut warnings, &source, app.limits),
+        );
         if let Some(section) = app.secret {
             apply_app_secret(
                 &mut secrets,
@@ -1079,6 +1102,23 @@ fn resolve_app(
                 ));
             }
         }
+        // `[limits]` mirrors `network`/`gui`: a trusted project may tune the cage's limits, on its
+        // own app or by overriding a trusted one; an untrusted project may not (loosening them
+        // weakens the anti-DoS control). Dropping the untrusted layer here — before any overlay —
+        // is what keeps a globally-defined app's tight limits intact under an untrusted project.
+        if let Some(raw) = app.limits {
+            if trusted {
+                overlay_limits(
+                    &mut limits,
+                    validate_limits(&mut warnings, &source, Some(raw)),
+                );
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `[limits]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         if let Some(section) = app.secret {
             if trusted {
                 apply_app_secret(
@@ -1134,6 +1174,7 @@ fn resolve_app(
         packages,
         network,
         gui,
+        limits,
         secrets,
         warnings,
     }
@@ -2687,6 +2728,7 @@ mod tests {
             network,
             gui: None,
             secret: None,
+            limits: None,
             home_scope: None,
         }
     }
@@ -2953,6 +2995,103 @@ mod tests {
         let app = &r.apps["mine"];
         assert_eq!(app.gui, None, "an untrusted project may not open a display");
         assert!(app.warnings.iter().any(|w| w.contains("gui")));
+    }
+
+    /// Build a `RawLimits` from optional tokens, for the per-app overlay tests.
+    fn app_raw_limits(
+        memory_high: Option<&str>,
+        memory_max: Option<&str>,
+        tasks_max: Option<&str>,
+    ) -> schema::RawLimits {
+        let text = |o: Option<&str>| o.map(|s| schema::RawLimit::Text(s.to_string()));
+        schema::RawLimits {
+            memory_high: text(memory_high),
+            memory_max: text(memory_max),
+            tasks_max: text(tasks_max),
+        }
+    }
+
+    #[test]
+    fn a_trusted_project_app_overrides_limits_per_field() {
+        // An app's `[limits]` overlay layers like its `network`/`gui`: a trusted project tunes a
+        // field its global definition set, the others standing. The global app caps tasks and
+        // memory; the trusted project lowers only the ceiling.
+        let global = raw_with_app(
+            "agent",
+            RawApp {
+                limits: Some(app_raw_limits(None, Some("16G"), Some("8192"))),
+                ..raw_app(&["agent"], &[], &[], &[], None)
+            },
+        );
+        let project = raw_with_app(
+            "agent",
+            RawApp {
+                limits: Some(app_raw_limits(None, Some("8G"), None)),
+                ..raw_app(&[], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        let app = &r.apps["agent"];
+        assert_eq!(
+            app.limits.memory_max.as_deref(),
+            Some("8G"),
+            "the trusted project overrides the ceiling"
+        );
+        assert_eq!(
+            app.limits.tasks_max.as_deref(),
+            Some("8192"),
+            "the global task cap stands"
+        );
+        assert_eq!(
+            app.limits.memory_high, None,
+            "neither layer set the throttle"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_projects_app_limits_are_dropped_and_a_global_apps_survive() {
+        // The flagship property for the limits overlay: a globally-declared app keeps its tight
+        // cap even under an untrusted project, which can neither loosen it nor set a limit on its
+        // own app — running an agent *on* untrusted code never lets that code weaken the anti-DoS.
+        let global = raw_with_app(
+            "agent",
+            RawApp {
+                limits: Some(app_raw_limits(None, None, Some("4096"))),
+                ..raw_app(&["agent"], &[], &[], &[], None)
+            },
+        );
+        let project = raw_with_app(
+            "agent",
+            RawApp {
+                limits: Some(app_raw_limits(None, None, Some("infinity"))),
+                ..raw_app(&[], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["agent"];
+        assert_eq!(
+            app.limits.tasks_max.as_deref(),
+            Some("4096"),
+            "an untrusted project may not loosen a trusted app's task cap"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("[limits]")));
+
+        // The reverse: an untrusted project cannot set a limit on its own app either.
+        let project = raw_with_app(
+            "mine",
+            RawApp {
+                limits: Some(app_raw_limits(None, None, Some("infinity"))),
+                ..raw_app(&["tool"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        let app = &r.apps["mine"];
+        assert_eq!(
+            app.limits,
+            crate::sandbox::cgroup::Limits::default(),
+            "an untrusted project's own app limits are dropped"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("[limits]")));
     }
 
     #[test]
@@ -3272,6 +3411,13 @@ mod tests {
     #[test]
     fn merge_app_overlays_the_baseline_with_app_precedence() {
         let mut base = resolve_no_plugins(raw(&[("A", "base"), ("B", "base")], &[]), None);
+        // Seed the baseline limits so the per-field overlay is observable: the app tightens only
+        // the task cap, and must inherit the baseline's memory limits untouched.
+        base.limits = crate::sandbox::cgroup::Limits {
+            memory_high: Some("70%".into()),
+            memory_max: Some("16G".into()),
+            tasks_max: Some("8192".into()),
+        };
         let app = ResolvedApp {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
@@ -3280,6 +3426,10 @@ mod tests {
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
             gui: None,
+            limits: crate::sandbox::cgroup::Limits {
+                tasks_max: Some("4096".into()),
+                ..Default::default()
+            },
             secrets: vec![],
             warnings: vec![],
         };
@@ -3290,6 +3440,22 @@ mod tests {
         assert!(base.env.iter().any(|(k, v)| k == "C" && v == "app"));
         // The app's posture replaces the baseline's.
         assert!(matches!(base.network, NetworkPolicy::Isolated));
+        // The app's limit override replaces the baseline per field; unset fields inherit it.
+        assert_eq!(
+            base.limits.tasks_max.as_deref(),
+            Some("4096"),
+            "app overrides the task cap"
+        );
+        assert_eq!(
+            base.limits.memory_high.as_deref(),
+            Some("70%"),
+            "baseline throttle inherited"
+        );
+        assert_eq!(
+            base.limits.memory_max.as_deref(),
+            Some("16G"),
+            "baseline ceiling inherited"
+        );
     }
 
     #[test]
@@ -3303,6 +3469,7 @@ mod tests {
             packages: vec![],
             network: None, // inherits the baseline's shared posture
             gui: None,
+            limits: Default::default(),
             secrets: vec![a_header_secret()],
             warnings: vec![],
         };
@@ -3327,6 +3494,7 @@ mod tests {
                 crate::allowlist::EgressPolicy::new(vec![], vec![]),
             )),
             gui: None,
+            limits: Default::default(),
             secrets: vec![a_header_secret()],
             warnings: vec![],
         };

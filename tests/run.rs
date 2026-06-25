@@ -2362,6 +2362,97 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
     }
 }
 
+/// A trusted app's `[limits]` overlay reaches the cage's scope at `ops app` dispatch — the seam a
+/// `merge_app` unit test cannot cover: that the real dispatch merges the overlay *before* it
+/// consumes the limits. An inline `[app.cap]` caps tasks below the default; after trust, `ops app
+/// cap` runs `sleep`, and the cage's host-visible `pids.max` equal to the *app override* — not the
+/// default — proves the overlay threaded resolve → merge_app → `cgroup::wrap` → the systemd scope.
+/// The default leaking through would be a real regression in that threading (panic); no scope at
+/// all is a host without a pids-delegating systemd session (skip).
+#[test]
+fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
+    const OVERRIDE_CAP: &str = "2048"; // distinct from the default (16384) and the baseline e2e's 4096
+    const DEFAULT_CAP: &str = "16384";
+    let project = TmpDir::new("applim-proj");
+    let data = TmpDir::new("applim-data");
+    let state = TmpDir::new("applim-state");
+
+    // A trusted app caps tasks below the default — on its overlay, not the baseline. `[limits]` is a
+    // security field, so the app must be trusted for the cap to apply.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[app.cap]\ncmd = [\"sleep\", \"5\"]\n[app.cap.limits]\ntasks_max = 2048\n",
+    )
+    .unwrap();
+
+    // Capability probe (also primes the base userland so the measured launch starts fast). Runs
+    // before the trust step — it only checks the host can sandbox.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping app-limits e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let mut child = ops()
+        .arg("app")
+        .arg("cap")
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ops app");
+    let pid = child.id();
+
+    let mut pids_max = String::new();
+    for _ in 0..50 {
+        if let Some(scope) = host_cgroup_path(pid) {
+            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
+                pids_max = v.trim().to_string();
+                if pids_max == OVERRIDE_CAP {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if pids_max != OVERRIDE_CAP {
+        assert_ne!(
+            pids_max, DEFAULT_CAP,
+            "the app cage ran under the default task cap, not the trusted app override \
+             {OVERRIDE_CAP} — the app `[limits]` overlay did not thread through merge_app to the scope"
+        );
+        eprintln!(
+            "skipping app-limits e2e: the cage is not under a task-capped scope \
+             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+        );
+    }
+}
+
 /// The real cgroup v2 path of a process, read from the host (`0::<path>`), or
 /// `None` if the process is gone or its cgroup cannot be read.
 fn host_cgroup_path(pid: u32) -> Option<String> {
