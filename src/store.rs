@@ -201,7 +201,7 @@ fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
         name,
         override_nix.as_deref(),
         owned_dir.as_deref(),
-        &|p| p.is_file(),
+        &|p| engine_probe(p),
         &|n| crate::pathfind::find_on_path(n),
     )
 }
@@ -256,34 +256,110 @@ fn ensure_owned_engine(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()>
     Ok(())
 }
 
-/// Pick the engine binary `name` from the three sources, in precedence order: the
-/// override, then an ops-owned engine directory, then `PATH`. File existence and the
-/// `PATH` lookup are injected so the precedence is testable in isolation.
+/// The trust state of a candidate engine binary, distinguishing "not there" from "there
+/// but not trustworthy". The two must not collapse: an explicit override that is
+/// present-but-unsafe is **refused outright** (never silently replaced by a lower tier),
+/// whereas an absent override merely yields to the next tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineProbe {
+    /// No file at the path.
+    Absent,
+    /// A file is present but fails the ownership/permission check.
+    Untrusted,
+    /// A regular file owned by us or root and not world-writable — safe to `execve`.
+    Trusted,
+}
+
+/// Pure ownership/permission verdict for an engine binary about to be `execve`d.
 ///
-/// A *resolved* override (one whose `nix` exists) is authoritative: `name` is taken
-/// from beside it and a missing sibling yields `None` (fail-closed), never a fall-back
-/// to the host's `PATH` — which would drive one store with two different engines. An
-/// override whose `nix` is absent is treated as unset and the next tier applies.
+/// Mirrors the config-file safety gate, with one deliberate difference: an engine may
+/// legitimately be owned by **root** (the host `/usr/bin/bwrap` is `root:root`, and an
+/// override may point at a system binary), so ownership by uid 0 is accepted alongside our
+/// own euid — neither is writable by an unprivileged attacker. A non-regular file
+/// (FIFO/device/dir, which could hang a launch or feed back attacker-controlled bytes) or a
+/// world-writable one (anyone could swap it) is refused; group-writable is tolerated, as for
+/// config files — the owner-only engine directory is the real boundary for the owned tier.
+/// `mode` is the full `st_mode`, type bits included.
+fn engine_verdict(file_uid: u32, mode: u32, euid: u32) -> Result<(), String> {
+    if mode & libc::S_IFMT != libc::S_IFREG {
+        return Err("not a regular file".into());
+    }
+    if file_uid != euid && file_uid != 0 {
+        return Err(format!("owned by uid {file_uid}, expected {euid} or root"));
+    }
+    if mode & 0o002 != 0 {
+        return Err("world-writable".into());
+    }
+    Ok(())
+}
+
+/// Probe a candidate engine path: absent, present-but-untrusted, or trusted. Metadata is read
+/// through the path — following a symlink, since that is what `execve` runs (e.g. the
+/// `nix-store -> nix` multi-call link). A present-but-untrusted binary at a resolved tier is
+/// **warned** about by name and reason (a swapped or loosely-permissioned engine is exactly
+/// the case worth surfacing); the caller then decides refuse-vs-fall-through.
+///
+/// This is a static-posture check (`stat` then `execve`), not a TOCTOU-proof gate: against a
+/// same-uid attacker — who already owns the account and could replace ops itself — nothing at
+/// this layer is a boundary. Its value is defense-in-depth: a foreign-owned or world-writable
+/// engine (a loosely-permissioned data dir, a world-writable first match on `PATH`) is refused
+/// rather than run. Note the `PATH` tier is the *first* match only (`find_on_path` does not
+/// scan past it), so this refuses a bad first match — it is not a full `PATH`-poisoning
+/// defense, which would need the lookup to skip-and-continue (a deferred option).
+fn engine_probe(path: &Path) -> EngineProbe {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return EngineProbe::Absent,
+    };
+    let euid = unsafe { libc::geteuid() };
+    match engine_verdict(meta.uid(), meta.mode(), euid) {
+        Ok(()) => EngineProbe::Trusted,
+        Err(why) => {
+            eprintln!(
+                "ops: ignoring untrusted engine binary {}: {why}",
+                path.display()
+            );
+            EngineProbe::Untrusted
+        }
+    }
+}
+
+/// Pick the engine binary `name` from the three sources, in precedence order: the override,
+/// then an ops-owned engine directory, then `PATH`. The trust probe and the `PATH` lookup are
+/// injected so the precedence — including the untrusted branches — is testable in isolation.
+///
+/// A *resolved* override (one whose `nix` is present and trusted) is authoritative: `name` is
+/// taken from beside it and a missing or untrusted sibling yields `None` (fail-closed), never a
+/// fall-back to the host's `PATH` — which would drive one store with two different engines. An
+/// override whose `nix` is **absent** is treated as unset and the next tier applies; one that
+/// is **present but untrusted** is refused outright (`None`), since it is a deliberate choice
+/// and silently substituting another engine would be worse. A lower tier (owned, then `PATH`)
+/// that is untrusted is skipped — with a warning — in favour of the next.
 fn pick_engine_bin(
     name: &str,
     override_nix: Option<&Path>,
     owned_dir: Option<&Path>,
-    exists: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> EngineProbe,
     on_path: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(nix) = override_nix {
-        if exists(nix) {
-            let bin = engine_sibling(nix, name);
-            return exists(&bin).then_some(bin);
+        match probe(nix) {
+            EngineProbe::Absent => {}
+            EngineProbe::Untrusted => return None,
+            EngineProbe::Trusted => {
+                let bin = engine_sibling(nix, name);
+                return matches!(probe(bin.as_path()), EngineProbe::Trusted).then_some(bin);
+            }
         }
     }
     if let Some(dir) = owned_dir {
         let bin = dir.join(name);
-        if exists(&bin) {
+        if matches!(probe(bin.as_path()), EngineProbe::Trusted) {
             return Some(bin);
         }
     }
-    on_path(name)
+    on_path(name).filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
 }
 
 /// Given the path of the `nix` binary, the path of its sibling command `name` in the
@@ -381,7 +457,7 @@ pub(crate) fn resolve_bwrap(layout: Option<&Layout>) -> Option<BwrapChoice> {
         apparmor_restricted,
         override_bin.as_deref(),
         owned_dir.as_deref(),
-        &|p| p.is_file(),
+        &|p| engine_probe(p),
         &|n| crate::pathfind::find_on_path(n),
     )?;
     Some(BwrapChoice {
@@ -436,32 +512,38 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
 }
 
 /// Pick the `bwrap` binary and its source from the override, the ops-owned engine directory,
-/// and `PATH`, in an order that depends on `restricted` (the AppArmor userns restriction).
-/// File existence and the `PATH` lookup are injected so the precedence — including the
-/// AppArmor branch, which a host without the restriction cannot exercise live — is
-/// unit-testable in isolation.
+/// and `PATH`, in an order that depends on `restricted` (the AppArmor userns restriction). The
+/// trust probe and the `PATH` lookup are injected so the precedence — including the AppArmor
+/// branch (which a host without the restriction cannot exercise live) and the untrusted
+/// branches — is unit-testable in isolation.
 ///
-/// The override, when it resolves, is authoritative. Otherwise: not restricted ⇒ the owned
-/// engine leads, then `PATH`; restricted ⇒ the host `PATH` engine leads (the same bwrap ops
-/// uses today — on a standard host that is the path-profiled `/usr/bin/bwrap`, the only one
+/// The override, when present and trusted, is authoritative; present-but-untrusted is refused
+/// outright (`None`), absent yields to the host-dependent order. Otherwise: not restricted ⇒
+/// the owned engine leads, then `PATH`; restricted ⇒ the host `PATH` engine leads (the same
+/// bwrap ops uses today — on a standard host the path-profiled `/usr/bin/bwrap`, the only one
 /// able to create a namespace under the restriction), then the owned engine as a last resort.
+/// An untrusted owned or `PATH` engine is skipped (with a warning) in favour of the next tier.
 fn pick_bwrap(
     restricted: bool,
     override_bin: Option<&Path>,
     owned_dir: Option<&Path>,
-    exists: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> EngineProbe,
     on_path: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<(PathBuf, BwrapSource)> {
     if let Some(bin) = override_bin {
-        if exists(bin) {
-            return Some((bin.to_path_buf(), BwrapSource::Override));
+        match probe(bin) {
+            EngineProbe::Absent => {}
+            EngineProbe::Untrusted => return None,
+            EngineProbe::Trusted => return Some((bin.to_path_buf(), BwrapSource::Override)),
         }
     }
     let owned = owned_dir
         .map(|d| d.join("bwrap"))
-        .filter(|p| exists(p))
+        .filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
         .map(|p| (p, BwrapSource::Bundled));
-    let host = on_path("bwrap").map(|p| (p, BwrapSource::HostPath));
+    let host = on_path("bwrap")
+        .filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
+        .map(|p| (p, BwrapSource::HostPath));
     if restricted {
         host.or(owned)
     } else {
@@ -1453,13 +1535,35 @@ mod tests {
     }
 
     #[test]
+    fn engine_verdict_accepts_us_or_root_and_refuses_the_rest() {
+        let reg = |perm: u32| perm | libc::S_IFREG;
+        // owned by us, not world-writable → trusted (group-writable is tolerated)
+        assert!(engine_verdict(1000, reg(0o755), 1000).is_ok());
+        assert!(engine_verdict(1000, reg(0o775), 1000).is_ok());
+        // root-owned is accepted — the host /usr/bin/bwrap is root:root and an override may be a
+        // system binary; neither is writable by an unprivileged attacker.
+        assert!(engine_verdict(0, reg(0o755), 1000).is_ok());
+        // a foreign, non-root owner is refused, naming the uid
+        let e = engine_verdict(1234, reg(0o755), 1000).unwrap_err();
+        assert!(e.contains("owned by uid 1234"), "got: {e}");
+        // world-writable is refused even when owned by us
+        assert!(engine_verdict(1000, reg(0o757), 1000)
+            .unwrap_err()
+            .contains("world-writable"));
+        // a non-regular file (here a directory) is refused
+        assert!(engine_verdict(1000, libc::S_IFDIR | 0o755, 1000)
+            .unwrap_err()
+            .contains("not a regular file"));
+    }
+
+    #[test]
     fn pick_engine_bin_follows_override_then_owned_then_path() {
         let over = Path::new("/over/nix");
         let owned = Path::new("/data/engine");
         let on_path = |n: &str| Some(PathBuf::from(format!("/usr/bin/{n}")));
 
-        // The override wins when its file exists; nix-store derives as a sibling.
-        let all = |_: &Path| true;
+        // The override wins when its file is present and trusted; nix-store derives as a sibling.
+        let all = |_: &Path| EngineProbe::Trusted;
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &all, &on_path),
             Some(PathBuf::from("/over/nix"))
@@ -1471,7 +1575,13 @@ mod tests {
 
         // A resolved override is authoritative: a missing sibling fails closed rather
         // than mixing in the host's nix-store, while `nix` itself still resolves.
-        let only_override_nix = |p: &Path| p == Path::new("/over/nix");
+        let only_override_nix = |p: &Path| {
+            if p == Path::new("/over/nix") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Absent
+            }
+        };
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &only_override_nix, &on_path),
             Some(PathBuf::from("/over/nix"))
@@ -1489,29 +1599,75 @@ mod tests {
 
         // An override whose `nix` is absent is treated as unset: the next tier (here
         // the ops-owned engine directory) applies.
-        let only_owned = |p: &Path| p.starts_with("/data/engine");
+        let only_owned = |p: &Path| {
+            if p.starts_with("/data/engine") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Absent
+            }
+        };
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &only_owned, &on_path),
             Some(PathBuf::from("/data/engine/nix"))
         );
 
-        // With neither override nor owned engine present, it falls to `PATH`.
-        let none_exist = |_: &Path| false;
+        // With neither override nor owned engine present, it falls to the (trusted) host `PATH`.
+        let host_only = |p: &Path| {
+            if p.starts_with("/usr/bin") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Absent
+            }
+        };
         assert_eq!(
-            pick_engine_bin("nix", Some(over), Some(owned), &none_exist, &on_path),
+            pick_engine_bin("nix", Some(over), Some(owned), &host_only, &on_path),
             Some(PathBuf::from("/usr/bin/nix"))
         );
 
         // No layout (no owned dir) simply skips that tier.
         assert_eq!(
-            pick_engine_bin("nix-store", None, None, &none_exist, &on_path),
+            pick_engine_bin("nix-store", None, None, &host_only, &on_path),
             Some(PathBuf::from("/usr/bin/nix-store"))
         );
 
         // Nothing anywhere → None; the caller turns it into a pointed error.
         let no_path = |_: &str| None;
         assert_eq!(
-            pick_engine_bin("nix", None, None, &none_exist, &no_path),
+            pick_engine_bin("nix", None, None, &host_only, &no_path),
+            None
+        );
+
+        // An override present but UNtrusted is refused outright — never silently replaced by
+        // the (here trusted) owned tier; the deliberate choice fails closed.
+        let over_untrusted = |p: &Path| {
+            if p.starts_with("/over") {
+                EngineProbe::Untrusted
+            } else {
+                EngineProbe::Trusted
+            }
+        };
+        assert_eq!(
+            pick_engine_bin("nix", Some(over), Some(owned), &over_untrusted, &on_path),
+            None
+        );
+
+        // An untrusted owned engine is skipped (warned) and resolution falls through to `PATH`.
+        let owned_untrusted = |p: &Path| {
+            if p.starts_with("/data/engine") {
+                EngineProbe::Untrusted
+            } else {
+                EngineProbe::Trusted
+            }
+        };
+        assert_eq!(
+            pick_engine_bin("nix", None, Some(owned), &owned_untrusted, &on_path),
+            Some(PathBuf::from("/usr/bin/nix"))
+        );
+
+        // An untrusted engine resolved from `PATH` (e.g. a poisoned entry) is not used.
+        let path_untrusted = |_: &Path| EngineProbe::Untrusted;
+        assert_eq!(
+            pick_engine_bin("nix", None, None, &path_untrusted, &on_path),
             None
         );
     }
@@ -1585,8 +1741,8 @@ mod tests {
         let owned_bwrap = PathBuf::from("/data/engine/bwrap");
         let host_bwrap = PathBuf::from("/usr/bin/bwrap");
 
-        // Not restricted, both present: the bundled engine leads (self-contained, pinned).
-        let all = |_: &Path| true;
+        // Not restricted, both present and trusted: the bundled engine leads (self-contained).
+        let all = |_: &Path| EngineProbe::Trusted;
         assert_eq!(
             pick_bwrap(false, None, Some(owned), &all, &host),
             Some((owned_bwrap.clone(), BwrapSource::Bundled))
@@ -1609,16 +1765,28 @@ mod tests {
             Some((over.to_path_buf(), BwrapSource::Override))
         );
         // An override whose file is absent is treated as unset: the next tier applies.
-        let only_owned = |p: &Path| p.starts_with("/data/engine");
+        let only_owned = |p: &Path| {
+            if p.starts_with("/data/engine") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Absent
+            }
+        };
         assert_eq!(
             pick_bwrap(false, Some(over), Some(owned), &only_owned, &host),
             Some((owned_bwrap.clone(), BwrapSource::Bundled))
         );
 
-        // Not restricted but no bundled engine present → fall back to the host.
-        let none_exist = |_: &Path| false;
+        // Not restricted but no bundled engine present → fall back to the (trusted) host.
+        let host_only = |p: &Path| {
+            if p.starts_with("/usr/bin") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Absent
+            }
+        };
         assert_eq!(
-            pick_bwrap(false, None, Some(owned), &none_exist, &host),
+            pick_bwrap(false, None, Some(owned), &host_only, &host),
             Some((host_bwrap.clone(), BwrapSource::HostPath))
         );
         // Restricted with no host engine → the bundled one is the last resort (it will fail
@@ -1627,15 +1795,51 @@ mod tests {
         let no_host = |_: &str| None;
         assert_eq!(
             pick_bwrap(true, None, Some(owned), &all, &no_host),
-            Some((owned_bwrap, BwrapSource::Bundled))
+            Some((owned_bwrap.clone(), BwrapSource::Bundled))
         );
         // No layout (no owned dir) simply skips that tier.
         assert_eq!(
-            pick_bwrap(false, None, None, &none_exist, &host),
-            Some((host_bwrap, BwrapSource::HostPath))
+            pick_bwrap(false, None, None, &host_only, &host),
+            Some((host_bwrap.clone(), BwrapSource::HostPath))
         );
         // Nothing anywhere → None; the caller turns it into a pointed error.
-        assert_eq!(pick_bwrap(false, None, None, &none_exist, &no_host), None);
+        assert_eq!(pick_bwrap(false, None, None, &host_only, &no_host), None);
+
+        // An override present but UNtrusted is refused outright, regardless of the restriction —
+        // never silently replaced by a lower (here trusted) tier.
+        let over_untrusted = |p: &Path| {
+            if p.starts_with("/over") {
+                EngineProbe::Untrusted
+            } else {
+                EngineProbe::Trusted
+            }
+        };
+        assert_eq!(
+            pick_bwrap(false, Some(over), Some(owned), &over_untrusted, &host),
+            None
+        );
+        assert_eq!(
+            pick_bwrap(true, Some(over), Some(owned), &over_untrusted, &host),
+            None
+        );
+
+        // An untrusted owned engine is skipped (warned) and resolution falls through to the host.
+        let owned_untrusted = |p: &Path| {
+            if p.starts_with("/data/engine") {
+                EngineProbe::Untrusted
+            } else {
+                EngineProbe::Trusted
+            }
+        };
+        assert_eq!(
+            pick_bwrap(false, None, Some(owned), &owned_untrusted, &host),
+            Some((host_bwrap, BwrapSource::HostPath))
+        );
+
+        // An untrusted host engine on `PATH` (a poisoned entry) is not used; with no owned
+        // engine, nothing resolves.
+        let host_untrusted = |_: &Path| EngineProbe::Untrusted;
+        assert_eq!(pick_bwrap(false, None, None, &host_untrusted, &host), None);
     }
 
     #[test]

@@ -143,6 +143,38 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   now uses its **own** bwrap by default (surfaced by the `· bundled engine` doctor line,
   escape-hatched by `OPS_BWRAP_BIN`) — a release-note line for power users with a customized host
   bwrap. Advisor-reviewed (plan AND impl).
+  **Engine resolution integrity gate (DONE 2026-06-25)** (`src/store.rs`): a follow-up hardening
+  of the engine seam above — before any resolved `nix`/`bwrap` binary is `execve`d it passes an
+  **ownership/permission gate** (`engine_verdict` + a 3-state `engine_probe`), mirroring the
+  config-file `safety` gate with one deliberate difference: an engine may be owned by **root**
+  (the host `/usr/bin/bwrap` is `root:root`, an override may be a system binary), so uid 0 is
+  accepted alongside our euid; a non-regular or world-writable file is refused, group-writable
+  tolerated (the `0700` engine dir is the real boundary). The probe is **3-state**
+  (`Absent`/`Untrusted`/`Trusted`) so the cases cannot collapse: a present-but-untrusted
+  **override is refused outright** (`None`, never silently replaced by a lower tier — a deliberate
+  choice failing closed), while a lower **owned/`PATH` tier that is untrusted is skipped with a
+  by-name warning** in favour of the next. Wired into `pick_engine_bin` **and** `pick_bwrap` (the
+  resolution path common to feature-on **and** feature-off), closing the soft spot that the
+  feature-off binary `execve`d `<data>/engine/<bin>` with **zero** checks. **Honest scope:**
+  defense-in-depth, **not** a boundary — a same-uid attacker who can write the engine already owns
+  the account and could replace `ops` itself; the real end-to-end integrity stays the deferred
+  **signature of the released `ops` binary**. **Static check** (`stat` then `execve`), not
+  TOCTOU-proof (would need `O_PATH`+`fexecve`, out of proportion for this tier). **Two named
+  residuals:** the `PATH` tier probes only `find_on_path`'s **first match**, so it refuses a
+  world-writable first match but does **not** scan past it — not a full `PATH`-poisoning defense
+  (skip-and-continue deferred); and under `bundled-*`, `ensure_owned_*`'s marker fast-path does
+  **not** re-lay-down a tampered-but-right-version engine — it is refused and falls through to
+  host, silently demoting a self-contained binary to host-dependence until the next version bump
+  (safe, same-uid class, documented). **Proven live with teeth** (`chmod o+w <data>/engine/bwrap`
+  → `ops: ignoring untrusted engine binary …: world-writable` + fall-through to `/usr/bin/bwrap`;
+  restored → `· bundled engine`, no warning) + unit tests (`engine_verdict` us/root/refusals;
+  `pick_*` override-untrusted→refuse, owned-untrusted→fall-through, PATH-untrusted→none) + **the
+  full launch-path e2e re-ran green through the new probe** (`tests/run.rs` 26/0, `tests/shell.rs`
+  1/0 — fresh data dirs hit the host-`PATH` tier through `engine_probe` end-to-end, the path
+  live-doctor skipped). **565 `--bins` + 27 e2e green**, fmt/clippy clean, musl static verified
+  (std-only, no new dep — reuses `libc`), advisor-reviewed (plan AND impl — it caught the missing
+  integration run, now green, and the PATH-first-match overclaim + the bundled-skip residual, both
+  folded in).
   **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
