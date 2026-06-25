@@ -2268,6 +2268,100 @@ fn the_cage_runs_under_a_resource_limit_scope() {
     }
 }
 
+/// A trusted `[limits]` override reaches the cage's scope. A project lowers the task cap to a
+/// value distinct from the built-in default, trusts it (the limits are a security field), then
+/// launches; the cage's host-visible `pids.max` equal to the *override* — not the default — is
+/// conclusive proof the config threaded through resolve → `cgroup::wrap` → the systemd scope. A
+/// leak of the default would be a real regression (panic), while no scope at all is a host skip.
+#[test]
+fn a_trusted_limits_override_lands_in_the_cage_scope() {
+    const OVERRIDE_CAP: &str = "4096"; // distinct from the default sandbox::cgroup::TASKS_MAX (16384)
+    const DEFAULT_CAP: &str = "16384";
+    let project = TmpDir::new("cglim-proj");
+    let data = TmpDir::new("cglim-data");
+    let state = TmpDir::new("cglim-state");
+
+    // A trusted project lowers the task cap below the default. `[limits]` is a security field,
+    // honored only after `ops trust`.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[limits]\ntasks_max = 4096\n",
+    )
+    .unwrap();
+
+    // Capability probe (also primes the base userland so the measured launch starts fast). It runs
+    // before the trust step, which is fine — it only checks the host can sandbox.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping limits-override e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // Trust the project so its `[limits]` override applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let mut child = ops()
+        .arg("run")
+        .arg("--")
+        .args(["sleep", "5"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ops run");
+    let pid = child.id();
+
+    let mut pids_max = String::new();
+    for _ in 0..50 {
+        if let Some(scope) = host_cgroup_path(pid) {
+            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
+                pids_max = v.trim().to_string();
+                if pids_max == OVERRIDE_CAP {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if pids_max != OVERRIDE_CAP {
+        // The default leaking through means the scope applied but the override did not — a real
+        // regression in the config→cgroup threading, so fail. Any other value (or none) is the
+        // host having no systemd user session that delegates the pids controller — skip.
+        assert_ne!(
+            pids_max, DEFAULT_CAP,
+            "the cage ran under the default task cap, not the trusted override {OVERRIDE_CAP} — \
+             the `[limits]` override did not thread through to the scope"
+        );
+        eprintln!(
+            "skipping limits-override e2e: the cage is not under a task-capped scope \
+             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+        );
+    }
+}
+
 /// The real cgroup v2 path of a process, read from the host (`0::<path>`), or
 /// `None` if the process is gone or its cgroup cannot be read.
 fn host_cgroup_path(pid: u32) -> Option<String> {

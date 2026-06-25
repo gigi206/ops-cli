@@ -133,7 +133,7 @@ fn launch_foreground(
         // the sandbox and is reclaimed by liveness pruning once it exits.
         None => {
             // On success this never returns; reaching past it means exec itself failed.
-            let err = exec(&prep.bwrap, &spec);
+            let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             eprintln!("ops: failed to launch the sandbox: {err}");
             ExitCode::FAILURE
         }
@@ -142,7 +142,7 @@ fn launch_foreground(
         // propagate the exit status — keeping the proxy alive and the guard (which unlinks
         // the socket and CA) held for the whole session.
         Some(guard) => {
-            let code = run_supervised(&prep.bwrap, &spec);
+            let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(guard);
             code
         }
@@ -264,7 +264,7 @@ fn detached_child(
     match egress {
         None => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
-            let err = exec(&prep.bwrap, &spec);
+            let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             eprintln!("ops: failed to launch the sandbox: {err}");
             std::process::exit(1);
         }
@@ -273,7 +273,7 @@ fn detached_child(
             // (`--die-with-parent`) hang from. Drop the guard explicitly before exiting — a bare
             // `process::exit` runs no destructors, so the socket and CA would otherwise leak even
             // on a clean exit.
-            let code = run_status(&prep.bwrap, &spec);
+            let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(guard);
             std::process::exit(code);
         }
@@ -634,7 +634,7 @@ pub(crate) fn upgrade_mise_packages(
         };
         // Fork-and-wait (never exec-replace) so the next group can run; the egress guard, if any,
         // is held across the wait so the proxy serves the fetch, then unlinked as the group ends.
-        let code = run_status(&prep.bwrap, &spec);
+        let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
         drop(egress);
         if code != 0 {
             crate::diag::warn(&format!("`{label}`: mise upgrade exited {code}"));
@@ -1071,7 +1071,7 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
     // runs alongside the pty supervisor, and the guard unlinks the socket and CA on exit.
     let _egress = egress;
 
-    match supervise(&prep.bwrap, &spec) {
+    match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("ops: sandbox session failed: {e}");
@@ -2120,15 +2120,15 @@ fn session_runtime(runtime: binds::Runtime) -> session::SessionRuntime {
 /// runs on a thread that an exec-replace would discard; `run` uses this exactly when an
 /// egress guard is present. `Command::status` forks, waits, and yields the child's code;
 /// the proxy thread was already spawned (by `egress::start`) before the launch.
-fn run_supervised(bwrap: &Path, spec: &SandboxSpec) -> ExitCode {
-    ExitCode::from(run_status(bwrap, spec) as u8)
+fn run_supervised(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> ExitCode {
+    ExitCode::from(run_status(bwrap, spec, limits) as u8)
 }
 
 /// Fork the cage, wait, and return its exit status code (shell convention). The fork-and-wait
 /// core of [`run_supervised`], shared with the multi-cage upgrade roll: both run a series of
 /// cages and need the code of each rather than exec-replacing the launcher. A failure to
 /// prepare or spawn surfaces a pointed error and yields `1`, matching the supervised path.
-fn run_status(bwrap: &Path, spec: &SandboxSpec) -> i32 {
+fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> i32 {
     let (argv, _seccomp) = match seccomp_argv(spec) {
         Ok(v) => v,
         Err(e) => {
@@ -2136,7 +2136,7 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec) -> i32 {
             return 1;
         }
     };
-    let (prog, args) = super::cgroup::wrap(bwrap, argv);
+    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits);
     match Command::new(prog).args(args).status() {
         Ok(status) => status_code(status),
         Err(e) => {
@@ -2169,7 +2169,7 @@ fn status_code(status: std::process::ExitStatus) -> i32 {
 
 /// Replace the current process with bubblewrap running `spec`. A successful
 /// `exec` never returns, so this returns *only* on failure.
-fn exec(bwrap: &Path, spec: &SandboxSpec) -> io::Error {
+fn exec(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io::Error {
     // Defense in depth: a private-tty spec relies on a controlling terminal that
     // only the pty supervisor provides. Exec-replace would leave it inheriting
     // the launching terminal, so refuse it here rather than weaken isolation.
@@ -2184,7 +2184,7 @@ fn exec(bwrap: &Path, spec: &SandboxSpec) -> io::Error {
     };
     // `_seccomp` stays alive until the exec replaces this process (or, on failure,
     // until this returns), so bwrap can read the inherited filter descriptors.
-    let (prog, args) = super::cgroup::wrap(bwrap, argv);
+    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits);
     Command::new(prog).args(args).exec()
 }
 
@@ -2192,7 +2192,7 @@ fn exec(bwrap: &Path, spec: &SandboxSpec) -> io::Error {
 /// a pty, launches bwrap with the *slave* as its controlling terminal (via
 /// `login_tty`), keeps the *master* itself, puts the real terminal in raw mode,
 /// and relays bytes both ways until the session ends.
-fn supervise(bwrap: &Path, spec: &SandboxSpec) -> io::Result<i32> {
+fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io::Result<i32> {
     // The seccomp filters are loaded into anonymous files *before* the fork so the
     // child inherits their descriptors; the parent holds `seccomp` alive through
     // `pump` so the descriptors stay open until bwrap has read them.
@@ -2204,7 +2204,7 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec) -> io::Result<i32> {
     // between fork and exec may allocate.
     let mut bwrap_argv = super::seccomp::argv_prefix(&seccomp);
     bwrap_argv.extend(super::argv::to_argv(spec));
-    let (program, full_argv) = super::cgroup::wrap(bwrap, bwrap_argv);
+    let (program, full_argv) = super::cgroup::wrap(bwrap, bwrap_argv, limits);
     let program_c = cstring(program.as_os_str().as_bytes())?;
     let mut argv_owned = vec![program_c.clone()];
     for arg in &full_argv {
@@ -2560,6 +2560,7 @@ mod tests {
             mise: None,
             network: crate::config::NetworkPolicy::default(),
             gui: crate::config::GuiPolicy::default(),
+            limits: Default::default(),
             secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -3052,7 +3053,11 @@ mod tests {
         .unwrap()
         .with_private_tty();
 
-        let err = exec(Path::new("/bin/true"), &spec);
+        let err = exec(
+            Path::new("/bin/true"),
+            &spec,
+            &super::super::cgroup::Limits::default(),
+        );
         assert!(
             err.to_string().contains("pty supervisor"),
             "exec must refuse a private-tty spec; got: {err}"

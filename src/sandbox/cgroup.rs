@@ -44,14 +44,132 @@ const MEMORY_MAX: &str = "90%";
 /// the cost of setting it too high is negligible.
 const TASKS_MAX: u32 = 16384;
 
+/// Overrides for the cage's resource limits, supplied by a trusted `[limits]` config table.
+/// Each field, when `Some`, replaces the corresponding built-in default; `None` keeps the
+/// default. The values are systemd-syntax tokens already validated by [`is_valid_memory_value`]
+/// / [`is_valid_tasks_value`] at config-resolution time, so anything here is a value `systemd-run
+/// -p` accepts — never a launch-bricking surprise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// Override for `MemoryHigh` (the throttle threshold), or `None` for the default.
+    pub(crate) memory_high: Option<String>,
+    /// Override for `MemoryMax` (the hard ceiling), or `None` for the default.
+    pub(crate) memory_max: Option<String>,
+    /// Override for `TasksMax` (the process/thread cap), or `None` for the default.
+    pub(crate) tasks_max: Option<String>,
+}
+
+impl Limits {
+    /// The effective `MemoryHigh` value (the override when set, else the default) and whether it
+    /// came from a config override — for display by `ops config` / `doctor`.
+    pub(crate) fn memory_high(&self) -> (String, bool) {
+        effective(&self.memory_high, MEMORY_HIGH)
+    }
+
+    /// The effective `MemoryMax` value and whether it was overridden.
+    pub(crate) fn memory_max(&self) -> (String, bool) {
+        effective(&self.memory_max, MEMORY_MAX)
+    }
+
+    /// The effective `TasksMax` value and whether it was overridden.
+    pub(crate) fn tasks_max(&self) -> (String, bool) {
+        match &self.tasks_max {
+            Some(v) => (v.clone(), true),
+            None => (TASKS_MAX.to_string(), false),
+        }
+    }
+}
+
+/// An effective limit value: the override when present, else `default`, with a flag telling the
+/// two apart.
+fn effective(override_value: &Option<String>, default: &str) -> (String, bool) {
+    match override_value {
+        Some(v) => (v.clone(), true),
+        None => (default.to_string(), false),
+    }
+}
+
+/// Whether `s` is a memory-limit value `systemd-run -p Memory{High,Max}=` accepts: `infinity`,
+/// a percentage `N%` of physical RAM (0 < N ≤ 100), or a byte quantity — a decimal number with
+/// an optional single uppercase `K`/`M`/`G`/`T`/`P`/`E` suffix (base-1024; no `B`, no `i`, no
+/// lowercase). The grammar is verified against a real `systemd-run` in the tests, so the
+/// validator can never accept a value that would later brick a launch. Stricter than systemd on
+/// whitespace (any is rejected), keeping a config value tight and the `-p` token injection-free.
+pub(crate) fn is_valid_memory_value(s: &str) -> bool {
+    if s == "infinity" {
+        return true;
+    }
+    if let Some(percent) = s.strip_suffix('%') {
+        return is_unit_percent(percent);
+    }
+    // A byte quantity: a decimal number with at most one base-1024 suffix. `strip_suffix` only
+    // strips when the last char is a suffix letter, so a bare integer (last char a digit) is left
+    // whole and validated as a plain decimal.
+    let number = s
+        .strip_suffix(|c| matches!(c, 'K' | 'M' | 'G' | 'T' | 'P' | 'E'))
+        .unwrap_or(s);
+    is_decimal(number)
+}
+
+/// Whether `s` is a `TasksMax=` value systemd accepts: `infinity` or a positive integer (systemd
+/// rejects `0`). A percentage (`N%` of the kernel pid limit) is a valid systemd form but is
+/// deliberately *not* accepted here: its upper bound is exclusive (systemd rejects `TasksMax=100%`
+/// while accepting `MemoryMax=100%`), an asymmetric and surprising boundary for an esoteric
+/// feature — a task cap is naturally a count or `infinity`. Verified live against `systemd-run`.
+pub(crate) fn is_valid_tasks_value(s: &str) -> bool {
+    // `u64::parse` rejects a sign, whitespace, or any non-digit, so a positive integer is the
+    // only accepted numeric form. `0` is excluded — systemd refuses `TasksMax=0`.
+    s == "infinity" || matches!(s.parse::<u64>(), Ok(n) if n >= 1)
+}
+
+/// A non-negative decimal number — `D+` or `D+.D+`, no sign, space, or other character. Rejects
+/// the empty string, a bare `.`, and a missing integer or fractional part (`2.`, `.5`).
+fn is_decimal(s: &str) -> bool {
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (s, None),
+    };
+    let all_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    all_digits(int_part) && frac_part.map(all_digits).unwrap_or(true)
+}
+
+/// Whether `s` (the part before a `%`) is a percentage in (0, 100]: a decimal systemd accepts as
+/// a fraction of a resource. `0%` and anything over `100%` are rejected, matching systemd.
+fn is_unit_percent(s: &str) -> bool {
+    is_decimal(s) && matches!(s.parse::<f64>(), Ok(x) if x > 0.0 && x <= 100.0)
+}
+
+/// The smallest byte count a memory limit may sensibly carry. The kernel rejects a `MemoryMax`
+/// below a page-aligned floor, and a memory value this small is almost always a percentage written
+/// without its `%` (the `memory_max = 90` footgun — 90 *bytes*, not 90%). 1 MiB sits comfortably
+/// below any real cap yet above any plausible typo, so it separates the mistake from a deliberate
+/// (if unusual) tiny value.
+const MIN_MEMORY_BYTES: u64 = 1024 * 1024;
+
+/// Whether `token` is a **bare byte count** (a plain integer — no `%`, no unit suffix) below the
+/// usable floor [`MIN_MEMORY_BYTES`]. A percentage, a unit-suffixed size, or `infinity` parses as
+/// a non-integer and is never flagged — only an unadorned small integer is, so the config layer
+/// can turn the most likely memory typo into a warning-and-default rather than a bricked launch.
+/// Syntactic validity is a separate check ([`is_valid_memory_value`]); this only judges magnitude.
+pub(crate) fn is_bare_byte_count_below_floor(token: &str) -> bool {
+    matches!(token.parse::<u64>(), Ok(n) if n < MIN_MEMORY_BYTES)
+}
+
 /// The limit profile expressed as systemd unit properties, in `KEY=VALUE` form,
 /// each tagged with the cgroup controller it needs so it can be dropped when that
-/// controller is not delegated.
-fn profile() -> Vec<(&'static str, String)> {
+/// controller is not delegated. A `[limits]` override replaces the matching default;
+/// an unset field keeps it.
+fn profile(limits: &Limits) -> Vec<(&'static str, String)> {
+    let memory_high = limits.memory_high.as_deref().unwrap_or(MEMORY_HIGH);
+    let memory_max = limits.memory_max.as_deref().unwrap_or(MEMORY_MAX);
+    let tasks_max = limits
+        .tasks_max
+        .clone()
+        .unwrap_or_else(|| TASKS_MAX.to_string());
     vec![
-        ("memory", format!("MemoryHigh={MEMORY_HIGH}")),
-        ("memory", format!("MemoryMax={MEMORY_MAX}")),
-        ("pids", format!("TasksMax={TASKS_MAX}")),
+        ("memory", format!("MemoryHigh={memory_high}")),
+        ("memory", format!("MemoryMax={memory_max}")),
+        ("pids", format!("TasksMax={tasks_max}")),
     ]
 }
 
@@ -89,8 +207,8 @@ fn delegated_controllers() -> Vec<String> {
 /// The systemd unit properties that can actually be enforced here: the profile
 /// filtered to the delegated controllers. Building the list from the delegated set
 /// sidesteps having to know whether `systemd-run` rejects an undelegated property.
-fn enforceable_properties(delegated: &[String]) -> Vec<String> {
-    profile()
+fn enforceable_properties(delegated: &[String], limits: &Limits) -> Vec<String> {
+    profile(limits)
         .into_iter()
         .filter(|(ctrl, _)| delegated.iter().any(|d| d == ctrl))
         .map(|(_, prop)| prop)
@@ -102,7 +220,7 @@ fn enforceable_properties(delegated: &[String]) -> Vec<String> {
 /// properties when resource limits can be applied on this host, or `None` for
 /// graceful degradation. Routing both consumers through here means `doctor` can
 /// never report a posture a launch would not actually take.
-fn limiter() -> Option<(PathBuf, Vec<String>)> {
+fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
     let systemd_run = crate::pathfind::find_on_path("systemd-run")?;
     // `systemd-run --user` needs a *reachable* user manager, not merely a named
     // runtime dir: a detached, cron, or post-logout context can inherit
@@ -115,7 +233,7 @@ fn limiter() -> Option<(PathBuf, Vec<String>)> {
     if !Path::new(&runtime).join("bus").exists() {
         return None;
     }
-    let props = enforceable_properties(&delegated_controllers());
+    let props = enforceable_properties(&delegated_controllers(), limits);
     if props.is_empty() {
         return None;
     }
@@ -125,8 +243,8 @@ fn limiter() -> Option<(PathBuf, Vec<String>)> {
 /// The `systemd-run` launcher and the argv prefix (ending with `--`) that wraps a
 /// command in a transient scope carrying the enforceable limits, or `None` when no
 /// limit can be applied on this host (graceful degradation).
-fn scope_wrapper() -> Option<(PathBuf, Vec<OsString>)> {
-    let (systemd_run, props) = limiter()?;
+fn scope_wrapper(limits: &Limits) -> Option<(PathBuf, Vec<OsString>)> {
+    let (systemd_run, props) = limiter(limits)?;
     let mut prefix = vec![
         OsString::from("--user"),
         OsString::from("--scope"),
@@ -147,8 +265,12 @@ fn scope_wrapper() -> Option<(PathBuf, Vec<OsString>)> {
 /// and its full argument list (excluding `argv[0]`). With limits available the
 /// program becomes `systemd-run` and bwrap is spliced in after `--`; otherwise the
 /// pair is returned unchanged so the caller launches bwrap directly.
-pub(crate) fn wrap(bwrap: &Path, bwrap_argv: Vec<OsString>) -> (PathBuf, Vec<OsString>) {
-    compose(scope_wrapper(), bwrap, bwrap_argv)
+pub(crate) fn wrap(
+    bwrap: &Path,
+    bwrap_argv: Vec<OsString>,
+    limits: &Limits,
+) -> (PathBuf, Vec<OsString>) {
+    compose(scope_wrapper(limits), bwrap, bwrap_argv)
 }
 
 /// Pure composition of a launch from an optional scope wrapper: with `Some` the
@@ -185,11 +307,13 @@ pub(crate) struct LimitReport {
 /// the enforceable properties — the conclusive check, matching how the security
 /// boundary is decided by a live launch rather than inferred. Never fails: an
 /// unavailable or non-working limiter is reported, not raised.
-pub(crate) fn probe() -> LimitReport {
+pub(crate) fn probe(limits: &Limits) -> LimitReport {
     // The verdict comes from the same `limiter()` decision a launch takes, so the
     // report cannot drift from reality; only when limits *would* be applied does
-    // the live scope confirm they actually work.
-    let Some((systemd_run, props)) = limiter() else {
+    // the live scope confirm they actually work. Passing the effective `limits`
+    // means the live scope also validates a config override, surfacing a bad value
+    // in `doctor` rather than at a launch.
+    let Some((systemd_run, props)) = limiter(limits) else {
         let note = if crate::pathfind::find_on_path("systemd-run").is_none() {
             "systemd-run not found; the cage runs without resource limits"
         } else {
@@ -235,7 +359,7 @@ mod tests {
 
     #[test]
     fn the_profile_throttles_then_caps_memory_and_bounds_tasks() {
-        let p = profile();
+        let p = profile(&Limits::default());
         // Memory is both throttled (high) and hard-capped (max); tasks are bounded.
         assert!(p
             .iter()
@@ -249,13 +373,133 @@ mod tests {
     }
 
     #[test]
+    fn an_override_replaces_the_matching_default_and_leaves_the_rest() {
+        // A partial override: only the memory ceiling and task cap are set, so the throttle
+        // threshold keeps its default. This is the per-field model — a set field wins, an unset
+        // one is untouched.
+        let limits = Limits {
+            memory_high: None,
+            memory_max: Some("16G".to_string()),
+            tasks_max: Some("8192".to_string()),
+        };
+        let p = profile(&limits);
+        assert!(
+            p.contains(&("memory", format!("MemoryHigh={MEMORY_HIGH}"))),
+            "the unset throttle keeps its default: {p:?}"
+        );
+        assert!(
+            p.contains(&("memory", "MemoryMax=16G".to_string())),
+            "the ceiling is overridden: {p:?}"
+        );
+        assert!(
+            p.contains(&("pids", "TasksMax=8192".to_string())),
+            "the task cap is overridden: {p:?}"
+        );
+    }
+
+    #[test]
+    fn effective_values_report_override_versus_default() {
+        let default = Limits::default();
+        assert_eq!(default.memory_high(), (MEMORY_HIGH.to_string(), false));
+        assert_eq!(default.memory_max(), (MEMORY_MAX.to_string(), false));
+        assert_eq!(default.tasks_max(), (TASKS_MAX.to_string(), false));
+
+        let custom = Limits {
+            memory_high: None,
+            memory_max: Some("16G".to_string()),
+            tasks_max: Some("8192".to_string()),
+        };
+        // The unset field reads as the default (not overridden); the set ones as their override.
+        assert_eq!(custom.memory_high(), (MEMORY_HIGH.to_string(), false));
+        assert_eq!(custom.memory_max(), ("16G".to_string(), true));
+        assert_eq!(custom.tasks_max(), ("8192".to_string(), true));
+    }
+
+    #[test]
+    fn the_value_validators_accept_systemd_forms_and_reject_the_rest() {
+        // Memory: infinity, bounded percentages, and decimal byte sizes with an uppercase
+        // base-1024 suffix.
+        for ok in [
+            "infinity",
+            "1%",
+            "80%",
+            "100%",
+            "12.5%",
+            "2M",
+            "2G",
+            "2T",
+            "1P",
+            "1E",
+            "1024K",
+            "2.5G",
+            "2147483648",
+        ] {
+            assert!(is_valid_memory_value(ok), "memory should accept `{ok}`");
+        }
+        // Rejected: a `B` suffix, lowercase, an `i` suffix, an out-of-range or zero percentage,
+        // whitespace, a bare suffix, and an empty value.
+        for bad in [
+            "2GB",
+            "2MB",
+            "2B",
+            "2g",
+            "2Gi",
+            "0%",
+            "150%",
+            "%",
+            "G",
+            "",
+            "2 G",
+            " 2G",
+            "80 %",
+            "infinity ",
+            "-5",
+            "2.",
+        ] {
+            assert!(!is_valid_memory_value(bad), "memory should reject `{bad}`");
+        }
+
+        // Tasks: infinity or a positive integer. Never `0`, a percentage (deliberately
+        // unsupported), a suffix, a sign, a decimal, or whitespace.
+        for ok in ["infinity", "1", "8192", "16384"] {
+            assert!(is_valid_tasks_value(ok), "tasks should accept `{ok}`");
+        }
+        for bad in ["0", "50%", "100%", "150%", "8K", "-5", "8 ", "", "1.5"] {
+            assert!(!is_valid_tasks_value(bad), "tasks should reject `{bad}`");
+        }
+    }
+
+    #[test]
+    fn a_bare_small_memory_integer_is_flagged_but_units_and_percentages_are_not() {
+        // The `memory_max = 90` footgun: a bare integer below 1 MiB is almost certainly a
+        // percentage missing its `%`, so it is flagged for the config layer to drop.
+        for flagged in ["90", "0", "1", "1048575"] {
+            assert!(
+                is_bare_byte_count_below_floor(flagged),
+                "`{flagged}` should be flagged as a likely typo"
+            );
+        }
+        // A deliberate unit, a percentage, `infinity`, or a byte count at/above the floor is never
+        // flagged — only a bare small integer is.
+        for ok in [
+            "1048576", "2097152", "64K", "16G", "90%", "infinity", "2.5G",
+        ] {
+            assert!(
+                !is_bare_byte_count_below_floor(ok),
+                "`{ok}` must not be flagged"
+            );
+        }
+    }
+
+    #[test]
     fn properties_are_filtered_to_delegated_controllers() {
+        let defaults = Limits::default();
         // Only `pids` delegated → only the task cap survives.
-        let only_pids = enforceable_properties(&["pids".to_string()]);
+        let only_pids = enforceable_properties(&["pids".to_string()], &defaults);
         assert_eq!(only_pids, vec![format!("TasksMax={TASKS_MAX}")]);
 
         // Only `memory` delegated → both memory properties, no task cap.
-        let only_mem = enforceable_properties(&["memory".to_string()]);
+        let only_mem = enforceable_properties(&["memory".to_string()], &defaults);
         assert_eq!(
             only_mem,
             vec![
@@ -265,7 +509,7 @@ mod tests {
         );
 
         // Nothing delegated → nothing enforceable (graceful degradation).
-        assert!(enforceable_properties(&[]).is_empty());
+        assert!(enforceable_properties(&[], &defaults).is_empty());
     }
 
     #[test]
@@ -312,7 +556,7 @@ mod tests {
             return;
         }
         let delegated = delegated_controllers();
-        let props = enforceable_properties(&delegated);
+        let props = enforceable_properties(&delegated, &Limits::default());
         if props.is_empty() {
             eprintln!("skipping cgroup landing test: no controller delegated");
             return;
@@ -359,6 +603,67 @@ mod tests {
             assert_ne!(max, "max", "MemoryMax left unbounded: {s}");
             let (h, m): (u64, u64) = (high.parse().unwrap(), max.parse().unwrap());
             assert!(h < m, "throttle {h} should sit below the hard cap {m}");
+        }
+    }
+
+    /// Every value form the validators accept must be one a real `systemd-run` accepts — a drift
+    /// would let a config override brick *every* launch of a project (the launch execs
+    /// `systemd-run`, which exits non-zero before bwrap on a rejected property). Drive a throwaway
+    /// scope per form and assert it launches. Memory forms are tried on `MemoryHigh`, which has no
+    /// minimum-value floor, so this proves grammar compatibility without a magnitude confound.
+    /// Skips (does not fail) where no user session can create a scope, so it is silent in headless
+    /// CI yet has teeth on a session.
+    #[test]
+    fn every_accepted_value_is_one_systemd_run_accepts() {
+        let Some(systemd_run) = crate::pathfind::find_on_path("systemd-run") else {
+            eprintln!("skipping systemd grammar test: no systemd-run");
+            return;
+        };
+        let launches = |prop: Option<&str>| {
+            let mut cmd = Command::new(&systemd_run);
+            cmd.args(["--user", "--scope", "-q", "--collect"]);
+            if let Some(p) = prop {
+                cmd.arg("-p").arg(p);
+            }
+            cmd.args(["--", "true"]);
+            cmd.status().map(|s| s.success()).unwrap_or(false)
+        };
+        // A baseline scope with no property must launch here, or there is no usable session — then
+        // a per-form failure would be the host, not a validator drift, so skip rather than fail.
+        if !launches(None) {
+            eprintln!("skipping systemd grammar test: cannot create a user scope here");
+            return;
+        }
+
+        let memory = [
+            "infinity",
+            "1%",
+            "80%",
+            "100%",
+            "12.5%",
+            "2M",
+            "2G",
+            "2T",
+            "1P",
+            "1024K",
+            "2.5G",
+            "2147483648",
+        ];
+        for v in memory {
+            assert!(is_valid_memory_value(v), "validator should accept `{v}`");
+            assert!(
+                launches(Some(&format!("MemoryHigh={v}"))),
+                "systemd-run rejected `MemoryHigh={v}` the validator accepted"
+            );
+        }
+
+        let tasks = ["infinity", "1", "8192", "16384"];
+        for v in tasks {
+            assert!(is_valid_tasks_value(v), "validator should accept `{v}`");
+            assert!(
+                launches(Some(&format!("TasksMax={v}"))),
+                "systemd-run rejected `TasksMax={v}` the validator accepted"
+            );
         }
     }
 }

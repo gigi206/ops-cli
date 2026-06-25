@@ -206,7 +206,7 @@ fn doctor() -> ExitCode {
             dim = pal.dim
         );
     }
-    report_resource_limits(&pal);
+    report_resource_limits(&pal, &config::global_limits());
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, ops cannot provision a project's tools. Resolution is read-only here
@@ -301,8 +301,11 @@ fn doctor() -> ExitCode {
 /// still runs, so an unavailable limiter is reported for context and never
 /// recorded as a missing prerequisite. The probe launches a real transient scope,
 /// so a green line means limiting actually works on this host.
-fn report_resource_limits(pal: &style::Palette) {
-    let report: sandbox::LimitReport = sandbox::resource_limits();
+fn report_resource_limits(pal: &style::Palette, limits: &sandbox::cgroup::Limits) {
+    // Reflect the *global* config's limits — they apply to every launch regardless of project,
+    // and the live probe validates them, so a bad global value surfaces here. A trusted project
+    // may further tune them per project; `ops config` is the project-aware view.
+    let report: sandbox::LimitReport = sandbox::resource_limits(limits);
     if report.verified {
         println!(
             "  {} resource limits   cage capped via a systemd scope ({})",
@@ -776,7 +779,7 @@ fn layer_tag(layer: Option<config::view::LayerView>, dim: &str, r: &str) -> Stri
 }
 
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
-    use config::view::{AppNetworkView, GuiView, NetworkView};
+    use config::view::{AppNetworkView, GuiView, LimitView, NetworkView};
     use std::fmt::Write as _;
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
@@ -934,6 +937,26 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         let _ = writeln!(
             o,
             "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
+        );
+    }
+
+    // Resource limits — shown only when a config `[limits]` override customizes one, so a
+    // default-profile config stays uncluttered (the effective defaults are in `ops doctor`).
+    let l = &view.limits;
+    if l.memory_high.overridden || l.memory_max.overridden || l.tasks_max.overridden {
+        let cell = |name: &str, v: &LimitView| {
+            if v.overridden {
+                format!("{name}={} {dim}(custom){r}", v.value)
+            } else {
+                format!("{name}={}", v.value)
+            }
+        };
+        let _ = writeln!(
+            o,
+            "  {h}limits:{r} {}, {}, {}",
+            cell("MemoryHigh", &l.memory_high),
+            cell("MemoryMax", &l.memory_max),
+            cell("TasksMax", &l.tasks_max),
         );
     }
 
@@ -3652,6 +3675,7 @@ mod tests {
             mise: None,
             network: config::NetworkPolicy::default(),
             gui: config::GuiPolicy::default(),
+            limits: Default::default(),
             secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -4076,6 +4100,7 @@ mod tests {
                 builtin: vec!["cache.nixos.org".into()],
             },
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![],
             warnings: vec![],
@@ -4149,6 +4174,57 @@ mod tests {
     }
 
     #[test]
+    fn config_render_shows_limits_only_when_overridden() {
+        let p = style::Palette::colored();
+        // A default-profile config prints no `limits:` line — the section surfaces a custom cap,
+        // not the documented defaults (which `ops doctor` shows).
+        let out = render_config(&sample_config_view(), &p, false);
+        assert!(
+            !out.contains("limits:"),
+            "a default profile must not print a limits line:\n{out}"
+        );
+
+        // An override of the ceiling and task cap prints the line, marking the customized fields
+        // `(custom)` and filling the untouched throttle with its default value.
+        let mut view = sample_config_view();
+        view.limits = config::view::LimitsView {
+            memory_high: config::view::LimitView {
+                value: "80%".into(),
+                overridden: false,
+            },
+            memory_max: config::view::LimitView {
+                value: "8G".into(),
+                overridden: true,
+            },
+            tasks_max: config::view::LimitView {
+                value: "4096".into(),
+                overridden: true,
+            },
+        };
+        let out = render_config(&view, &p, false);
+        assert!(
+            out.contains("limits:"),
+            "an override prints the line:\n{out}"
+        );
+        assert!(
+            out.contains("MemoryMax=8G"),
+            "the overridden ceiling shows:\n{out}"
+        );
+        assert!(
+            out.contains("TasksMax=4096"),
+            "the overridden task cap shows:\n{out}"
+        );
+        assert!(
+            out.contains("(custom)"),
+            "an overridden field is marked custom:\n{out}"
+        );
+        assert!(
+            out.contains("MemoryHigh=80%"),
+            "the untouched throttle shows its default value:\n{out}"
+        );
+    }
+
+    #[test]
     fn config_render_shows_flake_pins_and_floating_state() {
         // A pinned `flake:` package shows its short revision and `pinned`; an unpinned one shows
         // `floating`, so the absence of a rev reads as a state, not a gap. The same pin appears
@@ -4194,6 +4270,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
                 name: "demo-app".into(),
@@ -4264,6 +4341,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
                 name: "demo-app".into(),
@@ -4358,6 +4436,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![
                 app("shared-app", Some(AppNetworkView::Shared), None),
@@ -4410,6 +4489,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
                 name: "demo-app".into(),
@@ -4491,6 +4571,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
                 name: "demo-app".into(),
@@ -4569,6 +4650,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             gui: GuiView::None,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
                 name: "demo-app".into(),

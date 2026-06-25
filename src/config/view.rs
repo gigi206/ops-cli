@@ -47,6 +47,8 @@ pub(crate) struct ConfigView {
     pub(crate) network: NetworkView,
     /// The resolved GUI posture.
     pub(crate) gui: GuiView,
+    /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
+    pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
     pub(crate) secrets: Vec<SecretView>,
     /// Named application profiles, each a gated overlay over the baseline.
@@ -182,6 +184,23 @@ pub(crate) enum GuiView {
     Wayland,
 }
 
+/// The cage's effective cgroup resource limits: the throttle threshold, the hard memory ceiling,
+/// and the task cap, each its config override when set or ops's built-in default otherwise.
+#[derive(Serialize, Default)]
+pub(crate) struct LimitsView {
+    pub(crate) memory_high: LimitView,
+    pub(crate) memory_max: LimitView,
+    pub(crate) tasks_max: LimitView,
+}
+
+/// One effective resource limit: its value and whether a config `[limits]` override supplied it
+/// (as opposed to the built-in default).
+#[derive(Serialize, Default)]
+pub(crate) struct LimitView {
+    pub(crate) value: String,
+    pub(crate) overridden: bool,
+}
+
 /// An injected credential, by destination and source — never the plaintext, which ops reads only
 /// host-side at launch.
 #[derive(Serialize)]
@@ -312,6 +331,7 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         super::GuiPolicy::Wayland => GuiView::Wayland,
         super::GuiPolicy::None => GuiView::None,
     };
+    let limits = limits_view(&resolved.limits);
 
     let secrets = resolved
         .secrets
@@ -341,6 +361,7 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
         engine,
         network,
         gui,
+        limits,
         secrets,
         apps,
         warnings: resolved.warnings.clone(),
@@ -472,6 +493,17 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
     }
 }
 
+/// Project the cage's effective resource limits — each the config override when set, or ops's
+/// built-in default — so `ops config` shows what the launch would actually apply.
+fn limits_view(limits: &sandbox::cgroup::Limits) -> LimitsView {
+    let project = |(value, overridden): (String, bool)| LimitView { value, overridden };
+    LimitsView {
+        memory_high: project(limits.memory_high()),
+        memory_max: project(limits.memory_max()),
+        tasks_max: project(limits.tasks_max()),
+    }
+}
+
 /// Project one app overlay for display: its command, home scope, and the gated fields it adds.
 fn app_view(
     name: &str,
@@ -586,6 +618,7 @@ mod tests {
                 builtin: vec!["cache.nixos.org".into()],
             },
             gui: GuiView::Wayland,
+            limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
                 name: "demo-app".into(),

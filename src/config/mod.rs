@@ -455,6 +455,11 @@ pub(crate) struct Resolved {
     /// project asked for `"wayland"`. An untrusted project's choice is dropped with a warning
     /// — it may not open a display.
     pub(crate) gui: GuiPolicy,
+    /// The resolved cgroup resource limits (anti-DoS): the built-in defaults, with any field a
+    /// trusted `[limits]` table (global or project) overrode. A security field, gated like
+    /// `network`/`gui` — an untrusted project may not loosen a limit. Each of the three fields is
+    /// layered independently (global under a trusted project), like `env`.
+    pub(crate) limits: crate::sandbox::cgroup::Limits,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -612,6 +617,9 @@ fn resolve(
         .gui
         .and_then(|v| validate_gui(&mut warnings, GLOBAL_CONFIG, v))
         .unwrap_or_default();
+    // Resource limits are trusted by location at the global layer; each invalid field is dropped
+    // (warned) and the built-in default kept.
+    let mut limits = validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits);
     // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
     // captured for the global hosts and as the base a trusted project may extend.
     let mut secret_defaults = SecretDefaults::default();
@@ -709,6 +717,30 @@ fn resolve(
                 ));
             }
         }
+        // `[limits]` is a security field — a trusted project may tune the cgroup limits; an
+        // untrusted or changed one may not (loosening them weakens the anti-DoS control). The
+        // three fields layer independently: a project's set field overrides the global one, an
+        // unset field keeps the global (or built-in) value — the `env` model, not a wholesale
+        // replace, since each limit is a standalone scalar with its own default.
+        if let Some(raw) = proj.limits {
+            if trusted {
+                let project_limits = validate_limits(&mut warnings, PROJECT_CONFIG, Some(raw));
+                if project_limits.memory_high.is_some() {
+                    limits.memory_high = project_limits.memory_high;
+                }
+                if project_limits.memory_max.is_some() {
+                    limits.memory_max = project_limits.memory_max;
+                }
+                if project_limits.tasks_max.is_some() {
+                    limits.tasks_max = project_limits.tasks_max;
+                }
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `[limits]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // The `[secret]` section is a security field — a trusted project may inject
         // credentials (and extend the resolver defaults); an untrusted or changed one may
         // not (it would aim the user's secrets at a host of its choosing). The whole
@@ -761,10 +793,88 @@ fn resolve(
         mise: None,
         network,
         gui,
+        limits,
         secrets,
         apps,
         warnings,
     }
+}
+
+/// Validate a `[limits]` table into the resolved [`cgroup::Limits`](crate::sandbox::cgroup::Limits),
+/// dropping any field whose value systemd would not accept (with a warning naming the field) so a
+/// bad value can never reach `systemd-run` and brick a launch. A `None` table, or one whose every
+/// field is unset or invalid, yields all-`None` — the built-in defaults. The per-field validators
+/// mirror systemd's grammar exactly (verified against a live scope in the cgroup tests).
+fn validate_limits(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: Option<schema::RawLimits>,
+) -> crate::sandbox::cgroup::Limits {
+    let mut out = crate::sandbox::cgroup::Limits::default();
+    let Some(raw) = raw else {
+        return out;
+    };
+    out.memory_high = validate_memory_limit(warnings, source, "memory_high", raw.memory_high);
+    out.memory_max = validate_memory_limit(warnings, source, "memory_max", raw.memory_max);
+    out.tasks_max = validate_tasks_limit(warnings, source, raw.tasks_max);
+    out
+}
+
+/// Validate one memory limit (`memory_high`/`memory_max`): reject a value systemd would not
+/// accept, and — the likely-typo guard — reject a *bare small byte count*, which is almost always
+/// a percentage written without its `%` (`memory_max = 90` meaning 90 bytes, below the kernel
+/// floor, which would brick the launch). Either rejection falls back to the field's default.
+fn validate_memory_limit(
+    warnings: &mut Vec<String>,
+    source: &str,
+    field: &str,
+    value: Option<schema::RawLimit>,
+) -> Option<String> {
+    use crate::sandbox::cgroup;
+    let token = value?.as_token();
+    if !cgroup::is_valid_memory_value(&token) {
+        warnings.push(format!(
+            "{source}: ignoring invalid `limits.{field}` value `{token}`"
+        ));
+        return None;
+    }
+    if cgroup::is_bare_byte_count_below_floor(&token) {
+        warnings.push(format!(
+            "{source}: ignoring `limits.{field} = {token}` — a bare number is bytes, so this is \
+             {token} bytes (below the usable minimum); did you mean \"{token}%\" or e.g. \
+             \"{token}G\"?"
+        ));
+        return None;
+    }
+    Some(token)
+}
+
+/// Validate `tasks_max`: accept `infinity` or a positive integer, dropping anything else with a
+/// warning so it falls back to the default.
+fn validate_tasks_limit(
+    warnings: &mut Vec<String>,
+    source: &str,
+    value: Option<schema::RawLimit>,
+) -> Option<String> {
+    let token = value?.as_token();
+    if crate::sandbox::cgroup::is_valid_tasks_value(&token) {
+        Some(token)
+    } else {
+        warnings.push(format!(
+            "{source}: ignoring invalid `limits.tasks_max` value `{token}`"
+        ));
+        None
+    }
+}
+
+/// The global config's resource limits, for `doctor` (host-level, with no project context). Reads
+/// the global config — trusted by location — and validates its `[limits]`, discarding warnings:
+/// `doctor` surfaces availability, while `ops config` is the project-aware, warning-bearing view.
+/// An absent or limit-free global config yields the built-in defaults (all-`None`).
+pub(crate) fn global_limits() -> crate::sandbox::cgroup::Limits {
+    let mut warnings = Vec::new();
+    let global = read_global(&mut warnings);
+    validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits)
 }
 
 /// Clear injected credentials unless the posture is an allowlist. Injection is performed by
@@ -2475,6 +2585,7 @@ mod tests {
             gui: None,
             secret: None,
             app: BTreeMap::new(),
+            limits: None,
         }
     }
 
@@ -2526,6 +2637,24 @@ mod tests {
     fn raw_gui(value: &str) -> RawConfig {
         RawConfig {
             gui: Some(value.to_string()),
+            ..RawConfig::default()
+        }
+    }
+
+    /// A `RawConfig` declaring a `[limits]` table from optional string tokens (each `None` leaves
+    /// that field unset, falling back to the default).
+    fn raw_limits(
+        memory_high: Option<&str>,
+        memory_max: Option<&str>,
+        tasks_max: Option<&str>,
+    ) -> RawConfig {
+        let text = |o: Option<&str>| o.map(|s| schema::RawLimit::Text(s.to_string()));
+        RawConfig {
+            limits: Some(schema::RawLimits {
+                memory_high: text(memory_high),
+                memory_max: text(memory_max),
+                tasks_max: text(tasks_max),
+            }),
             ..RawConfig::default()
         }
     }
@@ -2883,6 +3012,94 @@ mod tests {
         );
         let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
         assert_eq!(r.apps["mine"].home_scope, AppHomeScope::Global);
+    }
+
+    #[test]
+    fn global_limits_are_honored_by_location() {
+        // The global config is trusted by location, so its whole `[limits]` table applies.
+        let global = raw_limits(Some("70%"), Some("16G"), Some("8192"));
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.limits.memory_high.as_deref(), Some("70%"));
+        assert_eq!(r.limits.memory_max.as_deref(), Some("16G"));
+        assert_eq!(r.limits.tasks_max.as_deref(), Some("8192"));
+    }
+
+    #[test]
+    fn a_trusted_project_overrides_limits_per_field() {
+        // Per-field layering (the `env` model, not wholesale): the project sets only the ceiling,
+        // so it overrides `memory_max` while the global throttle and task cap stand.
+        let global = raw_limits(Some("70%"), Some("16G"), Some("8192"));
+        let project = raw_limits(None, Some("8G"), None);
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        assert_eq!(
+            r.limits.memory_high.as_deref(),
+            Some("70%"),
+            "global throttle stands"
+        );
+        assert_eq!(
+            r.limits.memory_max.as_deref(),
+            Some("8G"),
+            "project overrides the ceiling"
+        );
+        assert_eq!(
+            r.limits.tasks_max.as_deref(),
+            Some("8192"),
+            "global task cap stands"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_projects_limits_are_dropped_with_a_warning() {
+        // Loosening the anti-DoS limits is a security choice — an untrusted project may not make
+        // it. The whole `[limits]` table is dropped and the built-in defaults (all-None) stand.
+        let project = raw_limits(Some("100%"), Some("infinity"), Some("infinity"));
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        assert_eq!(r.limits, crate::sandbox::cgroup::Limits::default());
+        assert!(r.warnings.iter().any(|w| w.contains("[limits]")));
+    }
+
+    #[test]
+    fn an_invalid_limits_value_is_dropped_and_the_field_keeps_its_default() {
+        // A value systemd would reject (`2GB` — no `B` suffix) must never reach `systemd-run`, or
+        // it would brick every launch. It is dropped (warned by field name) while the valid
+        // siblings apply.
+        let global = raw_limits(Some("80%"), Some("2GB"), Some("8192"));
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.limits.memory_high.as_deref(), Some("80%"));
+        assert_eq!(
+            r.limits.memory_max, None,
+            "the invalid ceiling falls back to the default"
+        );
+        assert_eq!(r.limits.tasks_max.as_deref(), Some("8192"));
+        assert!(r.warnings.iter().any(|w| w.contains("limits.memory_max")));
+    }
+
+    #[test]
+    fn a_bare_small_memory_number_is_refused_as_a_likely_percentage_typo() {
+        // The `memory_max = 90` footgun: a bare integer is *bytes*, so `90` means 90 bytes — almost
+        // certainly a percentage missing its `%`. It is dropped (with a "did you mean" hint) and
+        // the field falls back to its default, rather than reaching systemd and bricking the launch.
+        let global = RawConfig {
+            limits: Some(schema::RawLimits {
+                memory_max: Some(schema::RawLimit::Number(90)),
+                ..Default::default()
+            }),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.limits.memory_max, None, "the bare byte count is refused");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("did you mean") && w.contains("memory_max")));
+
+        // A deliberate unit or percentage is honored — the guard only catches the bare small int.
+        let global = raw_limits(None, Some("90%"), None);
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.limits.memory_max.as_deref(), Some("90%"));
+        let global = raw_limits(None, Some("16G"), None);
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.limits.memory_max.as_deref(), Some("16G"));
     }
 
     #[test]

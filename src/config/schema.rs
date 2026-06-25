@@ -63,6 +63,50 @@ pub(crate) struct RawConfig {
     /// trusted source), then merged onto the baseline by `ops app <name>`.
     #[serde(default)]
     pub(crate) app: BTreeMap<String, RawApp>,
+    /// Resource limits for the cage's cgroup scope (anti-DoS), overriding ops's built-in
+    /// defaults. A security field — honored from the global config or a trusted project,
+    /// ignored from an untrusted one: loosening a limit (a higher `tasks_max`, an unbounded
+    /// memory ceiling) reduces the anti-DoS protection, a choice an untrusted project may not
+    /// make. Each field is independent and falls back to the default when unset.
+    pub(crate) limits: Option<RawLimits>,
+}
+
+/// The `[limits]` table: optional overrides for the cage's cgroup resource limits.
+/// `memory_high` is the throttle threshold, `memory_max` the hard ceiling — each a systemd
+/// memory value (a percentage like `"80%"`, a byte quantity like `"16G"`, or `"infinity"`);
+/// `tasks_max` is the process/thread cap (a count like `8192`, or `"infinity"`). Each value's
+/// syntax is validated downstream against exactly what systemd accepts, so a malformed one is
+/// dropped with a warning rather than reaching `systemd-run` and failing the launch.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawLimits {
+    pub(crate) memory_high: Option<RawLimit>,
+    pub(crate) memory_max: Option<RawLimit>,
+    pub(crate) tasks_max: Option<RawLimit>,
+}
+
+/// One resource-limit value as declared: a bare number — a byte count for memory, a task count
+/// for tasks — or a string (`"80%"`, `"16G"`, `"infinity"`). An untagged enum so both TOML forms
+/// parse: a natural `tasks_max = 8192` and a `memory_max = "80%"` both load, rather than a type
+/// mismatch failing the whole config. A bare number is taken verbatim (bytes for memory, a count
+/// for tasks); a percentage or a suffixed size must be quoted.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawLimit {
+    /// A bare number: a byte count (memory) or a task count (tasks).
+    Number(u64),
+    /// A string form: a percentage (`"80%"`), a suffixed byte size (`"16G"`), or `"infinity"`.
+    Text(String),
+}
+
+impl RawLimit {
+    /// The value as the string token systemd's `-p KEY=VALUE` receives: a number renders as its
+    /// decimal form, a string is taken verbatim (and validated downstream before it is used).
+    pub(crate) fn as_token(&self) -> String {
+        match self {
+            RawLimit::Number(n) => n.to_string(),
+            RawLimit::Text(s) => s.clone(),
+        }
+    }
 }
 
 /// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
@@ -486,6 +530,46 @@ mod tests {
         // an app overlay carries its own gui posture
         let app = parse_app(b"cmd = \"x\"\ngui = \"wayland\"\n").unwrap();
         assert_eq!(app.gui.as_deref(), Some("wayland"));
+    }
+
+    #[test]
+    fn parses_a_limits_table_in_number_and_string_forms() {
+        let cfg = parse(
+            br#"
+            [limits]
+            memory_high = "70%"
+            memory_max  = "16G"
+            tasks_max   = 8192
+            "#,
+        )
+        .unwrap();
+        let l = cfg.limits.as_ref().unwrap();
+        // a string value is kept verbatim; a bare integer parses as a number and renders as its
+        // decimal token (so `tasks_max = 8192` and `tasks_max = "8192"` agree downstream).
+        assert_eq!(
+            l.memory_high.as_ref().map(RawLimit::as_token).as_deref(),
+            Some("70%")
+        );
+        assert_eq!(
+            l.memory_max.as_ref().map(RawLimit::as_token).as_deref(),
+            Some("16G")
+        );
+        assert_eq!(
+            l.tasks_max.as_ref().map(RawLimit::as_token).as_deref(),
+            Some("8192")
+        );
+
+        // an `infinity` string parses; an unset field stays None (falls back to the default).
+        let cfg = parse(b"[limits]\ntasks_max = \"infinity\"\n").unwrap();
+        let l = cfg.limits.as_ref().unwrap();
+        assert_eq!(
+            l.tasks_max.as_ref().map(RawLimit::as_token).as_deref(),
+            Some("infinity")
+        );
+        assert_eq!(l.memory_max, None);
+
+        // no table at all → None
+        assert_eq!(parse(b"").unwrap().limits, None);
     }
 
     #[test]

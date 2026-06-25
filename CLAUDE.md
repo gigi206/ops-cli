@@ -175,6 +175,56 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (std-only, no new dep — reuses `libc`), advisor-reviewed (plan AND impl — it caught the missing
   integration run, now green, and the PATH-first-match overclaim + the bundled-skip residual, both
   folded in).
+  **Configurable resource limits — `[limits]` override (DONE 2026-06-25)** (`src/config/schema.rs`
+  + `config/mod.rs` + `sandbox/cgroup.rs` + `sandbox/mod.rs` + `sandbox/launch.rs` + `main.rs` +
+  `config/view.rs` + `tests/run.rs`): the M4.2 cgroup limits (`MemoryHigh=80%`/`MemoryMax=90%`/
+  `TasksMax=16384`) were hardcoded constants; they are now **overridable from a `[limits]` config
+  table**, declarable in the **global config OR a project** `.ops.toml`. A new `RawLimits`
+  (`memory_high`/`memory_max`/`tasks_max`, each an untagged `RawLimit` number-or-string so a natural
+  `tasks_max = 8192` AND a `memory_max = "80%"` both parse without a type-mismatch dropping the whole
+  config) resolves into a `cgroup::Limits` (three `Option<String>` overrides over the constants),
+  threaded into `cgroup::wrap`/`profile`/`probe` at all three launch sites. **Gated trusted/global-
+  only like `network`/`gui`** — loosening a limit (a higher `tasks_max`, an unbounded ceiling)
+  reduces the anti-DoS control, so an **untrusted project's `[limits]` is dropped + warned**; the
+  three sub-fields **layer per field** (the `env` model, not wholesale: a global `tasks_max` + a
+  project `memory_max` compose, neither silently reverting to a constant). **Validation is
+  load-bearing** (advisor's #1): a launch execs `systemd-run`, which exits non-zero **before bwrap**
+  on a rejected `-p` value → a bad config value would **brick *every* launch of the project**. So
+  `is_valid_memory_value`/`is_valid_tasks_value` mirror systemd's grammar **exactly**, and the
+  grammar was **verified empirically against a live `systemd-run`** (not guessed): memory =
+  `infinity` | `N%` bounded **(0,100]** | a decimal byte size + an **uppercase** `K/M/G/T/P/E`
+  suffix (NO `B`, no `i`, no lowercase — the initial `B`-suffix guess was a bug live-probing caught);
+  tasks = `infinity` | a positive integer (`0` rejected). **A config-time invalid value is dropped +
+  warned by field name**, falling back to the default, never reaching `systemd-run`. The committed
+  **live grammar test** (`every_accepted_value_is_one_systemd_run_accepts`, skip-not-fail) drives a
+  real throwaway scope per accepted form — and **earned its keep**: it caught that **`TasksMax=100%`
+  is rejected by systemd** (an asymmetric exclusive percent bound vs memory's inclusive `100%`), so
+  tasks-percent was **deliberately dropped** (esoteric `% of pid_max`, surprising boundary — a task
+  cap is a count or `infinity`). `doctor` reflects the **global** `[limits]` (they apply to every
+  launch; its live probe validates them), `ops config` shows a `limits:` line **only when a field is
+  overridden** (uncluttered for the default profile, marking each custom field). `cgroup` module
+  raised to `pub(crate)` so `config`/`main` name `cgroup::Limits`. **579 tests green** (**577
+  `--bins`** incl. the live grammar test + schema parse + validator unit + profile-override +
+  config gating/merge matrix + the byte-floor guard + the `ops config` render test; **2 net-new
+  limits e2e** in `tests/run.rs` — the
+  default cap unchanged AND the **headline `a_trusted_limits_override_lands_in_the_cage_scope`**: a
+  trusted `tasks_max = 4096` → `ops run` → the cage's host-visible `pids.max` **measured 4096**, not
+  the default 16384, end-to-end through resolve → `cgroup::wrap` → the systemd scope — teeth: a
+  default leak panics, no scope skips), fmt/clippy clean, **std-only (no new dep)**, advisor-reviewed
+  (plan AND impl — the plan review made the grammar empirically-verified-and-tested the gate, which
+  is what caught the `B`-suffix and `TasksMax=100%` drifts; the impl review caught that my last
+  fmt/clippy predated the `run.rs` e2e (re-run clean) and flagged the `memory_max = 90` footgun
+  below). **Footgun guarded (advisor #2, user chose to add):** a memory value is *bytes* when bare,
+  so `memory_max = 90` means 90 **bytes** — a percentage written without its `%` — which is below
+  the kernel floor and would brick **every** launch of the project. `is_bare_byte_count_below_floor`
+  (config-time, < 1 MiB) drops a bare small memory integer with a `did you mean "90%"?` hint,
+  falling back to the default — converting the most-likely brick into a warning. **Narrower residual
+  (accepted, documented not guarded):** a unit-suffixed-but-too-small memory value (`"2K"`) or
+  `memory_high` ≥ `memory_max` is still a syntactically-valid value systemd rejects — the
+  already-accepted **self-sabotage-of-a-trusted-field** class (like a bad `nixpkgs`/`cmd`).
+  **Scope: baseline-only** (global + project); per-`app` limits are a named future extension (apps
+  inherit the baseline via `merge_app`). **579 tests green (577 `--bins` + the full 27 `run.rs` e2e
+  re-run, incl. the headline override e2e).**
   **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's

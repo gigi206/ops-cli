@@ -371,6 +371,7 @@ mod tests {
             mise: None,
             network: crate::config::NetworkPolicy::default(),
             gui: crate::config::GuiPolicy::default(),
+            limits: Default::default(),
             secrets: vec![],
             apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
             warnings: vec![],
