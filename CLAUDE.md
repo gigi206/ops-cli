@@ -89,7 +89,61 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   per-app isolated `$HOME`, export/import, and `nix:` / `mise:` / `flake:` package backends. **The
   two genuinely-remaining pieces are blocked on the user:** the flagship live-auth e2e (a real API
   key, never the assistant's) and the signed-store *distribution* of profiles (a hosting URL + a
-  long-term signing key). The per-increment history below is the append-only record, kept as-is.** **M3.4 done — hermetic TLS + a curated base
+  long-term signing key). **Beyond the milestones, the shipping binary is now self-contained** — it
+  embeds its own static `nix` (2.34.7) and `bwrap` (0.11.2) engines behind the `bundled-nix` /
+  `bundled-bwrap` features, materialized under `<data>/engine/`, so a release no longer depends on
+  host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
+  is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
+  per-increment history below is the append-only record, kept as-is.**
+  **Engine independence — the binary ships its own nix + bwrap (DONE 2026-06-25)** (`build.rs` +
+  `Cargo.toml` + `mise.toml` + `src/store.rs` + `src/sandbox/launch.rs` + `src/main.rs`): the two
+  host couplings that contradicted the self-contained-binary promise — host nix and host
+  `/usr/bin/bwrap` — are closed by **embedding both static engines** behind opt-in features.
+  **nix first** (`bundled-nix`): a static musl `nix` 2.34.7 (~39 MB, **multi-call** — one binary
+  dispatches `nix`/`nix-store` off argv0) is `include_bytes!`'d into ops and materialized,
+  content-keyed + atomic (temp+rename, 0755), into `<data>/engine/{nix,nix-store}` with a `.sha256`
+  marker; `store::resolve_nix` resolves **override `OPS_NIX_BIN` → owned `<data>/engine/nix` → host
+  PATH**, the owned tier consulted **feature-independently** (resolution only *finds* what
+  materialization placed — so any binary picks up an engine a prior bundled run left on disk), so a
+  release drives its own daemonless store with no host nix. **Then bwrap** (`bundled-bwrap`, the
+  2026-06-25 increment): same shape — a static musl `bwrap` 0.11.2 (~0.2 MB) embedded, materialized
+  into `<data>/engine/bwrap` with a **distinct `.bwrap.sha256`** marker (it shares `<data>/engine/`
+  with nix; markers never clobber), resolved by `store::resolve_bwrap`. **bwrap independence is
+  *partial*, not total like nix's** — the defining nuance: on a host with
+  `kernel.apparmor_restrict_unprivileged_userns` set, the kernel grants unprivileged
+  user-namespace creation **only** to a binary carrying an AppArmor profile that allows `userns`,
+  and the shipped profile attaches that grant **by path** to `/usr/bin/bwrap`; a bwrap materialized
+  elsewhere matches no profile and cannot create a namespace, and a user-level tool cannot ship its
+  own profile without root. So the seam chooses **by host** (`pick_bwrap`, pure, the AppArmor branch
+  unit-tested since a host without the restriction cannot flip the sysctl live): `OPS_BWRAP_BIN`
+  override always wins; **unrestricted** → the bundled engine leads (host PATH the fallback);
+  **restricted** → the host engine leads (the same bwrap ops uses today) — **non-regressive by
+  construction**. The pin is a **robustness win ≥ the independence**: ops couples tightly to bwrap
+  flags (`--add-seccomp-fd` / `--unshare-cgroup` / `--new-session`), so owning the version removes
+  the "host bwrap too old / missing flag" failure mode. `build.rs` carries a generalized **`ENGINES`
+  table** driving one `emit_bundled_engine` for both engines, each pinned by its own
+  build-time-verified sha256 (a drift fails the build, loudly); `mise run build-bundled` (needs host
+  nix) realises both `pkgsStatic` attrs from the pinned nixpkgs rev and builds `--features
+  bundled-nix,bundled-bwrap`; `doctor` reports which engine it would use and why (`· bundled engine`
+  / `· host PATH` + an AppArmor note). **The default-feature build is behaviorally unchanged** (host
+  engines), so CI stays embed-free. Verified: **564 tests** + fmt/clippy clean (default features);
+  feature-on `lint-bundled` / `build-bundled` clean (**44.0 MB** musl static, both engines
+  embedded); **live empty-PATH** (no host nix, no host bwrap, overrides unset) `ops doctor`
+  materializes both engines (distinct markers coexist) and launches a real hardened process, and a
+  **cold `ops run -- id`** provisions the base via the embedded nix (downloaded from
+  cache.nixos.org) and launches the hermetic cage via the embedded bwrap → `uid=1000(sandbox)`, exit
+  0 — real work, not `--version`, for both engines. **CI blind spot** (inherent to the feature gate):
+  CI exercises the *default* build (host engines), never the embedded versions, so **a pin bump is
+  not caught by CI** — after bumping either engine, re-run the live cold proof on the shipping musl
+  binary. **Residuals (deferred, named):** the LGPL NOTICE owed before distribution now covers
+  **bwrap too** (nix + bubblewrap are both LGPL); the pins are **x86_64-only** (a 2nd arch needs its
+  own `OPS_BUNDLED_*` + sha per `TARGET`); embedded-bwrap *on* restricted hosts is reachable only via
+  a one-time `sudo`-installed AppArmor profile for the materialized path (a packaging option,
+  explicitly outside the no-privilege runtime promise); and on unrestricted hosts the shipped binary
+  now uses its **own** bwrap by default (surfaced by the `· bundled engine` doctor line,
+  escape-hatched by `OPS_BWRAP_BIN`) — a release-note line for power users with a customized host
+  bwrap. Advisor-reviewed (plan AND impl).
+  **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
   reqwest), so in-cage TLS no longer depends on the host's `/etc/ssl`; and the base
