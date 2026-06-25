@@ -215,7 +215,7 @@ mod resolve_tests {
 
     #[test]
     fn resolves_a_usable_hermetic_userland_from_ops_store() {
-        let Some(nix) = crate::store::resolve_nix() else {
+        let Some(nix) = crate::store::resolve_nix(None) else {
             eprintln!("skipping userland resolution: no nix on PATH");
             return;
         };

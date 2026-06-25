@@ -589,7 +589,7 @@ mod run_tests {
 
     #[test]
     fn runs_mise_from_ops_store_hermetically_and_writes_only_into_ops_data() {
-        let Some(nix) = store::resolve_nix() else {
+        let Some(nix) = store::resolve_nix(None) else {
             eprintln!("skipping mise run: no nix on PATH");
             return;
         };
@@ -677,7 +677,7 @@ mod run_tests {
 
     #[test]
     fn resolve_env_maps_authorized_env_and_ignores_unauthorized_siblings() {
-        let Some(nix) = store::resolve_nix() else {
+        let Some(nix) = store::resolve_nix(None) else {
             eprintln!("skipping mise resolve_env: no nix on PATH");
             return;
         };

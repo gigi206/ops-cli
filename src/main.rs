@@ -186,9 +186,14 @@ fn doctor() -> ExitCode {
     }
     report_resource_limits(&pal);
 
+    // Resolved once and reused below for the store + channel report. Read-only:
+    // it derives paths from the environment, it does not create anything.
+    let layout = store::Layout::from_env();
+
     // The nix that drives the store. Its absence is load-bearing too — without
-    // nix, ops cannot provision a project's tools.
-    match store::resolve_nix() {
+    // nix, ops cannot provision a project's tools. Resolution is read-only here
+    // (override, then an ops-owned engine, then `PATH`), so doctor writes nothing.
+    match store::resolve_nix(layout.as_ref()) {
         Some(nix) => {
             println!("  {} nix               {}", tag_ok(&pal), nix.display());
             if let Some(v) = nix_version(&nix) {
@@ -196,7 +201,7 @@ fn doctor() -> ExitCode {
             }
         }
         None => {
-            println!("  {} nix               not found on PATH", tag_fail(&pal));
+            println!("  {} nix               not found", tag_fail(&pal));
             remediation.push("install nix (the store engine ops drives daemonlessly)");
         }
     }
@@ -217,7 +222,7 @@ fn doctor() -> ExitCode {
     // seeds the channel lock on first launch, so their absence here is informational,
     // not a failure. The channel state is the host-level global lock (doctor has no
     // project context), shown straight from disk.
-    match store::Layout::from_env() {
+    match layout.as_ref() {
         Some(layout) => {
             let dir = layout.store_dir();
             let state = if dir.is_dir() {
@@ -230,7 +235,7 @@ fn doctor() -> ExitCode {
                 tag_ok(&pal),
                 dir.display()
             );
-            match store::read_global_lock(&layout) {
+            match store::read_global_lock(layout) {
                 Some((source, rev)) => println!(
                     "  {} channel           {source} @ {} (locked)",
                     tag_ok(&pal),
@@ -1930,12 +1935,12 @@ fn search_cmd(args: Vec<OsString>) -> ExitCode {
         eprintln!("ops: usage: {}", help::synopsis("search"));
         return ExitCode::from(2);
     };
-    let Some(nix) = store::resolve_nix() else {
-        eprintln!("ops: nix not found — `ops search` needs it to query nixhub. See `ops doctor`.");
-        return ExitCode::FAILURE;
-    };
     let Some(layout) = store::Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let Some(nix) = store::resolve_nix(Some(&layout)) else {
+        eprintln!("ops: nix not found — `ops search` needs it to query nixhub. See `ops doctor`.");
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -2897,12 +2902,12 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         }
     };
 
-    let Some(nix) = store::resolve_nix() else {
-        eprintln!("ops: nix not found — cannot upgrade. See `ops doctor`.");
-        return ExitCode::FAILURE;
-    };
     let Some(layout) = store::Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let Some(nix) = store::resolve_nix(Some(&layout)) else {
+        eprintln!("ops: nix not found — cannot upgrade. See `ops doctor`.");
         return ExitCode::FAILURE;
     };
     let cwd = match std::env::current_dir() {

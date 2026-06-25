@@ -78,6 +78,14 @@ impl Layout {
         &self.data_dir
     }
 
+    /// Where ops places a nix engine it owns — the store-driving `nix`/`nix-store`
+    /// binary, as opposed to the host's. Distinct from the in-cage nix an agent
+    /// self-equips with: this one runs on the host to provision the store. The
+    /// engine resolver consults it ahead of the host `PATH`.
+    pub(crate) fn engine_dir(&self) -> PathBuf {
+        self.data_dir.join("engine")
+    }
+
     /// Where installed resolver plugins live, one directory per plugin. Trusted by
     /// location: a project cannot write here, so a plugin's presence is the user's act.
     pub(crate) fn plugins_dir(&self) -> PathBuf {
@@ -130,19 +138,96 @@ pub(crate) fn ensure(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
-/// Locate the nix binary that drives the store. Resolved from `PATH` for now;
-/// ops will later ship its own (embedded or fetched) nix, and this is the single
-/// seam that will point at it.
-pub(crate) fn resolve_nix() -> Option<PathBuf> {
-    crate::pathfind::find_on_path("nix")
+/// Environment override naming an explicit `nix` binary for ops to drive, ahead of
+/// every other source. Lets a power user — or a test — point ops at a chosen engine.
+/// It names `nix` itself; the sibling commands (`nix-store`, …) are found beside it,
+/// since one multi-call binary backs them all in every nix distribution.
+///
+/// A value that does not point at an existing `nix` is ignored (resolution falls
+/// through), so a stale override never strands ops. But once it *does* resolve, it is
+/// **authoritative**: every engine binary is taken from beside it, never mixed with
+/// the host's — a missing sibling there fails closed rather than silently driving the
+/// store with two different engines.
+const ENGINE_OVERRIDE_ENV: &str = "OPS_NIX_BIN";
+
+/// Locate the `nix` binary that drives the store.
+///
+/// Resolution precedence: the [`ENGINE_OVERRIDE_ENV`] override, then a nix engine ops
+/// owns under the data directory (`<data>/engine/`), then the host `PATH`. The
+/// data-directory tier is where ops will place an engine it ships itself; consulting
+/// it here puts the seam in place, while the `PATH` fallback keeps ops working until
+/// then. `layout` is `None` only when the data directory cannot be resolved (no
+/// `$HOME`), in which case that middle tier is skipped.
+///
+/// Pure resolution — it never writes — so a read-only caller (`ops doctor`) is safe.
+pub(crate) fn resolve_nix(layout: Option<&Layout>) -> Option<PathBuf> {
+    resolve_engine_bin("nix", layout)
 }
 
 /// Locate the `nix-store` binary, the classic command exposing the store's
-/// registration database (`--dump-db`/`--load-db`). Resolved from `PATH` alongside
-/// [`resolve_nix`]; the two ship as siblings in every nix distribution. Consumed by
-/// the per-project store seed the launcher backs the cage's writable `/nix` with.
-pub(crate) fn resolve_nix_store() -> Option<PathBuf> {
-    crate::pathfind::find_on_path("nix-store")
+/// registration database (`--dump-db`/`--load-db`). The same multi-call binary as
+/// `nix`, dispatched by argv0, so it is resolved by the same precedence as
+/// [`resolve_nix`]. Consumed by the per-project store seed the launcher backs the
+/// cage's writable `/nix` with.
+pub(crate) fn resolve_nix_store(layout: Option<&Layout>) -> Option<PathBuf> {
+    resolve_engine_bin("nix-store", layout)
+}
+
+/// Shared resolution for an engine command `name` (`nix`/`nix-store`), reading the
+/// real environment, data directory, and `PATH`. The precedence is factored into
+/// [`pick_engine_bin`] so it is unit-testable without touching any of them.
+fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
+    let override_nix = std::env::var_os(ENGINE_OVERRIDE_ENV).map(PathBuf::from);
+    let owned_dir = layout.map(Layout::engine_dir);
+    pick_engine_bin(
+        name,
+        override_nix.as_deref(),
+        owned_dir.as_deref(),
+        &|p| p.is_file(),
+        &|n| crate::pathfind::find_on_path(n),
+    )
+}
+
+/// Pick the engine binary `name` from the three sources, in precedence order: the
+/// override, then an ops-owned engine directory, then `PATH`. File existence and the
+/// `PATH` lookup are injected so the precedence is testable in isolation.
+///
+/// A *resolved* override (one whose `nix` exists) is authoritative: `name` is taken
+/// from beside it and a missing sibling yields `None` (fail-closed), never a fall-back
+/// to the host's `PATH` — which would drive one store with two different engines. An
+/// override whose `nix` is absent is treated as unset and the next tier applies.
+fn pick_engine_bin(
+    name: &str,
+    override_nix: Option<&Path>,
+    owned_dir: Option<&Path>,
+    exists: &dyn Fn(&Path) -> bool,
+    on_path: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(nix) = override_nix {
+        if exists(nix) {
+            let bin = engine_sibling(nix, name);
+            return exists(&bin).then_some(bin);
+        }
+    }
+    if let Some(dir) = owned_dir {
+        let bin = dir.join(name);
+        if exists(&bin) {
+            return Some(bin);
+        }
+    }
+    on_path(name)
+}
+
+/// Given the path of the `nix` binary, the path of its sibling command `name` in the
+/// same directory; `name == "nix"` is the binary itself.
+fn engine_sibling(nix: &Path, name: &str) -> PathBuf {
+    if name == "nix" {
+        return nix.to_path_buf();
+    }
+    match nix.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
 }
 
 /// Locate the `git` binary that fetches a remote plugin store. Resolved from `PATH`;
@@ -1107,6 +1192,90 @@ mod tests {
         assert!(!is_pinned_revision("nixos-unstable"));
         assert!(!is_pinned_revision("nixos-23.11"));
     }
+
+    #[test]
+    fn engine_sibling_resolves_nix_and_its_neighbours() {
+        let nix = Path::new("/opt/engine/bin/nix");
+        // `nix` itself is the override path verbatim.
+        assert_eq!(
+            engine_sibling(nix, "nix"),
+            PathBuf::from("/opt/engine/bin/nix")
+        );
+        // a sibling command shares the directory.
+        assert_eq!(
+            engine_sibling(nix, "nix-store"),
+            PathBuf::from("/opt/engine/bin/nix-store")
+        );
+        // no parent → the bare command name.
+        assert_eq!(
+            engine_sibling(Path::new("nix"), "nix-store"),
+            PathBuf::from("nix-store")
+        );
+    }
+
+    #[test]
+    fn pick_engine_bin_follows_override_then_owned_then_path() {
+        let over = Path::new("/over/nix");
+        let owned = Path::new("/data/engine");
+        let on_path = |n: &str| Some(PathBuf::from(format!("/usr/bin/{n}")));
+
+        // The override wins when its file exists; nix-store derives as a sibling.
+        let all = |_: &Path| true;
+        assert_eq!(
+            pick_engine_bin("nix", Some(over), Some(owned), &all, &on_path),
+            Some(PathBuf::from("/over/nix"))
+        );
+        assert_eq!(
+            pick_engine_bin("nix-store", Some(over), Some(owned), &all, &on_path),
+            Some(PathBuf::from("/over/nix-store"))
+        );
+
+        // A resolved override is authoritative: a missing sibling fails closed rather
+        // than mixing in the host's nix-store, while `nix` itself still resolves.
+        let only_override_nix = |p: &Path| p == Path::new("/over/nix");
+        assert_eq!(
+            pick_engine_bin("nix", Some(over), Some(owned), &only_override_nix, &on_path),
+            Some(PathBuf::from("/over/nix"))
+        );
+        assert_eq!(
+            pick_engine_bin(
+                "nix-store",
+                Some(over),
+                Some(owned),
+                &only_override_nix,
+                &on_path
+            ),
+            None
+        );
+
+        // An override whose `nix` is absent is treated as unset: the next tier (here
+        // the ops-owned engine directory) applies.
+        let only_owned = |p: &Path| p.starts_with("/data/engine");
+        assert_eq!(
+            pick_engine_bin("nix", Some(over), Some(owned), &only_owned, &on_path),
+            Some(PathBuf::from("/data/engine/nix"))
+        );
+
+        // With neither override nor owned engine present, it falls to `PATH`.
+        let none_exist = |_: &Path| false;
+        assert_eq!(
+            pick_engine_bin("nix", Some(over), Some(owned), &none_exist, &on_path),
+            Some(PathBuf::from("/usr/bin/nix"))
+        );
+
+        // No layout (no owned dir) simply skips that tier.
+        assert_eq!(
+            pick_engine_bin("nix-store", None, None, &none_exist, &on_path),
+            Some(PathBuf::from("/usr/bin/nix-store"))
+        );
+
+        // Nothing anywhere → None; the caller turns it into a pointed error.
+        let no_path = |_: &str| None;
+        assert_eq!(
+            pick_engine_bin("nix", None, None, &none_exist, &no_path),
+            None
+        );
+    }
 }
 
 /// Provisioning a real package needs a real nix, so this is an integration check:
@@ -1119,7 +1288,7 @@ mod provision_tests {
 
     #[test]
     fn provision_realises_a_pinned_package_into_the_user_store_with_a_gcroot() {
-        let Some(nix) = resolve_nix() else {
+        let Some(nix) = resolve_nix(None) else {
             eprintln!("skipping provision: no nix on PATH");
             return;
         };

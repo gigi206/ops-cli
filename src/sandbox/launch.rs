@@ -797,7 +797,7 @@ fn reap_dead_trees(
 /// trade.
 fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
     let (h, r) = (pal.head, pal.reset);
-    let Some(nix_store) = crate::store::resolve_nix_store() else {
+    let Some(nix_store) = crate::store::resolve_nix_store(Some(layout)) else {
         eprintln!("ops gc: nix-store not found; skipping the shared-store gc.");
         return;
     };
@@ -1326,15 +1326,15 @@ fn prepare() -> Result<Prepared, ExitCode> {
         );
         return Err(ExitCode::FAILURE);
     }
-    let Some(nix) = crate::store::resolve_nix() else {
-        return Err(missing("nix (the store engine)"));
-    };
-    let Some(nix_store) = crate::store::resolve_nix_store() else {
-        return Err(missing("nix-store (the store database tool)"));
-    };
     let Some(layout) = Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return Err(ExitCode::FAILURE);
+    };
+    let Some(nix) = crate::store::resolve_nix(Some(&layout)) else {
+        return Err(missing("nix (the store engine)"));
+    };
+    let Some(nix_store) = crate::store::resolve_nix_store(Some(&layout)) else {
+        return Err(missing("nix-store (the store database tool)"));
     };
     let cwd = match std::env::current_dir() {
         Ok(d) => d,

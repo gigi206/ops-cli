@@ -1331,7 +1331,7 @@ mod smoke {
         if !matches!(crate::probe_userns(), crate::Userns::Ok) {
             return None;
         }
-        let nix = crate::store::resolve_nix()?;
+        let nix = crate::store::resolve_nix(None)?;
         Some((bwrap, nix))
     }
 
@@ -1626,7 +1626,7 @@ mod smoke {
             eprintln!("skipping per-project store flip smoke: need bwrap, userns, and nix");
             return;
         };
-        let Some(nix_store) = crate::store::resolve_nix_store() else {
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
             eprintln!("skipping per-project store flip smoke: need nix-store");
             return;
         };
@@ -1790,7 +1790,7 @@ mod smoke {
             eprintln!("skipping nix-in-cage smoke: need bwrap, userns, and nix");
             return;
         };
-        let Some(nix_store) = crate::store::resolve_nix_store() else {
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
             eprintln!("skipping nix-in-cage smoke: need nix-store");
             return;
         };
@@ -1990,7 +1990,7 @@ mod smoke {
             eprintln!("skipping mise self-equip smoke: need bwrap, userns, and nix");
             return;
         };
-        let Some(nix_store) = crate::store::resolve_nix_store() else {
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
             eprintln!("skipping mise self-equip smoke: need nix-store");
             return;
         };
@@ -2124,7 +2124,7 @@ mod smoke {
             eprintln!("skipping mise activation smoke: need bwrap, userns, and nix");
             return;
         };
-        let Some(nix_store) = crate::store::resolve_nix_store() else {
+        let Some(nix_store) = crate::store::resolve_nix_store(None) else {
             eprintln!("skipping mise activation smoke: need nix-store");
             return;
         };

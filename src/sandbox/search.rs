@@ -527,7 +527,7 @@ mod search_tests {
 
     #[test]
     fn searches_a_known_package_and_surfaces_its_versions() {
-        let Some(nix) = store::resolve_nix() else {
+        let Some(nix) = store::resolve_nix(None) else {
             eprintln!("skipping nixhub search: no nix on PATH");
             return;
         };

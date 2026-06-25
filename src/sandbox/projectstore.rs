@@ -885,7 +885,7 @@ mod smoke {
 
     /// `(nix, nix-store)` when both are present; otherwise `None` to skip.
     fn prerequisites() -> Option<(PathBuf, PathBuf)> {
-        Some((store::resolve_nix()?, store::resolve_nix_store()?))
+        Some((store::resolve_nix(None)?, store::resolve_nix_store(None)?))
     }
 
     fn ino(path: &Path) -> (u64, u64) {

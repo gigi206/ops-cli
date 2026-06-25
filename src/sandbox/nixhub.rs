@@ -974,7 +974,7 @@ mod resolve_tests {
 
     #[test]
     fn resolves_a_known_package_to_a_pinned_commit_and_attribute() {
-        let Some(nix) = store::resolve_nix() else {
+        let Some(nix) = store::resolve_nix(None) else {
             eprintln!("skipping nixhub resolution: no nix on PATH");
             return;
         };
@@ -1004,7 +1004,7 @@ mod resolve_tests {
 
     #[test]
     fn provisions_a_trusted_nix_tool_and_withholds_an_untrusted_one() {
-        let Some(nix) = store::resolve_nix() else {
+        let Some(nix) = store::resolve_nix(None) else {
             eprintln!("skipping nix-tool provisioning: no nix on PATH");
             return;
         };
