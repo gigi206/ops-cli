@@ -1516,6 +1516,76 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
 }
 
 #[test]
+fn config_show_app_shows_the_effective_config_with_inheritance() {
+    let fx = Fixture::new();
+    // A baseline `[limits]` (global, trusted by location) the app inherits, plus a profile (also
+    // trusted by location) that sets its own command, network, and one limit. `config show --app`
+    // then tells the inheritance story end-to-end: the fields the app set read `app:global`, the
+    // ones it left alone read `inherited` and show the baseline's effective value.
+    fx.write_global("[limits]\nmemory_high = \"70%\"\n");
+    fx.write_profile(
+        "demo",
+        "cmd = \"demo-agent\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [limits]\ntasks_max = 2048\n[env]\nDEMO_TOKEN = \"placeholder\"\n",
+    );
+
+    let out = fx.run(&["config", "show", "--app", "demo"]);
+    assert!(out.status.success(), "config show --app must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The app set these — attributed to the app's global declaration.
+    assert!(
+        stdout.contains("cmd:     demo-agent  (app:global)"),
+        "the command the app set must read app:global:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("network: allowlist  (app:global)"),
+        "the network the app set must read app:global:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("TasksMax=2048 (app:global)"),
+        "the task cap the app set must read app:global:\n{stdout}"
+    );
+    // The app left these alone — inherited from the baseline (the throttle the baseline set; the
+    // GUI default). This is the headline the per-app view exists for.
+    assert!(
+        stdout.contains("gui:     none  (inherited)"),
+        "the untouched gui must read inherited:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("MemoryHigh=70% (inherited)"),
+        "the throttle the app left to the baseline must read inherited at the baseline's value:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("env:     1 own"),
+        "the overlay's own env count must show:\n{stdout}"
+    );
+
+    // An unknown app fails and names the declared ones.
+    let out = fx.run(&["config", "show", "--app", "nope"]);
+    assert!(!out.status.success(), "an unknown app must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no app named") && stderr.contains("demo"),
+        "the error must name the unknown app and list the declared ones:\n{stderr}"
+    );
+
+    // `--json` emits the machine-readable model, carrying the per-field provenance.
+    let out = fx.run(&["config", "show", "--app", "demo", "--json"]);
+    assert!(
+        out.status.success(),
+        "config show --app --json must succeed"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("--app --json must emit valid JSON");
+    assert_eq!(doc["name"], "demo");
+    assert_eq!(
+        doc["cmd_origin"], "Global",
+        "the JSON carries the command's provenance"
+    );
+    assert_eq!(doc["gui_origin"], "Inherited", "and the inherited GUI's");
+}
+
+#[test]
 fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     let fx = Fixture::new();
     // A profile whose credential lives in the app overlay — the common case, since the shipped

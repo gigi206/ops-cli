@@ -714,10 +714,20 @@ fn config_cmd(args: Vec<OsString>) -> ExitCode {
 fn config_show(args: &[OsString]) -> ExitCode {
     let mut json = false;
     let mut details = false;
-    for arg in args {
+    let mut app: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
         match arg.to_str() {
             Some("--json") => json = true,
             Some("--details") => details = true,
+            Some("--app") => match it.next() {
+                Some(name) => app = Some(name.to_string_lossy().into_owned()),
+                None => {
+                    eprintln!("ops: config show: `--app` needs an app name");
+                    eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+                    return ExitCode::from(2);
+                }
+            },
             _ => {
                 eprintln!(
                     "ops: config show: unexpected argument {:?}",
@@ -736,6 +746,13 @@ fn config_show(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // `--app <name>` focuses on one app's *effective* configuration with provenance, instead of the
+    // whole resolved baseline.
+    if let Some(name) = app {
+        return config_show_app(&cwd, &name, json, details);
+    }
+
     let view = config::view::build(&cwd);
 
     if json {
@@ -759,6 +776,40 @@ fn config_show(args: &[OsString]) -> ExitCode {
     for w in &view.warnings {
         diag::warn(w);
     }
+    ExitCode::SUCCESS
+}
+
+/// Render one app's effective configuration with provenance — the `config show --app <name>` path.
+/// Errors (listing the declared apps) when no such app exists.
+fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCode {
+    let Some(view) = config::view::build_app_detail(cwd, name) else {
+        eprintln!("ops: config show: no app named {name:?}");
+        let declared: Vec<String> = config::view::build(cwd)
+            .apps
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        if declared.is_empty() {
+            eprintln!("ops: no apps are declared for this directory");
+        } else {
+            eprintln!("ops: declared apps: {}", declared.join(", "));
+        }
+        return ExitCode::FAILURE;
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&view) {
+            Ok(doc) => println!("{doc}"),
+            Err(e) => {
+                eprintln!("ops: cannot serialize the app configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_app_detail(&view, &pal, details));
     ExitCode::SUCCESS
 }
 
@@ -789,6 +840,31 @@ fn provenance_parts(
         ProvenanceView::Default => ("default", pal.dim),
         ProvenanceView::Global => ("global", pal.name),
         ProvenanceView::Project => ("project", pal.ok),
+        ProvenanceView::Inherited => ("inherited", pal.dim),
+    }
+}
+
+/// The provenance tag for a field in the per-app detail view, hued by the same level scale but
+/// labelled in the app's vocabulary: a value the app declaration set reads `app:global`/`app:project`
+/// (not the baseline `global`/`project`), one it left to the baseline reads `inherited`.
+fn app_provenance_tag(origin: config::view::ProvenanceView, pal: &style::Palette) -> String {
+    let (label, span) = app_provenance_parts(origin, pal);
+    format!("  {span}({label}){r}", r = pal.reset)
+}
+
+/// The label and color span for a provenance level in the per-app view — the one place the app
+/// vocabulary lives (so the inline `limits` cells and the end-of-line tag cannot drift). Same hues
+/// as [`provenance_parts`]: a configured source is cyan/green, a default or inherited value dim.
+fn app_provenance_parts(
+    origin: config::view::ProvenanceView,
+    pal: &style::Palette,
+) -> (&'static str, &'static str) {
+    use config::view::ProvenanceView;
+    match origin {
+        ProvenanceView::Default => ("default", pal.dim),
+        ProvenanceView::Global => ("app:global", pal.name),
+        ProvenanceView::Project => ("app:project", pal.ok),
+        ProvenanceView::Inherited => ("inherited", pal.dim),
     }
 }
 
@@ -1192,6 +1268,183 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     }
 
     o
+}
+
+/// Render one app's *effective* configuration with per-field provenance — the `config show --app
+/// <name>` view. Every scalar shows the value the app would launch with, tagged `app:global`/
+/// `app:project` (the app set it) or `inherited` (it took the baseline's); collections show the
+/// overlay's own additions and a count of the baseline entries they inherit, with the entry lists
+/// and the allowlist rules expanded under `--details`. Color and layout only over
+/// [`config::view::AppDetailView`]; every span empties under a non-terminal.
+fn render_app_detail(
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+) -> String {
+    use config::view::{GuiView, LimitView, NetworkView};
+    use std::fmt::Write as _;
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let mut o = String::new();
+
+    let _ = writeln!(
+        o,
+        "{h}ops config{r} — app {n}{}{r} resolved for {n}{}{r}",
+        view.name, view.cwd
+    );
+
+    // The command — never inherited (the baseline carries none of its own).
+    match &view.cmd {
+        Some(cmd) => {
+            let _ = writeln!(
+                o,
+                "  {h}cmd:{r}     {cmd}{}",
+                app_provenance_tag(view.cmd_origin, pal)
+            );
+        }
+        None => {
+            let _ = writeln!(o, "  {h}cmd:{r}     {warn}(no command){r}");
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  {h}home:{r}    {}{}",
+        view.home_scope,
+        app_provenance_tag(view.home_scope_origin, pal)
+    );
+
+    // The effective network posture + provenance; the allowlist's rules expand under `--details`.
+    let net_tag = app_provenance_tag(view.network_origin, pal);
+    match &view.network {
+        NetworkView::Shared => {
+            let _ = writeln!(o, "  {h}network:{r} shared {dim}(host network){r}{net_tag}");
+        }
+        NetworkView::Isolated => {
+            let _ = writeln!(
+                o,
+                "  {h}network:{r} none {dim}(isolated — no network){r}{net_tag}"
+            );
+        }
+        NetworkView::Allowlist {
+            allow,
+            deny,
+            builtin,
+        } => {
+            let _ = writeln!(o, "  {h}network:{r} allowlist{net_tag}");
+            if details {
+                for rule in allow {
+                    let _ = writeln!(o, "    allow {n}{rule}{r}");
+                }
+                for rule in deny {
+                    let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+                }
+                let _ = writeln!(
+                    o,
+                    "    {dim}built-in (always allowed, so self-equip works):{r}"
+                );
+                for host in builtin {
+                    let _ = writeln!(o, "      allow {n}{host}{r}");
+                }
+                let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
+            } else {
+                let _ = writeln!(
+                    o,
+                    "    {dim}({} allow, {} deny — see --details){r}",
+                    allow.len(),
+                    deny.len()
+                );
+            }
+        }
+    }
+
+    // The effective GUI posture — shown even when `none`, so the inherited story is visible.
+    let gui_tag = app_provenance_tag(view.gui_origin, pal);
+    match view.gui {
+        GuiView::Wayland => {
+            let _ = writeln!(
+                o,
+                "  {h}gui:{r}     wayland {dim}(exposure depends on your compositor){r}{gui_tag}"
+            );
+        }
+        GuiView::None => {
+            let _ = writeln!(o, "  {h}gui:{r}     none{gui_tag}");
+        }
+    }
+
+    // The effective cgroup limits — every field its provenance (inherited from the baseline, or the
+    // app layer that tuned it).
+    let cell = |label_name: &str, v: &LimitView| {
+        let (label, span) = app_provenance_parts(v.origin, pal);
+        format!("{label_name}={} {span}({label}){r}", v.value)
+    };
+    let l = &view.limits;
+    let _ = writeln!(
+        o,
+        "  {h}limits:{r}  {}, {}, {}",
+        cell("MemoryHigh", &l.memory_high),
+        cell("MemoryMax", &l.memory_max),
+        cell("TasksMax", &l.tasks_max),
+    );
+
+    // Collections: the overlay's own additions and how many baseline entries it inherits. The own
+    // entry lists expand under `--details`; the inherited baseline entries are not re-listed (they
+    // are one hop away in `ops config show`).
+    let _ = writeln!(
+        o,
+        "  {h}env:{r}     {}",
+        collection_summary(view.env.len(), view.env_inherited, pal)
+    );
+    if details {
+        for e in &view.env {
+            let _ = writeln!(o, "    {n}{}{r}={}", e.key, e.value);
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  {h}binds:{r}   {}",
+        collection_summary(view.binds.len(), view.binds_inherited, pal)
+    );
+    if details {
+        for b in &view.binds {
+            let _ = writeln!(o, "    {n}{b}{r}");
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  {h}packages:{r} {}",
+        collection_summary(view.packages.len(), view.packages_inherited, pal)
+    );
+    if details {
+        for p in &view.packages {
+            let _ = writeln!(o, "{}", package_line(p, pal, "    "));
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  {h}secrets:{r} {}",
+        collection_summary(view.secrets.len(), view.secrets_inherited, pal)
+    );
+    if details {
+        for s in &view.secrets {
+            let _ = writeln!(
+                o,
+                "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
+                s.header, s.to, s.shape, s.sources
+            );
+        }
+    }
+
+    for note in &view.notes {
+        let _ = writeln!(o, "  {warn}note: {note}{r}");
+    }
+    o
+}
+
+/// The compact summary for a per-app collection: `<own> own · inherits <n> baseline`. The own count
+/// rides the name span (the app's own contribution), the inherited count is dim (it lives in the
+/// baseline `ops config show`).
+fn collection_summary(own: usize, inherited: usize, pal: &style::Palette) -> String {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    format!("{n}{own}{r} own  {dim}· inherits {inherited} baseline{r}")
 }
 
 /// One package's detail line, indented by `indent`: `<name> -> <backend>:<locator>  (<detail>)`,
@@ -4300,6 +4553,75 @@ mod tests {
         assert!(
             out.contains("gui: wayland (exposure depends on your compositor)  (global)"),
             "the gui posture must carry its global origin:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_app_detail_shows_effective_values_tagged_inherited_or_app_set() {
+        use config::view::*;
+        let p = style::Palette::plain();
+        let view = AppDetailView {
+            name: "demo".into(),
+            cwd: "/proj".into(),
+            cmd: Some("demo-agent".into()),
+            cmd_origin: ProvenanceView::Global,
+            home_scope: "global (shared across projects)".into(),
+            home_scope_origin: ProvenanceView::Default,
+            network: NetworkView::Allowlist {
+                allow: vec!["api.example.com".into()],
+                deny: vec![],
+                builtin: vec!["cache.nixos.org".into()],
+            },
+            network_origin: ProvenanceView::Global,
+            gui: GuiView::None,
+            gui_origin: ProvenanceView::Inherited,
+            limits: LimitsView {
+                memory_high: LimitView {
+                    value: "70%".into(),
+                    origin: ProvenanceView::Inherited,
+                },
+                memory_max: LimitView {
+                    value: "90%".into(),
+                    origin: ProvenanceView::Inherited,
+                },
+                tasks_max: LimitView {
+                    value: "2048".into(),
+                    origin: ProvenanceView::Project,
+                },
+            },
+            env: vec![AppEnvVar {
+                key: "DEMO_TOKEN".into(),
+                value: "placeholder".into(),
+            }],
+            env_inherited: 2,
+            binds: vec![],
+            binds_inherited: 0,
+            packages: vec![],
+            packages_inherited: 0,
+            secrets: vec![],
+            secrets_inherited: 0,
+            notes: vec![],
+        };
+
+        // Compact: each scalar carries its effective value + app-context provenance — the headline
+        // being that an unset field reads `inherited` (its effective value comes from the baseline).
+        let out = render_app_detail(&view, &p, false);
+        assert!(out.contains("cmd:     demo-agent  (app:global)"), "{out}");
+        assert!(out.contains("gui:     none  (inherited)"), "{out}");
+        assert!(out.contains("network: allowlist  (app:global)"), "{out}");
+        assert!(out.contains("(1 allow, 0 deny — see --details)"), "{out}");
+        // Per-field limits: two inherited from the baseline, the task cap set by the app.
+        assert!(out.contains("MemoryHigh=70% (inherited)"), "{out}");
+        assert!(out.contains("TasksMax=2048 (app:project)"), "{out}");
+        // Collections summarize the overlay's own count and the inherited baseline count.
+        assert!(out.contains("1 own  · inherits 2 baseline"), "{out}");
+
+        // Details expand the allowlist rules and the overlay's own env entries.
+        let detailed = render_app_detail(&view, &p, true);
+        assert!(detailed.contains("    allow api.example.com"), "{detailed}");
+        assert!(
+            detailed.contains("    DEMO_TOKEN=placeholder"),
+            "{detailed}"
         );
     }
 

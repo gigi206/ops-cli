@@ -405,7 +405,10 @@ fn base64_encode(input: &[u8]) -> String {
 /// Where a resolved value came from — the provenance `ops config` surfaces so a value's origin
 /// is never a mystery. `Default` is ops's built-in; `Global`/`Project` are the two config files.
 /// A later layer overrides an earlier one at the same key, so for a value this is the *winning*
-/// source. The launcher ignores it (provenance is a display affordance).
+/// source. The launcher ignores it (provenance is a display affordance). Inheritance — an app
+/// field taking the baseline's value — is a *display* concept derived at view time (the resolution
+/// never inherits), so it lives only on the view-side [`view::ProvenanceView`](super::view), not
+/// here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum Provenance {
     /// ops's built-in default — no config layer set this value.
@@ -542,6 +545,16 @@ pub(crate) struct ResolvedApp {
     pub(crate) limits: crate::sandbox::cgroup::Limits,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
+    /// Per-field provenance of this app's *scalar* overlay fields, for the per-app `ops config`
+    /// view — which app layer (`Global`/`Project`) set each. Read only when the app actually set
+    /// the field; an unset scalar is shown as inherited from the baseline. `home_scope_origin` is
+    /// `None` for the built-in default (`Global`), since the home scope is an app-only concept with
+    /// no baseline to inherit. The launcher ignores all of these (a display affordance).
+    pub(crate) cmd_origin: Provenance,
+    pub(crate) network_origin: Provenance,
+    pub(crate) gui_origin: Provenance,
+    pub(crate) limits_origin: LimitsOrigin,
+    pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `ops run`.
     pub(crate) warnings: Vec<String>,
@@ -1073,6 +1086,15 @@ fn resolve_app(
     // route the untrusted run into the home a trusted run shares.
     let mut home_scope = AppHomeScope::Global;
     let mut home_scope_trusted = false;
+    // Per-field provenance of the scalar overlay fields, for the per-app `ops config` view: which
+    // app layer set each, recorded at the same point the value is. A scalar the overlay never sets
+    // stays `Default` here and the view shows it inherited from the baseline; `home_scope_origin`
+    // stays `None` for the built-in default.
+    let mut cmd_origin = Provenance::Default;
+    let mut network_origin = Provenance::Default;
+    let mut gui_origin = Provenance::Default;
+    let mut limits_origin = LimitsOrigin::default();
+    let mut home_scope_origin: Option<Provenance> = None;
 
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
@@ -1088,15 +1110,20 @@ fn resolve_app(
             false,
         );
         if let Some(field) = app.network {
-            network = validate_network(&mut warnings, &source, field);
+            if let Some(policy) = validate_network(&mut warnings, &source, field) {
+                network = Some(policy);
+                network_origin = Provenance::Global;
+            }
         }
         if let Some(value) = app.gui {
-            gui = validate_gui(&mut warnings, &source, value);
+            if let Some(policy) = validate_gui(&mut warnings, &source, value) {
+                gui = Some(policy);
+                gui_origin = Provenance::Global;
+            }
         }
-        overlay_limits(
-            &mut limits,
-            validate_limits(&mut warnings, &source, app.limits),
-        );
+        let global_limits = validate_limits(&mut warnings, &source, app.limits);
+        mark_limit_origins(&mut limits_origin, &global_limits, Provenance::Global);
+        overlay_limits(&mut limits, global_limits);
         if let Some(section) = app.secret {
             apply_app_secret(
                 &mut secrets,
@@ -1110,11 +1137,13 @@ fn resolve_app(
         if let Some(c) = app.cmd {
             cmd = c.into_argv();
             cmd_trusted = true;
+            cmd_origin = Provenance::Global;
         }
         if let Some(raw) = app.home_scope {
             if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
                 home_scope = scope;
                 home_scope_trusted = true;
+                home_scope_origin = Some(Provenance::Global);
             }
         }
     }
@@ -1145,6 +1174,7 @@ fn resolve_app(
             if trusted {
                 if let Some(policy) = validate_network(&mut warnings, &source, field) {
                     network = Some(policy);
+                    network_origin = Provenance::Project;
                 }
             } else {
                 warnings.push(format!(
@@ -1160,6 +1190,7 @@ fn resolve_app(
             if trusted {
                 if let Some(policy) = validate_gui(&mut warnings, &source, value) {
                     gui = Some(policy);
+                    gui_origin = Provenance::Project;
                 }
             } else {
                 warnings.push(format!(
@@ -1174,10 +1205,9 @@ fn resolve_app(
         // is what keeps a globally-defined app's tight limits intact under an untrusted project.
         if let Some(raw) = app.limits {
             if trusted {
-                overlay_limits(
-                    &mut limits,
-                    validate_limits(&mut warnings, &source, Some(raw)),
-                );
+                let project_limits = validate_limits(&mut warnings, &source, Some(raw));
+                mark_limit_origins(&mut limits_origin, &project_limits, Provenance::Project);
+                overlay_limits(&mut limits, project_limits);
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `[limits]` ({})",
@@ -1208,6 +1238,7 @@ fn resolve_app(
         if let Some(c) = app.cmd {
             if trusted || !cmd_trusted {
                 cmd = c.into_argv();
+                cmd_origin = Provenance::Project;
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `cmd` override of a trusted app ({})",
@@ -1222,6 +1253,7 @@ fn resolve_app(
             if trusted || !home_scope_trusted {
                 if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
                     home_scope = scope;
+                    home_scope_origin = Some(Provenance::Project);
                 }
             } else {
                 warnings.push(format!(
@@ -1242,6 +1274,11 @@ fn resolve_app(
         gui,
         limits,
         secrets,
+        cmd_origin,
+        network_origin,
+        gui_origin,
+        limits_origin,
+        home_scope_origin,
         warnings,
     }
 }
@@ -3161,6 +3198,79 @@ mod tests {
     }
 
     #[test]
+    fn an_apps_scalar_origins_record_which_app_layer_set_each_field() {
+        // The data behind `config show --app`: each scalar the app overlay sets is attributed to
+        // its app layer; an untouched scalar keeps the default origin, so the detail view shows it
+        // inherited from the baseline.
+        let global = raw_with_app(
+            "demo",
+            RawApp {
+                limits: Some(app_raw_limits(None, None, Some("2048"))),
+                ..raw_app(
+                    &["demo-agent"],
+                    &[],
+                    &[],
+                    &[],
+                    Some(NetworkField::Posture("none".into())),
+                )
+            },
+        );
+        let resolved = resolve_no_plugins(global, None);
+        let app = &resolved.apps["demo"];
+        assert_eq!(
+            app.cmd_origin,
+            Provenance::Global,
+            "the global app set the command"
+        );
+        assert_eq!(app.network_origin, Provenance::Global, "and the network");
+        assert_eq!(
+            app.limits_origin.tasks_max,
+            Provenance::Global,
+            "and the task cap"
+        );
+        // A scalar the app left alone keeps its default origin and sets no value of its own.
+        assert_eq!(app.gui_origin, Provenance::Default);
+        assert!(app.gui.is_none());
+        assert_eq!(app.home_scope_origin, None);
+        assert_eq!(app.limits_origin.memory_high, Provenance::Default);
+
+        // A trusted project overriding a field is attributed to the project layer, while a field it
+        // does not touch keeps the global app's attribution.
+        let global = raw_with_app(
+            "demo",
+            raw_app(
+                &["demo-agent"],
+                &[],
+                &[],
+                &[],
+                Some(NetworkField::Posture("none".into())),
+            ),
+        );
+        let project = raw_with_app(
+            "demo",
+            raw_app(
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(NetworkField::Posture("shared".into())),
+            ),
+        );
+        let resolved = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        let app = &resolved.apps["demo"];
+        assert_eq!(
+            app.network_origin,
+            Provenance::Project,
+            "the project overrode the network"
+        );
+        assert_eq!(
+            app.cmd_origin,
+            Provenance::Global,
+            "the command stayed the global app's"
+        );
+    }
+
+    #[test]
     fn an_app_home_scope_defaults_to_global_and_a_trusted_layer_may_set_project() {
         // Unset → the global default. A trusted layer (here the global config) may pin it.
         let plain = raw_with_app("demo-app", raw_app(&["demo-app"], &[], &[], &[], None));
@@ -3574,6 +3684,11 @@ mod tests {
                 ..Default::default()
             },
             secrets: vec![],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
             warnings: vec![],
         };
         base.merge_app(app);
@@ -3614,6 +3729,11 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
             warnings: vec![],
         };
         base.merge_app(app);
@@ -3639,6 +3759,11 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
             warnings: vec![],
         };
         base.merge_app(app);

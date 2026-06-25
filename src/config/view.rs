@@ -80,13 +80,15 @@ pub(crate) struct BindView {
 }
 
 /// Where a resolved value came from — the presentation-agnostic mirror of [`super::Provenance`].
-/// `Default` is ops's built-in, `Global`/`Project` the two config files.
+/// `Default` is ops's built-in, `Global`/`Project` the two config files; `Inherited` is the per-app
+/// view's marker for a field the app overlay did not set (it takes the baseline's value).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum ProvenanceView {
     #[default]
     Default,
     Global,
     Project,
+    Inherited,
 }
 
 impl From<super::Provenance> for ProvenanceView {
@@ -299,6 +301,53 @@ pub(crate) struct AppView {
     /// default and lists each under `--details`.
     pub(crate) secrets: Vec<SecretView>,
     /// Per-app notes about what its resolution dropped or ignored.
+    pub(crate) notes: Vec<String>,
+}
+
+/// The *effective* configuration one app launches with — the baseline folded with the app's
+/// overlay — annotated, field by field, with where each value came from: `inherited` (the overlay
+/// set none of its own, so the baseline's value stands), `app:global`/`app:project` (the app
+/// declaration in that config file set it). This is what `ops config show --app <name>` renders,
+/// and it answers "what does this app actually run with, and which of it did the app change?" — a
+/// view the compact baseline `apps:` section (overlay-own only) cannot give. Scalars carry their
+/// effective value plus a [`ProvenanceView`]; collections carry the overlay's *own* additions plus
+/// a count of how many baseline entries they inherit (never the inherited entries themselves —
+/// those live in the baseline `ops config show`, one hop away).
+#[derive(Serialize)]
+pub(crate) struct AppDetailView {
+    pub(crate) name: String,
+    pub(crate) cwd: String,
+    /// The argv joined for display, or `None` when no layer declared one (an unlaunchable app).
+    pub(crate) cmd: Option<String>,
+    /// Which app layer set the command (`Global`/`Project`); never inherited (the baseline has no
+    /// command of its own).
+    pub(crate) cmd_origin: ProvenanceView,
+    pub(crate) home_scope: String,
+    /// `Default` for the built-in `global` scope, else which app layer set it.
+    pub(crate) home_scope_origin: ProvenanceView,
+    /// The effective network posture (the app's own, else the baseline's).
+    pub(crate) network: NetworkView,
+    pub(crate) network_origin: ProvenanceView,
+    /// The effective GUI posture (the app's own, else the baseline's).
+    pub(crate) gui: GuiView,
+    pub(crate) gui_origin: ProvenanceView,
+    /// The effective cgroup limits — the app's overrides folded onto the baseline — each field
+    /// carrying its provenance (`Inherited` when the app left it to the baseline).
+    pub(crate) limits: LimitsView,
+    /// The environment this app *adds* over the baseline (its overlay-own entries), and how many
+    /// baseline entries it inherits unchanged.
+    pub(crate) env: Vec<AppEnvVar>,
+    pub(crate) env_inherited: usize,
+    /// The read-only binds this app adds, and the count it inherits from the baseline.
+    pub(crate) binds: Vec<String>,
+    pub(crate) binds_inherited: usize,
+    /// The packages this app declares (its own), and the count it inherits from the baseline.
+    pub(crate) packages: Vec<PackageView>,
+    pub(crate) packages_inherited: usize,
+    /// The credentials this app injects (its own), and the count it inherits from the baseline.
+    pub(crate) secrets: Vec<SecretView>,
+    pub(crate) secrets_inherited: usize,
+    /// Notes about what this app's resolution dropped or ignored.
     pub(crate) notes: Vec<String>,
 }
 
@@ -614,6 +663,140 @@ fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
     })
 }
 
+/// Assemble the per-app detail view for `name` in `cwd` — the effective configuration `ops app
+/// <name>` would launch with, annotated with provenance. `None` when no such app is declared (the
+/// CLI then errors, listing the available names). Pure data gathering, like [`build`].
+pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> {
+    let resolved = super::load(cwd);
+    let app = resolved.apps.get(name)?;
+    let flake_pins = sandbox::flake_pinned_revs(cwd);
+    Some(app_detail_view(cwd, name, app, &resolved, &flake_pins))
+}
+
+/// Project one app's effective configuration plus per-field provenance: a scalar the app set is
+/// attributed to its app layer, one it left alone is `Inherited` and shows the baseline's value;
+/// collections carry the overlay's own entries and a count of the baseline entries they inherit
+/// (those a same-key overlay entry shadows are not counted as inherited).
+fn app_detail_view(
+    cwd: &Path,
+    name: &str,
+    app: &super::ResolvedApp,
+    baseline: &Resolved,
+    flake_pins: &BTreeMap<String, String>,
+) -> AppDetailView {
+    // Effective network/GUI: the app's own posture when it set one, else the baseline's.
+    let network = network_view(app.network.as_ref().unwrap_or(&baseline.network));
+    let network_origin = origin_or_inherited(app.network.is_some(), app.network_origin);
+    let eff_gui = app.gui.unwrap_or(baseline.gui);
+    let gui = match eff_gui {
+        super::GuiPolicy::Wayland => GuiView::Wayland,
+        super::GuiPolicy::None => GuiView::None,
+    };
+    let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
+
+    // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
+    // app's when it set the field, else inherited from the baseline.
+    let mut eff_limits = baseline.limits.clone();
+    super::overlay_limits(&mut eff_limits, app.limits.clone());
+    let limit = |(value, _ov): (String, bool), set: bool, origin: super::Provenance| LimitView {
+        value,
+        origin: origin_or_inherited(set, origin),
+    };
+    let limits = LimitsView {
+        memory_high: limit(
+            eff_limits.memory_high(),
+            app.limits.memory_high.is_some(),
+            app.limits_origin.memory_high,
+        ),
+        memory_max: limit(
+            eff_limits.memory_max(),
+            app.limits.memory_max.is_some(),
+            app.limits_origin.memory_max,
+        ),
+        tasks_max: limit(
+            eff_limits.tasks_max(),
+            app.limits.tasks_max.is_some(),
+            app.limits_origin.tasks_max,
+        ),
+    };
+
+    // Collections: the overlay's own entries, plus how many baseline entries are inherited. For
+    // `env`/`packages` a baseline entry shadowed by a same-key/-name overlay entry is not inherited;
+    // `binds`/`secrets` are additive, so every baseline entry is inherited.
+    let env_inherited = baseline
+        .env
+        .iter()
+        .filter(|(k, _)| !app.env.iter().any(|(ak, _)| ak == k))
+        .count();
+    let packages_inherited = baseline
+        .packages
+        .iter()
+        .filter(|p| !app.packages.iter().any(|ap| ap.name == p.name))
+        .count();
+
+    AppDetailView {
+        name: name.to_string(),
+        cwd: cwd.display().to_string(),
+        cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
+        cmd_origin: app.cmd_origin.into(),
+        home_scope: match app.home_scope {
+            super::AppHomeScope::Global => "global (shared across projects)".to_string(),
+            super::AppHomeScope::Project => "per-project".to_string(),
+        },
+        home_scope_origin: app
+            .home_scope_origin
+            .map_or(ProvenanceView::Default, Into::into),
+        network,
+        network_origin,
+        gui,
+        gui_origin,
+        limits,
+        env: app
+            .env
+            .iter()
+            .map(|(key, value)| AppEnvVar {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        env_inherited,
+        binds: app
+            .ro_binds
+            .iter()
+            .map(|b| b.display().to_string())
+            .collect(),
+        binds_inherited: baseline.ro_binds.len(),
+        packages: app
+            .packages
+            .iter()
+            .map(|p| package_view(p, flake_pins))
+            .collect(),
+        packages_inherited,
+        secrets: app
+            .secrets
+            .iter()
+            .map(|s| SecretView {
+                header: s.header.clone(),
+                to: s.to.to_string(),
+                shape: s.shape.describe(),
+                sources: s.describe_sources(),
+            })
+            .collect(),
+        secrets_inherited: baseline.secrets.len(),
+        notes: app.warnings.clone(),
+    }
+}
+
+/// A scalar app field's provenance for the detail view: the app layer that set it when it did,
+/// else `Inherited` (the field took the baseline's value).
+fn origin_or_inherited(app_set: bool, origin: super::Provenance) -> ProvenanceView {
+    if app_set {
+        origin.into()
+    } else {
+        ProvenanceView::Inherited
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,10 +993,103 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
             warnings: vec![],
         };
         let view = app_view("demo-app", &app, &pins);
         assert_eq!(view.packages[0].name, "pinned-tool");
         assert_eq!(view.packages[0].pinned_rev.as_deref(), Some(rev));
+    }
+
+    /// The increment's core guard: `app_detail_view` computes the effective network/gui/limits by
+    /// mirroring `merge_app`'s precedence rather than calling it (it needs the per-field "did the
+    /// app set this" the merge discards). Pin the two together — a drift in `merge_app` must fail
+    /// here, not silently make `config show --app` misreport what the app actually launches with.
+    #[test]
+    fn the_detail_views_effective_scalars_agree_with_merge_app() {
+        use crate::config::{AppHomeScope, GuiPolicy, Provenance, ResolvedApp};
+        let baseline = Resolved {
+            env: vec![],
+            env_layer: Default::default(),
+            ro_binds: vec![],
+            bind_layer: Default::default(),
+            packages: vec![],
+            nixpkgs_global: None,
+            nixpkgs_project: None,
+            mise: None,
+            network: NetworkPolicy::Shared,
+            network_origin: Provenance::Default,
+            gui: GuiPolicy::Wayland,
+            gui_origin: Provenance::Global,
+            limits: sandbox::cgroup::Limits {
+                memory_high: Some("50%".into()),
+                memory_max: None,
+                tasks_max: None,
+            },
+            limits_origin: Default::default(),
+            secrets: vec![],
+            apps: Default::default(),
+            warnings: vec![],
+        };
+        // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
+        let app = ResolvedApp {
+            cmd: vec!["demo".into()],
+            home_scope: AppHomeScope::Global,
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            network: Some(NetworkPolicy::Isolated),
+            gui: None,
+            limits: sandbox::cgroup::Limits {
+                memory_high: None,
+                memory_max: None,
+                tasks_max: Some("99".into()),
+            },
+            secrets: vec![],
+            cmd_origin: Provenance::Global,
+            network_origin: Provenance::Global,
+            gui_origin: Provenance::Default,
+            limits_origin: crate::config::LimitsOrigin {
+                memory_high: Provenance::Default,
+                memory_max: Provenance::Default,
+                tasks_max: Provenance::Global,
+            },
+            home_scope_origin: None,
+            warnings: vec![],
+        };
+
+        let mut merged = baseline.clone();
+        merged.merge_app(app.clone());
+        let detail = app_detail_view(
+            std::path::Path::new("/proj"),
+            "demo",
+            &app,
+            &baseline,
+            &BTreeMap::new(),
+        );
+
+        // Network (the app overrode it) and GUI (the app inherited it) must both equal what the
+        // merge launches; comparing the projected forms keeps it independent of the policy types.
+        assert_eq!(
+            serde_json::to_value(&detail.network).unwrap(),
+            serde_json::to_value(network_view(&merged.network)).unwrap(),
+            "effective network must match merge_app"
+        );
+        assert_eq!(
+            matches!(merged.gui, GuiPolicy::Wayland),
+            matches!(detail.gui, GuiView::Wayland),
+            "effective GUI must match merge_app"
+        );
+        // Every limit field's effective value must equal merge_app's, override or inherited.
+        assert_eq!(
+            detail.limits.memory_high.value,
+            merged.limits.memory_high().0
+        );
+        assert_eq!(detail.limits.memory_max.value, merged.limits.memory_max().0);
+        assert_eq!(detail.limits.tasks_max.value, merged.limits.tasks_max().0);
     }
 }

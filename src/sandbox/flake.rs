@@ -353,6 +353,11 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
             warnings: vec![],
         }
     }

@@ -298,6 +298,45 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   `limits … TasksMax=4096 (global)`), advisor-reviewed (plan AND impl — the impl review added the
   explicit-default discriminating test and the channel-seam test, and confirmed keeping the renderer
   mapping over a `ChannelView` field).
+  **`config show --app <name>` value provenance — apps (DONE 2026-06-25)** (`src/config/mod.rs` +
+  `config/view.rs` + `main.rs` + `tests/config.rs`): the second provenance increment — a dedicated
+  per-app view answering "what does this app *actually* launch with, and which of it did the app
+  change?", which the compact baseline `apps:` section (overlay-own only) cannot. `ops config show
+  --app <name>` renders the app's **effective** configuration (baseline folded with the overlay)
+  field by field, each scalar tagged `app:global`/`app:project` (the app declaration set it) or
+  **`inherited`** (it took the baseline's value) — so the inheritance the user said the feature
+  needed ("sinon ça ne veut pas dire grand chose") is finally visible (`gui: none (inherited)`,
+  `MemoryHigh=70% (inherited)` from the baseline, `TasksMax=2048 (app:global)` set by the app). Same
+  per-level coloring as the baseline (cyan/green/dim), with an **app-context label vocabulary**
+  (`app_provenance_parts`: `Global`→`app:global`, `Project`→`app:project`) over the same hues.
+  **`Inherited` lives only on the view-side `ProvenanceView`, never `Provenance`** (the resolution
+  never inherits — inheritance is *derived at view time* from the absence of an overlay value, the
+  advisor's call). `resolve_app` records per-field app-layer origin (`cmd_origin`/`network_origin`/
+  `gui_origin`/`limits_origin`/`home_scope_origin` on `ResolvedApp`, set at each assignment in the
+  global-then-project blocks); `app_detail_view` computes effective value + provenance, falling back
+  to the baseline (passed in — the one new plumb) for an unset scalar. **Collections
+  (env/binds/packages/secrets) are NOT re-listed** — they show the overlay's *own* additions + a
+  count of inherited baseline entries (a same-key/-name overlay entry shadows its baseline twin in
+  the `env`/`packages` count), so `--app` never becomes a baseline echo; `--details` expands the
+  allowlist rules and the own-entry lists. `--json` emits the serializable `AppDetailView`.
+  **The increment's core guard (advisor-required):** `app_detail_view` *mirrors* `merge_app`'s
+  precedence (it needs the per-field "did the app set this" the merge discards) rather than calling
+  it, so a unit test pins the two together — `baseline.clone().merge_app(app)` ’s effective
+  network/gui/limits must equal the detail view's — and a `merge_app` drift fails loudly instead of
+  silently making `--app` misreport what the app launches. **587 `--bins`** (net +3: `resolve_app`
+  per-field origin recording, the `render_app_detail` output, the merge_app-agreement guard) **+ 57
+  config** (the `config show --app` e2e: app:global vs inherited end-to-end, the unknown-app error,
+  and `--json` carrying the provenance), full suite green incl. **run.rs 28 (launch non-regression —
+  `resolve_app` is on the `ops app` launch path)**, fmt + clippy clean, **std-only (no new dep)**,
+  live-verified, advisor-reviewed (plan AND impl — the impl review required the merge_app-agreement
+  guard and the `--json` coverage, both added). **Named residual (documented, not fixed — the
+  advisor's call, consistent with the existing `apps:` section so no regression):** the detail view
+  does not apply `enforce_secret_posture` (which a launch runs to clear *all* secrets when the
+  effective network is not an allowlist), so an app that inherits baseline secrets while narrowing
+  its network to `none`/`shared` would show a secret count the launch drops to zero. **Scope: the
+  provenance axis (baseline + apps) is complete;** the deferred/provisional increment 3 (write-side
+  `--app` sugar — `app.<name>.<key>` already works as a dotted key — and `show --global/--local/
+  --default` single-source views) stays optional, to reassess if a concrete need appears.
   **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's
