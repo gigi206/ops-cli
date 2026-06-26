@@ -210,15 +210,15 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "get"],
-        synopsis: "ops config get <key> [--local|--global|-c <file>] [--app <name>]",
+        synopsis: "ops config get <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>]",
         summary: "read a value from a single config file",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or nixpkgs"),
-            ("--local", "the project .ops.toml (the default)"),
-            ("--global", "the global ops.toml"),
+            ("-l, --local", "the project .ops.toml (the default)"),
+            ("-g, --global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
             (
-                "--app <name>",
+                "-a, --app <name>",
                 "address the key under that app's table (app.<name>.<key>)",
             ),
         ],
@@ -234,16 +234,16 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "set"],
-        synopsis: "ops config set <key> <value> [--local|--global|-c <file>] [--app <name>] [--trust]",
+        synopsis: "ops config set <key> <value> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
         summary: "set a value in a config file (comments preserved)",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or network"),
             ("<value>", "the string value to set"),
-            ("--local", "the project .ops.toml (the default)"),
-            ("--global", "the global ops.toml"),
+            ("-l, --local", "the project .ops.toml (the default)"),
+            ("-g, --global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
             (
-                "--app <name>",
+                "-a, --app <name>",
                 "address the key under that app's table (app.<name>.<key>)",
             ),
             (
@@ -267,15 +267,15 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "unset"],
-        synopsis: "ops config unset <key> [--local|--global|-c <file>] [--app <name>] [--trust]",
+        synopsis: "ops config unset <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
         summary: "remove a key from a config file",
         options: &[
             ("<key>", "a dotted key to remove, e.g. env.FOO"),
-            ("--local", "the project .ops.toml (the default)"),
-            ("--global", "the global ops.toml"),
+            ("-l, --local", "the project .ops.toml (the default)"),
+            ("-g, --global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
             (
-                "--app <name>",
+                "-a, --app <name>",
                 "address the key under that app's table (app.<name>.<key>)",
             ),
             ("--trust", "re-trust the file after writing"),
@@ -291,11 +291,11 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "path"],
-        synopsis: "ops config path [--local|--global|-c <file>]",
+        synopsis: "ops config path [-l|--local|-g|--global|-c <file>]",
         summary: "print the path of the config file a scope targets",
         options: &[
-            ("--local", "the project .ops.toml (the default)"),
-            ("--global", "the global ops.toml"),
+            ("-l, --local", "the project .ops.toml (the default)"),
+            ("-g, --global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
         ],
         details: "Prints the path of the file the given scope targets — the file get/set/unset\n\
@@ -303,11 +303,11 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "edit"],
-        synopsis: "ops config edit [--local|--global|-c <file>] [--trust]",
+        synopsis: "ops config edit [-l|--local|-g|--global|-c <file>] [--trust]",
         summary: "open a config file in your editor",
         options: &[
-            ("--local", "the project .ops.toml (the default)"),
-            ("--global", "the global ops.toml"),
+            ("-l, --local", "the project .ops.toml (the default)"),
+            ("-g, --global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
             ("--trust", "re-trust the file after editing"),
         ],
@@ -319,7 +319,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "show"],
-        synopsis: "ops config show [--json] [--details] [--app <name>] [--global|--local|--default]",
+        synopsis: "ops config show [--json] [--details] [-a|--app <name>] [-g|--global|-l|--local|-d|--default]",
         summary: "show the resolved configuration for the current project",
         options: &[
             (
@@ -331,15 +331,15 @@ const PAGES: &[Page] = &[
                 "expand each app overlay's compact summary (env, binds, packages, allowlist rules, and injected credentials)",
             ),
             (
-                "--app <name>",
+                "-a, --app <name>",
                 "show one app's effective configuration, each field tagged inherited or set by the app",
             ),
             (
-                "--global",
+                "-g, --global",
                 "show only what the global config (and imported profiles) contributes",
             ),
-            ("--local", "show only what the project .ops.toml contributes"),
-            ("--default", "show the built-in defaults alone (no config)"),
+            ("-l, --local", "show only what the project .ops.toml contributes"),
+            ("-d, --default", "show the built-in defaults alone (no config)"),
         ],
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
@@ -354,7 +354,8 @@ const PAGES: &[Page] = &[
             global config plus any imported app profiles set (the project is ignored), --local\n\
             what the project .ops.toml sets (the global config and profiles ignored), and\n\
             --default the built-in defaults alone. The flags are mutually exclusive; with none,\n\
-            the full layered configuration is shown.\n\
+            the full layered configuration is shown. Each has a short form — -g, -l, -d, and -a\n\
+            for --app; note -d is --default, so --details has no short form.\n\
             \n\
             With --app <name>, the view is one app's effective configuration — the baseline\n\
             folded with the app's overlay — each field tagged (inherited) when it takes the\n\

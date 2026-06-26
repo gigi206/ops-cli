@@ -1802,6 +1802,65 @@ fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
 }
 
 #[test]
+fn config_short_flags_alias_their_long_forms() {
+    let fx = Fixture::new();
+    fx.write_global("[env]\nGLOBAL_VAR = \"g\"\n");
+    fx.write_project("[env]\nPROJECT_VAR = \"p\"\n");
+
+    // `-g` on `show` is `--global`: the global var, not the project's.
+    let out = fx.run(&["config", "show", "-g"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("GLOBAL_VAR=g  (global)") && !stdout.contains("PROJECT_VAR"),
+        "-g must alias --global:\n{stdout}"
+    );
+
+    // `-l` on `show` is `--local`: the project's var, not the global's.
+    let out = fx.run(&["config", "show", "-l"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("PROJECT_VAR=p  (project)") && !stdout.contains("GLOBAL_VAR"),
+        "-l must alias --local:\n{stdout}"
+    );
+
+    // `-d` on `show` is `--default`: neither layer's var.
+    let out = fx.run(&["config", "show", "-d"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("GLOBAL_VAR") && !stdout.contains("PROJECT_VAR"),
+        "-d must alias --default:\n{stdout}"
+    );
+
+    // `-a` on the write verbs is `--app`: `set -a` writes under the app's table, `-g` targets the
+    // global file.
+    let out = fx.run(&["config", "set", "-a", "demo", "-g", "cmd", "mytool"]);
+    assert!(out.status.success(), "set -a -g must succeed");
+    let global = fx.config_home.path().join("ops").join("ops.toml");
+    let body = std::fs::read_to_string(&global).unwrap();
+    assert!(
+        body.contains("[app.demo]") && body.contains("cmd = \"mytool\""),
+        "-a writes the app table into the -g (global) file:\n{body}"
+    );
+
+    // `get -a -g` reads it back from the same global file.
+    let out = fx.run(&["config", "get", "-a", "demo", "-g", "cmd"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mytool");
+
+    // `-a` on `show` is `--app`: the per-app effective view (a distinct parser from the write verbs)
+    // — the global app just written is visible.
+    let out = fx.run(&["config", "show", "-a", "demo"]);
+    assert!(out.status.success(), "show -a must succeed");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("mytool"),
+        "show -a must render the app's effective cmd"
+    );
+}
+
+#[test]
 fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     let fx = Fixture::new();
     // A profile whose credential lives in the app overlay — the common case, since the shipped

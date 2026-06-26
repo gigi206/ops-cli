@@ -743,7 +743,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--json") => json = true,
             Some("--details") => details = true,
-            Some("--app") => match it.next() {
+            Some("--app") | Some("-a") => match it.next() {
                 Some(name) => app = Some(name.to_string_lossy().into_owned()),
                 None => {
                     eprintln!("ops: config show: `--app` needs an app name");
@@ -751,18 +751,18 @@ fn config_show(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
-            Some("--global") => {
+            Some("--global") | Some("-g") => {
                 if let Err(code) = set_show_source(&mut source, "--global", config::Source::Global)
                 {
                     return code;
                 }
             }
-            Some("--local") => {
+            Some("--local") | Some("-l") => {
                 if let Err(code) = set_show_source(&mut source, "--local", config::Source::Local) {
                     return code;
                 }
             }
-            Some("--default") => {
+            Some("--default") | Some("-d") => {
                 if let Err(code) =
                     set_show_source(&mut source, "--default", config::Source::Default)
                 {
@@ -1575,10 +1575,10 @@ fn channel_origin_kind(label: &str) -> config::view::ProvenanceView {
     }
 }
 
-/// The trailing flags every `config` management verb accepts: the target scope (`--local`
-/// default, `--global`, `-c`/`--config <file>`), `--trust`, and the cross-cutting `--app <name>`
-/// that rewrites a key under that app's table. A verb consumes the fields it supports and rejects
-/// the rest (`path`/`edit` have no key, so they reject `--app`).
+/// The trailing flags every `config` management verb accepts: the target scope (`-l`/`--local`
+/// default, `-g`/`--global`, `-c`/`--config <file>`), `--trust`, and the cross-cutting
+/// `-a`/`--app <name>` that rewrites a key under that app's table. A verb consumes the fields it
+/// supports and rejects the rest (`path`/`edit` have no key, so they reject `--app`).
 struct ScopeArgs {
     positionals: Vec<String>,
     scope: config::manage::Scope,
@@ -1603,15 +1603,15 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
         }
         match arg.to_str() {
             Some("--") => only_positional = true,
-            Some("--local") => scope = Scope::Local,
-            Some("--global") => scope = Scope::Global,
+            Some("--local") | Some("-l") => scope = Scope::Local,
+            Some("--global") | Some("-g") => scope = Scope::Global,
             Some("-c") | Some("--config") => {
                 let file = it
                     .next()
                     .ok_or_else(|| "`-c` needs a file path".to_string())?;
                 scope = Scope::File(PathBuf::from(file));
             }
-            Some("--app") => {
+            Some("--app") | Some("-a") => {
                 let name = it
                     .next()
                     .ok_or_else(|| "`--app` needs an app name".to_string())?;
@@ -4810,6 +4810,29 @@ mod tests {
         assert!(set_show_source(&mut src, "--global", config::Source::Global).is_ok());
         // A different source flag is a conflict, not last-wins.
         assert!(set_show_source(&mut src, "--local", config::Source::Local).is_err());
+    }
+
+    #[test]
+    fn split_scope_accepts_the_short_scope_flags() {
+        use config::manage::Scope;
+        let osv = |parts: &[&str]| -> Vec<OsString> { parts.iter().map(OsString::from).collect() };
+
+        // `-l`/`-g` alias `--local`/`--global`; `-a` aliases `--app`.
+        let parsed = split_scope(&osv(&["network", "-g"])).unwrap();
+        assert!(matches!(parsed.scope, Scope::Global));
+        assert_eq!(parsed.positionals, vec!["network".to_string()]);
+
+        let parsed = split_scope(&osv(&["-l", "network"])).unwrap();
+        assert!(matches!(parsed.scope, Scope::Local));
+
+        let parsed = split_scope(&osv(&["-a", "demo", "cmd"])).unwrap();
+        assert_eq!(parsed.app.as_deref(), Some("demo"));
+        assert_eq!(parsed.positionals, vec!["cmd".to_string()]);
+
+        // `-c <file>` is unchanged and still needs its argument.
+        let parsed = split_scope(&osv(&["-c", "/tmp/x.toml", "k"])).unwrap();
+        assert!(matches!(parsed.scope, Scope::File(_)));
+        assert!(split_scope(&osv(&["-a"])).is_err());
     }
 
     #[test]
