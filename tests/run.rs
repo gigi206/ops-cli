@@ -730,6 +730,123 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 }
 
 #[test]
+fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
+    // The allow-by-default (denylist) mode through the real launch. A trusted `network = "allow"`
+    // stands up the same Model-B filtering proxy as the allowlist e2e (empty netns + in-cage
+    // forwarder + injected CA), with the verdict flipped so an unmatched host is allowed. This is a
+    // WIRING smoke: it proves the allow-mode policy parses, resolves, the proxy serves under it,
+    // the MITM terminates a real fetch, a deny carve-out still produces a 403 at the proxy, and the
+    // supervised exit propagates. The ISOLATING verdict teeth — an unlisted host passing the
+    // verdict under allow-by-default while deny-by-default blocks it — are the deterministic proxy
+    // unit tests, because a loopback test upstream cannot stand in for an unlisted *public* host.
+    // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("allowmode-proj");
+    let data = TmpDir::new("allowmode-data");
+    let state = TmpDir::new("allowmode-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allow\"\ndeny = [\"example.com/nix-cache-info\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net, allow-mode dropped): seeds the store too, so a
+    // later egress failure is a real fault rather than a cold cage.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping allow-mode egress e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping allow-mode egress e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // trust the project so its allow-mode posture is honored (a security field).
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // exit-status propagation on the supervised (filtered) path
+    let seven = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", "exit 7"],
+    );
+    assert_eq!(
+        seven.status.code(),
+        Some(7),
+        "exit status not propagated on the supervised allow-mode path: {}",
+        String::from_utf8_lossy(&seven.stderr)
+    );
+
+    // ALLOWED: a real fetch serves through the allow-mode proxy and returns the known
+    // nix-cache-info content hash — the forwarder bridged the empty netns, nix trusted the MITM
+    // leaf, and the bytes relayed intact under the new mode.
+    let allowed = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "nix-prefetch-url",
+            "--type",
+            "sha256",
+            "https://cache.nixos.org/nix-cache-info",
+        ],
+    );
+    assert!(
+        allowed.status.success(),
+        "allowed egress failed under allow mode: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&allowed.stdout)
+            .contains("15sqg1j6gq6081nk0v5c6npadlswb9238l336wb2g9bmmrry779c"),
+        "allowed fetch did not return the expected nix-cache-info hash: {}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+
+    // DENIED: the deny carve-out still wins under allow-by-default. The 403 is the proxy's verdict
+    // (the deny rule matched the path), so it does not depend on `example.com` being reachable.
+    let denied = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "nix-prefetch-url",
+            "--type",
+            "sha256",
+            "https://example.com/nix-cache-info",
+        ],
+    );
+    assert!(
+        !denied.status.success(),
+        "a deny carve-out unexpectedly succeeded under allow mode: {}",
+        String::from_utf8_lossy(&denied.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("403"),
+        "the deny carve-out must be refused with a 403 at the proxy: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+}
+
+#[test]
 fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     // The real desktop-agent posture: `gui = "wayland"` AND `network = "allowlist"` open at once,
     // each stacking its own binds and env into one cage. The display socket (a local Unix socket,

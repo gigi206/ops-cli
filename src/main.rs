@@ -935,7 +935,7 @@ fn opt_provenance_tag(
 }
 
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
-    use config::view::{AppNetworkView, GuiView, LimitView, NetworkView};
+    use config::view::{AppNetworkView, GuiView, LimitView, NetDefaultView, NetworkView};
     use std::fmt::Write as _;
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
@@ -1071,30 +1071,62 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             );
         }
         NetworkView::Allowlist {
+            default_action,
             allow,
             deny,
             builtin,
         } => {
-            let _ = writeln!(o, "  {h}network:{r} allowlist{net_tag}");
-            if allow.is_empty() {
-                let _ = writeln!(o, "    allow: {dim}(none declared){r}");
-            } else {
-                for rule in allow {
-                    let _ = writeln!(o, "    allow {n}{rule}{r}");
-                }
-            }
-            // Deny wins over allow, so the keyword takes the caution hue.
-            for rule in deny {
-                let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
-            }
             let _ = writeln!(
                 o,
-                "    {dim}built-in (always allowed, so self-equip works):{r}"
+                "  {h}network:{r} {}{net_tag}",
+                net_mode_word(*default_action)
             );
-            for host in builtin {
-                let _ = writeln!(o, "      allow {n}{host}{r}");
+            match default_action {
+                // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
+                NetDefaultView::Deny => {
+                    if allow.is_empty() {
+                        let _ = writeln!(
+                            o,
+                            "    {dim}allow: (none declared beyond the built-in set){r}"
+                        );
+                    } else {
+                        for rule in allow {
+                            let _ = writeln!(o, "    allow {n}{rule}{r}");
+                        }
+                    }
+                    // Deny wins over allow, so the keyword takes the caution hue.
+                    for rule in deny {
+                        let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+                    }
+                    let _ = writeln!(
+                        o,
+                        "    {dim}built-in (always allowed, so self-equip works):{r}"
+                    );
+                    for host in builtin {
+                        let _ = writeln!(o, "      allow {n}{host}{r}");
+                    }
+                    let _ = writeln!(o, "    {dim}(deny wins; an unlisted host is denied){r}");
+                }
+                // Denylist: every public host reaches except the deny carve-outs; the proxy stays
+                // active. The allow rules only relax the SSRF private-host guard here (every public
+                // host is already permitted), and the built-in set is moot, so neither is led with.
+                NetDefaultView::Allow => {
+                    let _ = writeln!(o, "    {dim}every public host is reachable except:{r}");
+                    if deny.is_empty() {
+                        let _ = writeln!(o, "    {dim}deny: (none declared){r}");
+                    } else {
+                        for rule in deny {
+                            let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+                        }
+                    }
+                    if !allow.is_empty() {
+                        let _ = writeln!(o, "    {dim}allow (private-host exceptions only):{r}");
+                        for rule in allow {
+                            let _ = writeln!(o, "      allow {n}{rule}{r}");
+                        }
+                    }
+                }
             }
-            let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
         }
     }
 
@@ -1234,11 +1266,16 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                         );
                     }
                     AppNetworkView::Allowlist {
+                        default_action,
                         allow,
                         deny,
                         builtin,
                     } if details => {
-                        let _ = writeln!(o, "      {dim}network:{r} allowlist");
+                        let _ = writeln!(
+                            o,
+                            "      {dim}network:{r} {}",
+                            net_mode_word(*default_action)
+                        );
                         for rule in allow {
                             let _ = writeln!(o, "        allow {n}{rule}{r}");
                         }
@@ -1254,10 +1291,16 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                         }
                         let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
                     }
-                    AppNetworkView::Allowlist { allow, deny, .. } => {
+                    AppNetworkView::Allowlist {
+                        default_action,
+                        allow,
+                        deny,
+                        ..
+                    } => {
                         let _ = writeln!(
                             o,
-                            "      {dim}network:{r} allowlist {dim}({} allow, {} deny){r}",
+                            "      {dim}network:{r} {} {dim}({} allow, {} deny){r}",
+                            net_mode_word(*default_action),
                             allow.len(),
                             deny.len()
                         );
@@ -1382,11 +1425,16 @@ fn render_app_detail(
             );
         }
         NetworkView::Allowlist {
+            default_action,
             allow,
             deny,
             builtin,
         } => {
-            let _ = writeln!(o, "  {h}network:{r} allowlist{net_tag}");
+            let _ = writeln!(
+                o,
+                "  {h}network:{r} {}{net_tag}",
+                net_mode_word(*default_action)
+            );
             if details {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
@@ -2536,6 +2584,17 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            // A one-line header so an ALLOWED/DENIED verdict on an arbitrary URL is
+            // self-explanatory — it names the default the policy applies to an unmatched request.
+            let mode = match policy.default_action() {
+                allowlist::DefaultAction::Deny => {
+                    "deny (allowlist — only listed/built-in hosts reach)"
+                }
+                allowlist::DefaultAction::Allow => {
+                    "allow (denylist — every public host reaches except the deny rules)"
+                }
+            };
+            println!("{h}network:{r} {mode}");
             let decision = policy.explain(&host, port, &path);
             print!("{}", render_net_decision(url, &decision, &pal));
             ExitCode::SUCCESS
@@ -2564,8 +2623,22 @@ fn render_net_decision(url: &str, decision: &allowlist::Decision, pal: &style::P
             let _ = writeln!(o, "{err}DENIED{r}   {n}{url}{r}");
             let _ = writeln!(o, "  {dim}no allow rule matches (deny-by-default){r}");
         }
+        allowlist::Decision::AllowedDefault => {
+            let _ = writeln!(o, "{ok}ALLOWED{r}  {n}{url}{r}");
+            let _ = writeln!(o, "  {dim}no deny rule matches (allow-by-default){r}");
+        }
     }
     o
+}
+
+/// The displayed keyword for a filtered-egress policy's default action: `allow` (a denylist —
+/// everything public reaches except the deny rules) or `deny` (an allowlist — only the listed and
+/// built-in hosts reach). Used wherever `ops config` renders a filtered network posture.
+fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
+    match default_action {
+        config::view::NetDefaultView::Deny => "deny",
+        config::view::NetDefaultView::Allow => "allow",
+    }
 }
 
 /// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
@@ -4578,6 +4651,7 @@ mod tests {
                 locked_rev: None,
             },
             network: NetworkView::Allowlist {
+                default_action: config::view::NetDefaultView::Deny,
                 allow: vec!["github.com".into()],
                 deny: vec!["evil.com".into()],
                 builtin: vec!["cache.nixos.org".into()],
@@ -4690,7 +4764,7 @@ mod tests {
         // posture came from. The sample's allowlist is project-supplied, so it reads `(project)`.
         let out = render_config(&sample_config_view(), &plain, false);
         assert!(
-            out.contains("network: allowlist  (project)"),
+            out.contains("network: deny  (project)"),
             "the network posture must carry its project origin:\n{out}"
         );
 
@@ -4727,6 +4801,7 @@ mod tests {
             home_scope: "global (shared across projects)".into(),
             home_scope_origin: ProvenanceView::Default,
             network: NetworkView::Allowlist {
+                default_action: config::view::NetDefaultView::Deny,
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
@@ -4767,7 +4842,7 @@ mod tests {
         let out = render_app_detail(&view, &p, false);
         assert!(out.contains("cmd:     demo-agent  (app:global)"), "{out}");
         assert!(out.contains("gui:     none  (inherited)"), "{out}");
-        assert!(out.contains("network: allowlist  (app:global)"), "{out}");
+        assert!(out.contains("network: deny  (app:global)"), "{out}");
         assert!(out.contains("(1 allow, 0 deny — see --details)"), "{out}");
         // Per-field limits: two inherited from the baseline, the task cap set by the app.
         assert!(out.contains("MemoryHigh=70% (inherited)"), "{out}");
@@ -5072,6 +5147,7 @@ mod tests {
                 binds: vec![],
                 packages: vec![],
                 network: Some(AppNetworkView::Allowlist {
+                    default_action: config::view::NetDefaultView::Deny,
                     allow: vec!["api.example.com".into(), "github.com".into()],
                     deny: vec!["github.com/secret".into()],
                     builtin: vec!["cache.nixos.org".into()],
@@ -5087,7 +5163,7 @@ mod tests {
         // Default: a compact count, both numbers present even at zero deny, no expanded rule.
         let compact = render_config(&view, &style::Palette::plain(), false);
         assert!(
-            compact.contains("      network: allowlist (2 allow, 1 deny)"),
+            compact.contains("      network: deny (2 allow, 1 deny)"),
             "the default app allowlist must read as compact counts:\n{compact}"
         );
         assert!(

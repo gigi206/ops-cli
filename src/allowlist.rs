@@ -363,17 +363,52 @@ impl fmt::Display for Rule {
     }
 }
 
-/// A classified egress policy: an allow list and a deny list. Deny wins. An empty allow
-/// list permits nothing (deny-by-default), regardless of the deny list.
+/// What a request that matches no rule gets — the policy's default action, orthogonal to
+/// the allow/deny lists. `Deny` is the classic allowlist (nothing reaches but the listed
+/// hosts); `Allow` is a denylist (everything public reaches *except* the listed hosts), with
+/// the filtering proxy still active so deny carve-outs, the SSRF guard, credential injection,
+/// and redaction all keep working. (`Ask` — park the request for a live decision — is a later
+/// increment.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DefaultAction {
+    /// No rule matched ⇒ deny (the classic allowlist; the default).
+    #[default]
+    Deny,
+    /// No rule matched ⇒ allow (a denylist; the proxy stays active for the matched-deny,
+    /// SSRF, injection, and redaction paths).
+    Allow,
+}
+
+/// A classified egress policy: an allow list, a deny list, and a default action for a request
+/// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
+/// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
+/// SSRF private-host exception (every public host is already permitted).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
+    default_action: DefaultAction,
 }
 
 impl EgressPolicy {
+    /// A deny-by-default policy (the classic allowlist). Use [`Self::with_default`] to make it
+    /// a denylist.
     pub(crate) fn new(allow: Vec<Rule>, deny: Vec<Rule>) -> Self {
-        Self { allow, deny }
+        Self {
+            allow,
+            deny,
+            default_action: DefaultAction::Deny,
+        }
+    }
+
+    /// Set the action a request matching no rule gets, returning the policy (builder style).
+    pub(crate) fn with_default(mut self, action: DefaultAction) -> Self {
+        self.default_action = action;
+        self
+    }
+
+    pub(crate) fn default_action(&self) -> DefaultAction {
+        self.default_action
     }
 
     pub(crate) fn allow_rules(&self) -> &[Rule] {
@@ -391,14 +426,18 @@ impl EgressPolicy {
     /// exercised only by tests.
     #[allow(dead_code)]
     pub(crate) fn permits(&self, host: &str, port: u16, path: &str) -> bool {
-        matches!(self.explain(host, port, path), Decision::AllowedBy(_))
+        matches!(
+            self.explain(host, port, path),
+            Decision::AllowedBy(_) | Decision::AllowedDefault
+        )
     }
 
     /// Explain the verdict for a request to `host`:`port` for `path`, naming the deciding
     /// rule. Deny wins: a matching deny rule decides even when an allow rule also matches;
-    /// otherwise a matching allow rule; otherwise deny-by-default (no allow matched). The
-    /// request is canonicalized once (host lowercased, path percent-decoded / `.`/`..`
-    /// resolved / query dropped) so every rule sees the same evasion-proof view.
+    /// otherwise a matching allow rule; otherwise the policy's default action (deny- or
+    /// allow-by-default). The request is canonicalized once (host lowercased, path
+    /// percent-decoded / `.`/`..` resolved / query dropped) so every rule sees the same
+    /// evasion-proof view.
     pub(crate) fn explain(&self, host: &str, port: u16, path: &str) -> Decision<'_> {
         let req = Request::new(host, port, path);
         if let Some(rule) = self.deny.iter().find(|r| r.matches(&req)) {
@@ -407,7 +446,10 @@ impl EgressPolicy {
         if let Some(rule) = self.allow.iter().find(|r| r.matches(&req)) {
             return Decision::AllowedBy(rule);
         }
-        Decision::DeniedDefault
+        match self.default_action {
+            DefaultAction::Deny => Decision::DeniedDefault,
+            DefaultAction::Allow => Decision::AllowedDefault,
+        }
     }
 }
 
@@ -420,8 +462,11 @@ pub(crate) enum Decision<'a> {
     DeniedBy(&'a Rule),
     /// An allow rule matched and no deny rule did.
     AllowedBy(&'a Rule),
-    /// No allow rule matched — denied by default.
+    /// No rule matched, and the policy denies by default (the classic allowlist).
     DeniedDefault,
+    /// No rule matched, and the policy allows by default (a denylist). There is no deciding
+    /// rule, so the SSRF guard treats this like an unnamed host (private addresses refused).
+    AllowedDefault,
 }
 
 /// Whether `rule` matches a request to `host`:`port` for `target`, canonicalized exactly
@@ -1381,6 +1426,50 @@ mod tests {
         let p = EgressPolicy::default();
         assert!(!p.permits("example.com", 443, "/"));
         assert!(p.allow_rules().is_empty() && p.deny_rules().is_empty());
+    }
+
+    #[test]
+    fn default_deny_is_the_constructor_default() {
+        // `new` and `Default` both deny by default: an unmatched host gets `DeniedDefault`.
+        let p = EgressPolicy::new(vec![rule("github.com")], vec![]);
+        assert_eq!(p.default_action(), DefaultAction::Deny);
+        assert_eq!(p.explain("other.com", 443, "/"), Decision::DeniedDefault);
+        assert_eq!(
+            EgressPolicy::default().default_action(),
+            DefaultAction::Deny
+        );
+    }
+
+    #[test]
+    fn default_allow_permits_the_unmatched_but_deny_still_wins() {
+        // A denylist: allow-by-default with a deny carve-out. The default action flips the verdict
+        // for an unmatched host, but deny still wins and a matching allow is still named.
+        let p =
+            EgressPolicy::new(vec![], vec![rule("evil.com")]).with_default(DefaultAction::Allow);
+        assert_eq!(p.default_action(), DefaultAction::Allow);
+
+        // an unlisted host is now permitted (the whole point of allow-by-default)
+        assert!(p.permits("anything.example", 443, "/"));
+        assert_eq!(
+            p.explain("anything.example", 443, "/"),
+            Decision::AllowedDefault
+        );
+
+        // a deny rule still wins, even under allow-by-default
+        assert!(!p.permits("evil.com", 443, "/"));
+        assert!(matches!(
+            p.explain("evil.com", 443, "/"),
+            Decision::DeniedBy(_)
+        ));
+
+        // an explicit allow rule is still reported as `AllowedBy` (it names the deciding rule),
+        // which the SSRF private-host exception relies on — `AllowedDefault` has no such rule
+        let q =
+            EgressPolicy::new(vec![rule("10.0.0.1")], vec![]).with_default(DefaultAction::Allow);
+        assert!(matches!(
+            q.explain("10.0.0.1", 443, "/"),
+            Decision::AllowedBy(_)
+        ));
     }
 
     #[test]

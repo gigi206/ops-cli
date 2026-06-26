@@ -1,5 +1,5 @@
-//! The host-side egress proxy: a TLS-terminating allowlisting proxy that is the cage's only
-//! path to the network under `[network] mode = "allowlist"`.
+//! The host-side egress proxy: a TLS-terminating filtering proxy that is the cage's only
+//! path to the network under a filtered-egress posture (`[network] mode = "deny"` or `"allow"`).
 //!
 //! The cage runs in an empty network namespace, so its sole egress is a Unix socket bound
 //! into it; an in-cage forwarder bridges the tool's `http_proxy`/`https_proxy` to this host
@@ -353,7 +353,7 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
 /// `deciding`. Public addresses are reachable; a private address is reachable only when the
 /// deciding rule named this exact host (a deliberate internal target — not a `*.domain`/regex/
 /// nix-cache match, which would turn into an SSRF wildcard); a blocked address never is.
-fn ip_permitted(ip: IpAddr, host: &str, deciding: &Rule) -> bool {
+fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
     match classify_ip(ip) {
         IpClass::Public => true,
         IpClass::Blocked => false,
@@ -362,8 +362,13 @@ fn ip_permitted(ip: IpAddr, host: &str, deciding: &Rule) -> bool {
 }
 
 /// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). Used to
-/// gate the private-IP exception.
-fn names_exact_host(host: &str, deciding: &Rule) -> bool {
+/// gate the private-IP exception. With no deciding rule — an allow-by-default verdict — the
+/// exception never applies, so a private/loopback address is refused (a denylist opens public
+/// egress, not the host's own internal services).
+fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
+    let Some(deciding) = deciding else {
+        return false;
+    };
     let h = allowlist::canonical_host(host);
     match deciding {
         Rule::Host(rh, _) => *rh == h,
@@ -514,11 +519,13 @@ impl ProxyCtx {
 }
 
 /// Append the built-in nix-cache allow rules to a policy's allow list (deny is unchanged, so a
-/// user deny still wins over a built-in allow).
+/// user deny still wins over a built-in allow). The default action is carried through unchanged —
+/// rebuilding the policy must not silently demote an allow-by-default (denylist) posture to
+/// deny-by-default.
 fn union_with_nix_cache(user: EgressPolicy) -> EgressPolicy {
     let mut allow = user.allow_rules().to_vec();
     allow.extend(nix_cache_allow());
-    EgressPolicy::new(allow, user.deny_rules().to_vec())
+    EgressPolicy::new(allow, user.deny_rules().to_vec()).with_default(user.default_action())
 }
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
@@ -697,14 +704,17 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     // 5. The verdict — built through the SAME canonicalizer `ops test net` uses, so enforcement
     //    cannot drift from the tester's prediction. The two denial shapes get distinct reasons so
     //    the agent can tell "no rule allowed this" from "a deny rule blocked it".
-    let deciding = match ctx.policy.explain(&connect_host, port, &itarget) {
-        Decision::AllowedBy(rule) => rule.clone(),
+    let deciding: Option<Rule> = match ctx.policy.explain(&connect_host, port, &itarget) {
+        Decision::AllowedBy(rule) => Some(rule.clone()),
+        // Allow-by-default (denylist mode): no rule named this host, so there is no deciding
+        // rule. The SSRF guard below then treats it as unnamed (private addresses refused).
+        Decision::AllowedDefault => None,
         Decision::DeniedBy(_) => {
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
                 "denied-by-rule",
-                "this request matches a deny rule in the network allowlist",
+                "this request matches a deny rule in the network policy",
             )
         }
         Decision::DeniedDefault => {
@@ -712,7 +722,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
                 &mut br,
                 "403 Forbidden",
                 "denied-default",
-                &format!("`{connect_host}:{port}` is not allowed by the network allowlist"),
+                &format!("`{connect_host}:{port}` is not allowed by the network policy"),
             )
         }
     };
@@ -733,7 +743,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     };
     let Some(ip) = ips
         .into_iter()
-        .find(|ip| ip_permitted(*ip, &connect_host, &deciding))
+        .find(|ip| ip_permitted(*ip, &connect_host, deciding.as_ref()))
     else {
         return respond_refusal_tls(
             &mut br,
@@ -798,7 +808,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         && ctx
             .injections
             .iter()
-            .any(|inj| names_exact_host(&connect_host, &inj.rule));
+            .any(|inj| names_exact_host(&connect_host, Some(&inj.rule)));
     if masks_reflection {
         pump_redacting(&mut upstream, br.get_mut(), &ctx.redactions)?;
     } else {
@@ -1214,7 +1224,7 @@ fn invalid(msg: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allowlist::classify;
+    use crate::allowlist::{classify, DefaultAction};
     use crate::testutil::TmpDir;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -1540,6 +1550,92 @@ mod tests {
         assert!(
             resp.contains("denied-default"),
             "the refusal must name the motif (no allow rule matched): {resp:?}"
+        );
+    }
+
+    /// The isolating teeth for the allow-by-default (denylist) mode. The test upstream is on
+    /// loopback, which the SSRF guard refuses for any host no rule names — so the *new* behavior
+    /// shows in the refusal *reason* on an identical unlisted request: under deny-by-default the
+    /// verdict blocks it (`denied-default`), under allow-by-default the verdict passes it and only
+    /// the SSRF guard stops it (`ssrf-blocked`). The reason is the proof the default action flipped
+    /// the verdict. A deny rule still wins under allow-by-default. (An unlisted *public* host being
+    /// reachable end-to-end is the live `tests/run.rs` smoke — it cannot be a loopback unit test.)
+    #[test]
+    fn allow_by_default_passes_the_verdict_while_deny_by_default_blocks_it() {
+        // deny-by-default: an unlisted host is blocked AT the verdict — the resolver never runs.
+        let deny_proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let deny_ca = deny_proxy_ca.ca_cert_der();
+        let deny_ctx = Arc::new(
+            ProxyCtx::new(deny_proxy_ca, EgressPolicy::default())
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a denied verdict")
+                })),
+        );
+        let resp = through_proxy(
+            deny_ctx,
+            deny_ca,
+            "unlisted.test",
+            "unlisted.test",
+            8443,
+            b"GET / HTTP/1.1\r\nHost: unlisted.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("denied-default"),
+            "deny-by-default must block an unlisted host at the verdict: {resp:?}"
+        );
+
+        // allow-by-default: the SAME unlisted host passes the verdict (the resolver runs), and is
+        // stopped only by the SSRF guard on the loopback address — a different reason.
+        let allow_proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let allow_ca_der = allow_proxy_ca.ca_cert_der();
+        let allow_ctx = Arc::new(
+            ProxyCtx::new(
+                allow_proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Allow),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(
+            allow_ctx,
+            allow_ca_der,
+            "unlisted.test",
+            "unlisted.test",
+            8443,
+            b"GET / HTTP/1.1\r\nHost: unlisted.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("ssrf-blocked"),
+            "allow-by-default must pass the verdict, then the SSRF guard stops the loopback: {resp:?}"
+        );
+
+        // deny still wins under allow-by-default: a denied host is blocked at the verdict.
+        let denylist = EgressPolicy::new(vec![], vec![classify("evil.test:*").unwrap()])
+            .with_default(DefaultAction::Allow);
+        let evil_proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let evil_ca_der = evil_proxy_ca.ca_cert_der();
+        let evil_ctx = Arc::new(
+            ProxyCtx::new(evil_proxy_ca, denylist)
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a denied verdict")
+                })),
+        );
+        let resp = through_proxy(
+            evil_ctx,
+            evil_ca_der,
+            "evil.test",
+            "evil.test",
+            8443,
+            b"GET / HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("denied-by-rule"),
+            "a deny rule must still win under allow-by-default: {resp:?}"
         );
     }
 

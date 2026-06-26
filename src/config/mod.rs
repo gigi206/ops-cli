@@ -972,11 +972,11 @@ pub(crate) fn global_limits() -> crate::sandbox::cgroup::Limits {
     validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits)
 }
 
-/// Clear injected credentials unless the posture is an allowlist. Injection is performed by
-/// the filtering proxy, which exists only under a network allowlist; under `shared` (no
-/// proxy) or `none` (no traffic) there is nowhere to inject, so the secrets are cleared with
-/// a loud warning rather than left as a no-op the user mistakes for working injection. (The
-/// plaintext is never read, so dropping is fail-safe.) Shared by the baseline resolution and
+/// Clear injected credentials unless the posture is a filtering one. Injection is performed by
+/// the filtering proxy, which exists only under a `deny`/`allow` (filtered-egress) posture; under
+/// `shared` (no proxy) or `none` (no traffic) there is nowhere to inject, so the secrets are
+/// cleared with a loud warning rather than left as a no-op the user mistakes for working injection.
+/// (The plaintext is never read, so dropping is fail-safe.) Shared by the baseline resolution and
 /// the per-app overlay, which can add secrets or change the posture.
 fn enforce_secret_posture(
     network: &NetworkPolicy,
@@ -985,8 +985,8 @@ fn enforce_secret_posture(
 ) {
     if !secrets.is_empty() && !matches!(network, NetworkPolicy::Allowlist(_)) {
         warnings.push(format!(
-            "ignoring {} HTTP-header secret(s): credential injection requires \
-             `[network] mode = \"allowlist\"` (the filtering proxy that injects them)",
+            "ignoring {} HTTP-header secret(s): credential injection requires a filtering \
+             network posture (`[network] mode = \"deny\"` or `\"allow\"`, the proxy that injects them)",
             secrets.len()
         ));
         secrets.clear();
@@ -1547,10 +1547,20 @@ fn validate_network(
         NetworkField::Posture(value) => match value.as_str() {
             "none" => Some(NetworkPolicy::Isolated),
             "shared" => Some(NetworkPolicy::Shared),
+            // The filtered-egress modes in bare-string form (no carve-out lists): `deny` =
+            // deny-by-default (only the built-in set reaches), `allow` = allow-by-default (a
+            // denylist; the proxy stays active). Carve-out lists need the `[network]` table.
+            "deny" => Some(NetworkPolicy::Allowlist(
+                crate::allowlist::EgressPolicy::default(),
+            )),
+            "allow" => Some(NetworkPolicy::Allowlist(
+                crate::allowlist::EgressPolicy::default()
+                    .with_default(crate::allowlist::DefaultAction::Allow),
+            )),
             other => {
                 warnings.push(format!(
                     "{source_label}: ignoring unknown network policy `{other}` \
-                     (expected \"none\", \"shared\", or an `[network]` allowlist table)"
+                     (expected \"none\", \"shared\", \"deny\", \"allow\", or an `[network]` table)"
                 ));
                 None
             }
@@ -1570,17 +1580,24 @@ fn validate_network_table(
     match table.mode.as_str() {
         "none" => Some(NetworkPolicy::Isolated),
         "shared" => Some(NetworkPolicy::Shared),
-        "allowlist" => {
+        // `deny` is the canonical name for the classic deny-by-default allowlist; `allowlist`
+        // is its permanently-kept backward-compatible alias. `allow` is the denylist: everything
+        // public reaches except the `deny` carve-outs, proxy still active.
+        "deny" | "allowlist" | "allow" => {
             let allow = classify_entries(warnings, source_label, "allow", table.allow);
             let deny = classify_entries(warnings, source_label, "deny", table.deny);
-            Some(NetworkPolicy::Allowlist(
-                crate::allowlist::EgressPolicy::new(allow, deny),
-            ))
+            let policy = crate::allowlist::EgressPolicy::new(allow, deny);
+            let policy = if table.mode == "allow" {
+                policy.with_default(crate::allowlist::DefaultAction::Allow)
+            } else {
+                policy
+            };
+            Some(NetworkPolicy::Allowlist(policy))
         }
         other => {
             warnings.push(format!(
                 "{source_label}: ignoring unknown network mode `{other}` \
-                 (expected \"none\", \"shared\", or \"allowlist\")"
+                 (expected \"none\", \"shared\", \"deny\", \"allow\", or the \"allowlist\" alias)"
             ));
             None
         }
@@ -2590,15 +2607,21 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
                 any = true;
             }
         }
-        // A credential is injected only under a network allowlist (the filtering proxy performs the
-        // injection). If the profile declares secrets but not its own allowlist, say so — otherwise
-        // the summary reads as if they would be injected when, standalone, they would not.
-        let allowlisted =
-            matches!(&app.network, Some(NetworkField::Table(t)) if t.mode == "allowlist");
-        if any && !allowlisted {
+        // A credential is injected only under a filtering posture (`deny`/`allow` — the proxy
+        // performs the injection). If the profile declares secrets but not its own filtering
+        // posture, say so — otherwise the summary reads as if they would be injected when,
+        // standalone, they would not. Any of the filtering spellings counts (table or bare string).
+        let filtered = match &app.network {
+            Some(NetworkField::Table(t)) => {
+                matches!(t.mode.as_str(), "allowlist" | "deny" | "allow")
+            }
+            Some(NetworkField::Posture(p)) => matches!(p.as_str(), "deny" | "allow"),
+            None => false,
+        };
+        if any && !filtered {
             lines.push(
-                "note: secrets are injected only under a network allowlist (declare \
-                 `[network] mode = \"allowlist\"`)"
+                "note: secrets are injected only under a filtering network posture (declare \
+                 `[network] mode = \"deny\"` or `\"allow\"`)"
                     .to_string(),
             );
         }
@@ -3077,6 +3100,69 @@ mod tests {
             .find(|p| p.name == "claude-code")
             .unwrap();
         assert_eq!(p.backend, Backend::Nix("claude-code".into()));
+    }
+
+    #[test]
+    fn network_modes_set_the_egress_default_action() {
+        use crate::allowlist::DefaultAction;
+        let mut w = Vec::new();
+        let tbl = |mode: &str, allow: &[&str], deny: &[&str]| {
+            NetworkField::Table(NetworkTable {
+                mode: mode.into(),
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+            })
+        };
+
+        // Bare-string `deny`/`allow` map to a filtered policy with the matching default action and
+        // no carve-out lists.
+        let deny =
+            validate_network(&mut w, GLOBAL_CONFIG, NetworkField::Posture("deny".into())).unwrap();
+        let allow =
+            validate_network(&mut w, GLOBAL_CONFIG, NetworkField::Posture("allow".into())).unwrap();
+        assert!(matches!(
+            &deny,
+            NetworkPolicy::Allowlist(p)
+                if p.default_action() == DefaultAction::Deny && p.allow_rules().is_empty()
+        ));
+        assert!(matches!(
+            &allow,
+            NetworkPolicy::Allowlist(p) if p.default_action() == DefaultAction::Allow
+        ));
+
+        // Table form: `allow` mode carries the deny carve-outs and allow-by-default.
+        let allow_tbl =
+            validate_network(&mut w, GLOBAL_CONFIG, tbl("allow", &[], &["evil.com"])).unwrap();
+        assert!(matches!(
+            &allow_tbl,
+            NetworkPolicy::Allowlist(p)
+                if p.default_action() == DefaultAction::Allow && p.deny_rules().len() == 1
+        ));
+
+        // `allowlist` is the permanently-kept backward-compatible alias of `deny`.
+        let alias = validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            tbl("allowlist", &["github.com"], &[]),
+        )
+        .unwrap();
+        let canon =
+            validate_network(&mut w, GLOBAL_CONFIG, tbl("deny", &["github.com"], &[])).unwrap();
+        assert_eq!(
+            alias, canon,
+            "`allowlist` must resolve identically to `deny`"
+        );
+
+        assert!(w.is_empty(), "every valid mode warns nothing: {w:?}");
+
+        // An unknown mode warns and yields nothing (fail-closed: the prior posture is kept).
+        assert!(
+            validate_network(&mut w, GLOBAL_CONFIG, NetworkField::Posture("yolo".into())).is_none()
+        );
+        assert!(
+            w.len() == 1 && w[0].contains("yolo"),
+            "unknown mode must warn: {w:?}"
+        );
     }
 
     #[test]
@@ -3698,6 +3784,49 @@ mod tests {
         assert!(
             joined.contains("api.example.com") && joined.contains("env://DEMO_API_KEY"),
             "{joined}"
+        );
+        // `allowlist`/`deny`/`allow` are all filtering postures, so a secret declared under any of
+        // them carries no "would not be injected" note. (The `allowlist` profile above already has
+        // a secret and is filtering, so its summary must not warn.)
+        assert!(
+            !joined.contains("injected only under"),
+            "a filtering-posture profile must not warn its secrets are uninjected:\n{joined}"
+        );
+        let deny = validate_profile(
+            br#"
+            cmd = "demo-app"
+            network = "deny"
+            [secret."api.example.com"]
+            from = "env://DEMO_API_KEY"
+            header = "x-api-key"
+            type = "raw"
+            "#,
+        )
+        .unwrap();
+        let deny_joined = deny.summary.join("\n");
+        assert!(deny_joined.contains("network: deny"), "{deny_joined}");
+        assert!(
+            !deny_joined.contains("injected only under"),
+            "a bare `deny` posture is filtering, so its secret must not warn:\n{deny_joined}"
+        );
+
+        // A non-filtering posture (`shared`) with a secret DOES carry the note — there is no proxy
+        // to inject under, so the summary must say so rather than imply working injection.
+        let shared = validate_profile(
+            br#"
+            cmd = "demo-app"
+            network = "shared"
+            [secret."api.example.com"]
+            from = "env://DEMO_API_KEY"
+            header = "x-api-key"
+            type = "raw"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            shared.summary.join("\n").contains("injected only under"),
+            "a non-filtering posture must warn its secrets are uninjected:\n{}",
+            shared.summary.join("\n")
         );
 
         // A profile with no command is refused — and so is a file wrapped in `[app.<name>]` (it
@@ -5407,7 +5536,7 @@ mod tests {
         assert!(r
             .warnings
             .iter()
-            .any(|w| w.contains("requires") && w.contains("allowlist")));
+            .any(|w| w.contains("requires") && w.contains("filtering")));
     }
 
     #[test]

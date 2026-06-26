@@ -33,13 +33,14 @@ pub(crate) struct RawConfig {
     /// — honored from the global config or a trusted project, ignored from an
     /// untrusted one (the source is a supply-chain-relevant choice).
     pub(crate) nixpkgs: Option<String>,
-    /// The sandbox's network posture. Either a simple string — `"none"` (a fresh,
-    /// empty network namespace) or `"shared"` (the host network, the default when
-    /// unset) — or a table selecting the filtered-egress allowlist
-    /// (`[network] mode = "allowlist"`, `allow = [...]`). A security field: honored
-    /// from the global config or a trusted project, ignored from an untrusted one,
-    /// since narrowing or widening the network is a confidentiality choice an
-    /// untrusted project may not make.
+    /// The sandbox's network posture. Either a simple string — `"none"` (a fresh, empty
+    /// network namespace), `"shared"` (the host network, the default when unset), `"deny"`
+    /// (filtered egress, deny-by-default — only the built-in hosts reach), or `"allow"`
+    /// (filtered egress, allow-by-default — a denylist, every public host reaches except the
+    /// carve-outs) — or a table that adds the `allow`/`deny` carve-out lists to a `deny`/`allow`
+    /// (or the `"allowlist"` alias of `deny`) mode. A security field: honored from the global
+    /// config or a trusted project, ignored from an untrusted one, since narrowing or widening
+    /// the network is a confidentiality choice an untrusted project may not make.
     pub(crate) network: Option<NetworkField>,
     /// The sandbox's GUI posture: `"none"` (the default — no display access) or `"wayland"`
     /// (bind the host's Wayland compositor socket read-only so a graphical app can map a
@@ -294,21 +295,21 @@ pub(crate) enum SecretFrom {
     Many(Vec<String>),
 }
 
-/// The two shapes the `network` field accepts: a bare posture string, or a table for
-/// the allowlist. An untagged enum so both TOML forms parse — `network = "none"` and
-/// `[network] mode = "allowlist"` — keeping the simple case a one-liner.
+/// The two shapes the `network` field accepts: a bare posture string, or a table for the
+/// filtered-egress carve-out lists. An untagged enum so both TOML forms parse — `network = "none"`
+/// and `[network] mode = "deny"` (or `"allow"`) — keeping the simple case a one-liner.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum NetworkField {
-    /// `network = "none"` | `"shared"`.
+    /// `network = "none"` | `"shared"` | `"deny"` | `"allow"`.
     Posture(String),
-    /// `[network] mode = "<mode>"` with an optional `allow` list.
+    /// `[network] mode = "<mode>"` with optional `allow`/`deny` carve-out lists.
     Table(NetworkTable),
 }
 
-/// The table form of the `network` field: a mode plus, for the allowlist, the egress
-/// entries (IPs, domains, `*.domain` wildcards, exact URLs — classified later). `deny`
-/// carves exceptions out of `allow`, and deny always wins.
+/// The table form of the `network` field: a mode plus the egress carve-out entries (IPs, domains,
+/// `*.domain` wildcards, exact URLs — classified later). Under `deny` mode `allow` lists what may
+/// reach; under `allow` mode `deny` lists what may not. `deny` always wins.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
     pub(crate) mode: String,

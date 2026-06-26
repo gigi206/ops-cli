@@ -171,6 +171,24 @@ pub(crate) struct ChannelView {
     pub(crate) locked_rev: Option<String>,
 }
 
+/// What a request matching no rule gets under the filtered-egress posture: `Deny` (the classic
+/// allowlist — nothing but the listed/built-in hosts reaches) or `Allow` (a denylist — everything
+/// public reaches except the deny carve-outs, proxy still active).
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetDefaultView {
+    Deny,
+    Allow,
+}
+
+impl From<crate::allowlist::DefaultAction> for NetDefaultView {
+    fn from(action: crate::allowlist::DefaultAction) -> Self {
+        match action {
+            crate::allowlist::DefaultAction::Deny => NetDefaultView::Deny,
+            crate::allowlist::DefaultAction::Allow => NetDefaultView::Allow,
+        }
+    }
+}
+
 /// The resolved network posture.
 #[derive(Serialize)]
 pub(crate) enum NetworkView {
@@ -178,9 +196,11 @@ pub(crate) enum NetworkView {
     Shared,
     /// An empty netns — no network at all.
     Isolated,
-    /// A filtering allowlist enforced by the host proxy through an empty-netns cage. `builtin` is
-    /// the always-allowed nix-cache set, surfaced so it is never a silent allowance.
+    /// Filtered egress enforced by the host proxy through an empty-netns cage. `default_action`
+    /// is the verdict for an unmatched request; `builtin` is the always-allowed nix-cache set,
+    /// surfaced so it is never a silent allowance.
     Allowlist {
+        default_action: NetDefaultView,
         allow: Vec<String>,
         deny: Vec<String>,
         builtin: Vec<String>,
@@ -243,6 +263,7 @@ pub(crate) enum AppNetworkView {
     Shared,
     Isolated,
     Allowlist {
+        default_action: NetDefaultView,
         allow: Vec<String>,
         deny: Vec<String>,
         builtin: Vec<String>,
@@ -580,6 +601,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
         NetworkPolicy::Shared => NetworkView::Shared,
         NetworkPolicy::Isolated => NetworkView::Isolated,
         NetworkPolicy::Allowlist(a) => NetworkView::Allowlist {
+            default_action: a.default_action().into(),
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             builtin: sandbox::nix_cache_hosts()
@@ -645,6 +667,7 @@ fn app_view(
             NetworkPolicy::Shared => AppNetworkView::Shared,
             NetworkPolicy::Isolated => AppNetworkView::Isolated,
             NetworkPolicy::Allowlist(a) => AppNetworkView::Allowlist {
+                default_action: a.default_action().into(),
                 allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
                 deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
                 builtin: sandbox::nix_cache_hosts()
@@ -893,6 +916,7 @@ mod tests {
                 locked_rev: Some("abc1234def".into()),
             },
             network: NetworkView::Allowlist {
+                default_action: NetDefaultView::Deny,
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
@@ -921,6 +945,7 @@ mod tests {
                     pinned_rev: None,
                 }],
                 network: Some(AppNetworkView::Allowlist {
+                    default_action: NetDefaultView::Deny,
                     allow: vec!["api.example.com".into()],
                     deny: vec!["api.example.com/admin".into()],
                     builtin: vec!["cache.nixos.org".into()],
@@ -956,6 +981,8 @@ mod tests {
         assert_eq!(json["engine"]["locked_rev"], "abc1234def");
         // A struct enum variant is externally tagged; a unit variant is its name as a string.
         assert!(json["network"]["Allowlist"]["allow"][0] == "github.com");
+        // The filtered-egress default action travels with the policy in the JSON contract.
+        assert_eq!(json["network"]["Allowlist"]["default_action"], "Deny");
         assert_eq!(json["gui"], "Wayland");
         // The scalar postures' provenance is part of the serialization contract — a value's origin
         // (default/global/project) travels with it.
@@ -964,6 +991,7 @@ mod tests {
         // An app overlay's allowlist serializes its rules and the built-in set in full, so the
         // JSON form carries what `ops app <name>` can reach without a `--details` equivalent.
         let app_net = &json["apps"][0]["network"]["Allowlist"];
+        assert_eq!(app_net["default_action"], "Deny");
         assert_eq!(app_net["allow"][0], "api.example.com");
         assert_eq!(app_net["deny"][0], "api.example.com/admin");
         assert_eq!(app_net["builtin"][0], "cache.nixos.org");

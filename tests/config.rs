@@ -479,7 +479,8 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("network: allowlist"), "stdout:\n{stdout}");
+    // `mode = "allowlist"` is the backward-compatible alias of `deny`, so it renders as `deny`.
+    assert!(stdout.contains("network: deny"), "stdout:\n{stdout}");
     assert!(stdout.contains("allow github.com"), "stdout:\n{stdout}");
     assert!(stdout.contains("allow *.nixos.org"), "stdout:\n{stdout}");
     assert!(
@@ -496,6 +497,60 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
     assert!(
         stdout.contains("built-in") && stdout.contains("cache.nixos.org"),
         "the built-in nix-cache allow-set must be shown:\n{stdout}"
+    );
+}
+
+#[test]
+fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
+    let fx = Fixture::new();
+    // Allow-by-default (a denylist) with one deny carve-out, in the table form.
+    fx.write_project("[network]\nmode = \"allow\"\ndeny = [\"evil.example/secret\"]\n");
+
+    // Security boundary: an UNTRUSTED project must not be able to *open* egress with allow mode —
+    // it falls back to the default (shared) with an explanation. Opening egress is exactly the
+    // capability an untrusted project may not gain; `allow` is a filtering posture but still a
+    // trust-gated security field, gated identically to `none`/`shared`/`deny`/`allowlist`.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("network: shared") && !stdout.contains("network: allow"),
+        "an untrusted `allow` mode must fall back to shared, not open egress:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("network") && stderr.contains("untrusted"),
+        "a dropped allow-mode posture must be explained:\n{stderr}"
+    );
+
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // `config show` names the mode and frames it as a denylist, not an allowlist.
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("network: allow"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("every public host is reachable except"),
+        "allow mode must read as a denylist:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("deny") && stdout.contains("evil.example/secret"),
+        "the deny carve-out must be shown:\n{stdout}"
+    );
+
+    // `ops test net`: an unlisted host is ALLOWED (the new default-allow behavior)...
+    let out = fx.run(&["test", "net", "https://anything.example/page"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ALLOWED") && stdout.contains("allow-by-default"),
+        "an unlisted host must be allowed under allow mode:\n{stdout}"
+    );
+    // ...while the deny carve-out is still DENIED (deny wins, even under allow-by-default).
+    let out = fx.run(&["test", "net", "https://evil.example/secret"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("DENIED") && stdout.contains("evil.example/secret"),
+        "the deny carve-out must still win under allow mode:\n{stdout}"
     );
 }
 
@@ -1466,7 +1521,7 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
         "the imported profile must resolve as an app:\n{stdout}"
     );
     assert!(
-        stdout.contains("network: allowlist"),
+        stdout.contains("network: deny"),
         "a profile's security field must be honored (trusted by location):\n{stdout}"
     );
 }
@@ -1489,7 +1544,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("network: allowlist (2 allow, 1 deny)"),
+        stdout.contains("network: deny (2 allow, 1 deny)"),
         "the default must show compact rule counts:\n{stdout}"
     );
     assert!(
@@ -1538,7 +1593,7 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         "the command the app set must read app:global:\n{stdout}"
     );
     assert!(
-        stdout.contains("network: allowlist  (app:global)"),
+        stdout.contains("network: deny  (app:global)"),
         "the network the app set must read app:global:\n{stdout}"
     );
     assert!(
@@ -1677,8 +1732,7 @@ fn config_show_single_source_views_restrict_to_one_layer() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("GLOBAL_VAR=g  (global)")
-            && stdout.contains("network: allowlist  (global)"),
+        stdout.contains("GLOBAL_VAR=g  (global)") && stdout.contains("network: deny  (global)"),
         "--global shows the global layer's contributions:\n{stdout}"
     );
     assert!(
@@ -1987,7 +2041,7 @@ fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project(
     // The profile's network posture stands (the untrusted `shared` is dropped), and the refusals
     // are explained on the app.
     assert!(
-        stdout.contains("network: allowlist"),
+        stdout.contains("network: deny"),
         "the profile network must stand:\n{stdout}"
     );
     assert!(
