@@ -480,11 +480,20 @@ const PAGES: &[Page] = &[
     // ---- test subcommands ---------------------------------------------------------
     Page {
         path: &["test", "net"],
-        synopsis: "ops test net <url>",
+        synopsis: "ops test net [--app <name>] <url>",
         summary: "test a URL against the resolved network policy",
-        options: &[("<url>", "the URL to test")],
-        details: "Reports ALLOWED/DENIED and the rule that decides it, reflecting the trust gate\n\
-            (an untrusted project's policy is dropped). No launch, no nix, no network.",
+        options: &[
+            ("<url>", "the URL (or a bare host, completed to https) to test"),
+            (
+                "-a, --app <name>",
+                "test against that app's effective policy (baseline + overlay), not the baseline",
+            ),
+        ],
+        details:
+            "Reports ALLOWED/DENIED/WOULD ASK and the rule that decides it, against the effective\n\
+            egress policy a launch serves: the built-in nix-cache allow-set is included, and a\n\
+            declared credential injection is noted (by header and source, never the value, and not\n\
+            resolved). Reflects the trust gate (an untrusted project's policy is dropped). No nix.",
     },
     // ---- net subcommands ----------------------------------------------------------
     Page {

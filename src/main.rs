@@ -2585,16 +2585,43 @@ fn test_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `ops test net <url>`: test a URL against the resolved network policy and report the rule
-/// that decides it. A diagnostic for the egress allowlist — it reflects the trust gate
-/// (an untrusted project's policy is dropped, so the *effective* posture is shown) and
-/// does no launch, no nix, no network. Exit status is informational only (success),
-/// since "the URL would be denied" is a valid answer, not an error.
+/// `ops test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
+/// report the rule that decides it. A diagnostic for the egress allowlist — it reflects the trust
+/// gate (an untrusted project's policy is dropped, so the *effective* posture is shown), folds in a
+/// named app's overlay when `--app` is given, includes the built-in nix-cache allow-set the proxy
+/// always unions, and notes a credential the proxy would inject (by header and source, never its
+/// value). A bare host with no scheme is completed to `https://`. No launch, no nix, no network.
+/// Exit status is informational only (success), since "the URL would be denied" is a valid answer.
 fn net_test(args: &[OsString]) -> ExitCode {
-    let Some(url) = args.first().and_then(|a| a.to_str()) else {
+    // An optional `--app/-a <name>` and the positional target (a URL or a bare host), in any order.
+    let mut app: Option<String> = None;
+    let mut target: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_str() {
+            Some("--app") | Some("-a") => {
+                let Some(name) = it.next().and_then(|n| n.to_str()) else {
+                    eprintln!("ops: test net: `--app` needs an app name");
+                    return ExitCode::from(2);
+                };
+                app = Some(name.to_string());
+            }
+            Some(s) if target.is_none() => target = Some(s),
+            Some(s) => {
+                eprintln!("ops: test net: unexpected argument `{s}`");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("ops: test net: an argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(target) = target else {
         eprintln!("ops: usage: {}", help::synopsis("test"));
         return ExitCode::from(2);
     };
+
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -2602,36 +2629,77 @@ fn net_test(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let resolved = config::load(&cwd);
+    let mut resolved = config::load(&cwd);
     for w in &resolved.warnings {
         diag::warn(w);
     }
+    // Fold a named app's overlay onto the baseline so the URL is tested against the *effective*
+    // policy `ops app <name>` would launch with (its own posture, allow/deny rules, credentials),
+    // not the bare baseline. `merge_app` appends the app's own warnings; surface the delta.
+    if let Some(name) = &app {
+        let Some(app_cfg) = resolved.apps.remove(name) else {
+            let names: Vec<&str> = resolved.apps.keys().map(String::as_str).collect();
+            if names.is_empty() {
+                eprintln!(
+                    "ops: test net: no app named {name:?} (no apps are declared for this directory)"
+                );
+            } else {
+                eprintln!(
+                    "ops: test net: no app named {name:?} (declared: {})",
+                    names.join(", ")
+                );
+            }
+            return ExitCode::from(2);
+        };
+        let before = resolved.warnings.len();
+        resolved.merge_app(app_cfg);
+        for w in &resolved.warnings[before..] {
+            diag::warn(w);
+        }
+    }
+
+    // A bare host (no scheme) is completed to https — the common case for a quick check.
+    let url = if target.contains("://") {
+        target.to_string()
+    } else {
+        format!("https://{target}")
+    };
+
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);
+    // Names which posture is in view: the baseline, or one app's effective overlay.
+    let scope = match &app {
+        Some(name) => format!(" (app {name})"),
+        None => String::new(),
+    };
     match &resolved.network {
         config::NetworkPolicy::Shared => {
             println!(
-                "{h}network:{r} shared (host network) — every URL is reachable; no allowlist to test"
+                "{h}network{scope}:{r} shared (host network) — every URL is reachable; no allowlist to test"
             );
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Isolated => {
-            println!("{h}network:{r} none (isolated) — no URL is reachable");
+            println!("{h}network{scope}:{r} none (isolated) — no URL is reachable");
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Allowlist(policy) => {
-            let (host, port, path) = match allowlist::parse_url_target(url) {
+            let (host, port, path) = match allowlist::parse_url_target(&url) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("ops: {e}");
                     return ExitCode::from(2);
                 }
             };
+            // Build the *effective* policy a launch serves: the user rules plus the built-in
+            // nix-cache allow-set the proxy always unions — the single source of truth, so the
+            // verdict here matches the wire (e.g. a cache host reads as allowed, not deny-default).
+            let effective = sandbox::union_with_nix_cache(policy.clone());
             // A one-line header so an ALLOWED/DENIED verdict on an arbitrary URL is
             // self-explanatory — it names the default the policy applies to an unmatched request.
-            let mode = match policy.default_action() {
+            let mode = match effective.default_action() {
                 allowlist::DefaultAction::Deny => {
-                    "deny (allowlist — only listed/built-in hosts reach)"
+                    "deny (allowlist — only listed and built-in hosts reach)"
                 }
                 allowlist::DefaultAction::Allow => {
                     "allow (denylist — every public host reaches except the deny rules)"
@@ -2640,9 +2708,31 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     "ask (an unmatched host parks for a live `ops net pending` decision)"
                 }
             };
-            println!("{h}network:{r} {mode}");
-            let decision = policy.explain(&host, port, &path);
-            print!("{}", render_net_decision(url, &decision, &pal));
+            println!("{h}network{scope}:{r} {mode}");
+            let decision = effective.explain(&host, port, &path);
+            // Tag a request allowed *only* by the built-in nix-cache set (not the user's own
+            // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
+            // only allow rules, so an effective `AllowedBy` the user policy does not also allow can
+            // only be the built-in set. Discriminate on the user verdict's own variant (definitely
+            // "the user allowed it") rather than a separate predicate.
+            let user_allowed = matches!(
+                policy.explain(&host, port, &path),
+                allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+            );
+            let builtin = matches!(decision, allowlist::Decision::AllowedBy(_)) && !user_allowed;
+            print!("{}", render_net_decision(&url, &decision, builtin, &pal));
+            // On an allowed request, surface any credential the proxy would inject for this exact
+            // destination — by header and source locator only, never the value, and with no I/O.
+            if matches!(
+                decision,
+                allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+            ) {
+                for secret in &resolved.secrets {
+                    if allowlist::rule_matches(&secret.to, &host, port, &path) {
+                        print!("{}", render_injection_note(secret, &pal));
+                    }
+                }
+            }
             ExitCode::SUCCESS
         }
     }
@@ -2652,14 +2742,28 @@ fn net_test(args: &[OsString]) -> ExitCode {
 /// test): the verdict (`ALLOWED` green / `DENIED` red), the URL and the deciding rule as
 /// identifiers (cyan, matching how `ops config` renders allow/deny rules), and the reason as
 /// de-emphasized prose. Every span is empty under a non-terminal, so a capture is plain text.
-fn render_net_decision(url: &str, decision: &allowlist::Decision, pal: &style::Palette) -> String {
+fn render_net_decision(
+    url: &str,
+    decision: &allowlist::Decision,
+    builtin: bool,
+    pal: &style::Palette,
+) -> String {
     use std::fmt::Write as _;
     let (n, ok, err, dim, r) = (pal.name, pal.ok, pal.err, pal.dim, pal.reset);
     let mut o = String::new();
     match decision {
         allowlist::Decision::AllowedBy(rule) => {
             let _ = writeln!(o, "{ok}ALLOWED{r}  {n}{url}{r}");
-            let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+            // Name the source when the allow came from the built-in nix-cache set rather than a
+            // user rule, so a pass the config did not declare is explained, not surprising.
+            if builtin {
+                let _ = writeln!(
+                    o,
+                    "  {dim}by allow rule (built-in nix-cache):{r} {n}{rule}{r}"
+                );
+            } else {
+                let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+            }
         }
         allowlist::Decision::DeniedBy(rule) => {
             let _ = writeln!(o, "{err}DENIED{r}   {n}{url}{r}");
@@ -2684,6 +2788,19 @@ fn render_net_decision(url: &str, decision: &allowlist::Decision, pal: &style::P
         }
     }
     o
+}
+
+/// Render the dim "+ a credential would be injected" note for a secret whose destination matches
+/// the tested request — by header name and source locator only (never the plaintext, and with no
+/// I/O), mirroring how `ops config` describes a credential. A pure presenter (its color is asserted
+/// in a test); every span is empty under a non-terminal, so a capture is plain text.
+fn render_injection_note(secret: &config::HeaderSecret, pal: &style::Palette) -> String {
+    let (dim, n, r) = (pal.dim, pal.name, pal.reset);
+    format!(
+        "  {dim}+ a credential would be injected:{r} {n}{}{r} {dim}(from {}){r}\n",
+        secret.header,
+        secret.describe_sources()
+    )
 }
 
 /// The displayed keyword for a filtered-egress policy's default action: `allow` (a denylist —
@@ -4778,7 +4895,12 @@ mod tests {
     fn net_decision_is_plain_text_when_uncolored() {
         // The OFF path the integration capture relies on: empty spans, byte-identical plain text.
         let p = style::Palette::plain();
-        let allowed = render_net_decision("https://x/y", &allowlist::Decision::DeniedDefault, &p);
+        let allowed = render_net_decision(
+            "https://x/y",
+            &allowlist::Decision::DeniedDefault,
+            false,
+            &p,
+        );
         assert_eq!(
             allowed,
             "DENIED   https://x/y\n  no allow rule matches (deny-by-default)\n"
@@ -4790,7 +4912,12 @@ mod tests {
         // The ON path: DENIED is wrapped in the error span and closed with a reset, the URL in
         // the name span — a mis-mapped verdict or a dropped reset would only ever show here.
         let p = style::Palette::colored();
-        let denied = render_net_decision("https://x/y", &allowlist::Decision::DeniedDefault, &p);
+        let denied = render_net_decision(
+            "https://x/y",
+            &allowlist::Decision::DeniedDefault,
+            false,
+            &p,
+        );
         assert!(
             denied.contains(&format!("{}DENIED{}", p.err, p.reset)),
             "DENIED must be wrapped in the error span and reset:\n{denied}"
@@ -4798,6 +4925,25 @@ mod tests {
         assert!(
             denied.contains(&format!("{}https://x/y{}", p.name, p.reset)),
             "the URL must be wrapped in the name span:\n{denied}"
+        );
+    }
+
+    #[test]
+    fn net_decision_tags_a_built_in_nix_cache_allow_only_when_asked() {
+        // The built-in flag controls one phrase on the ALLOWED rule line, in both directions, so a
+        // user-rule pass and a nix-cache-only pass read differently.
+        let p = style::Palette::plain();
+        let rule = allowlist::classify("cache.nixos.org").unwrap();
+        let d = allowlist::Decision::AllowedBy(&rule);
+        let tagged = render_net_decision("https://cache.nixos.org/x", &d, true, &p);
+        assert!(
+            tagged.contains("ALLOWED") && tagged.contains("(built-in nix-cache)"),
+            "a built-in allow must be named:\n{tagged}"
+        );
+        let plain = render_net_decision("https://cache.nixos.org/x", &d, false, &p);
+        assert!(
+            plain.contains("ALLOWED") && !plain.contains("built-in"),
+            "a user-rule allow must not claim the built-in source:\n{plain}"
         );
     }
 

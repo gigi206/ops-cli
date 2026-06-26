@@ -206,6 +206,55 @@ fn transactional_confirmations_are_plain_when_captured() {
 }
 
 #[test]
+fn app_targeted_net_test_is_plain_when_captured() {
+    // `ops test net --app <name>` renders spans the flat read-only loop never reaches: the app
+    // scope label, the built-in-nix-cache tag, and the credential-injection note. A miswired
+    // renderer (raw `colored()` instead of the captured-stream palette) would leak ANSI here only.
+    let home = TmpDir::new();
+    let cwd = TmpDir::new();
+    // A global app (trusted by location) with its own allowlist and an injected credential.
+    let ops_dir = home.path().join("ops");
+    std::fs::create_dir_all(&ops_dir).unwrap();
+    std::fs::write(
+        ops_dir.join("ops.toml"),
+        "[app.demo]\n\
+         cmd = \"true\"\n\
+         \n\
+         [app.demo.network]\n\
+         mode = \"deny\"\n\
+         allow = [\"api.demo.test\"]\n\
+         \n\
+         [app.demo.secret.\"api.demo.test\"]\n\
+         from = \"env://DEMO_API_KEY\"\n\
+         header = \"x-api-key\"\n\
+         type = \"raw\"\n",
+    )
+    .unwrap();
+
+    // The injection-note + app-scope path (an allowed app host).
+    let injected = run(
+        &["test", "net", "--app", "demo", "https://api.demo.test/v1"],
+        home.path(),
+        cwd.path(),
+    );
+    assert!(
+        injected.status.success(),
+        "test net --app must succeed:\n{}",
+        String::from_utf8_lossy(&injected.stderr)
+    );
+    assert_no_ansi(&injected, "test net --app (injection note)");
+
+    // The built-in-nix-cache tag path (a cache host allowed only by the built-in union).
+    let builtin = run(
+        &["test", "net", "--app", "demo", "https://cache.nixos.org/x"],
+        home.path(),
+        cwd.path(),
+    );
+    assert!(builtin.status.success());
+    assert_no_ansi(&builtin, "test net --app (built-in tag)");
+}
+
+#[test]
 fn a_captured_warning_is_plain_with_exactly_one_prefix() {
     // The `ops: warning:` / `ops: note:` family routes through the diag chokepoint. Drive a real
     // warning (an orphan mise file with no `.ops.toml`, the anchoring warning) and assert the

@@ -570,7 +570,7 @@ impl ProxyCtx {
 /// user deny still wins over a built-in allow). The default action *and* the ask timeout are
 /// carried through unchanged — rebuilding the policy must not silently demote an allow-by-default
 /// (denylist) posture to deny-by-default, nor drop the configured ask timeout.
-fn union_with_nix_cache(user: EgressPolicy) -> EgressPolicy {
+pub(crate) fn union_with_nix_cache(user: EgressPolicy) -> EgressPolicy {
     let mut allow = user.allow_rules().to_vec();
     allow.extend(nix_cache_allow());
     EgressPolicy::new(allow, user.deny_rules().to_vec())

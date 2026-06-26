@@ -490,3 +490,107 @@ fn net_pending_answer_rejects_a_scope_without_save() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ── `ops test net` enrichments: app targeting, launch fidelity, scheme-optional ─────────────────
+
+#[test]
+fn test_net_targets_an_app_effective_policy() {
+    let fx = Fixture::new();
+    // A global config (trusted by location, so no `ops trust` needed): a baseline allowlist that
+    // does NOT list the app's host, plus an app whose own overlay allows it and injects a key.
+    fx.write_global(
+        "[network]\n\
+         mode = \"deny\"\n\
+         allow = [\"github.com\"]\n\
+         \n\
+         [app.demo]\n\
+         cmd = \"true\"\n\
+         \n\
+         [app.demo.network]\n\
+         mode = \"deny\"\n\
+         allow = [\"api.demo.test\"]\n\
+         \n\
+         [app.demo.secret.\"api.demo.test\"]\n\
+         from = \"env://DEMO_API_KEY\"\n\
+         header = \"x-api-key\"\n\
+         type = \"raw\"\n",
+    );
+
+    // Baseline: the app's host is not in the baseline allowlist → DENIED.
+    let base = fx.run(&["test", "net", "https://api.demo.test/v1"]);
+    assert!(base.status.success());
+    let b = String::from_utf8_lossy(&base.stdout);
+    assert!(
+        b.contains("DENIED"),
+        "baseline must deny the app host:\n{b}"
+    );
+
+    // Same host under the app: ALLOWED by the app's own rule, with the injection noted by header
+    // and source (never the value).
+    let app = fx.run(&["test", "net", "--app", "demo", "https://api.demo.test/v1"]);
+    assert!(app.status.success());
+    let a = String::from_utf8_lossy(&app.stdout);
+    assert!(
+        a.contains("network (app demo):"),
+        "the header must name the app scope:\n{a}"
+    );
+    assert!(
+        a.contains("ALLOWED") && a.contains("api.demo.test"),
+        "the app's own allow rule must pass:\n{a}"
+    );
+    assert!(
+        a.contains("a credential would be injected")
+            && a.contains("x-api-key")
+            && a.contains("env DEMO_API_KEY"),
+        "the injection note must name the header and source, never the value:\n{a}"
+    );
+    assert!(
+        !a.contains("DEMO_API_KEY=") && !a.contains("placeholder"),
+        "no plaintext or value may appear:\n{a}"
+    );
+
+    // A bare host (no scheme) is completed to https and decides the same way.
+    let bare = fx.run(&["test", "net", "--app", "demo", "api.demo.test"]);
+    assert!(bare.status.success());
+    let r = String::from_utf8_lossy(&bare.stdout);
+    assert!(
+        r.contains("ALLOWED") && r.contains("https://api.demo.test"),
+        "a bare host must be completed to https and allowed:\n{r}"
+    );
+
+    // An unknown app is a pointed, exit-2 error that lists what exists.
+    let bad = fx.run(&["test", "net", "--app", "nope", "https://api.demo.test/v1"]);
+    assert_eq!(bad.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        e.contains("no app named") && e.contains("demo"),
+        "the error must name the missing app and list the declared one:\n{e}"
+    );
+}
+
+#[test]
+fn test_net_reflects_the_built_in_nix_cache_set_both_directions() {
+    let fx = Fixture::new();
+    // A trusted project allowlist that lists one host which is ALSO a built-in nix-cache host.
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // A nix-cache host the user did NOT list: allowed only by the built-in union, and tagged so.
+    let cache = fx.run(&["test", "net", "https://cache.nixos.org/nix-cache-info"]);
+    assert!(cache.status.success());
+    let c = String::from_utf8_lossy(&cache.stdout);
+    assert!(
+        c.contains("ALLOWED") && c.contains("built-in nix-cache"),
+        "a cache host must pass via the built-in set and be tagged:\n{c}"
+    );
+
+    // A host the user explicitly listed: allowed by the user's own rule — no built-in tag, even
+    // though github.com is also in the built-in set (the user rule is what decides).
+    let user = fx.run(&["test", "net", "https://github.com/x"]);
+    assert!(user.status.success());
+    let u = String::from_utf8_lossy(&user.stdout);
+    assert!(
+        u.contains("ALLOWED") && !u.contains("(built-in nix-cache)"),
+        "a user-listed host must not be tagged built-in:\n{u}"
+    );
+}
