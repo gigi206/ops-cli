@@ -458,6 +458,10 @@ pub(crate) struct ProxyCtx {
     /// throwaway internal queue by default (so a non-ask launch never touches it); the launch
     /// injects the one the control thread also holds via [`Self::with_control`].
     pending: Arc<super::control::PendingState>,
+    /// The live manual-rule overlay (`--session` answers). Consulted on the `ask` branch *before*
+    /// parking, so a remembered host:port is decided without re-asking. A throwaway empty overlay by
+    /// default; the launch injects the shared one via [`Self::with_control`].
+    manual: Arc<super::control::ManualRules>,
     /// Whether to print a one-line stderr notice when a request parks, so an interactive user sees
     /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
     /// it on when it wires the control socket.
@@ -486,15 +490,23 @@ impl ProxyCtx {
             injections: Vec::new(),
             redactions: Vec::new(),
             pending: Arc::new(super::control::PendingState::new()),
+            manual: Arc::new(super::control::ManualRules::new()),
             notices: false,
         })
     }
 
-    /// Wire the proxy to the launch's shared pending queue and turn on the park notices. The launch
-    /// ([`super::egress::start`]) passes the same [`super::control::PendingState`] it serves on the
-    /// control socket, so a request parked here is answerable by `ops net pending`.
-    pub(crate) fn with_control(mut self, pending: Arc<super::control::PendingState>) -> Self {
+    /// Wire the proxy to the launch's shared pending queue and manual-rule overlay, and turn on the
+    /// park notices. The launch ([`super::egress::start`]) passes the same
+    /// [`super::control::PendingState`] and [`super::control::ManualRules`] it serves on the control
+    /// socket, so a request parked here is answerable by `ops net pending` and a `--session` answer
+    /// it adds is honored here.
+    pub(crate) fn with_control(
+        mut self,
+        pending: Arc<super::control::PendingState>,
+        manual: Arc<super::control::ManualRules>,
+    ) -> Self {
         self.pending = pending;
+        self.manual = manual;
         self.notices = true;
         self
     }
@@ -543,6 +555,13 @@ impl ProxyCtx {
     /// [`with_control`](ProxyCtx::with_control), which the launch uses and which prints notices).
     fn with_pending_silent(mut self, pending: Arc<super::control::PendingState>) -> Self {
         self.pending = pending;
+        self
+    }
+
+    /// Wire the manual-rule overlay alone (notices off), so a test can pre-populate a remembered
+    /// decision and assert the proxy honors it without ever parking.
+    fn with_manual(mut self, manual: Arc<super::control::ManualRules>) -> Self {
+        self.manual = manual;
         self
     }
 }
@@ -762,38 +781,50 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
                 &format!("`{connect_host}:{port}` is not allowed by the network policy"),
             )
         }
-        // Ask-by-default: no rule decided, so park the connection and block until a host-side
-        // `ops net pending` answers it or the configured timeout elapses (deny — fail-closed). The
-        // notice (gated by `notices`) prints the live id so an interactive user need not poll.
+        // Ask-by-default: no config rule decided. First consult the live manual overlay (decisions
+        // a prior `--session` answer remembered) — a remembered allow/deny short-circuits the park,
+        // so the same request is not asked twice. Only if nothing is remembered does the request
+        // park and block until a host-side `ops net pending` answers it or the timeout elapses (deny
+        // — fail-closed). An allow (remembered or fresh) names this exact host:port as the deciding
+        // rule so the SSRF guard permits a deliberately-approved internal target.
         Decision::Ask => {
-            let verdict = ctx.pending.park(
-                &connect_host,
-                port,
-                &itarget,
-                ctx.policy.ask_timeout(),
-                ASK_PENDING_CAP,
-                |seq| {
-                    if ctx.notices {
-                        let id = super::control::format_id(std::process::id(), seq);
-                        eprintln!(
-                            "ops: egress decision needed [{id}] {connect_host}:{port}{itarget} — \
-                             allow: ops net pending allow {id}  |  deny: ops net pending deny {id}"
-                        );
+            match ctx.manual.decide(&connect_host, port, &itarget) {
+                Some(true) => Some(allowlist::host_port_rule(&connect_host, port)),
+                Some(false) => return respond_refusal_tls(
+                    &mut br,
+                    "403 Forbidden",
+                    "asked-denied",
+                    "this host:port was denied by a live `ops net pending deny --session` decision",
+                ),
+                None => {
+                    let verdict = ctx.pending.park(
+                    &connect_host,
+                    port,
+                    &itarget,
+                    ctx.policy.ask_timeout(),
+                    ASK_PENDING_CAP,
+                    |seq| {
+                        if ctx.notices {
+                            let id = super::control::format_id(std::process::id(), seq);
+                            eprintln!(
+                                "ops: egress decision needed [{id}] {connect_host}:{port}{itarget} \
+                                 — allow: ops net pending allow {id}  |  deny: ops net pending deny \
+                                 {id}"
+                            );
+                        }
+                    },
+                );
+                    match verdict {
+                        super::control::Verdict::Allow => {
+                            Some(allowlist::host_port_rule(&connect_host, port))
+                        }
+                        super::control::Verdict::Deny => return respond_refusal_tls(
+                            &mut br,
+                            "403 Forbidden",
+                            "asked-denied",
+                            "this request was denied by a live decision or the ask timeout elapsed",
+                        ),
                     }
-                },
-            );
-            match verdict {
-                // An explicit allow names this exact host as the deciding rule, so the SSRF guard
-                // permits a deliberately-approved internal target (otherwise "I said yes" would
-                // still be refused). A synthesized host rule is exactly what `--save` would write.
-                super::control::Verdict::Allow => allowlist::classify(&connect_host).ok(),
-                super::control::Verdict::Deny => {
-                    return respond_refusal_tls(
-                        &mut br,
-                        "403 Forbidden",
-                        "asked-denied",
-                        "this request was denied by a live decision or the ask timeout elapsed",
-                    )
                 }
             }
         }
@@ -1717,6 +1748,86 @@ mod tests {
         );
     }
 
+    /// A live manual rule (from a prior `--session` answer) short-circuits the ask: a remembered
+    /// allow lets the request proceed to the upstream **without parking** (no answerer thread — the
+    /// default ask wait is indefinite, so if the overlay did not decide, this would hang forever and
+    /// the test would time out), and a remembered deny refuses it. The 4b verdict path, cage-free.
+    #[test]
+    fn a_manual_rule_decides_an_ask_without_parking() {
+        use crate::sandbox::control::{ManualRules, Verdict};
+
+        // A remembered allow on the upstream's exact host:port → proceeds, never parks.
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "ask.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let manual = Arc::new(ManualRules::new());
+        manual.remember(Verdict::Allow, "ask.test", addr.port());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_manual(manual),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "ask.test",
+            "ask.test",
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: ask.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(
+            resp.contains("200 OK") && resp.contains("hello"),
+            "a remembered allow must proceed without parking: {resp:?}"
+        );
+
+        // A remembered deny refuses without parking; the resolver panics if (wrongly) reached.
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let manual = Arc::new(ManualRules::new());
+        manual.remember(Verdict::Deny, "blocked.test", 443);
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| {
+                panic!("resolve must not run for a remembered deny")
+            }))
+            .with_manual(manual),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "blocked.test",
+            "blocked.test",
+            443,
+            b"GET / HTTP/1.1\r\nHost: blocked.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("asked-denied"),
+            "a remembered deny must 403 without parking: {resp:?}"
+        );
+    }
+
     /// Block until exactly one request is parked in `state`, answer it with `verdict`, and return
     /// the host it was for — so a test thread can answer a request the proxy thread just parked.
     fn answer_when_parked(
@@ -1726,7 +1837,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(row) = state.list().first() {
-                return state.answer(row.seq, verdict);
+                return state.answer(row.seq, verdict).map(|(host, _port)| host);
             }
             assert!(
                 std::time::Instant::now() < deadline,

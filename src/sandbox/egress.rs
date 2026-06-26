@@ -181,13 +181,17 @@ pub(crate) fn start(
     let control_uds = if asks {
         let control_uds = dir.join(format!("control-{pid}.sock"));
         let _ = std::fs::remove_file(&control_uds);
+        // One pending queue and one manual-rule overlay, shared between the proxy and the control
+        // thread: the proxy parks into the queue and reads the overlay; the control thread answers
+        // the queue and appends to the overlay.
         let pending = Arc::new(super::control::PendingState::new());
-        ctx = ctx.with_control(pending.clone());
+        let manual = Arc::new(super::control::ManualRules::new());
+        ctx = ctx.with_control(pending.clone(), manual.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `ops net pending`.
         let control_listener = UnixListener::bind(&control_uds)?;
         std::thread::spawn(move || {
-            let _ = super::control::serve(control_listener, pending);
+            let _ = super::control::serve(control_listener, pending, manual);
         });
         Some(control_uds)
     } else {

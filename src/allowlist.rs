@@ -506,6 +506,16 @@ pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> 
     rule.matches(&Request::new(host, port, target))
 }
 
+/// An exact-host rule scoped to a single port — what a live `ask` decision remembers: exactly the
+/// `host:port` the answered request named, so re-running *that* request is decided without re-asking
+/// and nothing wider is opened. The host is canonicalized the same way the matcher canonicalizes a
+/// request host, so the remembered rule and a later request compare equal. (Deliberately *not*
+/// `classify(host)`, which defaults to the web ports {80, 443} and would fail to match a request
+/// that asked on a non-standard port — the very reason it reached `ask`.)
+pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
+    Rule::Host(canonical_host(host), Ports::Ranges(vec![(port, port)]))
+}
+
 /// Classify one declared entry (allow or deny) by its syntax, or report why it is
 /// malformed. Order matters: a `re:` regex, then a `/`-bearing `host[:ports]/path` URL rule,
 /// then the `*.` wildcard, then an IP literal, then a bare hostname. A scheme (`https://`)

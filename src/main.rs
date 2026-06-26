@@ -2870,13 +2870,15 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         sandbox::control::Verdict::Allow => "allow",
         sandbox::control::Verdict::Deny => "deny",
     };
-    // `--save` is extracted before `split_scope`, which rejects any flag it does not know. The id
-    // is the lone positional; the scope flags (--local/--global/--app) ride `split_scope` and apply
-    // only with `--save`.
+    // `--save` and `--session` are extracted before `split_scope`, which rejects any flag it does
+    // not know. The id is the lone positional; the scope flags (--local/--global/--app) ride
+    // `split_scope` and apply only with `--save`. `--session` remembers the decision for the live
+    // session (no config write); the two combine.
     let save = args.iter().any(|a| a.to_str() == Some("--save"));
+    let session = args.iter().any(|a| a.to_str() == Some("--session"));
     let rest: Vec<OsString> = args
         .iter()
-        .filter(|a| a.to_str() != Some("--save"))
+        .filter(|a| !matches!(a.to_str(), Some("--save") | Some("--session")))
         .cloned()
         .collect();
     let parsed = match split_scope(&rest) {
@@ -2914,7 +2916,7 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             return ExitCode::FAILURE;
         }
     };
-    let host = match sandbox::control::answer_request(&data_dir, pid, seq, verdict) {
+    let host = match sandbox::control::answer_request(&data_dir, pid, seq, verdict, session) {
         Ok(sandbox::control::AnswerOutcome::Answered(host)) => host,
         Ok(sandbox::control::AnswerOutcome::NotFound) => {
             eprintln!(
@@ -2930,7 +2932,11 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             return ExitCode::from(2);
         }
     };
-    println!("{verb}ed {host} for {id}");
+    if session {
+        println!("{verb}ed {host} for {id} (remembered for this session)");
+    } else {
+        println!("{verb}ed {host} for {id}");
+    }
 
     // `--save` persists a matching rule (the host) so the same destination is pre-decided next
     // launch: an allow becomes an allow rule, a deny a deny rule. The live answer already stuck, so
@@ -2975,14 +2981,17 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--source") | Some("-s") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("ops: `--source` needs a value (config, builtin)");
+                    eprintln!("ops: `--source` needs a value (config, builtin, manual)");
                     return ExitCode::from(2);
                 };
                 source = Some(match v {
                     "config" => RuleSourceView::Config,
                     "builtin" => RuleSourceView::Builtin,
+                    "manual" => RuleSourceView::Manual,
                     other => {
-                        eprintln!("ops: unknown rule source '{other}' (known: config, builtin)");
+                        eprintln!(
+                            "ops: unknown rule source '{other}' (known: config, builtin, manual)"
+                        );
                         return ExitCode::from(2);
                     }
                 });
@@ -3008,6 +3017,12 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `--source manual` is live runtime state, not config: query this project's ask sessions for the
+    // rules they remembered from `--session` answers, rather than reading the static config policy.
+    if source == Some(config::view::RuleSourceView::Manual) {
+        return net_rules_manual(&cwd, filter.as_deref(), json);
+    }
+
     let resolved = config::load(&cwd);
     for w in &resolved.warnings {
         diag::warn(w);
@@ -3050,6 +3065,74 @@ fn net_rules(args: &[OsString]) -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_net_rules(mode, &shown, total, &pal));
+    ExitCode::SUCCESS
+}
+
+/// `ops net rules --source manual`: the live manual rules this project's ask sessions remembered
+/// from `--session` answers. These live in the sessions' memory (not config) and are gone when the
+/// sessions end. Cross-references the registry to find the sessions for this project (by the
+/// canonical project root the registry keys on), queries each one's control socket, and lists the
+/// merged, deduped rules. No config read, no launch, no nix.
+fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
+    use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The sessions are keyed by the canonical project root (the registry stores canonical paths);
+    // fall back to the cwd as-is if it cannot be canonicalized.
+    let project = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let pids: Vec<u32> = pending_session_context(&data_dir)
+        .into_iter()
+        .filter(|(_, proj, _)| *proj == project)
+        .map(|(pid, _, _)| pid)
+        .collect();
+
+    // Merge + dedup the manual rules across this project's sessions.
+    let mut rules: Vec<NetRuleView> = Vec::new();
+    for pid in pids {
+        let Ok(rows) = sandbox::control::query_manual(&data_dir, pid) else {
+            continue; // the session ended between the registry read and the query
+        };
+        for row in rows {
+            let view = NetRuleView {
+                kind: if row.is_allow {
+                    NetRuleKind::Allow
+                } else {
+                    NetRuleKind::Deny
+                },
+                source: RuleSourceView::Manual,
+                rule: row.rule,
+            };
+            if !rules
+                .iter()
+                .any(|r| r.kind == view.kind && r.rule == view.rule)
+            {
+                rules.push(view);
+            }
+        }
+    }
+
+    let total = rules.len();
+    let shown: Vec<&NetRuleView> = rules
+        .iter()
+        .filter(|r| filter.is_none_or(|f| r.rule.to_lowercase().contains(f)))
+        .collect();
+
+    if json {
+        let value = serde_json::json!({
+            "mode": "manual",
+            "rules": shown.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+        });
+        println!("{value}");
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_net_rules("manual", &shown, total, &pal));
     ExitCode::SUCCESS
 }
 
@@ -3097,6 +3180,15 @@ fn render_net_rules(
                  allow rules auto-pass, deny rules auto-fail{r}"
             );
         }
+        // The live manual-rule listing (`--source manual`): runtime rules from `--session` answers,
+        // not config — framed as such so they are not mistaken for the static policy.
+        "manual" => {
+            let _ = writeln!(
+                o,
+                "{h}manual egress rules{r} {dim}— live, from `ops net pending … --session` answers \
+                 in this project's ask sessions (gone when they end){r}"
+            );
+        }
         _ => {
             let _ = writeln!(
                 o,
@@ -3119,6 +3211,7 @@ fn render_net_rules(
         let source = match rule.source {
             RuleSourceView::Config => "config",
             RuleSourceView::Builtin => "builtin",
+            RuleSourceView::Manual => "manual",
         };
         match rule.kind {
             NetRuleKind::Allow => {

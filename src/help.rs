@@ -489,12 +489,12 @@ const PAGES: &[Page] = &[
     // ---- net subcommands ----------------------------------------------------------
     Page {
         path: &["net", "rules"],
-        synopsis: "ops net rules [-s|--source config|builtin] [-f|--filter <substr>] [--json]",
+        synopsis: "ops net rules [-s|--source config|builtin|manual] [-f|--filter <substr>] [--json]",
         summary: "list the effective egress rules by source",
         options: &[
             (
                 "-s, --source <src>",
-                "show only one source: config (the .ops.toml/global rules) or builtin (the nix-cache set)",
+                "show only one source: config (the .ops.toml/global rules), builtin (the nix-cache set), or manual (live `--session` rules)",
             ),
             (
                 "-f, --filter <substr>",
@@ -505,7 +505,8 @@ const PAGES: &[Page] = &[
         details:
             "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
             built-in, reflecting the trust gate (an untrusted project's rules are dropped). Under\n\
-            `shared`/`none` there are no rules. No launch, no nix, no network.",
+            `shared`/`none` there are no rules. `--source manual` instead queries this project's live\n\
+            ask sessions for the rules they remembered from `--session` answers. No launch, no nix.",
     },
     Page {
         path: &["net", "allow"],
@@ -549,35 +550,38 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending", "allow"],
-        synopsis: "ops net pending allow <id> [--save [-l|--local|-g|--global|-a|--app <name>]]",
-        summary: "allow a parked egress request (optionally saving a rule)",
+        synopsis: "ops net pending allow <id> [--session] [--save [-l|--local|-g|--global|-a|--app <name>]]",
+        summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
+            ("--session", "also remember the host:port for this live session, so it is not re-asked"),
             ("--save", "also persist an allow rule for the request's host (scope below)"),
             ("-l, --local", "with --save: write the project .ops.toml (the default)"),
             ("-g, --global", "with --save: write the global ops.toml"),
             ("-a, --app <name>", "with --save: write under that app's `[app.<name>.network]`"),
         ],
         details:
-            "Unblocks the parked request, letting it proceed. With `--save` it also adds an allow rule\n\
-            for that host so the same destination is pre-decided next launch (the unblock sticks even\n\
-            if the save fails). The id addresses one live session's request.",
+            "Unblocks the parked request, letting it proceed. `--session` remembers the exact\n\
+            host:port for the running session (it is not re-asked); `--save` persists an allow rule\n\
+            so the host is pre-decided next launch. The unblock sticks even if a save fails. The two\n\
+            combine; the id addresses one live session's request.",
     },
     Page {
         path: &["net", "pending", "deny"],
-        synopsis: "ops net pending deny <id> [--save [-l|--local|-g|--global|-a|--app <name>]]",
-        summary: "deny a parked egress request (optionally saving a rule)",
+        synopsis: "ops net pending deny <id> [--session] [--save [-l|--local|-g|--global|-a|--app <name>]]",
+        summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
+            ("--session", "also remember the host:port as denied for this live session, so it is not re-asked"),
             ("--save", "also persist a deny rule for the request's host (scope below)"),
             ("-l, --local", "with --save: write the project .ops.toml (the default)"),
             ("-g, --global", "with --save: write the global ops.toml"),
             ("-a, --app <name>", "with --save: write under that app's `[app.<name>.network]`"),
         ],
         details:
-            "Refuses the parked request (the proxy returns a 403 to the cage). With `--save` it also\n\
-            adds a deny rule for that host so the same destination is auto-denied next launch (the\n\
-            answer sticks even if the save fails).",
+            "Refuses the parked request (the proxy returns a 403 to the cage). `--session` remembers\n\
+            the host:port as denied for the running session (it is not re-asked); `--save` persists a\n\
+            deny rule so the host is auto-denied next launch. The answer sticks even if a save fails.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

@@ -221,12 +221,13 @@ pub(crate) enum NetRuleKind {
 }
 
 /// Where a listed egress rule came from: the resolved config (`.ops.toml`/global, after the trust
-/// gate) or the always-allowed built-in nix-cache set. (`Manual`, for runtime-added rules, lands
-/// with the runtime rule store in a later increment.)
+/// gate), the always-allowed built-in nix-cache set, or `Manual` — a runtime rule a live `ask`
+/// session remembered from a `--session` answer (it lives in that session's memory, not config).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuleSourceView {
     Config,
     Builtin,
+    Manual,
 }
 
 /// One egress rule projected for `ops net rules`: its kind, its source, and its display text.

@@ -23,8 +23,10 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+use crate::allowlist::Rule;
 
 /// A human's answer to a parked request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,25 +149,97 @@ impl PendingState {
     }
 
     /// Answer a parked request by sequence id: remove it and wake its proxy thread with `verdict`,
-    /// returning the host it was for (so a `--save` can persist a rule). `None` if no such request
-    /// is parked (already answered, or timed out). A send failure (the thread just timed out) is
-    /// ignored — the entry is gone either way.
-    pub(crate) fn answer(&self, seq: u64, verdict: Verdict) -> Option<String> {
+    /// returning the `(host, port)` it was for (the host for a `--save`, the port for a `--session`
+    /// remember of the exact request). `None` if no such request is parked (already answered, or
+    /// timed out). A send failure (the thread just timed out) is ignored — the entry is gone either
+    /// way.
+    pub(crate) fn answer(&self, seq: u64, verdict: Verdict) -> Option<(String, u16)> {
         let mut inner = self.inner.lock().unwrap();
         let entry = inner.entries.remove(&seq)?;
         let _ = entry.answer.send(verdict);
-        Some(entry.host)
+        Some((entry.host, entry.port))
+    }
+}
+
+/// The live, per-session manual egress rules a user adds while answering with `--session`: a runtime
+/// overlay distinct from the (immutable) config policy. Shared via `Arc` between the proxy serve
+/// threads (which consult it on the `ask` branch, before parking) and the control thread (which
+/// appends to it). Each rule is an exact `host:port` — the answered request — so remembering a
+/// decision suppresses the re-ask of *that* request without widening to the host's other ports.
+#[derive(Default)]
+pub(crate) struct ManualRules {
+    inner: RwLock<ManualInner>,
+}
+
+#[derive(Default)]
+struct ManualInner {
+    allow: Vec<Rule>,
+    deny: Vec<Rule>,
+}
+
+impl ManualRules {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember an answered `host:port` as a manual allow or deny, so re-running that exact request
+    /// is decided without re-asking. Deduped — re-answering the same `host:port` does not stack.
+    pub(crate) fn remember(&self, verdict: Verdict, host: &str, port: u16) {
+        let rule = crate::allowlist::host_port_rule(host, port);
+        let mut inner = self.inner.write().unwrap();
+        let list = match verdict {
+            Verdict::Allow => &mut inner.allow,
+            Verdict::Deny => &mut inner.deny,
+        };
+        if !list.contains(&rule) {
+            list.push(rule);
+        }
+    }
+
+    /// The manual overlay's verdict for a request: `Some(true)` a remembered allow, `Some(false)` a
+    /// remembered deny (deny wins), `None` if no manual rule matches (the request still parks). The
+    /// read lock is held only for the check — nothing I/O-bound runs under it.
+    pub(crate) fn decide(&self, host: &str, port: u16, path: &str) -> Option<bool> {
+        let inner = self.inner.read().unwrap();
+        if inner
+            .deny
+            .iter()
+            .any(|r| crate::allowlist::rule_matches(r, host, port, path))
+        {
+            return Some(false);
+        }
+        if inner
+            .allow
+            .iter()
+            .any(|r| crate::allowlist::rule_matches(r, host, port, path))
+        {
+            return Some(true);
+        }
+        None
+    }
+
+    /// A snapshot of the manual rules `(allow, deny)` for listing — cloned out so the read lock is
+    /// not held across formatting or I/O.
+    pub(crate) fn snapshot(&self) -> (Vec<Rule>, Vec<Rule>) {
+        let inner = self.inner.read().unwrap();
+        (inner.allow.clone(), inner.deny.clone())
     }
 }
 
 /// Serve the control socket: one short-lived thread per connection, each handling exactly one
-/// command. A per-connection error is that connection's problem, never the server's.
-pub(crate) fn serve(listener: UnixListener, state: Arc<PendingState>) -> io::Result<()> {
+/// command. A per-connection error is that connection's problem, never the server's. Both the
+/// pending queue and the manual-rule overlay are shared in (the same ones the proxy holds).
+pub(crate) fn serve(
+    listener: UnixListener,
+    state: Arc<PendingState>,
+    manual: Arc<ManualRules>,
+) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         let state = state.clone();
+        let manual = manual.clone();
         std::thread::spawn(move || {
-            let _ = handle(stream, &state);
+            let _ = handle(stream, &state, &manual);
         });
     }
     Ok(())
@@ -178,22 +252,24 @@ const CMD_MAX: u64 = 256;
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
 /// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
 /// timeout are belt-and-braces against a stuck or malformed caller.
-fn handle(stream: UnixStream, state: &PendingState) -> io::Result<()> {
+fn handle(stream: UnixStream, state: &PendingState, manual: &ManualRules) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), state);
+    let response = dispatch(line.trim(), state, manual);
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
 
 /// Map a control command to its response. `LIST` returns one `pending …` line per parked request
-/// then `ok`; `ALLOW <seq>`/`DENY <seq>` answer one request, replying `ok host=<host>` or
-/// `err not-found`. `path` is emitted last on a `pending` line so a query string's `=` cannot be
-/// mistaken for a field separator (the reader splits each token on its first `=`).
-fn dispatch(cmd: &str, state: &PendingState) -> String {
+/// then `ok`; `ALLOW <seq>`/`DENY <seq>` answer one request (a trailing `session` token also
+/// remembers it as a manual rule), replying `ok host=<host>` or `err not-found`; `RULES` returns the
+/// session's manual rules (`manual allow|deny <rule>` lines) then `ok`. `path` is emitted last on a
+/// `pending` line so a query string's `=` cannot be mistaken for a field separator (the reader
+/// splits each token on its first `=`).
+fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("LIST") => {
@@ -211,15 +287,36 @@ fn dispatch(cmd: &str, state: &PendingState) -> String {
             let Some(seq) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
                 return "err bad-request\n".to_string();
             };
+            // A trailing `session` token means: also remember this decision as a live manual rule.
+            let remember = parts.next() == Some("session");
             let verdict = if verb == "ALLOW" {
                 Verdict::Allow
             } else {
                 Verdict::Deny
             };
             match state.answer(seq, verdict) {
-                Some(host) => format!("ok host={host}\n"),
+                Some((host, port)) => {
+                    if remember {
+                        manual.remember(verdict, &host, port);
+                    }
+                    format!("ok host={host}\n")
+                }
                 None => "err not-found\n".to_string(),
             }
+        }
+        Some("RULES") => {
+            let (allow, deny) = manual.snapshot();
+            let mut out = String::new();
+            // A manual rule is always an exact `host:port`, so its display carries no whitespace —
+            // the client takes everything after `manual allow `/`manual deny ` as the rule text.
+            for rule in allow {
+                out.push_str(&format!("manual allow {rule}\n"));
+            }
+            for rule in deny {
+                out.push_str(&format!("manual deny {rule}\n"));
+            }
+            out.push_str("ok\n");
+            out
         }
         _ => "err bad-request\n".to_string(),
     }
@@ -346,13 +443,15 @@ pub(crate) enum AnswerOutcome {
 }
 
 /// Answer the parked request `<pid>.<seq>`: connect to that session's control socket and send the
-/// verdict. A missing socket / dead session surfaces as a connect error; a live session that has
-/// no such request returns [`AnswerOutcome::NotFound`].
+/// verdict. With `remember`, a trailing `session` token also records the decision as a live manual
+/// rule (so the same request is not re-asked this session). A missing socket / dead session surfaces
+/// as a connect error; a live session that has no such request returns [`AnswerOutcome::NotFound`].
 pub(crate) fn answer_request(
     data_dir: &Path,
     pid: u32,
     seq: u64,
     verdict: Verdict,
+    remember: bool,
 ) -> io::Result<AnswerOutcome> {
     let stream = UnixStream::connect(control_socket(data_dir, pid))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -361,7 +460,12 @@ pub(crate) fn answer_request(
         Verdict::Allow => "ALLOW",
         Verdict::Deny => "DENY",
     };
-    (&stream).write_all(format!("{verb} {seq}\n").as_bytes())?;
+    let cmd = if remember {
+        format!("{verb} {seq} session\n")
+    } else {
+        format!("{verb} {seq}\n")
+    };
+    (&stream).write_all(cmd.as_bytes())?;
     (&stream).flush()?;
     let mut response = String::new();
     BufReader::new((&stream).take(CMD_MAX)).read_line(&mut response)?;
@@ -372,6 +476,43 @@ pub(crate) fn answer_request(
         // "err not-found" / "err bad-request" / anything unexpected → not answered.
         Ok(AnswerOutcome::NotFound)
     }
+}
+
+/// One manual rule reported by a live session: whether it allows (vs denies) and its display text.
+pub(crate) struct ManualRuleRow {
+    pub(crate) is_allow: bool,
+    pub(crate) rule: String,
+}
+
+/// Query a session's live manual rules (`RULES`) — the runtime rules added by `--session` answers.
+/// A connect error (the session is gone) propagates so the caller can skip it.
+pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRuleRow>> {
+    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    (&stream).write_all(b"RULES\n")?;
+    (&stream).flush()?;
+    let mut rules = Vec::new();
+    for line in BufReader::new(&stream).lines() {
+        let line = line?;
+        if line == "ok" {
+            break;
+        }
+        // The rule text is everything after the kind prefix — it carries no whitespace (an exact
+        // `host:port`), but taking the remainder is robust regardless.
+        if let Some(rule) = line.strip_prefix("manual allow ") {
+            rules.push(ManualRuleRow {
+                is_allow: true,
+                rule: rule.to_string(),
+            });
+        } else if let Some(rule) = line.strip_prefix("manual deny ") {
+            rules.push(ManualRuleRow {
+                is_allow: false,
+                rule: rule.to_string(),
+            });
+        }
+    }
+    Ok(rules)
 }
 
 #[cfg(test)]
@@ -390,7 +531,7 @@ mod tests {
         let seq = wait_for_one(&state);
         assert_eq!(
             state.answer(seq, Verdict::Allow),
-            Some("api.example.com".to_string())
+            Some(("api.example.com".to_string(), 443))
         );
         assert_eq!(handle.join().unwrap(), Verdict::Allow);
         // The queue is drained.
@@ -405,7 +546,7 @@ mod tests {
         let seq = wait_for_one(&state);
         assert_eq!(
             state.answer(seq, Verdict::Deny),
-            Some("evil.test".to_string())
+            Some(("evil.test".to_string(), 443))
         );
         assert_eq!(handle.join().unwrap(), Verdict::Deny);
     }
@@ -451,6 +592,113 @@ mod tests {
     fn answer_an_unknown_seq_is_none() {
         let state = PendingState::new();
         assert_eq!(state.answer(999, Verdict::Allow), None);
+    }
+
+    #[test]
+    fn manual_rules_remember_decide_and_dedup_by_host_port() {
+        let m = ManualRules::new();
+        // Nothing remembered → no decision (the request still parks).
+        assert_eq!(m.decide("api.test", 443, "/"), None);
+
+        // Remember an allow for a non-standard port (the very reason the request asked).
+        m.remember(Verdict::Allow, "api.test", 8080);
+        // The exact `host:port` is decided allow...
+        assert_eq!(m.decide("api.test", 8080, "/x"), Some(true));
+        // ...but a DIFFERENT port to the same host is not — no widening (the `classify` trap the
+        // advisor flagged: a host-only remember would re-ask `:8080`, or over-trust `:443`).
+        assert_eq!(m.decide("api.test", 443, "/x"), None);
+
+        // A deny is remembered and wins for its own host:port.
+        m.remember(Verdict::Deny, "evil.test", 443);
+        assert_eq!(m.decide("evil.test", 443, "/"), Some(false));
+
+        // Dedup: re-answering the same host:port does not stack duplicates.
+        m.remember(Verdict::Allow, "api.test", 8080);
+        assert_eq!(
+            m.snapshot().0.len(),
+            1,
+            "a re-answered host:port is not duplicated"
+        );
+    }
+
+    #[test]
+    fn dispatch_remembers_only_on_the_session_token() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+
+        // A bare ALLOW answers but does not remember.
+        let s = state.clone();
+        let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
+        let seq = wait_for_one(&state);
+        assert_eq!(
+            dispatch(&format!("ALLOW {seq}"), &state, &manual),
+            "ok host=api.test\n"
+        );
+        assert_eq!(parked.join().unwrap(), Verdict::Allow);
+        assert!(
+            manual.snapshot().0.is_empty(),
+            "a bare ALLOW must not remember"
+        );
+
+        // `ALLOW <seq> session` answers AND remembers the exact host:port.
+        let s = state.clone();
+        let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
+        let seq = wait_for_one(&state);
+        let _ = dispatch(&format!("ALLOW {seq} session"), &state, &manual);
+        parked.join().unwrap();
+        assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
+        // And `RULES` reports the remembered rule with its exact port.
+        assert!(
+            dispatch("RULES", &state, &manual).contains("manual allow api.test:8080"),
+            "RULES must list the remembered host:port"
+        );
+    }
+
+    #[test]
+    fn the_control_socket_round_trips_answer_and_rules() {
+        // The integration seam: drive the client functions (`answer_request`, `query_manual`)
+        // against a real `serve` over a bound socket, so the server's wire format and the client's
+        // parser are exercised *together* — not just agreeing by inspection.
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 12345u32; // a stand-in session pid; the socket path is keyed by it
+        let socket = control_socket(data.path(), pid);
+
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let listener = UnixListener::bind(&socket).unwrap();
+        {
+            let pending = pending.clone();
+            let manual = manual.clone();
+            thread::spawn(move || {
+                let _ = serve(listener, pending, manual);
+            });
+        }
+
+        // Park one request (a non-standard port — the granularity that must survive the round-trip).
+        let p = pending.clone();
+        let parked = thread::spawn(move || p.park("api.test", 8080, "/x", None, 256, |_| {}));
+        let seq = wait_for_one(&pending);
+
+        // Answer it ALLOW with `--session` (remember) over the real socket.
+        match answer_request(data.path(), pid, seq, Verdict::Allow, true).unwrap() {
+            AnswerOutcome::Answered(host) => assert_eq!(host, "api.test"),
+            AnswerOutcome::NotFound => panic!("the live request must be answered"),
+        }
+        assert_eq!(parked.join().unwrap(), Verdict::Allow);
+
+        // The remembered rule round-trips back through RULES with its exact host:port.
+        let rules = query_manual(data.path(), pid).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].is_allow);
+        assert_eq!(rules[0].rule, "api.test:8080");
+
+        // The consumed seq is now gone — a second answer is NotFound (not a phantom success).
+        match answer_request(data.path(), pid, seq, Verdict::Allow, false).unwrap() {
+            AnswerOutcome::NotFound => {}
+            AnswerOutcome::Answered(_) => panic!("an already-answered seq must be NotFound"),
+        }
     }
 
     #[test]

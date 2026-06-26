@@ -204,14 +204,55 @@ fn net_rejects_an_unknown_subcommand_and_source() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("rules"));
 
-    // an unknown rule source
+    // an unknown rule source (`config`/`builtin`/`manual` are the known ones)
     fx.write_project("network = \"deny\"\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
-    let out = fx.run(&["net", "rules", "--source", "manual"]);
+    let out = fx.run(&["net", "rules", "--source", "bogus"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("config, builtin"),
-        "an unknown source must name the known ones (manual lands later)"
+        String::from_utf8_lossy(&out.stderr).contains("config, builtin, manual"),
+        "an unknown source must name the known ones"
+    );
+}
+
+#[test]
+fn net_rules_source_manual_is_accepted_and_empty_without_live_sessions() {
+    let fx = Fixture::new();
+    // `--source manual` is a live query, valid even with no config and no running sessions: it
+    // succeeds with an empty listing under the manual header (not the unknown-source error).
+    let out = fx.run(&["net", "rules", "--source", "manual"]);
+    assert!(out.status.success(), "manual is a valid source");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("manual egress rules"), "{stdout}");
+    assert!(stdout.contains("no rules declared"), "{stdout}");
+
+    // `--json` is a clean empty list tagged `manual`.
+    let json = fx.run(&["net", "rules", "--source", "manual", "--json"]);
+    assert!(json.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(v["mode"], "manual");
+    assert_eq!(v["rules"].as_array().map(|a| a.len()), Some(0));
+}
+
+#[test]
+fn net_pending_session_flag_without_a_live_session_is_refused() {
+    let fx = Fixture::new();
+    // `--session` (like a bare answer) needs a live session; absent one it is a pointed refusal, not
+    // a crash. Combined `--session --save` parses too (both extracted before the scope parser).
+    let out = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "4294967295.1",
+        "--session",
+        "--save",
+        "-l",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no live session"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
