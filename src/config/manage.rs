@@ -238,7 +238,7 @@ pub(crate) fn add_egress_rule(
         Some(Item::Value(v)) if v.is_str() => {
             let s = v.as_str().unwrap_or_default().to_string();
             match s.as_str() {
-                "deny" | "allow" | "allowlist" => NetCase::BareFiltering(s),
+                "deny" | "allow" | "allowlist" | "ask" => NetCase::BareFiltering(s),
                 "shared" | "none" => NetCase::BareNonFiltering(s),
                 _ => NetCase::Malformed(format!("unknown posture {s:?}")),
             }

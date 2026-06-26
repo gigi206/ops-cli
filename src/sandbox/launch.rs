@@ -106,9 +106,27 @@ fn launch(
     label: &str,
 ) -> ExitCode {
     if detach {
+        warn_ask_under_detach(&prep.cfg.network);
         launch_detached(prep, runtime, kind, cmd, label)
     } else {
         launch_foreground(prep, runtime, kind, cmd)
+    }
+}
+
+/// Warn when an `ask`-posture launch is detached with no timeout. A background session has no
+/// terminal to surface the park notice, so an undecided request waits indefinitely (the default).
+/// The launch still proceeds — the user chose both `ask` and `--detach` — but the footgun is named,
+/// with the two ways out. A configured `ask_timeout`, or a non-ask posture, is silent.
+fn warn_ask_under_detach(network: &crate::config::NetworkPolicy) {
+    use crate::allowlist::DefaultAction;
+    if let crate::config::NetworkPolicy::Allowlist(policy) = network {
+        if policy.default_action() == DefaultAction::Ask && policy.ask_timeout().is_none() {
+            crate::diag::warn(
+                "`ask` egress under --detach with no `ask_timeout`: a background session has no \
+                 terminal to prompt, so an undecided request parks indefinitely. Set \
+                 `[network] ask_timeout`, or answer it with `ops net pending`.",
+            );
+        }
     }
 }
 

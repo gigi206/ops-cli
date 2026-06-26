@@ -67,18 +67,25 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
     "npm_config_cafile",   // npm
 ];
 
-/// A running egress session's host-side resources: the bound socket and the CA file. The
-/// proxy serves on a detached thread that dies when ops exits (right after the cage); this
-/// guard only owns the on-disk artifacts, unlinking them when the launch ends.
+/// A running egress session's host-side resources: the bound proxy socket, the CA file, and — under
+/// the `ask` posture — the control socket a host-side `ops net pending` reaches. The proxy and
+/// control threads are detached and die when ops exits (right after the cage); this guard only owns
+/// the on-disk artifacts, unlinking them when the launch ends. The control socket is deliberately
+/// not among the cage's binds (see [`start`]).
 pub(crate) struct Egress {
     host_uds: PathBuf,
     ca_file: PathBuf,
+    /// The `ask`-posture control socket, present only when the policy asks by default.
+    control_uds: Option<PathBuf>,
 }
 
 impl Drop for Egress {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.host_uds);
         let _ = std::fs::remove_file(&self.ca_file);
+        if let Some(control) = &self.control_uds {
+            let _ = std::fs::remove_file(control);
+        }
     }
 }
 
@@ -159,11 +166,34 @@ pub(crate) fn start(
     let ca_file = dir.join(format!("ca-{pid}.pem"));
     let _ = std::fs::remove_file(&host_uds);
 
-    let ctx = Arc::new(
-        ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
-            .with_injections(injections)
-            .with_redactions(redactions),
-    );
+    // Read the posture before the policy moves into the proxy context: only `ask` needs a control
+    // plane.
+    let asks = policy.default_action() == crate::allowlist::DefaultAction::Ask;
+    let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
+        .with_injections(injections)
+        .with_redactions(redactions);
+
+    // Under the `ask` posture, stand up the control socket the host-side `ops net pending` reaches
+    // to answer parked requests, sharing one pending queue with the proxy. It lives under the
+    // `0700` egress dir beside `<data>` and is **never** bound into the cage (only the proxy socket
+    // and the CA cross in) — in Mode B the in-cage agent must not be able to answer its own asks.
+    // Other postures never park, so they skip it entirely.
+    let control_uds = if asks {
+        let control_uds = dir.join(format!("control-{pid}.sock"));
+        let _ = std::fs::remove_file(&control_uds);
+        let pending = Arc::new(super::control::PendingState::new());
+        ctx = ctx.with_control(pending.clone());
+        // Bind+listen here, before the serving thread, so the control plane is reachable the moment
+        // the launch is up — never a race with the first `ops net pending`.
+        let control_listener = UnixListener::bind(&control_uds)?;
+        std::thread::spawn(move || {
+            let _ = super::control::serve(control_listener, pending);
+        });
+        Some(control_uds)
+    } else {
+        None
+    };
+    let ctx = Arc::new(ctx);
 
     // Write the CA owner-only, outside every writable mount, then bind it read-only — the
     // agent gets a trust anchor it cannot rewrite.
@@ -223,7 +253,14 @@ pub(crate) fn start(
         },
     ];
 
-    Ok((Egress { host_uds, ca_file }, Wiring { binds, env }))
+    Ok((
+        Egress {
+            host_uds,
+            ca_file,
+            control_uds,
+        },
+        Wiring { binds, env },
+    ))
 }
 
 /// A secret shorter than this many bytes is not added to the outbound-redaction set: such a value
@@ -562,10 +599,62 @@ mod tests {
             .contains("BEGIN CERTIFICATE"));
 
         let (host_uds, ca_file) = (guard.host_uds.clone(), guard.ca_file.clone());
+        // a non-ask posture stands up no control socket
+        assert!(
+            guard.control_uds.is_none(),
+            "deny mode needs no control socket"
+        );
         drop(guard);
         // the guard unlinks both artifacts when the launch ends
         assert!(!host_uds.exists(), "the socket must be unlinked on drop");
         assert!(!ca_file.exists(), "the CA file must be unlinked on drop");
+    }
+
+    /// The load-bearing security property of the `ask` posture: the control socket — over which a
+    /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
+    /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
+    /// Only the proxy socket and the CA cross in.
+    #[test]
+    fn the_ask_control_socket_is_created_but_never_bound_into_the_cage() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+
+        let ask = EgressPolicy::default().with_default(crate::allowlist::DefaultAction::Ask);
+        let (guard, wiring) = start(&layout, ask, &[], Path::new("/"), Path::new(UNUSED_BWRAP))
+            .expect("start the ask egress proxy");
+
+        // ask mode binds a control socket under the egress dir...
+        let control = guard
+            .control_uds
+            .clone()
+            .expect("ask mode must bind a control socket");
+        assert!(control.exists(), "the control socket must be bound");
+        assert!(control
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("control-"));
+
+        // ...but it is NEVER among the cage's binds — the proxy socket and the CA are all that cross
+        // in, so the in-cage agent cannot reach the control plane to answer its own asks.
+        for b in &wiring.binds {
+            assert_ne!(
+                b.src, control,
+                "the control socket must not be bound into the cage"
+            );
+        }
+        assert_eq!(
+            wiring.binds.len(),
+            2,
+            "ask mode adds no cage bind beyond the proxy socket and the CA"
+        );
+
+        drop(guard);
+        assert!(
+            !control.exists(),
+            "the control socket is unlinked when the launch ends"
+        );
     }
 
     fn secret(

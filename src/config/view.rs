@@ -172,12 +172,14 @@ pub(crate) struct ChannelView {
 }
 
 /// What a request matching no rule gets under the filtered-egress posture: `Deny` (the classic
-/// allowlist — nothing but the listed/built-in hosts reaches) or `Allow` (a denylist — everything
-/// public reaches except the deny carve-outs, proxy still active).
+/// allowlist — nothing but the listed/built-in hosts reaches), `Allow` (a denylist — everything
+/// public reaches except the deny carve-outs, proxy still active), or `Ask` (the request parks for
+/// a live host-side decision).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetDefaultView {
     Deny,
     Allow,
+    Ask,
 }
 
 impl From<crate::allowlist::DefaultAction> for NetDefaultView {
@@ -185,6 +187,7 @@ impl From<crate::allowlist::DefaultAction> for NetDefaultView {
         match action {
             crate::allowlist::DefaultAction::Deny => NetDefaultView::Deny,
             crate::allowlist::DefaultAction::Allow => NetDefaultView::Allow,
+            crate::allowlist::DefaultAction::Ask => NetDefaultView::Ask,
         }
     }
 }
@@ -198,9 +201,12 @@ pub(crate) enum NetworkView {
     Isolated,
     /// Filtered egress enforced by the host proxy through an empty-netns cage. `default_action`
     /// is the verdict for an unmatched request; `builtin` is the always-allowed nix-cache set,
-    /// surfaced so it is never a silent allowance.
+    /// surfaced so it is never a silent allowance; `ask_timeout` is the parked-request wait under
+    /// the `ask` default (`Some("90s")`, `Some("none")` for an indefinite wait, or `None` when the
+    /// default is not `ask` so the field is moot).
     Allowlist {
         default_action: NetDefaultView,
+        ask_timeout: Option<String>,
         allow: Vec<String>,
         deny: Vec<String>,
         builtin: Vec<String>,
@@ -318,6 +324,7 @@ pub(crate) enum AppNetworkView {
     Isolated,
     Allowlist {
         default_action: NetDefaultView,
+        ask_timeout: Option<String>,
         allow: Vec<String>,
         deny: Vec<String>,
         builtin: Vec<String>,
@@ -656,6 +663,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
         NetworkPolicy::Isolated => NetworkView::Isolated,
         NetworkPolicy::Allowlist(a) => NetworkView::Allowlist {
             default_action: a.default_action().into(),
+            ask_timeout: ask_timeout_view(a),
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             builtin: sandbox::nix_cache_hosts()
@@ -663,6 +671,31 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
                 .map(|h| h.to_string())
                 .collect(),
         },
+    }
+}
+
+/// The ask-default's parked-request wait, projected for display: `None` when the default action is
+/// not `ask` (the field is moot), `Some("none")` for an indefinite wait, or `Some("90s")` for a
+/// configured bound. Surfaced so a configured timeout is visible in `ops config`.
+fn ask_timeout_view(a: &crate::allowlist::EgressPolicy) -> Option<String> {
+    if a.default_action() != crate::allowlist::DefaultAction::Ask {
+        return None;
+    }
+    Some(match a.ask_timeout() {
+        None => "none".to_string(),
+        Some(d) => fmt_secs(d.as_secs()),
+    })
+}
+
+/// Format a whole-second duration compactly: `2h`/`5m` when it divides evenly into hours/minutes,
+/// else plain seconds (`90s`). Used only for display, so the coarse forms are fine.
+fn fmt_secs(secs: u64) -> String {
+    if secs != 0 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs != 0 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -722,6 +755,7 @@ fn app_view(
             NetworkPolicy::Isolated => AppNetworkView::Isolated,
             NetworkPolicy::Allowlist(a) => AppNetworkView::Allowlist {
                 default_action: a.default_action().into(),
+                ask_timeout: ask_timeout_view(a),
                 allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
                 deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
                 builtin: sandbox::nix_cache_hosts()
@@ -955,6 +989,34 @@ mod tests {
         assert_eq!(builtin.len(), sandbox::nix_cache_hosts().len());
     }
 
+    #[test]
+    fn ask_timeout_view_reflects_only_the_ask_default() {
+        use crate::allowlist::{DefaultAction, EgressPolicy};
+        use std::time::Duration;
+        // Not ask → moot (None), regardless of any timeout the policy happens to carry.
+        let deny = EgressPolicy::default();
+        assert_eq!(ask_timeout_view(&deny), None);
+        let allow = EgressPolicy::default().with_default(DefaultAction::Allow);
+        assert_eq!(ask_timeout_view(&allow), None);
+        // Ask with no timeout → an explicit "none" (indefinite), distinct from the moot None.
+        let ask = EgressPolicy::default().with_default(DefaultAction::Ask);
+        assert_eq!(ask_timeout_view(&ask), Some("none".to_string()));
+        // Ask with a timeout → the compact form.
+        let timed = ask.clone().with_ask_timeout(Some(Duration::from_secs(90)));
+        assert_eq!(ask_timeout_view(&timed), Some("90s".to_string()));
+        let mins = ask.with_ask_timeout(Some(Duration::from_secs(300)));
+        assert_eq!(ask_timeout_view(&mins), Some("5m".to_string()));
+    }
+
+    #[test]
+    fn fmt_secs_picks_the_coarsest_even_unit() {
+        assert_eq!(fmt_secs(90), "90s");
+        assert_eq!(fmt_secs(300), "5m");
+        assert_eq!(fmt_secs(7200), "2h");
+        assert_eq!(fmt_secs(0), "0s");
+        assert_eq!(fmt_secs(3661), "3661s"); // not an even minute or hour
+    }
+
     /// The view model serializes to a JSON object — the property a management front-end relies on,
     /// and the foundation a `--json` output stands on. Built here by hand (not through [`build`],
     /// which needs I/O) so the test pins the *serialization contract*: every field is plain data,
@@ -1000,6 +1062,7 @@ mod tests {
             },
             network: NetworkView::Allowlist {
                 default_action: NetDefaultView::Deny,
+                ask_timeout: None,
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
@@ -1029,6 +1092,7 @@ mod tests {
                 }],
                 network: Some(AppNetworkView::Allowlist {
                     default_action: NetDefaultView::Deny,
+                    ask_timeout: None,
                     allow: vec!["api.example.com".into()],
                     deny: vec!["api.example.com/admin".into()],
                     builtin: vec!["cache.nixos.org".into()],

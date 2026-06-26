@@ -355,3 +355,97 @@ fn net_allow_rejects_an_invalid_rule_before_writing() {
         "an invalid rule must not create the config"
     );
 }
+
+// ── increment 4: the `ask` posture + the live pending control plane ────────────────────────────
+
+#[test]
+fn ask_mode_renders_across_config_rules_and_the_tester() {
+    let fx = Fixture::new();
+    // A trusted `ask` posture with a timeout and one auto-allow / one auto-deny carve-out.
+    fx.write_project(
+        "[network]\nmode = \"ask\"\nask_timeout = \"90s\"\nallow = [\"github.com\"]\ndeny = [\"evil.com\"]\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // `ops config show` names the ask posture and surfaces the configured timeout.
+    let show = fx.run(&["config", "show"]);
+    let s = String::from_utf8_lossy(&show.stdout);
+    assert!(s.contains("network: ask"), "config show:\n{s}");
+    assert!(s.contains("ask timeout: 90s"), "config show:\n{s}");
+
+    // `ops net rules` frames the ask posture and still tags the carve-out rules.
+    let rules = fx.run(&["net", "rules"]);
+    let r = String::from_utf8_lossy(&rules.stdout);
+    assert!(r.contains("network: ask"), "net rules:\n{r}");
+    assert!(r.contains("allow github.com  (config)"), "net rules:\n{r}");
+    assert!(r.contains("deny  evil.com  (config)"), "net rules:\n{r}");
+
+    // `ops test net` reports an unmatched host as "would ask" (no static verdict).
+    let test = fx.run(&["test", "net", "https://unlisted.example.com/x"]);
+    let t = String::from_utf8_lossy(&test.stdout);
+    assert!(t.contains("WOULD ASK"), "test net:\n{t}");
+    // A carve-out host still resolves statically: the allow rule auto-passes.
+    let allowed = fx.run(&["test", "net", "https://github.com/x"]);
+    assert!(
+        String::from_utf8_lossy(&allowed.stdout).contains("ALLOWED"),
+        "an ask-mode allow rule must still pass: {:?}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+}
+
+#[test]
+fn net_pending_lists_nothing_when_no_session_is_parked() {
+    let fx = Fixture::new();
+    let out = fx.run(&["net", "pending"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("none"),
+        "an empty queue says so: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // `--json` is a clean empty list — the contract a front-end relies on.
+    let json = fx.run(&["net", "pending", "--json"]);
+    assert!(json.status.success());
+    let v: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("net pending --json is valid JSON");
+    assert_eq!(v["pending"].as_array().map(|a| a.len()), Some(0));
+}
+
+#[test]
+fn net_pending_answer_rejects_a_malformed_id() {
+    let fx = Fixture::new();
+    let out = fx.run(&["net", "pending", "allow", "not-an-id"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid pending id"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn net_pending_answer_an_absent_session_is_refused() {
+    let fx = Fixture::new();
+    // A well-formed id whose session does not exist (no control socket) → a pointed refusal, exit 2.
+    let out = fx.run(&["net", "pending", "allow", "4294967295.1"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no live session"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn net_pending_answer_rejects_a_scope_without_save() {
+    let fx = Fixture::new();
+    // A scope flag (here --global) is meaningless without --save — flagged, not silently ignored.
+    let out = fx.run(&["net", "pending", "allow", "123.1", "--global"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only applies with --save"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

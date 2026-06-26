@@ -1073,6 +1073,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
         NetworkView::Allowlist {
             default_action,
+            ask_timeout,
             allow,
             deny,
             builtin,
@@ -1082,6 +1083,14 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 "  {h}network:{r} {}{net_tag}",
                 net_mode_word(*default_action)
             );
+            if let Some(t) = ask_timeout {
+                let shown = if t == "none" {
+                    "none (wait indefinitely until answered)".to_string()
+                } else {
+                    t.clone()
+                };
+                let _ = writeln!(o, "    {dim}ask timeout: {shown}{r}");
+            }
             match default_action {
                 // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
                 NetDefaultView::Deny => {
@@ -1125,6 +1134,31 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                         for rule in allow {
                             let _ = writeln!(o, "      allow {n}{rule}{r}");
                         }
+                    }
+                }
+                // Ask: an unlisted host parks for a live decision; allow rules still auto-pass and
+                // deny rules still auto-fail, so list those (and the built-in set) as pre-decided.
+                NetDefaultView::Ask => {
+                    let _ = writeln!(
+                        o,
+                        "    {dim}an unlisted host parks for a live `ops net pending` decision; \
+                         these are pre-decided:{r}"
+                    );
+                    if !allow.is_empty() {
+                        let _ = writeln!(o, "    {dim}auto-allow:{r}");
+                        for rule in allow {
+                            let _ = writeln!(o, "      allow {n}{rule}{r}");
+                        }
+                    }
+                    for rule in deny {
+                        let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+                    }
+                    let _ = writeln!(
+                        o,
+                        "    {dim}built-in (always allowed, so self-equip works):{r}"
+                    );
+                    for host in builtin {
+                        let _ = writeln!(o, "      allow {n}{host}{r}");
                     }
                 }
             }
@@ -1268,6 +1302,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     }
                     AppNetworkView::Allowlist {
                         default_action,
+                        ask_timeout,
                         allow,
                         deny,
                         builtin,
@@ -1277,6 +1312,9 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                             "      {dim}network:{r} {}",
                             net_mode_word(*default_action)
                         );
+                        if let Some(t) = ask_timeout {
+                            let _ = writeln!(o, "        {dim}ask timeout: {t}{r}");
+                        }
                         for rule in allow {
                             let _ = writeln!(o, "        allow {n}{rule}{r}");
                         }
@@ -1427,6 +1465,7 @@ fn render_app_detail(
         }
         NetworkView::Allowlist {
             default_action,
+            ask_timeout,
             allow,
             deny,
             builtin,
@@ -1436,6 +1475,9 @@ fn render_app_detail(
                 "  {h}network:{r} {}{net_tag}",
                 net_mode_word(*default_action)
             );
+            if let Some(t) = ask_timeout {
+                let _ = writeln!(o, "    {dim}ask timeout: {t}{r}");
+            }
             if details {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
@@ -2594,6 +2636,9 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 allowlist::DefaultAction::Allow => {
                     "allow (denylist — every public host reaches except the deny rules)"
                 }
+                allowlist::DefaultAction::Ask => {
+                    "ask (an unmatched host parks for a live `ops net pending` decision)"
+                }
             };
             println!("{h}network:{r} {mode}");
             let decision = policy.explain(&host, port, &path);
@@ -2628,6 +2673,15 @@ fn render_net_decision(url: &str, decision: &allowlist::Decision, pal: &style::P
             let _ = writeln!(o, "{ok}ALLOWED{r}  {n}{url}{r}");
             let _ = writeln!(o, "  {dim}no deny rule matches (allow-by-default){r}");
         }
+        allowlist::Decision::Ask => {
+            // No static verdict: at launch this request would park for a live decision. Use the
+            // dim hue (neither pass nor fail) so a tester reading the column is not misled.
+            let _ = writeln!(o, "{dim}WOULD ASK{r} {n}{url}{r}");
+            let _ = writeln!(
+                o,
+                "  {dim}no rule matches (ask-by-default — it would park for `ops net pending`){r}"
+            );
+        }
     }
     o
 }
@@ -2639,6 +2693,7 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
     match default_action {
         config::view::NetDefaultView::Deny => "deny",
         config::view::NetDefaultView::Allow => "allow",
+        config::view::NetDefaultView::Ask => "ask",
     }
 }
 
@@ -2650,8 +2705,11 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("rules") => net_rules(&args[1..]),
         Some("allow") => net_add_rule(config::manage::EgressList::Allow, &args[1..]),
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
+        Some("pending") => net_pending(&args[1..]),
         Some(other) => {
-            eprintln!("ops: unknown `net` subcommand '{other}' (known: rules, allow, deny)");
+            eprintln!(
+                "ops: unknown `net` subcommand '{other}' (known: rules, allow, deny, pending)"
+            );
             ExitCode::from(2)
         }
         None => {
@@ -2659,6 +2717,247 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `ops net pending` family — the live control plane for the `ask` egress posture (see
+/// [`sandbox::control`]). With no verb it lists the requests parked across every reachable ask-mode
+/// session; `allow <id>`/`deny <id>` answer one (`<id>` = `<pid>.<seq>` from the listing or the
+/// launch's notice), optionally persisting a matching rule with `--save` + a scope. The control
+/// sockets live under `<data>/egress`, never inside any cage.
+fn net_pending(args: &[OsString]) -> ExitCode {
+    use sandbox::control::Verdict;
+    match args.first().and_then(|a| a.to_str()) {
+        Some("allow") => net_pending_answer(Verdict::Allow, &args[1..]),
+        Some("deny") => net_pending_answer(Verdict::Deny, &args[1..]),
+        // No verb (or `--json`): list the pending requests.
+        _ => net_pending_list(args),
+    }
+}
+
+/// The data directory the control sockets live under, or a pointed error.
+fn egress_data_dir() -> Result<PathBuf, String> {
+    store::Layout::from_env()
+        .map(|l| l.data_dir().to_path_buf())
+        .ok_or_else(|| "cannot locate the data directory (set $HOME or $XDG_DATA_HOME)".to_string())
+}
+
+/// The human context of the ask-mode control sockets, cross-referenced from the session registry:
+/// `(pid, project root, display label)` per live session. Best-effort — a session not in the
+/// registry (a race, or one that failed to register) simply lists without context, and a `--save`
+/// for it falls back to the cwd. The registry is keyed by the same pid the control socket filename
+/// carries, so the two line up.
+fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
+    session::Registry::at(data_dir)
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let label = s.label();
+            (s.pid, s.project, label)
+        })
+        .collect()
+}
+
+/// `ops net pending [--json]`: list every reachable ask-mode session's parked requests, grouped by
+/// session (with its agent/project context) and each carrying the `<pid>.<seq>` id to answer it. No
+/// launch / nix / network — it just queries the live control sockets. An empty result is a clean
+/// success (nothing is waiting).
+fn net_pending_list(args: &[OsString]) -> ExitCode {
+    let json = args.iter().any(|a| a.to_str() == Some("--json"));
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sessions = sandbox::control::list_all(&data_dir);
+    let context = pending_session_context(&data_dir);
+    let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
+
+    if json {
+        let rows: Vec<_> = sessions
+            .iter()
+            .flat_map(|s| {
+                let ctx = ctx_of(s.pid);
+                let project = ctx.map(|(_, p, _)| p.display().to_string());
+                let label = ctx.map(|(_, _, l)| l.clone());
+                s.rows.iter().map(move |row| {
+                    serde_json::json!({
+                        "id": sandbox::control::format_id(s.pid, row.seq),
+                        "pid": s.pid,
+                        "project": project,
+                        "label": label,
+                        "host": row.host,
+                        "port": row.port,
+                        "path": row.path,
+                        "waiting_secs": row.waiting_secs,
+                    })
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "pending": rows }));
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_pending(&sessions, &context, &pal));
+    ExitCode::SUCCESS
+}
+
+/// Render the pending-request listing — a pure presenter (its colored layout is asserted in a test):
+/// the parked requests grouped under a per-session header (the registry label + project, so several
+/// sessions are told apart), each request a `<pid>.<seq>` id, destination, and wait time. An empty
+/// listing says so and points at how requests arrive (an `ask`-posture launch).
+fn render_pending(
+    sessions: &[sandbox::control::SessionPending],
+    context: &[(u32, PathBuf, String)],
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    let total: usize = sessions.iter().map(|s| s.rows.len()).sum();
+    if total == 0 {
+        let _ = writeln!(
+            o,
+            "{h}pending egress requests:{r} {dim}(none — a request parks here only under \
+             `[network] mode = \"ask\"`){r}"
+        );
+        return o;
+    }
+    let _ = writeln!(o, "{h}pending egress requests:{r}");
+    for session in sessions {
+        // A per-session header from the registry, so with several agents the user can tell which one
+        // each request belongs to (the literal reason the control plane is multi-session).
+        match context.iter().find(|(pid, _, _)| *pid == session.pid) {
+            Some((_, project, label)) => {
+                let _ = writeln!(
+                    o,
+                    "  {dim}session {} [{}] {}{r}",
+                    session.pid,
+                    label,
+                    project.display()
+                );
+            }
+            None => {
+                let _ = writeln!(o, "  {dim}session {} (unregistered){r}", session.pid);
+            }
+        }
+        for row in &session.rows {
+            let id = sandbox::control::format_id(session.pid, row.seq);
+            let _ = writeln!(
+                o,
+                "    {n}{id}{r}  {}:{}{}  {dim}(waiting {}s){r}",
+                row.host, row.port, row.path, row.waiting_secs
+            );
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  {dim}answer: ops net pending allow <id> [--save --local|--global|--app <name>]{r}"
+    );
+    o
+}
+
+/// `ops net pending allow|deny <id> [--save --local|--global|--app <name>]`: answer one parked
+/// request live. The unblock is the primary action; `--save` additionally persists a matching rule
+/// (the request's host) through the shared writer so the same host is pre-decided next launch — a
+/// secondary step whose failure is a warning, never undoing the answer. `<id>` is `<pid>.<seq>`.
+fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> ExitCode {
+    use config::manage::EgressList;
+    let verb = match verdict {
+        sandbox::control::Verdict::Allow => "allow",
+        sandbox::control::Verdict::Deny => "deny",
+    };
+    // `--save` is extracted before `split_scope`, which rejects any flag it does not know. The id
+    // is the lone positional; the scope flags (--local/--global/--app) ride `split_scope` and apply
+    // only with `--save`.
+    let save = args.iter().any(|a| a.to_str() == Some("--save"));
+    let rest: Vec<OsString> = args
+        .iter()
+        .filter(|a| a.to_str() != Some("--save"))
+        .cloned()
+        .collect();
+    let parsed = match split_scope(&rest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let id = match parsed.positionals.as_slice() {
+        [id] => id.as_str(),
+        _ => {
+            eprintln!(
+                "ops: usage: {}",
+                help::synopsis_of(&["net", "pending", verb])
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let Some((pid, seq)) = sandbox::control::parse_id(id) else {
+        eprintln!("ops: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)");
+        return ExitCode::from(2);
+    };
+    // A scope (--global/--app, or a `-c` file) without `--save` is meaningless — flag it rather than
+    // silently ignore it. `--local` is the `split_scope` default, so a bare oneshot does not trip it.
+    if !save && (parsed.app.is_some() || !matches!(parsed.scope, config::manage::Scope::Local)) {
+        eprintln!("ops: a scope (--local/--global/--app) only applies with --save");
+        return ExitCode::from(2);
+    }
+
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let host = match sandbox::control::answer_request(&data_dir, pid, seq, verdict) {
+        Ok(sandbox::control::AnswerOutcome::Answered(host)) => host,
+        Ok(sandbox::control::AnswerOutcome::NotFound) => {
+            eprintln!(
+                "ops: no pending request '{id}' (it may have been answered already or timed out)"
+            );
+            return ExitCode::from(2);
+        }
+        Err(_) => {
+            eprintln!(
+                "ops: no live session for '{id}' (the launch may have ended, or its socket is \
+                 stale)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    println!("{verb}ed {host} for {id}");
+
+    // `--save` persists a matching rule (the host) so the same destination is pre-decided next
+    // launch: an allow becomes an allow rule, a deny a deny rule. The live answer already stuck, so
+    // a save failure is a warning, never a hard failure that would imply the answer was undone.
+    if save {
+        let list = match verdict {
+            sandbox::control::Verdict::Allow => EgressList::Allow,
+            sandbox::control::Verdict::Deny => EgressList::Deny,
+        };
+        // Resolve a `--local` save against the *answered session's* project (from the registry), not
+        // the cwd — the rule belongs in the project the agent runs in, which may not be where the
+        // user is standing. Fall back to the cwd if the session is not in the registry.
+        let base = pending_session_context(&data_dir)
+            .into_iter()
+            .find(|(p, _, _)| *p == pid)
+            .map(|(_, project, _)| project)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        match persist_egress_rule(list, &host, &parsed.scope, parsed.app.as_deref(), &base) {
+            Ok(message) => println!("{message}"),
+            Err((_, message)) => {
+                diag::warn(&format!("answered, but could not save the rule: {message}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// `ops net rules [--source config|builtin] [--filter <substr>] [--json]`: list the effective
@@ -2791,6 +3090,13 @@ fn render_net_rules(
                 "{h}network:{r} allow {dim}— denylist: every public host reaches except the deny rules{r}"
             );
         }
+        "ask" => {
+            let _ = writeln!(
+                o,
+                "{h}network:{r} ask {dim}— an unmatched host parks for a live `ops net pending` decision; \
+                 allow rules auto-pass, deny rules auto-fail{r}"
+            );
+        }
         _ => {
             let _ = writeln!(
                 o,
@@ -2837,7 +3143,7 @@ fn render_net_rules(
 /// re-trusted after the write so the rule takes effect. The global config is trusted by location
 /// (no gate). `--app <name>` targets the app's own `[app.<name>.network]`.
 fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
-    use config::manage::{self, AddOutcome, Scope};
+    use config::manage;
     let verb = match list {
         manage::EgressList::Allow => "allow",
         manage::EgressList::Deny => "deny",
@@ -2867,16 +3173,6 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             return ExitCode::from(2);
         }
     }
-    // An explicit `-c <file>` is refused here: it is neither the global config (trusted by
-    // location) nor the project's `.ops.toml` (the trust-gated path), so a write to it would land
-    // a rule the trust gate then drops at launch — a silently-inert write. The scope vocabulary is
-    // `--local`/`--global`/`--app` only.
-    if matches!(parsed.scope, Scope::File(_)) {
-        eprintln!(
-            "ops: `ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"
-        );
-        return ExitCode::from(2);
-    }
     // Validate the rule before touching any file (fail-closed: a `*` catch-all, a scheme, or an
     // uncompilable regex is refused — the same classification the config resolver applies).
     if let Err(e) = allowlist::classify(&rule) {
@@ -2884,6 +3180,8 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         return ExitCode::from(2);
     }
 
+    // `ops net allow|deny` resolves a `--local` scope against the cwd, as one expects of a command
+    // run in a project.
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -2891,70 +3189,100 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             return ExitCode::FAILURE;
         }
     };
-    let path = match manage::scope_path(&parsed.scope, &cwd) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ops: {e}");
-            return ExitCode::FAILURE;
+    match persist_egress_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
         }
+        Err((code, message)) => {
+            eprintln!("ops: {message}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
+/// it after — the shared writer behind `ops net allow|deny <rule>` and the `--save` of
+/// `ops net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
+/// refusal (a `-c` file scope, an untrusted project config, a posture conflict) is code `2`; an
+/// operational failure (no trust store, an unwritable path, a re-trust failure) is code `1`. A
+/// `Scope::File` is refused — the vocabulary is local/global/app, and a `-c` write would be
+/// silently dropped at launch (neither trusted-by-location nor the gated project path).
+fn persist_egress_rule(
+    list: config::manage::EgressList,
+    rule: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage::{self, AddOutcome, Scope};
+    let verb = match list {
+        manage::EgressList::Allow => "allow",
+        manage::EgressList::Deny => "deny",
     };
+    if matches!(scope, Scope::File(_)) {
+        return Err((
+            2,
+            format!("`ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
+        ));
+    }
+    // `base` is the directory a `--local` scope resolves against: the cwd for `ops net allow|deny`,
+    // or the *answered session's* project for `ops net pending --save` (so the rule lands in the
+    // project the agent runs in, not wherever the user happens to stand). Global ignores it.
+    let path = manage::scope_path(scope, base).map_err(|e| (1, e.to_string()))?;
 
     // A write to the project `.ops.toml` is trust-gated; the global config is trusted by location.
-    let gated = matches!(parsed.scope, Scope::Local);
-    let store = if gated {
-        match trust::default_store_dir() {
-            Some(s) => Some(s),
-            None => {
-                eprintln!(
-                    "ops: cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule \
-                     would be written but could not be trusted, so it would not take effect — use \
-                     --global, or set the trust store"
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
-    };
+    let gated = matches!(scope, Scope::Local);
+    let store =
+        if gated {
+            Some(trust::default_store_dir().ok_or((
+            1,
+            "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be \
+             written but could not be trusted, so it would not take effect — use --global, or set \
+             the trust store"
+                .to_string(),
+        ))?)
+        } else {
+            None
+        };
 
-    // Pre-check: an existing-but-untrusted project config must not be silently blessed by an
-    // append — the user reviews and trusts it first. Absent or already-trusted is fine: ops's edit
-    // is then the sole delta from the trusted bytes.
+    // Pre-check: an existing-but-untrusted project config must not be silently blessed by an append
+    // — the user reviews and trusts it first. Absent or already-trusted is fine: ops's edit is then
+    // the sole delta from the trusted bytes.
     if let Some(store) = &store {
         if path.exists() && !matches!(trust::state(store, &path), trust::TrustState::Trusted) {
-            eprintln!(
-                "ops: {} is not trusted — review it and run `ops trust {}`, then retry",
-                path.display(),
-                config::PROJECT_CONFIG
-            );
-            return ExitCode::from(2);
+            return Err((
+                2,
+                format!(
+                    "{} is not trusted — review it and run `ops trust {}`, then retry",
+                    path.display(),
+                    config::PROJECT_CONFIG
+                ),
+            ));
         }
     }
 
-    let outcome = match manage::add_egress_rule(&path, parsed.app.as_deref(), list, &rule) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("ops: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let outcome =
+        manage::add_egress_rule(&path, app, list, rule).map_err(|e| (2, e.to_string()))?;
 
     // Re-trust the project config after the write. Ordering is fail-safe: a crash between the write
-    // and the trust leaves a correct-but-untrusted file, which the next launch drops — the rule
-    // does not take effect, never a security hole.
+    // and the trust leaves a correct-but-untrusted file, which the next launch drops — the rule does
+    // not take effect, never a security hole.
     if let Some(store) = &store {
-        if let Err(e) = trust::trust(store, &path) {
-            eprintln!(
-                "ops: wrote the rule but could not re-trust {}: {e} — run `ops trust {}` so it \
-                 takes effect",
-                path.display(),
-                config::PROJECT_CONFIG
-            );
-            return ExitCode::FAILURE;
-        }
+        trust::trust(store, &path).map_err(|e| {
+            (
+                1,
+                format!(
+                    "wrote the rule but could not re-trust {}: {e} — run `ops trust {}` so it \
+                     takes effect",
+                    path.display(),
+                    config::PROJECT_CONFIG
+                ),
+            )
+        })?;
     }
 
-    let target = match (&parsed.scope, &parsed.app) {
+    let target = match (scope, app) {
         (Scope::Global, None) => "the global config".to_string(),
         (Scope::Global, Some(a)) => format!("the global config (app `{a}`)"),
         (Scope::Local, None) => "the project config".to_string(),
@@ -2962,23 +3290,23 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         (Scope::File(p), None) => p.display().to_string(),
         (Scope::File(p), Some(a)) => format!("{} (app `{a}`)", p.display()),
     };
-    match outcome {
+    Ok(match outcome {
         AddOutcome::AlreadyPresent => {
-            println!("{verb} {rule} is already present in {target} — no change");
+            format!("{verb} {rule} is already present in {target} — no change")
         }
         AddOutcome::Added { created_mode } => {
-            match created_mode {
+            let mut msg = match created_mode {
                 Some(mode) => {
-                    println!("set network mode `{mode}` and added {verb} {rule} to {target}")
+                    format!("set network mode `{mode}` and added {verb} {rule} to {target}")
                 }
-                None => println!("added {verb} {rule} to {target}"),
-            }
+                None => format!("added {verb} {rule} to {target}"),
+            };
             if gated {
-                println!("re-trusted {}", config::PROJECT_CONFIG);
+                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
             }
+            msg
         }
-    }
-    ExitCode::SUCCESS
+    })
 }
 
 /// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
@@ -4420,6 +4748,60 @@ mod tests {
     }
 
     #[test]
+    fn render_pending_groups_requests_under_a_session_header() {
+        use sandbox::control::{PendingRow, SessionPending};
+        let p = style::Palette::plain();
+
+        // Empty → the "none" line with the how-it-arrives hint.
+        assert!(render_pending(&[], &[], &p).contains("none"));
+
+        let row = |seq, host: &str, path: &str, waiting| PendingRow {
+            seq,
+            host: host.into(),
+            port: 443,
+            path: path.into(),
+            waiting_secs: waiting,
+        };
+        let sessions = [
+            SessionPending {
+                pid: 12345,
+                rows: vec![row(1, "api.example.com", "/v1/x", 12)],
+            },
+            SessionPending {
+                pid: 67890,
+                rows: vec![row(1, "files.example.org", "/dl", 3)],
+            },
+        ];
+        // Only the first session is in the registry context, so the two render differently.
+        let context = vec![(
+            12345u32,
+            std::path::PathBuf::from("/home/u/proj"),
+            "app:demo".to_string(),
+        )];
+
+        let out = render_pending(&sessions, &context, &p);
+        // Each request: a `<pid>.<seq>` id, its destination, and its wait time.
+        assert!(
+            out.contains("12345.1")
+                && out.contains("api.example.com:443/v1/x")
+                && out.contains("waiting 12s"),
+            "{out}"
+        );
+        assert!(
+            out.contains("67890.1") && out.contains("files.example.org:443/dl"),
+            "{out}"
+        );
+        // The registered session shows its label + project; the other is flagged — so two sessions
+        // are told apart (the literal multi-session ask).
+        assert!(
+            out.contains("session 12345 [app:demo] /home/u/proj"),
+            "{out}"
+        );
+        assert!(out.contains("session 67890 (unregistered)"), "{out}");
+        assert!(out.contains("ops net pending allow <id>"), "{out}");
+    }
+
+    #[test]
     fn trust_verdict_is_plain_text_when_uncolored() {
         let p = style::Palette::plain();
         let path = Path::new("/p/.ops.toml");
@@ -5031,6 +5413,7 @@ mod tests {
             },
             network: NetworkView::Allowlist {
                 default_action: config::view::NetDefaultView::Deny,
+                ask_timeout: None,
                 allow: vec!["github.com".into()],
                 deny: vec!["evil.com".into()],
                 builtin: vec!["cache.nixos.org".into()],
@@ -5181,6 +5564,7 @@ mod tests {
             home_scope_origin: ProvenanceView::Default,
             network: NetworkView::Allowlist {
                 default_action: config::view::NetDefaultView::Deny,
+                ask_timeout: None,
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
@@ -5527,6 +5911,7 @@ mod tests {
                 packages: vec![],
                 network: Some(AppNetworkView::Allowlist {
                     default_action: config::view::NetDefaultView::Deny,
+                    ask_timeout: None,
                     allow: vec!["api.example.com".into(), "github.com".into()],
                     deny: vec!["github.com/secret".into()],
                     builtin: vec!["cache.nixos.org".into()],

@@ -297,11 +297,11 @@ pub(crate) enum SecretFrom {
 
 /// The two shapes the `network` field accepts: a bare posture string, or a table for the
 /// filtered-egress carve-out lists. An untagged enum so both TOML forms parse — `network = "none"`
-/// and `[network] mode = "deny"` (or `"allow"`) — keeping the simple case a one-liner.
+/// and `[network] mode = "deny"` (or `"allow"`/`"ask"`) — keeping the simple case a one-liner.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum NetworkField {
-    /// `network = "none"` | `"shared"` | `"deny"` | `"allow"`.
+    /// `network = "none"` | `"shared"` | `"deny"` | `"allow"` | `"ask"`.
     Posture(String),
     /// `[network] mode = "<mode>"` with optional `allow`/`deny` carve-out lists.
     Table(NetworkTable),
@@ -309,7 +309,9 @@ pub(crate) enum NetworkField {
 
 /// The table form of the `network` field: a mode plus the egress carve-out entries (IPs, domains,
 /// `*.domain` wildcards, exact URLs — classified later). Under `deny` mode `allow` lists what may
-/// reach; under `allow` mode `deny` lists what may not. `deny` always wins.
+/// reach; under `allow` mode `deny` lists what may not; under `ask` mode `allow` auto-passes and
+/// `deny` auto-fails, everything else parks. `deny` always wins. `ask_timeout` (a duration like
+/// `"90s"`/`"5m"`, or absent for an indefinite wait) bounds a parked `ask` request.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
     pub(crate) mode: String,
@@ -317,6 +319,8 @@ pub(crate) struct NetworkTable {
     pub(crate) allow: Vec<String>,
     #[serde(default)]
     pub(crate) deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ask_timeout: Option<String>,
 }
 
 /// Parse config bytes as TOML. The error is a human-readable string: the loader
@@ -638,6 +642,7 @@ mod tests {
                     "https://example.com/x".into(),
                 ],
                 deny: vec!["evil.nixos.org".into()],
+                ask_timeout: None,
             }))
         );
     }
@@ -651,6 +656,7 @@ mod tests {
                 mode: "allowlist".into(),
                 allow: vec![],
                 deny: vec![],
+                ask_timeout: None,
             }))
         );
     }

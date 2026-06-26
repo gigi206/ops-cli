@@ -367,8 +367,8 @@ impl fmt::Display for Rule {
 /// the allow/deny lists. `Deny` is the classic allowlist (nothing reaches but the listed
 /// hosts); `Allow` is a denylist (everything public reaches *except* the listed hosts), with
 /// the filtering proxy still active so deny carve-outs, the SSRF guard, credential injection,
-/// and redaction all keep working. (`Ask` — park the request for a live decision — is a later
-/// increment.)
+/// and redaction all keep working. `Ask` parks an undecided request for a live human decision
+/// (allow rules auto-pass, deny rules auto-fail, everything else waits).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DefaultAction {
     /// No rule matched ⇒ deny (the classic allowlist; the default).
@@ -377,17 +377,24 @@ pub(crate) enum DefaultAction {
     /// No rule matched ⇒ allow (a denylist; the proxy stays active for the matched-deny,
     /// SSRF, injection, and redaction paths).
     Allow,
+    /// No rule matched ⇒ park the request for a live decision (allow rules still auto-pass,
+    /// deny rules still auto-fail). The proxy blocks the connection until a host-side
+    /// `ops net pending allow|deny` answers it or the configured timeout elapses (deny).
+    Ask,
 }
 
 /// A classified egress policy: an allow list, a deny list, and a default action for a request
 /// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
 /// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
-/// SSRF private-host exception (every public host is already permitted).
+/// SSRF private-host exception (every public host is already permitted). Under
+/// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
+/// (`None` = wait indefinitely until answered); it is inert under the other defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
     default_action: DefaultAction,
+    ask_timeout: Option<std::time::Duration>,
 }
 
 impl EgressPolicy {
@@ -398,6 +405,7 @@ impl EgressPolicy {
             allow,
             deny,
             default_action: DefaultAction::Deny,
+            ask_timeout: None,
         }
     }
 
@@ -407,8 +415,22 @@ impl EgressPolicy {
         self
     }
 
+    /// Set how long an `ask`-default request parks before timing out to a deny, returning the
+    /// policy (builder style). `None` (the default) waits indefinitely. Inert unless the
+    /// default action is [`DefaultAction::Ask`].
+    pub(crate) fn with_ask_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.ask_timeout = timeout;
+        self
+    }
+
     pub(crate) fn default_action(&self) -> DefaultAction {
         self.default_action
+    }
+
+    /// How long a parked `ask` request waits before timing out to a deny — `None` means wait
+    /// indefinitely. The proxy reads this only under [`DefaultAction::Ask`].
+    pub(crate) fn ask_timeout(&self) -> Option<std::time::Duration> {
+        self.ask_timeout
     }
 
     pub(crate) fn allow_rules(&self) -> &[Rule] {
@@ -449,6 +471,7 @@ impl EgressPolicy {
         match self.default_action {
             DefaultAction::Deny => Decision::DeniedDefault,
             DefaultAction::Allow => Decision::AllowedDefault,
+            DefaultAction::Ask => Decision::Ask,
         }
     }
 }
@@ -467,6 +490,10 @@ pub(crate) enum Decision<'a> {
     /// No rule matched, and the policy allows by default (a denylist). There is no deciding
     /// rule, so the SSRF guard treats this like an unnamed host (private addresses refused).
     AllowedDefault,
+    /// No rule matched, and the policy asks by default: the request parks for a live decision.
+    /// The proxy blocks until answered or the ask timeout elapses; the `ops test net` tester
+    /// reports it as "would ask" since there is no static verdict.
+    Ask,
 }
 
 /// Whether `rule` matches a request to `host`:`port` for `target`, canonicalized exactly

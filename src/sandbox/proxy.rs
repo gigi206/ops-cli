@@ -28,6 +28,7 @@
 //! |---|---|---|
 //! | `403` | `denied-default`         | no allow rule matched the host / port / path |
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
+//! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `ops net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal (a hostname is required) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
@@ -452,6 +453,15 @@ pub(crate) struct ProxyCtx {
     timeout: Duration,
     injections: Vec<HeaderInjection>,
     redactions: Vec<SecretNeedle>,
+    /// The shared queue of parked `ask`-posture requests. Under `DefaultAction::Ask` an undecided
+    /// request enqueues here and blocks; the control socket ([`super::control`]) answers it. A
+    /// throwaway internal queue by default (so a non-ask launch never touches it); the launch
+    /// injects the one the control thread also holds via [`Self::with_control`].
+    pending: Arc<super::control::PendingState>,
+    /// Whether to print a one-line stderr notice when a request parks, so an interactive user sees
+    /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
+    /// it on when it wires the control socket.
+    notices: bool,
 }
 
 impl ProxyCtx {
@@ -475,7 +485,18 @@ impl ProxyCtx {
             timeout: Duration::from_secs(30),
             injections: Vec::new(),
             redactions: Vec::new(),
+            pending: Arc::new(super::control::PendingState::new()),
+            notices: false,
         })
+    }
+
+    /// Wire the proxy to the launch's shared pending queue and turn on the park notices. The launch
+    /// ([`super::egress::start`]) passes the same [`super::control::PendingState`] it serves on the
+    /// control socket, so a request parked here is answerable by `ops net pending`.
+    pub(crate) fn with_control(mut self, pending: Arc<super::control::PendingState>) -> Self {
+        self.pending = pending;
+        self.notices = true;
+        self
     }
 
     /// Attach the resolved host-side credential injections. The proxy applies each to an
@@ -516,16 +537,26 @@ impl ProxyCtx {
         self.upstream = upstream;
         self
     }
+
+    /// Wire the shared pending queue without turning on the stderr park notices, so a test can
+    /// answer a parked request out of band while keeping the test output clean (unlike
+    /// [`with_control`](ProxyCtx::with_control), which the launch uses and which prints notices).
+    fn with_pending_silent(mut self, pending: Arc<super::control::PendingState>) -> Self {
+        self.pending = pending;
+        self
+    }
 }
 
 /// Append the built-in nix-cache allow rules to a policy's allow list (deny is unchanged, so a
-/// user deny still wins over a built-in allow). The default action is carried through unchanged —
-/// rebuilding the policy must not silently demote an allow-by-default (denylist) posture to
-/// deny-by-default.
+/// user deny still wins over a built-in allow). The default action *and* the ask timeout are
+/// carried through unchanged — rebuilding the policy must not silently demote an allow-by-default
+/// (denylist) posture to deny-by-default, nor drop the configured ask timeout.
 fn union_with_nix_cache(user: EgressPolicy) -> EgressPolicy {
     let mut allow = user.allow_rules().to_vec();
     allow.extend(nix_cache_allow());
-    EgressPolicy::new(allow, user.deny_rules().to_vec()).with_default(user.default_action())
+    EgressPolicy::new(allow, user.deny_rules().to_vec())
+        .with_default(user.default_action())
+        .with_ask_timeout(user.ask_timeout())
 }
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
@@ -547,6 +578,12 @@ pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()
 
 /// The largest request head (CONNECT or the decrypted inner request) the proxy will buffer.
 const HEAD_MAX: usize = 16 * 1024;
+
+/// The most `ask`-posture requests parked at once. A new one beyond this is denied immediately
+/// (fail-closed) rather than enqueued, so an in-cage agent cannot pin unbounded host threads by
+/// opening connections that all park — the default ask wait being indefinite. Far above any
+/// realistic interactive backlog.
+const ASK_PENDING_CAP: usize = 256;
 
 /// Handle one client connection: parse the CONNECT, man-in-the-middle the tunnel, read exactly
 /// one inner request, decide it against the policy (with the host/SNI/Host triple agreeing and
@@ -724,6 +761,41 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
                 "denied-default",
                 &format!("`{connect_host}:{port}` is not allowed by the network policy"),
             )
+        }
+        // Ask-by-default: no rule decided, so park the connection and block until a host-side
+        // `ops net pending` answers it or the configured timeout elapses (deny — fail-closed). The
+        // notice (gated by `notices`) prints the live id so an interactive user need not poll.
+        Decision::Ask => {
+            let verdict = ctx.pending.park(
+                &connect_host,
+                port,
+                &itarget,
+                ctx.policy.ask_timeout(),
+                ASK_PENDING_CAP,
+                |seq| {
+                    if ctx.notices {
+                        let id = super::control::format_id(std::process::id(), seq);
+                        eprintln!(
+                            "ops: egress decision needed [{id}] {connect_host}:{port}{itarget} — \
+                             allow: ops net pending allow {id}  |  deny: ops net pending deny {id}"
+                        );
+                    }
+                },
+            );
+            match verdict {
+                // An explicit allow names this exact host as the deciding rule, so the SSRF guard
+                // permits a deliberately-approved internal target (otherwise "I said yes" would
+                // still be refused). A synthesized host rule is exactly what `--save` would write.
+                super::control::Verdict::Allow => allowlist::classify(&connect_host).ok(),
+                super::control::Verdict::Deny => {
+                    return respond_refusal_tls(
+                        &mut br,
+                        "403 Forbidden",
+                        "asked-denied",
+                        "this request was denied by a live decision or the ask timeout elapsed",
+                    )
+                }
+            }
         }
     };
 
@@ -1551,6 +1623,117 @@ mod tests {
             resp.contains("denied-default"),
             "the refusal must name the motif (no allow rule matched): {resp:?}"
         );
+    }
+
+    /// Under the `ask` posture an undecided request parks; an out-of-band `allow` lets it proceed
+    /// to the validated upstream. The allow synthesizes an exact-host deciding rule, so the loopback
+    /// upstream passes the SSRF guard (the "I explicitly said yes to an internal host" case) — the
+    /// parking path's teeth without a live cage.
+    #[test]
+    fn an_asked_request_proceeds_when_allowed() {
+        use crate::sandbox::control::{PendingState, Verdict};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "ask.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let state = Arc::new(PendingState::new());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_pending_silent(state.clone()),
+        );
+        // Answer `allow` as soon as the request parks.
+        let answerer = {
+            let state = state.clone();
+            thread::spawn(move || answer_when_parked(&state, Verdict::Allow))
+        };
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "ask.test",
+            "ask.test",
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: ask.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(answerer.join().unwrap().as_deref(), Some("ask.test"));
+        up.join().unwrap();
+        assert!(
+            resp.contains("200 OK") && resp.contains("hello"),
+            "an allowed ask must reach the upstream: {resp:?}"
+        );
+    }
+
+    /// Under `ask`, an out-of-band `deny` refuses the parked request with 403 `asked-denied`, and
+    /// the upstream is never contacted (the resolver panics if reached).
+    #[test]
+    fn an_asked_request_is_refused_when_denied() {
+        use crate::sandbox::control::{PendingState, Verdict};
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let state = Arc::new(PendingState::new());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| {
+                panic!("resolve must not run for a denied ask")
+            }))
+            .with_pending_silent(state.clone()),
+        );
+        let answerer = {
+            let state = state.clone();
+            thread::spawn(move || answer_when_parked(&state, Verdict::Deny))
+        };
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "ask.test",
+            "ask.test",
+            8443,
+            b"GET / HTTP/1.1\r\nHost: ask.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        answerer.join().unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("asked-denied"),
+            "a denied ask must get 403 asked-denied: {resp:?}"
+        );
+    }
+
+    /// Block until exactly one request is parked in `state`, answer it with `verdict`, and return
+    /// the host it was for — so a test thread can answer a request the proxy thread just parked.
+    fn answer_when_parked(
+        state: &crate::sandbox::control::PendingState,
+        verdict: crate::sandbox::control::Verdict,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(row) = state.list().first() {
+                return state.answer(row.seq, verdict);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no request parked within the deadline"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// The isolating teeth for the allow-by-default (denylist) mode. The test upstream is on

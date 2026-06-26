@@ -9,6 +9,7 @@
 mod argv;
 mod binds;
 pub(crate) mod cgroup;
+pub(crate) mod control;
 pub(crate) mod egress;
 mod fhs;
 mod flake;

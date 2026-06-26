@@ -126,11 +126,12 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net"],
         synopsis: "ops net <subcommand> [args...]",
-        summary: "inspect the egress policy and its rules",
+        summary: "inspect the egress policy, its rules, and parked `ask` requests",
         options: &[],
         details:
-            "The egress-policy surface. `rules` lists the effective allow/deny rules by source.\n\
-            Read-only and host-side — no launch, no nix, no network. (Distinct from `ops test\n\
+            "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
+            `allow`/`deny <rule>` persist a rule to config; `pending` lists and answers requests\n\
+            parked by the `ask` posture. Host-side — no launch, no nix. (Distinct from `ops test\n\
             net <url>`, which tests one URL against the policy.)",
     },
     Page {
@@ -535,6 +536,48 @@ const PAGES: &[Page] = &[
             "Validates the rule, then adds it (deny always wins over allow). A deny needs an existing\n\
             filtering posture — it will not open one — so set the posture first on a fresh config.\n\
             Writing the project config re-trusts it; the global config is trusted by location.",
+    },
+    Page {
+        path: &["net", "pending"],
+        synopsis: "ops net pending [--json] | ops net pending allow|deny <id> [--save ...]",
+        summary: "list and answer egress requests parked by the `ask` posture",
+        options: &[("--json", "list the pending requests as JSON")],
+        details:
+            "Under `[network] mode = \"ask\"` a request no rule decides parks until answered. With no\n\
+            verb, lists what is parked across every live ask-mode session, each with a `<pid>.<seq>`\n\
+            id. `allow <id>`/`deny <id>` answer one live. No launch, no nix, no network.",
+    },
+    Page {
+        path: &["net", "pending", "allow"],
+        synopsis: "ops net pending allow <id> [--save [-l|--local|-g|--global|-a|--app <name>]]",
+        summary: "allow a parked egress request (optionally saving a rule)",
+        options: &[
+            ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
+            ("--save", "also persist an allow rule for the request's host (scope below)"),
+            ("-l, --local", "with --save: write the project .ops.toml (the default)"),
+            ("-g, --global", "with --save: write the global ops.toml"),
+            ("-a, --app <name>", "with --save: write under that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Unblocks the parked request, letting it proceed. With `--save` it also adds an allow rule\n\
+            for that host so the same destination is pre-decided next launch (the unblock sticks even\n\
+            if the save fails). The id addresses one live session's request.",
+    },
+    Page {
+        path: &["net", "pending", "deny"],
+        synopsis: "ops net pending deny <id> [--save [-l|--local|-g|--global|-a|--app <name>]]",
+        summary: "deny a parked egress request (optionally saving a rule)",
+        options: &[
+            ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
+            ("--save", "also persist a deny rule for the request's host (scope below)"),
+            ("-l, --local", "with --save: write the project .ops.toml (the default)"),
+            ("-g, --global", "with --save: write the global ops.toml"),
+            ("-a, --app <name>", "with --save: write under that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Refuses the parked request (the proxy returns a 403 to the cage). With `--save` it also\n\
+            adds a deny rule for that host so the same destination is auto-denied next launch (the\n\
+            answer sticks even if the save fails).",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

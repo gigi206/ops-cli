@@ -87,6 +87,7 @@ fn captured_output_carries_no_ansi_escapes() {
         &["plugins", "store", "list"],
         &["test", "net", "https://example.com/x"],
         &["net", "rules"],
+        &["net", "pending"],
         &["trust", "--show"],
         &["trust", ".ops.toml"],
         &["untrust", ".ops.toml"],

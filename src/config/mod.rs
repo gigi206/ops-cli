@@ -1557,10 +1557,16 @@ fn validate_network(
                 crate::allowlist::EgressPolicy::default()
                     .with_default(crate::allowlist::DefaultAction::Allow),
             )),
+            // `ask` in bare-string form parks every unmatched request with no timeout (an
+            // indefinite wait); a bound needs the `[network]` table's `ask_timeout`.
+            "ask" => Some(NetworkPolicy::Allowlist(
+                crate::allowlist::EgressPolicy::default()
+                    .with_default(crate::allowlist::DefaultAction::Ask),
+            )),
             other => {
                 warnings.push(format!(
-                    "{source_label}: ignoring unknown network policy `{other}` \
-                     (expected \"none\", \"shared\", \"deny\", \"allow\", or an `[network]` table)"
+                    "{source_label}: ignoring unknown network policy `{other}` (expected \
+                     \"none\", \"shared\", \"deny\", \"allow\", \"ask\", or an `[network]` table)"
                 ));
                 None
             }
@@ -1582,26 +1588,74 @@ fn validate_network_table(
         "shared" => Some(NetworkPolicy::Shared),
         // `deny` is the canonical name for the classic deny-by-default allowlist; `allowlist`
         // is its permanently-kept backward-compatible alias. `allow` is the denylist: everything
-        // public reaches except the `deny` carve-outs, proxy still active.
-        "deny" | "allowlist" | "allow" => {
+        // public reaches except the `deny` carve-outs, proxy still active. `ask` parks an unmatched
+        // request for a live decision (allow rules auto-pass, deny rules auto-fail).
+        "deny" | "allowlist" | "allow" | "ask" => {
+            use crate::allowlist::DefaultAction;
             let allow = classify_entries(warnings, source_label, "allow", table.allow);
             let deny = classify_entries(warnings, source_label, "deny", table.deny);
             let policy = crate::allowlist::EgressPolicy::new(allow, deny);
-            let policy = if table.mode == "allow" {
-                policy.with_default(crate::allowlist::DefaultAction::Allow)
-            } else {
-                policy
+            let policy = match table.mode.as_str() {
+                "allow" => policy.with_default(DefaultAction::Allow),
+                "ask" => {
+                    // A configured `ask_timeout` bounds the parked wait; a malformed value falls
+                    // back to indefinite (warned), never a hard config failure.
+                    let timeout = match &table.ask_timeout {
+                        None => None,
+                        Some(raw) => parse_ask_timeout(raw).unwrap_or_else(|reason| {
+                            warnings.push(format!(
+                                "{source_label}: ignoring invalid `ask_timeout` — {reason}; \
+                                 parked requests will wait indefinitely"
+                            ));
+                            None
+                        }),
+                    };
+                    policy
+                        .with_default(DefaultAction::Ask)
+                        .with_ask_timeout(timeout)
+                }
+                _ => policy, // `deny` / the `allowlist` alias: deny-by-default
             };
+            // An `ask_timeout` outside `ask` mode is moot — flag it rather than silently drop it.
+            if table.mode != "ask" && table.ask_timeout.is_some() {
+                warnings.push(format!(
+                    "{source_label}: `ask_timeout` is only meaningful under `mode = \"ask\"` — ignored"
+                ));
+            }
             Some(NetworkPolicy::Allowlist(policy))
         }
         other => {
             warnings.push(format!(
-                "{source_label}: ignoring unknown network mode `{other}` \
-                 (expected \"none\", \"shared\", \"deny\", \"allow\", or the \"allowlist\" alias)"
+                "{source_label}: ignoring unknown network mode `{other}` (expected \"none\", \
+                 \"shared\", \"deny\", \"allow\", \"ask\", or the \"allowlist\" alias)"
             ));
             None
         }
     }
+}
+
+/// Parse an `ask_timeout` duration string: a non-negative integer with an optional unit suffix
+/// (`s` seconds [the default], `m` minutes, `h` hours), e.g. `"90s"`, `"5m"`, `"2h"`, or a bare
+/// `"90"`. A zero-valued form (`"0"`, `"0m"`) means no timeout — an indefinite wait, the same as
+/// omitting the field — so it returns `Ok(None)`; a positive value returns `Ok(Some(duration))`.
+/// A malformed value is `Err(reason)` so the caller can warn and fall back to indefinite.
+fn parse_ask_timeout(raw: &str) -> Result<Option<std::time::Duration>, String> {
+    let s = raw.trim();
+    let malformed = || format!("`{raw}` is not a duration (try \"90s\", \"5m\", \"2h\")");
+    let (digits, unit) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = digits.trim().parse().map_err(|_| malformed())?;
+    let secs = n
+        .checked_mul(unit)
+        .ok_or_else(|| format!("`{raw}` is too large"))?;
+    Ok((secs > 0).then(|| std::time::Duration::from_secs(secs)))
 }
 
 /// Classify the entries of one egress list (`allow` or `deny`), dropping a malformed
@@ -2613,15 +2667,15 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         // standalone, they would not. Any of the filtering spellings counts (table or bare string).
         let filtered = match &app.network {
             Some(NetworkField::Table(t)) => {
-                matches!(t.mode.as_str(), "allowlist" | "deny" | "allow")
+                matches!(t.mode.as_str(), "allowlist" | "deny" | "allow" | "ask")
             }
-            Some(NetworkField::Posture(p)) => matches!(p.as_str(), "deny" | "allow"),
+            Some(NetworkField::Posture(p)) => matches!(p.as_str(), "deny" | "allow" | "ask"),
             None => false,
         };
         if any && !filtered {
             lines.push(
                 "note: secrets are injected only under a filtering network posture (declare \
-                 `[network] mode = \"deny\"` or `\"allow\"`)"
+                 `[network] mode = \"deny\"`, `\"allow\"`, or `\"ask\"`)"
                     .to_string(),
             );
         }
@@ -2836,6 +2890,7 @@ mod tests {
                 mode: "allowlist".to_string(),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
+                ask_timeout: None,
             })),
             ..RawConfig::default()
         }
@@ -3111,6 +3166,7 @@ mod tests {
                 mode: mode.into(),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
+                ask_timeout: None,
             })
         };
 
@@ -3163,6 +3219,72 @@ mod tests {
             w.len() == 1 && w[0].contains("yolo"),
             "unknown mode must warn: {w:?}"
         );
+    }
+
+    #[test]
+    fn ask_mode_parses_and_carries_an_optional_timeout() {
+        use crate::allowlist::DefaultAction;
+        let ask_table = |timeout: Option<&str>| {
+            NetworkField::Table(NetworkTable {
+                mode: "ask".into(),
+                allow: vec![],
+                deny: vec![],
+                ask_timeout: timeout.map(|s| s.to_string()),
+            })
+        };
+        let mut w = Vec::new();
+
+        // Bare-string `ask` → ask-by-default with no timeout (an indefinite wait).
+        let bare =
+            validate_network(&mut w, GLOBAL_CONFIG, NetworkField::Posture("ask".into())).unwrap();
+        assert!(matches!(&bare, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Ask && p.ask_timeout().is_none()));
+
+        // Table `ask` with a timeout → ask-by-default carrying the parsed duration.
+        let timed = validate_network(&mut w, GLOBAL_CONFIG, ask_table(Some("90s"))).unwrap();
+        assert!(matches!(&timed, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Ask
+            && p.ask_timeout() == Some(std::time::Duration::from_secs(90))));
+        assert!(w.is_empty(), "a valid ask config warns nothing: {w:?}");
+
+        // A malformed timeout falls back to indefinite, warned — never a hard config failure.
+        let fallback = validate_network(&mut w, GLOBAL_CONFIG, ask_table(Some("soon"))).unwrap();
+        assert!(matches!(&fallback, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Ask && p.ask_timeout().is_none()));
+        assert!(
+            w.iter().any(|m| m.contains("ask_timeout")),
+            "a bad timeout must warn: {w:?}"
+        );
+        w.clear();
+
+        // An `ask_timeout` under a non-ask mode is moot — warned and ignored.
+        let moot = NetworkField::Table(NetworkTable {
+            mode: "deny".into(),
+            allow: vec![],
+            deny: vec![],
+            ask_timeout: Some("90s".into()),
+        });
+        let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
+        assert!(
+            w.iter().any(|m| m.contains("ask_timeout")),
+            "a moot timeout must warn: {w:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ask_timeout_handles_units_and_rejects_garbage() {
+        use std::time::Duration;
+        assert_eq!(parse_ask_timeout("90s"), Ok(Some(Duration::from_secs(90))));
+        assert_eq!(parse_ask_timeout("90"), Ok(Some(Duration::from_secs(90))));
+        assert_eq!(parse_ask_timeout("5m"), Ok(Some(Duration::from_secs(300))));
+        assert_eq!(parse_ask_timeout("2h"), Ok(Some(Duration::from_secs(7200))));
+        // A zero of any unit means indefinite — the same as omitting the field.
+        assert_eq!(parse_ask_timeout("0"), Ok(None));
+        assert_eq!(parse_ask_timeout("0m"), Ok(None));
+        // Malformed values are refused (the caller then warns and falls back to indefinite).
+        assert!(parse_ask_timeout("soon").is_err());
+        assert!(parse_ask_timeout("9x").is_err());
+        assert!(parse_ask_timeout("").is_err());
     }
 
     #[test]
@@ -4623,6 +4745,7 @@ mod tests {
                     mode: "bogus".into(),
                     allow: vec![],
                     deny: vec![],
+                    ask_timeout: None,
                 })),
                 ..RawConfig::default()
             },
@@ -4720,6 +4843,7 @@ mod tests {
                 mode: "allowlist".into(),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
+                ask_timeout: None,
             })),
             secret: Some(raw_secret_section(secrets)),
             ..RawConfig::default()
@@ -4811,6 +4935,7 @@ mod tests {
             mode: "allowlist".into(),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
+            ask_timeout: None,
         }))
     }
 
