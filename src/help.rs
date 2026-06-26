@@ -506,6 +506,36 @@ const PAGES: &[Page] = &[
             built-in, reflecting the trust gate (an untrusted project's rules are dropped). Under\n\
             `shared`/`none` there are no rules. No launch, no nix, no network.",
     },
+    Page {
+        path: &["net", "allow"],
+        synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "persist an allow rule to a config file",
+        options: &[
+            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`)"),
+            ("-l, --local", "write the project .ops.toml (the default)"),
+            ("-g, --global", "write the global ops.toml"),
+            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Validates the rule, then adds it. With no filtering posture yet, `allow` bootstraps a\n\
+            deny-by-default allowlist. Writing the project config re-trusts it (it must be absent or\n\
+            already trusted first); the global config is trusted by location.",
+    },
+    Page {
+        path: &["net", "deny"],
+        synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "persist a deny rule to a config file",
+        options: &[
+            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`)"),
+            ("-l, --local", "write the project .ops.toml (the default)"),
+            ("-g, --global", "write the global ops.toml"),
+            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Validates the rule, then adds it (deny always wins over allow). A deny needs an existing\n\
+            filtering posture — it will not open one — so set the posture first on a fresh config.\n\
+            Writing the project config re-trusts it; the global config is trusted by location.",
+    },
     // ---- plugins subcommands ------------------------------------------------------
     Page {
         path: &["plugins", "list"],

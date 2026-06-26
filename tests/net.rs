@@ -214,3 +214,144 @@ fn net_rejects_an_unknown_subcommand_and_source() {
         "an unknown source must name the known ones (manual lands later)"
     );
 }
+
+#[test]
+fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
+    let fx = Fixture::new();
+    // A fresh project (no .ops.toml): `allow` bootstraps a deny-by-default allowlist and re-trusts.
+    let out = fx.run(&["net", "allow", "github.com"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mode `deny`")
+            && stdout.contains("github.com")
+            && stdout.contains("re-trusted"),
+        "bootstrap must report the created posture and the re-trust:\n{stdout}"
+    );
+    // The round-trip: the project is now trusted, so the rule is honored and `ops net rules` lists
+    // it as a config rule (a re-trust failure would have left it untrusted and dropped).
+    let rules = fx.run(&["net", "rules"]);
+    assert!(
+        String::from_utf8_lossy(&rules.stdout).contains("allow github.com  (config)"),
+        "the persisted, re-trusted rule must appear in `ops net rules`:\n{}",
+        String::from_utf8_lossy(&rules.stdout)
+    );
+
+    // A second add of the same rule is an idempotent no-op.
+    let again = fx.run(&["net", "allow", "github.com"]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already present"));
+}
+
+#[test]
+fn net_deny_on_a_fresh_project_is_refused_with_guidance() {
+    let fx = Fixture::new();
+    let out = fx.run(&["net", "deny", "evil.com"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("posture") && stderr.contains("ops config set network"),
+        "a deny on a fresh project must refuse and point at setting a posture:\n{stderr}"
+    );
+}
+
+#[test]
+fn net_allow_refuses_an_untrusted_existing_project() {
+    let fx = Fixture::new();
+    // A pre-existing, never-trusted project config: appending must not silently bless it.
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"a.com\"]\n");
+    let out = fx.run(&["net", "allow", "b.com"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not trusted")
+            && String::from_utf8_lossy(&out.stderr).contains("ops trust"),
+        "an untrusted existing config must be refused, pointing at `ops trust`:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The file is untouched (b.com was never written).
+    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        !body.contains("b.com"),
+        "a refused write must not touch the file:\n{body}"
+    );
+}
+
+#[test]
+fn net_allow_global_writes_the_global_config_without_a_trust_gate() {
+    let fx = Fixture::new();
+    // `--global` is trusted by location: no re-trust line, and it works from an untrusted project.
+    let out = fx.run(&["net", "allow", "cdn.example.com", "--global"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("global config") && !stdout.contains("re-trusted"),
+        "{stdout}"
+    );
+    let global = fx.config_home.path().join("ops").join("ops.toml");
+    let body = std::fs::read_to_string(&global).unwrap();
+    assert!(
+        body.contains("[network]") && body.contains("cdn.example.com"),
+        "{body}"
+    );
+}
+
+#[test]
+fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
+    let fx = Fixture::new();
+    let out = fx.run(&["net", "allow", "api.anthropic.com", "--app", "claude"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("re-trusted"),
+        "a local --app write must re-trust the project config"
+    );
+    // A second --app add must SUCCEED (it hits the Trusted branch) — proving the first add's
+    // re-trust took. Had it not, the project would be Untrusted and this would re-refuse. This is
+    // the one path that is three gates at once: app + local + trust.
+    let second = fx.run(&["net", "deny", "telemetry.example.com", "--app", "claude"]);
+    assert!(
+        second.status.success(),
+        "a second --app add must not re-refuse (the first re-trusted): {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        body.contains("[app.claude.network]")
+            && body.contains("api.anthropic.com")
+            && body.contains("telemetry.example.com"),
+        "both rules must land in the app's own network table:\n{body}"
+    );
+}
+
+#[test]
+fn net_allow_rejects_an_explicit_file_scope() {
+    let fx = Fixture::new();
+    // `-c <file>` is neither the trusted-by-location global nor the trust-gated project path, so a
+    // write to it would be silently dropped at launch — refuse it outright.
+    let out = fx.run(&["net", "allow", "github.com", "-c", ".ops.toml"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--local"),
+        "the refusal must point at the supported scopes:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn net_allow_rejects_an_invalid_rule_before_writing() {
+    let fx = Fixture::new();
+    // A `*` catch-all is refused by classification (the fail-closed validation), no file written.
+    let out = fx.run(&["net", "allow", "*"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid rule"));
+    assert!(
+        !fx.proj.path().join(".ops.toml").exists(),
+        "an invalid rule must not create the config"
+    );
+}

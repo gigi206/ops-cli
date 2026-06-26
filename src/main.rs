@@ -2648,8 +2648,10 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
 fn net_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("rules") => net_rules(&args[1..]),
+        Some("allow") => net_add_rule(config::manage::EgressList::Allow, &args[1..]),
+        Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
         Some(other) => {
-            eprintln!("ops: unknown `net` subcommand '{other}' (known: rules)");
+            eprintln!("ops: unknown `net` subcommand '{other}' (known: rules, allow, deny)");
             ExitCode::from(2)
         }
         None => {
@@ -2826,6 +2828,157 @@ fn render_net_rules(
         }
     }
     o
+}
+
+/// `ops net allow|deny <rule> [--local|--global|-c <file>] [--app <name>]`: persist an egress rule
+/// to a config file. The rule is validated up front (fail-closed), then `manage::add_egress_rule`
+/// places it per the posture matrix. A write to the project `.ops.toml` is trust-gated: it must be
+/// absent or already trusted (else refuse — never bless an unreviewed file by appending), and is
+/// re-trusted after the write so the rule takes effect. The global config is trusted by location
+/// (no gate). `--app <name>` targets the app's own `[app.<name>.network]`.
+fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
+    use config::manage::{self, AddOutcome, Scope};
+    let verb = match list {
+        manage::EgressList::Allow => "allow",
+        manage::EgressList::Deny => "deny",
+    };
+
+    let parsed = match split_scope(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let rule = match parsed.positionals.as_slice() {
+        [r] => r.clone(),
+        [] => {
+            eprintln!("ops: usage: {}", help::synopsis_of(&["net", verb]));
+            return ExitCode::from(2);
+        }
+        _ => {
+            eprintln!("ops: net {verb}: expected exactly one rule");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(name) = &parsed.app {
+        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+            eprintln!("ops: invalid app name '{name}'");
+            return ExitCode::from(2);
+        }
+    }
+    // An explicit `-c <file>` is refused here: it is neither the global config (trusted by
+    // location) nor the project's `.ops.toml` (the trust-gated path), so a write to it would land
+    // a rule the trust gate then drops at launch — a silently-inert write. The scope vocabulary is
+    // `--local`/`--global`/`--app` only.
+    if matches!(parsed.scope, Scope::File(_)) {
+        eprintln!(
+            "ops: `ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"
+        );
+        return ExitCode::from(2);
+    }
+    // Validate the rule before touching any file (fail-closed: a `*` catch-all, a scheme, or an
+    // uncompilable regex is refused — the same classification the config resolver applies).
+    if let Err(e) = allowlist::classify(&rule) {
+        eprintln!("ops: invalid rule {rule:?}: {e}");
+        return ExitCode::from(2);
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = match manage::scope_path(&parsed.scope, &cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A write to the project `.ops.toml` is trust-gated; the global config is trusted by location.
+    let gated = matches!(parsed.scope, Scope::Local);
+    let store = if gated {
+        match trust::default_store_dir() {
+            Some(s) => Some(s),
+            None => {
+                eprintln!(
+                    "ops: cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule \
+                     would be written but could not be trusted, so it would not take effect — use \
+                     --global, or set the trust store"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Pre-check: an existing-but-untrusted project config must not be silently blessed by an
+    // append — the user reviews and trusts it first. Absent or already-trusted is fine: ops's edit
+    // is then the sole delta from the trusted bytes.
+    if let Some(store) = &store {
+        if path.exists() && !matches!(trust::state(store, &path), trust::TrustState::Trusted) {
+            eprintln!(
+                "ops: {} is not trusted — review it and run `ops trust {}`, then retry",
+                path.display(),
+                config::PROJECT_CONFIG
+            );
+            return ExitCode::from(2);
+        }
+    }
+
+    let outcome = match manage::add_egress_rule(&path, parsed.app.as_deref(), list, &rule) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Re-trust the project config after the write. Ordering is fail-safe: a crash between the write
+    // and the trust leaves a correct-but-untrusted file, which the next launch drops — the rule
+    // does not take effect, never a security hole.
+    if let Some(store) = &store {
+        if let Err(e) = trust::trust(store, &path) {
+            eprintln!(
+                "ops: wrote the rule but could not re-trust {}: {e} — run `ops trust {}` so it \
+                 takes effect",
+                path.display(),
+                config::PROJECT_CONFIG
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let target = match (&parsed.scope, &parsed.app) {
+        (Scope::Global, None) => "the global config".to_string(),
+        (Scope::Global, Some(a)) => format!("the global config (app `{a}`)"),
+        (Scope::Local, None) => "the project config".to_string(),
+        (Scope::Local, Some(a)) => format!("the project config (app `{a}`)"),
+        (Scope::File(p), None) => p.display().to_string(),
+        (Scope::File(p), Some(a)) => format!("{} (app `{a}`)", p.display()),
+    };
+    match outcome {
+        AddOutcome::AlreadyPresent => {
+            println!("{verb} {rule} is already present in {target} — no change");
+        }
+        AddOutcome::Added { created_mode } => {
+            match created_mode {
+                Some(mode) => {
+                    println!("set network mode `{mode}` and added {verb} {rule} to {target}")
+                }
+                None => println!("added {verb} {rule} to {target}"),
+            }
+            if gated {
+                println!("re-trusted {}", config::PROJECT_CONFIG);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`

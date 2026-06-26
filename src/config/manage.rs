@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::{value, DocumentMut, Item, Table, Value};
+use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
 /// Which config file an operation targets.
 pub(crate) enum Scope {
@@ -42,6 +42,42 @@ pub(crate) enum ManageError {
     BadKey(String),
     /// The key resolves onto or through a non-scalar (an array or a table) — use `$EDITOR`.
     NotScalar(String),
+    /// A `deny` rule was added but there is no filtering posture to carry it (and a `deny` must
+    /// not silently create an open denylist) — the user must set a posture first.
+    DenyNeedsPosture,
+    /// The target's network is explicitly `shared`/`none` (a non-filtering posture); adding a rule
+    /// would silently flip a deliberate choice, so refuse and let the user change it explicitly.
+    NonFilteringPosture(String),
+    /// The `network` field is neither a posture string nor a table (a malformed config) — refuse
+    /// rather than guess.
+    MalformedNetwork(String),
+}
+
+/// Which egress list a rule is added to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressList {
+    Allow,
+    Deny,
+}
+
+impl EgressList {
+    fn key(self) -> &'static str {
+        match self {
+            EgressList::Allow => "allow",
+            EgressList::Deny => "deny",
+        }
+    }
+}
+
+/// The result of adding an egress rule.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AddOutcome {
+    /// The rule was added. `created_mode` is the mode of a `[network]` table this call created —
+    /// either by bootstrapping a fresh allowlist (`"deny"`) or by promoting a bare-string posture
+    /// to the table form (the kept mode) — or `None` when it appended to an existing table.
+    Added { created_mode: Option<String> },
+    /// The rule was already present (an exact-string match): a no-op.
+    AlreadyPresent,
 }
 
 impl std::fmt::Display for ManageError {
@@ -58,6 +94,19 @@ impl std::fmt::Display for ManageError {
                 f,
                 "{k} is not a single value (it is an array or table) — edit it with `ops config edit`"
             ),
+            ManageError::DenyNeedsPosture => write!(
+                f,
+                "no filtering network posture is set, and a `deny` rule must not open one — set a \
+                 posture first: `ops config set network allow` (a denylist) then `ops trust`"
+            ),
+            ManageError::NonFilteringPosture(p) => write!(
+                f,
+                "the network is explicitly `{p}`; change the posture first \
+                 (`ops config set network deny|allow`) before adding rules"
+            ),
+            ManageError::MalformedNetwork(s) => {
+                write!(f, "the `network` field is malformed ({s}) — edit it with `ops config edit`")
+            }
         }
     }
 }
@@ -152,6 +201,164 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
         write_doc(path, &doc)?;
     }
     Ok(existed)
+}
+
+/// Add an egress `rule` to the `list` (allow/deny) of the target file's network policy — the
+/// baseline `[network]` when `app` is `None`, or `[app.<name>.network]` when `Some(name)`.
+///
+/// The posture matrix (the caller's trust check is separate and runs first): an absent network with
+/// `allow` bootstraps a deny-by-default allowlist with the rule, while with `deny` it is a
+/// [`ManageError::DenyNeedsPosture`] (a deny must not open a posture); a bare-string
+/// `deny`/`allow`/`allowlist` is promoted to the table form keeping its mode; a bare-string
+/// `shared`/`none` is a [`ManageError::NonFilteringPosture`] (do not flip a deliberate choice); and
+/// an existing `[network]` table (regular or inline) gets the rule appended, idempotent on the exact
+/// string. Preserves comments/formatting and writes atomically. The outcome names any posture it
+/// created.
+pub(crate) fn add_egress_rule(
+    path: &Path,
+    app: Option<&str>,
+    list: EgressList,
+    rule: &str,
+) -> Result<AddOutcome, ManageError> {
+    // Inspect the current `network` field into an owned decision first, so the read borrow is
+    // released before the document is mutated below.
+    enum NetCase {
+        Absent,
+        BareFiltering(String),
+        BareNonFiltering(String),
+        Table,
+        Inline,
+        Malformed(String),
+    }
+
+    let mut doc = read_or_empty(path)?;
+    let parent = network_parent(&mut doc, app)?;
+    let case = match parent.get("network") {
+        None => NetCase::Absent,
+        Some(Item::Value(v)) if v.is_str() => {
+            let s = v.as_str().unwrap_or_default().to_string();
+            match s.as_str() {
+                "deny" | "allow" | "allowlist" => NetCase::BareFiltering(s),
+                "shared" | "none" => NetCase::BareNonFiltering(s),
+                _ => NetCase::Malformed(format!("unknown posture {s:?}")),
+            }
+        }
+        Some(Item::Table(_)) => NetCase::Table,
+        Some(Item::Value(v)) if v.is_inline_table() => NetCase::Inline,
+        Some(_) => NetCase::Malformed("not a posture string or table".into()),
+    };
+
+    let outcome = match case {
+        NetCase::Absent => {
+            // A deny rule must not silently create an open denylist; only `allow` bootstraps, into
+            // the most restrictive (deny-by-default) posture.
+            if list == EgressList::Deny {
+                return Err(ManageError::DenyNeedsPosture);
+            }
+            parent.insert(
+                "network",
+                Item::Table(new_network_table("deny", list, rule)),
+            );
+            AddOutcome::Added {
+                created_mode: Some("deny".into()),
+            }
+        }
+        NetCase::BareFiltering(mode) => {
+            // Promote the bare-string posture to the table form, keeping its mode, with the rule.
+            parent.insert("network", Item::Table(new_network_table(&mode, list, rule)));
+            AddOutcome::Added {
+                created_mode: Some(mode),
+            }
+        }
+        NetCase::BareNonFiltering(p) => return Err(ManageError::NonFilteringPosture(p)),
+        NetCase::Malformed(m) => return Err(ManageError::MalformedNetwork(m)),
+        NetCase::Table => {
+            let t = parent["network"]
+                .as_table_mut()
+                .expect("inspected as a regular table");
+            let arr = t
+                .entry(list.key())
+                .or_insert_with(|| value(Array::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    ManageError::MalformedNetwork(format!("`{}` is not an array", list.key()))
+                })?;
+            push_outcome(arr, rule)
+        }
+        NetCase::Inline => {
+            let it = parent["network"]
+                .as_value_mut()
+                .and_then(Value::as_inline_table_mut)
+                .expect("inspected as an inline table");
+            let arr = it
+                .entry(list.key())
+                .or_insert_with(|| Value::Array(Array::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    ManageError::MalformedNetwork(format!("`{}` is not an array", list.key()))
+                })?;
+            push_outcome(arr, rule)
+        }
+    };
+
+    write_doc(path, &doc)?;
+    Ok(outcome)
+}
+
+/// The table where the `network` key lives: the document root for the baseline, or the
+/// `[app.<name>]` table (created if absent) for an app overlay.
+fn network_parent<'a>(
+    doc: &'a mut DocumentMut,
+    app: Option<&str>,
+) -> Result<&'a mut Table, ManageError> {
+    match app {
+        None => Ok(doc.as_table_mut()),
+        Some(name) => {
+            // Create the `[app]` and `[app.<name>]` parents as *implicit* tables so a fresh one
+            // prints no empty header — only the `[app.<name>.network]` we fill renders. An existing
+            // table is left as-is (its own contents decide whether its header shows).
+            let root = doc.as_table_mut();
+            if !root.contains_key("app") {
+                root.insert("app", Item::Table(implicit_table()));
+            }
+            let apps = root
+                .get_mut("app")
+                .and_then(Item::as_table_mut)
+                .ok_or_else(|| ManageError::NotScalar("app".into()))?;
+            if !apps.contains_key(name) {
+                apps.insert(name, Item::Table(implicit_table()));
+            }
+            apps.get_mut(name)
+                .and_then(Item::as_table_mut)
+                .ok_or_else(|| ManageError::NotScalar(format!("app.{name}")))
+        }
+    }
+}
+
+/// A table whose header is hidden when it carries only sub-tables (a structural parent).
+fn implicit_table() -> Table {
+    let mut t = Table::new();
+    t.set_implicit(true);
+    t
+}
+
+/// A fresh `[network]` table carrying `mode` and one `rule` in `list`.
+fn new_network_table(mode: &str, list: EgressList, rule: &str) -> Table {
+    let mut t = Table::new();
+    t.insert("mode", value(mode));
+    let mut arr = Array::new();
+    arr.push(rule);
+    t.insert(list.key(), value(arr));
+    t
+}
+
+/// Push `rule` into `arr` unless an exact-string match is already present, reporting which.
+fn push_outcome(arr: &mut Array, rule: &str) -> AddOutcome {
+    if arr.iter().any(|v| v.as_str() == Some(rule)) {
+        return AddOutcome::AlreadyPresent;
+    }
+    arr.push(rule);
+    AddOutcome::Added { created_mode: None }
 }
 
 /// Split a dotted key into its segments, rejecting an empty key or an empty segment (`a..b`).
@@ -303,5 +510,143 @@ mod tests {
         let p = doc_at(tmp.path(), "a = \"b\"\n");
         assert!(matches!(get(&p, ""), Err(ManageError::BadKey(_))));
         assert!(matches!(set(&p, "a..b", "1"), Err(ManageError::BadKey(_))));
+    }
+
+    #[test]
+    fn add_egress_rule_bootstraps_an_allowlist_for_allow_on_a_fresh_config() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".ops.toml");
+        let out = add_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap();
+        assert_eq!(
+            out,
+            AddOutcome::Added {
+                created_mode: Some("deny".into())
+            }
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("mode = \"deny\"") && body.contains("allow = [\"github.com\"]"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_refuses_a_deny_with_no_posture_without_writing() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".ops.toml");
+        assert!(matches!(
+            add_egress_rule(&p, None, EgressList::Deny, "evil.com"),
+            Err(ManageError::DenyNeedsPosture)
+        ));
+        assert!(!p.exists(), "a refused deny must not create the file");
+    }
+
+    #[test]
+    fn add_egress_rule_promotes_a_bare_string_posture_keeping_its_mode() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "network = \"allow\"\n");
+        let out = add_egress_rule(&p, None, EgressList::Deny, "evil.com").unwrap();
+        assert_eq!(
+            out,
+            AddOutcome::Added {
+                created_mode: Some("allow".into())
+            }
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("[network]") && body.contains("mode = \"allow\""),
+            "{body}"
+        );
+        assert!(body.contains("deny = [\"evil.com\"]"), "{body}");
+        assert!(
+            !body.contains("network = \"allow\""),
+            "the bare string must be promoted, not kept:\n{body}"
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_refuses_an_explicit_non_filtering_posture() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "network = \"shared\"\n");
+        assert!(matches!(
+            add_egress_rule(&p, None, EgressList::Allow, "x.com"),
+            Err(ManageError::NonFilteringPosture(s)) if s == "shared"
+        ));
+    }
+
+    #[test]
+    fn add_egress_rule_appends_to_a_table_and_is_idempotent() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "[network]\nmode = \"deny\"\nallow = [\"a.com\"]\n",
+        );
+        assert_eq!(
+            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            AddOutcome::Added { created_mode: None }
+        );
+        assert_eq!(
+            add_egress_rule(&p, None, EgressList::Deny, "evil.com").unwrap(),
+            AddOutcome::Added { created_mode: None }
+        );
+        // An exact-string match already present is a no-op.
+        assert_eq!(
+            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("\"a.com\"")
+                && body.contains("\"b.com\"")
+                && body.contains("\"evil.com\""),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_writes_the_apps_own_network_table_with_implicit_parents() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".ops.toml");
+        add_egress_rule(&p, Some("claude"), EgressList::Allow, "api.anthropic.com").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("[app.claude.network]") && body.contains("api.anthropic.com"),
+            "{body}"
+        );
+        // The structural parents are implicit, so no empty `[app]` / `[app.claude]` headers.
+        assert!(
+            !body.contains("[app]\n") && !body.contains("[app.claude]\n"),
+            "parent tables must be implicit:\n{body}"
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_appends_into_an_inline_table() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "network = { mode = \"deny\", allow = [\"a.com\"] }\n",
+        );
+        assert_eq!(
+            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            AddOutcome::Added { created_mode: None }
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("a.com") && body.contains("b.com"), "{body}");
+        // Idempotent within the inline form too.
+        assert_eq!(
+            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_refuses_a_malformed_network_field() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "network = 42\n");
+        assert!(matches!(
+            add_egress_rule(&p, None, EgressList::Allow, "x.com"),
+            Err(ManageError::MalformedNetwork(_))
+        ));
     }
 }

@@ -54,6 +54,8 @@ const PATHS: &[&[&str]] = &[
     &["app", "list"],
     &["test", "net"],
     &["net", "rules"],
+    &["net", "allow"],
+    &["net", "deny"],
     &["plugins", "list"],
     &["plugins", "info"],
     &["plugins", "install"],
