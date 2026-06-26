@@ -103,6 +103,7 @@ fn main() -> ExitCode {
         "app" => app_cmd(rest),
         "search" => search_cmd(rest),
         "test" => test_cmd(rest),
+        "net" => net_cmd(rest),
         "plugins" => plugins_cmd(rest),
         other => {
             eprintln!("ops: unknown command '{other}'");
@@ -2641,6 +2642,192 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
     }
 }
 
+/// `ops net <subcommand>`: the interactive-egress namespace. Read-only for now — `rules` lists the
+/// effective egress rules; the pending-request and rule-management verbs land in later increments.
+/// Distinct from `ops test net <url>` (the URL matcher): `net` is the listing/management surface.
+fn net_cmd(args: Vec<OsString>) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("rules") => net_rules(&args[1..]),
+        Some(other) => {
+            eprintln!("ops: unknown `net` subcommand '{other}' (known: rules)");
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!("ops: usage: {}", help::synopsis("net"));
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `ops net rules [--source config|builtin] [--filter <substr>] [--json]`: list the effective
+/// egress rules, each tagged by source, optionally filtered. Reflects the trust gate (an untrusted
+/// project's rules are dropped), and does no launch / nix / network — the read-only posture of
+/// `ops config show` and `ops test net`.
+fn net_rules(args: &[OsString]) -> ExitCode {
+    use config::view::RuleSourceView;
+    let mut source: Option<RuleSourceView> = None;
+    let mut filter: Option<String> = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            Some("--source") | Some("-s") => {
+                let Some(v) = it.next().and_then(|a| a.to_str()) else {
+                    eprintln!("ops: `--source` needs a value (config, builtin)");
+                    return ExitCode::from(2);
+                };
+                source = Some(match v {
+                    "config" => RuleSourceView::Config,
+                    "builtin" => RuleSourceView::Builtin,
+                    other => {
+                        eprintln!("ops: unknown rule source '{other}' (known: config, builtin)");
+                        return ExitCode::from(2);
+                    }
+                });
+            }
+            Some("--filter") | Some("-f") => {
+                let Some(v) = it.next().and_then(|a| a.to_str()) else {
+                    eprintln!("ops: `--filter` needs a substring");
+                    return ExitCode::from(2);
+                };
+                filter = Some(v.to_lowercase());
+            }
+            _ => {
+                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "rules"]));
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let resolved = config::load(&cwd);
+    for w in &resolved.warnings {
+        diag::warn(w);
+    }
+
+    // The effective posture decides the mode word and whether there are rules at all. The built-in
+    // nix-cache set is unioned by the proxy, which runs only under a filtering posture, so it is
+    // absent (with every other rule) under `shared`/`none`.
+    let (mode, all_rules) = match &resolved.network {
+        config::NetworkPolicy::Shared => ("shared", Vec::new()),
+        config::NetworkPolicy::Isolated => ("none", Vec::new()),
+        config::NetworkPolicy::Allowlist(policy) => (
+            net_mode_word(policy.default_action().into()),
+            config::view::net_rules_view(policy),
+        ),
+    };
+
+    // Apply the source and substring filters (the substring is matched case-insensitively against
+    // the rule text). `total` is the unfiltered count, so an empty result reads as "nothing matched
+    // your filter" rather than "no rules at all".
+    let total = all_rules.len();
+    let shown: Vec<&config::view::NetRuleView> = all_rules
+        .iter()
+        .filter(|r| source.is_none_or(|s| r.source == s))
+        .filter(|r| {
+            filter
+                .as_ref()
+                .is_none_or(|f| r.rule.to_lowercase().contains(f))
+        })
+        .collect();
+
+    if json {
+        let value = serde_json::json!({
+            "mode": mode,
+            "rules": shown.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+        });
+        println!("{value}");
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_net_rules(mode, &shown, total, &pal));
+    ExitCode::SUCCESS
+}
+
+/// Render the egress rule listing — a pure presenter (so its colored layout is asserted in a test):
+/// a header naming the effective mode, then one line per shown rule (`allow`/`deny` keyword, the
+/// rule as a cyan identifier matching `ops config`, the source dim). `shared`/`none` carry no rules
+/// and say so; an empty result distinguishes "no rules declared" from "nothing matched the filter".
+fn render_net_rules(
+    mode: &str,
+    shown: &[&config::view::NetRuleView],
+    total: usize,
+    pal: &style::Palette,
+) -> String {
+    use config::view::{NetRuleKind, RuleSourceView};
+    use std::fmt::Write as _;
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let mut o = String::new();
+
+    match mode {
+        "shared" => {
+            let _ = writeln!(
+                o,
+                "{h}network:{r} shared {dim}— no egress rules (host network, no proxy){r}"
+            );
+            return o;
+        }
+        "none" => {
+            let _ = writeln!(
+                o,
+                "{h}network:{r} none {dim}— no egress rules (no network){r}"
+            );
+            return o;
+        }
+        // A filtering posture: name it and frame what the rules mean.
+        "allow" => {
+            let _ = writeln!(
+                o,
+                "{h}network:{r} allow {dim}— denylist: every public host reaches except the deny rules{r}"
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                o,
+                "{h}network:{r} deny {dim}— allowlist: only the listed and built-in hosts reach{r}"
+            );
+        }
+    }
+
+    if shown.is_empty() {
+        let note = if total == 0 {
+            "(no rules declared)"
+        } else {
+            "(no rules match the filter)"
+        };
+        let _ = writeln!(o, "  {dim}{note}{r}");
+        return o;
+    }
+
+    for rule in shown {
+        let source = match rule.source {
+            RuleSourceView::Config => "config",
+            RuleSourceView::Builtin => "builtin",
+        };
+        match rule.kind {
+            NetRuleKind::Allow => {
+                let _ = writeln!(o, "  allow {n}{}{r}  {dim}({source}){r}", rule.rule);
+            }
+            NetRuleKind::Deny => {
+                let _ = writeln!(
+                    o,
+                    "  {warn}deny{r}  {n}{}{r}  {dim}({source}){r}",
+                    rule.rule
+                );
+            }
+        }
+    }
+    o
+}
+
 /// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
 /// — it reads `<data>/plugins`, not a project's `.ops.toml`. A read-only diagnostic for now;
 /// installation and the signed plugin store are later increments, so the dispatch only knows the
@@ -4038,6 +4225,45 @@ mod tests {
             denied.contains(&format!("{}https://x/y{}", p.name, p.reset)),
             "the URL must be wrapped in the name span:\n{denied}"
         );
+    }
+
+    #[test]
+    fn net_rules_render_tags_each_rule_by_source_and_kind() {
+        use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
+        let p = style::Palette::plain();
+        let mk = |kind, source, rule: &str| NetRuleView {
+            kind,
+            source,
+            rule: rule.into(),
+        };
+        let rules = [
+            mk(NetRuleKind::Allow, RuleSourceView::Config, "github.com"),
+            mk(NetRuleKind::Deny, RuleSourceView::Config, "evil.com"),
+            mk(
+                NetRuleKind::Allow,
+                RuleSourceView::Builtin,
+                "cache.nixos.org",
+            ),
+        ];
+        let refs: Vec<&NetRuleView> = rules.iter().collect();
+
+        // deny mode: header frames it as an allowlist; each rule carries its kind + source.
+        let out = render_net_rules("deny", &refs, refs.len(), &p);
+        assert!(out.contains("network: deny"), "{out}");
+        assert!(out.contains("allow github.com  (config)"), "{out}");
+        assert!(out.contains("deny  evil.com  (config)"), "{out}");
+        assert!(out.contains("allow cache.nixos.org  (builtin)"), "{out}");
+
+        // allow mode frames it as a denylist.
+        assert!(render_net_rules("allow", &refs, refs.len(), &p).contains("network: allow"));
+
+        // shared/none carry no rules, with an explanatory one-liner (no rule list).
+        assert!(render_net_rules("shared", &[], 0, &p).contains("no egress rules"));
+        assert!(render_net_rules("none", &[], 0, &p).contains("no egress rules"));
+
+        // An empty result distinguishes "nothing declared" from "the filter matched nothing".
+        assert!(render_net_rules("deny", &[], 0, &p).contains("no rules declared"));
+        assert!(render_net_rules("deny", &[], 3, &p).contains("no rules match the filter"));
     }
 
     #[test]

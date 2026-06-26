@@ -124,6 +124,16 @@ const PAGES: &[Page] = &[
             no network — it reports a verdict against the resolved policy.",
     },
     Page {
+        path: &["net"],
+        synopsis: "ops net <subcommand> [args...]",
+        summary: "inspect the egress policy and its rules",
+        options: &[],
+        details:
+            "The egress-policy surface. `rules` lists the effective allow/deny rules by source.\n\
+            Read-only and host-side — no launch, no nix, no network. (Distinct from `ops test\n\
+            net <url>`, which tests one URL against the policy.)",
+    },
+    Page {
         path: &["plugins"],
         synopsis: "ops plugins <subcommand> [args...]",
         summary: "inspect and manage resolver plugins and plugin stores",
@@ -475,6 +485,27 @@ const PAGES: &[Page] = &[
         details: "Reports ALLOWED/DENIED and the rule that decides it, reflecting the trust gate\n\
             (an untrusted project's policy is dropped). No launch, no nix, no network.",
     },
+    // ---- net subcommands ----------------------------------------------------------
+    Page {
+        path: &["net", "rules"],
+        synopsis: "ops net rules [-s|--source config|builtin] [-f|--filter <substr>] [--json]",
+        summary: "list the effective egress rules by source",
+        options: &[
+            (
+                "-s, --source <src>",
+                "show only one source: config (the .ops.toml/global rules) or builtin (the nix-cache set)",
+            ),
+            (
+                "-f, --filter <substr>",
+                "show only rules whose text contains <substr> (case-insensitive)",
+            ),
+            ("--json", "emit the mode and rules as JSON"),
+        ],
+        details:
+            "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
+            built-in, reflecting the trust gate (an untrusted project's rules are dropped). Under\n\
+            `shared`/`none` there are no rules. No launch, no nix, no network.",
+    },
     // ---- plugins subcommands ------------------------------------------------------
     Page {
         path: &["plugins", "list"],
@@ -662,7 +693,6 @@ pub fn subcommand_hint(name: &str) -> Option<&'static str> {
     Some(match name {
         "import" => "ops app import",
         "export" => "ops app export",
-        "net" => "ops test net",
         "publish" => "ops plugins store publish",
         "add" => "ops plugins store add",
         "update" => "ops plugins store update",

@@ -207,6 +207,60 @@ pub(crate) enum NetworkView {
     },
 }
 
+/// Whether a listed egress rule allows or denies.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetRuleKind {
+    Allow,
+    Deny,
+}
+
+/// Where a listed egress rule came from: the resolved config (`.ops.toml`/global, after the trust
+/// gate) or the always-allowed built-in nix-cache set. (`Manual`, for runtime-added rules, lands
+/// with the runtime rule store in a later increment.)
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleSourceView {
+    Config,
+    Builtin,
+}
+
+/// One egress rule projected for `ops net rules`: its kind, its source, and its display text.
+#[derive(Serialize, Clone)]
+pub(crate) struct NetRuleView {
+    pub(crate) kind: NetRuleKind,
+    pub(crate) source: RuleSourceView,
+    pub(crate) rule: String,
+}
+
+/// Project a filtered-egress policy's rules for listing: the config allow rules, then the config
+/// deny rules, then the built-in nix-cache allow set — each tagged with its source. The built-in
+/// set is the same one [`network_view`] surfaces, so the two cannot drift. Only meaningful under a
+/// filtering posture; `shared`/`none` carry no rules, which the caller handles.
+pub(crate) fn net_rules_view(policy: &crate::allowlist::EgressPolicy) -> Vec<NetRuleView> {
+    let mut rules = Vec::new();
+    for r in policy.allow_rules() {
+        rules.push(NetRuleView {
+            kind: NetRuleKind::Allow,
+            source: RuleSourceView::Config,
+            rule: r.to_string(),
+        });
+    }
+    for r in policy.deny_rules() {
+        rules.push(NetRuleView {
+            kind: NetRuleKind::Deny,
+            source: RuleSourceView::Config,
+            rule: r.to_string(),
+        });
+    }
+    for h in sandbox::nix_cache_hosts() {
+        rules.push(NetRuleView {
+            kind: NetRuleKind::Allow,
+            source: RuleSourceView::Builtin,
+            rule: h.to_string(),
+        });
+    }
+    rules
+}
+
 /// The resolved GUI posture.
 #[derive(Serialize)]
 pub(crate) enum GuiView {
@@ -871,6 +925,35 @@ fn origin_or_inherited(app_set: bool, origin: super::Provenance) -> ProvenanceVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_rules_view_projects_allow_deny_and_builtin_by_source() {
+        use crate::allowlist::{classify, EgressPolicy};
+        let policy = EgressPolicy::new(
+            vec![classify("github.com").unwrap()],
+            vec![classify("evil.com").unwrap()],
+        );
+        let rules = net_rules_view(&policy);
+        assert!(rules.iter().any(|r| r.rule == "github.com"
+            && r.kind == NetRuleKind::Allow
+            && r.source == RuleSourceView::Config));
+        assert!(rules.iter().any(|r| r.rule == "evil.com"
+            && r.kind == NetRuleKind::Deny
+            && r.source == RuleSourceView::Config));
+        // Every built-in entry is an allow tagged `builtin`, and the set matches the one
+        // `network_view` surfaces (the same `nix_cache_hosts` call) so the two cannot drift.
+        let builtin: Vec<&str> = rules
+            .iter()
+            .filter(|r| r.source == RuleSourceView::Builtin)
+            .map(|r| r.rule.as_str())
+            .collect();
+        assert!(builtin.contains(&"cache.nixos.org"));
+        assert!(rules
+            .iter()
+            .filter(|r| r.source == RuleSourceView::Builtin)
+            .all(|r| r.kind == NetRuleKind::Allow));
+        assert_eq!(builtin.len(), sandbox::nix_cache_hosts().len());
+    }
 
     /// The view model serializes to a JSON object — the property a management front-end relies on,
     /// and the foundation a `--json` output stands on. Built here by hand (not through [`build`],

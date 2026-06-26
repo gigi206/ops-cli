@@ -18,8 +18,8 @@ fn ops(args: &[&str]) -> Output {
 
 /// Every top-level command `main` dispatches.
 const TOP_LEVEL: &[&str] = &[
-    "doctor", "shell", "run", "mise", "app", "search", "test", "plugins", "ls", "attach", "stop",
-    "trust", "untrust", "config", "upgrade", "gc",
+    "doctor", "shell", "run", "mise", "app", "search", "test", "net", "plugins", "ls", "attach",
+    "stop", "trust", "untrust", "config", "upgrade", "gc",
 ];
 
 /// Every command path the dispatchers accept (top-level commands and their subcommands). Keep
@@ -32,6 +32,7 @@ const PATHS: &[&[&str]] = &[
     &["app"],
     &["search"],
     &["test"],
+    &["net"],
     &["plugins"],
     &["ls"],
     &["attach"],
@@ -52,6 +53,7 @@ const PATHS: &[&[&str]] = &[
     &["app", "rm"],
     &["app", "list"],
     &["test", "net"],
+    &["net", "rules"],
     &["plugins", "list"],
     &["plugins", "info"],
     &["plugins", "install"],
