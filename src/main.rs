@@ -711,10 +711,33 @@ fn config_cmd(args: Vec<OsString>) -> ExitCode {
 /// `ops config show [--json]`: show the resolved configuration for the current project — the
 /// layered, trust-gated view a launch would use. The human render is colored when stdout is a
 /// terminal; `--json` emits the whole resolved model for tooling.
+/// Record a chosen single-source `config show` view flag (`--global`/`--local`/`--default`),
+/// rejecting a second, conflicting one — two different sources is a user error, not last-wins. The
+/// same flag repeated is harmless. On conflict, prints the usage and returns the usage exit code.
+fn set_show_source(
+    current: &mut Option<(&'static str, config::Source)>,
+    flag: &'static str,
+    source: config::Source,
+) -> Result<(), ExitCode> {
+    match current {
+        Some((prev, _)) if *prev == flag => Ok(()),
+        Some((prev, _)) => {
+            eprintln!("ops: config show: `{flag}` conflicts with `{prev}` (choose one source)");
+            eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+            Err(ExitCode::from(2))
+        }
+        None => {
+            *current = Some((flag, source));
+            Ok(())
+        }
+    }
+}
+
 fn config_show(args: &[OsString]) -> ExitCode {
     let mut json = false;
     let mut details = false;
     let mut app: Option<String> = None;
+    let mut source: Option<(&'static str, config::Source)> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
@@ -728,6 +751,24 @@ fn config_show(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            Some("--global") => {
+                if let Err(code) = set_show_source(&mut source, "--global", config::Source::Global)
+                {
+                    return code;
+                }
+            }
+            Some("--local") => {
+                if let Err(code) = set_show_source(&mut source, "--local", config::Source::Local) {
+                    return code;
+                }
+            }
+            Some("--default") => {
+                if let Err(code) =
+                    set_show_source(&mut source, "--default", config::Source::Default)
+                {
+                    return code;
+                }
+            }
             _ => {
                 eprintln!(
                     "ops: config show: unexpected argument {:?}",
@@ -736,6 +777,17 @@ fn config_show(args: &[OsString]) -> ExitCode {
                 eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
                 return ExitCode::from(2);
             }
+        }
+    }
+
+    // A per-app view is inherently the app's effective configuration over the *full* baseline, so a
+    // single-source restriction is meaningless there — reject the combination rather than silently
+    // ignoring one flag.
+    if app.is_some() {
+        if let Some((flag, _)) = source {
+            eprintln!("ops: config show: `--app` does not combine with `{flag}`");
+            eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+            return ExitCode::from(2);
         }
     }
 
@@ -753,7 +805,12 @@ fn config_show(args: &[OsString]) -> ExitCode {
         return config_show_app(&cwd, &name, json, details);
     }
 
-    let view = config::view::build(&cwd);
+    // A source flag restricts the view to that one layer (over the built-in defaults); with none,
+    // the full layered configuration is shown.
+    let view = match source {
+        Some((_, src)) => config::view::build_scoped(&cwd, src),
+        None => config::view::build(&cwd),
+    };
 
     if json {
         // The whole resolved model, warnings and all, as one JSON document — already exhaustive
@@ -1518,14 +1575,25 @@ fn channel_origin_kind(label: &str) -> config::view::ProvenanceView {
     }
 }
 
-/// Parse the management verbs' trailing flags — the scope (`--local` default, `--global`,
-/// `-c`/`--config <file>`) and `--trust` — out of `args`, returning the leftover positionals and
-/// the scope. `--` ends flag parsing, so a value that begins with `-` can still be passed.
-fn split_scope(args: &[OsString]) -> Result<(Vec<String>, config::manage::Scope, bool), String> {
+/// The trailing flags every `config` management verb accepts: the target scope (`--local`
+/// default, `--global`, `-c`/`--config <file>`), `--trust`, and the cross-cutting `--app <name>`
+/// that rewrites a key under that app's table. A verb consumes the fields it supports and rejects
+/// the rest (`path`/`edit` have no key, so they reject `--app`).
+struct ScopeArgs {
+    positionals: Vec<String>,
+    scope: config::manage::Scope,
+    trust: bool,
+    app: Option<String>,
+}
+
+/// Parse a management verb's trailing flags out of `args`. `--` ends flag parsing, so a value that
+/// begins with `-` can still be passed.
+fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
     use config::manage::Scope;
     let mut positionals = Vec::new();
     let mut scope = Scope::Local;
     let mut trust = false;
+    let mut app = None;
     let mut only_positional = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1543,6 +1611,12 @@ fn split_scope(args: &[OsString]) -> Result<(Vec<String>, config::manage::Scope,
                     .ok_or_else(|| "`-c` needs a file path".to_string())?;
                 scope = Scope::File(PathBuf::from(file));
             }
+            Some("--app") => {
+                let name = it
+                    .next()
+                    .ok_or_else(|| "`--app` needs an app name".to_string())?;
+                app = Some(name.to_string_lossy().into_owned());
+            }
             Some("--trust") => trust = true,
             Some(flag) if flag.starts_with('-') && flag != "-" => {
                 return Err(format!("unknown flag `{flag}`"));
@@ -1550,7 +1624,30 @@ fn split_scope(args: &[OsString]) -> Result<(Vec<String>, config::manage::Scope,
             _ => positionals.push(arg.to_string_lossy().into_owned()),
         }
     }
-    Ok((positionals, scope, trust))
+    Ok(ScopeArgs {
+        positionals,
+        scope,
+        trust,
+        app,
+    })
+}
+
+/// Rewrite a dotted `key` to address it under app `name`'s table — the `--app <name>` sugar, so
+/// `set --app demo network shared` writes `app.demo.network`. The name keys a single TOML table
+/// segment, and the segment splitter does not handle quoting, so a name with a `.` (which is a
+/// valid app name otherwise) cannot be addressed this way — it is edited directly with `ops config
+/// edit`. A name that no app could ever carry is rejected outright.
+fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
+    if name.contains('.') {
+        return Err(format!(
+            "an app name containing `.` (`{name}`) cannot be addressed with `--app`; \
+             edit it directly with `ops config edit`"
+        ));
+    }
+    if !config::is_valid_app_name(name) {
+        return Err(format!("invalid app name `{name}`: 1–64 of [A-Za-z0-9._-]"));
+    }
+    Ok(format!("app.{name}.{key}"))
 }
 
 /// Print the usage synopsis for a `config` verb and return the usage exit code.
@@ -1572,7 +1669,12 @@ fn config_cwd() -> Result<PathBuf, ExitCode> {
 /// *effective resolved* value across layers, use `ops config show` / `ops config show --json`. An unset key
 /// exits 1 (so a script can tell "absent" from a real error), a usage problem exits 2.
 fn config_get(args: &[OsString]) -> ExitCode {
-    let (positionals, scope, _trust) = match split_scope(args) {
+    let ScopeArgs {
+        positionals,
+        scope,
+        app,
+        ..
+    } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("ops: config get: {e}");
@@ -1582,6 +1684,10 @@ fn config_get(args: &[OsString]) -> ExitCode {
     if positionals.len() != 1 {
         return config_usage("get");
     }
+    let key = match effective_key("get", &positionals[0], &app) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
     let cwd = match config_cwd() {
         Ok(d) => d,
         Err(code) => return code,
@@ -1593,23 +1699,43 @@ fn config_get(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match config::manage::get(&path, &positionals[0]) {
+    match config::manage::get(&path, &key) {
         Ok(Some(v)) => {
             println!("{v}");
             ExitCode::SUCCESS
         }
         Ok(None) => {
-            eprintln!(
-                "ops: config: `{}` is not set in {}",
-                positionals[0],
-                path.display()
-            );
+            eprintln!("ops: config: `{}` is not set in {}", key, path.display());
             ExitCode::from(1)
         }
         Err(e) => {
             eprintln!("ops: config: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Reject `--app` on a verb that takes no key (`path` prints a file path; `edit` opens the whole
+/// file) — there is nothing for the app rewrite to apply to. Returns the usage exit code when an
+/// `--app` was passed, else `None`.
+fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
+    if app.is_some() {
+        eprintln!("ops: config {verb}: `--app` does not apply to `{verb}` (it takes no key)");
+        Some(config_usage(verb))
+    } else {
+        None
+    }
+}
+
+/// Resolve the dotted key a key-taking verb (`get`/`set`/`unset`) operates on, applying the
+/// `--app <name>` rewrite when present. Returns the verb's usage exit code on an invalid app name.
+fn effective_key(verb: &str, raw_key: &str, app: &Option<String>) -> Result<String, ExitCode> {
+    match app {
+        Some(name) => app_prefixed_key(name, raw_key).map_err(|e| {
+            eprintln!("ops: config {verb}: {e}");
+            config_usage(verb)
+        }),
+        None => Ok(raw_key.to_string()),
     }
 }
 
@@ -1649,7 +1775,12 @@ fn render_trusted_whole_file(path: &Path, pal: &style::Palette) -> String {
 /// trust gate hashes the whole file, any edit re-arms it — so a write to a trusted file warns that
 /// its security fields will not apply until `ops trust`, and `--trust` re-trusts in one step.
 fn config_set(args: &[OsString]) -> ExitCode {
-    let (positionals, scope, trust) = match split_scope(args) {
+    let ScopeArgs {
+        positionals,
+        scope,
+        trust,
+        app,
+    } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("ops: config set: {e}");
@@ -1659,7 +1790,11 @@ fn config_set(args: &[OsString]) -> ExitCode {
     if positionals.len() != 2 {
         return config_usage("set");
     }
-    let (key, val) = (&positionals[0], &positionals[1]);
+    let key = match effective_key("set", &positionals[0], &app) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let val = &positionals[1];
     let cwd = match config_cwd() {
         Ok(d) => d,
         Err(code) => return code,
@@ -1678,12 +1813,12 @@ fn config_set(args: &[OsString]) -> ExitCode {
         .as_deref()
         .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
 
-    match config::manage::set(&path, key, val) {
+    match config::manage::set(&path, &key, val) {
         Ok(created) => {
             let verb = if created { "set" } else { "updated" };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_write(verb, key, &path, &pal));
-            report_write_trust(&path, key, was_trusted, trust, store_dir.as_deref());
+            println!("{}", render_config_write(verb, &key, &path, &pal));
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1697,7 +1832,12 @@ fn config_set(args: &[OsString]) -> ExitCode {
 /// was not set is a no-op (exit 0) that changes nothing — so it never re-arms trust. A removal
 /// that does change a trusted file re-arms it, with the same warning as `set`.
 fn config_unset(args: &[OsString]) -> ExitCode {
-    let (positionals, scope, trust) = match split_scope(args) {
+    let ScopeArgs {
+        positionals,
+        scope,
+        trust,
+        app,
+    } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("ops: config unset: {e}");
@@ -1707,7 +1847,10 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     if positionals.len() != 1 {
         return config_usage("unset");
     }
-    let key = &positionals[0];
+    let key = match effective_key("unset", &positionals[0], &app) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
     let cwd = match config_cwd() {
         Ok(d) => d,
         Err(code) => return code,
@@ -1724,16 +1867,16 @@ fn config_unset(args: &[OsString]) -> ExitCode {
         .as_deref()
         .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
 
-    match config::manage::unset(&path, key) {
+    match config::manage::unset(&path, &key) {
         Ok(true) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_write("unset", key, &path, &pal));
-            report_write_trust(&path, key, was_trusted, trust, store_dir.as_deref());
+            println!("{}", render_config_write("unset", &key, &path, &pal));
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref());
             ExitCode::SUCCESS
         }
         Ok(false) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_config_unchanged(key, &path, &pal));
+            println!("{}", render_config_unchanged(&key, &path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1746,13 +1889,21 @@ fn config_unset(args: &[OsString]) -> ExitCode {
 /// `ops config path`: print the path of the target layer file (`--local` by default) — the file
 /// `set`/`unset`/`edit` would touch. Useful for scripting and for finding the global config.
 fn config_path_cmd(args: &[OsString]) -> ExitCode {
-    let (positionals, scope, _trust) = match split_scope(args) {
+    let ScopeArgs {
+        positionals,
+        scope,
+        app,
+        ..
+    } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("ops: config path: {e}");
             return config_usage("path");
         }
     };
+    if let Some(code) = reject_app("path", &app) {
+        return code;
+    }
     if !positionals.is_empty() {
         return config_usage("path");
     }
@@ -1779,13 +1930,21 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
 /// changes a trusted file re-arms it — detected after the editor exits (the verdict becomes
 /// Changed) and warned, or applied at once with `--trust`.
 fn config_edit(args: &[OsString]) -> ExitCode {
-    let (positionals, scope, trust_flag) = match split_scope(args) {
+    let ScopeArgs {
+        positionals,
+        scope,
+        trust: trust_flag,
+        app,
+    } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("ops: config edit: {e}");
             return config_usage("edit");
         }
     };
+    if let Some(code) = reject_app("edit", &app) {
+        return code;
+    }
     if !positionals.is_empty() {
         return config_usage("edit");
     }
@@ -4623,6 +4782,34 @@ mod tests {
             detailed.contains("    DEMO_TOKEN=placeholder"),
             "{detailed}"
         );
+    }
+
+    #[test]
+    fn app_prefixed_key_rewrites_a_simple_name_and_rejects_a_dotted_one() {
+        // The `--app` sugar puts the key under the app's table; a dotted leaf key composes.
+        assert_eq!(
+            app_prefixed_key("demo", "network").unwrap(),
+            "app.demo.network"
+        );
+        assert_eq!(
+            app_prefixed_key("demo", "env.FOO").unwrap(),
+            "app.demo.env.FOO"
+        );
+        // A name with a `.` is not one TOML segment under the naive key splitter — point at `edit`.
+        let err = app_prefixed_key("my.app", "cmd").unwrap_err();
+        assert!(err.contains("ops config edit"), "{err}");
+        // A name no app could ever carry is rejected outright.
+        assert!(app_prefixed_key("bad name", "cmd").is_err());
+    }
+
+    #[test]
+    fn set_show_source_rejects_a_conflicting_second_flag() {
+        let mut src: Option<(&'static str, config::Source)> = None;
+        assert!(set_show_source(&mut src, "--global", config::Source::Global).is_ok());
+        // The same flag repeated is harmless (no conflict).
+        assert!(set_show_source(&mut src, "--global", config::Source::Global).is_ok());
+        // A different source flag is a conflict, not last-wins.
+        assert!(set_show_source(&mut src, "--local", config::Source::Local).is_err());
     }
 
     #[test]

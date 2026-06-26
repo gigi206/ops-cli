@@ -210,23 +210,31 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "get"],
-        synopsis: "ops config get <key> [--local|--global|-c <file>]",
+        synopsis: "ops config get <key> [--local|--global|-c <file>] [--app <name>]",
         summary: "read a value from a single config file",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or nixpkgs"),
             ("--local", "the project .ops.toml (the default)"),
             ("--global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
+            (
+                "--app <name>",
+                "address the key under that app's table (app.<name>.<key>)",
+            ),
         ],
         details:
             "Prints the value declared at a dotted key in one layer file. This is the raw declared\n\
             value in that file — for the effective resolved value across layers, use `ops config\n\
             show` (or `ops config show --json`). An unset key exits 1; an array or table value is\n\
-            edited with `ops config edit`, not read as a single value.",
+            edited with `ops config edit`, not read as a single value.\n\
+            \n\
+            --app <name> rewrites the key under that app's table, so `get --app demo cmd` reads\n\
+            app.demo.cmd — sugar for the dotted key. An app name containing a `.` is edited with\n\
+            `ops config edit` instead.",
     },
     Page {
         path: &["config", "set"],
-        synopsis: "ops config set <key> <value> [--local|--global|-c <file>] [--trust]",
+        synopsis: "ops config set <key> <value> [--local|--global|-c <file>] [--app <name>] [--trust]",
         summary: "set a value in a config file (comments preserved)",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or network"),
@@ -234,6 +242,10 @@ const PAGES: &[Page] = &[
             ("--local", "the project .ops.toml (the default)"),
             ("--global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
+            (
+                "--app <name>",
+                "address the key under that app's table (app.<name>.<key>)",
+            ),
             (
                 "--trust",
                 "re-trust the file after writing (applies its security fields at once)",
@@ -243,6 +255,10 @@ const PAGES: &[Page] = &[
             "Writes a string value at a dotted key, preserving the file's other keys, comments,\n\
             and formatting. Creates the file and intermediate tables as needed.\n\
             \n\
+            --app <name> rewrites the key under that app's table, so `set --app demo network\n\
+            shared` writes app.demo.network — sugar for the dotted key. An app name containing a\n\
+            `.` is edited with `ops config edit` instead.\n\
+            \n\
             The trust gate hashes the whole file, so any edit re-arms it: after writing a file\n\
             you had trusted, its security fields stop applying until you run `ops trust`. Pass\n\
             --trust to re-trust in one step (this blesses the whole current file). A free env\n\
@@ -251,19 +267,27 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "unset"],
-        synopsis: "ops config unset <key> [--local|--global|-c <file>] [--trust]",
+        synopsis: "ops config unset <key> [--local|--global|-c <file>] [--app <name>] [--trust]",
         summary: "remove a key from a config file",
         options: &[
             ("<key>", "a dotted key to remove, e.g. env.FOO"),
             ("--local", "the project .ops.toml (the default)"),
             ("--global", "the global ops.toml"),
             ("-c <file>", "an explicit config file"),
+            (
+                "--app <name>",
+                "address the key under that app's table (app.<name>.<key>)",
+            ),
             ("--trust", "re-trust the file after writing"),
         ],
         details:
             "Removes a dotted key from one layer file. Removing a key that is not set changes\n\
             nothing (and so never re-arms trust). A removal that does change a trusted file\n\
-            re-arms its trust gate, the same as `set`.",
+            re-arms its trust gate, the same as `set`.\n\
+            \n\
+            --app <name> rewrites the key under that app's table, so `unset --app demo network`\n\
+            removes app.demo.network. An app name containing a `.` is edited with `ops config\n\
+            edit` instead.",
     },
     Page {
         path: &["config", "path"],
@@ -295,7 +319,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["config", "show"],
-        synopsis: "ops config show [--json] [--details]",
+        synopsis: "ops config show [--json] [--details] [--app <name>] [--global|--local|--default]",
         summary: "show the resolved configuration for the current project",
         options: &[
             (
@@ -306,21 +330,45 @@ const PAGES: &[Page] = &[
                 "--details",
                 "expand each app overlay's compact summary (env, binds, packages, allowlist rules, and injected credentials)",
             ),
+            (
+                "--app <name>",
+                "show one app's effective configuration, each field tagged inherited or set by the app",
+            ),
+            (
+                "--global",
+                "show only what the global config (and imported profiles) contributes",
+            ),
+            ("--local", "show only what the project .ops.toml contributes"),
+            ("--default", "show the built-in defaults alone (no config)"),
         ],
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
             project environment, binds, packages, tools, network, GUI, secrets, and app\n\
             profiles, after the trust gate has dropped anything an untrusted project may not\n\
-            set. Warnings explain what was dropped and why. No launch, no nix, no network.\n\
+            set. Each value is tagged with where it came from — (default), (global), or\n\
+            (project), colored by level. Warnings explain what was dropped and why. No launch,\n\
+            no nix, no network.\n\
             \n\
-            An app profile is shown as a compact summary (one line per field); with --details\n\
-            its env is expanded to each KEY=value, its binds to each path, its packages to each\n\
-            full backend line (a withheld one marked, the same line the baseline packages section\n\
-            renders), its allowlist to the individual allow/deny rules plus the always-allowed\n\
-            built-in hosts, and its injected credentials to each by destination and source — so\n\
-            what `ops app <name>` adds, can reach, and injects is visible at a glance. An env\n\
-            value is the in-cage placeholder, a free field; the credential value is never shown\n\
-            — ops reads it host-side at launch.\n\
+            A single-source flag restricts the view to one layer (over the built-in defaults),\n\
+            so the provenance tags read as that layer's own additions: --global shows what the\n\
+            global config plus any imported app profiles set (the project is ignored), --local\n\
+            what the project .ops.toml sets (the global config and profiles ignored), and\n\
+            --default the built-in defaults alone. The flags are mutually exclusive; with none,\n\
+            the full layered configuration is shown.\n\
+            \n\
+            With --app <name>, the view is one app's effective configuration — the baseline\n\
+            folded with the app's overlay — each field tagged (inherited) when it takes the\n\
+            baseline's value, or (app:global)/(app:project) when the app set it. (It does not\n\
+            combine with a single-source flag.)\n\
+            \n\
+            An app profile is otherwise shown as a compact summary (one line per field); with\n\
+            --details its env is expanded to each KEY=value, its binds to each path, its packages\n\
+            to each full backend line (a withheld one marked, the same line the baseline packages\n\
+            section renders), its allowlist to the individual allow/deny rules plus the\n\
+            always-allowed built-in hosts, and its injected credentials to each by destination and\n\
+            source — so what `ops app <name>` adds, can reach, and injects is visible at a glance.\n\
+            An env value is the in-cage placeholder, a free field; the credential value is never\n\
+            shown — ops reads it host-side at launch.\n\
             \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
             included as a field) — the machine-readable form the human output renders, already\n\

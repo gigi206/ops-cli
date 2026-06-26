@@ -329,14 +329,61 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   and `--json` carrying the provenance), full suite green incl. **run.rs 28 (launch non-regression —
   `resolve_app` is on the `ops app` launch path)**, fmt + clippy clean, **std-only (no new dep)**,
   live-verified, advisor-reviewed (plan AND impl — the impl review required the merge_app-agreement
-  guard and the `--json` coverage, both added). **Named residual (documented, not fixed — the
-  advisor's call, consistent with the existing `apps:` section so no regression):** the detail view
-  does not apply `enforce_secret_posture` (which a launch runs to clear *all* secrets when the
-  effective network is not an allowlist), so an app that inherits baseline secrets while narrowing
-  its network to `none`/`shared` would show a secret count the launch drops to zero. **Scope: the
-  provenance axis (baseline + apps) is complete;** the deferred/provisional increment 3 (write-side
-  `--app` sugar — `app.<name>.<key>` already works as a dotted key — and `show --global/--local/
-  --default` single-source views) stays optional, to reassess if a concrete need appears.
+  guard and the `--json` coverage, both added). **The once-named secret-posture residual is now
+  fixed (see the increment-3 entry below):** the detail view applies `enforce_secret_posture`, so an
+  app that inherits baseline secrets while narrowing its network reports the zero the launch injects.
+  **Scope: the provenance axis (baseline + apps) is complete;** increment 3 (write-side `--app` sugar
+  and `show --global/--local/--default` single-source views) **also shipped — see the next entry.**
+  **`config` family — increment 3: source views + write-side `--app` + the secret-posture fix
+  (DONE 2026-06-26)** (`src/config/mod.rs` + `config/view.rs` + `src/main.rs` + `src/help.rs` +
+  `tests/config.rs`): the user pulled the deferred increment 3 forward, plus closing the
+  apps-provenance secret residual. **Three slices, one cohesive commit.** **(a) the secret-posture
+  fix** (`view.rs::app_detail_view` AND `app_view`): both per-app credential views now **mirror
+  `merge_app`'s `enforce_secret_posture`** — the detail view builds the effective `baseline ++ app`
+  set and runs the *same* host-private check (reachable as `super::enforce_secret_posture`, a child
+  seeing the parent-private fn), so when the app's **effective** network is not an allowlist it
+  reports **zero** credentials (own *and* inherited) and carries the launch's exact drop note,
+  instead of over-reporting a credential `ops app <name>` silently drops. **The advisor's impl-review
+  consistency check caught that this would otherwise diverge from the sibling compact `apps:`
+  roster** (`app_view`, the full `config show`), which showed the declared-own count unconditionally
+  — so an app with its *own* `[secret]` + `network = "none"` read `1 injected host-side` in the
+  compact line while `--app` correctly said 0; `app_view` was therefore *also* made posture-aware
+  (it takes the app's **effective** network — its own, else the baseline's — and emits no credential
+  when that is not an allowlist), so **all three secret views now agree** (the baseline `secrets:`
+  section was already posture-checked at `resolve`). Pinned by **extending the
+  merge_app-agreement guard** (a baseline secret the app's narrowed network drops → `detail.secrets +
+  secrets_inherited == merged.secrets.len() == 0`) **and** two `config show` integration cases (a
+  `--app` `wide`/`narrow` pair — inherit-and-keep vs narrow-and-drop; and a compact-roster
+  `wired`/`solo` pair where exactly one of two own-secret apps claims an injection). **(b) single-source views** `ops config show --global|--local|--default`
+  (`config/mod.rs` `Source` enum + `load_scoped`; `view.rs` `build_scoped`): each shows what **one
+  layer contributes over the built-in defaults**, so the provenance tags read as that layer's own
+  additions (`--global` = global config + imported profiles, project ignored; `--local` = project
+  only; `--default` = the built-ins alone). **The advisor's #1 (highest) risk handled:** `load` is on
+  the **launch path** (`launch.rs` calls `config::load`), so `load` is kept a **thin
+  `load_scoped(cwd, Source::All)` wrapper** with a **minimal diff** (only the global+profiles and
+  project *reads* are gated behind `Source`; plugins, mise, bind-canonicalization, and warning
+  assembly stay byte-identical) — and the **launch non-regression is verified by run.rs (28) +
+  shell.rs (1)**, not config tests alone. The flags are **mutually exclusive** (a second, different
+  source flag errors, not last-wins) and **`--app` ⊥ any source flag** (a per-app view is inherently
+  over the full baseline) — one parser in `config_show`'s own loop (the write-verb `--global/--local`
+  stay in `split_scope`; `--default` is show-only, kept out of `split_scope` so a write verb rejects
+  it). **(c) write-side `--app <name>`** (`main.rs`): `set`/`unset`/`get --app <name> <key>` rewrites
+  the key to `app.<name>.<key>` (sugar over the dotted key, which already worked). Parsed once in
+  `split_scope` (now returning a `ScopeArgs` struct); `app_prefixed_key` validates the name
+  (`is_valid_app_name` **and** no `.` — the key splitter is naive, so a dotted name is unaddressable
+  this way and the error points at `ops config edit`); **`path`/`edit` reject `--app`** (they take no
+  key) via `reject_app`. **Help** (`help.rs`): the `show` synopsis/options/prose document `--app` +
+  the three source flags (and that `--global` surfaces imported profiles — deliberate, advisor-noted);
+  `get`/`set`/`unset` gain `--app`. **589 `--bins`** (+2 unit: `app_prefixed_key` simple-vs-dotted,
+  `set_show_source` conflict) **+ 63 config** (+6 integration: source-view restriction, the `--app`
+  secret drop, the compact-roster posture-awareness, the conflict matrix, the `--app` write
+  round-trip, the name-validation + path/edit rejection)
+  **+ run.rs 28 + shell.rs 1 (launch non-regression — the load refactor)**, fmt/clippy clean,
+  **std-only (no new dep)**, live-verified (all three source views, the conflict errors, the `--app`
+  round-trip, and the secret drop with its note), advisor-reviewed (plan AND impl — the plan review
+  caught that `load` is launch-path and set the minimal-diff + run.rs-verification discipline, the
+  flag-matrix single-source-of-truth, and the dotted-name→`edit` escape hatch). The **config-family
+  provenance + source-vocabulary work is now complete**; nothing in this axis remains deferred.
   **M3.4 done — hermetic TLS + a curated base
   toolset: ops provisions its own `cacert` into the base userland and binds the bundle
   at BOTH cert paths (`ca-bundle.crt` for nix/libcurl, `ca-certificates.crt` for mise's

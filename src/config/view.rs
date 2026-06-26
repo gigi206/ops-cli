@@ -345,6 +345,8 @@ pub(crate) struct AppDetailView {
     pub(crate) packages: Vec<PackageView>,
     pub(crate) packages_inherited: usize,
     /// The credentials this app injects (its own), and the count it inherits from the baseline.
+    /// Both are zero when the app's effective network is not an allowlist: the launch injects no
+    /// credential then, so the view does not report one either (mirroring the launch's posture).
     pub(crate) secrets: Vec<SecretView>,
     pub(crate) secrets_inherited: usize,
     /// Notes about what this app's resolution dropped or ignored.
@@ -355,7 +357,15 @@ pub(crate) struct AppDetailView {
 /// the channel locks, which need a touch of I/O) into the serializable model. This is the data
 /// gathering only — no realisation, no nix, no network — exactly as `ops config` has always been.
 pub(crate) fn build(cwd: &Path) -> ConfigView {
-    let resolved = super::load(cwd);
+    build_scoped(cwd, super::Source::All)
+}
+
+/// Assemble the view restricted to one configuration `source` — the single-source `ops config show
+/// --global/--local/--default` views. `build(cwd)` is `build_scoped(cwd, Source::All)`; a
+/// restricted form projects the same model from fewer layers, so each value's provenance tag reads
+/// as what that source contributes over the built-in defaults.
+pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
+    let resolved = super::load_scoped(cwd, source);
 
     let env = resolved
         .env
@@ -426,7 +436,13 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
     let apps = resolved
         .apps
         .iter()
-        .map(|(name, app)| app_view(name, app, &flake_pins))
+        .map(|(name, app)| {
+            // The app's effective network decides whether its credentials inject — the same posture
+            // the launch enforces. Pass it so the compact roster agrees with the launch (and the
+            // `--app` detail view), never claiming an injection a narrowed network drops.
+            let eff_network = app.network.as_ref().unwrap_or(&resolved.network);
+            app_view(name, app, eff_network, &flake_pins)
+        })
         .collect();
 
     ConfigView {
@@ -593,8 +609,13 @@ fn limits_view(limits: &sandbox::cgroup::Limits, origin: &super::LimitsOrigin) -
 fn app_view(
     name: &str,
     app: &super::ResolvedApp,
+    eff_network: &NetworkPolicy,
     flake_pins: &BTreeMap<String, String>,
 ) -> AppView {
+    // A credential injects only under an allowlist (the proxy that performs it). When the app's
+    // effective network is anything else, the launch injects none, so the roster shows none too —
+    // the same posture `enforce_secret_posture` applies at merge, kept consistent across views.
+    let injects = matches!(eff_network, NetworkPolicy::Allowlist(_));
     AppView {
         name: name.to_string(),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
@@ -637,16 +658,19 @@ fn app_view(
             super::GuiPolicy::None => GuiView::None,
         }),
         limits: app_limits_view(&app.limits),
-        secrets: app
-            .secrets
-            .iter()
-            .map(|s| SecretView {
-                header: s.header.clone(),
-                to: s.to.to_string(),
-                shape: s.shape.describe(),
-                sources: s.describe_sources(),
-            })
-            .collect(),
+        secrets: if injects {
+            app.secrets
+                .iter()
+                .map(|s| SecretView {
+                    header: s.header.clone(),
+                    to: s.to.to_string(),
+                    shape: s.shape.describe(),
+                    sources: s.describe_sources(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         notes: app.warnings.clone(),
     }
 }
@@ -676,7 +700,9 @@ pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> 
 /// Project one app's effective configuration plus per-field provenance: a scalar the app set is
 /// attributed to its app layer, one it left alone is `Inherited` and shows the baseline's value;
 /// collections carry the overlay's own entries and a count of the baseline entries they inherit
-/// (those a same-key overlay entry shadows are not counted as inherited).
+/// (those a same-key overlay entry shadows are not counted as inherited). Credentials additionally
+/// mirror the launch's secret-vs-network posture: when the effective network is not an allowlist,
+/// the launch injects none, so the view reports none (and carries the same drop note).
 fn app_detail_view(
     cwd: &Path,
     name: &str,
@@ -685,7 +711,8 @@ fn app_detail_view(
     flake_pins: &BTreeMap<String, String>,
 ) -> AppDetailView {
     // Effective network/GUI: the app's own posture when it set one, else the baseline's.
-    let network = network_view(app.network.as_ref().unwrap_or(&baseline.network));
+    let eff_network = app.network.as_ref().unwrap_or(&baseline.network);
+    let network = network_view(eff_network);
     let network_origin = origin_or_inherited(app.network.is_some(), app.network_origin);
     let eff_gui = app.gui.unwrap_or(baseline.gui);
     let gui = match eff_gui {
@@ -734,6 +761,20 @@ fn app_detail_view(
         .filter(|p| !app.packages.iter().any(|ap| ap.name == p.name))
         .count();
 
+    // Effective credentials mirror `merge_app`: the baseline's plus the app's, then
+    // `enforce_secret_posture` clears *all* of them when the effective network is not an
+    // allowlist (the proxy that injects them runs only under one). Reproduce that check so the
+    // count — and the note — match what `ops app <name>` would actually inject; otherwise the
+    // view over-reports credentials an app silently drops by narrowing its network.
+    let mut eff_secrets = baseline.secrets.clone();
+    eff_secrets.extend(app.secrets.iter().cloned());
+    let mut secret_notes = Vec::new();
+    super::enforce_secret_posture(eff_network, &mut eff_secrets, &mut secret_notes);
+    let secrets_dropped =
+        eff_secrets.is_empty() && !(baseline.secrets.is_empty() && app.secrets.is_empty());
+    let mut notes = app.warnings.clone();
+    notes.extend(secret_notes);
+
     AppDetailView {
         name: name.to_string(),
         cwd: cwd.display().to_string(),
@@ -772,18 +813,25 @@ fn app_detail_view(
             .map(|p| package_view(p, flake_pins))
             .collect(),
         packages_inherited,
-        secrets: app
-            .secrets
-            .iter()
-            .map(|s| SecretView {
-                header: s.header.clone(),
-                to: s.to.to_string(),
-                shape: s.shape.describe(),
-                sources: s.describe_sources(),
-            })
-            .collect(),
-        secrets_inherited: baseline.secrets.len(),
-        notes: app.warnings.clone(),
+        secrets: if secrets_dropped {
+            Vec::new()
+        } else {
+            app.secrets
+                .iter()
+                .map(|s| SecretView {
+                    header: s.header.clone(),
+                    to: s.to.to_string(),
+                    shape: s.shape.describe(),
+                    sources: s.describe_sources(),
+                })
+                .collect()
+        },
+        secrets_inherited: if secrets_dropped {
+            0
+        } else {
+            baseline.secrets.len()
+        },
+        notes,
     }
 }
 
@@ -1000,7 +1048,7 @@ mod tests {
             home_scope_origin: None,
             warnings: vec![],
         };
-        let view = app_view("demo-app", &app, &pins);
+        let view = app_view("demo-app", &app, &NetworkPolicy::Shared, &pins);
         assert_eq!(view.packages[0].name, "pinned-tool");
         assert_eq!(view.packages[0].pinned_rev.as_deref(), Some(rev));
     }
@@ -1009,9 +1057,24 @@ mod tests {
     /// mirroring `merge_app`'s precedence rather than calling it (it needs the per-field "did the
     /// app set this" the merge discards). Pin the two together — a drift in `merge_app` must fail
     /// here, not silently make `config show --app` misreport what the app actually launches with.
+    /// A minimal HTTP-header credential, for the secret-posture agreement below.
+    fn a_header_secret() -> crate::config::HeaderSecret {
+        crate::config::HeaderSecret {
+            sources: vec![crate::config::SecretSource::Env("TOKEN".into())],
+            to: crate::allowlist::Rule::Host(
+                "api.example.com".into(),
+                crate::allowlist::Ports::Any,
+            ),
+            header: "Authorization".into(),
+            shape: crate::config::HeaderShape::new("Bearer ", false),
+        }
+    }
+
     #[test]
     fn the_detail_views_effective_scalars_agree_with_merge_app() {
         use crate::config::{AppHomeScope, GuiPolicy, Provenance, ResolvedApp};
+        // A baseline credential the app inherits — and that the app's narrowed network drops, the
+        // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
             env: vec![],
             env_layer: Default::default(),
@@ -1031,7 +1094,7 @@ mod tests {
                 tasks_max: None,
             },
             limits_origin: Default::default(),
-            secrets: vec![],
+            secrets: vec![a_header_secret()],
             apps: Default::default(),
             warnings: vec![],
         };
@@ -1091,5 +1154,19 @@ mod tests {
         );
         assert_eq!(detail.limits.memory_max.value, merged.limits.memory_max().0);
         assert_eq!(detail.limits.tasks_max.value, merged.limits.tasks_max().0);
+
+        // Credentials must agree with merge_app too: the app narrowed the network to `none`, so
+        // merge_app's posture check clears the inherited secret — and the detail view, mirroring it,
+        // must report zero (own + inherited), not the over-count of the unenforced baseline.
+        assert_eq!(
+            merged.secrets.len(),
+            0,
+            "merge_app drops the inherited secret"
+        );
+        assert_eq!(
+            detail.secrets.len() + detail.secrets_inherited,
+            merged.secrets.len(),
+            "effective credential count must match merge_app"
+        );
     }
 }

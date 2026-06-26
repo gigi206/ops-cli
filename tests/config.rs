@@ -1586,6 +1586,222 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
 }
 
 #[test]
+fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
+    let fx = Fixture::new();
+    // A baseline credential (global, trusted by location) under a network allowlist, and two apps:
+    // `wide` inherits the allowlist (so the launch injects the secret), `narrow` cuts the network
+    // to none (so the launch injects nothing). The per-app view must match the launch — it must not
+    // report a credential `ops app narrow` would silently drop.
+    fx.write_global(
+        "[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n\
+         [app.wide]\ncmd = \"agent\"\n\
+         [app.narrow]\ncmd = \"agent\"\nnetwork = \"none\"\n",
+    );
+
+    // `wide` keeps the network, so it inherits the baseline credential.
+    let out = fx.run(&["config", "show", "--app", "wide"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("inherits 1 baseline"),
+        "an app under the allowlist inherits the baseline credential:\n{stdout}"
+    );
+
+    // `narrow` cuts the network — the launch injects nothing, so the view reports zero credentials
+    // (own and inherited) and carries the same drop note the launch would emit.
+    let out = fx.run(&["config", "show", "--app", "narrow"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("0 own  · inherits 0 baseline"),
+        "a narrowed network drops the inherited credential in the view:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ignoring 1 HTTP-header secret(s)"),
+        "the view must carry the launch's drop note:\n{stdout}"
+    );
+
+    // The JSON model agrees: no credential survives.
+    let out = fx.run(&["config", "show", "--app", "narrow", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["secrets"].as_array().unwrap().len(), 0);
+    assert_eq!(doc["secrets_inherited"], 0);
+}
+
+#[test]
+fn config_show_compact_app_section_is_secret_posture_aware() {
+    let fx = Fixture::new();
+    // The compact `apps:` roster in the full `config show` must agree with the launch (and the
+    // `--app` detail view): an app declaring its own credential injects it only under an allowlist.
+    // `wired` keeps an allowlist (injects); `solo` declares the same credential but cuts the network
+    // to none (the launch injects nothing), so the roster must not claim an injection for it.
+    fx.write_global(
+        "[app.wired]\ncmd = \"agent\"\n[app.wired.network]\nmode = \"allowlist\"\n\
+         allow = [\"api.example.com\"]\n[app.wired.secret.\"api.example.com\"]\n\
+         from = \"env://DEMO_TOKEN\"\nheader = \"Authorization\"\ntype = \"bearer\"\n\
+         [app.solo]\ncmd = \"agent\"\nnetwork = \"none\"\n\
+         [app.solo.secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
+    );
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The allowlist app injects: its compact roster shows the credential count.
+    assert!(
+        stdout.contains("secrets: 1 injected host-side"),
+        "the allowlist app must show its injected credential:\n{stdout}"
+    );
+    // Exactly one app shows an injected-secrets line — `solo` (network none) must not, since the
+    // launch injects nothing for it (the line is omitted, like an app with no credential).
+    assert_eq!(
+        stdout.matches("injected host-side").count(),
+        1,
+        "a narrowed-network app must not claim an injection in the compact roster:\n{stdout}"
+    );
+}
+
+#[test]
+fn config_show_single_source_views_restrict_to_one_layer() {
+    let fx = Fixture::new();
+    // A free env var and a security field in the global config; a different free env var in the
+    // project. Each single-source view shows what *that* layer contributes (over the defaults), so
+    // its provenance tags read as that layer's own additions.
+    fx.write_global("[env]\nGLOBAL_VAR = \"g\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n");
+    fx.write_project("[env]\nPROJECT_VAR = \"p\"\n");
+
+    // --global: the global's var (tagged global) and its network; the project's var is absent.
+    let out = fx.run(&["config", "show", "--global"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("GLOBAL_VAR=g  (global)")
+            && stdout.contains("network: allowlist  (global)"),
+        "--global shows the global layer's contributions:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("PROJECT_VAR"),
+        "--global omits the project layer:\n{stdout}"
+    );
+
+    // --local: the project's var (tagged project); the network is the default (the project did not
+    // set one), and the global's var is absent.
+    let out = fx.run(&["config", "show", "--local"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("PROJECT_VAR=p  (project)")
+            && stdout.contains("network: shared")
+            && stdout.contains("(default)"),
+        "--local shows the project's contributions over the defaults:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("GLOBAL_VAR"),
+        "--local omits the global layer:\n{stdout}"
+    );
+
+    // --default: neither var; the built-in default network.
+    let out = fx.run(&["config", "show", "--default"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("GLOBAL_VAR") && !stdout.contains("PROJECT_VAR"),
+        "--default shows neither config layer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("network: shared") && stdout.contains("(default)"),
+        "--default shows the built-in default network:\n{stdout}"
+    );
+}
+
+#[test]
+fn config_show_rejects_conflicting_source_and_app_flags() {
+    let fx = Fixture::new();
+    // Two different source flags is a user error, not last-wins.
+    let out = fx.run(&["config", "show", "--global", "--local"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "conflicting sources are a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("conflicts"), "stderr:\n{stderr}");
+
+    // A per-app view is inherently over the full baseline, so a single-source flag is rejected.
+    let out = fx.run(&["config", "show", "--app", "demo", "--global"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--app + a source flag is a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not combine"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
+    let fx = Fixture::new();
+    // `set --app` writes under the app's table — sugar for the dotted key `app.<name>.<key>`.
+    let out = fx.run(&["config", "set", "--app", "demo", "cmd", "mytool"]);
+    assert!(out.status.success(), "set --app must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("app.demo.cmd"),
+        "the write must name the app-scoped key:\n{stdout}"
+    );
+    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        body.contains("[app.demo]") && body.contains("cmd = \"mytool\""),
+        "the file must carry the app table:\n{body}"
+    );
+
+    // `get --app` reads it back.
+    let out = fx.run(&["config", "get", "--app", "demo", "cmd"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mytool");
+
+    // `unset --app` removes it.
+    let out = fx.run(&["config", "unset", "--app", "demo", "cmd"]);
+    assert!(out.status.success());
+    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        !body.contains("cmd = \"mytool\""),
+        "unset --app must remove the key:\n{body}"
+    );
+}
+
+#[test]
+fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
+    let fx = Fixture::new();
+    // A name with a `.` cannot be one TOML table segment under the naive key splitter — the error
+    // points at `ops config edit`.
+    let out = fx.run(&["config", "set", "--app", "my.app", "cmd", "x"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ops config edit"), "stderr:\n{stderr}");
+
+    // A name no app could carry is rejected outright.
+    let out = fx.run(&["config", "set", "--app", "bad name", "cmd", "x"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    // `path` and `edit` take no key, so `--app` does not apply.
+    let out = fx.run(&["config", "path", "--app", "demo"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not apply"),
+        "path must reject --app"
+    );
+    let out = fx.run(&["config", "edit", "--app", "demo"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not apply"),
+        "edit must reject --app"
+    );
+}
+
+#[test]
 fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     let fx = Fixture::new();
     // A profile whose credential lives in the app overlay — the common case, since the shipped

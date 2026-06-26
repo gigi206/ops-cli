@@ -2211,19 +2211,65 @@ fn dropped_binds_warning(state: TrustState, count: usize) -> String {
     }
 }
 
+/// Which configuration layers feed a resolution. `All` is what a launch and the full `ops config
+/// show` use; the restricted forms back the single-source `ops config show --global/--local/
+/// --default` views, each showing what one layer contributes (over the built-in defaults) so the
+/// provenance tags read as that layer's own additions. Plugins and bind canonicalization are
+/// unaffected — only which config *files* are read changes.
+#[derive(Clone, Copy)]
+pub(crate) enum Source {
+    /// Global config (and imported profiles) layered under the project — the default.
+    All,
+    /// The global config and imported profiles only; the project layer is ignored.
+    Global,
+    /// The project config only; the global config and imported profiles are ignored.
+    Local,
+    /// Neither config; the built-in defaults alone.
+    Default,
+}
+
+impl Source {
+    fn includes_global(self) -> bool {
+        matches!(self, Source::All | Source::Global)
+    }
+
+    fn includes_project(self) -> bool {
+        matches!(self, Source::All | Source::Local)
+    }
+}
+
 /// Load and resolve the configuration for a project rooted at `cwd`. Infallible by
 /// design: every failure mode (absent, unsafe, unparseable, no trust store)
 /// degrades to a warning and a dropped layer, so a command is never blocked by a
 /// bad config — least of all an attacker-controlled project one.
 pub(crate) fn load(cwd: &Path) -> Resolved {
+    load_scoped(cwd, Source::All)
+}
+
+/// Resolve the configuration for `cwd` restricted to `source`'s layers. `load_scoped(cwd,
+/// Source::All)` is [`load`] — the launch and full-view path; the restricted forms read fewer
+/// config files but are otherwise byte-identical (same plugins, mise gating, bind
+/// canonicalization, and warning assembly), so a single-source view stays a faithful slice of
+/// the same resolution rather than a parallel code path.
+pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     let mut warnings = Vec::new();
-    let mut global = read_global(&mut warnings);
     // Imported app profiles live beside the global config and are trusted by location, so they
     // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
-    // layer them exactly like an inline global app, with no special casing.
-    let profiles = read_profile_apps(&mut warnings);
-    fold_profile_apps(&mut global, profiles, &mut warnings);
-    let project = read_project(cwd, &mut warnings);
+    // layer them exactly like an inline global app, with no special casing. They ride the global
+    // layer, so a `--local` (project-only) view omits them just as it omits the global config.
+    let global = if source.includes_global() {
+        let mut global = read_global(&mut warnings);
+        let profiles = read_profile_apps(&mut warnings);
+        fold_profile_apps(&mut global, profiles, &mut warnings);
+        global
+    } else {
+        RawConfig::default()
+    };
+    let project = if source.includes_project() {
+        read_project(cwd, &mut warnings)
+    } else {
+        None
+    };
 
     // Discover installed resolver plugins (trusted by location, under the data dir). With no
     // usable data directory there are simply no plugins; a malformed one warns and is dropped.
