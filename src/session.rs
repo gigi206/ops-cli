@@ -158,6 +158,15 @@ impl Session {
         }
     }
 
+    /// The app this session runs as (`ops app <name>`), or `None` for a plain project shell/run — so
+    /// a listing or an action can be scoped to one app's session(s).
+    pub(crate) fn app(&self) -> Option<&str> {
+        match &self.runtime {
+            SessionRuntime::Project => None,
+            SessionRuntime::GlobalApp(name) | SessionRuntime::ProjectApp(name) => Some(name),
+        }
+    }
+
     /// Stop this session's process: SIGTERM, then SIGKILL if it has not exited within `grace`.
     ///
     /// Signalling goes through a **pidfd**, not a bare pid, for two reasons that matter here. A

@@ -2962,12 +2962,45 @@ fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
         .collect()
 }
 
-/// `ops net pending [--json]`: list every reachable ask-mode session's parked requests, grouped by
-/// session (with its agent/project context) and each carrying the `<pid>.<seq>` id to answer it. No
-/// launch / nix / network — it just queries the live control sockets. An empty result is a clean
-/// success (nothing is waiting).
+/// The live-session pids that belong to app `name` (an `ops app <name>` session), from the registry
+/// — the basis for scoping `ops net pending` to one app. A session not in the registry (a race, or a
+/// plain shell) has no known app, so under a filter it is excluded: scoping to an app shows only
+/// sessions the registry confirms are that app.
+fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSet<u32> {
+    session::Registry::at(data_dir)
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.app() == Some(name))
+        .map(|s| s.pid)
+        .collect()
+}
+
+/// `ops net pending [-a|--app <name>] [--json]`: list every reachable ask-mode session's parked
+/// requests, grouped by session (with its agent/project context); identical retries of one URL
+/// collapse to a single destination carrying the `<pid>.<seq>` id to answer it (and, in `--json`, a
+/// `count`). `--app <name>` limits the listing to that app's session(s). No launch / nix / network —
+/// it just queries the live control sockets. An empty result is a clean success (nothing is waiting).
 fn net_pending_list(args: &[OsString]) -> ExitCode {
-    let json = args.iter().any(|a| a.to_str() == Some("--json"));
+    let mut json = false;
+    let mut app: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some("--app") | Some("-a") => match it.next() {
+                Some(name) => app = Some(name.to_string_lossy().into_owned()),
+                None => {
+                    eprintln!("ops: `--app` needs an app name");
+                    return ExitCode::from(2);
+                }
+            },
+            _ => {
+                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "pending"]));
+                return ExitCode::from(2);
+            }
+        }
+    }
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -2975,29 +3008,42 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let sessions = sandbox::control::list_all(&data_dir);
+    let mut sessions = sandbox::control::list_all(&data_dir);
+    // `--app <name>` scopes the listing to that app's session(s) (the registry maps pid → app).
+    if let Some(name) = &app {
+        let pids = session_pids_for_app(&data_dir, name);
+        sessions.retain(|s| pids.contains(&s.pid));
+    }
     let context = pending_session_context(&data_dir);
     let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
 
     if json {
+        // Grouped like the human listing — one object per destination, not per connection — because
+        // `allow <id>` now answers the whole destination: exposing every individually-addressable seq
+        // would mislead a consumer into per-seq answering (the first answers the group, the rest are
+        // NotFound). `count` carries how many connections collapsed; `id` is the representative.
         let rows: Vec<_> = sessions
             .iter()
             .flat_map(|s| {
                 let ctx = ctx_of(s.pid);
                 let project = ctx.map(|(_, p, _)| p.display().to_string());
                 let label = ctx.map(|(_, _, l)| l.clone());
-                s.rows.iter().map(move |row| {
-                    serde_json::json!({
-                        "id": sandbox::control::format_id(s.pid, row.seq),
-                        "pid": s.pid,
-                        "project": project,
-                        "label": label,
-                        "host": row.host,
-                        "port": row.port,
-                        "path": row.path,
-                        "waiting_secs": row.waiting_secs,
+                group_pending(&s.rows)
+                    .into_iter()
+                    .map(move |g| {
+                        serde_json::json!({
+                            "id": sandbox::control::format_id(s.pid, g.seq),
+                            "pid": s.pid,
+                            "project": project,
+                            "label": label,
+                            "host": g.host,
+                            "port": g.port,
+                            "path": g.path,
+                            "count": g.count,
+                            "waiting_secs": g.waiting_secs,
+                        })
                     })
-                })
+                    .collect::<Vec<_>>()
             })
             .collect();
         println!("{}", serde_json::json!({ "pending": rows }));
@@ -3005,17 +3051,63 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_pending(&sessions, &context, &pal));
+    print!(
+        "{}",
+        render_pending(&sessions, &context, app.as_deref(), &pal)
+    );
     ExitCode::SUCCESS
+}
+
+/// One collapsed group of identical pending requests (same `host:port/path`): the representative id
+/// (the lowest seq — the id to answer, which wakes the whole group), how many were collapsed, and the
+/// longest wait (the oldest still parked).
+struct PendingGroup<'a> {
+    seq: u64,
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+    count: usize,
+    waiting_secs: u64,
+}
+
+/// Collapse a session's parked requests by destination, preserving first-seen (lowest-seq) order. A
+/// tool that retries one URL re-parks it many times; those are a single decision, so the listing
+/// shows one line per destination rather than one per connection.
+fn group_pending(rows: &[sandbox::control::PendingRow]) -> Vec<PendingGroup<'_>> {
+    let mut groups: Vec<PendingGroup> = Vec::new();
+    for row in rows {
+        match groups
+            .iter_mut()
+            .find(|g| g.host == row.host && g.port == row.port && g.path == row.path)
+        {
+            Some(g) => {
+                g.count += 1;
+                g.seq = g.seq.min(row.seq);
+                g.waiting_secs = g.waiting_secs.max(row.waiting_secs);
+            }
+            None => groups.push(PendingGroup {
+                seq: row.seq,
+                host: &row.host,
+                port: row.port,
+                path: &row.path,
+                count: 1,
+                waiting_secs: row.waiting_secs,
+            }),
+        }
+    }
+    groups
 }
 
 /// Render the pending-request listing — a pure presenter (its colored layout is asserted in a test):
 /// the parked requests grouped under a per-session header (the registry label + project, so several
-/// sessions are told apart), each request a `<pid>.<seq>` id, destination, and wait time. An empty
-/// listing says so and points at how requests arrive (an `ask`-posture launch).
+/// sessions are told apart), each destination a `<pid>.<seq>` id, target, and wait time. Identical
+/// retries of one URL collapse to a single `×N` line. An empty listing says so and points at how
+/// requests arrive (an `ask`-posture launch); under an `--app` filter it names the app, so an empty
+/// result is not mistaken for "nothing parked anywhere" when other apps do have requests.
 fn render_pending(
     sessions: &[sandbox::control::SessionPending],
     context: &[(u32, PathBuf, String)],
+    app: Option<&str>,
     pal: &style::Palette,
 ) -> String {
     use std::fmt::Write as _;
@@ -3023,11 +3115,22 @@ fn render_pending(
     let mut o = String::new();
     let total: usize = sessions.iter().map(|s| s.rows.len()).sum();
     if total == 0 {
-        let _ = writeln!(
-            o,
-            "{h}pending egress requests:{r} {dim}(none — a request parks here only under \
-             `[network] mode = \"ask\"`){r}"
-        );
+        match app {
+            Some(name) => {
+                let _ = writeln!(
+                    o,
+                    "{h}pending egress requests:{r} {dim}(none for app `{name}` — nothing parked in \
+                     its `ask`-mode session(s)){r}"
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    o,
+                    "{h}pending egress requests:{r} {dim}(none — a request parks here only under \
+                     `[network] mode = \"ask\"`){r}"
+                );
+            }
+        }
         return o;
     }
     let _ = writeln!(o, "{h}pending egress requests:{r}");
@@ -3048,12 +3151,19 @@ fn render_pending(
                 let _ = writeln!(o, "  {dim}session {} (unregistered){r}", session.pid);
             }
         }
-        for row in &session.rows {
-            let id = sandbox::control::format_id(session.pid, row.seq);
+        // Collapse identical destinations: a tool that retries one URL re-parks it many times, and
+        // they are a single decision. `×N` is itself a signal — an agent hammering one endpoint.
+        for group in group_pending(&session.rows) {
+            let id = sandbox::control::format_id(session.pid, group.seq);
+            let times = if group.count > 1 {
+                format!("×{}, ", group.count)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 o,
-                "    {n}{id}{r}  {}:{}{}  {dim}(waiting {}s){r}",
-                row.host, row.port, row.path, row.waiting_secs
+                "    {n}{id}{r}  {}:{}{}  {dim}({times}waiting {}s){r}",
+                group.host, group.port, group.path, group.waiting_secs
             );
         }
     }
@@ -3096,10 +3206,11 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         .cloned()
         .collect();
 
-    // `--all` drains every parked request across every reachable session — a bulk path with no id
-    // and no scope. `--save` is deliberately out of scope here (it would mean a per-host, per-project
-    // save fanned across sessions); rejected explicitly rather than silently dropped, so a user who
-    // expected persistence is told to save by id.
+    // `--all` drains every parked request across every reachable session (or, with `--app <name>`,
+    // every request of that one app's session(s)). `--save` is deliberately out of scope here (it
+    // would mean a per-host, per-project save fanned across sessions); rejected explicitly rather than
+    // silently dropped, so a user who expected persistence is told to save by id. The bulk path takes
+    // no id and no *save* scope — `-a` here is a session filter, not a save target.
     if all {
         if save {
             eprintln!(
@@ -3109,14 +3220,28 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             );
             return ExitCode::from(2);
         }
-        if !rest.is_empty() {
+        let parsed = match split_scope(&rest) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ops: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        if !parsed.positionals.is_empty() {
             eprintln!(
-                "ops: `--all` answers every parked request and takes no id or scope \
-                 (only --session may accompany it)"
+                "ops: `--all` answers every parked request and takes no id \
+                 (use `--app <name>` to limit it to one app; `--session` to remember)"
             );
             return ExitCode::from(2);
         }
-        return net_pending_answer_all(verdict, session);
+        if parsed.scope_explicit {
+            eprintln!(
+                "ops: `--all` takes no save scope (--local/--global/-c) — that is for `--save` by \
+                 id; use `--app <name>` to limit the drain to one app"
+            );
+            return ExitCode::from(2);
+        }
+        return net_pending_answer_all(verdict, session, parsed.app.as_deref());
     }
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
@@ -3153,26 +3278,34 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             return ExitCode::FAILURE;
         }
     };
-    let host = match sandbox::control::answer_request(&data_dir, pid, seq, verdict, session) {
-        Ok(sandbox::control::AnswerOutcome::Answered(host)) => host,
-        Ok(sandbox::control::AnswerOutcome::NotFound) => {
-            eprintln!(
+    let (host, count) =
+        match sandbox::control::answer_request(&data_dir, pid, seq, verdict, session) {
+            Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
+            Ok(sandbox::control::AnswerOutcome::NotFound) => {
+                eprintln!(
                 "ops: no pending request '{id}' (it may have been answered already or timed out)"
             );
-            return ExitCode::from(2);
-        }
-        Err(_) => {
-            eprintln!(
-                "ops: no live session for '{id}' (the launch may have ended, or its socket is \
+                return ExitCode::from(2);
+            }
+            Err(_) => {
+                eprintln!(
+                    "ops: no live session for '{id}' (the launch may have ended, or its socket is \
                  stale)"
-            );
-            return ExitCode::from(2);
-        }
+                );
+                return ExitCode::from(2);
+            }
+        };
+    // `<id>` names one parked request, but identical retries of the same URL collapse to one decision
+    // — so the answer may have woken several. `×N` mirrors the grouped listing.
+    let times = if count > 1 {
+        format!(" (×{count})")
+    } else {
+        String::new()
     };
     if session {
-        println!("{verb}ed {host} for {id} (remembered for this session)");
+        println!("{verb}ed {host}{times} for {id} (remembered for this session)");
     } else {
-        println!("{verb}ed {host} for {id}");
+        println!("{verb}ed {host}{times} for {id}");
     }
 
     // `--save` persists a matching rule (the host) so the same destination is pre-decided next
@@ -3203,13 +3336,18 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     ExitCode::SUCCESS
 }
 
-/// `ops net pending allow|deny --all [--session]`: drain every parked request across every reachable
-/// ask-mode session in one shot. A point-in-time bulk answer — a request that parks *after* the
-/// drain still waits. It reports per session what it answered, so a cross-agent grant (one keystroke
-/// can open egress for several agents at once) is visible rather than a silent aggregate count.
-/// `--session` remembers each answered host for its session. A session that vanished between the
-/// socket glob and the drain is skipped (best-effort, mirroring the listing).
-fn net_pending_answer_all(verdict: sandbox::control::Verdict, session: bool) -> ExitCode {
+/// `ops net pending allow|deny --all [-a|--app <name>] [--session]`: drain every parked request
+/// across every reachable ask-mode session in one shot — or, with `--app <name>`, only that app's
+/// session(s). A point-in-time bulk answer — a request that parks *after* the drain still waits. It
+/// reports per session what it answered, so a cross-agent grant (one keystroke can open egress for
+/// several agents at once) is visible rather than a silent aggregate count. `--session` remembers
+/// each answered host for its session. A session that vanished between the socket glob and the drain
+/// is skipped (best-effort, mirroring the listing).
+fn net_pending_answer_all(
+    verdict: sandbox::control::Verdict,
+    session: bool,
+    app: Option<&str>,
+) -> ExitCode {
     let past = match verdict {
         sandbox::control::Verdict::Allow => "allowed",
         sandbox::control::Verdict::Deny => "denied",
@@ -3222,8 +3360,16 @@ fn net_pending_answer_all(verdict: sandbox::control::Verdict, session: bool) -> 
         }
     };
     let context = pending_session_context(&data_dir);
+    // `--app <name>` scopes the drain to that app's session pids (from the registry); an unregistered
+    // session has no known app, so it is excluded under a filter.
+    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
     let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
     for pid in sandbox::control::session_pids(&data_dir) {
+        if let Some(pids) = &app_pids {
+            if !pids.contains(&pid) {
+                continue;
+            }
+        }
         match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
             Ok(hosts) if !hosts.is_empty() => answered.push((pid, hosts)),
             // An empty drain, or a dead/stale socket (the session went away) — nothing to report.
@@ -3231,16 +3377,22 @@ fn net_pending_answer_all(verdict: sandbox::control::Verdict, session: bool) -> 
         }
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_drain(past, session, &answered, &context, &pal));
+    print!(
+        "{}",
+        render_drain(past, session, app, &answered, &context, &pal)
+    );
     ExitCode::SUCCESS
 }
 
 /// Render a bulk `--all` drain: a per-session breakdown of the hosts it answered (so the user sees
 /// exactly what was granted/refused, across which agents), then a total. An empty drain says nothing
-/// was parked. A pure presenter — its palette comes from the caller (plain on a captured stream).
+/// was parked (naming the `--app` filter when one narrowed the scope, so an empty result is not
+/// mistaken for "nothing anywhere"). A pure presenter — its palette comes from the caller (plain on a
+/// captured stream).
 fn render_drain(
     past: &str,
     session: bool,
+    app: Option<&str>,
     answered: &[(u32, Vec<String>)],
     context: &[(u32, PathBuf, String)],
     pal: &style::Palette,
@@ -3250,10 +3402,21 @@ fn render_drain(
     let mut o = String::new();
     let total: usize = answered.iter().map(|(_, hosts)| hosts.len()).sum();
     if total == 0 {
-        let _ = writeln!(
-            o,
-            "{dim}no pending requests (nothing parked across any ask-mode session){r}"
-        );
+        match app {
+            Some(name) => {
+                let _ = writeln!(
+                    o,
+                    "{dim}no pending requests for app `{name}` (nothing parked in its ask-mode \
+                     session(s)){r}"
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    o,
+                    "{dim}no pending requests (nothing parked across any ask-mode session){r}"
+                );
+            }
+        }
         return o;
     }
     let _ = writeln!(o, "{h}{past} {total} parked request(s):{r}");
@@ -5425,7 +5588,13 @@ mod tests {
         let p = style::Palette::plain();
 
         // Empty → the "none" line with the how-it-arrives hint.
-        assert!(render_pending(&[], &[], &p).contains("none"));
+        assert!(render_pending(&[], &[], None, &p).contains("none"));
+        // An empty listing under an `--app` filter names the app (not "nothing anywhere").
+        let scoped = render_pending(&[], &[], Some("claude-code"), &p);
+        assert!(
+            scoped.contains("none for app `claude-code`"),
+            "the empty filtered listing must name the app:\n{scoped}"
+        );
 
         let row = |seq, host: &str, path: &str, waiting| PendingRow {
             seq,
@@ -5437,7 +5606,12 @@ mod tests {
         let sessions = [
             SessionPending {
                 pid: 12345,
-                rows: vec![row(1, "api.example.com", "/v1/x", 12)],
+                rows: vec![
+                    row(1, "api.example.com", "/v1/x", 12),
+                    // A retry of the SAME destination: it must collapse onto the lowest-seq line as
+                    // `×2` with the *largest* wait, not show as its own row.
+                    row(4, "api.example.com", "/v1/x", 5),
+                ],
             },
             SessionPending {
                 pid: 67890,
@@ -5451,16 +5625,21 @@ mod tests {
             "app:demo".to_string(),
         )];
 
-        let out = render_pending(&sessions, &context, &p);
-        // Each request: a `<pid>.<seq>` id, its destination, and its wait time.
+        let out = render_pending(&sessions, &context, None, &p);
+        // The collapsed destination: the lowest-seq id, the target, `×2`, and the largest wait.
         assert!(
             out.contains("12345.1")
                 && out.contains("api.example.com:443/v1/x")
-                && out.contains("waiting 12s"),
+                && out.contains("×2, waiting 12s"),
             "{out}"
         );
+        // The retry collapsed — its higher seq is not a line of its own.
+        assert!(!out.contains("12345.4"), "{out}");
+        // A lone request carries no `×N` prefix.
         assert!(
-            out.contains("67890.1") && out.contains("files.example.org:443/dl"),
+            out.contains("67890.1")
+                && out.contains("files.example.org:443/dl")
+                && out.contains("(waiting 3s)"),
             "{out}"
         );
         // The registered session shows its label + project; the other is flagged — so two sessions
@@ -5480,7 +5659,13 @@ mod tests {
         let p = style::Palette::plain();
 
         // Empty drain → the "nothing parked" line, no total.
-        assert!(render_drain("allowed", false, &[], &[], &p).contains("no pending requests"));
+        assert!(render_drain("allowed", false, None, &[], &[], &p).contains("no pending requests"));
+        // An empty drain under an `--app` filter names the app (not "nothing anywhere").
+        let scoped = render_drain("allowed", false, Some("claude-code"), &[], &[], &p);
+        assert!(
+            scoped.contains("for app `claude-code`"),
+            "the empty filtered drain must name the app:\n{scoped}"
+        );
 
         let answered = vec![
             (
@@ -5496,7 +5681,7 @@ mod tests {
             "app:demo".to_string(),
         )];
 
-        let out = render_drain("allowed", true, &answered, &context, &p);
+        let out = render_drain("allowed", true, None, &answered, &context, &p);
         // The total counts every answered host across every session.
         assert!(out.contains("allowed 3 parked request(s)"), "{out}");
         // Each session is named (the cross-agent grant made visible), and each host listed.
@@ -5514,9 +5699,40 @@ mod tests {
         assert!(out.contains("remembered for each session"), "{out}");
 
         // Without `--session`, no remembered note; "denied" past tense for a deny drain.
-        let out = render_drain("denied", false, &answered, &context, &p);
+        let out = render_drain("denied", false, None, &answered, &context, &p);
         assert!(out.contains("denied 3 parked request(s)"), "{out}");
         assert!(!out.contains("remembered for each session"), "{out}");
+    }
+
+    #[test]
+    fn session_pids_for_app_selects_only_that_apps_live_sessions() {
+        use crate::testutil::TmpDir;
+        use session::{Kind, Registry, Session, SessionRuntime};
+
+        // Register THIS process (alive, so it survives the registry's liveness pruning) as an
+        // `ops app claude-code` session in a throwaway data dir.
+        let data = TmpDir::new();
+        let me = Session::current(
+            std::path::PathBuf::from("/home/u/proj"),
+            Kind::Run,
+            SessionRuntime::GlobalApp("claude-code".to_string()),
+        )
+        .expect("read this process's session identity");
+        Registry::at(data.path())
+            .register(&me)
+            .expect("register the session");
+
+        // The filter returns this app's live pid...
+        let pids = session_pids_for_app(data.path(), "claude-code");
+        assert!(
+            pids.contains(&std::process::id()),
+            "the app's live session must be selected: {pids:?}"
+        );
+        // ...and nothing for a different app, so an `--all -a other` drain excludes this session.
+        assert!(
+            session_pids_for_app(data.path(), "other").is_empty(),
+            "a different app must select no session"
+        );
     }
 
     #[test]

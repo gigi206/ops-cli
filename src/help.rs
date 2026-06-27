@@ -561,60 +561,69 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending"],
-        synopsis: "ops net pending [--json] | ops net pending allow|deny <id>|--all [--save ...]",
+        synopsis:
+            "ops net pending [-a <app>] [--json] | ops net pending allow|deny <id>|--all [-a <app>] [--save ...]",
         summary: "list and answer egress requests parked by the `ask` posture",
-        options: &[("--json", "list the pending requests as JSON")],
+        options: &[
+            ("-a, --app <name>", "limit the listing / `--all` drain to one app's session(s)"),
+            ("--json", "list the pending requests as JSON"),
+        ],
         details:
             "Under `[network] mode = \"ask\"` a request no rule decides parks until answered. With no\n\
             verb, lists what is parked across every live ask-mode session, each with a `<pid>.<seq>`\n\
-            id. `allow <id>`/`deny <id>` answer one live; `allow|deny --all` drain every parked\n\
-            request at once. No launch, no nix, no network.",
+            id; identical retries of one URL collapse to a single `×N` line. `allow <id>`/`deny <id>`\n\
+            answer that whole destination (every identical retry at once); `allow|deny --all` drain\n\
+            every parked request. `--app <name>` scopes the listing or the `--all` drain to one\n\
+            app's session(s). No launch, no nix, no network.",
     },
     Page {
         path: &["net", "pending", "allow"],
-        synopsis: "ops net pending allow <id>|--all [--session] [--save [-l|--local|-g|--global|-a|--app <name>]]",
+        synopsis: "ops net pending allow <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending allow --all [-a <app>] [--session]",
         summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
-            ("--all", "allow every parked request across every session (drains at once; no id/scope)"),
+            ("--all", "allow every parked request at once (every session, or with `-a <app>` only that app's)"),
             ("--session", "also remember the host:port for this live session, so it is not re-asked"),
             ("--save", "also persist an allow rule for the request's host (scope below; by id only)"),
             ("-l, --local", "with --save: write the project .ops.toml (the default)"),
             ("-g, --global", "with --save: write the global ops.toml"),
-            ("-a, --app <name>", "with --save: write under that app's `[app.<name>.network]`"),
+            ("-a, --app <name>", "with --all: limit the drain to that app's session(s); with --save: write under that app's `[app.<name>.network]`"),
         ],
         details:
-            "Unblocks the parked request, letting it proceed. `--session` remembers the exact\n\
-            host:port for the running session (it is not re-asked); `--save` persists an allow rule\n\
-            so the host is pre-decided next launch. The unblock sticks even if a save fails. The two\n\
-            combine; the id addresses one live session's request.\n\
+            "Unblocks the parked request — and every identical retry of the same URL — letting it\n\
+            proceed. `--session` remembers the exact host:port for the running session (it is not\n\
+            re-asked); `--save` persists an allow rule so the host is pre-decided next launch. The\n\
+            unblock sticks even if a save fails. The two combine; the id addresses one live session's\n\
+            destination.\n\
             \n\
-            `--all` instead drains every request parked across every reachable session at once — a\n\
-            point-in-time bulk allow (one parked after the drain still waits), reported per session\n\
-            so a cross-agent grant is visible. It composes with `--session` but not `--save` (save a\n\
-            per-host rule by id).",
+            `--all` instead drains every request parked across every reachable session at once — or,\n\
+            with `-a <app>`, only that app's session(s). A point-in-time bulk allow (one parked after\n\
+            the drain still waits), reported per session so a cross-agent grant is visible. It composes\n\
+            with `--session` but not `--save` (save a per-host rule by id).",
     },
     Page {
         path: &["net", "pending", "deny"],
-        synopsis: "ops net pending deny <id>|--all [--session] [--save [-l|--local|-g|--global|-a|--app <name>]]",
+        synopsis: "ops net pending deny <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending deny --all [-a <app>] [--session]",
         summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
-            ("--all", "deny every parked request across every session (drains at once; no id/scope)"),
+            ("--all", "deny every parked request at once (every session, or with `-a <app>` only that app's)"),
             ("--session", "also remember the host:port as denied for this live session, so it is not re-asked"),
             ("--save", "also persist a deny rule for the request's host (scope below; by id only)"),
             ("-l, --local", "with --save: write the project .ops.toml (the default)"),
             ("-g, --global", "with --save: write the global ops.toml"),
-            ("-a, --app <name>", "with --save: write under that app's `[app.<name>.network]`"),
+            ("-a, --app <name>", "with --all: limit the drain to that app's session(s); with --save: write under that app's `[app.<name>.network]`"),
         ],
         details:
-            "Refuses the parked request (the proxy returns a 403 to the cage). `--session` remembers\n\
-            the host:port as denied for the running session (it is not re-asked); `--save` persists a\n\
-            deny rule so the host is auto-denied next launch. The answer sticks even if a save fails.\n\
+            "Refuses the parked request — and every identical retry of the same URL — (the proxy\n\
+            returns a 403 to the cage). `--session` remembers the host:port as denied for the running\n\
+            session (it is not re-asked); `--save` persists a deny rule so the host is auto-denied\n\
+            next launch. The answer sticks even if a save fails.\n\
             \n\
-            `--all` instead drains every request parked across every reachable session at once — a\n\
-            point-in-time bulk deny (one parked after the drain still waits), reported per session.\n\
-            It composes with `--session` but not `--save` (save a per-host rule by id).",
+            `--all` instead drains every request parked across every reachable session at once — or,\n\
+            with `-a <app>`, only that app's session(s). A point-in-time bulk deny (one parked after\n\
+            the drain still waits), reported per session. It composes with `--session` but not\n\
+            `--save` (save a per-host rule by id).",
     },
     Page {
         path: &["net", "stats"],

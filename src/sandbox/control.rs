@@ -15,8 +15,9 @@
 //! Discovery is a glob of the egress directory; the socket filename carries the session pid, which
 //! is also the `<pid>.<seq>` id prefix the proxy prints in its notice and the CLI parses to address
 //! one session. The wire protocol is line-based and minimal (one command per connection): `LIST`
-//! returns the pending rows, `ALLOW <seq>` / `DENY <seq>` answer one, naming the host so a
-//! `--save` can persist it.
+//! returns the pending rows, `ALLOW <seq>` / `DENY <seq>` answer one destination (every identical
+//! retry of it, since a tool re-parks one URL many times), naming the host so a `--save` can persist
+//! it.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -57,8 +58,8 @@ pub(crate) struct PendingRow {
 
 /// The shared, lock-guarded queue of parked requests. The proxy [`park`](PendingState::park)s into
 /// it and blocks; the control socket [`list`](PendingState::list)s and
-/// [`answer`](PendingState::answer)s it. One per launch, shared (via `Arc`) between the proxy serve
-/// threads and the control serve thread.
+/// [`answer_like`](PendingState::answer_like)s it. One per launch, shared (via `Arc`) between the
+/// proxy serve threads and the control serve thread.
 #[derive(Default)]
 pub(crate) struct PendingState {
     inner: Mutex<Inner>,
@@ -148,16 +149,37 @@ impl PendingState {
             .collect()
     }
 
-    /// Answer a parked request by sequence id: remove it and wake its proxy thread with `verdict`,
-    /// returning the `(host, port)` it was for (the host for a `--save`, the port for a `--session`
-    /// remember of the exact request). `None` if no such request is parked (already answered, or
-    /// timed out). A send failure (the thread just timed out) is ignored — the entry is gone either
-    /// way.
-    pub(crate) fn answer(&self, seq: u64, verdict: Verdict) -> Option<(String, u16)> {
+    /// Answer every parked request sharing the named request's destination — its `(host, port, path)`
+    /// — with `verdict`, waking each blocked proxy thread, and return `(host, port, count)` where
+    /// `count` is how many were answered (the host for a `--save`, the port for a `--session` remember
+    /// of the exact request). `None` if `seq` is not parked (already answered, or timed out). A send
+    /// failure (a thread that just timed out on its own) is ignored — that entry is gone either way.
+    ///
+    /// This is the destination-grained answer the grouped listing addresses: a tool that retries one
+    /// URL re-parks it many times, and they are a single decision, so `allow <id>`/`deny <id>` on the
+    /// representative id decides the whole group at once. A *different* destination stays parked — this
+    /// is not the blanket [`answer_all`](PendingState::answer_all) drain.
+    pub(crate) fn answer_like(&self, seq: u64, verdict: Verdict) -> Option<(String, u16, usize)> {
         let mut inner = self.inner.lock().unwrap();
-        let entry = inner.entries.remove(&seq)?;
-        let _ = entry.answer.send(verdict);
-        Some((entry.host, entry.port))
+        let (host, port, path) = {
+            let e = inner.entries.get(&seq)?;
+            (e.host.clone(), e.port, e.path.clone())
+        };
+        // The seqs of every parked request to the same destination (collected first — the map cannot
+        // be mutated while it is borrowed for the scan).
+        let matching: Vec<u64> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| e.host == host && e.port == port && e.path == path)
+            .map(|(&s, _)| s)
+            .collect();
+        let count = matching.len();
+        for s in matching {
+            if let Some(entry) = inner.entries.remove(&s) {
+                let _ = entry.answer.send(verdict);
+            }
+        }
+        Some((host, port, count))
     }
 
     /// Answer *every* currently-parked request with `verdict`: drain the queue under one lock, wake
@@ -283,8 +305,10 @@ fn handle(stream: UnixStream, state: &PendingState, manual: &ManualRules) -> io:
 }
 
 /// Map a control command to its response. `LIST` returns one `pending …` line per parked request
-/// then `ok`; `ALLOW <seq>`/`DENY <seq>` answer one request (a trailing `session` token also
-/// remembers it as a manual rule), replying `ok host=<host>` or `err not-found`; `ALLOW *`/`DENY *`
+/// then `ok`; `ALLOW <seq>`/`DENY <seq>` answer every parked request to that request's destination
+/// (its `host:port/path` — identical retries are one decision; a trailing `session` token also
+/// remembers it as a manual rule), replying `ok host=<host> count=<n>` or `err not-found`;
+/// `ALLOW *`/`DENY *`
 /// drain *every* parked request, replying one `answered host=<host>` line each then `ok` (the
 /// `session` token remembers each); `RULES` returns the session's manual rules
 /// (`manual allow|deny <rule>` lines) then `ok`. `path` is emitted last on a `pending` line so a
@@ -332,12 +356,12 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules) -> String {
             let Some(seq) = target.parse::<u64>().ok() else {
                 return "err bad-request\n".to_string();
             };
-            match state.answer(seq, verdict) {
-                Some((host, port)) => {
+            match state.answer_like(seq, verdict) {
+                Some((host, port, count)) => {
                     if remember {
                         manual.remember(verdict, &host, port);
                     }
-                    format!("ok host={host}\n")
+                    format!("ok host={host} count={count}\n")
                 }
                 None => "err not-found\n".to_string(),
             }
@@ -483,10 +507,34 @@ fn parse_pending_line(line: &str) -> Option<PendingRow> {
 
 /// The outcome of answering a request over the control socket.
 pub(crate) enum AnswerOutcome {
-    /// The request was answered; the host it was for (for a `--save`).
-    Answered(String),
+    /// The request was answered: the host it was for (for a `--save`) and how many parked requests to
+    /// that destination the answer woke (identical retries collapse to one decision).
+    Answered { host: String, count: usize },
     /// No such request is parked (already answered, timed out, or a wrong id).
     NotFound,
+}
+
+/// Parse a control `ALLOW`/`DENY` reply line into an outcome. `ok host=<h> count=<n>` is an answer;
+/// `count` is **optional** (defaults to 1) so a freshly-built client degrades cleanly against an
+/// older server that omits it — a long-lived session serves the wire protocol of the binary that
+/// launched it, so new-client ↔ older-server skew is real before a release. Anything else (`err …`)
+/// is [`AnswerOutcome::NotFound`].
+fn parse_answer_reply(line: &str) -> AnswerOutcome {
+    if let Some(rest) = line.strip_prefix("ok ") {
+        let mut host = None;
+        let mut count = 1usize;
+        for token in rest.split_whitespace() {
+            if let Some(h) = token.strip_prefix("host=") {
+                host = Some(h.to_string());
+            } else if let Some(c) = token.strip_prefix("count=") {
+                count = c.parse().unwrap_or(1);
+            }
+        }
+        if let Some(host) = host {
+            return AnswerOutcome::Answered { host, count };
+        }
+    }
+    AnswerOutcome::NotFound
 }
 
 /// Answer the parked request `<pid>.<seq>`: connect to that session's control socket and send the
@@ -516,13 +564,7 @@ pub(crate) fn answer_request(
     (&stream).flush()?;
     let mut response = String::new();
     BufReader::new((&stream).take(CMD_MAX)).read_line(&mut response)?;
-    let response = response.trim();
-    if let Some(rest) = response.strip_prefix("ok host=") {
-        Ok(AnswerOutcome::Answered(rest.to_string()))
-    } else {
-        // "err not-found" / "err bad-request" / anything unexpected → not answered.
-        Ok(AnswerOutcome::NotFound)
-    }
+    Ok(parse_answer_reply(response.trim()))
 }
 
 /// Drain *every* parked request in one session (`ALLOW *`/`DENY *`): connect, send the bulk verdict,
@@ -614,8 +656,8 @@ mod tests {
         // Wait for the request to appear, then allow it.
         let seq = wait_for_one(&state);
         assert_eq!(
-            state.answer(seq, Verdict::Allow),
-            Some(("api.example.com".to_string(), 443))
+            state.answer_like(seq, Verdict::Allow),
+            Some(("api.example.com".to_string(), 443, 1))
         );
         assert_eq!(handle.join().unwrap(), Verdict::Allow);
         // The queue is drained.
@@ -629,8 +671,8 @@ mod tests {
         let handle = thread::spawn(move || s.park("evil.test", 443, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
         assert_eq!(
-            state.answer(seq, Verdict::Deny),
-            Some(("evil.test".to_string(), 443))
+            state.answer_like(seq, Verdict::Deny),
+            Some(("evil.test".to_string(), 443, 1))
         );
         assert_eq!(handle.join().unwrap(), Verdict::Deny);
     }
@@ -668,14 +710,67 @@ mod tests {
         );
         // Release the first so the thread joins.
         let seq = state.list()[0].seq;
-        state.answer(seq, Verdict::Allow);
+        state.answer_like(seq, Verdict::Allow);
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
     }
 
     #[test]
     fn answer_an_unknown_seq_is_none() {
         let state = PendingState::new();
-        assert_eq!(state.answer(999, Verdict::Allow), None);
+        assert_eq!(state.answer_like(999, Verdict::Allow), None);
+    }
+
+    #[test]
+    fn answer_like_wakes_the_whole_destination_and_leaves_others_parked() {
+        let state = Arc::new(PendingState::new());
+        // Two identical retries of one URL (same host:port/path) plus a different destination,
+        // parked one at a time so the seqs are 1, 2, 3 in this order.
+        let a1 = park_next(&state, "dl.test", 443, 0);
+        let a2 = park_next(&state, "dl.test", 443, 1);
+        let other = park_next(&state, "logs.test", 443, 2);
+
+        // Answering the representative (seq 1) wakes BOTH dl.test retries and reports the count.
+        assert_eq!(
+            state.answer_like(1, Verdict::Allow),
+            Some(("dl.test".to_string(), 443, 2))
+        );
+        assert_eq!(a1.join().unwrap(), Verdict::Allow);
+        assert_eq!(a2.join().unwrap(), Verdict::Allow);
+
+        // The different destination stays parked — this is destination-grained, not the `--all` drain.
+        let still = state.list();
+        assert_eq!(
+            still.len(),
+            1,
+            "the other destination is untouched: {still:?}"
+        );
+        assert_eq!(still[0].host, "logs.test");
+
+        state.answer_like(still[0].seq, Verdict::Deny);
+        assert_eq!(other.join().unwrap(), Verdict::Deny);
+    }
+
+    #[test]
+    fn parse_answer_reply_reads_count_and_tolerates_its_absence() {
+        match parse_answer_reply("ok host=api.test count=9") {
+            AnswerOutcome::Answered { host, count } => {
+                assert_eq!(host, "api.test");
+                assert_eq!(count, 9);
+            }
+            AnswerOutcome::NotFound => panic!("a well-formed ok must answer"),
+        }
+        // An older server omits `count` → defaults to 1 (new-client ↔ older-server version skew).
+        match parse_answer_reply("ok host=api.test") {
+            AnswerOutcome::Answered { host, count } => {
+                assert_eq!(host, "api.test");
+                assert_eq!(count, 1);
+            }
+            AnswerOutcome::NotFound => panic!("a countless ok must still answer"),
+        }
+        assert!(matches!(
+            parse_answer_reply("err not-found"),
+            AnswerOutcome::NotFound
+        ));
     }
 
     #[test]
@@ -716,7 +811,7 @@ mod tests {
         let seq = wait_for_one(&state);
         assert_eq!(
             dispatch(&format!("ALLOW {seq}"), &state, &manual),
-            "ok host=api.test\n"
+            "ok host=api.test count=1\n"
         );
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
         assert!(
@@ -767,7 +862,10 @@ mod tests {
 
         // Answer it ALLOW with `--session` (remember) over the real socket.
         match answer_request(data.path(), pid, seq, Verdict::Allow, true).unwrap() {
-            AnswerOutcome::Answered(host) => assert_eq!(host, "api.test"),
+            AnswerOutcome::Answered { host, count } => {
+                assert_eq!(host, "api.test");
+                assert_eq!(count, 1);
+            }
             AnswerOutcome::NotFound => panic!("the live request must be answered"),
         }
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
@@ -781,7 +879,7 @@ mod tests {
         // The consumed seq is now gone — a second answer is NotFound (not a phantom success).
         match answer_request(data.path(), pid, seq, Verdict::Allow, false).unwrap() {
             AnswerOutcome::NotFound => {}
-            AnswerOutcome::Answered(_) => panic!("an already-answered seq must be NotFound"),
+            AnswerOutcome::Answered { .. } => panic!("an already-answered seq must be NotFound"),
         }
     }
 

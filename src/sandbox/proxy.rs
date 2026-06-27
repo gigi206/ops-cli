@@ -1904,7 +1904,9 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(row) = state.list().first() {
-                return state.answer(row.seq, verdict).map(|(host, _port)| host);
+                return state
+                    .answer_like(row.seq, verdict)
+                    .map(|(host, _port, _count)| host);
             }
             assert!(
                 std::time::Instant::now() < deadline,

@@ -531,18 +531,65 @@ fn net_pending_all_rejects_save_and_a_stray_id_or_scope() {
     let out = fx.run(&["net", "pending", "deny", "--all", "123.1"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("takes no id or scope"),
+        String::from_utf8_lossy(&out.stderr).contains("takes no id"),
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // A scope flag alongside `--all` (no save) is likewise refused.
+    // A *save* scope flag alongside `--all` is refused (that is for `--save` by id); the message
+    // points at `--app` as the way to narrow the drain.
     let out = fx.run(&["net", "pending", "allow", "--all", "--global"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("takes no id or scope"),
+        String::from_utf8_lossy(&out.stderr).contains("no save scope"),
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn net_pending_all_accepts_an_app_filter_and_lists_accept_it_too() {
+    let fx = Fixture::new();
+
+    // The user's exact shape — `-a <app> --all --session` — is now ACCEPTED (it used to error with
+    // "takes no id or scope"). With no live session for that app it is a clean no-op that names the
+    // app, so an empty result is not mistaken for "nothing parked anywhere".
+    let out = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "-a",
+        "claude-code",
+        "--all",
+        "--session",
+    ]);
+    assert!(
+        out.status.success(),
+        "an app-scoped --all must be accepted:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("for app `claude-code`"),
+        "the empty drain must name the app:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // `-a <app>` is also accepted on the listing (it used to be silently ignored). No session → the
+    // clean empty line, which names the app (not "nothing anywhere"), exit 0.
+    let out = fx.run(&["net", "pending", "-a", "claude-code"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("none for app `claude-code`"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // A bare `--app` with no name is a usage error, and an unknown flag is now rejected rather than
+    // silently ignored (the bug that hid `-a` in the first place).
+    assert_eq!(fx.run(&["net", "pending", "--app"]).status.code(), Some(2));
+    assert_eq!(
+        fx.run(&["net", "pending", "--bogus"]).status.code(),
+        Some(2)
     );
 }
 
@@ -692,6 +739,68 @@ fn net_pending_all_drains_a_live_session_through_the_socket() {
         stdout.contains(&format!("session {pid}")),
         "the answering session must be named:\n{stdout}"
     );
+}
+
+#[test]
+fn net_pending_list_collapses_identical_retries_in_text_and_json() {
+    // A tool that retries one URL re-parks it many times; the listing must show one line per
+    // destination (with a count), not one per connection — proven through the real binary against a
+    // fake control socket that replies with duplicate LIST rows. The same grouping holds in `--json`
+    // (so a consumer is not handed individually-addressable seqs that `allow` no longer answers one
+    // at a time).
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let egress = fx.data_home.path().join("ops").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let pid = 44444u32; // not registered → the `(unregistered)` header path; irrelevant to grouping
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    // Two LISTs are served (one per `ops net pending` invocation below): three parked rows each — two
+    // identical retries of one URL (seqs 1 and 4) plus a different destination (seq 2).
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut cmd = String::new();
+            BufReader::new(&stream).read_line(&mut cmd).unwrap();
+            assert!(cmd.starts_with("LIST"), "expected a LIST, got {cmd:?}");
+            (&stream)
+                .write_all(
+                    b"pending seq=1 port=443 waiting=80 host=dl.test path=/latest\n\
+                      pending seq=4 port=443 waiting=20 host=dl.test path=/latest\n\
+                      pending seq=2 port=443 waiting=50 host=logs.test path=/api\n\
+                      ok\n",
+                )
+                .unwrap();
+        }
+    });
+
+    // Text: the two dl.test retries collapse to one `×2` line at the lowest seq (44444.1) with the
+    // largest wait (80s); the different destination keeps its own line; the higher seq is gone.
+    let text = fx.run(&["net", "pending"]);
+    let t = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        t.contains("44444.1") && t.contains("dl.test:443/latest") && t.contains("×2, waiting 80s"),
+        "identical retries must collapse to one ×2 line:\n{t}"
+    );
+    assert!(
+        !t.contains("44444.4"),
+        "the retry must not be a line of its own:\n{t}"
+    );
+    assert!(t.contains("logs.test:443/api"), "{t}");
+
+    // JSON: grouped the same way — one object per destination, dl.test carrying count=2.
+    let json = fx.run(&["net", "pending", "--json"]);
+    server.join().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let arr = v["pending"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "two destinations, not three connections: {v}");
+    let dl = arr.iter().find(|r| r["host"] == "dl.test").unwrap();
+    assert_eq!(dl["count"], 2, "{v}");
+    assert_eq!(dl["id"], "44444.1", "{v}");
+    assert_eq!(dl["waiting_secs"], 80, "{v}");
 }
 
 // ── `ops test net` enrichments: app targeting, launch fidelity, scheme-optional ─────────────────
