@@ -24,11 +24,11 @@ jobs:
     name: bats + shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Cache apt packages
         id: apt-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/apt/archives/*.deb
@@ -101,7 +101,7 @@ jobs:
     name: hadolint Dockerfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: hadolint Dockerfile
         uses: hadolint/hadolint-action@v3.3.0
         with:
@@ -133,7 +133,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run trivy filesystem scan
         # Scans the working tree for CVEs in pinned dependencies + misconfigs
         # in Dockerfiles / workflows. Non-blocking (exit-code 0) so a new
@@ -157,7 +157,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Generate SBOM (CycloneDX JSON)
         # syft scans the working tree for declared / installed dependencies and
         # emits a Software Bill of Materials. We publish two formats:
@@ -200,7 +200,7 @@ jobs:
       matrix:
         runtime: [docker, podman, nerdctl]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install docker
         if: matrix.runtime == 'docker'
@@ -327,7 +327,7 @@ jobs:
     outputs:
       image: ${{ steps.filter.outputs.image }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: filter
         uses: dorny/paths-filter@v4
         with:
@@ -366,7 +366,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [bats, hadolint, image_changes]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install bats
         run: |
@@ -403,7 +403,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [bats, hadolint, image_changes]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install bats
         run: |
