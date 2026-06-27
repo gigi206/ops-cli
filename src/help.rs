@@ -578,14 +578,14 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending", "allow"],
-        synopsis: "ops net pending allow <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending allow --all [-a <app>] [--session]",
+        synopsis: "ops net pending allow <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
             ("--all", "allow every parked request at once (every session, or with `-a <app>` only that app's)"),
             ("--session", "also remember the host:port for this live session, so it is not re-asked"),
-            ("--save", "also persist an allow rule for the request's host (scope below; by id only)"),
-            ("-l, --local", "with --save: write the project .ops.toml (the default)"),
+            ("--save", "also persist an allow rule per answered host (scope below; by id or in bulk with --all)"),
+            ("-l, --local", "with --save: write the project .ops.toml (the default; with --all, drains only this project)"),
             ("-g, --global", "with --save: write the global ops.toml"),
             ("-a, --app <name>", "with --all: limit the drain to that app's session(s); with --save: write under that app's `[app.<name>.network]`"),
         ],
@@ -599,18 +599,22 @@ const PAGES: &[Page] = &[
             `--all` instead drains every request parked across every reachable session at once — or,\n\
             with `-a <app>`, only that app's session(s). A point-in-time bulk allow (one parked after\n\
             the drain still waits), reported per session so a cross-agent grant is visible. It composes\n\
-            with `--session` but not `--save` (save a per-host rule by id).",
+            with `--session`, and with `--save`: `--all --save` (default `--local`) drains only the\n\
+            *current project's* sessions and saves each host to the project config — never machine-wide,\n\
+            so one project's requests can never land in another's config; `--all --save --global` drains\n\
+            across sessions and saves to the global config. A `--local` save pre-flights the trust gate\n\
+            before the (irreversible) drain.",
     },
     Page {
         path: &["net", "pending", "deny"],
-        synopsis: "ops net pending deny <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending deny --all [-a <app>] [--session]",
+        synopsis: "ops net pending deny <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
             ("--all", "deny every parked request at once (every session, or with `-a <app>` only that app's)"),
             ("--session", "also remember the host:port as denied for this live session, so it is not re-asked"),
-            ("--save", "also persist a deny rule for the request's host (scope below; by id only)"),
-            ("-l, --local", "with --save: write the project .ops.toml (the default)"),
+            ("--save", "also persist a deny rule per answered host (scope below; by id or in bulk with --all)"),
+            ("-l, --local", "with --save: write the project .ops.toml (the default; with --all, drains only this project)"),
             ("-g, --global", "with --save: write the global ops.toml"),
             ("-a, --app <name>", "with --all: limit the drain to that app's session(s); with --save: write under that app's `[app.<name>.network]`"),
         ],
@@ -622,8 +626,11 @@ const PAGES: &[Page] = &[
             \n\
             `--all` instead drains every request parked across every reachable session at once — or,\n\
             with `-a <app>`, only that app's session(s). A point-in-time bulk deny (one parked after\n\
-            the drain still waits), reported per session. It composes with `--session` but not\n\
-            `--save` (save a per-host rule by id).",
+            the drain still waits), reported per session. It composes with `--session`, and with\n\
+            `--save`: `--all --save` (default `--local`) drains only the *current project's* sessions\n\
+            and saves each host to the project config; `--all --save --global` drains across sessions\n\
+            and saves to the global config. A `--local` save pre-flights the trust gate before the\n\
+            (irreversible) drain.",
     },
     Page {
         path: &["net", "stats"],

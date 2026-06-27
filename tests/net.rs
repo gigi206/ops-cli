@@ -514,18 +514,8 @@ fn net_pending_all_drains_nothing_when_no_session_is_parked() {
 }
 
 #[test]
-fn net_pending_all_rejects_save_and_a_stray_id_or_scope() {
+fn net_pending_all_rejects_a_stray_id_a_scope_without_save_and_a_file_scope() {
     let fx = Fixture::new();
-
-    // `--save` is deliberately not supported with `--all` (a per-host, per-project fan-out) — it is
-    // refused explicitly, pointing at saving by id, rather than silently ignored.
-    let out = fx.run(&["net", "pending", "allow", "--all", "--save"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("does not combine with `--all`"),
-        "{:?}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 
     // A stray positional id alongside `--all` is a usage error (the two address different things).
     let out = fx.run(&["net", "pending", "deny", "--all", "123.1"]);
@@ -536,14 +526,186 @@ fn net_pending_all_rejects_save_and_a_stray_id_or_scope() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // A *save* scope flag alongside `--all` is refused (that is for `--save` by id); the message
-    // points at `--app` as the way to narrow the drain.
+    // A scope flag WITHOUT `--save` is meaningless (there is no file to write) — refused, pointing at
+    // `--save` (to persist) or `--app` (to narrow the drain).
     let out = fx.run(&["net", "pending", "allow", "--all", "--global"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no save scope"),
+        String::from_utf8_lossy(&out.stderr).contains("without `--save` takes no scope"),
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--all --save` does NOT take a `-c <file>` scope (the vocabulary is --local/--global).
+    let out = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "--all",
+        "--save",
+        "-c",
+        "/tmp/x.toml",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--local or --global"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn net_pending_all_save_local_refuses_an_untrusted_project_before_draining() {
+    let fx = Fixture::new();
+    // An untrusted project config in the cwd: a `--local` bulk save must refuse UP FRONT — before the
+    // irreversible drain — rather than answer everything then fail to save with nothing persisted.
+    fx.write_project("[network]\nmode = \"ask\"\nallow = [\"x.test\"]\n");
+    let before = std::fs::read(fx.proj.path().join(".ops.toml")).unwrap();
+
+    let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--local"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not trusted"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The untrusted config is byte-for-byte untouched — not silently blessed by the refused save.
+    assert_eq!(
+        std::fs::read(fx.proj.path().join(".ops.toml")).unwrap(),
+        before,
+        "the untrusted config must not be modified"
+    );
+}
+
+#[test]
+fn net_pending_all_save_global_drains_and_persists_each_host() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let egress = fx.data_home.path().join("ops").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let pid = 55555u32; // a fake session: --global drains every socket, no registry/project filter
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    // The fake session answers the bulk drain with one host.
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        assert!(
+            cmd.starts_with("ALLOW *"),
+            "expected a bulk drain, got {cmd:?}"
+        );
+        (&stream)
+            .write_all(b"answered host=blocked.example\nok\n")
+            .unwrap();
+    });
+
+    let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
+    server.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("blocked.example")
+            && stdout.contains("saved 1 allow rule(s) to the global config"),
+        "the drain and the save must both be reported:\n{stdout}"
+    );
+
+    // The global config now carries the allow rule for the drained host (the durable half).
+    let global =
+        std::fs::read_to_string(fx.config_home.path().join("ops").join("ops.toml")).unwrap();
+    assert!(
+        global.contains("blocked.example"),
+        "the rule must be persisted to the global config:\n{global}"
+    );
+}
+
+#[test]
+fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
+    // The headline, proven end to end: `--all --save --local` drains only THIS project's session and
+    // persists the host to THIS project's `.ops.toml`. The project filter needs a *live* registered
+    // session, so register THIS test process (alive → survives liveness pruning) as a project session
+    // of fx.proj, and bind its control socket; the child `fx.run` then drains it via the project
+    // filter. The one coupling is the registry record format (session.rs's serializer): fields
+    // `kind=/pid=/start=/runtime=project/project=<canonical>`, filename `<pid>-<start_ticks>`,
+    // start_ticks = `/proc/self/stat` field 22.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let data = fx.data_home.path().join("ops");
+    let egress = data.join("egress");
+    let sessions = data.join("sessions");
+    std::fs::create_dir_all(&egress).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let pid = std::process::id();
+    let start_ticks: u64 = {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // Everything after the last ')' starts at field 3 (state); starttime is field 22 → index 19.
+        let after = &stat[stat.rfind(')').unwrap() + 1..];
+        after.split_whitespace().nth(19).unwrap().parse().unwrap()
+    };
+    // The project path is hex-encoded in the record (so a non-UTF-8/newline path round-trips).
+    use std::os::unix::ffi::OsStrExt;
+    let project = fx.proj.path().canonicalize().unwrap();
+    let project_hex: String = project
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(
+        sessions.join(format!("{pid}-{start_ticks}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=project\nproject={project_hex}\n"
+        ),
+    )
+    .unwrap();
+
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        assert!(
+            cmd.starts_with("ALLOW *"),
+            "expected a bulk drain, got {cmd:?}"
+        );
+        (&stream)
+            .write_all(b"answered host=blocked.example\nok\n")
+            .unwrap();
+    });
+
+    // No initial `.ops.toml` → the precheck passes (absent is fine) and the local save bootstraps it.
+    let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--local"]);
+    server.join().unwrap();
+    let _ = std::fs::remove_file(&socket);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("blocked.example") && stdout.contains("scoped to this project"),
+        "the local drain must report the host and the project scope:\n{stdout}"
+    );
+
+    // THIS project's config was created (and trusted) with the allow rule — the durable local half,
+    // proving drain-filtered-to-project + persist-local composed correctly.
+    let cfg = std::fs::read_to_string(fx.proj.path().join(".ops.toml"))
+        .expect("the project config must be created");
+    assert!(
+        cfg.contains("blocked.example"),
+        "the rule must be persisted to THIS project's config:\n{cfg}"
     );
 }
 

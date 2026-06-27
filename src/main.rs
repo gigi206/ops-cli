@@ -2976,6 +2976,21 @@ fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSe
         .collect()
 }
 
+/// The live-session pids running in `project` (a canonical project root), from the registry — the
+/// basis for scoping `ops net pending` to the current project. The match is `s.project == project`,
+/// the exact comparison the launch path records and `ops gc` already uses (both sides go through
+/// [`sandbox::project_identity`]), so a session and its project never disagree. A session not in the
+/// registry has no known project, so under a filter it is excluded.
+fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections::HashSet<u32> {
+    session::Registry::at(data_dir)
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.project == project)
+        .map(|s| s.pid)
+        .collect()
+}
+
 /// `ops net pending [-a|--app <name>] [--json]`: list every reachable ask-mode session's parked
 /// requests, grouped by session (with its agent/project context); identical retries of one URL
 /// collapse to a single destination carrying the `<pid>.<seq>` id to answer it (and, in `--json`, a
@@ -3207,19 +3222,12 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         .collect();
 
     // `--all` drains every parked request across every reachable session (or, with `--app <name>`,
-    // every request of that one app's session(s)). `--save` is deliberately out of scope here (it
-    // would mean a per-host, per-project save fanned across sessions); rejected explicitly rather than
-    // silently dropped, so a user who expected persistence is told to save by id. The bulk path takes
-    // no id and no *save* scope — `-a` here is a session filter, not a save target.
+    // that one app's session(s)). With `--save` it also persists a rule per answered host; the drain
+    // is then scoped to match the save target — `--local` (the default) writes the *current project's*
+    // config and so restricts the drain to that project, which is what makes a bulk local save
+    // unambiguous (it can never answer one project's requests into another's config). Without `--save`,
+    // a scope flag is meaningless (there is no file to write), so it is refused.
     if all {
-        if save {
-            eprintln!(
-                "ops: `--save` does not combine with `--all` (that would save a rule per host \
-                 across every session); save by id, e.g. `ops net pending {verb} <id> --save`, or \
-                 set a rule / `[network] mode` for a permanent decision"
-            );
-            return ExitCode::from(2);
-        }
         let parsed = match split_scope(&rest) {
             Ok(p) => p,
             Err(e) => {
@@ -3234,10 +3242,18 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             );
             return ExitCode::from(2);
         }
+        if save {
+            return net_pending_drain_and_save(
+                verdict,
+                session,
+                &parsed.scope,
+                parsed.app.as_deref(),
+            );
+        }
         if parsed.scope_explicit {
             eprintln!(
-                "ops: `--all` takes no save scope (--local/--global/-c) — that is for `--save` by \
-                 id; use `--app <name>` to limit the drain to one app"
+                "ops: `--all` without `--save` takes no scope (--local/--global/-c) — add `--save` \
+                 to persist a rule per host, or use `--app <name>` to limit the drain to one app"
             );
             return ExitCode::from(2);
         }
@@ -3939,6 +3955,190 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         Err((code, message)) => {
             eprintln!("ops: {message}");
             ExitCode::from(code)
+        }
+    }
+}
+
+/// Pre-flight the trust gate for a `--local` save at `cwd`, *before* any irreversible action (a bulk
+/// drain unblocks agents and cannot be undone). Mirrors [`persist_egress_rule`]'s gate exactly — same
+/// `scope_path`, same trust-store, same "existing config must be trusted" rule — so a save that would
+/// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (ops's
+/// append is then the sole delta).
+fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
+    use config::manage::{self, Scope};
+    let store = trust::default_store_dir().ok_or((
+        1,
+        "cannot determine the trust store (set XDG_STATE_HOME or HOME) — needed to trust the project \
+         config a `--local` save writes; use --global instead"
+            .to_string(),
+    ))?;
+    let path = manage::scope_path(&Scope::Local, cwd).map_err(|e| (1, e.to_string()))?;
+    if path.exists() && !matches!(trust::state(&store, &path), trust::TrustState::Trusted) {
+        return Err((
+            2,
+            format!(
+                "{} is not trusted — review it and run `ops trust {}`, then retry (a `--local` save \
+                 will not silently bless an untrusted project)",
+                path.display(),
+                config::PROJECT_CONFIG
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `ops net pending allow|deny --all --save [-l|-g|-a <app>]`: drain parked requests *and* persist a
+/// rule per answered host, so the same destinations are pre-decided next launch. The drain is scoped
+/// to match the save target: a `--local` save (the default) writes the **current project's** config,
+/// so it drains only that project's sessions — never machine-wide — which is what makes a bulk local
+/// save unambiguous (one project's requests can never land in another's config). `--global` writes the
+/// one global file and so may drain across projects; `-a <app>` narrows by app and composes with the
+/// project scope. The drain is irreversible, so a `--local` save pre-flights the trust gate first.
+fn net_pending_drain_and_save(
+    verdict: sandbox::control::Verdict,
+    session: bool,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+) -> ExitCode {
+    use config::manage::{EgressList, Scope};
+    let (list, verb, past) = match verdict {
+        sandbox::control::Verdict::Allow => (EgressList::Allow, "allow", "allowed"),
+        sandbox::control::Verdict::Deny => (EgressList::Deny, "deny", "denied"),
+    };
+    if matches!(scope, Scope::File(_)) {
+        eprintln!("ops: `--all --save` takes --local or --global, not `-c <file>`");
+        return ExitCode::from(2);
+    }
+    let local = matches!(scope, Scope::Local);
+
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // For a `--local` save, resolve the current project up front — its canonical root scopes the drain
+    // AND is the save base — and pre-flight the trust gate before the irreversible drain.
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let project_canonical = if local {
+        if let Err((code, msg)) = precheck_local_save(&cwd) {
+            eprintln!("ops: {msg}");
+            return ExitCode::from(code);
+        }
+        match sandbox::project_identity(&cwd) {
+            Ok((_, canonical)) => Some(canonical),
+            Err(e) => {
+                eprintln!("ops: cannot resolve the current project directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Two composing pid filters: the project (a `--local` save) and the app (`-a`). A session must
+    // pass every active filter to be drained.
+    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
+    let project_pids = project_canonical
+        .as_deref()
+        .map(|canon| session_pids_for_project(&data_dir, canon));
+
+    let context = pending_session_context(&data_dir);
+    let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
+    let mut hosts: Vec<String> = Vec::new();
+    for pid in sandbox::control::session_pids(&data_dir) {
+        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        if let Ok(answered_hosts) =
+            sandbox::control::drain_session(&data_dir, pid, verdict, session)
+        {
+            if !answered_hosts.is_empty() {
+                hosts.extend(answered_hosts.iter().cloned());
+                answered.push((pid, answered_hosts));
+            }
+        }
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let total: usize = answered.iter().map(|(_, h)| h.len()).sum();
+    if total == 0 {
+        let scope_note = if local {
+            "for this project".to_string()
+        } else if let Some(name) = app {
+            format!("for app `{name}`")
+        } else {
+            "across any ask-mode session".to_string()
+        };
+        println!(
+            "{}no pending requests {scope_note} — nothing to answer or save{}",
+            pal.dim, pal.reset
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // Persist a rule per *unique* answered host (a host answered in several sessions is one rule),
+    // preserving first-seen order. The base of a `--local` write is the cwd — every drained session is
+    // in this project. The live answers already stuck, so a save failure is a warning, not a rollback.
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<String> = hosts
+        .into_iter()
+        .filter(|h| seen.insert(h.clone()))
+        .collect();
+    let mut saved = 0usize;
+    let mut save_error = None;
+    for host in &unique {
+        match persist_egress_rule(list, host, scope, app, &cwd) {
+            Ok(_) => saved += 1,
+            Err((_, msg)) => {
+                save_error = Some(msg);
+                break;
+            }
+        }
+    }
+
+    print!(
+        "{}",
+        render_drain(past, session, app, &answered, &context, &pal)
+    );
+    let target = if local {
+        "the project config".to_string()
+    } else {
+        "the global config".to_string()
+    };
+    let app_note = app.map(|a| format!(" under app `{a}`")).unwrap_or_default();
+    match save_error {
+        None => {
+            println!(
+                "  saved {saved} {verb} rule(s) to {target}{app_note}{}",
+                if local { " (re-trusted)" } else { "" }
+            );
+            if local {
+                println!(
+                    "{}  scoped to this project — other projects' sessions are untouched \
+                     (use --global to widen){}",
+                    pal.dim, pal.reset
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Some(msg) => {
+            diag::warn(&format!(
+                "answered {total} request(s) and saved {saved} of {} rule(s), then stopped: {msg}",
+                unique.len()
+            ));
+            ExitCode::FAILURE
         }
     }
 }
@@ -5732,6 +5932,41 @@ mod tests {
         assert!(
             session_pids_for_app(data.path(), "other").is_empty(),
             "a different app must select no session"
+        );
+    }
+
+    #[test]
+    fn session_pids_for_project_selects_only_this_projects_live_sessions() {
+        use crate::testutil::TmpDir;
+        use session::{Kind, Registry, Session, SessionRuntime};
+
+        let data = TmpDir::new();
+        let proj = TmpDir::new(); // real existing dirs to stand in as project roots
+        let other = TmpDir::new();
+
+        // Register THIS process (alive) with the project the launch path WOULD record — exactly
+        // `project_identity(cwd).1` — so the test drives the real key on BOTH sides. A mismatch
+        // between how the record is written and how the filter resolves the cwd would silently select
+        // nothing (the make-or-break fact for `--all --save --local`).
+        let (_, canonical) =
+            sandbox::project_identity(proj.path()).expect("resolve the project root");
+        let me = Session::current(canonical, Kind::Run, SessionRuntime::Project)
+            .expect("read this process's session identity");
+        Registry::at(data.path())
+            .register(&me)
+            .expect("register the session");
+
+        // Filtering by the same cwd (resolved the same way) selects this session...
+        let here = sandbox::project_identity(proj.path()).unwrap().1;
+        assert!(
+            session_pids_for_project(data.path(), &here).contains(&std::process::id()),
+            "this project's live session must be selected"
+        );
+        // ...and a different project selects nothing (so a local bulk save there drains zero).
+        let elsewhere = sandbox::project_identity(other.path()).unwrap().1;
+        assert!(
+            session_pids_for_project(data.path(), &elsewhere).is_empty(),
+            "a different project must select no session"
         );
     }
 
