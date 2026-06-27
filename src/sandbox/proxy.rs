@@ -837,10 +837,24 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
                     |seq| {
                         if ctx.notices {
                             let id = super::control::format_id(std::process::id(), seq);
+                            // Paint the alert when stderr is a terminal (the canonical NO_COLOR / dumb
+                            // / is-tty predicate, borrowed from the shared palette): `ops:` bold +
+                            // underlined + red, the rest of the alert red, the copy-paste commands left
+                            // plain so they read cleanly.
+                            let colored = !crate::style::Palette::for_stream(
+                                std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                            )
+                            .err
+                            .is_empty();
+                            let (ops, red, rst) = if colored {
+                                ("\x1b[1;4;31m", "\x1b[31m", "\x1b[0m")
+                            } else {
+                                ("", "", "")
+                            };
                             eprintln!(
-                                "ops: egress decision needed [{id}] {connect_host}:{port}{itarget} \
-                                 — allow: ops net pending allow {id}  |  deny: ops net pending deny \
-                                 {id}"
+                                "{ops}ops:{rst}{red} egress decision needed [{id}] \
+                                 {connect_host}:{port}{itarget}{rst} — allow: ops net pending allow \
+                                 {id}  |  deny: ops net pending deny {id}"
                             );
                         }
                     },
