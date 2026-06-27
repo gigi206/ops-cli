@@ -569,6 +569,96 @@ fn test_net_targets_an_app_effective_policy() {
 }
 
 #[test]
+fn net_rules_targets_an_app_effective_policy() {
+    let fx = Fixture::new();
+    // A global config (trusted by location): a baseline allowlist listing one host, plus an app
+    // whose OWN network overlay lists a different host and a path-scoped deny. `--app` must list the
+    // app's effective rules (its overlay replaces the baseline posture), not the baseline's.
+    fx.write_global(
+        "[network]\n\
+         mode = \"deny\"\n\
+         allow = [\"github.com\"]\n\
+         \n\
+         [app.demo]\n\
+         cmd = \"true\"\n\
+         \n\
+         [app.demo.network]\n\
+         mode = \"deny\"\n\
+         allow = [\"api.demo.test\"]\n\
+         deny = [\"api.demo.test/secret\"]\n",
+    );
+
+    // Bare `net rules`: the baseline only — github.com, and NOT the app's host. This is the teeth:
+    // it proves the `--app` listing below took the overlay, not coincidentally echoed the baseline.
+    let base = fx.run(&["net", "rules"]);
+    assert!(base.status.success());
+    let b = String::from_utf8_lossy(&base.stdout);
+    assert!(
+        b.contains("allow github.com  (config)") && !b.contains("api.demo.test"),
+        "the baseline listing must be the baseline, not the app:\n{b}"
+    );
+
+    // `--app demo`: the app's effective policy. The header names the scope; its own allow/deny
+    // appear; the baseline's github.com is GONE (the app's network replaces it); the built-in
+    // nix-cache set is still unioned (app-invariant).
+    let app = fx.run(&["net", "rules", "--app", "demo"]);
+    assert!(app.status.success());
+    let a = String::from_utf8_lossy(&app.stdout);
+    assert!(
+        a.contains("network (app demo): deny"),
+        "the header must name the app scope:\n{a}"
+    );
+    assert!(a.contains("allow api.demo.test  (config)"), "{a}");
+    assert!(a.contains("deny  api.demo.test/secret  (config)"), "{a}");
+    assert!(
+        !a.contains("github.com  (config)"),
+        "the app's network overlay replaces the baseline's, so github.com must be gone:\n{a}"
+    );
+    assert!(
+        a.contains("allow cache.nixos.org  (builtin)"),
+        "the built-in nix-cache set is app-invariant and still listed:\n{a}"
+    );
+
+    // `--source config` + `--app`: the app's config rules only, no built-in set.
+    let cfg = fx.run(&["net", "rules", "--app", "demo", "--source", "config"]);
+    let c = String::from_utf8_lossy(&cfg.stdout);
+    assert!(
+        c.contains("api.demo.test") && !c.contains("(builtin)"),
+        "--source config must filter to the app's own rules:\n{c}"
+    );
+
+    // `--json` + `--app`: the effective rules as JSON (the {mode, rules} contract is unchanged).
+    let json = fx.run(&["net", "rules", "--app", "demo", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("net rules --app --json emits valid JSON");
+    assert_eq!(v["mode"], "deny");
+    assert!(
+        v["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["rule"] == "api.demo.test"),
+        "the app's rule must be in the JSON:\n{v}"
+    );
+
+    // An unknown app is a pointed, exit-2 error listing what exists.
+    let bad = fx.run(&["net", "rules", "--app", "nope"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no app named"),
+        "an unknown app must error"
+    );
+
+    // `--app` does not combine with `--source manual` (manual is live runtime, not config).
+    let clash = fx.run(&["net", "rules", "--app", "demo", "--source", "manual"]);
+    assert_eq!(clash.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&clash.stderr).contains("does not combine"),
+        "--app + --source manual must be refused"
+    );
+}
+
+#[test]
 fn test_net_reflects_the_built_in_nix_cache_set_both_directions() {
     let fx = Fixture::new();
     // A trusted project allowlist that lists one host which is ALSO a built-in nix-cache host.

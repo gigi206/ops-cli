@@ -2647,6 +2647,30 @@ fn test_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
+/// Fold the named app's overlay onto the resolved baseline so a read-only diagnostic sees the
+/// *effective* policy `ops app <name>` would launch with — the shared core of `ops test net --app`
+/// and `ops net rules --app`. The baseline warnings are the caller's to surface; this captures the
+/// warning count *before* the merge and emits only the app's own new ones (no double-print). On an
+/// unknown app it returns a pointed message (the caller prepends its own `ops: <verb>:` prefix);
+/// the merge itself reuses `config::load` → `merge_app`, so the trust gate and the "a global app
+/// keeps its posture under an untrusted project" property hold through that path, not new code.
+fn fold_app_overlay(resolved: &mut config::Resolved, name: &str) -> Result<(), String> {
+    let Some(app_cfg) = resolved.apps.remove(name) else {
+        let names: Vec<&str> = resolved.apps.keys().map(String::as_str).collect();
+        return Err(if names.is_empty() {
+            format!("no app named {name:?} (no apps are declared for this directory)")
+        } else {
+            format!("no app named {name:?} (declared: {})", names.join(", "))
+        });
+    };
+    let before = resolved.warnings.len();
+    resolved.merge_app(app_cfg);
+    for w in &resolved.warnings[before..] {
+        diag::warn(w);
+    }
+    Ok(())
+}
+
 /// `ops test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
 /// report the rule that decides it. A diagnostic for the egress allowlist — it reflects the trust
 /// gate (an untrusted project's policy is dropped, so the *effective* posture is shown), folds in a
@@ -2697,26 +2721,11 @@ fn net_test(args: &[OsString]) -> ExitCode {
     }
     // Fold a named app's overlay onto the baseline so the URL is tested against the *effective*
     // policy `ops app <name>` would launch with (its own posture, allow/deny rules, credentials),
-    // not the bare baseline. `merge_app` appends the app's own warnings; surface the delta.
+    // not the bare baseline.
     if let Some(name) = &app {
-        let Some(app_cfg) = resolved.apps.remove(name) else {
-            let names: Vec<&str> = resolved.apps.keys().map(String::as_str).collect();
-            if names.is_empty() {
-                eprintln!(
-                    "ops: test net: no app named {name:?} (no apps are declared for this directory)"
-                );
-            } else {
-                eprintln!(
-                    "ops: test net: no app named {name:?} (declared: {})",
-                    names.join(", ")
-                );
-            }
+        if let Err(e) = fold_app_overlay(&mut resolved, name) {
+            eprintln!("ops: test net: {e}");
             return ExitCode::from(2);
-        };
-        let before = resolved.warnings.len();
-        resolved.merge_app(app_cfg);
-        for w in &resolved.warnings[before..] {
-            diag::warn(w);
         }
     }
 
@@ -2876,9 +2885,10 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
     }
 }
 
-/// `ops net <subcommand>`: the interactive-egress namespace. Read-only for now — `rules` lists the
-/// effective egress rules; the pending-request and rule-management verbs land in later increments.
-/// Distinct from `ops test net <url>` (the URL matcher): `net` is the listing/management surface.
+/// `ops net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
+/// rules (optionally for one app), `allow`/`deny` persist a rule to a config file, and `pending`
+/// drives the live `ask`-posture control plane. Distinct from `ops test net <url>` (the URL
+/// matcher): `net` is the listing/management surface.
 fn net_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("rules") => net_rules(&args[1..]),
@@ -3153,11 +3163,19 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     use config::view::RuleSourceView;
     let mut source: Option<RuleSourceView> = None;
     let mut filter: Option<String> = None;
+    let mut app: Option<String> = None;
     let mut json = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
             Some("--json") => json = true,
+            Some("--app") | Some("-a") => {
+                let Some(v) = it.next().and_then(|a| a.to_str()) else {
+                    eprintln!("ops: net rules: `--app` needs an app name");
+                    return ExitCode::from(2);
+                };
+                app = Some(v.to_string());
+            }
             Some("--source") | Some("-s") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
                     eprintln!("ops: `--source` needs a value (config, builtin, manual)");
@@ -3189,6 +3207,17 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         }
     }
 
+    // `--app` folds a declared config overlay; `--source manual` lists live session rules that no
+    // config produces — orthogonal, so the combination is refused rather than silently ignored
+    // (mirroring how `ops config show` rejects `--app` alongside a source flag).
+    if app.is_some() && source == Some(RuleSourceView::Manual) {
+        eprintln!(
+            "ops: net rules: `--app` does not combine with `--source manual` \
+             (manual rules are live session state, not a config overlay)"
+        );
+        return ExitCode::from(2);
+    }
+
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -3202,9 +3231,18 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         return net_rules_manual(&cwd, filter.as_deref(), json);
     }
 
-    let resolved = config::load(&cwd);
+    let mut resolved = config::load(&cwd);
     for w in &resolved.warnings {
         diag::warn(w);
+    }
+    // Fold a named app's overlay so the rules listed are the *effective* set `ops app <name>` would
+    // launch with (its own posture, allow/deny, credentials), not the bare baseline — the same path
+    // `ops test net --app` uses, so the two read the same policy.
+    if let Some(name) = &app {
+        if let Err(e) = fold_app_overlay(&mut resolved, name) {
+            eprintln!("ops: net rules: {e}");
+            return ExitCode::from(2);
+        }
     }
 
     // The effective posture decides the mode word and whether there are rules at all. The built-in
@@ -3242,8 +3280,14 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Name the posture in view: the baseline, or one app's effective overlay (matching the label
+    // `ops test net --app` prints, so the two commands read the same).
+    let scope = app
+        .as_ref()
+        .map(|n| format!(" (app {n})"))
+        .unwrap_or_default();
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_net_rules(mode, &shown, total, &pal));
+    print!("{}", render_net_rules(mode, &scope, &shown, total, &pal));
     ExitCode::SUCCESS
 }
 
@@ -3311,7 +3355,7 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_net_rules("manual", &shown, total, &pal));
+    print!("{}", render_net_rules("manual", "", &shown, total, &pal));
     ExitCode::SUCCESS
 }
 
@@ -3321,6 +3365,7 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
 /// and say so; an empty result distinguishes "no rules declared" from "nothing matched the filter".
 fn render_net_rules(
     mode: &str,
+    scope: &str,
     shown: &[&config::view::NetRuleView],
     total: usize,
     pal: &style::Palette,
@@ -3334,14 +3379,14 @@ fn render_net_rules(
         "shared" => {
             let _ = writeln!(
                 o,
-                "{h}network:{r} shared {dim}— no egress rules (host network, no proxy){r}"
+                "{h}network{scope}:{r} shared {dim}— no egress rules (host network, no proxy){r}"
             );
             return o;
         }
         "none" => {
             let _ = writeln!(
                 o,
-                "{h}network:{r} none {dim}— no egress rules (no network){r}"
+                "{h}network{scope}:{r} none {dim}— no egress rules (no network){r}"
             );
             return o;
         }
@@ -3349,13 +3394,13 @@ fn render_net_rules(
         "allow" => {
             let _ = writeln!(
                 o,
-                "{h}network:{r} allow {dim}— denylist: every public host reaches except the deny rules{r}"
+                "{h}network{scope}:{r} allow {dim}— denylist: every public host reaches except the deny rules{r}"
             );
         }
         "ask" => {
             let _ = writeln!(
                 o,
-                "{h}network:{r} ask {dim}— an unmatched host parks for a live `ops net pending` decision; \
+                "{h}network{scope}:{r} ask {dim}— an unmatched host parks for a live `ops net pending` decision; \
                  allow rules auto-pass, deny rules auto-fail{r}"
             );
         }
@@ -3371,7 +3416,7 @@ fn render_net_rules(
         _ => {
             let _ = writeln!(
                 o,
-                "{h}network:{r} deny {dim}— allowlist: only the listed and built-in hosts reach{r}"
+                "{h}network{scope}:{r} deny {dim}— allowlist: only the listed and built-in hosts reach{r}"
             );
         }
     }
@@ -5083,22 +5128,33 @@ mod tests {
         let refs: Vec<&NetRuleView> = rules.iter().collect();
 
         // deny mode: header frames it as an allowlist; each rule carries its kind + source.
-        let out = render_net_rules("deny", &refs, refs.len(), &p);
+        let out = render_net_rules("deny", "", &refs, refs.len(), &p);
         assert!(out.contains("network: deny"), "{out}");
         assert!(out.contains("allow github.com  (config)"), "{out}");
         assert!(out.contains("deny  evil.com  (config)"), "{out}");
         assert!(out.contains("allow cache.nixos.org  (builtin)"), "{out}");
 
         // allow mode frames it as a denylist.
-        assert!(render_net_rules("allow", &refs, refs.len(), &p).contains("network: allow"));
+        assert!(render_net_rules("allow", "", &refs, refs.len(), &p).contains("network: allow"));
+
+        // A `--app` scope labels the header exactly as `ops test net --app` does, on every posture.
+        assert!(
+            render_net_rules("deny", " (app demo)", &refs, refs.len(), &p)
+                .contains("network (app demo): deny"),
+            "the app scope must label the header"
+        );
+        assert!(
+            render_net_rules("shared", " (app demo)", &[], 0, &p).contains("network (app demo):"),
+            "the app scope must label a non-filtering posture too"
+        );
 
         // shared/none carry no rules, with an explanatory one-liner (no rule list).
-        assert!(render_net_rules("shared", &[], 0, &p).contains("no egress rules"));
-        assert!(render_net_rules("none", &[], 0, &p).contains("no egress rules"));
+        assert!(render_net_rules("shared", "", &[], 0, &p).contains("no egress rules"));
+        assert!(render_net_rules("none", "", &[], 0, &p).contains("no egress rules"));
 
         // An empty result distinguishes "nothing declared" from "the filter matched nothing".
-        assert!(render_net_rules("deny", &[], 0, &p).contains("no rules declared"));
-        assert!(render_net_rules("deny", &[], 3, &p).contains("no rules match the filter"));
+        assert!(render_net_rules("deny", "", &[], 0, &p).contains("no rules declared"));
+        assert!(render_net_rules("deny", "", &[], 3, &p).contains("no rules match the filter"));
     }
 
     #[test]

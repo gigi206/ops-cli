@@ -256,6 +256,12 @@ fn app_targeted_net_test_is_plain_when_captured() {
     );
     assert!(builtin.status.success());
     assert_no_ansi(&builtin, "test net --app (built-in tag)");
+
+    // `ops net rules --app demo` colors the app-scoped header and the per-rule source tags — a
+    // captured run must still be plain.
+    let rules = run(&["net", "rules", "--app", "demo"], home.path(), cwd.path());
+    assert!(rules.status.success());
+    assert_no_ansi(&rules, "net rules --app");
 }
 
 #[test]

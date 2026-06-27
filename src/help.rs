@@ -503,9 +503,13 @@ const PAGES: &[Page] = &[
     // ---- net subcommands ----------------------------------------------------------
     Page {
         path: &["net", "rules"],
-        synopsis: "ops net rules [-s|--source config|builtin|manual] [-f|--filter <substr>] [--json]",
+        synopsis: "ops net rules [-a|--app <name>] [-s|--source config|builtin|manual] [-f|--filter <substr>] [--json]",
         summary: "list the effective egress rules by source",
         options: &[
+            (
+                "-a, --app <name>",
+                "list the effective rules for that app (its `[app.<name>.network]` folded onto the baseline), not the baseline's",
+            ),
             (
                 "-s, --source <src>",
                 "show only one source: config (the .ops.toml/global rules), builtin (the nix-cache set), or manual (live `--session` rules)",
@@ -519,8 +523,10 @@ const PAGES: &[Page] = &[
         details:
             "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
             built-in, reflecting the trust gate (an untrusted project's rules are dropped). Under\n\
-            `shared`/`none` there are no rules. `--source manual` instead queries this project's live\n\
-            ask sessions for the rules they remembered from `--session` answers. No launch, no nix.",
+            `shared`/`none` there are no rules. `--app <name>` shows what `ops app <name>` would\n\
+            launch with — the same effective policy `ops test net --app` tests a URL against. `--source\n\
+            manual` instead queries this project's live ask sessions for the rules they remembered\n\
+            from `--session` answers (it does not combine with `--app`). No launch, no nix.",
     },
     Page {
         path: &["net", "allow"],
