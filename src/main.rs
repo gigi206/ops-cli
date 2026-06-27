@@ -3441,6 +3441,22 @@ fn net_pending_answer_all(
 /// was parked (naming the `--app` filter when one narrowed the scope, so an empty result is not
 /// mistaken for "nothing anywhere"). A pure presenter — its palette comes from the caller (plain on a
 /// captured stream).
+/// Collapse a session's answered-host list — one entry per parked request, so a host repeats once per
+/// request — into first-seen order paired with an occurrence count. A burst of retries (or several
+/// paths) to one destination then reads as a single `host ×N` line instead of N identical lines. The
+/// fold is host-granular: the drain wire format carries only `answered host=`, so distinct paths and
+/// plain retries to the same host both add to the one count.
+fn collapse_hosts(hosts: &[String]) -> Vec<(&str, usize)> {
+    let mut order: Vec<(&str, usize)> = Vec::new();
+    for host in hosts {
+        match order.iter_mut().find(|(h, _)| *h == host.as_str()) {
+            Some(entry) => entry.1 += 1,
+            None => order.push((host.as_str(), 1)),
+        }
+    }
+    order
+}
+
 fn render_drain(
     past: &str,
     session: bool,
@@ -3490,8 +3506,14 @@ fn render_drain(
                 let _ = writeln!(o, "  {dim}session {pid} (unregistered){r}");
             }
         }
-        for host in hosts {
-            let _ = writeln!(o, "    {n}{host}{r}");
+        // One parked request emits one host, so a burst of retries (or several paths) to one
+        // destination would print that host once per request. Fold the repeats into `host ×N`.
+        for (host, count) in collapse_hosts(hosts) {
+            if count > 1 {
+                let _ = writeln!(o, "    {n}{host}{r} {dim}×{count}{r}");
+            } else {
+                let _ = writeln!(o, "    {n}{host}{r}");
+            }
         }
     }
     if session {
@@ -5995,6 +6017,44 @@ mod tests {
         let out = render_drain("denied", false, None, &answered, &[], &context, &p);
         assert!(out.contains("denied 3 parked request(s)"), "{out}");
         assert!(!out.contains("remembered for each session"), "{out}");
+
+        // Duplication collapse (the regression): a session that retried one destination many times
+        // must list that host ONCE with a ×count, not once per request.
+        let mut hosts = vec!["ziglang.org".to_string(); 20];
+        hosts.push("downloads.claude.ai".to_string());
+        let bursty = vec![(285706u32, hosts)];
+        let out = render_drain("allowed", false, None, &bursty, &[], &[], &p);
+        // Teeth: on the un-folded code this count is 20, so the assert fails without the fix.
+        assert_eq!(
+            out.matches("ziglang.org").count(),
+            1,
+            "a repeated host must be listed once, not once per request:\n{out}"
+        );
+        assert!(
+            out.contains("×20"),
+            "the collapsed host must carry its occurrence count:\n{out}"
+        );
+        // The header still counts every request (21), and the singleton host gets no ×1 noise.
+        assert!(out.contains("allowed 21 parked request(s)"), "{out}");
+        assert!(
+            out.contains("downloads.claude.ai") && !out.contains("×1"),
+            "a single-request host must not get a ×1 suffix:\n{out}"
+        );
+    }
+
+    #[test]
+    fn collapse_hosts_folds_repeats_in_first_seen_order_and_preserves_the_total() {
+        let hosts = vec![
+            "a.test".to_string(),
+            "b.test".to_string(),
+            "a.test".to_string(),
+            "a.test".to_string(),
+        ];
+        let folded = collapse_hosts(&hosts);
+        // First-seen order, each host once, with its count.
+        assert_eq!(folded, vec![("a.test", 3), ("b.test", 1)]);
+        // The counts sum back to the request total — the invariant the drain header relies on.
+        assert_eq!(folded.iter().map(|(_, n)| n).sum::<usize>(), hosts.len());
     }
 
     #[test]
