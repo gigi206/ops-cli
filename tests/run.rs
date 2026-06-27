@@ -727,6 +727,42 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
         "denied egress must be refused with a 403 at the proxy: {}",
         String::from_utf8_lossy(&denied.stderr)
     );
+
+    // STATS — the write↔read key agreement, end to end. The proxy recorded one outcome per request
+    // into a session file keyed by the project's canonical path; `ops net stats` run from the same
+    // project reads it back. That it finds the rows proves the launch-side write key and the
+    // read-side filter cannot drift (a mismatch would yield an empty, silently-wrong listing). The
+    // allowed host shows an allow, the denied host a deny — the buckets the two requests exercised.
+    let stats = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["net", "stats", "--json"],
+    );
+    assert!(
+        stats.status.success(),
+        "net stats failed: {}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&stats.stdout).expect("net stats --json is valid JSON");
+    let rows = v["stats"].as_array().expect("a stats array");
+    let count = |host: &str, bucket: &str| -> u64 {
+        rows.iter()
+            .find(|r| r["host"] == host)
+            .and_then(|r| r[bucket].as_u64())
+            .unwrap_or(0)
+    };
+    assert!(
+        count("cache.nixos.org", "allow") >= 1,
+        "the allowed host must show an allow in the stats:\n{}",
+        String::from_utf8_lossy(&stats.stdout)
+    );
+    assert!(
+        count("example.com", "deny") >= 1,
+        "the denied host must show a deny in the stats:\n{}",
+        String::from_utf8_lossy(&stats.stdout)
+    );
 }
 
 #[test]

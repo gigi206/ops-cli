@@ -77,6 +77,10 @@ pub(crate) struct Egress {
     ca_file: PathBuf,
     /// The `ask`-posture control socket, present only when the policy asks by default.
     control_uds: Option<PathBuf>,
+    /// The session's per-host decision counters, when stats are on. The guard owns a flush on a
+    /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
+    /// persists for `ops net stats` to aggregate after the session ends (cleared by `--reset`).
+    stats: Option<Arc<super::egress_stats::EgressStats>>,
 }
 
 impl Drop for Egress {
@@ -85,6 +89,11 @@ impl Drop for Egress {
         let _ = std::fs::remove_file(&self.ca_file);
         if let Some(control) = &self.control_uds {
             let _ = std::fs::remove_file(control);
+        }
+        // A final flush for a graceful exit; the per-decision flush already keeps the file current
+        // for the common case of a killed session, where this Drop never runs.
+        if let Some(stats) = &self.stats {
+            stats.flush_final();
         }
     }
 }
@@ -139,6 +148,7 @@ pub(crate) fn start(
     secrets: &[HeaderSecret],
     project_root: &Path,
     bwrap: &Path,
+    app: Option<&str>,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -165,6 +175,21 @@ pub(crate) fn start(
     let host_uds = dir.join(format!("proxy-{pid}.sock"));
     let ca_file = dir.join(format!("ca-{pid}.pem"));
     let _ = std::fs::remove_file(&host_uds);
+
+    // Per-host decision counters for this session, keyed by the project's canonical path (the same
+    // identity `ops net stats` derives from a cwd, so a launch's record and a later read agree).
+    // Best-effort: a project that cannot be canonicalised simply records no stats, never a launch
+    // failure. The proxy flushes the file after each decision (robust to a killed session); it
+    // persists after the session for aggregation.
+    let stats = super::binds::project_identity(project_root)
+        .ok()
+        .map(|(_, canon)| {
+            Arc::new(super::egress_stats::EgressStats::new(
+                dir.join(format!("stats-{pid}")),
+                canon.display().to_string(),
+                app.map(str::to_string),
+            ))
+        });
 
     // Read the posture before the policy moves into the proxy context: only `ask` needs a control
     // plane.
@@ -197,6 +222,9 @@ pub(crate) fn start(
     } else {
         None
     };
+    if let Some(stats) = &stats {
+        ctx = ctx.with_stats(stats.clone());
+    }
     let ctx = Arc::new(ctx);
 
     // Write the CA owner-only, outside every writable mount, then bind it read-only — the
@@ -262,6 +290,7 @@ pub(crate) fn start(
             host_uds,
             ca_file,
             control_uds,
+            stats,
         },
         Wiring { binds, env },
     ))
@@ -544,6 +573,7 @@ mod tests {
             &[],
             Path::new("/"),
             Path::new(UNUSED_BWRAP),
+            None,
         )
         .expect("start the egress proxy");
 
@@ -625,8 +655,15 @@ mod tests {
         std::fs::create_dir_all(layout.data_dir()).unwrap();
 
         let ask = EgressPolicy::default().with_default(crate::allowlist::DefaultAction::Ask);
-        let (guard, wiring) = start(&layout, ask, &[], Path::new("/"), Path::new(UNUSED_BWRAP))
-            .expect("start the ask egress proxy");
+        let (guard, wiring) = start(
+            &layout,
+            ask,
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+        )
+        .expect("start the ask egress proxy");
 
         // ask mode binds a control socket under the egress dir...
         let control = guard

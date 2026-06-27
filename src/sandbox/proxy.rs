@@ -114,6 +114,8 @@ use rustls::{
 
 use crate::allowlist::{self, Decision, EgressPolicy, Rule};
 
+use super::egress_stats::{EgressStats, StatKind};
+
 /// Install the `ring` crypto provider as the process default exactly once. With the default
 /// crate features turned off there is no auto-installed provider, so every `ServerConfig`/
 /// `ClientConfig` builder needs this to have run first. Idempotent and racing-safe.
@@ -466,6 +468,10 @@ pub(crate) struct ProxyCtx {
     /// the pending id without polling. Off by default (tests, non-ask launches); the launch turns
     /// it on when it wires the control socket.
     notices: bool,
+    /// The per-host decision counters this launch records (one outcome per request), or `None` when
+    /// stats are off. The launch ([`super::egress::start`]) attaches the session's
+    /// [`EgressStats`] via [`Self::with_stats`]; tests leave it unset.
+    stats: Option<Arc<EgressStats>>,
 }
 
 impl ProxyCtx {
@@ -492,7 +498,24 @@ impl ProxyCtx {
             pending: Arc::new(super::control::PendingState::new()),
             manual: Arc::new(super::control::ManualRules::new()),
             notices: false,
+            stats: None,
         })
+    }
+
+    /// Attach the session's per-host decision counters, so each request's outcome is recorded.
+    /// Set once by the launch ([`super::egress::start`]) when stats are enabled.
+    pub(crate) fn with_stats(mut self, stats: Arc<EgressStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Record one request's outcome for `host`, if stats are on (a no-op otherwise). The single
+    /// chokepoint the decision sites in [`handle_client`] call, so the bucket-per-site mapping is
+    /// the only place a request's outcome is classified.
+    fn record(&self, host: &str, kind: StatKind) {
+        if let Some(stats) = &self.stats {
+            stats.record(host, kind);
+        }
     }
 
     /// Wire the proxy to the launch's shared pending queue and manual-rule overlay, and turn on the
@@ -671,6 +694,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         .map(|s| allowlist::canonical_host(s) != connect_host)
         .unwrap_or(true)
     {
+        ctx.record(&connect_host, StatKind::Blocked);
         return respond_refusal_tls(
             &mut br,
             "421 Misdirected Request",
@@ -734,6 +758,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         .map(|h| allowlist::canonical_host(&strip_port(h)) != connect_host)
         .unwrap_or(true)
     {
+        ctx.record(&connect_host, StatKind::Blocked);
         return respond_refusal_tls(
             &mut br,
             "421 Misdirected Request",
@@ -749,6 +774,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     //     name or opens an upstream. A backstop against naive re-exfil only: it sees the head, not
     //     the streamed body, and matches the value byte-for-byte (any encoding evades it).
     if carries_secret(&inner_bytes, &ctx.redactions) {
+        ctx.record(&connect_host, StatKind::Blocked);
         return respond_refusal_tls(
             &mut br,
             "403 Forbidden",
@@ -766,20 +792,22 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         // rule. The SSRF guard below then treats it as unnamed (private addresses refused).
         Decision::AllowedDefault => None,
         Decision::DeniedBy(_) => {
+            ctx.record(&connect_host, StatKind::Deny);
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
                 "denied-by-rule",
                 "this request matches a deny rule in the network policy",
-            )
+            );
         }
         Decision::DeniedDefault => {
+            ctx.record(&connect_host, StatKind::Deny);
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
                 "denied-default",
                 &format!("`{connect_host}:{port}` is not allowed by the network policy"),
-            )
+            );
         }
         // Ask-by-default: no config rule decided. First consult the live manual overlay (decisions
         // a prior `--session` answer remembered) — a remembered allow/deny short-circuits the park,
@@ -787,17 +815,20 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         // park and block until a host-side `ops net pending` answers it or the timeout elapses (deny
         // — fail-closed). An allow (remembered or fresh) names this exact host:port as the deciding
         // rule so the SSRF guard permits a deliberately-approved internal target.
-        Decision::Ask => {
-            match ctx.manual.decide(&connect_host, port, &itarget) {
-                Some(true) => Some(allowlist::host_port_rule(&connect_host, port)),
-                Some(false) => return respond_refusal_tls(
+        Decision::Ask => match ctx.manual.decide(&connect_host, port, &itarget) {
+            Some(true) => Some(allowlist::host_port_rule(&connect_host, port)),
+            Some(false) => {
+                ctx.record(&connect_host, StatKind::Deny);
+                return respond_refusal_tls(
                     &mut br,
                     "403 Forbidden",
                     "asked-denied",
-                    "this host:port was denied by a live `ops net pending deny --session` decision",
-                ),
-                None => {
-                    let verdict = ctx.pending.park(
+                    "this host:port was denied by a live `ops net pending deny --session` \
+                         decision",
+                );
+            }
+            None => {
+                let verdict = ctx.pending.park(
                     &connect_host,
                     port,
                     &itarget,
@@ -814,20 +845,23 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
                         }
                     },
                 );
-                    match verdict {
-                        super::control::Verdict::Allow => {
-                            Some(allowlist::host_port_rule(&connect_host, port))
-                        }
-                        super::control::Verdict::Deny => return respond_refusal_tls(
+                match verdict {
+                    super::control::Verdict::Allow => {
+                        Some(allowlist::host_port_rule(&connect_host, port))
+                    }
+                    super::control::Verdict::Deny => {
+                        ctx.record(&connect_host, StatKind::Deny);
+                        return respond_refusal_tls(
                             &mut br,
                             "403 Forbidden",
                             "asked-denied",
-                            "this request was denied by a live decision or the ask timeout elapsed",
-                        ),
+                            "this request was denied by a live decision or the ask timeout \
+                                 elapsed",
+                        );
                     }
                 }
             }
-        }
+        },
     };
 
     // 6. Resolve host-side, then the SSRF guard. A resolution failure for an allowed host is a
@@ -848,6 +882,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         .into_iter()
         .find(|ip| ip_permitted(*ip, &connect_host, deciding.as_ref()))
     else {
+        ctx.record(&connect_host, StatKind::Blocked);
         return respond_refusal_tls(
             &mut br,
             "403 Forbidden",
@@ -885,6 +920,11 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
             )
         }
     };
+
+    // The request is permitted and the upstream is up — it will now egress. Record the one `allow`
+    // outcome here (a single count per request: a refusal above already returned, and the steps
+    // below are I/O, not policy verdicts, so this is the sole place a forwarded request is counted).
+    ctx.record(&connect_host, StatKind::Allow);
 
     // 8. Inject any matching host-scoped credentials. This runs *after* the verdict, so a
     //    denied request never receives a secret, and is keyed on the already-verified
@@ -1597,10 +1637,17 @@ mod tests {
         );
         // allow the host on any port (the upstream's ephemeral port); resolve it to loopback —
         // permitted only because the deciding rule names this exact host (the explicit-internal case)
+        let sdir = TmpDir::new();
+        let stats = Arc::new(crate::sandbox::egress_stats::EgressStats::new(
+            sdir.join("stats"),
+            "/t".into(),
+            None,
+        ));
         let ctx = Arc::new(
             ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
                 .unwrap()
                 .with_upstream(upstream_cfg)
+                .with_stats(stats.clone())
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
 
@@ -1621,6 +1668,13 @@ mod tests {
         assert!(
             resp.contains("hello"),
             "the body was not streamed back: {resp:?}"
+        );
+        // A forwarded request lands in the `allow` bucket (the one bucket counted only after the
+        // upstream connects — the refusal buckets are pinned in `each_refusal_site_records_…`).
+        assert_eq!(
+            stats.snapshot()["upstream.test"].allow,
+            1,
+            "an egressed request must record one allow"
         );
     }
 
@@ -1717,6 +1771,12 @@ mod tests {
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
         let state = Arc::new(PendingState::new());
+        let sdir = TmpDir::new();
+        let stats = Arc::new(crate::sandbox::egress_stats::EgressStats::new(
+            sdir.join("stats"),
+            "/t".into(),
+            None,
+        ));
         let ctx = Arc::new(
             ProxyCtx::new(
                 proxy_ca,
@@ -1726,6 +1786,7 @@ mod tests {
             .with_resolver(Box::new(|_| {
                 panic!("resolve must not run for a denied ask")
             }))
+            .with_stats(stats.clone())
             .with_pending_silent(state.clone()),
         );
         let answerer = {
@@ -1745,6 +1806,12 @@ mod tests {
         assert!(
             resp.contains("403") && resp.contains("asked-denied"),
             "a denied ask must get 403 asked-denied: {resp:?}"
+        );
+        // The parked-then-denied site records a deny (the sibling of the manual-deny site).
+        assert_eq!(
+            stats.snapshot()["ask.test"].deny,
+            1,
+            "a parked-and-denied request must record one deny"
         );
     }
 
@@ -2556,6 +2623,262 @@ mod tests {
             resp.contains("403") && resp.contains("outbound-secret"),
             "a secret in the request URL must be refused: {resp:?}"
         );
+    }
+
+    /// The stats classification: each refusal site records exactly the bucket its column means —
+    /// `deny` for a rule / `ask` decision, `blocked` for a security guard. A mis-bucketed guard (an
+    /// SSRF counted as a deny, say) would pass every other green test, so each of the seven refusal
+    /// sites is pinned here. The `allow` site (counted only after a real upstream connects) is pinned
+    /// in the happy-path test and the live allowlist e2e. The counter is keyed on the CONNECT host.
+    #[test]
+    fn each_refusal_site_records_its_stat_bucket() {
+        use crate::allowlist::DefaultAction;
+        use crate::sandbox::control::{ManualRules, Verdict};
+        use crate::sandbox::egress_stats::{Counts, EgressStats};
+
+        let dir = TmpDir::new();
+        let seq = std::sync::atomic::AtomicU32::new(0);
+        let fresh = || {
+            let i = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The file lives in the temp dir; the assertions read the in-memory snapshot.
+            Arc::new(EgressStats::new(
+                dir.join(&format!("stats-{i}")),
+                "/t".into(),
+                None,
+            ))
+        };
+        // The recorded count for `host` (a missing host is the zero counts).
+        let count =
+            |s: &Arc<EgressStats>, host: &str| s.snapshot().get(host).copied().unwrap_or_default();
+
+        // denied-default → deny. No allow rule matches; the resolver must never run.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, policy(&["allowed.test:*"]))
+                    .unwrap()
+                    .with_stats(s.clone())
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run for a denied host")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "denied.test",
+                "denied.test",
+                8443,
+                b"GET / HTTP/1.1\r\nHost: denied.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("denied-default"), "{resp:?}");
+            assert_eq!(
+                count(&s, "denied.test"),
+                Counts {
+                    deny: 1,
+                    ..Default::default()
+                }
+            );
+        }
+
+        // denied-by-rule → deny. A deny rule matches before any resolve.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let denylist = EgressPolicy::new(vec![], vec![classify("evil.test:*").unwrap()])
+                .with_default(DefaultAction::Allow);
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, denylist)
+                    .unwrap()
+                    .with_stats(s.clone())
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run for a deny-rule host")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "evil.test",
+                "evil.test",
+                8443,
+                b"GET / HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("denied-by-rule"), "{resp:?}");
+            assert_eq!(
+                count(&s, "evil.test"),
+                Counts {
+                    deny: 1,
+                    ..Default::default()
+                }
+            );
+        }
+
+        // asked-denied (a remembered manual deny) → deny.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let manual = Arc::new(ManualRules::new());
+            manual.remember(Verdict::Deny, "blocked.test", 443);
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, EgressPolicy::default().with_default(DefaultAction::Ask))
+                    .unwrap()
+                    .with_stats(s.clone())
+                    .with_manual(manual)
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run for a manual deny")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "blocked.test",
+                "blocked.test",
+                443,
+                b"GET / HTTP/1.1\r\nHost: blocked.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("asked-denied"), "{resp:?}");
+            assert_eq!(
+                count(&s, "blocked.test"),
+                Counts {
+                    deny: 1,
+                    ..Default::default()
+                }
+            );
+        }
+
+        // sni-mismatch (domain-fronting) → blocked.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, policy(&["allowed.test:*", "evil.test:*"]))
+                    .unwrap()
+                    .with_stats(s.clone())
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run on a fronting attempt")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "allowed.test",
+                "evil.test",
+                8443,
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("host-mismatch"), "{resp:?}");
+            assert_eq!(
+                count(&s, "allowed.test"),
+                Counts {
+                    blocked: 1,
+                    ..Default::default()
+                }
+            );
+        }
+
+        // host-header-mismatch (SNI matches, decrypted Host disagrees) → blocked.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, policy(&["allowed.test:*"]))
+                    .unwrap()
+                    .with_stats(s.clone())
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run on a host mismatch")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "allowed.test",
+                "allowed.test",
+                8443,
+                b"GET / HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("host-mismatch"), "{resp:?}");
+            assert_eq!(
+                count(&s, "allowed.test"),
+                Counts {
+                    blocked: 1,
+                    ..Default::default()
+                }
+            );
+        }
+
+        // outbound-secret (a configured value echoed in the head) → blocked.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, policy(&["host.test:*"]))
+                    .unwrap()
+                    .with_stats(s.clone())
+                    .with_redactions(vec![SecretNeedle::new(b"s3cret-reflected-value".to_vec())])
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run on a secret leak")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "host.test",
+                "host.test",
+                8443,
+                b"GET / HTTP/1.1\r\nHost: host.test\r\nX-Leak: s3cret-reflected-value\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("outbound-secret"), "{resp:?}");
+            assert_eq!(
+                count(&s, "host.test"),
+                Counts {
+                    blocked: 1,
+                    ..Default::default()
+                }
+            );
+        }
+
+        // ssrf-blocked (an allowed host resolving to a metadata address) → blocked.
+        {
+            let s = fresh();
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, policy(&["host.test:*"]))
+                    .unwrap()
+                    .with_stats(s.clone())
+                    // the cloud metadata address — always refused, even for an exact-host rule
+                    .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+            );
+            let resp = through_proxy(
+                ctx,
+                der,
+                "host.test",
+                "host.test",
+                8443,
+                b"GET / HTTP/1.1\r\nHost: host.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            assert!(resp.contains("ssrf-blocked"), "{resp:?}");
+            assert_eq!(
+                count(&s, "host.test"),
+                Counts {
+                    blocked: 1,
+                    ..Default::default()
+                }
+            );
+        }
     }
 
     /// Like [`run_with_injections`] but also carrying redaction needles, to a capturing upstream —

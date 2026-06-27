@@ -547,6 +547,97 @@ fn net_pending_all_rejects_save_and_a_stray_id_or_scope() {
 }
 
 #[test]
+fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
+    // Hand-author session stat files keyed by this project's canonical path (the header
+    // `egress::start` writes), then prove `ops net stats` sums them for the project, scopes to an
+    // app, carries the counts in `--json`, and `--reset` clears only this project's files.
+    let fx = Fixture::new();
+    let egress = fx.data_home.path().join("ops").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let proj = fx.proj.path().canonicalize().unwrap();
+    let proj = proj.display().to_string();
+
+    // Two sessions of this project (one tagged `app=demo`), one of an unrelated project.
+    std::fs::write(
+        egress.join("stats-1"),
+        format!("project={proj}\ncache.nixos.org\t10\t0\t0\nevil.test\t0\t3\t1\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        egress.join("stats-2"),
+        format!("project={proj}\napp=demo\ncache.nixos.org\t5\t0\t0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        egress.join("stats-3"),
+        "project=/somewhere/else\nother.test\t99\t0\t0\n",
+    )
+    .unwrap();
+
+    // Project-wide table: the two sessions sum, the other project is excluded.
+    let out = fx.run(&["net", "stats"]);
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("ALLOW") && s.contains("DENY") && s.contains("BLOCKED"),
+        "{s}"
+    );
+    assert!(
+        s.contains("cache.nixos.org") && s.contains("evil.test"),
+        "{s}"
+    );
+    assert!(
+        !s.contains("other.test"),
+        "another project's hosts must not appear:\n{s}"
+    );
+
+    // `--json` carries exact counts: cache.nixos.org allow = 10 + 5 = 15.
+    let out = fx.run(&["net", "stats", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let cache = v["stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["host"] == "cache.nixos.org")
+        .expect("cache.nixos.org row");
+    assert_eq!(cache["allow"], 15);
+    let evil = v["stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["host"] == "evil.test")
+        .expect("evil.test row");
+    assert_eq!(evil["deny"], 3);
+    assert_eq!(evil["blocked"], 1);
+
+    // `--app demo`: only the tagged session (allow 5), the untagged session's evil.test is gone.
+    let out = fx.run(&["net", "stats", "--app", "demo", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["stats"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the app session's host: {rows:?}");
+    assert_eq!(rows[0]["host"], "cache.nixos.org");
+    assert_eq!(rows[0]["allow"], 5);
+
+    // `--reset` clears this project's two files; the unrelated project's file is untouched.
+    let out = fx.run(&["net", "stats", "--reset"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("reset 2"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!egress.join("stats-1").exists() && !egress.join("stats-2").exists());
+    assert!(
+        egress.join("stats-3").exists(),
+        "another project's file must survive --reset"
+    );
+}
+
+#[test]
 fn net_pending_all_drains_a_live_session_through_the_socket() {
     // The headline non-empty drain, proven end to end through the real binary — no cage needed, since
     // the control plane is just a bound Unix socket + a server thread (the same seam the in-process

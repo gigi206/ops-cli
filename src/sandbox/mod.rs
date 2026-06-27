@@ -11,6 +11,7 @@ mod binds;
 pub(crate) mod cgroup;
 pub(crate) mod control;
 pub(crate) mod egress;
+pub(crate) mod egress_stats;
 mod fhs;
 mod flake;
 mod fonts;
@@ -28,6 +29,7 @@ mod seccomp;
 mod smoke;
 mod spec;
 
+pub(crate) use binds::project_identity;
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use flake::{
     pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,

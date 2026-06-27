@@ -2886,18 +2886,21 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
 }
 
 /// `ops net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
-/// rules (optionally for one app), `allow`/`deny` persist a rule to a config file, and `pending`
-/// drives the live `ask`-posture control plane. Distinct from `ops test net <url>` (the URL
-/// matcher): `net` is the listing/management surface.
+/// rules (optionally for one app), `allow`/`deny` persist a rule to a config file, `pending`
+/// drives the live `ask`-posture control plane, and `stats` reports the per-host allow/deny/blocked
+/// decision counters a launch recorded. Distinct from `ops test net <url>` (the URL matcher): `net`
+/// is the listing/management surface.
 fn net_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("rules") => net_rules(&args[1..]),
         Some("allow") => net_add_rule(config::manage::EgressList::Allow, &args[1..]),
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
         Some("pending") => net_pending(&args[1..]),
+        Some("stats") => net_stats(&args[1..]),
         Some(other) => {
             eprintln!(
-                "ops: unknown `net` subcommand '{other}' (known: rules, allow, deny, pending)"
+                "ops: unknown `net` subcommand '{other}' (known: rules, allow, deny, pending, \
+                 stats)"
             );
             ExitCode::from(2)
         }
@@ -3259,6 +3262,145 @@ fn render_drain(
     }
     if session {
         let _ = writeln!(o, "  {dim}(remembered for each session — not re-asked){r}");
+    }
+    o
+}
+
+/// `ops net stats [--app <name>] [--reset] [--json]`: report the per-host egress decision counters a
+/// project's launches recorded — how often each destination was allowed, denied by a rule, or
+/// stopped by a security guard (SSRF, an outbound-secret tripwire, a domain-fronting mismatch).
+/// Read-only and host-side: it aggregates the session files under `<data>/egress`, with no launch,
+/// nix, or network. `--reset` clears this project's recorded files instead.
+fn net_stats(args: &[OsString]) -> ExitCode {
+    let mut app: Option<String> = None;
+    let mut reset = false;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            Some("--reset") => reset = true,
+            Some("--app") | Some("-a") => {
+                let Some(v) = it.next().and_then(|a| a.to_str()) else {
+                    eprintln!("ops: net stats: `--app` needs an app name");
+                    return ExitCode::from(2);
+                };
+                app = Some(v.to_string());
+            }
+            _ => {
+                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "stats"]));
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // `--reset` reports how many files it cleared; pairing it with `--json` is meaningless — flag it
+    // rather than silently pick one.
+    if reset && json {
+        eprintln!("ops: net stats: `--reset` does not combine with `--json`");
+        return ExitCode::from(2);
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The canonical project identity is exactly what `egress::start` writes into each session file's
+    // `project=` header, so a read here matches what a launch recorded — no canonicalization drift.
+    let project = match sandbox::project_identity(&cwd) {
+        Ok((_, canon)) => canon.display().to_string(),
+        Err(e) => {
+            eprintln!("ops: cannot resolve the project directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let egress_dir = match egress_data_dir() {
+        Ok(d) => d.join("egress"),
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if reset {
+        let n = sandbox::egress_stats::reset(&egress_dir, &project, app.as_deref());
+        let scope = app
+            .as_ref()
+            .map(|a| format!(" for app {a}"))
+            .unwrap_or_default();
+        println!("reset {n} egress stat file(s){scope}");
+        return ExitCode::SUCCESS;
+    }
+
+    let counts = sandbox::egress_stats::aggregate(&egress_dir, &project, app.as_deref());
+    if json {
+        let rows: Vec<_> = counts
+            .iter()
+            .map(|(host, c)| {
+                serde_json::json!({
+                    "host": host,
+                    "allow": c.allow,
+                    "deny": c.deny,
+                    "blocked": c.blocked,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "project": project, "app": app, "stats": rows })
+        );
+        return ExitCode::SUCCESS;
+    }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_stats(&project, app.as_deref(), &counts, &pal));
+    ExitCode::SUCCESS
+}
+
+/// Render the per-host egress stats table — a pure presenter (its colored layout is asserted in a
+/// test): a project/app header, then one row per destination with its allow/deny/blocked counts,
+/// busiest first (ties broken by host for stable output). An empty result says nothing has been
+/// recorded yet and when recording happens.
+fn render_stats(
+    project: &str,
+    app: Option<&str>,
+    counts: &std::collections::BTreeMap<String, sandbox::egress_stats::Counts>,
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    let scope = app.map(|a| format!(" · app {a}")).unwrap_or_default();
+    let _ = writeln!(o, "{h}egress stats{r} {dim}({project}{scope}){r}");
+    if counts.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {dim}nothing recorded yet \
+             (stats accrue while a filtering posture — allowlist/ask — runs){r}"
+        );
+        return o;
+    }
+    // Busiest host first; ties by host name so the order is stable run to run.
+    let mut rows: Vec<(&String, &sandbox::egress_stats::Counts)> = counts.iter().collect();
+    rows.sort_by(|(ha, a), (hb, b)| b.total().cmp(&a.total()).then(ha.cmp(hb)));
+    let host_w = rows
+        .iter()
+        .map(|(host, _)| host.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let _ = writeln!(
+        o,
+        "  {dim}{:<host_w$}  {:>6}  {:>6}  {:>7}{r}",
+        "HOST", "ALLOW", "DENY", "BLOCKED"
+    );
+    for (host, c) in rows {
+        let _ = writeln!(
+            o,
+            "  {n}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
+            host, c.allow, c.deny, c.blocked
+        );
     }
     o
 }
@@ -5363,6 +5505,52 @@ mod tests {
         let out = render_drain("denied", false, &answered, &context, &p);
         assert!(out.contains("denied 3 parked request(s)"), "{out}");
         assert!(!out.contains("remembered for each session"), "{out}");
+    }
+
+    #[test]
+    fn render_stats_tabulates_hosts_busiest_first() {
+        use sandbox::egress_stats::Counts;
+        let p = style::Palette::plain();
+
+        // Empty → the project header plus the "nothing recorded yet" line.
+        let empty = std::collections::BTreeMap::new();
+        let out = render_stats("/home/u/proj", None, &empty, &p);
+        assert!(
+            out.contains("/home/u/proj") && out.contains("nothing recorded yet"),
+            "{out}"
+        );
+
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert(
+            "quiet.test".to_string(),
+            Counts {
+                allow: 1,
+                deny: 0,
+                blocked: 0,
+            },
+        );
+        counts.insert(
+            "busy.test".to_string(),
+            Counts {
+                allow: 40,
+                deny: 2,
+                blocked: 1,
+            },
+        );
+        let out = render_stats("/home/u/proj", Some("demo"), &counts, &p);
+        // The app scope is shown in the header, and the columns are present.
+        assert!(out.contains("app demo"), "{out}");
+        assert!(
+            out.contains("HOST")
+                && out.contains("ALLOW")
+                && out.contains("DENY")
+                && out.contains("BLOCKED"),
+            "{out}"
+        );
+        // Busiest host first: busy.test (total 43) precedes quiet.test (total 1).
+        let busy = out.find("busy.test").unwrap();
+        let quiet = out.find("quiet.test").unwrap();
+        assert!(busy < quiet, "busiest host must sort first:\n{out}");
     }
 
     #[test]

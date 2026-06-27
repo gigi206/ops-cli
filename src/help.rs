@@ -131,7 +131,8 @@ const PAGES: &[Page] = &[
         details:
             "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
             `allow`/`deny <rule>` persist a rule to config; `pending` lists and answers requests\n\
-            parked by the `ask` posture. Host-side — no launch, no nix. (Distinct from `ops test\n\
+            parked by the `ask` posture; `stats` reports the per-host allow/deny/blocked decision\n\
+            counters launches recorded. Host-side — no launch, no nix. (Distinct from `ops test\n\
             net <url>`, which tests one URL against the policy.)",
     },
     Page {
@@ -614,6 +615,24 @@ const PAGES: &[Page] = &[
             `--all` instead drains every request parked across every reachable session at once — a\n\
             point-in-time bulk deny (one parked after the drain still waits), reported per session.\n\
             It composes with `--session` but not `--save` (save a per-host rule by id).",
+    },
+    Page {
+        path: &["net", "stats"],
+        synopsis: "ops net stats [-a|--app <name>] [--reset] [--json]",
+        summary: "per-host egress decision counters (allow / deny / blocked)",
+        options: &[
+            ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
+            ("--reset", "clear this project's recorded stat files instead of showing them"),
+            ("--json", "emit the counters as JSON"),
+        ],
+        details:
+            "Reports, per destination host, how many requests this project's launches allowed,\n\
+            denied by a rule (or an `ask` decision), or had blocked by a security guard — SSRF, an\n\
+            outbound-secret tripwire, or a domain-fronting host mismatch. Each request is counted\n\
+            once. Counters accrue while a filtering posture (allowlist / ask) runs and persist after\n\
+            the session; they are owner-only under the data dir. Transport/protocol failures (DNS, an\n\
+            unreachable upstream, a malformed request) are not a policy verdict and are not counted.\n\
+            Host-side and read-only — no launch, no nix, no network.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

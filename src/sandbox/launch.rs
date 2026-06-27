@@ -1659,12 +1659,19 @@ fn build(
     let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut egress_env: Vec<(String, String)> = Vec::new();
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
+        // An `ops app <name>` launch tags its egress stats with the app, so `ops net stats --app`
+        // can scope to it; a plain `run`/`shell` records under the project with no app tag.
+        let app = match &runtime {
+            binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => Some(*name),
+            binds::Runtime::ProjectDefault => None,
+        };
         let (guard, wiring) = egress::start(
             &prep.layout,
             policy.clone(),
             &prep.cfg.secrets,
             &prep.cwd,
             &prep.bwrap,
+            app,
         )
         .map_err(|e| {
             eprintln!("ops: cannot start the egress filtering proxy: {e}");

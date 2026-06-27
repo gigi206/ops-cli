@@ -96,6 +96,8 @@ fn captured_output_carries_no_ansi_escapes() {
         // The bulk-drain presenter (`--all`) — a no-op with no live session, but it must still build
         // its "no pending requests" line from the captured-stream palette.
         &["net", "pending", "allow", "--all"],
+        // The egress-stats table (empty here) — its header + "nothing recorded" line must be plain.
+        &["net", "stats"],
         &["trust", "--show"],
         &["trust", ".ops.toml"],
         &["untrust", ".ops.toml"],
