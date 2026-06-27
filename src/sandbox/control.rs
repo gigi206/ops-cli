@@ -159,6 +159,25 @@ impl PendingState {
         let _ = entry.answer.send(verdict);
         Some((entry.host, entry.port))
     }
+
+    /// Answer *every* currently-parked request with `verdict`: drain the queue under one lock, wake
+    /// each proxy thread, and return the `(host, port)` of each, oldest id first (the `BTreeMap`
+    /// orders by sequence). A point-in-time drain — a request that parks after this returns is not
+    /// affected. The lock is released before the sends, so a woken `park` thread's idempotent
+    /// self-`remove` does not contend (the entry is already gone — taken with the rest of the map).
+    pub(crate) fn answer_all(&self, verdict: Verdict) -> Vec<(String, u16)> {
+        let entries = {
+            let mut inner = self.inner.lock().unwrap();
+            std::mem::take(&mut inner.entries)
+        };
+        entries
+            .into_values()
+            .map(|e| {
+                let _ = e.answer.send(verdict);
+                (e.host, e.port)
+            })
+            .collect()
+    }
 }
 
 /// The live, per-session manual egress rules a user adds while answering with `--session`: a runtime
@@ -265,10 +284,12 @@ fn handle(stream: UnixStream, state: &PendingState, manual: &ManualRules) -> io:
 
 /// Map a control command to its response. `LIST` returns one `pending …` line per parked request
 /// then `ok`; `ALLOW <seq>`/`DENY <seq>` answer one request (a trailing `session` token also
-/// remembers it as a manual rule), replying `ok host=<host>` or `err not-found`; `RULES` returns the
-/// session's manual rules (`manual allow|deny <rule>` lines) then `ok`. `path` is emitted last on a
-/// `pending` line so a query string's `=` cannot be mistaken for a field separator (the reader
-/// splits each token on its first `=`).
+/// remembers it as a manual rule), replying `ok host=<host>` or `err not-found`; `ALLOW *`/`DENY *`
+/// drain *every* parked request, replying one `answered host=<host>` line each then `ok` (the
+/// `session` token remembers each); `RULES` returns the session's manual rules
+/// (`manual allow|deny <rule>` lines) then `ok`. `path` is emitted last on a `pending` line so a
+/// query string's `=` cannot be mistaken for a field separator (the reader splits each token on its
+/// first `=`).
 fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
@@ -284,15 +305,32 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules) -> String {
             out
         }
         Some(verb @ ("ALLOW" | "DENY")) => {
-            let Some(seq) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
-                return "err bad-request\n".to_string();
-            };
-            // A trailing `session` token means: also remember this decision as a live manual rule.
-            let remember = parts.next() == Some("session");
             let verdict = if verb == "ALLOW" {
                 Verdict::Allow
             } else {
                 Verdict::Deny
+            };
+            // The target is a seq, or `*` for every parked request (a bulk drain). A trailing
+            // `session` token (after either) also remembers each decision as a live manual rule.
+            let Some(target) = parts.next() else {
+                return "err bad-request\n".to_string();
+            };
+            let remember = parts.next() == Some("session");
+            if target == "*" {
+                // Drain framing mirrors `LIST`: one `answered host=…` line per request, then `ok`.
+                // An empty queue is a clean `ok` (nothing to answer is not an error).
+                let mut out = String::new();
+                for (host, port) in state.answer_all(verdict) {
+                    if remember {
+                        manual.remember(verdict, &host, port);
+                    }
+                    out.push_str(&format!("answered host={host}\n"));
+                }
+                out.push_str("ok\n");
+                return out;
+            }
+            let Some(seq) = target.parse::<u64>().ok() else {
+                return "err bad-request\n".to_string();
             };
             match state.answer(seq, verdict) {
                 Some((host, port)) => {
@@ -357,20 +395,29 @@ pub(crate) fn parse_id(id: &str) -> Option<(u32, u64)> {
 /// are returned ordered by pid for stable output.
 pub(crate) fn list_all(data_dir: &Path) -> Vec<SessionPending> {
     let mut sessions = Vec::new();
+    for pid in session_pids(data_dir) {
+        if let Ok(rows) = query(&control_socket(data_dir, pid)) {
+            sessions.push(SessionPending { pid, rows });
+        }
+    }
+    sessions
+}
+
+/// The pids of every session that has a control socket present, sorted for stable output. A superset
+/// of the still-live sessions: a stale socket from a crashed launch is included, but a connect to it
+/// (a `query` or a [`drain_session`]) simply fails and the caller skips it. This is the authoritative
+/// pid source (the socket glob), distinct from the session registry — a launch may have a control
+/// socket before, or without, a registry record.
+pub(crate) fn session_pids(data_dir: &Path) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(control_dir(data_dir)) else {
-        return sessions;
+        return Vec::new();
     };
     let mut pids: Vec<u32> = entries
         .flatten()
         .filter_map(|e| pid_from_socket(&e.file_name().to_string_lossy()))
         .collect();
     pids.sort_unstable();
-    for pid in pids {
-        if let Ok(rows) = query(&control_socket(data_dir, pid)) {
-            sessions.push(SessionPending { pid, rows });
-        }
-    }
-    sessions
+    pids
 }
 
 /// Extract the pid from a `control-<pid>.sock` filename.
@@ -476,6 +523,43 @@ pub(crate) fn answer_request(
         // "err not-found" / "err bad-request" / anything unexpected → not answered.
         Ok(AnswerOutcome::NotFound)
     }
+}
+
+/// Drain *every* parked request in one session (`ALLOW *`/`DENY *`): connect, send the bulk verdict,
+/// and collect the hosts it answered (oldest first). With `remember`, the trailing `session` token
+/// also records each as a live manual rule. An empty queue is an empty `Ok(vec)`; a connect error
+/// (the session is gone, or a stale socket) propagates so the caller skips that session.
+pub(crate) fn drain_session(
+    data_dir: &Path,
+    pid: u32,
+    verdict: Verdict,
+    remember: bool,
+) -> io::Result<Vec<String>> {
+    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let verb = match verdict {
+        Verdict::Allow => "ALLOW",
+        Verdict::Deny => "DENY",
+    };
+    let cmd = if remember {
+        format!("{verb} * session\n")
+    } else {
+        format!("{verb} *\n")
+    };
+    (&stream).write_all(cmd.as_bytes())?;
+    (&stream).flush()?;
+    let mut hosts = Vec::new();
+    for line in BufReader::new(&stream).lines() {
+        let line = line?;
+        if line == "ok" {
+            break;
+        }
+        if let Some(host) = line.strip_prefix("answered host=") {
+            hosts.push(host.to_string());
+        }
+    }
+    Ok(hosts)
 }
 
 /// One manual rule reported by a live session: whether it allows (vs denies) and its display text.
@@ -766,5 +850,127 @@ mod tests {
             assert!(Instant::now() < deadline, "no request was parked");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Block until at least `n` requests are parked (used by the bulk-drain tests).
+    fn wait_for_n(state: &PendingState, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.list().len() < n {
+            assert!(Instant::now() < deadline, "fewer than {n} requests parked");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Spawn one parked request and block until it is enqueued (its seq assigned). Parking one at a
+    /// time makes the per-host seq order deterministic — each `park` grabs the lock and increments
+    /// the counter before the next is spawned — so a test can assert the oldest-first drain order.
+    fn park_next(
+        state: &Arc<PendingState>,
+        host: &'static str,
+        port: u16,
+        already: usize,
+    ) -> thread::JoinHandle<Verdict> {
+        let s = state.clone();
+        let handle = thread::spawn(move || s.park(host, port, "/", None, 256, |_| {}));
+        wait_for_n(state, already + 1);
+        handle
+    }
+
+    #[test]
+    fn answer_all_drains_every_parked_request_oldest_first() {
+        let state = Arc::new(PendingState::new());
+        // Park three requests one at a time, so their seqs are 1,2,3 in this order.
+        let parked: Vec<_> = ["a.test", "b.test", "c.test"]
+            .iter()
+            .enumerate()
+            .map(|(i, host)| park_next(&state, host, 443, i))
+            .collect();
+
+        // One drain answers all three, oldest id first (so the parking order is preserved).
+        let answered = state.answer_all(Verdict::Allow);
+        assert_eq!(
+            answered,
+            vec![
+                ("a.test".to_string(), 443),
+                ("b.test".to_string(), 443),
+                ("c.test".to_string(), 443),
+            ]
+        );
+        for p in parked {
+            assert_eq!(p.join().unwrap(), Verdict::Allow);
+        }
+        assert!(state.list().is_empty(), "the queue is fully drained");
+        // A second drain on the empty queue answers nothing (clean, not an error).
+        assert!(state.answer_all(Verdict::Deny).is_empty());
+    }
+
+    #[test]
+    fn dispatch_star_drains_all_and_remembers_only_with_session() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+
+        // A bare `DENY *` drains every request but remembers nothing. Parked one at a time so the
+        // response lines come back in a deterministic oldest-first order.
+        let _ = park_next(&state, "x.test", 8080, 0);
+        let _ = park_next(&state, "y.test", 8080, 1);
+        let response = dispatch("DENY *", &state, &manual);
+        assert_eq!(response, "answered host=x.test\nanswered host=y.test\nok\n");
+        assert!(
+            manual.snapshot().1.is_empty(),
+            "a bare `DENY *` must not remember"
+        );
+
+        // `ALLOW * session` drains and remembers each host:port as a manual rule.
+        let _ = park_next(&state, "p.test", 8080, 0);
+        let _ = park_next(&state, "q.test", 8080, 1);
+        let _ = dispatch("ALLOW * session", &state, &manual);
+        let (allow, _) = manual.snapshot();
+        assert_eq!(allow.len(), 2, "`* session` remembers each answered host");
+
+        // An empty queue replies a clean `ok` with no `answered` lines.
+        assert_eq!(dispatch("ALLOW *", &state, &manual), "ok\n");
+    }
+
+    #[test]
+    fn drain_session_round_trips_over_the_socket() {
+        // The integration seam for the bulk drain: the client `drain_session` against a real `serve`.
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 22222u32;
+        let socket = control_socket(data.path(), pid);
+
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let listener = UnixListener::bind(&socket).unwrap();
+        {
+            let pending = pending.clone();
+            let manual = manual.clone();
+            thread::spawn(move || {
+                let _ = serve(listener, pending, manual);
+            });
+        }
+
+        // Parked one at a time so the drained order is deterministic (seqs 1 then 2).
+        let parked = vec![
+            park_next(&pending, "one.test", 8080, 0),
+            park_next(&pending, "two.test", 8080, 1),
+        ];
+
+        // Drain ALLOW with `--session` (remember) over the real socket.
+        let hosts = drain_session(data.path(), pid, Verdict::Allow, true).unwrap();
+        assert_eq!(hosts, vec!["one.test".to_string(), "two.test".to_string()]);
+        for p in parked {
+            assert_eq!(p.join().unwrap(), Verdict::Allow);
+        }
+        // Each answered host:port round-trips back as a remembered manual rule.
+        let rules = query_manual(data.path(), pid).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().all(|r| r.is_allow));
+
+        // A drain on the now-empty queue is a clean empty result.
+        assert!(drain_session(data.path(), pid, Verdict::Allow, false)
+            .unwrap()
+            .is_empty());
     }
 }

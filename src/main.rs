@@ -3046,6 +3046,10 @@ fn render_pending(
         o,
         "  {dim}answer: ops net pending allow <id> [--save --local|--global|--app <name>]{r}"
     );
+    let _ = writeln!(
+        o,
+        "  {dim}        ops net pending allow|deny --all  (drain every parked request at once){r}"
+    );
     o
 }
 
@@ -3059,17 +3063,46 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         sandbox::control::Verdict::Allow => "allow",
         sandbox::control::Verdict::Deny => "deny",
     };
-    // `--save` and `--session` are extracted before `split_scope`, which rejects any flag it does
-    // not know. The id is the lone positional; the scope flags (--local/--global/--app) ride
+    // `--all`, `--save` and `--session` are extracted before `split_scope`, which rejects any flag
+    // it does not know. The id is the lone positional; the scope flags (--local/--global/--app) ride
     // `split_scope` and apply only with `--save`. `--session` remembers the decision for the live
     // session (no config write); the two combine.
+    let all = args.iter().any(|a| a.to_str() == Some("--all"));
     let save = args.iter().any(|a| a.to_str() == Some("--save"));
     let session = args.iter().any(|a| a.to_str() == Some("--session"));
     let rest: Vec<OsString> = args
         .iter()
-        .filter(|a| !matches!(a.to_str(), Some("--save") | Some("--session")))
+        .filter(|a| {
+            !matches!(
+                a.to_str(),
+                Some("--save") | Some("--session") | Some("--all")
+            )
+        })
         .cloned()
         .collect();
+
+    // `--all` drains every parked request across every reachable session — a bulk path with no id
+    // and no scope. `--save` is deliberately out of scope here (it would mean a per-host, per-project
+    // save fanned across sessions); rejected explicitly rather than silently dropped, so a user who
+    // expected persistence is told to save by id.
+    if all {
+        if save {
+            eprintln!(
+                "ops: `--save` does not combine with `--all` (that would save a rule per host \
+                 across every session); save by id, e.g. `ops net pending {verb} <id> --save`, or \
+                 set a rule / `[network] mode` for a permanent decision"
+            );
+            return ExitCode::from(2);
+        }
+        if !rest.is_empty() {
+            eprintln!(
+                "ops: `--all` answers every parked request and takes no id or scope \
+                 (only --session may accompany it)"
+            );
+            return ExitCode::from(2);
+        }
+        return net_pending_answer_all(verdict, session);
+    }
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
@@ -3153,6 +3186,81 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `ops net pending allow|deny --all [--session]`: drain every parked request across every reachable
+/// ask-mode session in one shot. A point-in-time bulk answer — a request that parks *after* the
+/// drain still waits. It reports per session what it answered, so a cross-agent grant (one keystroke
+/// can open egress for several agents at once) is visible rather than a silent aggregate count.
+/// `--session` remembers each answered host for its session. A session that vanished between the
+/// socket glob and the drain is skipped (best-effort, mirroring the listing).
+fn net_pending_answer_all(verdict: sandbox::control::Verdict, session: bool) -> ExitCode {
+    let past = match verdict {
+        sandbox::control::Verdict::Allow => "allowed",
+        sandbox::control::Verdict::Deny => "denied",
+    };
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let context = pending_session_context(&data_dir);
+    let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
+    for pid in sandbox::control::session_pids(&data_dir) {
+        match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
+            Ok(hosts) if !hosts.is_empty() => answered.push((pid, hosts)),
+            // An empty drain, or a dead/stale socket (the session went away) — nothing to report.
+            _ => {}
+        }
+    }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_drain(past, session, &answered, &context, &pal));
+    ExitCode::SUCCESS
+}
+
+/// Render a bulk `--all` drain: a per-session breakdown of the hosts it answered (so the user sees
+/// exactly what was granted/refused, across which agents), then a total. An empty drain says nothing
+/// was parked. A pure presenter — its palette comes from the caller (plain on a captured stream).
+fn render_drain(
+    past: &str,
+    session: bool,
+    answered: &[(u32, Vec<String>)],
+    context: &[(u32, PathBuf, String)],
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    let total: usize = answered.iter().map(|(_, hosts)| hosts.len()).sum();
+    if total == 0 {
+        let _ = writeln!(
+            o,
+            "{dim}no pending requests (nothing parked across any ask-mode session){r}"
+        );
+        return o;
+    }
+    let _ = writeln!(o, "{h}{past} {total} parked request(s):{r}");
+    for (pid, hosts) in answered {
+        // A per-session header from the registry, so with several agents the user can tell which one
+        // each grant belongs to — the cross-agent reach made visible, not silent.
+        match context.iter().find(|(p, _, _)| p == pid) {
+            Some((_, project, label)) => {
+                let _ = writeln!(o, "  {dim}session {pid} [{label}] {}{r}", project.display());
+            }
+            None => {
+                let _ = writeln!(o, "  {dim}session {pid} (unregistered){r}");
+            }
+        }
+        for host in hosts {
+            let _ = writeln!(o, "    {n}{host}{r}");
+        }
+    }
+    if session {
+        let _ = writeln!(o, "  {dim}(remembered for each session — not re-asked){r}");
+    }
+    o
 }
 
 /// `ops net rules [--source config|builtin] [--filter <substr>] [--json]`: list the effective
@@ -5209,6 +5317,52 @@ mod tests {
         );
         assert!(out.contains("session 67890 (unregistered)"), "{out}");
         assert!(out.contains("ops net pending allow <id>"), "{out}");
+        // The footer also advertises the bulk drain.
+        assert!(out.contains("ops net pending allow|deny --all"), "{out}");
+    }
+
+    #[test]
+    fn render_drain_reports_each_session_and_a_total() {
+        let p = style::Palette::plain();
+
+        // Empty drain → the "nothing parked" line, no total.
+        assert!(render_drain("allowed", false, &[], &[], &p).contains("no pending requests"));
+
+        let answered = vec![
+            (
+                12345u32,
+                vec!["api.example.com".to_string(), "cdn.example.com".to_string()],
+            ),
+            (67890u32, vec!["files.example.org".to_string()]),
+        ];
+        // Only the first session is registered, so the two headers render differently.
+        let context = vec![(
+            12345u32,
+            std::path::PathBuf::from("/home/u/proj"),
+            "app:demo".to_string(),
+        )];
+
+        let out = render_drain("allowed", true, &answered, &context, &p);
+        // The total counts every answered host across every session.
+        assert!(out.contains("allowed 3 parked request(s)"), "{out}");
+        // Each session is named (the cross-agent grant made visible), and each host listed.
+        assert!(
+            out.contains("session 12345 [app:demo] /home/u/proj"),
+            "{out}"
+        );
+        assert!(
+            out.contains("api.example.com") && out.contains("cdn.example.com"),
+            "{out}"
+        );
+        assert!(out.contains("session 67890 (unregistered)"), "{out}");
+        assert!(out.contains("files.example.org"), "{out}");
+        // `--session` adds the remembered-for-each note.
+        assert!(out.contains("remembered for each session"), "{out}");
+
+        // Without `--session`, no remembered note; "denied" past tense for a deny drain.
+        let out = render_drain("denied", false, &answered, &context, &p);
+        assert!(out.contains("denied 3 parked request(s)"), "{out}");
+        assert!(!out.contains("remembered for each session"), "{out}");
     }
 
     #[test]

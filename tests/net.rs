@@ -491,6 +491,118 @@ fn net_pending_answer_rejects_a_scope_without_save() {
     );
 }
 
+#[test]
+fn net_pending_all_drains_nothing_when_no_session_is_parked() {
+    let fx = Fixture::new();
+    // With no live session, `--all` is a clean no-op (exit 0), not an error — it answered nothing.
+    let out = fx.run(&["net", "pending", "allow", "--all"]);
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no pending requests"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // `deny --all` is symmetric.
+    let out = fx.run(&["net", "pending", "deny", "--all"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no pending requests"));
+}
+
+#[test]
+fn net_pending_all_rejects_save_and_a_stray_id_or_scope() {
+    let fx = Fixture::new();
+
+    // `--save` is deliberately not supported with `--all` (a per-host, per-project fan-out) — it is
+    // refused explicitly, pointing at saving by id, rather than silently ignored.
+    let out = fx.run(&["net", "pending", "allow", "--all", "--save"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not combine with `--all`"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A stray positional id alongside `--all` is a usage error (the two address different things).
+    let out = fx.run(&["net", "pending", "deny", "--all", "123.1"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("takes no id or scope"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A scope flag alongside `--all` (no save) is likewise refused.
+    let out = fx.run(&["net", "pending", "allow", "--all", "--global"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("takes no id or scope"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn net_pending_all_drains_a_live_session_through_the_socket() {
+    // The headline non-empty drain, proven end to end through the real binary — no cage needed, since
+    // the control plane is just a bound Unix socket + a server thread (the same seam the in-process
+    // round-trip test stands up). This closes the one path the unit tests cover only with synthetic
+    // data: the CLI's glob → drain → per-session render orchestration.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    // The control socket lives at <data>/egress/control-<pid>.sock, and <data> is $XDG_DATA_HOME/ops
+    // (the dir `fx.run` redirects). Binding it at the right place is itself the proof the path wiring
+    // is correct — a wrong path yields an empty drain ("no pending requests") and the assert fails.
+    let egress = fx.data_home.path().join("ops").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let pid = 33333u32; // not in the session registry → the `(unregistered)` header path
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    // A one-shot fake session: accept one connection, assert it is the bulk drain, answer two hosts.
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        assert!(
+            cmd.starts_with("ALLOW *"),
+            "the CLI must send a bulk drain, got: {cmd:?}"
+        );
+        (&stream)
+            .write_all(b"answered host=a.test\nanswered host=b.test\nok\n")
+            .unwrap();
+    });
+
+    let out = fx.run(&["net", "pending", "allow", "--all"]);
+    server.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The total over every session, both answered hosts, and the per-session breakdown (so the
+    // cross-agent reach is visible, not a silent count).
+    assert!(
+        stdout.contains("allowed 2 parked request(s)"),
+        "the drain total must be reported:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("a.test") && stdout.contains("b.test"),
+        "every answered host must be listed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("session {pid}")),
+        "the answering session must be named:\n{stdout}"
+    );
+}
+
 // ── `ops test net` enrichments: app targeting, launch fidelity, scheme-optional ─────────────────
 
 #[test]
