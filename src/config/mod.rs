@@ -472,6 +472,13 @@ pub(crate) struct Resolved {
     /// Which layer supplied the winning `network` posture (`Default` when neither config set it).
     /// A display affordance for `ops config`; the launcher ignores it.
     pub(crate) network_origin: Provenance,
+    /// Whether the egress proxy records its per-host decision counters (`ops net stats`). On by
+    /// default; a trusted layer's `[network] stats = false` turns the audit off. Gated like the
+    /// rest of `[network]` — an untrusted project's table (and so its `stats`) is dropped, so it
+    /// cannot disable the auditing of its own egress. Baseline-only: a `stats` key inside an
+    /// `[app.<name>.network]` table is ignored (warned), and `ops config show --app` does not surface
+    /// the inherited value — the app inherits this baseline.
+    pub(crate) egress_stats: bool,
     /// The resolved GUI posture: the default (`None`) unless the global config or a trusted
     /// project asked for `"wayland"`. An untrusted project's choice is dropped with a warning
     /// — it may not open a display.
@@ -652,6 +659,12 @@ fn resolve(
     // unset value falls back to the default (shared). The origin is recorded as `Global` only
     // when the layer actually supplied a valid posture, so a `Default` is never mistaken for one.
     let mut network_origin = Provenance::Default;
+    // The egress-stats toggle rides the `[network]` table (the global layer is trusted by location);
+    // extract it before the field moves into `validate_network`. Default on.
+    let mut egress_stats = true;
+    if let Some(b) = global.network.as_ref().and_then(network_stats_of) {
+        egress_stats = b;
+    }
     let mut network = match global
         .network
         .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v))
@@ -752,6 +765,12 @@ fn resolve(
         // an untrusted or changed one may not narrow or widen the network.
         if let Some(value) = proj.network {
             if trusted {
+                // The stats toggle rides the same trusted `[network]` table — honor it before the
+                // field moves into `validate_network`, so a trusted project may turn its own audit
+                // off (or back on). An untrusted project never reaches here, so it cannot.
+                if let Some(b) = network_stats_of(&value) {
+                    egress_stats = b;
+                }
                 if let Some(policy) = validate_network(&mut warnings, PROJECT_CONFIG, value) {
                     network = policy;
                     network_origin = Provenance::Project;
@@ -848,6 +867,7 @@ fn resolve(
         mise: None,
         network,
         network_origin,
+        egress_stats,
         gui,
         gui_origin,
         limits,
@@ -855,6 +875,29 @@ fn resolve(
         secrets,
         apps,
         warnings,
+    }
+}
+
+/// The egress-stats toggle a `network` field carries, or `None` if it does not mention it (the bare
+/// string form never does; only the `[network]` table's `stats =` key). Pulled out so the resolver
+/// can honor it from a trusted layer before the field is consumed by `validate_network`.
+fn network_stats_of(field: &NetworkField) -> Option<bool> {
+    match field {
+        NetworkField::Table(t) => t.stats,
+        NetworkField::Posture(_) => None,
+    }
+}
+
+/// Warn when an app's `[network]` table carries a `stats` toggle: the egress-stats switch is
+/// baseline-only (it applies to every launch), so an `[app.<name>.network] stats = …` is parsed but
+/// has no effect. Surfacing it (rather than silently dropping it) keeps a profile author from
+/// believing they disabled an agent's audit when they did not.
+fn warn_if_app_sets_stats(warnings: &mut Vec<String>, source: &str, field: &NetworkField) {
+    if network_stats_of(field).is_some() {
+        warnings.push(format!(
+            "{source}: ignoring `stats` under `[network]` — the egress-stats toggle is baseline-only; \
+             set `[network] stats` at the top level (it applies to every launch)"
+        ));
     }
 }
 
@@ -1110,6 +1153,7 @@ fn resolve_app(
             false,
         );
         if let Some(field) = app.network {
+            warn_if_app_sets_stats(&mut warnings, &source, &field);
             if let Some(policy) = validate_network(&mut warnings, &source, field) {
                 network = Some(policy);
                 network_origin = Provenance::Global;
@@ -1172,6 +1216,7 @@ fn resolve_app(
         );
         if let Some(field) = app.network {
             if trusted {
+                warn_if_app_sets_stats(&mut warnings, &source, &field);
                 if let Some(policy) = validate_network(&mut warnings, &source, field) {
                     network = Some(policy);
                     network_origin = Provenance::Project;
@@ -2891,6 +2936,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
+                stats: None,
             })),
             ..RawConfig::default()
         }
@@ -3167,6 +3213,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
+                stats: None,
             })
         };
 
@@ -3230,6 +3277,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: timeout.map(|s| s.to_string()),
+                stats: None,
             })
         };
         let mut w = Vec::new();
@@ -3263,6 +3311,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             ask_timeout: Some("90s".into()),
+            stats: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
@@ -4746,6 +4795,7 @@ mod tests {
                     allow: vec![],
                     deny: vec![],
                     ask_timeout: None,
+                    stats: None,
                 })),
                 ..RawConfig::default()
             },
@@ -4844,6 +4894,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
                 ask_timeout: None,
+                stats: None,
             })),
             secret: Some(raw_secret_section(secrets)),
             ..RawConfig::default()
@@ -4883,6 +4934,88 @@ mod tests {
     /// [`resolve`] with no installed plugins — the default for the layering tests.
     fn resolve_no_plugins(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resolved {
         super::resolve(global, project, &PluginRegistry::default())
+    }
+
+    #[test]
+    fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
+        // A `[network]` table carrying an explicit `stats` value.
+        let net = |stats: Option<bool>| RawConfig {
+            network: Some(NetworkField::Table(NetworkTable {
+                mode: "allowlist".into(),
+                allow: vec!["github.com".into()],
+                deny: vec![],
+                ask_timeout: None,
+                stats,
+            })),
+            ..RawConfig::default()
+        };
+
+        // Default: nothing set → recording is on.
+        assert!(resolve_no_plugins(RawConfig::default(), None).egress_stats);
+        // A bare-string posture carries no `stats` key → stays on.
+        assert!(resolve_no_plugins(raw_network("allowlist"), None).egress_stats);
+        // Global `stats = false` (trusted by location) → off.
+        assert!(!resolve_no_plugins(net(Some(false)), None).egress_stats);
+        // A TRUSTED project may turn its own audit off.
+        assert!(
+            !resolve_no_plugins(
+                RawConfig::default(),
+                Some((net(Some(false)), TrustState::Trusted))
+            )
+            .egress_stats
+        );
+        // An UNTRUSTED project's `stats = false` is dropped with its whole `[network]` table — it
+        // cannot disable the auditing of its own egress.
+        assert!(
+            resolve_no_plugins(
+                RawConfig::default(),
+                Some((net(Some(false)), TrustState::Untrusted))
+            )
+            .egress_stats
+        );
+        // Layering: a trusted project's `stats = true` overrides a global `false`.
+        assert!(
+            resolve_no_plugins(
+                net(Some(false)),
+                Some((net(Some(true)), TrustState::Trusted))
+            )
+            .egress_stats
+        );
+    }
+
+    #[test]
+    fn an_apps_network_stats_toggle_is_warned_and_ignored() {
+        // The egress-stats switch is baseline-only, so a `stats` key inside an `[app.<name>.network]`
+        // table is parsed but has no effect — warned, never silently dropped (every shipped profile
+        // declares its network as a table, so an author would otherwise believe it took).
+        let app = raw_app(
+            &["true"],
+            &[],
+            &[],
+            &[],
+            Some(NetworkField::Table(NetworkTable {
+                mode: "allowlist".into(),
+                allow: vec!["api.example.com".into()],
+                deny: vec![],
+                ask_timeout: None,
+                stats: Some(false),
+            })),
+        );
+        let r = resolve_no_plugins(raw_with_app("demo", app), None);
+        assert!(
+            r.egress_stats,
+            "an app's stats toggle must not change the baseline (it is baseline-only)"
+        );
+        // The warning lives on the app (surfaced when `ops app demo` launches, via `merge_app`
+        // folding it into the baseline warnings), not on the baseline read.
+        let demo = r.apps.get("demo").expect("the app resolves");
+        assert!(
+            demo.warnings
+                .iter()
+                .any(|w| w.contains("stats") && w.contains("baseline-only")),
+            "the ignored app stats toggle must be warned: {:?}",
+            demo.warnings
+        );
     }
 
     /// A terse `RawHostSecret` — `key` only, no explicit `from` — for the expansion tests.
@@ -4936,6 +5069,7 @@ mod tests {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
             ask_timeout: None,
+            stats: None,
         }))
     }
 

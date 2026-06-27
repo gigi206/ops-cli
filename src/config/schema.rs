@@ -321,6 +321,11 @@ pub(crate) struct NetworkTable {
     pub(crate) deny: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ask_timeout: Option<String>,
+    /// Whether the egress proxy records its per-host decision counters (`ops net stats`). On by
+    /// default; a trusted layer may set `false` to turn the audit off (`true` re-enables it). Absent
+    /// means "inherit" — a layer that does not mention it does not change the inherited value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stats: Option<bool>,
 }
 
 /// Parse config bytes as TOML. The error is a human-readable string: the loader
@@ -643,6 +648,7 @@ mod tests {
                 ],
                 deny: vec!["evil.nixos.org".into()],
                 ask_timeout: None,
+                stats: None,
             }))
         );
     }
@@ -657,6 +663,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: None,
+                stats: None,
             }))
         );
     }

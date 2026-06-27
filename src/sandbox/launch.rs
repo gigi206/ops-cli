@@ -1672,6 +1672,7 @@ fn build(
             &prep.cwd,
             &prep.bwrap,
             app,
+            prep.cfg.egress_stats,
         )
         .map_err(|e| {
             eprintln!("ops: cannot start the egress filtering proxy: {e}");
@@ -2585,6 +2586,7 @@ mod tests {
             mise: None,
             network: crate::config::NetworkPolicy::default(),
             network_origin: Default::default(),
+            egress_stats: true,
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
             limits: Default::default(),

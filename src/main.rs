@@ -1162,6 +1162,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     }
                 }
             }
+            // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
+            // only then), so it rides the network section. Shown both ways — an audit knob is worth
+            // surfacing — naming the reader command when on.
+            let _ = writeln!(
+                o,
+                "    {dim}stats: {}{r}",
+                if view.egress_stats {
+                    "recording (ops net stats)"
+                } else {
+                    "off"
+                }
+            );
         }
     }
 
@@ -5741,6 +5753,7 @@ mod tests {
             mise: None,
             network: config::NetworkPolicy::default(),
             network_origin: Default::default(),
+            egress_stats: true,
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
             limits: Default::default(),
@@ -6171,6 +6184,7 @@ mod tests {
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),
@@ -6576,6 +6590,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),
@@ -6650,6 +6665,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),
@@ -6751,6 +6767,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),
@@ -6806,6 +6823,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),
@@ -6891,6 +6909,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),
@@ -6973,6 +6992,7 @@ mod tests {
             },
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
+            egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             limits: Default::default(),

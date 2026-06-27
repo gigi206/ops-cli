@@ -149,6 +149,7 @@ pub(crate) fn start(
     project_root: &Path,
     bwrap: &Path,
     app: Option<&str>,
+    stats_enabled: bool,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -178,18 +179,22 @@ pub(crate) fn start(
 
     // Per-host decision counters for this session, keyed by the project's canonical path (the same
     // identity `ops net stats` derives from a cwd, so a launch's record and a later read agree).
-    // Best-effort: a project that cannot be canonicalised simply records no stats, never a launch
-    // failure. The proxy flushes the file after each decision (robust to a killed session); it
-    // persists after the session for aggregation.
-    let stats = super::binds::project_identity(project_root)
-        .ok()
-        .map(|(_, canon)| {
-            Arc::new(super::egress_stats::EgressStats::new(
-                dir.join(format!("stats-{pid}")),
-                canon.display().to_string(),
-                app.map(str::to_string),
-            ))
-        });
+    // Disabled by `[network] stats = false`; otherwise best-effort — a project that cannot be
+    // canonicalised simply records no stats, never a launch failure. The proxy flushes the file
+    // after each decision (robust to a killed session); it persists after the session for aggregation.
+    let stats = if stats_enabled {
+        super::binds::project_identity(project_root)
+            .ok()
+            .map(|(_, canon)| {
+                Arc::new(super::egress_stats::EgressStats::new(
+                    dir.join(format!("stats-{pid}")),
+                    canon.display().to_string(),
+                    app.map(str::to_string),
+                ))
+            })
+    } else {
+        None
+    };
 
     // Read the posture before the policy moves into the proxy context: only `ask` needs a control
     // plane.
@@ -574,6 +579,7 @@ mod tests {
             Path::new("/"),
             Path::new(UNUSED_BWRAP),
             None,
+            false,
         )
         .expect("start the egress proxy");
 
@@ -662,6 +668,7 @@ mod tests {
             Path::new("/"),
             Path::new(UNUSED_BWRAP),
             None,
+            false,
         )
         .expect("start the ask egress proxy");
 
@@ -695,6 +702,60 @@ mod tests {
         assert!(
             !control.exists(),
             "the control socket is unlinked when the launch ends"
+        );
+    }
+
+    #[test]
+    fn the_stats_toggle_controls_whether_a_session_file_is_written() {
+        let pid = std::process::id();
+
+        // stats OFF → no session file, even after the guard's final flush on drop.
+        let off = TmpDir::new();
+        let layout = Layout::under(off.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let (guard, _w) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+        )
+        .expect("start with stats off");
+        drop(guard);
+        assert!(
+            !layout
+                .data_dir()
+                .join("egress")
+                .join(format!("stats-{pid}"))
+                .exists(),
+            "stats off must write no session file"
+        );
+
+        // stats ON → the guard's final flush writes the session file (a separate data dir so the
+        // pid-keyed name cannot collide with the off case's).
+        let on = TmpDir::new();
+        let layout = Layout::under(on.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let (guard, _w) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            true,
+        )
+        .expect("start with stats on");
+        drop(guard);
+        assert!(
+            layout
+                .data_dir()
+                .join("egress")
+                .join(format!("stats-{pid}"))
+                .exists(),
+            "stats on must write a session file"
         );
     }
 

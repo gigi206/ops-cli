@@ -48,6 +48,9 @@ pub(crate) struct ConfigView {
     pub(crate) network: NetworkView,
     /// Which layer supplied the network posture (`Default` when neither config set it).
     pub(crate) network_origin: ProvenanceView,
+    /// Whether the egress proxy records `ops net stats` (on by default; off via `[network] stats =
+    /// false`). Only meaningful under a filtering posture (the proxy runs only then).
+    pub(crate) egress_stats: bool,
     /// The resolved GUI posture.
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
@@ -539,6 +542,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         engine,
         network,
         network_origin: resolved.network_origin.into(),
+        egress_stats: resolved.egress_stats,
         gui,
         gui_origin: resolved.gui_origin.into(),
         limits,
@@ -1069,6 +1073,7 @@ mod tests {
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
+            egress_stats: true,
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
             limits: Default::default(),
@@ -1262,6 +1267,7 @@ mod tests {
             mise: None,
             network: NetworkPolicy::Shared,
             network_origin: Provenance::Default,
+            egress_stats: true,
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             limits: sandbox::cgroup::Limits {

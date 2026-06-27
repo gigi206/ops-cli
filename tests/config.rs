@@ -498,6 +498,40 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
         stdout.contains("built-in") && stdout.contains("cache.nixos.org"),
         "the built-in nix-cache allow-set must be shown:\n{stdout}"
     );
+    // stats default on under a filtering posture.
+    assert!(
+        stdout.contains("stats: recording"),
+        "the egress-stats toggle defaults on:\n{stdout}"
+    );
+}
+
+#[test]
+fn the_egress_stats_toggle_is_shown_and_trust_gated() {
+    // A trusted project that turns its audit off reads `stats: off`.
+    let fx = Fixture::new();
+    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"github.com\"]\nstats = false\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("stats: off"),
+        "a trusted `stats = false` must read off:\n{stdout}"
+    );
+
+    // The gate: an untrusted project's `stats = false` is dropped with its whole `[network]` table,
+    // so the global filtering posture's recording stays on — a project cannot disable the auditing
+    // of its own egress.
+    let fx = Fixture::new();
+    fx.write_global("[network]\nmode = \"allowlist\"\nallow = [\"github.com\"]\n");
+    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"github.com\"]\nstats = false\n");
+    // deliberately NOT trusting the project
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("stats: recording"),
+        "an untrusted `stats = false` must not disable recording:\n{stdout}"
+    );
 }
 
 #[test]

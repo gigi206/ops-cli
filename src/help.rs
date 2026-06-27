@@ -632,7 +632,8 @@ const PAGES: &[Page] = &[
             once. Counters accrue while a filtering posture (allowlist / ask) runs and persist after\n\
             the session; they are owner-only under the data dir. Transport/protocol failures (DNS, an\n\
             unreachable upstream, a malformed request) are not a policy verdict and are not counted.\n\
-            Host-side and read-only — no launch, no nix, no network.",
+            Recording is on by default; a trusted `[network] stats = false` turns it off. Host-side\n\
+            and read-only — no launch, no nix, no network.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {
