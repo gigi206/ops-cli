@@ -2342,7 +2342,8 @@ fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
 #[test]
 fn config_path_reports_the_target_file_per_scope() {
     let fx = Fixture::new();
-    let local = fx.run(&["config", "path"]);
+    // An explicit scope prints a single bare path — the scripting contract.
+    let local = fx.run(&["config", "path", "--local"]);
     assert!(local.status.success());
     assert!(String::from_utf8_lossy(&local.stdout)
         .trim()
@@ -2355,6 +2356,38 @@ fn config_path_reports_the_target_file_per_scope() {
         g.contains("ops.toml") && !g.contains(".ops.toml"),
         "global path:\n{g}"
     );
+}
+
+#[test]
+fn config_path_lists_the_resolution_order_by_default() {
+    let fx = Fixture::new();
+
+    // No files exist yet (the common first-run state): the overview still succeeds and lists both
+    // layers as absent, rather than printing one bare path that does not exist.
+    let out = fx.run(&["config", "path"]);
+    assert!(out.status.success(), "the overview must exit 0");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("resolution order"), "header missing:\n{s}");
+    assert!(
+        s.contains("global") && s.contains("project"),
+        "layers:\n{s}"
+    );
+    assert_eq!(s.matches("(absent)").count(), 2, "both absent:\n{s}");
+    assert!(!s.contains("(present)"), "nothing present yet:\n{s}");
+
+    // The project line must carry exactly the path `--local` targets — the overview is derived from
+    // the same primitive, so they can never disagree.
+    let local = fx.run(&["config", "path", "--local"]);
+    let local_path = String::from_utf8_lossy(&local.stdout).trim().to_string();
+    assert!(s.contains(&local_path), "project line vs --local:\n{s}");
+
+    // Once both files exist, each layer reads present.
+    fx.write_global("env.A = \"1\"\n");
+    fx.write_project("env.B = \"2\"\n");
+    let out = fx.run(&["config", "path"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(s.matches("(present)").count(), 2, "both present:\n{s}");
+    assert!(!s.contains("(absent)"), "none absent now:\n{s}");
 }
 
 #[test]

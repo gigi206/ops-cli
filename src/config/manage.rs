@@ -121,6 +121,33 @@ pub(crate) fn scope_path(scope: &Scope, cwd: &Path) -> Result<PathBuf, ManageErr
     }
 }
 
+/// One config file in resolution order, for `ops config path`'s overview. `path` is `None` only
+/// for the global layer when no config directory resolves (no `$XDG_CONFIG_HOME`/`$HOME`).
+pub(crate) struct Layer {
+    /// A short label (`"global"` / `"project"`).
+    pub(crate) label: &'static str,
+    /// The layer's file, derived through [`scope_path`] so the overview can never disagree with
+    /// the scoped single-path forms.
+    pub(crate) path: Option<PathBuf>,
+}
+
+/// The config files a launch resolves, in order: the global `ops.toml` (the base layer) then the
+/// project `.ops.toml`, which overlays it (so the project wins). Each path comes through
+/// [`scope_path`] — the same primitive `--global`/`--local` target — so this overview and those
+/// single-path forms stay byte-identical.
+pub(crate) fn resolution_layers(cwd: &Path) -> Vec<Layer> {
+    vec![
+        Layer {
+            label: "global",
+            path: scope_path(&Scope::Global, cwd).ok(),
+        },
+        Layer {
+            label: "project",
+            path: scope_path(&Scope::Local, cwd).ok(),
+        },
+    ]
+}
+
 /// The declared value at a dotted key in the target file, or `None` if it (or any parent) is
 /// absent. A string is returned unquoted; another scalar (number, bool) is rendered as written;
 /// a non-scalar leaf is a [`ManageError::NotScalar`].
@@ -413,6 +440,22 @@ mod tests {
         let p = dir.join(".ops.toml");
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    #[test]
+    fn resolution_layers_match_the_scoped_paths_they_overview() {
+        // The overview must never drift from the single-path forms `--global`/`--local` print, so
+        // its layers are derived through `scope_path` — pin that here.
+        let cwd = Path::new("/some/project");
+        let layers = resolution_layers(cwd);
+        assert_eq!(layers[0].label, "global");
+        assert_eq!(layers[0].path, scope_path(&Scope::Global, cwd).ok());
+        assert_eq!(layers[1].label, "project");
+        assert_eq!(
+            layers[1].path,
+            Some(scope_path(&Scope::Local, cwd).unwrap())
+        );
+        assert_eq!(layers[1].path, Some(cwd.join(".ops.toml")));
     }
 
     #[test]

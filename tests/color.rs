@@ -78,6 +78,10 @@ fn captured_output_carries_no_ansi_escapes() {
     // `trust` precedes `untrust` so the revoke finds the marker it recorded (the `existed` path).
     let invocations: &[&[&str]] = &[
         &["config", "show"],
+        // The resolution overview (no scope flag) colors its layer labels and present/absent
+        // markers — captured here with a present project config and an absent global, so it must
+        // be plain.
+        &["config", "path"],
         // Bare `config` prints its page to stderr (a no-subcommand usage error) — captured, so it
         // too must be plain.
         &["config"],

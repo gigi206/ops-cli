@@ -303,14 +303,19 @@ const PAGES: &[Page] = &[
     Page {
         path: &["config", "path"],
         synopsis: "ops config path [-l|--local|-g|--global|-c <file>]",
-        summary: "print the path of the config file a scope targets",
+        summary: "show the config files in resolution order, or one scope's path",
         options: &[
-            ("-l, --local", "the project .ops.toml (the default)"),
-            ("-g, --global", "the global ops.toml"),
-            ("-c <file>", "an explicit config file"),
+            ("(no flag)", "list every config layer in resolution order, marking which exist"),
+            ("-l, --local", "print only the project .ops.toml path"),
+            ("-g, --global", "print only the global ops.toml path"),
+            ("-c <file>", "print only this explicit config file path"),
         ],
-        details: "Prints the path of the file the given scope targets — the file get/set/unset\n\
-            would read or edit. Useful for scripting and for locating the global config.",
+        details:
+            "With no scope flag, lists the config files a launch resolves — the global ops.toml\n\
+            (the base) then the project .ops.toml (which overlays it) — and whether each exists,\n\
+            so it is clear where ops looks even before any file is created. With a scope flag,\n\
+            prints just that file's path (the one get/set/unset/edit would touch) — for scripting\n\
+            and for locating the global config. For resolved values, see `ops config show`.",
     },
     Page {
         path: &["config", "edit"],

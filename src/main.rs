@@ -1673,6 +1673,9 @@ fn channel_origin_kind(label: &str) -> config::view::ProvenanceView {
 struct ScopeArgs {
     positionals: Vec<String>,
     scope: config::manage::Scope,
+    /// Whether a scope flag (`-l`/`-g`/`-c`) was given explicitly, as opposed to the `Local`
+    /// default — `ops config path` shows the resolution overview when none was.
+    scope_explicit: bool,
     trust: bool,
     app: Option<String>,
 }
@@ -1683,6 +1686,7 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
     use config::manage::Scope;
     let mut positionals = Vec::new();
     let mut scope = Scope::Local;
+    let mut scope_explicit = false;
     let mut trust = false;
     let mut app = None;
     let mut only_positional = false;
@@ -1694,13 +1698,20 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
         }
         match arg.to_str() {
             Some("--") => only_positional = true,
-            Some("--local") | Some("-l") => scope = Scope::Local,
-            Some("--global") | Some("-g") => scope = Scope::Global,
+            Some("--local") | Some("-l") => {
+                scope = Scope::Local;
+                scope_explicit = true;
+            }
+            Some("--global") | Some("-g") => {
+                scope = Scope::Global;
+                scope_explicit = true;
+            }
             Some("-c") | Some("--config") => {
                 let file = it
                     .next()
                     .ok_or_else(|| "`-c` needs a file path".to_string())?;
                 scope = Scope::File(PathBuf::from(file));
+                scope_explicit = true;
             }
             Some("--app") | Some("-a") => {
                 let name = it
@@ -1718,6 +1729,7 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
     Ok(ScopeArgs {
         positionals,
         scope,
+        scope_explicit,
         trust,
         app,
     })
@@ -1871,6 +1883,7 @@ fn config_set(args: &[OsString]) -> ExitCode {
         scope,
         trust,
         app,
+        ..
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -1928,6 +1941,7 @@ fn config_unset(args: &[OsString]) -> ExitCode {
         scope,
         trust,
         app,
+        ..
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -1977,12 +1991,16 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `ops config path`: print the path of the target layer file (`--local` by default) — the file
-/// `set`/`unset`/`edit` would touch. Useful for scripting and for finding the global config.
+/// `ops config path`: with no scope flag, show the config files a launch resolves, in order, each
+/// with whether it exists — so it is clear where ops looks (and that a default project `.ops.toml`
+/// need not exist). With an explicit scope (`-l`/`-g`/`-c`), print the single bare path that scope
+/// targets — the file `set`/`unset`/`edit` would touch, for scripting and for finding the global
+/// config.
 fn config_path_cmd(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
         scope,
+        scope_explicit,
         app,
         ..
     } = match split_scope(args) {
@@ -2002,6 +2020,16 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(code) => return code,
     };
+
+    if !scope_explicit {
+        // The useful default: the resolution overview. A successful listing even when nothing
+        // exists yet — that is the common first-run state, not an error.
+        let layers = config::manage::resolution_layers(&cwd);
+        let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+        print!("{}", render_resolution_layers(&layers, &pal));
+        return ExitCode::SUCCESS;
+    }
+
     match config::manage::scope_path(&scope, &cwd) {
         Ok(p) => {
             println!("{}", p.display());
@@ -2012,6 +2040,39 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Render the config-file resolution overview: each layer in order (global base, project overlay)
+/// with its path and whether the file is present. Returned as a string so a test can assert it
+/// without a terminal. The label column is padded as plain text before color is applied, so the
+/// path column stays aligned regardless of styling.
+fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, nm, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "{h}config files in resolution order{r} \
+         {dim}(global is the base; the project overlays it){r}"
+    );
+    for layer in layers {
+        let label = format!("{:<8}", layer.label);
+        match &layer.path {
+            Some(p) => {
+                let (state, hue) = if p.try_exists().unwrap_or(false) {
+                    ("present", ok)
+                } else {
+                    ("absent", dim)
+                };
+                let _ = writeln!(o, "  {nm}{label}{r}{}  {hue}({state}){r}", p.display());
+            }
+            None => {
+                let _ = writeln!(o, "  {nm}{label}{r}{dim}(no config directory){r}");
+            }
+        }
+    }
+    let _ = writeln!(o, "{dim}for the resolved values, see `ops config show`.{r}");
+    o
 }
 
 /// `ops config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
@@ -2026,6 +2087,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
         scope,
         trust: trust_flag,
         app,
+        ..
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -4944,6 +5006,59 @@ mod tests {
         assert!(
             plain.contains("ALLOWED") && !plain.contains("built-in"),
             "a user-rule allow must not claim the built-in source:\n{plain}"
+        );
+    }
+
+    #[test]
+    fn resolution_layers_render_marks_presence_and_stays_plain_uncolored() {
+        use config::manage::Layer;
+        let tmp = crate::testutil::TmpDir::new();
+        let present = tmp.path().join("here.toml");
+        std::fs::write(&present, "x = 1\n").unwrap();
+        let absent = tmp.path().join("gone.toml");
+        let layers = vec![
+            Layer {
+                label: "global",
+                path: Some(absent.clone()),
+            },
+            Layer {
+                label: "project",
+                path: Some(present.clone()),
+            },
+        ];
+        let plain = render_resolution_layers(&layers, &style::Palette::plain());
+        assert!(plain.contains("resolution order"), "header:\n{plain}");
+        assert!(
+            plain.contains(&format!("{}  (absent)", absent.display())),
+            "an absent layer must be marked absent:\n{plain}"
+        );
+        assert!(
+            plain.contains(&format!("{}  (present)", present.display())),
+            "a present layer must be marked present:\n{plain}"
+        );
+        // The colored path wraps the marker in its hue and resets it — pad-then-color keeps the
+        // path column aligned, which only ever shows here.
+        let c = style::Palette::colored();
+        let colored = render_resolution_layers(&layers, &c);
+        assert!(
+            colored.contains(&format!("{}(present){}", c.ok, c.reset)),
+            "a present marker must be wrapped in the ok span and reset:\n{colored}"
+        );
+    }
+
+    #[test]
+    fn resolution_layers_render_handles_a_missing_config_directory() {
+        // The global layer can have no path (no $XDG_CONFIG_HOME/$HOME) — it must not error the
+        // listing, just say so.
+        use config::manage::Layer;
+        let layers = vec![Layer {
+            label: "global",
+            path: None,
+        }];
+        let plain = render_resolution_layers(&layers, &style::Palette::plain());
+        assert!(
+            plain.contains("global") && plain.contains("(no config directory)"),
+            "a pathless global layer must read as no config directory:\n{plain}"
         );
     }
 
