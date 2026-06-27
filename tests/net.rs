@@ -904,6 +904,234 @@ fn net_pending_all_drains_a_live_session_through_the_socket() {
 }
 
 #[test]
+fn net_pending_all_app_scoped_drains_a_registered_app_session() {
+    // The app-scoped live drain — the path that was untested (the existing app-filter test covered
+    // only the empty case). Register THIS process as a `global-app:claude-code` session, bind its
+    // control socket, then drive `-a claude-code --all --session` and assert it actually answers.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let data = fx.data_home.path().join("ops");
+    let egress = data.join("egress");
+    let sessions = data.join("sessions");
+    std::fs::create_dir_all(&egress).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let pid = std::process::id();
+    let start_ticks: u64 = {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let after = &stat[stat.rfind(')').unwrap() + 1..];
+        after.split_whitespace().nth(19).unwrap().parse().unwrap()
+    };
+    let project = fx.proj.path().canonicalize().unwrap();
+    let project_hex: String = project
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // The crux: an APP session (`global-app:claude-code`), so `session.app() == Some("claude-code")`.
+    std::fs::write(
+        sessions.join(format!("{pid}-{start_ticks}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:claude-code\nproject={project_hex}\n"
+        ),
+    )
+    .unwrap();
+
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        assert!(
+            cmd.starts_with("ALLOW *"),
+            "expected a bulk drain, got {cmd:?}"
+        );
+        (&stream)
+            .write_all(b"answered host=claude.ai\nok\n")
+            .unwrap();
+    });
+
+    let out = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "-a",
+        "claude-code",
+        "--all",
+        "--session",
+    ]);
+    let _ = std::fs::remove_file(&socket);
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("claude.ai") && !stdout.contains("no pending requests"),
+        "the app-scoped drain must answer the parked host, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
+    // A control server speaking the OLD protocol (one predating `--all`) replies `err bad-request`
+    // to a bulk drain. The CLI must NOT swallow it as "no pending requests" (the misleading field
+    // symptom) — it names the older session and points at the only real fix, relaunching the agent.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let egress = fx.data_home.path().join("ops").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let pid = 44444u32;
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        // An old server does not understand `ALLOW *`.
+        (&stream).write_all(b"err bad-request\n").unwrap();
+    });
+    let out = fx.run(&["net", "pending", "allow", "--all"]);
+    let _ = std::fs::remove_file(&socket);
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("no pending requests")
+            && stdout.contains("44444")
+            && stdout.contains("older ops")
+            && stdout.contains("relaunch the agent"),
+        "the drain must surface the older session, not claim emptiness:\n{stdout}"
+    );
+}
+
+#[test]
+fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
+    // The `--save` drain site must surface an older session too — and, since nothing was answered,
+    // persist nothing (no false "saved a rule" against a session it could not actually drain).
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let egress = fx.data_home.path().join("ops").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let pid = 45454u32;
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        (&stream).write_all(b"err bad-request\n").unwrap();
+    });
+    // `--global` avoids the project filter so the unsupported session is reached.
+    let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
+    let _ = std::fs::remove_file(&socket);
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("older ops") && stdout.contains("relaunch the agent"),
+        "the --save drain must name the older session:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("saved"),
+        "nothing was answered, so nothing must be reported saved:\n{stdout}"
+    );
+    // The global config must not have been written (no rule to persist).
+    assert!(
+        !fx.config_home.path().join("ops").join("ops.toml").exists(),
+        "an unsupported-only drain must not write any config"
+    );
+}
+
+#[test]
+fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
+    // `-a <app>` on the by-id path is a session scope (the natural carry-over from
+    // `ops net pending -a <app>`), honored without `--save`: it answers the id when the registry
+    // confirms that session is that app, and refuses when the id belongs to a *different* app.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    let data = fx.data_home.path().join("ops");
+    let egress = data.join("egress");
+    let sessions = data.join("sessions");
+    std::fs::create_dir_all(&egress).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let pid = std::process::id();
+    let start_ticks: u64 = {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let after = &stat[stat.rfind(')').unwrap() + 1..];
+        after.split_whitespace().nth(19).unwrap().parse().unwrap()
+    };
+    let project = fx.proj.path().canonicalize().unwrap();
+    let project_hex: String = project
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(
+        sessions.join(format!("{pid}-{start_ticks}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:claude-code\nproject={project_hex}\n"
+        ),
+    )
+    .unwrap();
+
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    // Only the matching-app case reaches the socket (the mismatch is refused before any answer).
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        assert!(cmd.starts_with(&format!("ALLOW {pid_seq}", pid_seq = 1)));
+        (&stream).write_all(b"ok host=claude.ai count=1\n").unwrap();
+    });
+
+    // Matching app → answered (the rejection that prompted this fix is gone).
+    let ok = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "-a",
+        "claude-code",
+        &format!("{pid}.1"),
+        "--session",
+    ]);
+    server.join().unwrap();
+    assert!(
+        ok.status.success() && String::from_utf8_lossy(&ok.stdout).contains("claude.ai"),
+        "an app-scoped by-id answer must work:\nout={}\nerr={}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // A different app → refused before contacting the session, naming the actual app.
+    let bad = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "-a",
+        "some-other-app",
+        &format!("{pid}.1"),
+    ]);
+    let _ = std::fs::remove_file(&socket);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("is a session of app `claude-code`"),
+        "the mismatch must name the actual app:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[test]
 fn net_pending_list_collapses_identical_retries_in_text_and_json() {
     // A tool that retries one URL re-parks it many times; the listing must show one line per
     // destination (with a count), not one per connection — proven through the real binary against a

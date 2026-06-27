@@ -567,16 +567,31 @@ pub(crate) fn answer_request(
     Ok(parse_answer_reply(response.trim()))
 }
 
+/// The outcome of a bulk drain (`ALLOW *`/`DENY *`) of one session.
+pub(crate) enum DrainOutcome {
+    /// The session drained: the hosts it answered, oldest first. An empty vec means the session was
+    /// healthy but had nothing parked.
+    Drained(Vec<String>),
+    /// The session's control server did not understand the bulk-drain command (it replied `err …`) —
+    /// it was launched by an `ops` predating `--all`. Its requests are still parked; only relaunching
+    /// the agent with the current binary lets `--all` reach them. (Answering by id is *not* a fallback:
+    /// destination-grouping is server-side, so an old server's `ALLOW <seq>` wakes one connection of
+    /// the group, leaving the retries parked.)
+    Unsupported,
+}
+
 /// Drain *every* parked request in one session (`ALLOW *`/`DENY *`): connect, send the bulk verdict,
 /// and collect the hosts it answered (oldest first). With `remember`, the trailing `session` token
-/// also records each as a live manual rule. An empty queue is an empty `Ok(vec)`; a connect error
-/// (the session is gone, or a stale socket) propagates so the caller skips that session.
+/// also records each as a live manual rule. An empty queue is `Drained(vec![])`; a control server too
+/// old to know `ALLOW *` (it replies `err …`) is `Unsupported` — distinct from a clean empty drain,
+/// so the caller can tell "nothing parked" from "this session predates --all". A connect error (the
+/// session is gone, or a stale socket) propagates so the caller skips that session.
 pub(crate) fn drain_session(
     data_dir: &Path,
     pid: u32,
     verdict: Verdict,
     remember: bool,
-) -> io::Result<Vec<String>> {
+) -> io::Result<DrainOutcome> {
     let stream = UnixStream::connect(control_socket(data_dir, pid))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -595,13 +610,19 @@ pub(crate) fn drain_session(
     for line in BufReader::new(&stream).lines() {
         let line = line?;
         if line == "ok" {
-            break;
+            return Ok(DrainOutcome::Drained(hosts));
         }
         if let Some(host) = line.strip_prefix("answered host=") {
             hosts.push(host.to_string());
+        } else if line.starts_with("err ") {
+            // A current server never answers a bulk drain with `err` — so any `err` line is an older
+            // server that does not understand `ALLOW *`/`DENY *`.
+            return Ok(DrainOutcome::Unsupported);
         }
     }
-    Ok(hosts)
+    // EOF without a terminating `ok` (defensive — a current server always closes with `ok`): report
+    // what we collected rather than inventing an error.
+    Ok(DrainOutcome::Drained(hosts))
 }
 
 /// One manual rule reported by a live session: whether it allows (vs denies) and its display text.
@@ -1056,8 +1077,14 @@ mod tests {
         ];
 
         // Drain ALLOW with `--session` (remember) over the real socket.
-        let hosts = drain_session(data.path(), pid, Verdict::Allow, true).unwrap();
-        assert_eq!(hosts, vec!["one.test".to_string(), "two.test".to_string()]);
+        match drain_session(data.path(), pid, Verdict::Allow, true).unwrap() {
+            DrainOutcome::Drained(hosts) => {
+                assert_eq!(hosts, vec!["one.test".to_string(), "two.test".to_string()])
+            }
+            DrainOutcome::Unsupported => {
+                panic!("a current server must drain, not report unsupported")
+            }
+        }
         for p in parked {
             assert_eq!(p.join().unwrap(), Verdict::Allow);
         }
@@ -1066,9 +1093,39 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert!(rules.iter().all(|r| r.is_allow));
 
-        // A drain on the now-empty queue is a clean empty result.
-        assert!(drain_session(data.path(), pid, Verdict::Allow, false)
-            .unwrap()
-            .is_empty());
+        // A drain on the now-empty queue is a clean *empty* Drained — distinct from Unsupported.
+        match drain_session(data.path(), pid, Verdict::Allow, false).unwrap() {
+            DrainOutcome::Drained(hosts) => assert!(hosts.is_empty()),
+            DrainOutcome::Unsupported => {
+                panic!("an empty healthy queue is Drained, not Unsupported")
+            }
+        }
+    }
+
+    #[test]
+    fn drain_session_reports_unsupported_when_the_server_does_not_know_the_command() {
+        // An older control server (one predating `--all`) replies `err bad-request` to a bulk drain.
+        // `drain_session` must report that as `Unsupported`, NOT silently swallow it as an empty drain
+        // — the difference between "nothing parked" and "this session is too old to drain in bulk".
+        use crate::testutil::TmpDir;
+        use std::io::{BufRead, BufReader, Write};
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 24242u32;
+        let socket = control_socket(data.path(), pid);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut cmd = String::new();
+            BufReader::new(&stream).read_line(&mut cmd).unwrap();
+            assert!(cmd.starts_with("ALLOW *"));
+            (&stream).write_all(b"err bad-request\n").unwrap();
+        });
+        let outcome = drain_session(data.path(), pid, Verdict::Allow, false).unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(outcome, DrainOutcome::Unsupported),
+            "an `err` reply must surface as Unsupported"
+        );
     }
 }

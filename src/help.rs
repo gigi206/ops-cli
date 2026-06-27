@@ -578,7 +578,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending", "allow"],
-        synopsis: "ops net pending allow <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
+        synopsis: "ops net pending allow <id> [-a <app>] [--session] [--save [-l|-g]] | ops net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
@@ -587,7 +587,7 @@ const PAGES: &[Page] = &[
             ("--save", "also persist an allow rule per answered host (scope below; by id or in bulk with --all)"),
             ("-l, --local", "with --save: write the project .ops.toml (the default; with --all, drains only this project)"),
             ("-g, --global", "with --save: write the global ops.toml"),
-            ("-a, --app <name>", "with --all: limit the drain to that app's session(s); with --save: write under that app's `[app.<name>.network]`"),
+            ("-a, --app <name>", "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`"),
         ],
         details:
             "Unblocks the parked request — and every identical retry of the same URL — letting it\n\
@@ -607,7 +607,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending", "deny"],
-        synopsis: "ops net pending deny <id> [--session] [--save [-l|-g|-a <app>]] | ops net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
+        synopsis: "ops net pending deny <id> [-a <app>] [--session] [--save [-l|-g]] | ops net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
             ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
@@ -616,7 +616,7 @@ const PAGES: &[Page] = &[
             ("--save", "also persist a deny rule per answered host (scope below; by id or in bulk with --all)"),
             ("-l, --local", "with --save: write the project .ops.toml (the default; with --all, drains only this project)"),
             ("-g, --global", "with --save: write the global ops.toml"),
-            ("-a, --app <name>", "with --all: limit the drain to that app's session(s); with --save: write under that app's `[app.<name>.network]`"),
+            ("-a, --app <name>", "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`"),
         ],
         details:
             "Refuses the parked request — and every identical retry of the same URL — (the proxy\n\

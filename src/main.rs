@@ -2976,6 +2976,18 @@ fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSe
         .collect()
 }
 
+/// The app a session pid runs as (`ops app <name>`), from the registry — or `None` if the session is
+/// a plain project shell, or is not in the registry. The basis for validating that a `<pid>.<seq>` id
+/// the user scoped with `--app` really belongs to that app.
+fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
+    session::Registry::at(data_dir)
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.pid == pid)
+        .and_then(|s| s.app().map(str::to_string))
+}
+
 /// The live-session pids running in `project` (a canonical project root), from the registry — the
 /// basis for scoping `ops net pending` to the current project. The match is `s.project == project`,
 /// the exact comparison the launch path records and `ops gc` already uses (both sides go through
@@ -3280,10 +3292,13 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         eprintln!("ops: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)");
         return ExitCode::from(2);
     };
-    // A scope (--global/--app, or a `-c` file) without `--save` is meaningless — flag it rather than
-    // silently ignore it. `--local` is the `split_scope` default, so a bare oneshot does not trip it.
-    if !save && (parsed.app.is_some() || !matches!(parsed.scope, config::manage::Scope::Local)) {
-        eprintln!("ops: a scope (--local/--global/--app) only applies with --save");
+    // A *config* scope (--global / -c) without `--save` is meaningless — there is no rule to write, so
+    // flag it rather than silently ignore it. `--local` is the `split_scope` default, so a bare oneshot
+    // does not trip it. `--app` is deliberately *not* here: it doubles as a session scope, so it is
+    // honored without `--save` too (a natural carry-over from `ops net pending -a <app>`) and validated
+    // against the id below.
+    if !save && !matches!(parsed.scope, config::manage::Scope::Local) {
+        eprintln!("ops: --global/-c only applies with --save (it names where to persist the rule)");
         return ExitCode::from(2);
     }
 
@@ -3294,6 +3309,19 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             return ExitCode::FAILURE;
         }
     };
+    // `--app <name>` on the by-id path asserts the id belongs to that app. The id already names the
+    // exact session, so this is a consistency check, not a filter: if the registry knows this session
+    // as a *different* app, the assertion is wrong → flag it (and, with `--save`, the save would land
+    // in the wrong app's config). An unregistered session or a plain shell (no known app) is given the
+    // benefit of the doubt — the id is authoritative.
+    if let Some(name) = parsed.app.as_deref() {
+        if let Some(actual) = session_app_of(&data_dir, pid) {
+            if actual != name {
+                eprintln!("ops: {id} is a session of app `{actual}`, not `{name}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
     let (host, count) =
         match sandbox::control::answer_request(&data_dir, pid, seq, verdict, session) {
             Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
@@ -3380,6 +3408,7 @@ fn net_pending_answer_all(
     // session has no known app, so it is excluded under a filter.
     let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
     let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
+    let mut unsupported: Vec<u32> = Vec::new();
     for pid in sandbox::control::session_pids(&data_dir) {
         if let Some(pids) = &app_pids {
             if !pids.contains(&pid) {
@@ -3387,15 +3416,22 @@ fn net_pending_answer_all(
             }
         }
         match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
-            Ok(hosts) if !hosts.is_empty() => answered.push((pid, hosts)),
-            // An empty drain, or a dead/stale socket (the session went away) — nothing to report.
-            _ => {}
+            Ok(sandbox::control::DrainOutcome::Drained(hosts)) if !hosts.is_empty() => {
+                answered.push((pid, hosts))
+            }
+            // A healthy session with nothing parked — nothing to report.
+            Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
+            // A session launched by an older ops that does not understand `--all` — its requests stay
+            // parked, so name it rather than fold it into a misleading "nothing parked".
+            Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
+            // A dead/stale socket (the session went away) — skip it.
+            Err(_) => {}
         }
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!(
         "{}",
-        render_drain(past, session, app, &answered, &context, &pal)
+        render_drain(past, session, app, &answered, &unsupported, &context, &pal)
     );
     ExitCode::SUCCESS
 }
@@ -3410,29 +3446,36 @@ fn render_drain(
     session: bool,
     app: Option<&str>,
     answered: &[(u32, Vec<String>)],
+    unsupported: &[u32],
     context: &[(u32, PathBuf, String)],
     pal: &style::Palette,
 ) -> String {
     use std::fmt::Write as _;
-    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
     let total: usize = answered.iter().map(|(_, hosts)| hosts.len()).sum();
     if total == 0 {
-        match app {
-            Some(name) => {
-                let _ = writeln!(
-                    o,
-                    "{dim}no pending requests for app `{name}` (nothing parked in its ask-mode \
-                     session(s)){r}"
-                );
-            }
-            None => {
-                let _ = writeln!(
-                    o,
-                    "{dim}no pending requests (nothing parked across any ask-mode session){r}"
-                );
+        // Nothing answered. Distinguish "every session is healthy but empty" from "the only sessions
+        // present were launched by an older ops that does not understand `--all`" — the latter would
+        // otherwise read as "nothing parked" while requests are in fact still blocked.
+        if unsupported.is_empty() {
+            match app {
+                Some(name) => {
+                    let _ = writeln!(
+                        o,
+                        "{dim}no pending requests for app `{name}` (nothing parked in its ask-mode \
+                         session(s)){r}"
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        o,
+                        "{dim}no pending requests (nothing parked across any ask-mode session){r}"
+                    );
+                }
             }
         }
+        write_unsupported_note(&mut o, unsupported, warn, dim, r);
         return o;
     }
     let _ = writeln!(o, "{h}{past} {total} parked request(s):{r}");
@@ -3454,7 +3497,33 @@ fn render_drain(
     if session {
         let _ = writeln!(o, "  {dim}(remembered for each session — not re-asked){r}");
     }
+    write_unsupported_note(&mut o, unsupported, warn, dim, r);
     o
+}
+
+/// Append the older-session warning to a drain report: name the sessions whose control server is too
+/// old to understand `--all`, and point at the only fix (relaunch the agent). Answering their requests
+/// by id is deliberately *not* offered — destination grouping is server-side, so an old server's
+/// `ALLOW <seq>` wakes one connection of a retried group and leaves the rest blocked.
+fn write_unsupported_note(o: &mut String, unsupported: &[u32], warn: &str, dim: &str, r: &str) {
+    use std::fmt::Write as _;
+    if unsupported.is_empty() {
+        return;
+    }
+    let pids = unsupported
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        o,
+        "{warn}session(s) {pids} were launched by an older ops without `--all` support — their \
+         parked requests stay blocked.{r}"
+    );
+    let _ = writeln!(
+        o,
+        "  {dim}relaunch the agent with the current ops to drain them in bulk.{r}"
+    );
 }
 
 /// `ops net stats [--app <name>] [--reset] [--json]`: report the per-host egress decision counters a
@@ -4054,6 +4123,7 @@ fn net_pending_drain_and_save(
     let context = pending_session_context(&data_dir);
     let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
     let mut hosts: Vec<String> = Vec::new();
+    let mut unsupported: Vec<u32> = Vec::new();
     for pid in sandbox::control::session_pids(&data_dir) {
         if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
             continue;
@@ -4061,30 +4131,40 @@ fn net_pending_drain_and_save(
         if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
             continue;
         }
-        if let Ok(answered_hosts) =
-            sandbox::control::drain_session(&data_dir, pid, verdict, session)
-        {
-            if !answered_hosts.is_empty() {
+        match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
+            Ok(sandbox::control::DrainOutcome::Drained(answered_hosts))
+                if !answered_hosts.is_empty() =>
+            {
                 hosts.extend(answered_hosts.iter().cloned());
                 answered.push((pid, answered_hosts));
             }
+            Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
+            // A session launched by an older ops that does not understand `--all` — nothing was
+            // answered, so nothing is saved for it either; name it so the user knows why.
+            Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
+            Err(_) => {}
         }
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let total: usize = answered.iter().map(|(_, h)| h.len()).sum();
     if total == 0 {
-        let scope_note = if local {
-            "for this project".to_string()
-        } else if let Some(name) = app {
-            format!("for app `{name}`")
-        } else {
-            "across any ask-mode session".to_string()
-        };
-        println!(
-            "{}no pending requests {scope_note} — nothing to answer or save{}",
-            pal.dim, pal.reset
-        );
+        let mut out = String::new();
+        if unsupported.is_empty() {
+            let scope_note = if local {
+                "for this project".to_string()
+            } else if let Some(name) = app {
+                format!("for app `{name}`")
+            } else {
+                "across any ask-mode session".to_string()
+            };
+            out.push_str(&format!(
+                "{}no pending requests {scope_note} — nothing to answer or save{}\n",
+                pal.dim, pal.reset
+            ));
+        }
+        write_unsupported_note(&mut out, &unsupported, pal.warn, pal.dim, pal.reset);
+        print!("{out}");
         return ExitCode::SUCCESS;
     }
 
@@ -4110,7 +4190,7 @@ fn net_pending_drain_and_save(
 
     print!(
         "{}",
-        render_drain(past, session, app, &answered, &context, &pal)
+        render_drain(past, session, app, &answered, &unsupported, &context, &pal)
     );
     let target = if local {
         "the project config".to_string()
@@ -5859,12 +5939,25 @@ mod tests {
         let p = style::Palette::plain();
 
         // Empty drain → the "nothing parked" line, no total.
-        assert!(render_drain("allowed", false, None, &[], &[], &p).contains("no pending requests"));
+        assert!(
+            render_drain("allowed", false, None, &[], &[], &[], &p).contains("no pending requests")
+        );
         // An empty drain under an `--app` filter names the app (not "nothing anywhere").
-        let scoped = render_drain("allowed", false, Some("claude-code"), &[], &[], &p);
+        let scoped = render_drain("allowed", false, Some("claude-code"), &[], &[], &[], &p);
         assert!(
             scoped.contains("for app `claude-code`"),
             "the empty filtered drain must name the app:\n{scoped}"
+        );
+
+        // An empty drain whose only sessions are too old to understand `--all` does NOT say "nothing
+        // parked" — it names the older sessions and points at relaunching.
+        let old = render_drain("allowed", false, None, &[], &[99999u32], &[], &p);
+        assert!(
+            !old.contains("no pending requests")
+                && old.contains("99999")
+                && old.contains("older ops")
+                && old.contains("relaunch the agent"),
+            "an unsupported-only drain must name the older session and the fix, not claim emptiness:\n{old}"
         );
 
         let answered = vec![
@@ -5881,7 +5974,7 @@ mod tests {
             "app:demo".to_string(),
         )];
 
-        let out = render_drain("allowed", true, None, &answered, &context, &p);
+        let out = render_drain("allowed", true, None, &answered, &[], &context, &p);
         // The total counts every answered host across every session.
         assert!(out.contains("allowed 3 parked request(s)"), "{out}");
         // Each session is named (the cross-agent grant made visible), and each host listed.
@@ -5899,7 +5992,7 @@ mod tests {
         assert!(out.contains("remembered for each session"), "{out}");
 
         // Without `--session`, no remembered note; "denied" past tense for a deny drain.
-        let out = render_drain("denied", false, None, &answered, &context, &p);
+        let out = render_drain("denied", false, None, &answered, &[], &context, &p);
         assert!(out.contains("denied 3 parked request(s)"), "{out}");
         assert!(!out.contains("remembered for each session"), "{out}");
     }
