@@ -15,17 +15,20 @@ claude-code = "mise:aqua:anthropics/claude-code"
 
 # Egress is denied by construction except the Anthropic API, the Claude platform host
 # the CLI contacts at startup (its connectivity/account check — without it the tool
-# reports "Unable to connect to Anthropic services"), and the one Google Cloud Storage
-# bucket Anthropic ships the `claude` binary from (so the tool can self-equip fresh at
-# first launch). The bucket rule is path-scoped — reads from exactly that bucket, not
-# all of GCS. The agent may run on untrusted project code, but it can only reach these.
-# (If a future `claude-code` release moves hosts, the proxy reports the refused host —
-# add it; check ahead with `ops test net <url>`.)
+# reports "Unable to connect to Anthropic services"), the Claude downloads host and the
+# Anthropic MCP proxy the CLI reaches for updates and MCP connectors, and the one Google
+# Cloud Storage bucket Anthropic ships the `claude` binary from (so the tool can
+# self-equip fresh at first launch). The bucket rule is path-scoped — reads from exactly
+# that bucket, not all of GCS. The agent may run on untrusted project code, but it can
+# only reach these. (If a future `claude-code` release moves hosts, the proxy reports the
+# refused host — add it; check ahead with `ops test net <url>`.)
 [network]
 mode = "allowlist"
 allow = [
     "api.anthropic.com",
     "platform.claude.com",
+    "downloads.claude.ai",
+    "mcp-proxy.anthropic.com",
     "storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
