@@ -388,13 +388,17 @@ pub(crate) enum DefaultAction {
 /// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
 /// SSRF private-host exception (every public host is already permitted). Under
 /// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
-/// (`None` = wait indefinitely until answered); it is inert under the other defaults.
+/// (`None` = wait indefinitely until answered); it is inert under the other defaults. The `ask`
+/// park notice is printed to stderr by default; a policy may suppress it (the request still parks).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
     default_action: DefaultAction,
     ask_timeout: Option<std::time::Duration>,
+    /// Stored inverted so the derived `Default` (and [`Self::new`]) both mean "notice shown".
+    /// Read via [`Self::ask_notice`].
+    suppress_ask_notice: bool,
 }
 
 impl EgressPolicy {
@@ -406,6 +410,7 @@ impl EgressPolicy {
             deny,
             default_action: DefaultAction::Deny,
             ask_timeout: None,
+            suppress_ask_notice: false,
         }
     }
 
@@ -423,8 +428,22 @@ impl EgressPolicy {
         self
     }
 
+    /// Set whether the `ask`-mode park notice is printed to stderr (builder style). `true` (the
+    /// default) shows it; `false` silences the inline alert — the request still parks, answerable
+    /// via `ops net pending`. Inert unless the default action is [`DefaultAction::Ask`].
+    pub(crate) fn with_ask_notice(mut self, show: bool) -> Self {
+        self.suppress_ask_notice = !show;
+        self
+    }
+
     pub(crate) fn default_action(&self) -> DefaultAction {
         self.default_action
+    }
+
+    /// Whether the proxy prints the `ask` park notice to stderr — `true` by default. The proxy
+    /// reads this only under [`DefaultAction::Ask`].
+    pub(crate) fn ask_notice(&self) -> bool {
+        !self.suppress_ask_notice
     }
 
     /// How long a parked `ask` request waits before timing out to a deny — `None` means wait
@@ -1463,6 +1482,20 @@ mod tests {
         let p = EgressPolicy::default();
         assert!(!p.permits("example.com", 443, "/"));
         assert!(p.allow_rules().is_empty() && p.deny_rules().is_empty());
+    }
+
+    #[test]
+    fn ask_notice_shows_by_default_and_inverts_cleanly() {
+        // The notice is shown by default, and crucially `new()` and the derived `default()` must
+        // agree (the field is stored inverted so the derive's `false` means "shown").
+        assert!(EgressPolicy::new(vec![], vec![]).ask_notice());
+        assert!(EgressPolicy::default().ask_notice());
+        // `with_ask_notice(false)` silences it; `true` restores it.
+        assert!(!EgressPolicy::default().with_ask_notice(false).ask_notice());
+        assert!(EgressPolicy::default()
+            .with_ask_notice(false)
+            .with_ask_notice(true)
+            .ask_notice());
     }
 
     #[test]

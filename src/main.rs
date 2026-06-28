@@ -1074,6 +1074,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         NetworkView::Allowlist {
             default_action,
             ask_timeout,
+            ask_notice,
             allow,
             deny,
             builtin,
@@ -1090,6 +1091,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     t.clone()
                 };
                 let _ = writeln!(o, "    {dim}ask timeout: {shown}{r}");
+            }
+            if matches!(ask_notice, Some(false)) {
+                let _ = writeln!(
+                    o,
+                    "    {dim}ask notice: off (parked requests are silent — answer via \
+                     `ops net pending`){r}"
+                );
             }
             match default_action {
                 // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
@@ -1315,6 +1323,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     AppNetworkView::Allowlist {
                         default_action,
                         ask_timeout,
+                        ask_notice,
                         allow,
                         deny,
                         builtin,
@@ -1326,6 +1335,9 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                         );
                         if let Some(t) = ask_timeout {
                             let _ = writeln!(o, "        {dim}ask timeout: {t}{r}");
+                        }
+                        if matches!(ask_notice, Some(false)) {
+                            let _ = writeln!(o, "        {dim}ask notice: off{r}");
                         }
                         for rule in allow {
                             let _ = writeln!(o, "        allow {n}{rule}{r}");
@@ -1478,6 +1490,7 @@ fn render_app_detail(
         NetworkView::Allowlist {
             default_action,
             ask_timeout,
+            ask_notice,
             allow,
             deny,
             builtin,
@@ -1489,6 +1502,13 @@ fn render_app_detail(
             );
             if let Some(t) = ask_timeout {
                 let _ = writeln!(o, "    {dim}ask timeout: {t}{r}");
+            }
+            if matches!(ask_notice, Some(false)) {
+                let _ = writeln!(
+                    o,
+                    "    {dim}ask notice: off (parked requests are silent — answer via \
+                     `ops net pending`){r}"
+                );
             }
             if details {
                 for rule in allow {
@@ -6783,6 +6803,7 @@ mod tests {
             network: NetworkView::Allowlist {
                 default_action: config::view::NetDefaultView::Deny,
                 ask_timeout: None,
+                ask_notice: None,
                 allow: vec!["github.com".into()],
                 deny: vec!["evil.com".into()],
                 builtin: vec!["cache.nixos.org".into()],
@@ -6935,6 +6956,7 @@ mod tests {
             network: NetworkView::Allowlist {
                 default_action: config::view::NetDefaultView::Deny,
                 ask_timeout: None,
+                ask_notice: None,
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
@@ -7284,6 +7306,7 @@ mod tests {
                 network: Some(AppNetworkView::Allowlist {
                     default_action: config::view::NetDefaultView::Deny,
                     ask_timeout: None,
+                    ask_notice: None,
                     allow: vec!["api.example.com".into(), "github.com".into()],
                     deny: vec!["github.com/secret".into()],
                     builtin: vec!["cache.nixos.org".into()],

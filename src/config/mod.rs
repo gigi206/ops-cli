@@ -1658,6 +1658,7 @@ fn validate_network_table(
                     policy
                         .with_default(DefaultAction::Ask)
                         .with_ask_timeout(timeout)
+                        .with_ask_notice(table.ask_notice.unwrap_or(true))
                 }
                 _ => policy, // `deny` / the `allowlist` alias: deny-by-default
             };
@@ -1665,6 +1666,12 @@ fn validate_network_table(
             if table.mode != "ask" && table.ask_timeout.is_some() {
                 warnings.push(format!(
                     "{source_label}: `ask_timeout` is only meaningful under `mode = \"ask\"` — ignored"
+                ));
+            }
+            // Likewise an `ask_notice` outside `ask` mode is moot (parity with `ask_timeout`).
+            if table.mode != "ask" && table.ask_notice.is_some() {
+                warnings.push(format!(
+                    "{source_label}: `ask_notice` is only meaningful under `mode = \"ask\"` — ignored"
                 ));
             }
             Some(NetworkPolicy::Allowlist(policy))
@@ -2936,6 +2943,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
+                ask_notice: None,
                 stats: None,
             })),
             ..RawConfig::default()
@@ -3213,6 +3221,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
+                ask_notice: None,
                 stats: None,
             })
         };
@@ -3277,6 +3286,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: timeout.map(|s| s.to_string()),
+                ask_notice: None,
                 stats: None,
             })
         };
@@ -3311,12 +3321,59 @@ mod tests {
             allow: vec![],
             deny: vec![],
             ask_timeout: Some("90s".into()),
+            ask_notice: None,
             stats: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
             w.iter().any(|m| m.contains("ask_timeout")),
             "a moot timeout must warn: {w:?}"
+        );
+    }
+
+    #[test]
+    fn ask_notice_defaults_on_and_can_be_silenced() {
+        use crate::allowlist::DefaultAction;
+        let ask = |notice: Option<bool>| {
+            NetworkField::Table(NetworkTable {
+                mode: "ask".into(),
+                allow: vec![],
+                deny: vec![],
+                ask_timeout: None,
+                ask_notice: notice,
+                stats: None,
+            })
+        };
+        let mut w = Vec::new();
+
+        // Absent `ask_notice` → the park notice is shown (the default).
+        let def = validate_network(&mut w, GLOBAL_CONFIG, ask(None)).unwrap();
+        assert!(matches!(&def, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Ask && p.ask_notice()));
+
+        // `ask_notice = false` silences it.
+        let off = validate_network(&mut w, GLOBAL_CONFIG, ask(Some(false))).unwrap();
+        assert!(matches!(&off, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Ask && !p.ask_notice()));
+
+        // `ask_notice = true` is the explicit default — still shown, no warning.
+        let on = validate_network(&mut w, GLOBAL_CONFIG, ask(Some(true))).unwrap();
+        assert!(matches!(&on, NetworkPolicy::Allowlist(p) if p.ask_notice()));
+        assert!(w.is_empty(), "valid ask_notice configs warn nothing: {w:?}");
+
+        // An `ask_notice` under a non-ask mode is moot — warned and ignored.
+        let moot = NetworkField::Table(NetworkTable {
+            mode: "deny".into(),
+            allow: vec![],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: Some(false),
+            stats: None,
+        });
+        let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
+        assert!(
+            w.iter().any(|m| m.contains("ask_notice")),
+            "a moot ask_notice must warn: {w:?}"
         );
     }
 
@@ -4795,6 +4852,7 @@ mod tests {
                     allow: vec![],
                     deny: vec![],
                     ask_timeout: None,
+                    ask_notice: None,
                     stats: None,
                 })),
                 ..RawConfig::default()
@@ -4894,6 +4952,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
                 ask_timeout: None,
+                ask_notice: None,
                 stats: None,
             })),
             secret: Some(raw_secret_section(secrets)),
@@ -4945,6 +5004,7 @@ mod tests {
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 ask_timeout: None,
+                ask_notice: None,
                 stats,
             })),
             ..RawConfig::default()
@@ -4998,6 +5058,7 @@ mod tests {
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 ask_timeout: None,
+                ask_notice: None,
                 stats: Some(false),
             })),
         );
@@ -5069,6 +5130,7 @@ mod tests {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
             ask_timeout: None,
+            ask_notice: None,
             stats: None,
         }))
     }

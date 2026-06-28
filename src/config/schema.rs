@@ -311,7 +311,8 @@ pub(crate) enum NetworkField {
 /// `*.domain` wildcards, exact URLs — classified later). Under `deny` mode `allow` lists what may
 /// reach; under `allow` mode `deny` lists what may not; under `ask` mode `allow` auto-passes and
 /// `deny` auto-fails, everything else parks. `deny` always wins. `ask_timeout` (a duration like
-/// `"90s"`/`"5m"`, or absent for an indefinite wait) bounds a parked `ask` request.
+/// `"90s"`/`"5m"`, or absent for an indefinite wait) bounds a parked `ask` request, and
+/// `ask_notice = false` silences the inline stderr park alert (the request still parks).
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
     pub(crate) mode: String,
@@ -321,6 +322,12 @@ pub(crate) struct NetworkTable {
     pub(crate) deny: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ask_timeout: Option<String>,
+    /// Whether to print the `ask`-mode park notice to stderr when a request parks. On by default; a
+    /// trusted layer may set `false` to silence the inline alert — the request still parks, answer it
+    /// with `ops net pending`. Inert outside `ask` mode. Absent means "inherit" — a layer that does
+    /// not mention it does not change the inherited value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ask_notice: Option<bool>,
     /// Whether the egress proxy records its per-host decision counters (`ops net stats`). On by
     /// default; a trusted layer may set `false` to turn the audit off (`true` re-enables it). Absent
     /// means "inherit" — a layer that does not mention it does not change the inherited value.
@@ -648,6 +655,7 @@ mod tests {
                 ],
                 deny: vec!["evil.nixos.org".into()],
                 ask_timeout: None,
+                ask_notice: None,
                 stats: None,
             }))
         );
@@ -663,6 +671,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: None,
+                ask_notice: None,
                 stats: None,
             }))
         );

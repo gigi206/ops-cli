@@ -519,10 +519,10 @@ impl ProxyCtx {
     }
 
     /// Wire the proxy to the launch's shared pending queue and manual-rule overlay, and turn on the
-    /// park notices. The launch ([`super::egress::start`]) passes the same
-    /// [`super::control::PendingState`] and [`super::control::ManualRules`] it serves on the control
-    /// socket, so a request parked here is answerable by `ops net pending` and a `--session` answer
-    /// it adds is honored here.
+    /// park notices unless the policy suppressed them (`[network] ask_notice = false`). The launch
+    /// ([`super::egress::start`]) passes the same [`super::control::PendingState`] and
+    /// [`super::control::ManualRules`] it serves on the control socket, so a request parked here is
+    /// answerable by `ops net pending` and a `--session` answer it adds is honored here.
     pub(crate) fn with_control(
         mut self,
         pending: Arc<super::control::PendingState>,
@@ -530,7 +530,7 @@ impl ProxyCtx {
     ) -> Self {
         self.pending = pending;
         self.manual = manual;
-        self.notices = true;
+        self.notices = self.policy.ask_notice();
         self
     }
 
@@ -599,6 +599,7 @@ pub(crate) fn union_with_nix_cache(user: EgressPolicy) -> EgressPolicy {
     EgressPolicy::new(allow, user.deny_rules().to_vec())
         .with_default(user.default_action())
         .with_ask_timeout(user.ask_timeout())
+        .with_ask_notice(user.ask_notice())
 }
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
@@ -838,23 +839,31 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
                         if ctx.notices {
                             let id = super::control::format_id(std::process::id(), seq);
                             // Paint the alert when stderr is a terminal (the canonical NO_COLOR / dumb
-                            // / is-tty predicate, borrowed from the shared palette): `ops:` bold +
-                            // underlined + red, the rest of the alert red, the copy-paste commands left
-                            // plain so they read cleanly.
+                            // / is-tty predicate, borrowed from the shared palette): `ops:` bold red
+                            // (no underline), the rest of the alert red, and the two copy-paste
+                            // commands yellow with a bold-yellow `allow`/`deny` label so the actions
+                            // stand out.
                             let colored = !crate::style::Palette::for_stream(
                                 std::io::IsTerminal::is_terminal(&std::io::stderr()),
                             )
                             .err
                             .is_empty();
-                            let (ops, red, rst) = if colored {
-                                ("\x1b[1;4;31m", "\x1b[31m", "\x1b[0m")
+                            let (ops, red, ylw, bylw, rst) = if colored {
+                                (
+                                    "\x1b[1;31m",
+                                    "\x1b[31m",
+                                    "\x1b[33m",
+                                    "\x1b[1;33m",
+                                    "\x1b[0m",
+                                )
                             } else {
-                                ("", "", "")
+                                ("", "", "", "", "")
                             };
                             eprintln!(
                                 "{ops}ops:{rst}{red} egress decision needed [{id}] \
-                                 {connect_host}:{port}{itarget}{rst} — allow: ops net pending allow \
-                                 {id}  |  deny: ops net pending deny {id}"
+                                 {connect_host}:{port}{itarget}{rst} — {bylw}allow{ylw}: ops net \
+                                 pending allow {id}{rst}  |  {bylw}deny{ylw}: ops net pending deny \
+                                 {id}{rst}"
                             );
                         }
                     },
@@ -1689,6 +1698,32 @@ mod tests {
             stats.snapshot()["upstream.test"].allow,
             1,
             "an egressed request must record one allow"
+        );
+    }
+
+    /// `with_control` turns the stderr park notices on, but honors a policy that silenced them
+    /// (`[network] ask_notice = false`) — and the union with the nix-cache set must preserve that.
+    #[test]
+    fn with_control_honors_the_policy_ask_notice() {
+        let pending = Arc::new(crate::sandbox::control::PendingState::new());
+        let manual = Arc::new(crate::sandbox::control::ManualRules::new());
+
+        // Default policy → the notice is on under `with_control`.
+        let on = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), EgressPolicy::default())
+            .unwrap()
+            .with_control(pending.clone(), manual.clone());
+        assert!(on.notices, "the park notice is on by default");
+
+        // A policy that silenced the notice → off, surviving the nix-cache union in `new`.
+        let off = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            EgressPolicy::default().with_ask_notice(false),
+        )
+        .unwrap()
+        .with_control(pending, manual);
+        assert!(
+            !off.notices,
+            "ask_notice = false suppresses the park notice"
         );
     }
 

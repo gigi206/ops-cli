@@ -206,10 +206,12 @@ pub(crate) enum NetworkView {
     /// is the verdict for an unmatched request; `builtin` is the always-allowed nix-cache set,
     /// surfaced so it is never a silent allowance; `ask_timeout` is the parked-request wait under
     /// the `ask` default (`Some("90s")`, `Some("none")` for an indefinite wait, or `None` when the
-    /// default is not `ask` so the field is moot).
+    /// default is not `ask` so the field is moot); `ask_notice` is whether the park notice prints
+    /// under the `ask` default (`None` when moot).
     Allowlist {
         default_action: NetDefaultView,
         ask_timeout: Option<String>,
+        ask_notice: Option<bool>,
         allow: Vec<String>,
         deny: Vec<String>,
         builtin: Vec<String>,
@@ -329,6 +331,7 @@ pub(crate) enum AppNetworkView {
     Allowlist {
         default_action: NetDefaultView,
         ask_timeout: Option<String>,
+        ask_notice: Option<bool>,
         allow: Vec<String>,
         deny: Vec<String>,
         builtin: Vec<String>,
@@ -669,6 +672,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
         NetworkPolicy::Allowlist(a) => NetworkView::Allowlist {
             default_action: a.default_action().into(),
             ask_timeout: ask_timeout_view(a),
+            ask_notice: ask_notice_view(a),
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             builtin: sandbox::nix_cache_hosts()
@@ -677,6 +681,16 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
                 .collect(),
         },
     }
+}
+
+/// Whether the `ask` park notice prints, projected for display: `None` when the default action is
+/// not `ask` (moot), else `Some(true)` (shown, the default) or `Some(false)` (silenced by
+/// `ask_notice = false`). Surfaced so a silenced notice is visible in `ops config`.
+fn ask_notice_view(a: &crate::allowlist::EgressPolicy) -> Option<bool> {
+    if a.default_action() != crate::allowlist::DefaultAction::Ask {
+        return None;
+    }
+    Some(a.ask_notice())
 }
 
 /// The ask-default's parked-request wait, projected for display: `None` when the default action is
@@ -761,6 +775,7 @@ fn app_view(
             NetworkPolicy::Allowlist(a) => AppNetworkView::Allowlist {
                 default_action: a.default_action().into(),
                 ask_timeout: ask_timeout_view(a),
+                ask_notice: ask_notice_view(a),
                 allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
                 deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
                 builtin: sandbox::nix_cache_hosts()
@@ -1068,6 +1083,7 @@ mod tests {
             network: NetworkView::Allowlist {
                 default_action: NetDefaultView::Deny,
                 ask_timeout: None,
+                ask_notice: None,
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 builtin: vec!["cache.nixos.org".into()],
@@ -1099,6 +1115,7 @@ mod tests {
                 network: Some(AppNetworkView::Allowlist {
                     default_action: NetDefaultView::Deny,
                     ask_timeout: None,
+                    ask_notice: None,
                     allow: vec!["api.example.com".into()],
                     deny: vec!["api.example.com/admin".into()],
                     builtin: vec!["cache.nixos.org".into()],
