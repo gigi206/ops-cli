@@ -1015,7 +1015,7 @@ mod tests {
             .filter(|r| r.source == RuleSourceView::Builtin)
             .map(|r| r.rule.as_str())
             .collect();
-        assert!(builtin.contains(&"cache.nixos.org"));
+        assert!(builtin.contains(&"cache.nixos.org:443"));
         assert!(rules
             .iter()
             .filter(|r| r.source == RuleSourceView::Builtin)

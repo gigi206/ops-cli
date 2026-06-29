@@ -2860,13 +2860,10 @@ fn render_net_decision(
     match decision {
         allowlist::Decision::AllowedBy(rule) => {
             let _ = writeln!(o, "{ok}ALLOWED{r}  {n}{url}{r}");
-            // Name the source when the allow came from the built-in nix-cache set rather than a
+            // Name the source when the allow came from the built-in self-equip set rather than a
             // user rule, so a pass the config did not declare is explained, not surprising.
             if builtin {
-                let _ = writeln!(
-                    o,
-                    "  {dim}by allow rule (built-in nix-cache):{r} {n}{rule}{r}"
-                );
+                let _ = writeln!(o, "  {dim}by allow rule (built-in):{r} {n}{rule}{r}");
             } else {
                 let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
             }
@@ -5939,15 +5936,15 @@ mod tests {
     }
 
     #[test]
-    fn net_decision_tags_a_built_in_nix_cache_allow_only_when_asked() {
+    fn net_decision_tags_a_built_in_allow_only_when_asked() {
         // The built-in flag controls one phrase on the ALLOWED rule line, in both directions, so a
-        // user-rule pass and a nix-cache-only pass read differently.
+        // user-rule pass and a built-in-only pass read differently.
         let p = style::Palette::plain();
         let rule = allowlist::classify("cache.nixos.org").unwrap();
         let d = allowlist::Decision::AllowedBy(&rule);
         let tagged = render_net_decision("https://cache.nixos.org/x", &d, true, &p);
         assert!(
-            tagged.contains("ALLOWED") && tagged.contains("(built-in nix-cache)"),
+            tagged.contains("ALLOWED") && tagged.contains("(built-in)"),
             "a built-in allow must be named:\n{tagged}"
         );
         let plain = render_net_decision("https://cache.nixos.org/x", &d, false, &p);

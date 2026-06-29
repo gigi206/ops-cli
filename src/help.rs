@@ -497,7 +497,7 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Reports ALLOWED/DENIED/WOULD ASK and the rule that decides it, against the effective\n\
-            egress policy a launch serves: the built-in nix-cache allow-set is included, and a\n\
+            egress policy a launch serves: the built-in self-equip allow-set is included, and a\n\
             declared credential injection is noted (by header and source, never the value, and not\n\
             resolved). Reflects the trust gate (an untrusted project's policy is dropped). No nix.",
     },
@@ -513,7 +513,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "-s, --source <src>",
-                "show only one source: config (the .ops.toml/global rules), builtin (the nix-cache set), or manual (live `--session` rules)",
+                "show only one source: config (the .ops.toml/global rules), builtin (the always-allowed self-equip set), or manual (live `--session` rules)",
             ),
             (
                 "-f, --filter <substr>",

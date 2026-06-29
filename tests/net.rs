@@ -81,7 +81,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     let out = fx.run(&["net", "rules"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // the mode header, the config allow/deny rules each tagged, and the built-in nix-cache set
+    // the mode header, the config allow/deny rules each tagged, and the built-in self-equip set
     assert!(stdout.contains("network: deny"), "{stdout}");
     assert!(stdout.contains("allow github.com  (config)"), "{stdout}");
     assert!(stdout.contains("allow *.nixos.org  (config)"), "{stdout}");
@@ -90,8 +90,8 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("allow cache.nixos.org  (builtin)"),
-        "the built-in nix-cache set must be listed and tagged:\n{stdout}"
+        stdout.contains("allow cache.nixos.org:443  (builtin)"),
+        "the built-in self-equip set must be listed and tagged:\n{stdout}"
     );
 
     // `--source builtin` shows only the built-in set; the config rules are gone.
@@ -1317,8 +1317,8 @@ fn net_rules_targets_an_app_effective_policy() {
         "the app's network overlay replaces the baseline's, so github.com must be gone:\n{a}"
     );
     assert!(
-        a.contains("allow cache.nixos.org  (builtin)"),
-        "the built-in nix-cache set is app-invariant and still listed:\n{a}"
+        a.contains("allow cache.nixos.org:443  (builtin)"),
+        "the built-in self-equip set is app-invariant and still listed:\n{a}"
     );
 
     // `--source config` + `--app`: the app's config rules only, no built-in set.
@@ -1361,18 +1361,18 @@ fn net_rules_targets_an_app_effective_policy() {
 }
 
 #[test]
-fn test_net_reflects_the_built_in_nix_cache_set_both_directions() {
+fn test_net_reflects_the_built_in_set_both_directions() {
     let fx = Fixture::new();
-    // A trusted project allowlist that lists one host which is ALSO a built-in nix-cache host.
+    // A trusted project allowlist that lists one host which is ALSO a built-in self-equip host.
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
-    // A nix-cache host the user did NOT list: allowed only by the built-in union, and tagged so.
+    // A built-in host the user did NOT list: allowed only by the built-in union, and tagged so.
     let cache = fx.run(&["test", "net", "https://cache.nixos.org/nix-cache-info"]);
     assert!(cache.status.success());
     let c = String::from_utf8_lossy(&cache.stdout);
     assert!(
-        c.contains("ALLOWED") && c.contains("built-in nix-cache"),
+        c.contains("ALLOWED") && c.contains("(built-in)"),
         "a cache host must pass via the built-in set and be tagged:\n{c}"
     );
 
@@ -1382,7 +1382,7 @@ fn test_net_reflects_the_built_in_nix_cache_set_both_directions() {
     assert!(user.status.success());
     let u = String::from_utf8_lossy(&user.stdout);
     assert!(
-        u.contains("ALLOWED") && !u.contains("(built-in nix-cache)"),
+        u.contains("ALLOWED") && !u.contains("(built-in)"),
         "a user-listed host must not be tagged built-in:\n{u}"
     );
 }

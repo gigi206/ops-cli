@@ -274,29 +274,35 @@ pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
 }
 
-/// The hosts of the built-in nix-cache allow-set, in allowlist-entry syntax. Sourced once so
+/// The hosts of the built-in self-equip allow-set, in allowlist-entry syntax. Sourced once so
 /// the policy (`nix_cache_allow`) and the `ops config` display can never drift.
 pub(crate) fn nix_cache_hosts() -> &'static [&'static str] {
     &[
-        "cache.nixos.org",         // binary substitution
-        "*.nixos.org",             // channels / releases / tarballs
-        "github.com",              // `github:NixOS/nixpkgs/<rev>` source
-        "api.github.com",          // the github tarball/redirect endpoint
-        "codeload.github.com",     // the github archive download host
-        "*.githubusercontent.com", // raw content / release assets
-        "search.devbox.sh",        // the nixhub metadata endpoint the resolver GETs
+        // All pinned to :443 — every one of these is HTTPS-only, so closing port 80 is pure
+        // least-privilege (a bare entry would otherwise also admit :80).
+        "cache.nixos.org:443",         // binary substitution
+        "*.nixos.org:443",             // channels / releases / tarballs
+        "github.com:443",              // `github:NixOS/nixpkgs/<rev>` source
+        "api.github.com:443",          // the github tarball/redirect endpoint
+        "codeload.github.com:443",     // the github archive download host
+        "*.githubusercontent.com:443", // raw content / release assets
+        "search.devbox.sh:443",        // the nixhub metadata endpoint the nix resolver GETs
+        "mise-versions.jdx.dev:443", // mise's version index — the resolver any `mise:` backend GETs
     ]
 }
 
-/// The built-in egress always permitted so a project can self-equip its nix toolchain even when
-/// untrusted: the binary cache, the nixpkgs source github fetches, and the nixhub metadata
-/// endpoint the resolver queries. Unioned into every policy regardless of trust (a user `deny`
+/// The built-in egress always permitted so a project can self-equip its toolchain even when
+/// untrusted: the nix binary cache, the nixpkgs source github fetches, the nixhub metadata
+/// endpoint the nix resolver queries, and mise's version index. Both self-equip front-ends —
+/// in-cage nix and the always-on `mise:` backends — run regardless of trust, so each front-end's
+/// version-resolution host belongs here; the artifact hosts they download from (npm, the per-tool
+/// release host) stay per-profile. Unioned into every policy regardless of trust (a user `deny`
 /// can still carve it). The exact set is refined empirically against a real self-equip and is
 /// shown in `ops config`, so it is never a silent allowance.
 fn nix_cache_allow() -> Vec<Rule> {
     nix_cache_hosts()
         .iter()
-        .map(|e| allowlist::classify(e).expect("a built-in nix-cache entry must be a valid rule"))
+        .map(|e| allowlist::classify(e).expect("a built-in self-equip entry must be a valid rule"))
         .collect()
 }
 
@@ -505,7 +511,7 @@ pub(crate) struct ProxyCtx {
 
 impl ProxyCtx {
     /// Build the context from the session CA and the launch's resolved egress policy. The policy
-    /// is augmented with the built-in nix-cache allow-set (regardless of trust). The server
+    /// is augmented with the built-in self-equip allow-set (regardless of trust). The server
     /// config advertises no ALPN, so the client speaks HTTP/1.1 and every request is re-checked
     /// as its own CONNECT — nothing multiplexes past the filter.
     pub(crate) fn new(ca: Arc<Ca>, user_policy: EgressPolicy) -> io::Result<Self> {
@@ -618,7 +624,7 @@ impl ProxyCtx {
     }
 }
 
-/// Append the built-in nix-cache allow rules to a policy's allow list (deny is unchanged, so a
+/// Append the built-in self-equip allow rules to a policy's allow list (deny is unchanged, so a
 /// user deny still wins over a built-in allow). The default action *and* the ask timeout are
 /// carried through unchanged — rebuilding the policy must not silently demote an allow-by-default
 /// (denylist) posture to deny-by-default, nor drop the configured ask timeout.
@@ -2406,7 +2412,7 @@ mod tests {
         );
     }
 
-    /// The built-in nix-cache allow-set is unioned into every policy (even an empty one) so an
+    /// The built-in self-equip allow-set is unioned into every policy (even an empty one) so an
     /// untrusted project can still self-equip, and is well-formed.
     #[test]
     fn nix_cache_allow_set_is_unioned_regardless_of_trust() {
