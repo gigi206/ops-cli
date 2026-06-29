@@ -217,7 +217,7 @@ fn transactional_confirmations_are_plain_when_captured() {
 #[test]
 fn app_targeted_net_test_is_plain_when_captured() {
     // `ops test net --app <name>` renders spans the flat read-only loop never reaches: the app
-    // scope label, the built-in-nix-cache tag, and the credential-injection note. A miswired
+    // scope label, the built-in-built-in tag, and the credential-injection note. A miswired
     // renderer (raw `colored()` instead of the captured-stream palette) would leak ANSI here only.
     let home = TmpDir::new();
     let cwd = TmpDir::new();
@@ -253,7 +253,7 @@ fn app_targeted_net_test_is_plain_when_captured() {
     );
     assert_no_ansi(&injected, "test net --app (injection note)");
 
-    // The built-in-nix-cache tag path (a cache host allowed only by the built-in union).
+    // The built-in-built-in tag path (a cache host allowed only by the built-in union).
     let builtin = run(
         &["test", "net", "--app", "demo", "https://cache.nixos.org/x"],
         home.path(),

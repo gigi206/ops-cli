@@ -77,14 +77,14 @@
 //! a prober that an exact byte string is a configured secret), defanged by a high-entropy value plus
 //! the resolution-side minimum length — kept distinct deliberately so a legitimately-confused agent
 //! is not blinded; and a secret value that happens to be a substring of legitimate traffic on the
-//! always-on nix-cache lane would refuse that request (low-probability, length-mitigated, nonzero).
+//! always-on built-in lane would refuse that request (low-probability, length-mitigated, nonzero).
 //!
 //! An **inbound** tripwire closes the reflection itself: when the response comes from a host an
 //! injection targets — the only place a configured secret can re-enter the cage by reflection — the
 //! proxy masks every verbatim occurrence of the value out of the relayed response, replacing it with
 //! an equal-length run of `*` ([`pump_redacting`]). So the agent receives the legitimate response
 //! content with the credential struck out, never the plaintext. It is scoped to injection-target
-//! responses precisely so the always-on nix-cache downloads are streamed untouched and the
+//! responses precisely so the always-on built-in downloads are streamed untouched and the
 //! mutate-on-match cannot corrupt unrelated traffic. The action differs from the outbound tripwire's
 //! — mask here, refuse there — not from a different security claim but because the response also
 //! carries content the agent legitimately needs, so refusing it would deny a real result; both are
@@ -275,8 +275,8 @@ pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>
 }
 
 /// The hosts of the built-in self-equip allow-set, in allowlist-entry syntax. Sourced once so
-/// the policy (`nix_cache_allow`) and the `ops config` display can never drift.
-pub(crate) fn nix_cache_hosts() -> &'static [&'static str] {
+/// the policy (`builtin_allow_rules`) and the `ops config` display can never drift.
+pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
     &[
         // All pinned to :443 — every one of these is HTTPS-only, so closing port 80 is pure
         // least-privilege (a bare entry would otherwise also admit :80).
@@ -299,8 +299,8 @@ pub(crate) fn nix_cache_hosts() -> &'static [&'static str] {
 /// release host) stay per-profile. Unioned into every policy regardless of trust (a user `deny`
 /// can still carve it). The exact set is refined empirically against a real self-equip and is
 /// shown in `ops config`, so it is never a silent allowance.
-fn nix_cache_allow() -> Vec<Rule> {
-    nix_cache_hosts()
+fn builtin_allow_rules() -> Vec<Rule> {
+    builtin_allow_hosts()
         .iter()
         .map(|e| allowlist::classify(e).expect("a built-in self-equip entry must be a valid rule"))
         .collect()
@@ -390,7 +390,7 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
 /// Whether the proxy may connect to `ip` for a request to `host` that the policy permitted via
 /// `deciding`. Public addresses are reachable; a private address is reachable only when the
 /// deciding rule named this exact host (a deliberate internal target — not a `*.domain`/regex/
-/// nix-cache match, which would turn into an SSRF wildcard); a blocked address never is.
+/// built-in match, which would turn into an SSRF wildcard); a blocked address never is.
 fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
     match classify_ip(ip) {
         IpClass::Public => true,
@@ -479,7 +479,7 @@ impl fmt::Debug for SecretNeedle {
 }
 
 /// The running context of the egress proxy: the cert machinery, the upstream-validation config,
-/// the resolved (and nix-cache-augmented) policy, the resolver, the per-socket timeout, and the
+/// the resolved (and built-in-augmented) policy, the resolver, the per-socket timeout, and the
 /// host-side credential injections.
 pub(crate) struct ProxyCtx {
     ca: Arc<Ca>,
@@ -525,7 +525,7 @@ impl ProxyCtx {
             ca,
             server_config,
             upstream: upstream_config(),
-            policy: union_with_nix_cache(user_policy),
+            policy: union_with_builtin(user_policy),
             resolve: Box::new(default_resolve),
             timeout: Duration::from_secs(30),
             injections: Vec::new(),
@@ -628,9 +628,9 @@ impl ProxyCtx {
 /// user deny still wins over a built-in allow). The default action *and* the ask timeout are
 /// carried through unchanged — rebuilding the policy must not silently demote an allow-by-default
 /// (denylist) posture to deny-by-default, nor drop the configured ask timeout.
-pub(crate) fn union_with_nix_cache(user: EgressPolicy) -> EgressPolicy {
+pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
     let mut allow = user.allow_rules().to_vec();
-    allow.extend(nix_cache_allow());
+    allow.extend(builtin_allow_rules());
     EgressPolicy::new(allow, user.deny_rules().to_vec())
         .with_default(user.default_action())
         .with_ask_timeout(user.ask_timeout())
@@ -1002,7 +1002,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     // 10. Response-side leak backstop: a configured secret can only re-enter the cage by being
     //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
     //     and later returns the credential). So mask the reflected value out of the response — but
-    //     only for a response from such a host. Every other response (notably the large nix-cache
+    //     only for a response from such a host. Every other response (notably the large built-in
     //     downloads) is streamed untouched, which both avoids the scan cost and confines the
     //     mutate-on-match to the one host the reflection threat actually lives on.
     let masks_reflection = !ctx.redactions.is_empty()
@@ -1742,7 +1742,7 @@ mod tests {
     }
 
     /// `with_control` turns the stderr park notices on, but honors a policy that silenced them
-    /// (`[network] ask_notice = false`) — and the union with the nix-cache set must preserve that.
+    /// (`[network] ask_notice = false`) — and the union with the built-in set must preserve that.
     #[test]
     fn with_control_honors_the_policy_ask_notice() {
         let pending = Arc::new(crate::sandbox::control::PendingState::new());
@@ -1754,7 +1754,7 @@ mod tests {
             .with_control(pending.clone(), manual.clone());
         assert!(on.notices, "the park notice is on by default");
 
-        // A policy that silenced the notice → off, surviving the nix-cache union in `new`.
+        // A policy that silenced the notice → off, surviving the built-in union in `new`.
         let off = ProxyCtx::new(
             Arc::new(Ca::ephemeral().unwrap()),
             EgressPolicy::default().with_ask_notice(false),
@@ -2415,11 +2415,11 @@ mod tests {
     /// The built-in self-equip allow-set is unioned into every policy (even an empty one) so an
     /// untrusted project can still self-equip, and is well-formed.
     #[test]
-    fn nix_cache_allow_set_is_unioned_regardless_of_trust() {
-        let cache = nix_cache_allow();
+    fn builtin_allow_set_is_unioned_regardless_of_trust() {
+        let cache = builtin_allow_rules();
         assert!(!cache.is_empty());
         // unioning into an empty (untrusted) policy still permits the cache host
-        let p = union_with_nix_cache(EgressPolicy::default());
+        let p = union_with_builtin(EgressPolicy::default());
         assert!(p.permits("cache.nixos.org", 443, "/nar/abc"));
         assert!(
             p.permits("channels.nixos.org", 443, "/"),

@@ -203,7 +203,7 @@ pub(crate) enum NetworkView {
     /// An empty netns — no network at all.
     Isolated,
     /// Filtered egress enforced by the host proxy through an empty-netns cage. `default_action`
-    /// is the verdict for an unmatched request; `builtin` is the always-allowed nix-cache set,
+    /// is the verdict for an unmatched request; `builtin` is the always-allowed built-in set,
     /// surfaced so it is never a silent allowance; `ask_timeout` is the parked-request wait under
     /// the `ask` default (`Some("90s")`, `Some("none")` for an indefinite wait, or `None` when the
     /// default is not `ask` so the field is moot); `ask_notice` is whether the park notice prints
@@ -226,7 +226,7 @@ pub(crate) enum NetRuleKind {
 }
 
 /// Where a listed egress rule came from: the resolved config (`.ops.toml`/global, after the trust
-/// gate), the always-allowed built-in nix-cache set, or `Manual` — a runtime rule a live `ask`
+/// gate), the always-allowed built-in set, or `Manual` — a runtime rule a live `ask`
 /// session remembered from a `--session` answer (it lives in that session's memory, not config).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuleSourceView {
@@ -244,7 +244,7 @@ pub(crate) struct NetRuleView {
 }
 
 /// Project a filtered-egress policy's rules for listing: the config allow rules, then the config
-/// deny rules, then the built-in nix-cache allow set — each tagged with its source. The built-in
+/// deny rules, then the built-in allow set — each tagged with its source. The built-in
 /// set is the same one [`network_view`] surfaces, so the two cannot drift. Only meaningful under a
 /// filtering posture; `shared`/`none` carry no rules, which the caller handles.
 pub(crate) fn net_rules_view(policy: &crate::allowlist::EgressPolicy) -> Vec<NetRuleView> {
@@ -263,7 +263,7 @@ pub(crate) fn net_rules_view(policy: &crate::allowlist::EgressPolicy) -> Vec<Net
             rule: r.to_string(),
         });
     }
-    for h in sandbox::nix_cache_hosts() {
+    for h in sandbox::builtin_allow_hosts() {
         rules.push(NetRuleView {
             kind: NetRuleKind::Allow,
             source: RuleSourceView::Builtin,
@@ -319,7 +319,7 @@ pub(crate) struct AppEnvVar {
 }
 
 /// An app overlay's own network posture, projected for display. An allowlist carries its declared
-/// allow/deny rules and the always-allowed built-in nix-cache set: the proxy unions that set into
+/// allow/deny rules and the always-allowed built-in set: the proxy unions that set into
 /// whatever policy is in effect at launch, so for an app it is part of what `ops app <name>` can
 /// reach — and the baseline `network` section shows it only when the *baseline* is an allowlist, so
 /// a profile that puts its allowlist in the app overlay (the common case) would otherwise show it
@@ -664,7 +664,7 @@ fn engine_channel(resolved: &Resolved) -> ChannelView {
 }
 
 /// Project the network posture, surfacing an allowlist's allow/deny rules and the always-allowed
-/// nix-cache set so the effective policy is visible at a glance.
+/// built-in set so the effective policy is visible at a glance.
 fn network_view(network: &NetworkPolicy) -> NetworkView {
     match network {
         NetworkPolicy::Shared => NetworkView::Shared,
@@ -675,7 +675,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             ask_notice: ask_notice_view(a),
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
-            builtin: sandbox::nix_cache_hosts()
+            builtin: sandbox::builtin_allow_hosts()
                 .iter()
                 .map(|h| h.to_string())
                 .collect(),
@@ -778,7 +778,7 @@ fn app_view(
                 ask_notice: ask_notice_view(a),
                 allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
                 deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
-                builtin: sandbox::nix_cache_hosts()
+                builtin: sandbox::builtin_allow_hosts()
                     .iter()
                     .map(|h| h.to_string())
                     .collect(),
@@ -1009,7 +1009,7 @@ mod tests {
             && r.kind == NetRuleKind::Deny
             && r.source == RuleSourceView::Config));
         // Every built-in entry is an allow tagged `builtin`, and the set matches the one
-        // `network_view` surfaces (the same `nix_cache_hosts` call) so the two cannot drift.
+        // `network_view` surfaces (the same `builtin_allow_hosts` call) so the two cannot drift.
         let builtin: Vec<&str> = rules
             .iter()
             .filter(|r| r.source == RuleSourceView::Builtin)
@@ -1020,7 +1020,7 @@ mod tests {
             .iter()
             .filter(|r| r.source == RuleSourceView::Builtin)
             .all(|r| r.kind == NetRuleKind::Allow));
-        assert_eq!(builtin.len(), sandbox::nix_cache_hosts().len());
+        assert_eq!(builtin.len(), sandbox::builtin_allow_hosts().len());
     }
 
     #[test]

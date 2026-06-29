@@ -1302,7 +1302,7 @@ fn net_rules_targets_an_app_effective_policy() {
 
     // `--app demo`: the app's effective policy. The header names the scope; its own allow/deny
     // appear; the baseline's github.com is GONE (the app's network replaces it); the built-in
-    // nix-cache set is still unioned (app-invariant).
+    // built-in set is still unioned (app-invariant).
     let app = fx.run(&["net", "rules", "--app", "demo"]);
     assert!(app.status.success());
     let a = String::from_utf8_lossy(&app.stdout);

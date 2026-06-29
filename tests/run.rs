@@ -703,7 +703,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     );
 
     // DENIED (teeth): the same request shape to a non-allowlisted host is refused with a 403 at
-    // the proxy. `example.com` is not in the allow list nor the built-in nix-cache set.
+    // the proxy. `example.com` is not in the allow list nor the built-in set.
     let denied = ops_in(
         project.path(),
         data.path(),
@@ -1229,7 +1229,7 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
 
     // self-equip jq through the MITM proxy: mise must trust the proxy's per-session leaf
     // (devbox.sh metadata + cache.nixos.org substitution both ride the allowlist's built-in
-    // nix-cache set).
+    // built-in set).
     let installed = ops_in(
         project.path(),
         data.path(),
@@ -1306,7 +1306,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     // cannot reach — it forces BOTH (1) the wrap composition (the auto-equip wrap nests *inside*
     // the egress wrap, so the forwarder is up before the install fetches) and (2) mise's *own*
     // reqwest through the MITM proxy on a direct download (aqua fetches from github, already in
-    // the built-in nix-cache allow-set), a TLS path nix:'s libcurl never exercises. Teeth: rg
+    // the built-in allow-set), a TLS path nix:'s libcurl never exercises. Teeth: rg
     // runs, so mise's reqwest trusted the proxy's per-session CA and the forwarder bridged the
     // empty netns. Short tags keep the egress socket path under `SUN_LEN`. Skips (never fails)
     // when the host cannot sandbox or the cache is unreachable.
@@ -1375,7 +1375,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     // The load-bearing proof of the fresh-profiles increment: an app declaring its tool as a
     // `[packages] mise:` backend (the form the shipped profiles use) equips it *globally* via
     // `mise use -g` at the `ops app` launch and runs it fresh, under the app's *own* network
-    // allowlist — claude-code's aqua release fetch rides the built-in nix-cache allow-set
+    // allowlist — claude-code's aqua release fetch rides the built-in allow-set
     // (github / *.githubusercontent.com), never a wide-open net. Teeth: `claude --version` prints
     // the upstream version through the empty-netns MITM, proving (1) the global `[packages] mise:`
     // equip path end-to-end, (2) the nixpkgs unfree blocker is gone (this is an aqua standalone
@@ -1433,7 +1433,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("Claude Code"),
         "a fresh `mise:` package app must equip claude-code via `mise use -g` and run it under its \
-         own allowlist (the aqua release fetch riding the nix-cache allow-set): {log}"
+         own allowlist (the aqua release fetch riding the built-in allow-set): {log}"
     );
 }
 
@@ -1539,7 +1539,7 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
     // *own* network allowlist. The ref is a real, pinned flake (`nixpkgs#hello`); `hello` prints
     // "Hello, world!" through the empty-netns MITM, proving the parse → in-cage build →
     // out-link-on-PATH → run chain. Honest limitation: this flake's inputs (the nixpkgs tarball
-    // from codeload, the `hello` closure from cache.nixos.org) ride the *built-in* nix-cache
+    // from codeload, the `hello` closure from cache.nixos.org) ride the *built-in* built-in
     // allow-set, so it does NOT exercise a fetch from a host *outside* that set — the uv2nix/PyPI
     // friction a real profile like hermes hits is a heavier manual validation, not covered here.
     //

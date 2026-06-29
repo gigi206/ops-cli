@@ -134,7 +134,7 @@ pub(crate) fn wrap_command(socat: &Path, bash: &Path, cmd: Vec<OsString>) -> Vec
 /// Start the host proxy for `policy` on a fresh per-launch Unix socket, write its CA, and
 /// return the cage wiring plus a guard owning the on-disk artifacts. The proxy is serving
 /// before this returns (the listener is bound and a thread is accepting), so the cage's
-/// first connection is never refused. The built-in nix-cache allow-set is added by the
+/// first connection is never refused. The built-in allow-set is added by the
 /// proxy regardless of trust, so an untrusted project can still self-equip.
 ///
 /// `secrets` are resolved here, host-side: each source ([`SecretSource`]) is read to a

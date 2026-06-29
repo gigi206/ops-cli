@@ -1059,7 +1059,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
 
     // The network posture — a security field. `shared` keeps the host network; `none` cuts it
     // off; an `allowlist` lists exactly what egress is permitted (deny wins over allow), plus the
-    // always-allowed nix-cache set so the self-equip allowance is never silent.
+    // always-allowed built-in set so the self-equip allowance is never silent.
     let net_tag = provenance_tag(view.network_origin, pal);
     match &view.network {
         NetworkView::Shared => {
@@ -2709,7 +2709,7 @@ fn fold_app_overlay(resolved: &mut config::Resolved, name: &str) -> Result<(), S
 /// `ops test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
 /// report the rule that decides it. A diagnostic for the egress allowlist — it reflects the trust
 /// gate (an untrusted project's policy is dropped, so the *effective* posture is shown), folds in a
-/// named app's overlay when `--app` is given, includes the built-in nix-cache allow-set the proxy
+/// named app's overlay when `--app` is given, includes the built-in allow-set the proxy
 /// always unions, and notes a credential the proxy would inject (by header and source, never its
 /// value). A bare host with no scheme is completed to `https://`. No launch, no nix, no network.
 /// Exit status is informational only (success), since "the URL would be denied" is a valid answer.
@@ -2798,9 +2798,9 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 }
             };
             // Build the *effective* policy a launch serves: the user rules plus the built-in
-            // nix-cache allow-set the proxy always unions — the single source of truth, so the
+            // built-in allow-set the proxy always unions — the single source of truth, so the
             // verdict here matches the wire (e.g. a cache host reads as allowed, not deny-default).
-            let effective = sandbox::union_with_nix_cache(policy.clone());
+            let effective = sandbox::union_with_builtin(policy.clone());
             // A one-line header so an ALLOWED/DENIED verdict on an arbitrary URL is
             // self-explanatory — it names the default the policy applies to an unmatched request.
             let mode = match effective.default_action() {
@@ -2816,7 +2816,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
             };
             println!("{h}network{scope}:{r} {mode}");
             let decision = effective.explain(&host, port, &path);
-            // Tag a request allowed *only* by the built-in nix-cache set (not the user's own
+            // Tag a request allowed *only* by the built-in set (not the user's own
             // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
             // only allow rules, so an effective `AllowedBy` the user policy does not also allow can
             // only be the built-in set. Discriminate on the user verdict's own variant (definitely
@@ -3909,7 +3909,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     }
 
     // The effective posture decides the mode word and whether there are rules at all. The built-in
-    // nix-cache set is unioned by the proxy, which runs only under a filtering posture, so it is
+    // built-in set is unioned by the proxy, which runs only under a filtering posture, so it is
     // absent (with every other rule) under `shared`/`none`.
     let (mode, all_rules) = match &resolved.network {
         config::NetworkPolicy::Shared => ("shared", Vec::new()),
@@ -7458,7 +7458,7 @@ mod tests {
     #[test]
     fn config_render_shows_an_app_allowlist_compactly_then_expands_under_details() {
         // An app overlay's allowlist is a one-line count by default and expands to its rules under
-        // `--details`. The expansion includes the built-in nix-cache set, which the baseline
+        // `--details`. The expansion includes the built-in set, which the baseline
         // `network` section does not show here (the baseline is `shared`), so this is the only place
         // a profile's app-overlay allowlist surfaces what `ops app <name>` can actually reach.
         use config::view::*;

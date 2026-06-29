@@ -492,11 +492,11 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
         stdout.contains("deny") && stdout.contains("evil.nixos.org"),
         "stdout:\n{stdout}"
     );
-    // the built-in nix-cache allow-set is shown (always allowed so self-equip works), so it
+    // the built-in allow-set is shown (always allowed so self-equip works), so it
     // is never a silent allowance.
     assert!(
         stdout.contains("built-in") && stdout.contains("cache.nixos.org"),
-        "the built-in nix-cache allow-set must be shown:\n{stdout}"
+        "the built-in allow-set must be shown:\n{stdout}"
     );
     // stats default on under a filtering posture.
     assert!(
@@ -1565,7 +1565,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     let fx = Fixture::new();
     // A profile (trusted by location) whose allowlist lives in the app overlay — the common case,
     // since the baseline stays `shared`. The compact view shows the rule counts; `--details`
-    // expands the individual rules plus the always-allowed built-in nix-cache set (which the
+    // expands the individual rules plus the always-allowed built-in set (which the
     // baseline `network` section never prints here, because the baseline is not an allowlist).
     fx.write_profile(
         "demo-app",
@@ -1600,7 +1600,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     );
     assert!(
         stdout.contains("built-in") && stdout.contains("cache.nixos.org"),
-        "--details must surface the always-allowed built-in nix-cache set:\n{stdout}"
+        "--details must surface the always-allowed built-in set:\n{stdout}"
     );
 }
 
