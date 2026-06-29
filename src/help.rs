@@ -562,7 +562,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "pending"],
         synopsis:
-            "ops net pending [-a <app>] [--json] | ops net pending allow|deny <id>|--all [-a <app>] [--save ...]",
+            "ops net pending [-a <app>] [--json] | ops net pending allow|deny <id>|--all [-a <app>] [--save ...] | ops net pending watch [-i <secs>]",
         summary: "list and answer egress requests parked by the `ask` posture",
         options: &[
             ("-a, --app <name>", "limit the listing / `--all` drain to one app's session(s)"),
@@ -573,8 +573,24 @@ const PAGES: &[Page] = &[
             verb, lists what is parked across every live ask-mode session, each with a `<pid>.<seq>`\n\
             id; identical retries of one URL collapse to a single `×N` line. `allow <id>`/`deny <id>`\n\
             answer that whole destination (every identical retry at once); `allow|deny --all` drain\n\
-            every parked request. `--app <name>` scopes the listing or the `--all` drain to one\n\
-            app's session(s). No launch, no nix, no network.",
+            every parked request; `watch` redraws the listing live. `--app <name>` scopes the\n\
+            listing or the `--all` drain to one app's session(s). No launch, no nix, no network.",
+    },
+    Page {
+        path: &["net", "pending", "watch"],
+        synopsis: "ops net pending watch [-i|--interval <secs>] [-a|--app <name>]",
+        summary: "redraw the parked-request listing live until interrupted",
+        options: &[
+            ("-i, --interval <secs>", "seconds between refreshes (default 2)"),
+            ("-a, --app <name>", "limit the listing to one app's session(s)"),
+        ],
+        details:
+            "Polls the same live control sockets as `ops net pending` and redraws the listing in\n\
+            place every few seconds (top-style — the terminal scrollback is preserved), so a parked\n\
+            request appears as soon as an agent triggers it. Answer it from another shell with\n\
+            `ops net pending allow|deny <id>`; the watch picks up the change on the next refresh.\n\
+            Ctrl-C quits. Needs a terminal — for a pipe or a script use the one-shot listing (`--json`).\n\
+            No launch, no nix, no network.",
     },
     Page {
         path: &["net", "pending", "allow"],

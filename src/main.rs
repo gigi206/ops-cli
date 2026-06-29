@@ -2956,6 +2956,7 @@ fn net_pending(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("allow") => net_pending_answer(Verdict::Allow, &args[1..]),
         Some("deny") => net_pending_answer(Verdict::Deny, &args[1..]),
+        Some("watch") => net_pending_watch(&args[1..]),
         // No verb (or `--json`): list the pending requests.
         _ => net_pending_list(args),
     }
@@ -3026,6 +3027,26 @@ fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections
         .collect()
 }
 
+/// Query the live control sockets for the parked requests, scoped to one app's session(s) when
+/// `app` is set, and pair them with their registry context (`(pid, project, label)`). The shared
+/// gather step behind both the one-shot listing and the `watch` loop. No launch / nix / network.
+fn collect_pending(
+    data_dir: &Path,
+    app: Option<&str>,
+) -> (
+    Vec<sandbox::control::SessionPending>,
+    Vec<(u32, PathBuf, String)>,
+) {
+    let mut sessions = sandbox::control::list_all(data_dir);
+    // `--app <name>` scopes the listing to that app's session(s) (the registry maps pid → app).
+    if let Some(name) = app {
+        let pids = session_pids_for_app(data_dir, name);
+        sessions.retain(|s| pids.contains(&s.pid));
+    }
+    let context = pending_session_context(data_dir);
+    (sessions, context)
+}
+
 /// `ops net pending [-a|--app <name>] [--json]`: list every reachable ask-mode session's parked
 /// requests, grouped by session (with its agent/project context); identical retries of one URL
 /// collapse to a single destination carrying the `<pid>.<seq>` id to answer it (and, in `--json`, a
@@ -3058,13 +3079,7 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut sessions = sandbox::control::list_all(&data_dir);
-    // `--app <name>` scopes the listing to that app's session(s) (the registry maps pid → app).
-    if let Some(name) = &app {
-        let pids = session_pids_for_app(&data_dir, name);
-        sessions.retain(|s| pids.contains(&s.pid));
-    }
-    let context = pending_session_context(&data_dir);
+    let (sessions, context) = collect_pending(&data_dir, app.as_deref());
     let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
 
     if json {
@@ -3106,6 +3121,102 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
         render_pending(&sessions, &context, app.as_deref(), &pal)
     );
     ExitCode::SUCCESS
+}
+
+/// The parsed `ops net pending watch` flags: how often to refresh, and an optional app scope.
+#[derive(Debug)]
+struct WatchArgs {
+    interval: Duration,
+    app: Option<String>,
+}
+
+/// Parse `watch [-i|--interval <secs>] [-a|--app <name>]`. Pure (no I/O), so every reject path is
+/// unit-testable without a terminal or entering the loop: a missing value, a non-numeric or zero
+/// interval, or an unknown flag is an error. The refresh defaults to 2 seconds.
+fn parse_watch_args(args: &[OsString]) -> Result<WatchArgs, String> {
+    let mut interval_secs: u64 = 2;
+    let mut app: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_str() {
+            Some("-i") | Some("--interval") => {
+                let v = it.next().ok_or("`--interval` needs a value in seconds")?;
+                let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                    format!(
+                        "invalid interval `{}` — expected a whole number of seconds",
+                        v.to_string_lossy()
+                    )
+                })?;
+                if secs == 0 {
+                    return Err("interval must be at least 1 second".into());
+                }
+                interval_secs = secs;
+            }
+            Some("-a") | Some("--app") => {
+                let name = it.next().ok_or("`--app` needs an app name")?;
+                app = Some(name.to_string_lossy().into_owned());
+            }
+            _ => {
+                return Err(format!(
+                    "usage: {}",
+                    help::synopsis_of(&["net", "pending", "watch"])
+                ));
+            }
+        }
+    }
+    Ok(WatchArgs {
+        interval: Duration::from_secs(interval_secs),
+        app,
+    })
+}
+
+/// `ops net pending watch [-i|--interval <secs>] [-a|--app <name>]`: redraw the parked-request
+/// listing in place on an interval (default 2s) until interrupted. A `top`-style poll of the same
+/// live control sockets `ops net pending` queries — no launch, nix, or network, and nothing is held
+/// open between ticks. Requires a terminal (the frame is redrawn in place); the one-shot listing
+/// (optionally `--json`) is the path for a pipe or a script.
+fn net_pending_watch(args: &[OsString]) -> ExitCode {
+    use std::io::Write as _;
+    let parsed = match parse_watch_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let is_tty = std::io::stdout().is_terminal();
+    if !is_tty {
+        eprintln!(
+            "ops: `watch` needs a terminal — use `ops net pending` for a one-shot listing, \
+             or `--json` to script it"
+        );
+        return ExitCode::from(2);
+    }
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pal = style::Palette::for_stream(is_tty);
+    let (dim, r) = (pal.dim, pal.reset);
+    let secs = parsed.interval.as_secs();
+    loop {
+        let (sessions, context) = collect_pending(&data_dir, parsed.app.as_deref());
+        let body = render_pending(&sessions, &context, parsed.app.as_deref(), &pal);
+        // `top`-style in-place redraw: home the cursor, paint the frame, then clear from the cursor to
+        // the end of the screen. This keeps the terminal scrollback intact (unlike `\x1b[3J`) and
+        // erases any trailing lines a shorter frame leaves behind, with no full-screen blank flicker.
+        // Interrupting mid-watch just leaves the last frame on screen — no cleanup is owed.
+        let mut out = std::io::stdout().lock();
+        let _ = write!(
+            out,
+            "\x1b[H{dim}watching · refresh {secs}s · Ctrl-C to quit{r}\n{body}\x1b[J"
+        );
+        let _ = out.flush();
+        std::thread::sleep(parsed.interval);
+    }
 }
 
 /// One collapsed group of identical pending requests (same `host:port/path`): the representative id
@@ -6019,6 +6130,42 @@ mod tests {
         assert!(out.contains("ops net pending allow <id>"), "{out}");
         // The footer also advertises the bulk drain.
         assert!(out.contains("ops net pending allow|deny --all"), "{out}");
+    }
+
+    #[test]
+    fn parse_watch_args_defaults_and_overrides() {
+        let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+
+        // No flags → the 2s default, no app scope.
+        let d = parse_watch_args(&[]).expect("bare watch parses");
+        assert_eq!(d.interval, Duration::from_secs(2));
+        assert!(d.app.is_none());
+
+        // `-i` / `--interval` set the refresh; `-a` / `--app` set the scope; both spellings work.
+        let a = parse_watch_args(&osv(&["-i", "5", "-a", "claude-code"])).unwrap();
+        assert_eq!(a.interval, Duration::from_secs(5));
+        assert_eq!(a.app.as_deref(), Some("claude-code"));
+        let b = parse_watch_args(&osv(&["--interval", "10", "--app", "codex"])).unwrap();
+        assert_eq!(b.interval, Duration::from_secs(10));
+        assert_eq!(b.app.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn parse_watch_args_rejects_bad_input() {
+        let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+
+        // A zero interval would busy-loop — refused, not silently clamped.
+        assert!(parse_watch_args(&osv(&["-i", "0"])).is_err());
+        // A non-numeric interval is an error naming the offending value.
+        assert!(parse_watch_args(&osv(&["-i", "soon"]))
+            .unwrap_err()
+            .contains("soon"));
+        // A flag missing its value is an error, not a panic.
+        assert!(parse_watch_args(&osv(&["-i"])).is_err());
+        assert!(parse_watch_args(&osv(&["--app"])).is_err());
+        // An unknown flag (e.g. the contradictory `--json`) is refused with a usage hint.
+        assert!(parse_watch_args(&osv(&["--json"])).is_err());
+        assert!(parse_watch_args(&osv(&["bogus"])).is_err());
     }
 
     #[test]
