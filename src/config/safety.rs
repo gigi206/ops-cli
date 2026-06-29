@@ -19,9 +19,10 @@ use std::path::Path;
 /// checked. `mode` is the full `st_mode` (type bits included), so the
 /// regular-file test reads its `S_IFMT` field.
 fn verdict(file_uid: u32, mode: u32, euid: u32) -> io::Result<()> {
-    // A non-regular file (FIFO, socket, device, directory) must never be loaded:
-    // a FIFO would hang every command waiting on a writer, a device could feed
-    // back attacker-controlled bytes. The owner/mode checks alone do not catch it.
+    // A non-regular file (FIFO, socket, device, directory) must never be loaded: a device could
+    // feed back attacker-controlled bytes, a FIFO would stall a reader. The owner/mode checks alone
+    // do not catch it. (The descriptor is opened `O_NONBLOCK` so a writer-less FIFO reaches this
+    // refusal instead of hanging the open — see `read_safe_bytes`.)
     if mode & libc::S_IFMT != libc::S_IFREG {
         return Err(refuse("not a regular file"));
     }
@@ -62,7 +63,15 @@ pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> 
 /// later parse act on exactly these bytes).
 pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let mut f = std::fs::File::open(path).map_err(|e| with_path(e, path))?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Open non-blocking: a writer-less FIFO would otherwise hang this `O_RDONLY` open indefinitely,
+    // before the verdict below could refuse it as a non-regular file. For a regular file
+    // `O_NONBLOCK` is a no-op on reads, so the bytes read are unaffected.
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| with_path(e, path))?;
     check_safe_file(&f, path)?;
     let mut out = Vec::new();
     f.read_to_end(&mut out).map_err(|e| with_path(e, path))?;
@@ -85,6 +94,24 @@ mod tests {
     /// type bits, so `verdict`'s regular-file gate sees a real file.
     fn reg(perm: u32) -> u32 {
         perm | libc::S_IFREG
+    }
+
+    #[test]
+    fn read_safe_bytes_refuses_a_fifo_without_hanging() {
+        // A writer-less FIFO must be refused as a non-regular file, not hang the open — the whole
+        // point of the non-blocking open. (Were the open blocking, this test would deadlock.)
+        use std::ffi::CString;
+        let tmp = TmpDir::new();
+        let p = tmp.join("cfg");
+        let c = CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo({p:?}) failed"
+        );
+        let err = read_safe_bytes(&p).expect_err("a FIFO must be refused, not read");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("not a regular file"));
     }
 
     #[test]

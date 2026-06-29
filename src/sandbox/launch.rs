@@ -1754,9 +1754,10 @@ fn build(
     let mut extra_binds = egress_binds;
     extra_binds.extend(gui_binds);
 
-    // Environment, lowest precedence first: host passthrough, then ops's hermetic CA bundle,
-    // then a trusted project's mise `[env]`, then the egress machinery (proxy + CA), then the
-    // `.ops.toml` `[env]` (the ops-native config has the final say). The structural
+    // Environment, lowest precedence first: host passthrough, then ops's hermetic CA bundle, then
+    // the Wayland GUI keys, then the non-nix auto-equip variable, then a trusted project's mise
+    // `[env]`, then the egress machinery (proxy + CA), then the `.ops.toml` `[env]` (the ops-native
+    // config has the final say). The structural
     // HOME/PATH/... are added by the assembler, which upserts all of these over them. An
     // untrusted config has already lost its reserved keys upstream — including the proxy and
     // CA keys — so it can neither redirect the egress nor swap the CA; a trusted config
@@ -2592,6 +2593,7 @@ mod tests {
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
         }
@@ -3033,8 +3035,9 @@ mod tests {
             net_policy(&crate::config::NetworkPolicy::Isolated),
             NetPolicy::Isolated
         );
-        // until the filtering proxy lands, an allowlist posture is fail-closed: it maps
-        // to isolation (no network), never to the shared host network.
+        // an allowlist posture maps to an isolated (empty) namespace by design — the Model-B
+        // foundation: the cage's only egress is the bound socket to the host filtering proxy,
+        // never the shared host network.
         assert_eq!(
             net_policy(&crate::config::NetworkPolicy::Allowlist(
                 crate::allowlist::EgressPolicy::default()

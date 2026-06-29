@@ -37,7 +37,8 @@ pub(crate) struct RawConfig {
     /// network namespace), `"shared"` (the host network, the default when unset), `"deny"`
     /// (filtered egress, deny-by-default — only the built-in hosts reach), or `"allow"`
     /// (filtered egress, allow-by-default — a denylist, every public host reaches except the
-    /// carve-outs) — or a table that adds the `allow`/`deny` carve-out lists to a `deny`/`allow`
+    /// carve-outs), or `"ask"` (filtered egress, park-and-confirm — an undecided host blocks until
+    /// you answer) — or a table that adds the `allow`/`deny` carve-out lists to a `deny`/`allow`
     /// (or the `"allowlist"` alias of `deny`) mode. A security field: honored from the global
     /// config or a trusted project, ignored from an untrusted one, since narrowing or widening
     /// the network is a confidentiality choice an untrusted project may not make.

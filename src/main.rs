@@ -2247,10 +2247,13 @@ fn report_write_trust(
     }
 }
 
-/// Whether a dotted config key names a security-relevant field. Everything but the free `env`
-/// table is gated on trust, so setting one on an untrusted file is worth a note.
+/// Whether a dotted config key names a security-relevant field. The only field applied without
+/// trust (minus the untrusted-env denylist) is the free `env` table — both the baseline `env.*`
+/// and an app's `app.<name>.env.*`; everything else is gated, so setting one on an untrusted file
+/// is worth a note.
 fn is_security_key(key: &str) -> bool {
-    key.split('.').next() != Some("env")
+    let segs: Vec<&str> = key.split('.').collect();
+    !matches!(segs.as_slice(), ["env", ..] | ["app", _, "env", ..])
 }
 
 /// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the global
@@ -4075,6 +4078,15 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
 /// `scope_path`, same trust-store, same "existing config must be trusted" rule — so a save that would
 /// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (ops's
 /// append is then the sole delta).
+/// The write-side trust gate for a `--local` save: an existing-but-untrusted (or changed) project
+/// config must not be silently blessed by an appended rule — the user reviews and re-trusts it
+/// first. An absent config (bootstrap) or an already-trusted one is fine, so ops's edit is the sole
+/// delta from the trusted bytes. Pure on the `(exists, state)` pair, so the refuse/allow matrix is
+/// unit-testable without a filesystem.
+fn local_save_permitted(exists: bool, state: trust::TrustState) -> bool {
+    !exists || state == trust::TrustState::Trusted
+}
+
 fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
     use config::manage::{self, Scope};
     let store = trust::default_store_dir().ok_or((
@@ -4084,7 +4096,7 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
             .to_string(),
     ))?;
     let path = manage::scope_path(&Scope::Local, cwd).map_err(|e| (1, e.to_string()))?;
-    if path.exists() && !matches!(trust::state(&store, &path), trust::TrustState::Trusted) {
+    if !local_save_permitted(path.exists(), trust::state(&store, &path)) {
         return Err((
             2,
             format!(
@@ -4314,7 +4326,7 @@ fn persist_egress_rule(
     // — the user reviews and trusts it first. Absent or already-trusted is fine: ops's edit is then
     // the sole delta from the trusted bytes.
     if let Some(store) = &store {
-        if path.exists() && !matches!(trust::state(store, &path), trust::TrustState::Trusted) {
+        if !local_save_permitted(path.exists(), trust::state(store, &path)) {
             return Err((
                 2,
                 format!(
@@ -5227,6 +5239,12 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Exactly one (optional) target. A trailing token — a mistyped flag or a second target —
+    // is rejected, not silently swallowed (so `ops upgrade nix mise` does not roll only `nix`).
+    if args.len() > 1 {
+        eprintln!("ops: usage: {}", help::synopsis("upgrade"));
+        return ExitCode::from(2);
+    }
 
     let Some(layout) = store::Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
@@ -5734,6 +5752,33 @@ mod tests {
         assert_eq!(classify_probe_exit(2), Userns::CapStripped);
         assert_eq!(classify_probe_exit(1), Userns::Unsupported);
         assert_eq!(classify_probe_exit(42), Userns::Unsupported);
+    }
+
+    #[test]
+    fn local_save_gate_blocks_only_an_existing_untrusted_config() {
+        use trust::TrustState::{Changed, Trusted, Untrusted};
+        // absent config → allowed (a `--local` save bootstraps it, then trusts it)
+        assert!(local_save_permitted(false, Untrusted));
+        // already-trusted config → allowed (ops's append is the sole delta)
+        assert!(local_save_permitted(true, Trusted));
+        // existing untrusted/changed config → refused (never silently bless it)
+        assert!(!local_save_permitted(true, Untrusted));
+        assert!(!local_save_permitted(true, Changed));
+    }
+
+    #[test]
+    fn is_security_key_treats_only_the_env_table_as_free() {
+        // the free `env` table — baseline and per-app — is not gated
+        assert!(!is_security_key("env.FOO"));
+        assert!(!is_security_key("env"));
+        assert!(!is_security_key("app.claude.env.FOO"));
+        // everything else is a security field, including an app's own security overlay
+        assert!(is_security_key("binds"));
+        assert!(is_security_key("network"));
+        assert!(is_security_key("app.claude.network"));
+        assert!(is_security_key("app.claude.cmd"));
+        // a bare app table (no field) is gated too
+        assert!(is_security_key("app.claude"));
     }
 
     #[test]
@@ -6383,6 +6428,7 @@ mod tests {
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
         };

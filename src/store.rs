@@ -1009,10 +1009,35 @@ pub(crate) fn provision(
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    select_marked_output(layout, &stdout, attr, marker)
+}
+
+/// Pick, among the logical store paths a build printed (`--print-out-paths` may list several —
+/// e.g. a `-man` beside the binary), the one whose tree carries `marker`.
+///
+/// The entry is probed with `symlink_metadata` (lstat), not `Path::exists` (which follows
+/// symlinks): a marker can be an *absolute in-store symlink* into a sibling output — for instance
+/// nixpkgs' wrapped `nix`, whose installed `bin/nix` points at `/nix/store/<unwrapped>/bin/nix`.
+/// That absolute path resolves *inside the cage* (where `/nix` IS this store) but not on the host
+/// (where `/nix` is the host's own store), so following it would wrongly reject the bin-bearing
+/// output and abort provisioning. The symlink target is in the output's closure, so the per-project
+/// seed copies it and it resolves in-cage — selecting the output is correct; only the host-side
+/// probe must not chase the link.
+fn select_marked_output(
+    layout: &Layout,
+    stdout: &str,
+    attr: &str,
+    marker: &str,
+) -> io::Result<PathBuf> {
     stdout
         .lines()
         .map(PathBuf::from)
-        .find(|logical| physical_path(layout, logical).join(marker).exists())
+        .find(|logical| {
+            physical_path(layout, logical)
+                .join(marker)
+                .symlink_metadata()
+                .is_ok()
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1116,6 +1141,38 @@ mod tests {
             physical_path(&layout, Path::new("/nix")),
             PathBuf::from("/data/ops/store/nix")
         );
+    }
+
+    #[test]
+    fn select_marked_output_accepts_a_marker_that_is_an_absolute_in_store_symlink() {
+        // A wrapped output (nixpkgs' `nix`) carries its marker as an absolute in-store symlink
+        // into a sibling output. That target only resolves inside the cage (`/nix` == the store),
+        // not on the host, so the selection must probe with lstat, never follow the link.
+        use std::os::unix::fs::symlink;
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+
+        // `<store>/nix/store/out-man` — no marker.
+        let man = physical_path(&layout, Path::new("/nix/store/out-man"));
+        std::fs::create_dir_all(&man).unwrap();
+        // `<store>/nix/store/out/bin/nix` — a symlink to an absolute /nix path absent on the host.
+        let out_bin = physical_path(&layout, Path::new("/nix/store/out")).join("bin");
+        std::fs::create_dir_all(&out_bin).unwrap();
+        symlink("/nix/store/unwrapped/bin/nix", out_bin.join("nix")).unwrap();
+        assert!(
+            !out_bin.join("nix").exists(),
+            "the absolute symlink must be unresolvable on the host (the bug's precondition)"
+        );
+
+        let stdout = "/nix/store/out-man\n/nix/store/out\n";
+        assert_eq!(
+            select_marked_output(&layout, stdout, "nix", "bin/nix").unwrap(),
+            PathBuf::from("/nix/store/out"),
+            "the bin-bearing output is selected by the symlink entry, not by following it"
+        );
+
+        // and a genuinely-absent marker still errors (no false positive).
+        assert!(select_marked_output(&layout, stdout, "nix", "bin/absent").is_err());
     }
 
     #[test]

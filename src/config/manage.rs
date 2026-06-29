@@ -303,6 +303,10 @@ pub(crate) fn add_egress_rule(
             let t = parent["network"]
                 .as_table_mut()
                 .expect("inspected as a regular table");
+            // A `[network] mode = "shared"/"none"` table ignores the allow/deny lists at
+            // resolution, so appending a rule would be inert — refuse it like the bare-string path,
+            // rather than report a rule "added" that never takes effect.
+            refuse_non_filtering(t.get("mode").and_then(Item::as_str))?;
             let arr = t
                 .entry(list.key())
                 .or_insert_with(|| value(Array::new()))
@@ -317,6 +321,7 @@ pub(crate) fn add_egress_rule(
                 .as_value_mut()
                 .and_then(Value::as_inline_table_mut)
                 .expect("inspected as an inline table");
+            refuse_non_filtering(it.get("mode").and_then(Value::as_str))?;
             let arr = it
                 .entry(list.key())
                 .or_insert_with(|| Value::Array(Array::new()))
@@ -330,6 +335,17 @@ pub(crate) fn add_egress_rule(
 
     write_doc(path, &doc)?;
     Ok(outcome)
+}
+
+/// Refuse adding an allow/deny rule to an explicit non-filtering posture (`shared`/`none`), where
+/// the lists are ignored at resolution — the same guard the bare-string path applies, so the table
+/// and inline-table forms cannot silently accept an inert rule. A missing or filtering `mode` is
+/// fine (the rule takes effect).
+fn refuse_non_filtering(mode: Option<&str>) -> Result<(), ManageError> {
+    match mode {
+        Some(m @ ("shared" | "none")) => Err(ManageError::NonFilteringPosture(m.to_string())),
+        _ => Ok(()),
+    }
 }
 
 /// The table where the `network` key lives: the document root for the baseline, or the
@@ -615,6 +631,27 @@ mod tests {
             add_egress_rule(&p, None, EgressList::Allow, "x.com"),
             Err(ManageError::NonFilteringPosture(s)) if s == "shared"
         ));
+    }
+
+    #[test]
+    fn add_egress_rule_refuses_a_non_filtering_table_and_inline_table() {
+        // A `[network] mode = "shared"/"none"` table (or its inline form) ignores allow/deny at
+        // resolution, so appending a rule must be refused — not reported "added" yet inert.
+        for body in [
+            "[network]\nmode = \"shared\"\n",
+            "[network]\nmode = \"none\"\nallow = []\n",
+            "network = { mode = \"shared\" }\n",
+        ] {
+            let tmp = crate::testutil::TmpDir::new();
+            let p = doc_at(tmp.path(), body);
+            assert!(
+                matches!(
+                    add_egress_rule(&p, None, EgressList::Deny, "evil.com"),
+                    Err(ManageError::NonFilteringPosture(_))
+                ),
+                "expected a non-filtering refusal for {body:?}"
+            );
+        }
     }
 
     #[test]

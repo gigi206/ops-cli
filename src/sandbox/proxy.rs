@@ -1,5 +1,6 @@
 //! The host-side egress proxy: a TLS-terminating filtering proxy that is the cage's only
-//! path to the network under a filtered-egress posture (`[network] mode = "deny"` or `"allow"`).
+//! path to the network under a filtered-egress posture (`[network] mode = "deny"`, `"allow"`, or
+//! `"ask"`).
 //!
 //! The cage runs in an empty network namespace, so its sole egress is a Unix socket bound
 //! into it; an in-cage forwarder bridges the tool's `http_proxy`/`https_proxy` to this host
@@ -317,13 +318,41 @@ enum IpClass {
 fn classify_ip(ip: IpAddr) -> IpClass {
     match ip {
         IpAddr::V4(v4) => classify_v4(v4),
-        // an IPv4-mapped IPv6 address is the underlying v4 (so `::ffff:127.0.0.1` cannot dodge
-        // the v4 loopback guard)
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        // An IPv6 address that embeds a v4 (mapped, NAT64, 6to4, Teredo) is classified as that v4,
+        // so an internal/metadata v4 cannot dodge the v4 guard wearing a v6 spelling (e.g.
+        // `64:ff9b::a9fe:a9fe`, NAT64 of `169.254.169.254`).
+        IpAddr::V6(v6) => match embedded_v4(v6) {
             Some(v4) => classify_v4(v4),
             None => classify_v6(v6),
         },
     }
+}
+
+/// The IPv4 address an IPv6 address embeds through a translation/transition form, or `None`.
+/// Covers IPv4-mapped (`::ffff:a.b.c.d`), NAT64 well-known (`64:ff9b::/96`, the v4 in the low 32
+/// bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo (`2001:0::/32`, the client v4 in the last two
+/// segments, bit-inverted). The host's stack actually routing these is what makes the SSRF real;
+/// classifying them by their embedded v4 keeps the metadata/internal guard sound where it does.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    let v4_of =
+        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    // NAT64 well-known prefix 64:ff9b::/96 — the v4 is the low 32 bits.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        return Some(v4_of(s[6], s[7]));
+    }
+    // 6to4 2002::/16 — the v4 is segments 1 and 2.
+    if s[0] == 0x2002 {
+        return Some(v4_of(s[1], s[2]));
+    }
+    // Teredo 2001:0::/32 — the client v4 is the last two segments, bit-inverted.
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return Some(v4_of(!s[6], !s[7]));
+    }
+    None
 }
 
 fn classify_v4(v4: Ipv4Addr) -> IpClass {
@@ -1046,7 +1075,12 @@ fn read_head_buffered<R: BufRead>(r: &mut R, max: usize) -> io::Result<Vec<u8>> 
     let mut buf = Vec::new();
     loop {
         let start = buf.len();
-        if r.read_until(b'\n', &mut buf)? == 0 {
+        // Cap each line at the remaining budget (+1 to detect overflow): a bare `read_until` would
+        // buffer an arbitrarily long line with no terminator *before* the size check below runs, so
+        // an in-cage client could force unbounded host-side allocation here (this proxy runs outside
+        // the cage's cgroup). With the cap a no-`\n` flood hits the budget and errors.
+        let budget = (max - start + 1) as u64;
+        if (&mut *r).take(budget).read_until(b'\n', &mut buf)? == 0 {
             return Err(invalid(
                 "connection closed before the end of the request head",
             ));
@@ -1757,6 +1791,69 @@ mod tests {
             resp.contains("denied-default"),
             "the refusal must name the motif (no allow rule matched): {resp:?}"
         );
+    }
+
+    #[test]
+    fn classify_ip_unwraps_v6_embedded_v4_translation_forms() {
+        let c = |s: &str| classify_ip(s.parse::<IpAddr>().unwrap());
+        // NAT64 well-known of the metadata address 169.254.169.254 → blocked, not public
+        assert!(matches!(c("64:ff9b::a9fe:a9fe"), IpClass::Blocked));
+        // NAT64 of loopback → private
+        assert!(matches!(c("64:ff9b::7f00:1"), IpClass::Private));
+        // 6to4 of 10.0.0.1 (RFC1918) → private
+        assert!(matches!(c("2002:0a00:0001::"), IpClass::Private));
+        // Teredo carrying 169.254.169.254 (client v4 bit-inverted: !0xa9fe = 0x5601) → blocked
+        assert!(matches!(c("2001:0:0:0:0:0:5601:5601"), IpClass::Blocked));
+        // a genuine public v6 (no embedded v4) stays public
+        assert!(matches!(c("2606:4700:4700::1111"), IpClass::Public));
+        // the pre-existing v4-mapped case still folds to its v4 class
+        assert!(matches!(c("::ffff:127.0.0.1"), IpClass::Private));
+    }
+
+    #[test]
+    fn read_head_buffered_bounds_a_line_with_no_terminator() {
+        // a single oversized line with no terminator must error (bounded), not buffer unboundedly
+        let mut flood = std::io::Cursor::new(vec![b'a'; 64 * 1024]);
+        let err = read_head_buffered(&mut flood, 16 * 1024).unwrap_err();
+        assert!(err.to_string().contains("request head too large"), "{err}");
+        // a normal head within the bound still parses
+        let mut ok = std::io::Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
+        assert!(read_head_buffered(&mut ok, 16 * 1024).is_ok());
+    }
+
+    #[test]
+    fn ambiguous_framing_is_refused_with_400_before_the_policy_check() {
+        // Transfer-Encoding, or a duplicated Content-Length / Host, is a classic request-desync
+        // vector — refused fail-closed at the proxy, before policy/resolve (the resolver panics if
+        // reached, so the guard is proven to precede it).
+        for req in [
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nHost: evil.test\r\nConnection: close\r\n\r\n".to_vec(),
+        ] {
+            let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+            let proxy_ca_der = proxy_ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
+                    .unwrap()
+                    .with_resolver(Box::new(|_| {
+                        panic!("resolve must not run for a framing refusal")
+                    })),
+            );
+            let resp = through_proxy(
+                ctx,
+                proxy_ca_der,
+                "allowed.test",
+                "allowed.test",
+                8443,
+                &req,
+            )
+            .unwrap();
+            assert!(
+                resp.contains("400") && resp.contains("bad-request"),
+                "expected a 400 bad-request framing refusal: {resp:?}"
+            );
+        }
     }
 
     /// Under the `ask` posture an undecided request parks; an out-of-band `allow` lets it proceed
@@ -3003,7 +3100,7 @@ mod tests {
         );
     }
 
-    /// The interaction with 6.3a strip-and-replace: an agent that *replays* the real secret value
+    /// The interaction with header strip-and-replace: an agent that *replays* the real secret value
     /// (learned via a reflection) to the `to` host is now refused outright (not silently
     /// stripped+reinjected); a *different* client auth value still hits the normal strip-and-replace
     /// path — the two mechanisms coexist.

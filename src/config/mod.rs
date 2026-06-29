@@ -497,6 +497,13 @@ pub(crate) struct Resolved {
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
     pub(crate) secrets: Vec<HeaderSecret>,
+    /// The baseline credentials *before* the posture clear — what an app overlay inherits. An app
+    /// may open a filtering posture (`deny`/`allow`/`ask`) over a non-filtering baseline, in which
+    /// case the proxy would inject these; [`Resolved::merge_app`] (and the `--app` view) re-derive
+    /// the effective set from this, not from the posture-cleared `secrets`, so a baseline credential
+    /// the baseline posture would clear is still inheritable. The baseline launch/display use
+    /// `secrets`; only the per-app fold reads this.
+    pub(crate) declared_secrets: Vec<HeaderSecret>,
     /// Named application launch profiles, each a gated overlay over this baseline. Keyed
     /// by name; `ops app <name>` looks one up and folds it on with [`Resolved::merge_app`].
     /// `ops run`/`ops shell` ignore them.
@@ -594,8 +601,22 @@ impl Resolved {
             self.gui = gui;
         }
         overlay_limits(&mut self.limits, app.limits);
-        self.secrets.extend(app.secrets);
+        // Drop the baseline secret-posture warning: it judged the *baseline* network, but the app's
+        // posture re-decides injection just below — keeping it would let `ops app <name>` both inject
+        // a credential and print "ignoring N HTTP-header secret(s)". The re-check re-emits it only if
+        // the *merged* posture still drops them.
+        self.warnings
+            .retain(|w| !w.contains("HTTP-header secret(s)"));
         self.warnings.extend(app.warnings);
+        // Re-derive the effective credentials from the *declared* baseline (not the posture-cleared
+        // `secrets`), so an app that opens a filtering posture inherits a baseline credential the
+        // baseline posture would have cleared. App credentials fold through the same `(to, header)`
+        // upsert a single layer uses, so an app credential shadows its baseline twin (like
+        // env/packages) instead of injecting a second identical header line upstream.
+        self.secrets = self.declared_secrets.clone();
+        for secret in app.secrets {
+            upsert_secret(&mut self.secrets, &mut self.warnings, "app overlay", secret);
+        }
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
     }
 }
@@ -845,6 +866,10 @@ fn resolve(
         }
     }
 
+    // Capture the declared baseline credentials before the posture clear: an app overlay that
+    // opens a filtering posture inherits these (re-judged on its effective posture), even when the
+    // baseline posture clears them from the baseline-effective `secrets`.
+    let declared_secrets = secrets.clone();
     enforce_secret_posture(&network, &mut secrets, &mut warnings);
 
     let apps = resolve_apps(
@@ -873,6 +898,7 @@ fn resolve(
         limits,
         limits_origin,
         secrets,
+        declared_secrets,
         apps,
         warnings,
     }
@@ -1029,7 +1055,7 @@ fn enforce_secret_posture(
     if !secrets.is_empty() && !matches!(network, NetworkPolicy::Allowlist(_)) {
         warnings.push(format!(
             "ignoring {} HTTP-header secret(s): credential injection requires a filtering \
-             network posture (`[network] mode = \"deny\"` or `\"allow\"`, the proxy that injects them)",
+             network posture (`[network] mode = \"deny\"`, `\"allow\"`, or `\"ask\"`, the proxy that injects them)",
             secrets.len()
         ));
         secrets.clear();
@@ -4172,6 +4198,79 @@ mod tests {
         base.merge_app(app);
         assert_eq!(base.secrets.len(), 1);
         assert!(matches!(base.network, NetworkPolicy::Allowlist(_)));
+    }
+
+    #[test]
+    fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
+        // A baseline credential and an app credential to the same host + header must collapse to
+        // one (the app shadowing the baseline, like env/packages) — never two identical header
+        // lines injected upstream.
+        let mut base = resolve_no_plugins(raw_network("shared"), None);
+        base.network =
+            NetworkPolicy::Allowlist(crate::allowlist::EgressPolicy::new(vec![], vec![]));
+        base.declared_secrets = vec![a_header_secret()];
+        base.secrets = vec![a_header_secret()];
+        let app = ResolvedApp {
+            cmd: vec!["x".into()],
+            home_scope: AppHomeScope::Global,
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            network: None,
+            gui: None,
+            limits: Default::default(),
+            secrets: vec![a_header_secret()],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
+            warnings: vec![],
+        };
+        base.merge_app(app);
+        assert_eq!(
+            base.secrets.len(),
+            1,
+            "the app secret shadows its baseline twin, not duplicated"
+        );
+    }
+
+    #[test]
+    fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture() {
+        // A baseline credential declared under a non-filtering baseline posture (the `shared`
+        // default) is absent from the baseline-effective set, but an app that opens a filtering
+        // posture must still inherit it — the proxy under the app's posture is what injects it.
+        let mut base = resolve_no_plugins(raw_network("shared"), None);
+        base.declared_secrets = vec![a_header_secret()];
+        assert!(
+            base.secrets.is_empty(),
+            "the baseline-effective set is cleared under a shared posture"
+        );
+        let app = ResolvedApp {
+            cmd: vec!["x".into()],
+            home_scope: AppHomeScope::Global,
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            network: Some(NetworkPolicy::Allowlist(
+                crate::allowlist::EgressPolicy::new(vec![], vec![]),
+            )),
+            gui: None,
+            limits: Default::default(),
+            secrets: vec![],
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
+            warnings: vec![],
+        };
+        base.merge_app(app);
+        assert_eq!(
+            base.secrets.len(),
+            1,
+            "the app's filtering posture inherits the baseline credential"
+        );
     }
 
     fn pkg<'a>(packages: &'a [Package], name: &str) -> Option<&'a Package> {

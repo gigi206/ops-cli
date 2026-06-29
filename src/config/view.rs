@@ -878,9 +878,10 @@ fn app_detail_view(
         ),
     };
 
-    // Collections: the overlay's own entries, plus how many baseline entries are inherited. For
-    // `env`/`packages` a baseline entry shadowed by a same-key/-name overlay entry is not inherited;
-    // `binds`/`secrets` are additive, so every baseline entry is inherited.
+    // Collections: the overlay's own entries, plus how many baseline entries are inherited. A
+    // baseline entry shadowed by a same-key/-name/-target overlay entry is not inherited (it is the
+    // app's own) — `merge_app` dedups env/packages/binds and folds secrets through the same
+    // `(to, header)` upsert, so the inherited counts mirror that.
     let env_inherited = baseline
         .env
         .iter()
@@ -897,12 +898,12 @@ fn app_detail_view(
     // allowlist (the proxy that injects them runs only under one). Reproduce that check so the
     // count — and the note — match what `ops app <name>` would actually inject; otherwise the
     // view over-reports credentials an app silently drops by narrowing its network.
-    let mut eff_secrets = baseline.secrets.clone();
+    let mut eff_secrets = baseline.declared_secrets.clone();
     eff_secrets.extend(app.secrets.iter().cloned());
     let mut secret_notes = Vec::new();
     super::enforce_secret_posture(eff_network, &mut eff_secrets, &mut secret_notes);
     let secrets_dropped =
-        eff_secrets.is_empty() && !(baseline.secrets.is_empty() && app.secrets.is_empty());
+        eff_secrets.is_empty() && !(baseline.declared_secrets.is_empty() && app.secrets.is_empty());
     let mut notes = app.warnings.clone();
     notes.extend(secret_notes);
 
@@ -937,7 +938,11 @@ fn app_detail_view(
             .iter()
             .map(|b| b.display().to_string())
             .collect(),
-        binds_inherited: baseline.ro_binds.len(),
+        binds_inherited: baseline
+            .ro_binds
+            .iter()
+            .filter(|b| !app.ro_binds.contains(b))
+            .count(),
         packages: app
             .packages
             .iter()
@@ -960,8 +965,17 @@ fn app_detail_view(
         secrets_inherited: if secrets_dropped {
             0
         } else {
-            baseline.secrets.len()
+            baseline
+                .declared_secrets
+                .iter()
+                .filter(|b| {
+                    !app.secrets
+                        .iter()
+                        .any(|a| a.to == b.to && a.header.eq_ignore_ascii_case(&b.header))
+                })
+                .count()
         },
+
         notes,
     }
 }
@@ -1294,6 +1308,7 @@ mod tests {
             },
             limits_origin: Default::default(),
             secrets: vec![a_header_secret()],
+            declared_secrets: vec![a_header_secret()],
             apps: Default::default(),
             warnings: vec![],
         };

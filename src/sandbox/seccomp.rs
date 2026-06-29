@@ -372,7 +372,8 @@ mod tests {
         // x86_64 syscall numbers: keyctl=250, clone3=435, unshare=272, clone=56,
         // ioctl=16. `clone(CLONE_NEWUSER|SIGCHLD)` and `ioctl(TIOCSTI)` exercise the
         // *argument-filtered* rules (a different BPF codegen than the unconditional
-        // entries); a regression in either is the escape vector Posture A closes.
+        // entries); a regression in either reopens the mount/namespace escape surface the
+        // denylist closes.
         // The EPERM action fires before the syscall runs, so the clone probe spawns
         // no child. `fork()` (clone without namespace flags) must still succeed.
         let probe = "import ctypes,os,socket\n\
