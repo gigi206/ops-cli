@@ -320,6 +320,58 @@ mod tests {
     }
 
     #[test]
+    fn the_eperm_filter_actually_blocks_a_denied_syscall() {
+        // The set-membership tests prove WHICH syscalls are listed; this proves the compiled filter
+        // ENFORCES — a regression that flipped the match action to Allow or broke the codegen would
+        // pass those yet fail here, without needing bwrap (so it runs in `cargo test --bins`). The
+        // filter is built in the parent and installed in a forked child that runs ONLY
+        // async-signal-safe calls (prctl + syscall + _exit), so there is no fork-in-threaded hazard
+        // and no test-harness recursion.
+        let prog = compile(eperm_rules(), SeccompAction::Errno(libc::EPERM as u32));
+        // SAFETY: the child touches only async-signal-safe libc calls before `_exit`; `prog` is
+        // read-only memory shared copy-on-write from the parent (the child allocates nothing).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let fprog = libc::sock_fprog {
+                    len: (prog.len() / 8) as libc::c_ushort,
+                    filter: prog.as_ptr() as *mut libc::sock_filter,
+                };
+                if libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                    &fprog as *const libc::sock_fprog as libc::c_ulong,
+                ) != 0
+                {
+                    // could not install the filter (e.g. a kernel without CONFIG_SECCOMP): skip.
+                    libc::_exit(2);
+                }
+                // a denied syscall must return EPERM (neither succeed nor kill the process)
+                let denied = libc::syscall(libc::SYS_keyctl, 0, 0, 0, 0, 0);
+                let blocked = denied == -1 && *libc::__errno_location() == libc::EPERM;
+                // an allowed syscall must still work
+                let allowed_ok = libc::getpid() > 0;
+                libc::_exit(if blocked && allowed_ok { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status),
+            "the probe child did not exit normally"
+        );
+        match libc::WEXITSTATUS(status) {
+            0 => {} // enforced: the denied syscall was refused with EPERM, the allowed one ran
+            2 => eprintln!(
+                "skipping seccomp enforcement: filter not installable (no CONFIG_SECCOMP?)"
+            ),
+            code => panic!("the EPERM filter did not enforce the denylist (probe exit {code})"),
+        }
+    }
+
+    #[test]
     fn each_memfd_holds_its_compiled_filter() {
         let files = memfds().expect("memfds");
         let expected = programs();

@@ -29,7 +29,9 @@
 //! since written.
 //!
 //! The cage's nix reads and writes only this self-contained store; ops's own seed
-//! is the only reader of the shared store, and only ever reads it.
+//! is the only reader of the shared store, and only ever reads its content paths
+//! (which stay byte-identical) — though `nix-store --dump-db` may checkpoint the
+//! shared database's write-ahead log, a benign fold-in that mutates no store path.
 //!
 //! Concurrency needs no lock of ops's own. Two sandboxes of the same project can
 //! seed at once: each path is placed by atomic rename, so a lost race is just a
@@ -327,8 +329,18 @@ fn seed_path(
     let mut tmp_name = std::ffi::OsString::from(format!(".tmp-{}-", unique()));
     tmp_name.push(name);
     let tmp = project_paths.join(tmp_name);
-    copy_recursive(&shared_paths.join(name), &tmp, reflink_ok)?;
-    place_atomically(&tmp, &dest)
+    copy_into_place(&shared_paths.join(name), &dest, &tmp, reflink_ok)
+}
+
+/// Copy `src` into `dest` via the temporary sibling `tmp`, atomically. Any stale `tmp` a crashed
+/// seed left behind is cleared first: `unique()` is process-local, so two processes reuse temp
+/// names, and a leftover store-path temp is a *directory tree* — use the recursive `discard` (a
+/// no-op when absent), not `remove_file`, or `copy_recursive`'s non-recursive `DirBuilder::create`
+/// would fail EEXIST.
+fn copy_into_place(src: &Path, dest: &Path, tmp: &Path, reflink_ok: bool) -> io::Result<()> {
+    discard(tmp);
+    copy_recursive(src, tmp, reflink_ok)?;
+    place_atomically(tmp, dest)
 }
 
 /// Move the fully-copied `tmp` tree into place at its real store-path name `dest` by
@@ -767,6 +779,26 @@ mod tests {
             .flatten()
             .any(|e| e.file_name().to_string_lossy().starts_with(".tmp-"));
         assert!(!leaked, "a temporary placement was left behind");
+    }
+
+    #[test]
+    fn copy_into_place_clears_a_stale_temp_dir_before_copying() {
+        // A crashed/SIGKILL'd seed can leave a directory tree at the temp name a later seed reuses
+        // (the temp name is process-local). The copy must clear it first — `copy_recursive`'s
+        // non-recursive dir-create would otherwise fail EEXIST and brick the re-seed.
+        let base = TmpDir::new();
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/file"), b"content").unwrap();
+        let dest = base.join("dest");
+        let tmp = base.join(".tmp-stale-dest");
+        // the leftover from a crashed seed: a non-empty directory tree at the temp name
+        std::fs::create_dir_all(tmp.join("leftover")).unwrap();
+
+        copy_into_place(&src, &dest, &tmp, false)
+            .expect("a stale temp must be cleared, not fail EEXIST");
+        assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"content");
+        assert!(!tmp.exists(), "the temp was consumed by the atomic rename");
     }
 
     #[test]

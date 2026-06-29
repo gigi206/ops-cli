@@ -2311,14 +2311,16 @@ fn is_valid_mise_token(token: &str) -> bool {
 /// characters (`:` `/` `#` `?` `=` `&` `~`) plus the identifier set — so a malformed or
 /// shell/space-bearing value is refused rather than handed to nix. **Local sources are
 /// rejected** so a package declaration can never point the in-cage build at a filesystem
-/// path: not only the explicit local schemes (`path:`, `git+file:`) but also a **bare
-/// path-flakeref** — nix treats a ref starting with `/`, `.`, or `~` as a local path — and an
-/// ambiguous registry-indirect ref (`nixpkgs`), by *requiring an explicit scheme* (a `:`). A
-/// real remote ref always carries one (`github:`, `git+https:`, `gitlab:`, …).
+/// path: not only the explicit local schemes (`path:`, and any `file:` or `+file:` scheme —
+/// `file://`, `git+file:`, `tarball+file:`, …) but also a **bare path-flakeref** — nix treats a
+/// ref starting with `/`, `.`, or `~` as a local path — and an ambiguous registry-indirect ref
+/// (`nixpkgs`), by *requiring an explicit scheme* (a `:`). A real remote ref always carries one
+/// (`github:`, `git+https:`, `gitlab:`, …).
 fn is_valid_flake_ref(reference: &str) -> bool {
     if reference.is_empty()
         || reference.starts_with("path:")
-        || reference.starts_with("git+file:")
+        || reference.starts_with("file:")
+        || reference.contains("+file:")
         || reference.starts_with('/')
         || reference.starts_with('.')
         || reference.starts_with('~')
@@ -4608,6 +4610,8 @@ mod tests {
                 ("pinned", "flake:github:o/r/abc123#default"),
                 ("local", "flake:path:/etc"), // local scheme: refused
                 ("localgit", "flake:git+file:///etc"), // local git scheme: refused
+                ("filescheme", "flake:file:///etc/x.tar.gz"), // file:// tarball: refused
+                ("tarballfile", "flake:tarball+file:///etc/x.tar.gz"), // tarball+file: refused
                 ("bare", "flake:/etc"),       // bare absolute path: refused
                 ("dotted", "flake:./x"),      // bare relative path: refused
                 ("tilde", "flake:~/x"),       // bare home path: refused
@@ -4625,14 +4629,22 @@ mod tests {
             Backend::Flake("github:o/r/abc123#default".into())
         );
         for refused in [
-            "local", "localgit", "bare", "dotted", "tilde", "indirect", "spacey",
+            "local",
+            "localgit",
+            "filescheme",
+            "tarballfile",
+            "bare",
+            "dotted",
+            "tilde",
+            "indirect",
+            "spacey",
         ] {
             assert!(
                 pkg(&r.packages, refused).is_none(),
                 "{refused} should be refused"
             );
         }
-        assert_eq!(r.warnings.len(), 7, "one warning per refused flake ref");
+        assert_eq!(r.warnings.len(), 9, "one warning per refused flake ref");
         assert!(r
             .warnings
             .iter()

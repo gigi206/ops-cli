@@ -86,6 +86,12 @@ impl Catalogue {
             crate::plugins::validate_scheme(&entry.scheme).map_err(here)?;
             validate_repo_path(&entry.path).map_err(here)?;
             validate_sha256(&entry.sha256).map_err(here)?;
+            // The free-text fields are displayed verbatim (`ops plugins store list/info`), and a
+            // TOML basic string can carry a control byte via a `\uXXXX` escape; the serializer
+            // refuses control chars, so mirror that on the consuming side (a legitimately-published
+            // store never carries one) to keep a TOFU-pinned store from injecting terminal escapes.
+            validate_free_text("version", &entry.version).map_err(here)?;
+            validate_free_text("description", &entry.description).map_err(here)?;
             plugins.insert(
                 name,
                 CatalogueEntry {
@@ -323,6 +329,19 @@ pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
         out.push_str(&format!("sha256 = {}\n", toml_quoted(&entry.sha256)?));
     }
     Ok(out)
+}
+
+/// Refuse a control character in a catalogue free-text field (`version`/`description`), which is
+/// displayed verbatim. The serializer refuses them too, so this is symmetric: no legitimately-
+/// published store carries one, and a malicious TOFU-pinned store cannot smuggle a terminal escape.
+fn validate_free_text(field: &str, s: &str) -> Result<(), String> {
+    match s.chars().find(|c| c.is_control()) {
+        Some(bad) => Err(format!(
+            "`{field}` contains a control character (U+{:04X})",
+            bad as u32
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Render a string as a TOML basic string (`"..."`), refusing any control character and escaping
@@ -676,6 +695,16 @@ mod tests {
     fn a_bad_sha256_is_refused() {
         assert!(Catalogue::parse(one_entry("sha256", "deadbeef").as_bytes()).is_err());
         assert!(Catalogue::parse(one_entry("sha256", &"A".repeat(64)).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_control_character_in_a_free_text_field_is_refused() {
+        // A `\uXXXX` escape decodes to a real control byte in the value; the serializer refuses
+        // control chars, so the parser must too — a TOFU-pinned store cannot smuggle a terminal
+        // escape sequence into the verbatim-displayed version/description (the escape is U+001B).
+        assert!(Catalogue::parse(one_entry("version", "\\u001b]0;x").as_bytes()).is_err());
+        // a clean value still parses
+        assert!(Catalogue::parse(one_entry("version", "1.2.3").as_bytes()).is_ok());
     }
 
     #[test]

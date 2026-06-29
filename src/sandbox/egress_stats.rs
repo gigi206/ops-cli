@@ -123,7 +123,7 @@ impl EgressStats {
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         let tmp = self.path.with_extension(format!("tmp.{seq}"));
         // Owner-only: the counters live under the 0700 egress dir, but tighten the file too.
-        {
+        let write = || -> io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -131,15 +131,15 @@ impl EgressStats {
                 .truncate(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            f.write_all(body.as_bytes())?;
+            f.write_all(body.as_bytes())
+        };
+        // On ANY failure — open, write (e.g. ENOSPC), or rename — remove the temp, so a failed flush
+        // never leaks a `.tmp.<seq>` orphan that the aggregate read and `reset` both skip by name.
+        let result = write().and_then(|()| std::fs::rename(&tmp, &self.path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        match std::fs::rename(&tmp, &self.path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        result
     }
 }
 

@@ -1,9 +1,11 @@
 //! The user-owned, daemonless nix store.
 //!
 //! ops provisions a project's tools into a store it owns under its own data
-//! directory, never the host's `/nix`. The store is a single shared flat tree:
-//! deduplicated across projects, bound read-only when a sandbox consumes it and
-//! writable only while ops itself provisions into it. This module computes the
+//! directory, never the host's `/nix`. The shared store is a single flat tree —
+//! deduplicated across projects, written only while ops itself provisions into it
+//! on the host side; a sandbox then consumes a per-project copy seeded from it,
+//! bound read-write so an agent can self-equip, while the shared tree stays
+//! read-only. This module computes the
 //! on-disk layout, bootstraps it, and builds the daemonless nix invocation that
 //! drives it.
 

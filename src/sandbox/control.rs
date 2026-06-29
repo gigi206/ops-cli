@@ -17,7 +17,9 @@
 //! one session. The wire protocol is line-based and minimal (one command per connection): `LIST`
 //! returns the pending rows, `ALLOW <seq>` / `DENY <seq>` answer one destination (every identical
 //! retry of it, since a tool re-parks one URL many times), naming the host so a `--save` can persist
-//! it.
+//! it; `RULES` lists the session's live manual `--session` rules; and `ALLOW *` / `DENY *` drain
+//! every parked request at once (one `answered host=…` line each, then `ok` — an older server that
+//! predates this replies `err …`, which the CLI reports as unsupported).
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};

@@ -287,18 +287,25 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Canonicalize a host for matching: lowercase it, and if it is an IP literal, normalize it
-/// to its canonical textual form so every spelling of one address compares equal (`::1` and
-/// `0:0:0:0:0:0:0:1` both become `::1`). A hostname passes through lowercased. Applied on both
-/// sides — the rule (`parse_url_target`) and the request (`Request::new`) — so a `Url` host,
-/// which is matched as a plain string, cannot be dodged by an alternate IPv6 spelling. The
-/// filtering proxy reuses it to compare the CONNECT host, the TLS SNI, and the decrypted
-/// `Host` header against one normal form (anti domain-fronting).
+/// Canonicalize a host for matching: lowercase it, drop a trailing DNS root dot, and if it is an
+/// IP literal, normalize it to its canonical textual form so every spelling of one address compares
+/// equal (`::1` and `0:0:0:0:0:0:0:1` both become `::1`). A hostname passes through lowercased and
+/// dot-stripped. Applied on both sides — the rule (`parse_url_target`) and the request
+/// (`Request::new`) — so a `Url`/`Host`/`Subdomain` host cannot be dodged by an alternate IPv6
+/// spelling or a fully-qualified trailing dot (`evil.com.`, which DNS resolves identically but rules
+/// can never carry, since `is_valid_hostname` rejects it). The filtering proxy reuses it to compare
+/// the CONNECT host, the TLS SNI, and the decrypted `Host` header against one normal form (anti
+/// domain-fronting).
 pub(crate) fn canonical_host(host: &str) -> String {
     let lower = host.to_ascii_lowercase();
+    // Strip every trailing dot: `evil.com.` is the absolute-FQDN form and `evil.com..` resolves to
+    // the same host, while rules are always dot-free — so normalize the request side to one dot-free
+    // form. (The proxy connects to this canonicalized host, so the connect target is clean too; an
+    // IP literal never carries a trailing dot, so this is a no-op for those.)
+    let lower = lower.trim_end_matches('.');
     match lower.parse::<IpAddr>() {
         Ok(ip) => ip.to_string(),
-        Err(_) => lower,
+        Err(_) => lower.to_string(),
     }
 }
 
@@ -1540,6 +1547,25 @@ mod tests {
             q.explain("10.0.0.1", 443, "/"),
             Decision::AllowedBy(_)
         ));
+    }
+
+    #[test]
+    fn a_trailing_dot_fqdn_cannot_dodge_a_deny() {
+        // `evil.com.` is the absolute-FQDN spelling — DNS resolves it identically, but rules are
+        // always dot-free. canonical_host strips the trailing dot so the request still hits the
+        // deny; under allow-by-default it must NOT slip through to AllowedDefault.
+        let p =
+            EgressPolicy::new(vec![], vec![rule("evil.com")]).with_default(DefaultAction::Allow);
+        // one trailing dot, and a doubled dot (which DNS resolves to the same host) — both denied
+        for host in ["evil.com.", "evil.com..", "evil.com..."] {
+            assert!(!p.permits(host, 443, "/"), "{host} must be denied");
+            assert!(matches!(p.explain(host, 443, "/"), Decision::DeniedBy(_)));
+        }
+        // a subdomain deny is likewise not dodged by trailing dots
+        let q =
+            EgressPolicy::new(vec![], vec![rule("*.evil.com")]).with_default(DefaultAction::Allow);
+        assert!(!q.permits("api.evil.com.", 443, "/"));
+        assert!(!q.permits("api.evil.com..", 443, "/"));
     }
 
     #[test]

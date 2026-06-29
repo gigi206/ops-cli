@@ -40,14 +40,12 @@ pub(crate) enum Mount {
 /// either shares the host network or is fully isolated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetPolicy {
-    /// Keep the host network namespace. No isolation yet — there is no
-    /// confidentiality guarantee until the egress allowlist ships.
+    /// Keep the host network namespace — no network isolation (the `network = "shared"` posture).
     Shared,
-    /// A fresh, empty network namespace: no connectivity at all.
-    ///
-    /// Not yet selected by any command — reserved for the fully-isolated
-    /// posture; the argv builder already honours it.
-    #[allow(dead_code)]
+    /// A fresh, empty network namespace. Used by `network = "none"` (no connectivity at all) and
+    /// as the substrate for the egress allowlist — under a filtering posture the cage's only egress
+    /// is a bound Unix socket to the host MITM proxy, so the filtering lives in that proxy, not in
+    /// the netns.
     Isolated,
 }
 
@@ -135,10 +133,8 @@ impl SandboxSpec {
 
     /// Switch to a private-pty terminal (see [`TerminalPolicy::PrivateTty`]).
     /// The caller **must** then launch through the pty supervisor; otherwise the
-    /// sandbox would inherit the launching terminal.
-    ///
-    /// No caller yet: the interactive shell opts in once its pty supervisor lands.
-    #[allow(dead_code)]
+    /// sandbox would inherit the launching terminal. The interactive `ops shell`
+    /// path opts in through this.
     pub(crate) fn with_private_tty(mut self) -> Self {
         self.terminal = TerminalPolicy::PrivateTty;
         self

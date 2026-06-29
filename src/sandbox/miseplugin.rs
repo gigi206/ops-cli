@@ -78,8 +78,13 @@ pub(crate) fn stage(data_dir: &Path) -> io::Result<PathBuf> {
 pub(crate) fn register(plugins_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(plugins_dir)?;
     let link = plugins_dir.join(PLUGIN_NAME);
-    let tmp = plugins_dir.join(format!(".{PLUGIN_NAME}.{}.tmp", unique()));
-    let _ = std::fs::remove_file(&tmp); // clear a stale temp from a crashed launch
+    // The temp name carries the pid (like `stage`): `unique()` is a process-local counter starting
+    // at 0, so without the pid two concurrent same-project launches would share `.nix.0.tmp` and one
+    // could `remove_file` the other's temp mid-rename. A crashed launch's pid-tagged temp is then a
+    // tiny dangling symlink the next launch does not match — the same self-healing GC class `stage`
+    // already accepts.
+    let tmp = plugins_dir.join(register_temp_name(std::process::id(), unique()));
+    let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(INCAGE_DIR, &tmp)?;
     let placed = std::fs::rename(&tmp, &link).or_else(|_| {
         // `rename` replaces an existing symlink or file atomically, but not a real
@@ -92,6 +97,13 @@ pub(crate) fn register(plugins_dir: &Path) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     placed
+}
+
+/// The temp name `register` stages the plugin symlink at. It carries the pid because `unique()` is a
+/// process-local counter starting at 0: without the pid two concurrent same-project launches would
+/// both stage at `.nix.0.tmp` and one could `remove_file` the other's temp mid-rename.
+fn register_temp_name(pid: u32, seq: u64) -> String {
+    format!(".{PLUGIN_NAME}.{pid}.{seq}.tmp")
 }
 
 /// Write the embedded plugin tree under `root`, recreating each file's relative
@@ -138,6 +150,17 @@ fn unique() -> u64 {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    #[test]
+    fn register_temp_names_are_unique_per_process() {
+        // Two processes both start `unique()` at 0; the pid keeps their first temp distinct, so a
+        // concurrent same-project register cannot collide on `.nix.0.tmp`.
+        assert_ne!(register_temp_name(1000, 0), register_temp_name(2000, 0));
+        // within one process the counter keeps them distinct too
+        assert_ne!(register_temp_name(1000, 0), register_temp_name(1000, 1));
+        // and the pid is actually in the name
+        assert!(register_temp_name(4242, 7).contains("4242"));
+    }
 
     #[test]
     fn the_embedded_tree_carries_the_plugin_entrypoints() {

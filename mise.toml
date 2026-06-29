@@ -46,7 +46,7 @@ run = "cargo zigbuild --release --target x86_64-unknown-linux-musl"
 
 # The pinned static nix engine the `bundled-nix` feature embeds. Pinned by revision for
 # reproducibility; build.rs verifies its sha256, so a drift fails the build loudly. Bump
-# this ref and the `EXPECTED_NIX_SHA256` const in build.rs together.
+# this ref and the `nix` `expected_sha` in build.rs (the `ENGINES` table) together.
 [tasks.static-nix]
 description = "Realise the pinned static nix and print the path to its bin/nix"
 hide = true

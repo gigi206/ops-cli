@@ -1069,6 +1069,42 @@ mod resolve_tests {
     }
 
     #[test]
+    fn an_untrusted_projects_nix_tools_are_withheld_without_invoking_nix() {
+        // The trust-boundary property — an untrusted project's `nix:` tools are withheld — is
+        // decided BEFORE any nix is invoked, so it is verifiable in the pipeline (no `resolve_nix`
+        // skip) with a bogus nix path. A regression that dropped the gate would now fail in CI.
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let proj = TmpDir::new();
+        let files = vec![(
+            ".mise.toml".to_string(),
+            b"[tools]\n\"nix:jq\" = \"latest\"\nnode = \"20\"\n\"nix:bad name\" = \"1\"\n".to_vec(),
+        )];
+        let out = provision(
+            Path::new("/nonexistent/ops-test-nix"),
+            &layout,
+            proj.path(),
+            &files,
+            false,
+            &current_system(),
+        )
+        .expect("untrusted provisioning withholds rather than failing, touching no nix");
+        assert!(
+            out.bins.is_empty(),
+            "an untrusted project provisions no tools"
+        );
+        assert!(out.roots.is_empty(), "an untrusted project seeds no roots");
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("withholding") && w.contains("jq")));
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("malformed") && w.contains("bad name")));
+    }
+
+    #[test]
     fn upgrade_tools_classifies_prunes_and_is_best_effort() {
         use crate::store::Layout;
         use crate::testutil::TmpDir;
