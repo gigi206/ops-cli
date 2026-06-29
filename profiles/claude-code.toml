@@ -25,11 +25,11 @@ claude-code = "mise:aqua:anthropics/claude-code"
 [network]
 mode = "allowlist"
 allow = [
-    "api.anthropic.com",
-    "platform.claude.com",
-    "downloads.claude.ai",
-    "mcp-proxy.anthropic.com",
-    "storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
+    "api.anthropic.com:443",
+    "platform.claude.com:443",
+    "downloads.claude.ai:443",
+    "mcp-proxy.anthropic.com:443",
+    "storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
 # The real API key is read on the HOST and injected into the outbound request by
