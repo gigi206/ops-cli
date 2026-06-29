@@ -1386,3 +1386,35 @@ fn test_net_reflects_the_built_in_set_both_directions() {
         "a user-listed host must not be tagged built-in:\n{u}"
     );
 }
+
+#[test]
+fn test_net_method_scopes_a_rule_to_its_verbs() {
+    let fx = Fixture::new();
+    // a GET/HEAD-only allow for the host
+    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // the prefix is shown in the rule listing
+    let rules = fx.run(&["net", "rules", "--source", "config"]);
+    assert!(
+        String::from_utf8_lossy(&rules.stdout).contains("{GET,HEAD} api.test:443"),
+        "the method prefix must be listed"
+    );
+
+    // GET (and the default verb) reach; POST does not
+    let get = fx.run(&["test", "net", "--method", "GET", "https://api.test/x"]);
+    assert!(
+        String::from_utf8_lossy(&get.stdout).contains("ALLOWED"),
+        "GET must be allowed by a GET/HEAD rule"
+    );
+    let dflt = fx.run(&["test", "net", "https://api.test/x"]);
+    assert!(
+        String::from_utf8_lossy(&dflt.stdout).contains("ALLOWED"),
+        "the default verb (GET) must be allowed"
+    );
+    let post = fx.run(&["test", "net", "-X", "POST", "https://api.test/x"]);
+    assert!(
+        String::from_utf8_lossy(&post.stdout).contains("DENIED"),
+        "POST must be denied by a GET/HEAD-only rule"
+    );
+}

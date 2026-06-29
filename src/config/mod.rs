@@ -19,7 +19,7 @@ pub(crate) mod safety;
 mod schema;
 pub(crate) mod view;
 
-use crate::allowlist::{Rule, RuleKind};
+use crate::allowlist::{Methods, Rule, RuleKind};
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
@@ -2186,6 +2186,15 @@ fn file_source(file: &str) -> Result<SecretSource, String> {
 /// user never meant to hand the secret to.
 fn validate_secret_target(to: &str) -> Result<Rule, String> {
     let rule = crate::allowlist::classify(to).map_err(|e| format!("invalid `to` target — {e}"))?;
+    // A credential is host-scoped — injected into every request to the destination, regardless of
+    // verb — so a `{...}` method prefix on the `to` host would silently inject *wider* than written.
+    // Reject it fail-closed (a method constraint belongs only on an allow/deny rule).
+    if rule.methods != Methods::Any {
+        return Err(format!(
+            "a secret `to` host carries no method prefix — remove the `{{...}}` from `{to}` \
+             (a credential is injected for the host on every method)"
+        ));
+    }
     match rule.kind {
         RuleKind::Ip(..) | RuleKind::Host(..) | RuleKind::Url { .. } => Ok(rule),
         RuleKind::Subdomain(..) => Err(format!(
@@ -5312,6 +5321,15 @@ mod tests {
         raw.from = None;
         let err = validate(raw).unwrap_err();
         assert!(err.contains("needs a source"), "{err}");
+    }
+
+    #[test]
+    fn a_secret_to_host_rejects_a_method_prefix() {
+        // a credential is host-scoped (injected on every verb), so a `{...}` method prefix on the
+        // `to` host would inject wider than written — rejected fail-closed. A bare host still parses.
+        assert!(validate_secret_target("api.example.com").is_ok());
+        let err = validate_secret_target("{POST} api.example.com").unwrap_err();
+        assert!(err.contains("no method prefix"), "{err}");
     }
 
     #[test]

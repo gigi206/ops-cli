@@ -486,13 +486,17 @@ const PAGES: &[Page] = &[
     // ---- test subcommands ---------------------------------------------------------
     Page {
         path: &["test", "net"],
-        synopsis: "ops test net [--app <name>] <url>",
+        synopsis: "ops test net [--app <name>] [-X|--method <verb>] <url>",
         summary: "test a URL against the resolved network policy",
         options: &[
             ("<url>", "the URL (or a bare host, completed to https) to test"),
             (
                 "-a, --app <name>",
                 "test against that app's effective policy (baseline + overlay), not the baseline",
+            ),
+            (
+                "-X, --method <verb>",
+                "the HTTP method to test (default GET); a method-scoped rule like `{GET} host` only matches that verb",
             ),
         ],
         details:
@@ -534,7 +538,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist an allow rule to a config file",
         options: &[
-            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`)"),
+            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
@@ -549,7 +553,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist a deny rule to a config file",
         options: &[
-            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`)"),
+            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),

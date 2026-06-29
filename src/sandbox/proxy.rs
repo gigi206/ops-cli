@@ -740,7 +740,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     }
 
     let inner = parse_head(&inner_bytes)?;
-    let Some((_imethod, itarget)) = request_line_parts(&inner.request_line) else {
+    let Some((imethod, itarget)) = request_line_parts(&inner.request_line) else {
         return respond_refusal_tls(
             &mut br,
             "400 Bad Request",
@@ -822,7 +822,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     // 5. The verdict — built through the SAME canonicalizer `ops test net` uses, so enforcement
     //    cannot drift from the tester's prediction. The two denial shapes get distinct reasons so
     //    the agent can tell "no rule allowed this" from "a deny rule blocked it".
-    let deciding: Option<Rule> = match ctx.policy.explain(&connect_host, port, &itarget) {
+    let deciding: Option<Rule> = match ctx.policy.explain(&connect_host, port, &itarget, &imethod) {
         Decision::AllowedBy(rule) => Some(rule.clone()),
         // Allow-by-default (denylist mode): no rule named this host, so there is no deciding
         // rule. The SSRF guard below then treats it as unnamed (private addresses refused).
@@ -838,6 +838,23 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
         }
         Decision::DeniedDefault => {
             ctx.record(&connect_host, StatKind::Deny);
+            // Distinguish "this host is allowed, but not for this verb" from "this host is not
+            // allowed at all": if an allow rule matches the host/path but its method set excludes
+            // the request's verb, say so, so the agent can tell a method-scoped deny apart.
+            if ctx
+                .policy
+                .method_denied(&connect_host, port, &itarget, &imethod)
+            {
+                return respond_refusal_tls(
+                    &mut br,
+                    "403 Forbidden",
+                    "denied-method",
+                    &format!(
+                        "the `{imethod}` method is not permitted to `{connect_host}:{port}` by \
+                         the network policy"
+                    ),
+                );
+            }
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
@@ -2187,6 +2204,37 @@ mod tests {
         assert!(
             resp.contains("denied-by-rule"),
             "a deny-rule refusal must be distinguishable from a default deny: {resp:?}"
+        );
+    }
+
+    /// The proxy decrypts the request, so it enforces the method: a verb outside a `{GET,HEAD}`
+    /// allow is refused as `denied-method` (distinct from a host that is not allowed at all). The
+    /// resolver panics if reached, so a pass would fail the test — proving the method is what blocks
+    /// it (a method-blind proxy would match the host kind, resolve, and panic).
+    #[test]
+    fn a_method_outside_the_allow_set_is_refused_as_denied_method() {
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let policy = EgressPolicy::new(vec![classify("{GET,HEAD} host.test:*").unwrap()], vec![]);
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy)
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a method-denied request")
+                })),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "host.test",
+            "host.test",
+            8443,
+            b"POST /submit HTTP/1.1\r\nHost: host.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("denied-method"),
+            "a POST to a GET/HEAD-only host must be refused as denied-method: {resp:?}"
         );
     }
 

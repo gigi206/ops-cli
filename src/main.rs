@@ -2714,8 +2714,10 @@ fn fold_app_overlay(resolved: &mut config::Resolved, name: &str) -> Result<(), S
 /// value). A bare host with no scheme is completed to `https://`. No launch, no nix, no network.
 /// Exit status is informational only (success), since "the URL would be denied" is a valid answer.
 fn net_test(args: &[OsString]) -> ExitCode {
-    // An optional `--app/-a <name>` and the positional target (a URL or a bare host), in any order.
+    // An optional `--app/-a <name>`, an optional `--method/-X <verb>` (the HTTP method to test,
+    // default GET), and the positional target (a URL or a bare host), in any order.
     let mut app: Option<String> = None;
+    let mut method: String = "GET".to_string();
     let mut target: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -2726,6 +2728,13 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 app = Some(name.to_string());
+            }
+            Some("--method") | Some("-X") => {
+                let Some(m) = it.next().and_then(|n| n.to_str()) else {
+                    eprintln!("ops: test net: `--method` needs an HTTP verb (e.g. GET, POST)");
+                    return ExitCode::from(2);
+                };
+                method = m.to_ascii_uppercase();
             }
             Some(s) if target.is_none() => target = Some(s),
             Some(s) => {
@@ -2815,14 +2824,14 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 }
             };
             println!("{h}network{scope}:{r} {mode}");
-            let decision = effective.explain(&host, port, &path);
+            let decision = effective.explain(&host, port, &path, &method);
             // Tag a request allowed *only* by the built-in set (not the user's own
             // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
             // only allow rules, so an effective `AllowedBy` the user policy does not also allow can
             // only be the built-in set. Discriminate on the user verdict's own variant (definitely
             // "the user allowed it") rather than a separate predicate.
             let user_allowed = matches!(
-                policy.explain(&host, port, &path),
+                policy.explain(&host, port, &path, &method),
                 allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
             );
             let builtin = matches!(decision, allowlist::Decision::AllowedBy(_)) && !user_allowed;

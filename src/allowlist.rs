@@ -13,6 +13,13 @@
 //! or a `re:<pattern>` regex. A rule carries **no scheme**: `http`/`https` would only pick a
 //! default port, which the `:port` qualifier already expresses, so a scheme in an entry is
 //! rejected (it stays meaningful only on a *request*, e.g. `ops test net https://…`).
+//! Any entry may carry a leading **method prefix** `{VERB,VERB,...}` (uppercase verbs, e.g.
+//! `{GET,HEAD} github.com`) that scopes the rule to those HTTP methods only — a rule with no
+//! prefix applies to every verb. The leading `{` is an unambiguous sentinel (no rule kind starts
+//! with one), so it never collides with the `{n,m}` quantifiers a `re:` body may contain. A method
+//! constraint narrows an allow to particular verbs — `{GET,HEAD} host` permits reads but forbids
+//! writes — but it bounds what the agent can drive the upstream's API to do per the upstream's own
+//! verb semantics; it is **not** raw-exfiltration protection (a GET URL still carries data out).
 //! Classification
 //! happens once when the config is resolved, so a malformed entry (including an
 //! uncompilable regex) is rejected up front rather than silently mis-read at request time.
@@ -108,14 +115,12 @@ pub(crate) enum Methods {
     #[default]
     Any,
     /// An explicit, non-empty set of uppercase verbs, sorted and de-duplicated.
-    #[allow(dead_code)]
     Only(Vec<String>),
 }
 
 impl Methods {
     /// Whether this set applies to `method` (already uppercased by the caller). `Any` admits
     /// every verb; `Only` admits exactly the listed ones.
-    #[allow(dead_code)]
     fn admits(&self, method: &str) -> bool {
         match self {
             Methods::Any => true,
@@ -231,13 +236,13 @@ impl Request {
 }
 
 impl Rule {
-    /// Whether this rule matches the (already-canonicalized) request — its [`RuleKind`] matches
-    /// the host/port/path, ignoring the method dimension (host-level matching). Used where a rule
-    /// is known to be method-agnostic (credential injection and live `ask`-session rules, which
-    /// are always [`Methods::Any`]); the full method-aware verdict goes through
-    /// [`EgressPolicy::explain`].
-    fn matches(&self, req: &Request) -> bool {
-        self.kind.matches(req)
+    /// Whether this rule matches the (already-canonicalized) request for `method` (uppercased by
+    /// the caller): its method set must admit the verb **and** its [`RuleKind`] must match the
+    /// host/port/path. The method is a separate dimension, kept out of the canonical URL the
+    /// `RuleKind` matches. Host-level callers that are method-agnostic by construction (credential
+    /// injection, live `ask`-session rules) go straight through [`RuleKind::matches`] instead.
+    fn matches(&self, req: &Request, method: &str) -> bool {
+        self.methods.admits(method) && self.kind.matches(req)
     }
 }
 
@@ -536,29 +541,33 @@ impl EgressPolicy {
 
     /// Whether a request to `host`:`port` for `path` is permitted: it must match some
     /// allow rule and no deny rule — **deny always wins**. A thin bool view over
-    /// [`Self::explain`]. The filtering proxy and the `ops test net` tester both decide
-    /// through [`Self::explain`] (they need the deciding rule), so this convenience view is
+    /// [`Self::explain`], for the verb `GET` (these tests exercise method-agnostic rules).
+    /// The filtering proxy and the `ops test net` tester both decide through [`Self::explain`]
+    /// (they need the deciding rule and the request's actual method), so this convenience view is
     /// exercised only by tests.
     #[allow(dead_code)]
     pub(crate) fn permits(&self, host: &str, port: u16, path: &str) -> bool {
         matches!(
-            self.explain(host, port, path),
+            self.explain(host, port, path, "GET"),
             Decision::AllowedBy(_) | Decision::AllowedDefault
         )
     }
 
-    /// Explain the verdict for a request to `host`:`port` for `path`, naming the deciding
-    /// rule. Deny wins: a matching deny rule decides even when an allow rule also matches;
-    /// otherwise a matching allow rule; otherwise the policy's default action (deny- or
-    /// allow-by-default). The request is canonicalized once (host lowercased, path
-    /// percent-decoded / `.`/`..` resolved / query dropped) so every rule sees the same
-    /// evasion-proof view.
-    pub(crate) fn explain(&self, host: &str, port: u16, path: &str) -> Decision<'_> {
+    /// Explain the verdict for a request to `host`:`port` for `path` with HTTP `method`, naming
+    /// the deciding rule. Deny wins: a matching deny rule decides even when an allow rule also
+    /// matches; otherwise a matching allow rule; otherwise the policy's default action (deny- or
+    /// allow-by-default). A rule matches only when its method set admits `method` (a method-less
+    /// rule admits every verb), so a `{GET,HEAD} host` allow does not match a POST. The request is
+    /// canonicalized once (host lowercased, path percent-decoded / `.`/`..` resolved / query
+    /// dropped) so every rule sees the same evasion-proof view; `method` is uppercased here so the
+    /// caller need not.
+    pub(crate) fn explain(&self, host: &str, port: u16, path: &str, method: &str) -> Decision<'_> {
         let req = Request::new(host, port, path);
-        if let Some(rule) = self.deny.iter().find(|r| r.matches(&req)) {
+        let method = method.to_ascii_uppercase();
+        if let Some(rule) = self.deny.iter().find(|r| r.matches(&req, &method)) {
             return Decision::DeniedBy(rule);
         }
-        if let Some(rule) = self.allow.iter().find(|r| r.matches(&req)) {
+        if let Some(rule) = self.allow.iter().find(|r| r.matches(&req, &method)) {
             return Decision::AllowedBy(rule);
         }
         match self.default_action {
@@ -566,6 +575,21 @@ impl EgressPolicy {
             DefaultAction::Allow => Decision::AllowedDefault,
             DefaultAction::Ask => Decision::Ask,
         }
+    }
+
+    /// Whether a request is denied *purely* because of its method: an allow rule matches the
+    /// host/port/path (its [`RuleKind`]) but its method set excludes `method` — so a different
+    /// verb to the same destination would be allowed. Lets the proxy report a `denied-method`
+    /// reason distinct from "this host is not allowed at all". Meaningful only on the
+    /// deny-by-default path (deny rules are already decided by [`Self::explain`]); reuses the same
+    /// kind matcher, so it cannot drift from the verdict. `method` is uppercased here to match
+    /// [`Self::explain`], so the caller need not.
+    pub(crate) fn method_denied(&self, host: &str, port: u16, path: &str, method: &str) -> bool {
+        let req = Request::new(host, port, path);
+        let method = method.to_ascii_uppercase();
+        self.allow
+            .iter()
+            .any(|r| r.kind.matches(&req) && !r.methods.admits(&method))
     }
 }
 
@@ -589,14 +613,16 @@ pub(crate) enum Decision<'a> {
     Ask,
 }
 
-/// Whether `rule` matches a request to `host`:`port` for `target`, canonicalized exactly
-/// the way [`EgressPolicy::explain`] canonicalizes it (host lowercased, path percent-decoded
-/// / `.`/`..`-resolved / query dropped). The filtering proxy uses this to decide whether a
-/// per-host credential injection applies to a request it has already allowed — so the
-/// injection sees the identical normalized view as the verdict, and a host or path dodge
-/// cannot separate the two.
+/// Whether `rule`'s host/port/path matches a request to `host`:`port` for `target`, canonicalized
+/// exactly the way [`EgressPolicy::explain`] canonicalizes it (host lowercased, path
+/// percent-decoded / `.`/`..`-resolved / query dropped). **Method-agnostic by design** — it tests
+/// the [`RuleKind`] only, never the method set. The filtering proxy uses it to decide whether a
+/// per-host credential injection applies to a request it has already allowed, and the live `ask`
+/// overlay to match a remembered host rule; both deal in host-scoped, method-less rules, and a
+/// credential is injected for the destination regardless of verb. So the injection sees the
+/// identical normalized view as the verdict, and a host or path dodge cannot separate the two.
 pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> bool {
-    rule.matches(&Request::new(host, port, target))
+    rule.kind.matches(&Request::new(host, port, target))
 }
 
 /// An exact-host rule scoped to a single port — what a live `ask` decision remembers: exactly the
@@ -621,10 +647,54 @@ pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
 /// already expresses — so it is rejected with a pointer to the scheme-free form. A value that
 /// fits none is rejected so it can never be read as an unintended kind.
 pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
+    let (methods, rest) = split_method_prefix(entry.trim())?;
     Ok(Rule {
-        kind: classify_kind(entry.trim())?,
-        methods: Methods::Any,
+        kind: classify_kind(rest.trim())?,
+        methods,
     })
+}
+
+/// Split an optional leading `{VERB,VERB,...}` method prefix off an entry, returning the method
+/// set and the rest (the rule body, still to be trimmed). A leading `{` is an unambiguous sentinel
+/// that a method spec is present — no rule kind (`re:`, a host, a path, an IP) ever starts with one
+/// — so it never collides with the `{n,m}` quantifiers a `re:` body may contain (those sit after
+/// `re:`, never at the very start). No `{` means [`Methods::Any`] and the whole entry as the body.
+fn split_method_prefix(s: &str) -> Result<(Methods, &str), String> {
+    let Some(after) = s.strip_prefix('{') else {
+        return Ok((Methods::Any, s));
+    };
+    let Some(close) = after.find('}') else {
+        return Err(
+            "unterminated `{` in the method prefix (expected `{GET,POST} <rule>`)".to_string(),
+        );
+    };
+    Ok((parse_methods(&after[..close])?, &after[close + 1..]))
+}
+
+/// Parse the inside of a `{...}` method prefix into a [`Methods::Only`] set: a non-empty,
+/// comma-separated list of verbs, each non-empty uppercase ASCII letters (`GET`, `POST`,
+/// `PROPFIND`, …), sorted and de-duplicated so equal specs compare and display identically. An
+/// empty set (`{}`), an empty item (`{GET,}`), or a non-uppercase verb is rejected — fail-closed,
+/// never a rule that can match nothing or a typo that silently never fires.
+fn parse_methods(spec: &str) -> Result<Methods, String> {
+    let mut verbs: Vec<String> = Vec::new();
+    for part in spec.split(',') {
+        let v = part.trim();
+        if v.is_empty() {
+            return Err(
+                "empty method in the `{...}` prefix (expected e.g. `{GET,POST}`)".to_string(),
+            );
+        }
+        if !v.bytes().all(|b| b.is_ascii_uppercase()) {
+            return Err(format!(
+                "method `{v}` must be uppercase ASCII letters (e.g. GET, POST, DELETE)"
+            ));
+        }
+        verbs.push(v.to_string());
+    }
+    verbs.sort();
+    verbs.dedup();
+    Ok(Methods::Only(verbs))
 }
 
 /// Classify the syntactic [`RuleKind`] of an entry (already trimmed, and with any method prefix
@@ -1434,17 +1504,20 @@ mod tests {
     fn explain_names_the_deciding_rule() {
         let p = EgressPolicy::new(vec![rule("*.nixos.org")], vec![rule("evil.nixos.org")]);
         // allowed by the subdomain rule
-        match p.explain("cache.nixos.org", 443, "/x") {
+        match p.explain("cache.nixos.org", 443, "/x", "GET") {
             Decision::AllowedBy(r) => assert_eq!(r.to_string(), "*.nixos.org"),
             d => panic!("expected AllowedBy, got {d:?}"),
         }
         // denied by the deny rule, which wins over the matching subdomain allow
-        match p.explain("evil.nixos.org", 443, "/x") {
+        match p.explain("evil.nixos.org", 443, "/x", "GET") {
             Decision::DeniedBy(r) => assert_eq!(r.to_string(), "evil.nixos.org"),
             d => panic!("expected DeniedBy, got {d:?}"),
         }
         // denied by default when no allow matches
-        assert_eq!(p.explain("other.com", 443, "/"), Decision::DeniedDefault);
+        assert_eq!(
+            p.explain("other.com", 443, "/", "GET"),
+            Decision::DeniedDefault
+        );
     }
 
     #[test]
@@ -1591,7 +1664,10 @@ mod tests {
         // `new` and `Default` both deny by default: an unmatched host gets `DeniedDefault`.
         let p = EgressPolicy::new(vec![rule("github.com")], vec![]);
         assert_eq!(p.default_action(), DefaultAction::Deny);
-        assert_eq!(p.explain("other.com", 443, "/"), Decision::DeniedDefault);
+        assert_eq!(
+            p.explain("other.com", 443, "/", "GET"),
+            Decision::DeniedDefault
+        );
         assert_eq!(
             EgressPolicy::default().default_action(),
             DefaultAction::Deny
@@ -1609,14 +1685,14 @@ mod tests {
         // an unlisted host is now permitted (the whole point of allow-by-default)
         assert!(p.permits("anything.example", 443, "/"));
         assert_eq!(
-            p.explain("anything.example", 443, "/"),
+            p.explain("anything.example", 443, "/", "GET"),
             Decision::AllowedDefault
         );
 
         // a deny rule still wins, even under allow-by-default
         assert!(!p.permits("evil.com", 443, "/"));
         assert!(matches!(
-            p.explain("evil.com", 443, "/"),
+            p.explain("evil.com", 443, "/", "GET"),
             Decision::DeniedBy(_)
         ));
 
@@ -1625,7 +1701,7 @@ mod tests {
         let q =
             EgressPolicy::new(vec![rule("10.0.0.1")], vec![]).with_default(DefaultAction::Allow);
         assert!(matches!(
-            q.explain("10.0.0.1", 443, "/"),
+            q.explain("10.0.0.1", 443, "/", "GET"),
             Decision::AllowedBy(_)
         ));
     }
@@ -1640,7 +1716,10 @@ mod tests {
         // one trailing dot, and a doubled dot (which DNS resolves to the same host) — both denied
         for host in ["evil.com.", "evil.com..", "evil.com..."] {
             assert!(!p.permits(host, 443, "/"), "{host} must be denied");
-            assert!(matches!(p.explain(host, 443, "/"), Decision::DeniedBy(_)));
+            assert!(matches!(
+                p.explain(host, 443, "/", "GET"),
+                Decision::DeniedBy(_)
+            ));
         }
         // a subdomain deny is likewise not dodged by trailing dots
         let q =
@@ -1684,5 +1763,133 @@ mod tests {
         // a path rule with an IPv6 host stays bracketed
         assert_eq!(rule("[::1]:8080/secret").to_string(), "[::1]:8080/secret");
         assert_eq!(rule("[2001:db8::1]/a/b").to_string(), "[2001:db8::1]/a/b");
+    }
+
+    #[test]
+    fn a_method_prefix_attaches_to_each_kind_and_a_bare_rule_is_any() {
+        // a method-less rule is `Any`
+        assert_eq!(rule("github.com").methods, Methods::Any);
+        // the prefix attaches to every structured kind and to a regex, verbs sorted + de-duped
+        assert_eq!(
+            rule("{GET,HEAD} github.com").methods,
+            Methods::Only(vec!["GET".into(), "HEAD".into()])
+        );
+        assert_eq!(
+            rule("{POST,GET,GET} *.nixos.org").methods,
+            Methods::Only(vec!["GET".into(), "POST".into()]),
+            "verbs are sorted and de-duplicated"
+        );
+        assert_eq!(
+            rule("{GET} 1.2.3.4").methods,
+            Methods::Only(vec!["GET".into()])
+        );
+        assert_eq!(
+            rule("{PUT} example.com:443/path").methods,
+            Methods::Only(vec!["PUT".into()])
+        );
+        // the prefix sits before `re:`, so the regex body's own `{n,m}` quantifiers are untouched
+        let r = rule("{POST} re:^https://x\\.test/a{2,3}$");
+        assert_eq!(r.methods, Methods::Only(vec!["POST".into()]));
+        assert!(matches!(r.kind, RuleKind::Regex { .. }));
+        // the kind is parsed correctly behind the prefix
+        assert_eq!(
+            rule("{GET} github.com:443").kind,
+            RuleKind::Host("github.com".into(), Ports::Ranges(vec![(443, 443)]))
+        );
+    }
+
+    #[test]
+    fn a_method_prefix_round_trips_through_display() {
+        // a qualified rule renders `{V,V} <rule>` and round-trips; the verbs are normalized
+        assert_eq!(
+            rule("{GET,HEAD} github.com:443").to_string(),
+            "{GET,HEAD} github.com:443"
+        );
+        assert_eq!(rule("{POST} re:^x$").to_string(), "{POST} re:^x$");
+        assert_eq!(
+            rule("{HEAD,GET} example.com/p").to_string(),
+            "{GET,HEAD} example.com/p",
+            "display shows the sorted set"
+        );
+        // a method-less rule is byte-for-byte unchanged (empty prefix)
+        assert_eq!(rule("github.com").to_string(), "github.com");
+    }
+
+    #[test]
+    fn rejects_a_malformed_method_prefix() {
+        for bad in [
+            "{} github.com",         // empty set
+            "{GET,} github.com",     // trailing empty item
+            "{,GET} github.com",     // leading empty item
+            "{get} github.com",      // lowercase
+            "{GET POST} github.com", // space instead of comma (not all uppercase)
+            "{GET github.com",       // unterminated
+            "{GE1} github.com",      // a digit is not a method letter
+        ] {
+            assert!(classify(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_method_restricted_rule_matches_only_those_verbs() {
+        // a GET/HEAD-only allow: reads pass, a write falls to deny-by-default
+        let p = allow(&["{GET,HEAD} api.test:443"]);
+        assert!(
+            p.permits("api.test", 443, "/x"),
+            "GET (the permits default) passes"
+        );
+        assert!(
+            matches!(
+                p.explain("api.test", 443, "/x", "head"),
+                Decision::AllowedBy(_)
+            ),
+            "method match is case-insensitive (HEAD)"
+        );
+        assert_eq!(
+            p.explain("api.test", 443, "/x", "POST"),
+            Decision::DeniedDefault,
+            "a write is not permitted by a GET/HEAD-only allow"
+        );
+        // a method-less rule admits every verb
+        let q = allow(&["other.test:443"]);
+        assert!(matches!(
+            q.explain("other.test", 443, "/x", "DELETE"),
+            Decision::AllowedBy(_)
+        ));
+    }
+
+    #[test]
+    fn a_method_can_be_denied_out_of_an_open_host() {
+        // open the host for all verbs, then deny just POST — deny wins for that verb only
+        let p = EgressPolicy::new(
+            vec![rule("api.test:443")],
+            vec![rule("{POST} api.test:443")],
+        );
+        assert!(matches!(
+            p.explain("api.test", 443, "/x", "GET"),
+            Decision::AllowedBy(_)
+        ));
+        assert!(matches!(
+            p.explain("api.test", 443, "/x", "POST"),
+            Decision::DeniedBy(_)
+        ));
+    }
+
+    #[test]
+    fn method_denied_distinguishes_a_verb_block_from_an_unknown_host() {
+        let p = allow(&["{GET} api.test:443"]);
+        // the host is allowed, but POST is not its verb → "denied because of method"
+        assert!(p.method_denied("api.test", 443, "/x", "POST"));
+        assert!(
+            p.method_denied("api.test", 443, "/x", "post"),
+            "case-insensitive"
+        );
+        // GET is permitted, so it is not a method-block
+        assert!(!p.method_denied("api.test", 443, "/x", "GET"));
+        // a host no allow rule names at all is not a method-block (it is just unknown)
+        assert!(!p.method_denied("other.test", 443, "/x", "POST"));
+        // a method-less allow never reports a method-block
+        let q = allow(&["api.test:443"]);
+        assert!(!q.method_denied("api.test", 443, "/x", "POST"));
     }
 }
