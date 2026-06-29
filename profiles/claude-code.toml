@@ -18,18 +18,21 @@ claude-code = "mise:aqua:anthropics/claude-code"
 # reports "Unable to connect to Anthropic services"), the Claude downloads host and the
 # Anthropic MCP proxy the CLI reaches for updates and MCP connectors, and the one Google
 # Cloud Storage bucket Anthropic ships the `claude` binary from (so the tool can
-# self-equip fresh at first launch). The bucket rule is path-scoped — reads from exactly
-# that bucket, not all of GCS. The agent may run on untrusted project code, but it can
-# only reach these. (If a future `claude-code` release moves hosts, the proxy reports the
-# refused host — add it; check ahead with `ops test net <url>`.)
+# self-equip fresh at first launch). The two pure-download hosts — downloads.claude.ai and the
+# GCS dist bucket (path-scoped to exactly that bucket, not the rest of GCS) — are method-scoped
+# `{GET,HEAD}`, so the agent can only *read* from them, never POST/upload. The API, platform
+# (account/connectivity check), and MCP proxy (JSON-RPC: POST/SSE/DELETE) hosts stay open to
+# every verb. The agent may run on untrusted project code, but it can only reach these. (If a
+# future `claude-code` release moves hosts or needs another verb, the proxy reports the refusal
+# — add it; check ahead with `ops test net <url>`.)
 [network]
 mode = "allowlist"
 allow = [
     "api.anthropic.com:443",
     "platform.claude.com:443",
-    "downloads.claude.ai:443",
+    "{GET,HEAD} downloads.claude.ai:443",
     "mcp-proxy.anthropic.com:443",
-    "storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
+    "{GET,HEAD} storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
 # The real API key is read on the HOST and injected into the outbound request by

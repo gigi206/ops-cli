@@ -29,8 +29,9 @@ kilo = "mise:github:Kilo-Org/kilocode"
 
 [network]
 mode = "allowlist"
-# api.anthropic.com: the provider API. models.dev: opencode/kilo's model catalogue.
-allow = ["api.anthropic.com", "models.dev"]
+# api.anthropic.com: the provider API (open to every verb — the CLI POSTs completions).
+# models.dev: opencode/kilo's model catalogue — a read-only fetch, so scoped to `{GET,HEAD}`.
+allow = ["api.anthropic.com", "{GET,HEAD} models.dev"]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage.
 # Provide it on the host as $ANTHROPIC_API_KEY (or point `from` at a resolver).
