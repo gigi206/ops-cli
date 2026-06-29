@@ -19,7 +19,7 @@ pub(crate) mod safety;
 mod schema;
 pub(crate) mod view;
 
-use crate::allowlist::Rule;
+use crate::allowlist::{Rule, RuleKind};
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
@@ -2186,13 +2186,13 @@ fn file_source(file: &str) -> Result<SecretSource, String> {
 /// user never meant to hand the secret to.
 fn validate_secret_target(to: &str) -> Result<Rule, String> {
     let rule = crate::allowlist::classify(to).map_err(|e| format!("invalid `to` target — {e}"))?;
-    match rule {
-        Rule::Ip(..) | Rule::Host(..) | Rule::Url { .. } => Ok(rule),
-        Rule::Subdomain(..) => Err(format!(
+    match rule.kind {
+        RuleKind::Ip(..) | RuleKind::Host(..) | RuleKind::Url { .. } => Ok(rule),
+        RuleKind::Subdomain(..) => Err(format!(
             "`to` must be a concrete host, not the `*.` wildcard `{to}` \
              (a credential is sent to one known host)"
         )),
-        Rule::Regex { .. } => Err(format!(
+        RuleKind::Regex { .. } => Err(format!(
             "`to` must be a concrete host, not the regex `{to}` \
              (a credential is sent to one known host)"
         )),

@@ -1273,10 +1273,13 @@ mod tests {
     fn a_header_secret() -> crate::config::HeaderSecret {
         crate::config::HeaderSecret {
             sources: vec![crate::config::SecretSource::Env("TOKEN".into())],
-            to: crate::allowlist::Rule::Host(
-                "api.example.com".into(),
-                crate::allowlist::Ports::Any,
-            ),
+            to: crate::allowlist::Rule {
+                kind: crate::allowlist::RuleKind::Host(
+                    "api.example.com".into(),
+                    crate::allowlist::Ports::Any,
+                ),
+                methods: crate::allowlist::Methods::Any,
+            },
             header: "Authorization".into(),
             shape: crate::config::HeaderShape::new("Bearer ", false),
         }

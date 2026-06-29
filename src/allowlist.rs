@@ -55,11 +55,20 @@ use std::net::IpAddr;
 
 use regex::Regex;
 
-/// One classified match rule, used in either the allow or the deny list. The kind is
-/// inferred from the entry's syntax at config resolution; an entry that matches none is a
-/// hard error, never a silent drop.
+/// One classified match rule, used in either the allow or the deny list: a syntactic [`RuleKind`]
+/// plus the set of HTTP [`Methods`] it applies to. A rule with no `{...}` method prefix carries
+/// [`Methods::Any`] and so behaves exactly as before; a method-qualified rule (`{GET,HEAD} host`)
+/// applies only to those verbs, letting an allow be narrowed to read-only access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rule {
+    pub(crate) kind: RuleKind,
+    pub(crate) methods: Methods,
+}
+
+/// The syntactic kind of a match rule, inferred from an entry's syntax at config resolution; an
+/// entry that matches none is a hard error, never a silent drop.
 #[derive(Debug, Clone)]
-pub(crate) enum Rule {
+pub(crate) enum RuleKind {
     /// A literal IP with a port set: matches a request whose host is exactly this address
     /// and whose port the set admits (any path).
     Ip(IpAddr, Ports),
@@ -85,6 +94,43 @@ pub(crate) enum Rule {
     /// A `re:<pattern>` regex over the request's whole reconstructed URL. The pattern is
     /// kept for display and equality; the compiled engine does the matching.
     Regex { pattern: String, re: Regex },
+}
+
+/// The HTTP methods a rule applies to. [`Methods::Any`] (the default — a rule with no `{...}`
+/// prefix) matches every method; [`Methods::Only`] pins an explicit set of verbs (uppercased,
+/// sorted, and de-duplicated so equal specs compare and display identically). A method constraint
+/// narrows a rule to particular verbs — e.g. `{GET,HEAD} host` permits reads but forbids writes to
+/// that host. It constrains what the agent can drive the upstream's API to do per the upstream's
+/// own verb semantics; it is not raw-exfiltration protection (a GET URL still carries data out).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum Methods {
+    /// No method prefix — the rule applies to every verb.
+    #[default]
+    Any,
+    /// An explicit, non-empty set of uppercase verbs, sorted and de-duplicated.
+    #[allow(dead_code)]
+    Only(Vec<String>),
+}
+
+impl Methods {
+    /// Whether this set applies to `method` (already uppercased by the caller). `Any` admits
+    /// every verb; `Only` admits exactly the listed ones.
+    #[allow(dead_code)]
+    fn admits(&self, method: &str) -> bool {
+        match self {
+            Methods::Any => true,
+            Methods::Only(ms) => ms.iter().any(|m| m == method),
+        }
+    }
+
+    /// The display prefix: empty for `Any` (the rule renders bare), else `{V,V,...} ` with the
+    /// verbs comma-joined and a trailing space before the rule body.
+    fn prefix(&self) -> String {
+        match self {
+            Methods::Any => String::new(),
+            Methods::Only(ms) => format!("{{{}}} ", ms.join(",")),
+        }
+    }
 }
 
 /// The set of ports a host-level rule (`Ip`/`Host`/`Subdomain`) admits. A bare entry
@@ -185,14 +231,25 @@ impl Request {
 }
 
 impl Rule {
-    /// Whether this rule matches the (already-canonicalized) request. A `Url` rule needs the
+    /// Whether this rule matches the (already-canonicalized) request — its [`RuleKind`] matches
+    /// the host/port/path, ignoring the method dimension (host-level matching). Used where a rule
+    /// is known to be method-agnostic (credential injection and live `ask`-session rules, which
+    /// are always [`Methods::Any`]); the full method-aware verdict goes through
+    /// [`EgressPolicy::explain`].
+    fn matches(&self, req: &Request) -> bool {
+        self.kind.matches(req)
+    }
+}
+
+impl RuleKind {
+    /// Whether this kind matches the (already-canonicalized) request. A `Url` kind needs the
     /// host and port to be equal and the path to satisfy [`path_matches`] — exact by default,
     /// or the path and its subtree when the rule was declared with a trailing `/*`. The
     /// canonicalization means `/secret?x`, `/secret/`, `%2f`, and `/foo/../secret` all reduce
-    /// to the same path, so a deny cannot be dodged. A `Regex` rule matches the canonical URL.
+    /// to the same path, so a deny cannot be dodged. A `Regex` kind matches the canonical URL.
     fn matches(&self, req: &Request) -> bool {
         match self {
-            Rule::Ip(ip, ports) => {
+            RuleKind::Ip(ip, ports) => {
                 ports.admits(req.port)
                     && req
                         .host
@@ -200,17 +257,17 @@ impl Rule {
                         .map(|h| &h == ip)
                         .unwrap_or(false)
             }
-            Rule::Host(h, ports) => ports.admits(req.port) && &req.host == h,
-            Rule::Subdomain(d, ports) => {
+            RuleKind::Host(h, ports) => ports.admits(req.port) && &req.host == h,
+            RuleKind::Subdomain(d, ports) => {
                 ports.admits(req.port) && (&req.host == d || req.host.ends_with(&format!(".{d}")))
             }
-            Rule::Url {
+            RuleKind::Url {
                 host: h,
                 ports,
                 path: pa,
                 subtree,
             } => &req.host == h && ports.admits(req.port) && path_matches(&req.segs, pa, *subtree),
-            Rule::Regex { re, .. } => re.is_match(&req.url),
+            RuleKind::Regex { re, .. } => re.is_match(&req.url),
         }
     }
 }
@@ -318,40 +375,50 @@ fn display_host(host: &str) -> String {
     }
 }
 
-/// Two rules are equal when they are the same kind with the same data; for a regex that is
-/// the same pattern string (the compiled engine has no equality of its own).
-impl PartialEq for Rule {
+/// Two kinds are equal when they are the same variant with the same data; for a regex that is
+/// the same pattern string (the compiled engine has no equality of its own). [`Rule`] then
+/// derives equality over its kind and method set.
+impl PartialEq for RuleKind {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Rule::Ip(a, pa), Rule::Ip(b, pb)) => a == b && pa == pb,
-            (Rule::Host(a, pa), Rule::Host(b, pb)) => a == b && pa == pb,
-            (Rule::Subdomain(a, pa), Rule::Subdomain(b, pb)) => a == b && pa == pb,
+            (RuleKind::Ip(a, pa), RuleKind::Ip(b, pb)) => a == b && pa == pb,
+            (RuleKind::Host(a, pa), RuleKind::Host(b, pb)) => a == b && pa == pb,
+            (RuleKind::Subdomain(a, pa), RuleKind::Subdomain(b, pb)) => a == b && pa == pb,
             (
-                Rule::Url {
+                RuleKind::Url {
                     host: h1,
                     ports: p1,
                     path: pa1,
                     ..
                 },
-                Rule::Url {
+                RuleKind::Url {
                     host: h2,
                     ports: p2,
                     path: pa2,
                     ..
                 },
             ) => h1 == h2 && p1 == p2 && pa1 == pa2,
-            (Rule::Regex { pattern: a, .. }, Rule::Regex { pattern: b, .. }) => a == b,
+            (RuleKind::Regex { pattern: a, .. }, RuleKind::Regex { pattern: b, .. }) => a == b,
             _ => false,
         }
     }
 }
 
-impl Eq for Rule {}
+impl Eq for RuleKind {}
 
+/// A rule renders as its optional method prefix (`{GET,HEAD} ` — empty for [`Methods::Any`])
+/// followed by its kind, so a method-less rule is byte-for-byte unchanged and a qualified one
+/// round-trips through [`classify`].
 impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.methods.prefix(), self.kind)
+    }
+}
+
+impl fmt::Display for RuleKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Rule::Ip(ip, ports) => {
+            RuleKind::Ip(ip, ports) => {
                 let suffix = ports.suffix();
                 // bracket an IPv6 literal when it carries a port, so `:port` is unambiguous
                 if !suffix.is_empty() && ip.is_ipv6() {
@@ -360,12 +427,12 @@ impl fmt::Display for Rule {
                     write!(f, "{ip}{suffix}")
                 }
             }
-            Rule::Host(h, ports) => write!(f, "{h}{}", ports.suffix()),
-            Rule::Subdomain(d, ports) => write!(f, "*.{d}{}", ports.suffix()),
-            Rule::Url {
+            RuleKind::Host(h, ports) => write!(f, "{h}{}", ports.suffix()),
+            RuleKind::Subdomain(d, ports) => write!(f, "*.{d}{}", ports.suffix()),
+            RuleKind::Url {
                 host, ports, path, ..
             } => write!(f, "{}{}{path}", display_host(host), ports.suffix()),
-            Rule::Regex { pattern, .. } => write!(f, "re:{pattern}"),
+            RuleKind::Regex { pattern, .. } => write!(f, "re:{pattern}"),
         }
     }
 }
@@ -539,7 +606,12 @@ pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> 
 /// `classify(host)`, which defaults to the web ports {80, 443} and would fail to match a request
 /// that asked on a non-standard port — the very reason it reached `ask`.)
 pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
-    Rule::Host(canonical_host(host), Ports::Ranges(vec![(port, port)]))
+    // Method-agnostic by design ([`Methods::Any`]): a live `ask` answer approves the *host*, not a
+    // particular verb, so re-running any method to it is not re-asked.
+    Rule {
+        kind: RuleKind::Host(canonical_host(host), Ports::Ranges(vec![(port, port)])),
+        methods: Methods::Any,
+    }
 }
 
 /// Classify one declared entry (allow or deny) by its syntax, or report why it is
@@ -549,13 +621,22 @@ pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
 /// already expresses — so it is rejected with a pointer to the scheme-free form. A value that
 /// fits none is rejected so it can never be read as an unintended kind.
 pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
-    let s = entry.trim();
+    Ok(Rule {
+        kind: classify_kind(entry.trim())?,
+        methods: Methods::Any,
+    })
+}
+
+/// Classify the syntactic [`RuleKind`] of an entry (already trimmed, and with any method prefix
+/// already stripped by [`classify`]). Order matters: a `re:` regex, then a `/`-bearing
+/// `host[:ports]/path` URL rule, then the `*.` wildcard, then an IP literal, then a bare hostname.
+fn classify_kind(s: &str) -> Result<RuleKind, String> {
     if s.is_empty() {
         return Err("empty entry".to_string());
     }
     if let Some(pattern) = s.strip_prefix("re:") {
         let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
-        return Ok(Rule::Regex {
+        return Ok(RuleKind::Regex {
             pattern: pattern.to_string(),
             re,
         });
@@ -565,7 +646,7 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
     // (`ops test net <url>`), which names one concrete connection.
     if scheme_of(s).is_some() {
         return Err(format!(
-            "remove the scheme from `{entry}` — a rule takes a bare host and path, e.g. \
+            "remove the scheme from `{s}` — a rule takes a bare host and path, e.g. \
              `example.com/path` or `example.com:443/path` (a scheme only names a request's port)"
         ));
     }
@@ -577,18 +658,18 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
     reject_catch_all(host)?;
     if let Some(domain) = host.strip_prefix("*.") {
         if is_valid_hostname(domain) {
-            return Ok(Rule::Subdomain(domain.to_ascii_lowercase(), ports));
+            return Ok(RuleKind::Subdomain(domain.to_ascii_lowercase(), ports));
         }
-        return Err(format!("invalid subdomain wildcard `{entry}`"));
+        return Err(format!("invalid subdomain wildcard `{s}`"));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(Rule::Ip(ip, ports));
+        return Ok(RuleKind::Ip(ip, ports));
     }
     if is_valid_hostname(host) {
-        return Ok(Rule::Host(host.to_ascii_lowercase(), ports));
+        return Ok(RuleKind::Host(host.to_ascii_lowercase(), ports));
     }
     Err(format!(
-        "unrecognized entry `{entry}` (expected an IP, a domain, `*.domain`, a `host[:port]/path` URL, or `re:<regex>`, each host optionally `:port`-qualified)"
+        "unrecognized entry `{s}` (expected an IP, a domain, `*.domain`, a `host[:port]/path` URL, or `re:<regex>`, each host optionally `:port`-qualified)"
     ))
 }
 
@@ -770,7 +851,7 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
 /// host must be concrete — an exact hostname or IP literal (bracketed for IPv6); a `*.domain`
 /// wildcard with a path is rejected (use `re:`). A trailing `/*` marks a subtree rule (the path
 /// and everything under it); without it the path matches exactly.
-fn parse_path_rule(s: &str, slash: usize) -> Result<Rule, String> {
+fn parse_path_rule(s: &str, slash: usize) -> Result<RuleKind, String> {
     let (authority, path) = (&s[..slash], &s[slash..]);
     if authority.is_empty() {
         return Err(format!("entry `{s}` has no host before the path"));
@@ -784,7 +865,7 @@ fn parse_path_rule(s: &str, slash: usize) -> Result<Rule, String> {
         ));
     }
     let subtree = path.ends_with("/*");
-    Ok(Rule::Url {
+    Ok(RuleKind::Url {
         host: canonical_host(host),
         ports,
         path: path.to_string(),
@@ -827,25 +908,25 @@ mod tests {
     #[test]
     fn classifies_each_granularity() {
         assert_eq!(
-            rule("1.2.3.4"),
-            Rule::Ip("1.2.3.4".parse().unwrap(), Ports::default())
+            rule("1.2.3.4").kind,
+            RuleKind::Ip("1.2.3.4".parse().unwrap(), Ports::default())
         );
         assert_eq!(
-            rule("::1"),
-            Rule::Ip("::1".parse().unwrap(), Ports::default())
+            rule("::1").kind,
+            RuleKind::Ip("::1".parse().unwrap(), Ports::default())
         );
         assert_eq!(
-            rule("github.com"),
-            Rule::Host("github.com".into(), Ports::default())
+            rule("github.com").kind,
+            RuleKind::Host("github.com".into(), Ports::default())
         );
         assert_eq!(
-            rule("*.nixos.org"),
-            Rule::Subdomain("nixos.org".into(), Ports::default())
+            rule("*.nixos.org").kind,
+            RuleKind::Subdomain("nixos.org".into(), Ports::default())
         );
         // a `/` makes it a path rule; a bare host defaults to the web ports {80, 443}
         assert_eq!(
-            rule("example.com/exact/path"),
-            Rule::Url {
+            rule("example.com/exact/path").kind,
+            RuleKind::Url {
                 host: "example.com".into(),
                 ports: Ports::default(),
                 path: "/exact/path".into(),
@@ -854,8 +935,8 @@ mod tests {
         );
         // a trailing /* marks a subtree rule
         assert_eq!(
-            rule("example.com/area/*"),
-            Rule::Url {
+            rule("example.com/area/*").kind,
+            RuleKind::Url {
                 host: "example.com".into(),
                 ports: Ports::default(),
                 path: "/area/*".into(),
@@ -868,8 +949,8 @@ mod tests {
     fn a_path_rule_carries_the_same_port_syntax_as_a_host() {
         // a bare `host/` is the root path on the default web ports {80, 443}
         assert_eq!(
-            rule("example.com/"),
-            Rule::Url {
+            rule("example.com/").kind,
+            RuleKind::Url {
                 host: "example.com".into(),
                 ports: Ports::default(),
                 path: "/".into(),
@@ -878,8 +959,8 @@ mod tests {
         );
         // an explicit single port pins exactly that port for the path
         assert_eq!(
-            rule("example.com:8443/x"),
-            Rule::Url {
+            rule("example.com:8443/x").kind,
+            RuleKind::Url {
                 host: "example.com".into(),
                 ports: Ports::Ranges(vec![(8443, 8443)]),
                 path: "/x".into(),
@@ -888,8 +969,8 @@ mod tests {
         );
         // `:*` opens the path on any port; a list/range works too
         assert_eq!(
-            rule("example.com:*/admin"),
-            Rule::Url {
+            rule("example.com:*/admin").kind,
+            RuleKind::Url {
                 host: "example.com".into(),
                 ports: Ports::Any,
                 path: "/admin".into(),
@@ -898,8 +979,8 @@ mod tests {
         );
         // an IPv6 host with a port and a path
         assert_eq!(
-            rule("[::1]:8080/admin"),
-            Rule::Url {
+            rule("[::1]:8080/admin").kind,
+            RuleKind::Url {
                 host: "::1".into(),
                 ports: Ports::Ranges(vec![(8080, 8080)]),
                 path: "/admin".into(),
@@ -928,50 +1009,50 @@ mod tests {
     #[test]
     fn classifies_port_specs() {
         assert_eq!(
-            rule("github.com:443"),
-            Rule::Host("github.com".into(), Ports::Ranges(vec![(443, 443)]))
+            rule("github.com:443").kind,
+            RuleKind::Host("github.com".into(), Ports::Ranges(vec![(443, 443)]))
         );
         assert_eq!(
-            rule("github.com:80,443,8443"),
-            Rule::Host(
+            rule("github.com:80,443,8443").kind,
+            RuleKind::Host(
                 "github.com".into(),
                 Ports::Ranges(vec![(80, 80), (443, 443), (8443, 8443)])
             )
         );
         // a comma list is sorted and de-duplicated; {80,443} is the default set
         assert_eq!(
-            rule("github.com:443,80,443"),
-            Rule::Host("github.com".into(), Ports::default())
+            rule("github.com:443,80,443").kind,
+            RuleKind::Host("github.com".into(), Ports::default())
         );
         // an inclusive range
         assert_eq!(
-            rule("internal.test:8000-8100"),
-            Rule::Host("internal.test".into(), Ports::Ranges(vec![(8000, 8100)]))
+            rule("internal.test:8000-8100").kind,
+            RuleKind::Host("internal.test".into(), Ports::Ranges(vec![(8000, 8100)]))
         );
         // ranges and singles mix
         assert_eq!(
-            rule("internal.test:22,8000-8100"),
-            Rule::Host(
+            rule("internal.test:22,8000-8100").kind,
+            RuleKind::Host(
                 "internal.test".into(),
                 Ports::Ranges(vec![(22, 22), (8000, 8100)])
             )
         );
         // :* is any port
         assert_eq!(
-            rule("github.com:*"),
-            Rule::Host("github.com".into(), Ports::Any)
+            rule("github.com:*").kind,
+            RuleKind::Host("github.com".into(), Ports::Any)
         );
         // works on IP and subdomain kinds too
         assert_eq!(
-            rule("1.2.3.4:8080,9090"),
-            Rule::Ip(
+            rule("1.2.3.4:8080,9090").kind,
+            RuleKind::Ip(
                 "1.2.3.4".parse().unwrap(),
                 Ports::Ranges(vec![(8080, 8080), (9090, 9090)])
             )
         );
         assert_eq!(
-            rule("*.nixos.org:443"),
-            Rule::Subdomain("nixos.org".into(), Ports::Ranges(vec![(443, 443)]))
+            rule("*.nixos.org:443").kind,
+            RuleKind::Subdomain("nixos.org".into(), Ports::Ranges(vec![(443, 443)]))
         );
     }
 
@@ -979,30 +1060,30 @@ mod tests {
     fn classifies_bracketed_ipv6_with_ports() {
         // bare IPv6 needs no brackets, at the default ports
         assert_eq!(
-            rule("::1"),
-            Rule::Ip("::1".parse().unwrap(), Ports::default())
+            rule("::1").kind,
+            RuleKind::Ip("::1".parse().unwrap(), Ports::default())
         );
         // bracketed, no port -> default ports
         assert_eq!(
-            rule("[::1]"),
-            Rule::Ip("::1".parse().unwrap(), Ports::default())
+            rule("[::1]").kind,
+            RuleKind::Ip("::1".parse().unwrap(), Ports::default())
         );
         // bracketed with a port spec
         assert_eq!(
-            rule("[::1]:443"),
-            Rule::Ip("::1".parse().unwrap(), Ports::Ranges(vec![(443, 443)]))
+            rule("[::1]:443").kind,
+            RuleKind::Ip("::1".parse().unwrap(), Ports::Ranges(vec![(443, 443)]))
         );
         assert_eq!(
-            rule("[2001:db8::1]:8080"),
-            Rule::Ip(
+            rule("[2001:db8::1]:8080").kind,
+            RuleKind::Ip(
                 "2001:db8::1".parse().unwrap(),
                 Ports::Ranges(vec![(8080, 8080)])
             )
         );
         // :* on IPv6
         assert_eq!(
-            rule("[fe80::1]:*"),
-            Rule::Ip("fe80::1".parse().unwrap(), Ports::Any)
+            rule("[fe80::1]:*").kind,
+            RuleKind::Ip("fe80::1".parse().unwrap(), Ports::Any)
         );
     }
 
@@ -1096,12 +1177,12 @@ mod tests {
     #[test]
     fn classification_is_case_insensitive_on_the_host() {
         assert_eq!(
-            rule("GitHub.COM"),
-            Rule::Host("github.com".into(), Ports::default())
+            rule("GitHub.COM").kind,
+            RuleKind::Host("github.com".into(), Ports::default())
         );
         assert_eq!(
-            rule("*.NixOS.org"),
-            Rule::Subdomain("nixos.org".into(), Ports::default())
+            rule("*.NixOS.org").kind,
+            RuleKind::Subdomain("nixos.org".into(), Ports::default())
         );
     }
 
@@ -1143,8 +1224,8 @@ mod tests {
     fn the_bounded_subdomain_wildcard_is_not_a_catch_all() {
         // `*.domain` is a bounded subdomain wildcard, distinct from the rejected bare `*`.
         assert_eq!(
-            rule("*.nixos.org"),
-            Rule::Subdomain("nixos.org".into(), Ports::default())
+            rule("*.nixos.org").kind,
+            RuleKind::Subdomain("nixos.org".into(), Ports::default())
         );
     }
 
@@ -1292,8 +1373,8 @@ mod tests {
     #[test]
     fn classifies_a_regex_entry() {
         assert_eq!(
-            rule("re:^https://github\\.com/myorg/"),
-            Rule::Regex {
+            rule("re:^https://github\\.com/myorg/").kind,
+            RuleKind::Regex {
                 pattern: "^https://github\\.com/myorg/".into(),
                 re: Regex::new("^https://github\\.com/myorg/").unwrap(),
             }

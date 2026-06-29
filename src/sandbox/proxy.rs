@@ -113,7 +113,7 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 
-use crate::allowlist::{self, Decision, EgressPolicy, Rule};
+use crate::allowlist::{self, Decision, EgressPolicy, Rule, RuleKind};
 
 use super::egress_stats::{EgressStats, StatKind};
 
@@ -408,11 +408,11 @@ fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
         return false;
     };
     let h = allowlist::canonical_host(host);
-    match deciding {
-        Rule::Host(rh, _) => *rh == h,
-        Rule::Url { host: rh, .. } => *rh == h,
-        Rule::Ip(rip, _) => rip.to_string() == h,
-        Rule::Subdomain(..) | Rule::Regex { .. } => false,
+    match &deciding.kind {
+        RuleKind::Host(rh, _) => *rh == h,
+        RuleKind::Url { host: rh, .. } => *rh == h,
+        RuleKind::Ip(rip, _) => rip.to_string() == h,
+        RuleKind::Subdomain(..) | RuleKind::Regex { .. } => false,
     }
 }
 
