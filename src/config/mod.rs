@@ -871,6 +871,7 @@ fn resolve(
     // baseline posture clears them from the baseline-effective `secrets`.
     let declared_secrets = secrets.clone();
     enforce_secret_posture(&network, &mut secrets, &mut warnings);
+    warn_l4_l7_conflicts(&network, &mut warnings);
 
     let apps = resolve_apps(
         &mut warnings,
@@ -1059,6 +1060,24 @@ fn enforce_secret_posture(
             secrets.len()
         ));
         secrets.clear();
+    }
+}
+
+/// Warn when a host carries both a raw `tcp://` (L4) allow and an inspected (L7) rule on overlapping
+/// ports: the splice is uninspected, so the L7 path/method/regex/redaction on that host:port is
+/// silently ineffective. A config-quality hint (the layer partition is the actual control), so it
+/// drops nothing — it points the user at keeping one layer per host:port. Checked on the **baseline**
+/// policy (where rules are written); a per-app `[app.<name>.network]` override is not re-checked, to
+/// avoid duplicating the baseline warning for the common inherit-the-network app.
+fn warn_l4_l7_conflicts(network: &NetworkPolicy, warnings: &mut Vec<String>) {
+    if let NetworkPolicy::Allowlist(policy) = network {
+        for host in policy.l4_l7_conflicts() {
+            warnings.push(format!(
+                "host `{host}` has both a raw `tcp://` (L4) rule and an inspected (L7) rule on \
+                 overlapping ports — the splice is uninspected, so the L7 rule does not apply to it \
+                 (use one layer per host:port)"
+            ));
+        }
     }
 }
 

@@ -317,6 +317,38 @@ fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
 }
 
 #[test]
+fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
+    let fx = Fixture::new();
+    // The same host:port carries a raw tcp:// allow AND an inspected (L7) path deny — the splice is
+    // uninspected, so the L7 deny silently does not apply. The config load must warn about it.
+    fx.write_project(
+        "[network]\nmode = \"allowlist\"\nallow = [\"tcp://api.example.com:443\"]\ndeny = [\"api.example.com/secret\"]\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["net", "rules"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("api.example.com")
+            && stderr.contains("tcp://")
+            && stderr.contains("splice is uninspected"),
+        "a host with both an L4 and an L7 rule must warn that the splice bypasses inspection:\n{stderr}"
+    );
+
+    // A host reached by only one layer does not warn (no false positive).
+    fx.write_project(
+        "[network]\nmode = \"allowlist\"\nallow = [\"tcp://ssh.example.com:22\", \"api.example.com\"]\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    let clean = fx.run(&["net", "rules"]);
+    assert!(
+        !String::from_utf8_lossy(&clean.stderr).contains("splice is uninspected"),
+        "disjoint single-layer hosts must not warn:\n{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+}
+
+#[test]
 fn net_deny_on_a_fresh_project_is_refused_with_guidance() {
     let fx = Fixture::new();
     let out = fx.run(&["net", "deny", "evil.com"]);

@@ -202,6 +202,18 @@ impl Ports {
         }
     }
 
+    /// Whether this set shares at least one port with `other` — `Any` overlaps everything, two
+    /// range sets overlap when any range of one meets any range of the other. Used to flag an
+    /// L4/L7 rule overlap on the same host.
+    fn intersects(&self, other: &Ports) -> bool {
+        match (self, other) {
+            (Ports::Any, _) | (_, Ports::Any) => true,
+            (Ports::Ranges(a), Ports::Ranges(b)) => a
+                .iter()
+                .any(|(alo, ahi)| b.iter().any(|(blo, bhi)| alo <= bhi && blo <= ahi)),
+        }
+    }
+
     /// The display suffix: empty for the default {80, 443} (rendered as a bare host), `:*`
     /// for any, else `:` plus a comma list where each item is `p` or `lo-hi`.
     fn suffix(&self) -> String {
@@ -674,6 +686,46 @@ impl EgressPolicy {
         } else {
             L4Decision::Splice(allow)
         }
+    }
+
+    /// The exact hosts that carry **both** a raw `tcp://` (L4) allow rule and an inspected (L7) rule
+    /// (allow or deny) on an **overlapping** port — so the L7 rule is silently ineffective on that
+    /// host's spliced traffic (a splice is uninspected). For surfacing a config warning, never for
+    /// enforcement (the layer partition is the control). Conservative by construction: it flags only
+    /// an **exact-host** overlap (`Ip`/`Host`/`Url` kinds, whose host is one concrete name) with
+    /// intersecting port sets; a `*.domain` or `re:` host — whose overlap is not decidable here — is
+    /// not flagged, so the check yields a missed warning rather than a false one. Each host is
+    /// reported once.
+    pub(crate) fn l4_l7_conflicts(&self) -> Vec<String> {
+        let l7: Vec<(String, &Ports)> = self
+            .allow
+            .iter()
+            .chain(self.deny.iter())
+            .filter(|r| r.layer == Layer::L7)
+            .filter_map(|r| exact_host_ports(&r.kind))
+            .collect();
+        let mut hosts: Vec<String> = Vec::new();
+        for l4 in self.allow.iter().filter(|r| r.layer == Layer::L4) {
+            let Some((h4, p4)) = exact_host_ports(&l4.kind) else {
+                continue;
+            };
+            if !hosts.contains(&h4) && l7.iter().any(|(h7, p7)| *h7 == h4 && p4.intersects(p7)) {
+                hosts.push(h4);
+            }
+        }
+        hosts
+    }
+}
+
+/// The exact host name and port set of a host-level rule kind, for the L4/L7 overlap check — `None`
+/// for a `*.domain` (its host is not one concrete name) or a `re:` regex (no structured host), which
+/// the conservative check skips rather than guess an overlap.
+fn exact_host_ports(kind: &RuleKind) -> Option<(String, &Ports)> {
+    match kind {
+        RuleKind::Ip(ip, ports) => Some((ip.to_string(), ports)),
+        RuleKind::Host(h, ports) => Some((h.clone(), ports)),
+        RuleKind::Url { host, ports, .. } => Some((host.clone(), ports)),
+        RuleKind::Subdomain(..) | RuleKind::Regex { .. } => None,
     }
 }
 
@@ -2249,6 +2301,49 @@ mod tests {
         assert!(parse_tcp_target("https://ssh.example.com:22").is_err());
         assert!(parse_tcp_target("tcp://ssh.example.com:0").is_err());
         assert!(parse_tcp_target("tcp://ssh.example.com:notaport").is_err());
+    }
+
+    #[test]
+    fn l4_l7_conflicts_flags_an_overlapping_host_conservatively() {
+        // exact host + overlapping ports between a tcp:// allow and an L7 rule → flagged
+        let p = EgressPolicy::new(
+            vec![
+                rule("tcp://api.example.com:443"),
+                rule("api.example.com:443"),
+            ],
+            vec![],
+        );
+        assert_eq!(p.l4_l7_conflicts(), vec!["api.example.com".to_string()]);
+
+        // an L7 *path* deny on the same host:port is the real footgun (the deny can't apply to the
+        // spliced traffic) — flagged too
+        let q = EgressPolicy::new(
+            vec![rule("tcp://api.example.com:443")],
+            vec![rule("api.example.com/secret")],
+        );
+        assert_eq!(q.l4_l7_conflicts(), vec!["api.example.com".to_string()]);
+
+        // disjoint ports are NOT a conflict (tcp on :22, the bare L7 host on {80,443})
+        let r = EgressPolicy::new(
+            vec![rule("tcp://ssh.example.com:22"), rule("ssh.example.com")],
+            vec![],
+        );
+        assert!(r.l4_l7_conflicts().is_empty());
+
+        // a `*.domain` or `re:` host is not flagged (overlap undecidable → no false positive), and a
+        // host reached only by L4 has no conflict
+        let s = EgressPolicy::new(
+            vec![rule("tcp://*.corp:5432"), rule("db.corp:5432")],
+            vec![rule("re:.*example.*")],
+        );
+        assert!(s.l4_l7_conflicts().is_empty());
+
+        // each conflicting host is reported once, even with several matching L7 rules
+        let t = EgressPolicy::new(
+            vec![rule("tcp://h.example:443"), rule("h.example:443")],
+            vec![rule("h.example/a"), rule("h.example/b")],
+        );
+        assert_eq!(t.l4_l7_conflicts(), vec!["h.example".to_string()]);
     }
 
     #[test]
