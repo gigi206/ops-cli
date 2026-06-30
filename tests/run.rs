@@ -766,6 +766,98 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 }
 
 #[test]
+fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
+    // The L4 (`tcp://`) raw-splice path end to end through the real binary — the headline proof. A
+    // trusted `network = "allowlist"` with a `tcp://` rule lets an in-cage client (curl tunnelling
+    // via HTTP CONNECT to the in-cage forwarder) reach a host-side **plain-HTTP** upstream through
+    // the empty-netns → forwarder → host proxy → splice chain. Teeth: the upstream speaks plain HTTP,
+    // not TLS, so the exchange can only complete if the proxy *spliced* the bytes uninspected — had
+    // it taken the inspected L7 path (no `tcp://` rule), it would expect a TLS ClientHello and the
+    // plain-HTTP request would fail the handshake. The `tcp://127.0.0.1` rule also exercises the
+    // IP-literal CONNECT splice (no SNI). `curl` is in the curated base toolset, so it is always in
+    // the cage. The CONNECT target `127.0.0.1` is resolved/connected by the host proxy in the *host*
+    // netns (where loopback is the upstream), never by the empty-netns cage. Skips (never fails) when
+    // the host cannot sandbox.
+    let project = TmpDir::new("tcp-splice-proj");
+    let data = TmpDir::new("tcp-splice-data");
+    let state = TmpDir::new("tcp-splice-state");
+
+    // A host-side minimal plain-HTTP upstream on loopback — the splice's destination. Detached: it
+    // answers each connection with a fixed body and closes; the process exit reaps it.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in upstream.incoming() {
+            let Ok(mut sock) = conn else { break };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                // read the request head up to the blank line (loop, so a fragmented head is fully
+                // consumed before replying), then reply and close
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nRAW-L4-OK",
+                );
+            });
+        }
+    });
+
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        format!("[network]\nmode = \"allowlist\"\nallow = [\"tcp://127.0.0.1:{port}\"]\n"),
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net, no allowlist): seeds the project store too, so a
+    // later splice failure is a real fault rather than a cold cage.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping tcp splice e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The in-cage client: tunnel a plain-HTTP request through the proxy's HTTP CONNECT (18043 is the
+    // in-cage forwarder) to the plain upstream. `--proxytunnel` forces CONNECT even for an http://
+    // target; `--noproxy ''` overrides ops's `no_proxy` (which lists 127.0.0.1) so the loopback
+    // target is sent *through* the proxy rather than bypassing it.
+    let cmd =
+        format!("curl -sS --proxytunnel --noproxy '' -x 127.0.0.1:18043 http://127.0.0.1:{port}/");
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", &cmd],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RAW-L4-OK"),
+        "the plain-HTTP exchange did not round-trip through the tcp:// splice — stdout: {:?}, stderr: {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
     // The allow-by-default (denylist) mode through the real launch. A trusted `network = "allow"`
     // stands up the same Model-B filtering proxy as the allowlist e2e (empty netns + in-cage

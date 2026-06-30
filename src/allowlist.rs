@@ -10,10 +10,17 @@
 //! an exact domain, a `*.domain` wildcard (the domain and any subdomain) — each host kind
 //! optionally `:port`-qualified (a comma list of ports and/or `lo-hi` ranges, or `:*`,
 //! defaulting to {80, 443}) — a `host[:port]/path` URL (exact, or a `/*`-suffixed subtree),
-//! or a `re:<pattern>` regex. A rule carries **no scheme**: `http`/`https` would only pick a
-//! default port, which the `:port` qualifier already expresses, so a scheme in an entry is
-//! rejected (it stays meaningful only on a *request*, e.g. `ops test net https://…`).
-//! Any entry may carry a leading **method prefix** `{VERB,VERB,...}` (uppercase verbs, e.g.
+//! or a `re:<pattern>` regex. A rule may carry a scheme that selects its enforcement **layer**: a
+//! bare host or `https://` is an **inspected L7** rule (the proxy man-in-the-middles the TLS and
+//! enforces the full path / method / regex / redaction / anti-fronting policy); `tcp://host:port`
+//! is a **raw L4** rule (the proxy splices the byte stream uninspected — host:port plus the SSRF
+//! guard are the only controls, for a non-HTTP protocol such as SSH). The scheme selects the layer
+//! **only, never a port** — `:port` is the sole port control, so `https://h` and bare `h` are the
+//! same rule. A `tcp://` rule is host:port only: it carries no `/path` and no `{method}` prefix (a
+//! raw stream has no HTTP to inspect). `http://` and `udp://` are not yet supported, and any other
+//! scheme is rejected (a scheme stays meaningful on a *request*, e.g. `ops test net https://…` or
+//! `ops test net tcp://host:22`).
+//! Any L7 entry may carry a leading **method prefix** `{VERB,VERB,...}` (uppercase verbs, e.g.
 //! `{GET,HEAD} github.com`) that scopes the rule to those HTTP methods only — a rule with no
 //! prefix applies to every verb. The leading `{` is an unambiguous sentinel (no rule kind starts
 //! with one), so it never collides with the `{n,m}` quantifiers a `re:` body may contain. A method
@@ -62,14 +69,41 @@ use std::net::IpAddr;
 
 use regex::Regex;
 
-/// One classified match rule, used in either the allow or the deny list: a syntactic [`RuleKind`]
-/// plus the set of HTTP [`Methods`] it applies to. A rule with no `{...}` method prefix carries
-/// [`Methods::Any`] and so behaves exactly as before; a method-qualified rule (`{GET,HEAD} host`)
-/// applies only to those verbs, letting an allow be narrowed to read-only access.
+/// One classified match rule, used in either the allow or the deny list: a syntactic [`RuleKind`],
+/// the set of HTTP [`Methods`] it applies to, and the enforcement [`Layer`] its scheme selects. A
+/// rule with no `{...}` method prefix carries [`Methods::Any`]; a method-qualified rule
+/// (`{GET,HEAD} host`) applies only to those verbs. A bare or `https://` rule is [`Layer::L7`]
+/// (inspected, the default); a `tcp://` rule is [`Layer::L4`] (raw-spliced, host:port only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rule {
     pub(crate) kind: RuleKind,
     pub(crate) methods: Methods,
+    pub(crate) layer: Layer,
+}
+
+/// The enforcement layer a rule's scheme selects. [`Layer::L7`] (the default — a bare or `https://`
+/// rule) is **inspected**: the proxy terminates the TLS, parses the HTTP request, and enforces the
+/// full path / method / regex / redaction / anti-fronting policy. [`Layer::L4`] (a `tcp://` rule) is
+/// a **raw splice**: the proxy copies the TCP byte stream verbatim without terminating TLS or
+/// inspecting it, for a non-HTTP protocol such as SSH. An L4 rule's only controls are its host:port
+/// match and the SSRF guard; it has no path, no method, and no Host/SNI anti-fronting. A raw splice
+/// is **strictly opt-in** — only an explicit `tcp://` allow rule enables it, so a host with no
+/// `tcp://` rule is always inspected (an L7 path/method deny on a host that *does* carry a `tcp://`
+/// allow cannot apply — raw has no HTTP to match; use a host-level deny to suppress the splice
+/// entirely). The credential machinery is bypassed wholesale on a spliced host: there is no request
+/// head to inspect, so a `[secret]` injection, the response redaction, **and the outbound-secret
+/// tripwire** are all inert for a `tcp://`-allowed host:port — the secret simply never reaches it
+/// (the secret-target validator rejects a `tcp://` `to`). This is within the threat model (a
+/// `tcp://` rule is trusted-only and self-authored, the blast radius stays that one host, and it is
+/// loud — a tool's header auth simply breaks), but it is the reason a host must not be both a
+/// credential target and a raw-splice target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Layer {
+    /// Inspected L7 (a bare or `https://` rule) — the MITM path. The default.
+    #[default]
+    L7,
+    /// Raw L4 (a `tcp://` rule) — the splice path: host:port + the SSRF guard, no inspection.
+    L4,
 }
 
 /// The syntactic kind of a match rule, inferred from an entry's syntax at config resolution; an
@@ -411,12 +445,19 @@ impl PartialEq for RuleKind {
 
 impl Eq for RuleKind {}
 
-/// A rule renders as its optional method prefix (`{GET,HEAD} ` — empty for [`Methods::Any`])
-/// followed by its kind, so a method-less rule is byte-for-byte unchanged and a qualified one
-/// round-trips through [`classify`].
+/// A rule renders as an optional `tcp://` scheme (for [`Layer::L4`] — an L7 rule shows no scheme, so
+/// it is byte-for-byte unchanged), then its optional method prefix (`{GET,HEAD} ` — empty for
+/// [`Methods::Any`], and always empty for L4), then its kind. So a method-less L7 rule round-trips to
+/// itself, an `https://` rule round-trips to the equivalent bare form, and a `tcp://` rule round-trips
+/// through [`classify`]. The scheme makes the layer visible wherever rules are listed
+/// (`ops net rules`, `ops config`).
 impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", self.methods.prefix(), self.kind)
+        let scheme = match self.layer {
+            Layer::L4 => "tcp://",
+            Layer::L7 => "",
+        };
+        write!(f, "{scheme}{}{}", self.methods.prefix(), self.kind)
     }
 }
 
@@ -560,14 +601,24 @@ impl EgressPolicy {
     /// rule admits every verb), so a `{GET,HEAD} host` allow does not match a POST. The request is
     /// canonicalized once (host lowercased, path percent-decoded / `.`/`..` resolved / query
     /// dropped) so every rule sees the same evasion-proof view; `method` is uppercased here so the
-    /// caller need not.
+    /// caller need not. Only [`Layer::L7`] (inspected) rules participate — a `tcp://` (L4) rule
+    /// governs the raw-splice decision at CONNECT time ([`Self::l4_decision`]), never the inspected
+    /// HTTP verdict, so the two layers stay cleanly partitioned.
     pub(crate) fn explain(&self, host: &str, port: u16, path: &str, method: &str) -> Decision<'_> {
         let req = Request::new(host, port, path);
         let method = method.to_ascii_uppercase();
-        if let Some(rule) = self.deny.iter().find(|r| r.matches(&req, &method)) {
+        if let Some(rule) = self
+            .deny
+            .iter()
+            .find(|r| r.layer == Layer::L7 && r.matches(&req, &method))
+        {
             return Decision::DeniedBy(rule);
         }
-        if let Some(rule) = self.allow.iter().find(|r| r.matches(&req, &method)) {
+        if let Some(rule) = self
+            .allow
+            .iter()
+            .find(|r| r.layer == Layer::L7 && r.matches(&req, &method))
+        {
             return Decision::AllowedBy(rule);
         }
         match self.default_action {
@@ -589,8 +640,63 @@ impl EgressPolicy {
         let method = method.to_ascii_uppercase();
         self.allow
             .iter()
+            .filter(|r| r.layer == Layer::L7)
             .any(|r| r.kind.matches(&req) && !r.methods.admits(&method))
     }
+
+    /// Decide, from the CONNECT authority alone (host:port, pre-decrypt), whether a connection is a
+    /// raw L4 splice or must take the inspected L7 path. A splice is **strictly opt-in**: it happens
+    /// only when an explicit `tcp://` ([`Layer::L4`]) allow rule matches host:port — the default
+    /// action is never consulted, so a denylist posture does not silently stop inspecting everything.
+    /// **Deny wins**: any host-level deny rule (an `Ip`/`Host`/`Subdomain` kind, in either layer)
+    /// matching host:port suppresses the splice and sends the connection to the inspected L7 path
+    /// instead (where [`Self::explain`] denies it, or — if an L7 rule also allows it — inspects it).
+    /// Path/regex deny rules are excluded: they are not decidable before the TLS is decrypted, and a
+    /// raw splice has no HTTP path to match anyway — so a `tcp://` allow consciously forgoes
+    /// path/method inspection on that host. L4 rules carry no path or method, so only host:port is
+    /// matched. The filtering proxy and `ops test net tcp://…` both decide through this one function,
+    /// so enforcement cannot drift from the tester.
+    pub(crate) fn l4_decision(&self, host: &str, port: u16) -> L4Decision<'_> {
+        let req = Request::new(host, port, "/");
+        let Some(allow) = self
+            .allow
+            .iter()
+            .find(|r| r.layer == Layer::L4 && r.kind.matches(&req))
+        else {
+            return L4Decision::NoMatch;
+        };
+        let suppressed = self
+            .deny
+            .iter()
+            .any(|r| is_host_level(&r.kind) && r.kind.matches(&req));
+        if suppressed {
+            L4Decision::NoMatch
+        } else {
+            L4Decision::Splice(allow)
+        }
+    }
+}
+
+/// Whether a rule kind is host-level — an `Ip`, `Host`, or `Subdomain` — and so decidable from the
+/// CONNECT authority (host:port) alone, before any TLS is decrypted. A `Url` (path) or `Regex` kind
+/// is not, which is why those deny kinds do not participate in the raw-splice suppression check.
+fn is_host_level(kind: &RuleKind) -> bool {
+    matches!(
+        kind,
+        RuleKind::Ip(..) | RuleKind::Host(..) | RuleKind::Subdomain(..)
+    )
+}
+
+/// The CONNECT-time verdict for a connection's enforcement layer, from [`EgressPolicy::l4_decision`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum L4Decision<'a> {
+    /// A `tcp://` allow rule opts this host:port into a raw splice and no host-level deny suppresses
+    /// it: the proxy splices the TCP stream uninspected. Carries the deciding allow rule, so the
+    /// SSRF guard can apply its exact-host exception (a deliberate internal target).
+    Splice(&'a Rule),
+    /// No `tcp://` allow opts this host:port into a splice (or a host-level deny suppressed one): the
+    /// connection takes the inspected L7 path (the MITM), where the HTTP verdict decides it.
+    NoMatch,
 }
 
 /// The verdict [`EgressPolicy::explain`] reaches for one request, with the rule that
@@ -633,25 +739,83 @@ pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> 
 /// that asked on a non-standard port — the very reason it reached `ask`.)
 pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
     // Method-agnostic by design ([`Methods::Any`]): a live `ask` answer approves the *host*, not a
-    // particular verb, so re-running any method to it is not re-asked.
+    // particular verb, so re-running any method to it is not re-asked. Inspected ([`Layer::L7`]): an
+    // `ask` park only ever happens on the MITM path, so the remembered rule is an L7 host rule.
     Rule {
         kind: RuleKind::Host(canonical_host(host), Ports::Ranges(vec![(port, port)])),
         methods: Methods::Any,
+        layer: Layer::L7,
     }
 }
 
-/// Classify one declared entry (allow or deny) by its syntax, or report why it is
-/// malformed. Order matters: a `re:` regex, then a `/`-bearing `host[:ports]/path` URL rule,
-/// then the `*.` wildcard, then an IP literal, then a bare hostname. A scheme (`https://`)
-/// carries no meaning in a rule — it would only pick a default port the `:port` qualifier
-/// already expresses — so it is rejected with a pointer to the scheme-free form. A value that
-/// fits none is rejected so it can never be read as an unintended kind.
+/// Classify one declared entry (allow or deny) by its syntax, or report why it is malformed. The
+/// optional pieces are peeled in order: a leading `{VERB,...}` method prefix, then — for a non-`re:`
+/// entry — a `tcp://`/`https://` scheme that selects the enforcement [`Layer`]. A `re:` regex is
+/// never scheme-split (its pattern may itself contain `://`) and is always inspected L7. A `tcp://`
+/// (raw L4) rule is constrained: it carries no method prefix and no `/path` (a raw stream has no
+/// HTTP), so either is rejected. A value that fits no kind is rejected so it can never be read as an
+/// unintended kind.
 pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
     let (methods, rest) = split_method_prefix(entry.trim())?;
+    let rest = rest.trim();
+    // `re:` patterns may contain `://`, so they are never scheme-split — always inspected L7.
+    if let Some(pattern) = rest.strip_prefix("re:") {
+        let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
+        return Ok(Rule {
+            kind: RuleKind::Regex {
+                pattern: pattern.to_string(),
+                re,
+            },
+            methods,
+            layer: Layer::L7,
+        });
+    }
+    let (layer, body) = split_scheme(rest)?;
+    let kind = classify_kind(body.trim())?;
+    if layer == Layer::L4 {
+        if methods != Methods::Any {
+            return Err(format!(
+                "a `tcp://` (raw L4) rule carries no `{{...}}` method prefix — remove it from \
+                 `{entry}` (a raw stream is spliced byte-for-byte; it has no HTTP method to filter)"
+            ));
+        }
+        if let RuleKind::Url { .. } = kind {
+            return Err(format!(
+                "a `tcp://` (raw L4) rule is host:port only — remove the `/path` from `{entry}` \
+                 (a raw TCP stream has no HTTP path); use `tcp://host:port`"
+            ));
+        }
+    }
     Ok(Rule {
-        kind: classify_kind(rest.trim())?,
+        kind,
         methods,
+        layer,
     })
+}
+
+/// Split an optional scheme prefix off a rule body (the method prefix and any `re:` already handled),
+/// returning the enforcement [`Layer`] it selects and the rest. `tcp://` selects raw L4 (the proxy
+/// splices the stream uninspected); `https://` selects inspected L7 (the MITM path — identical to a
+/// bare host). The scheme selects the **layer only, never a port** — `:port` is the sole port
+/// control, so `https://h` and bare `h` are the same rule. A recognizable but unsupported scheme
+/// (`http://`, `udp://`, `ssh://`, …) is rejected with a pointer rather than mis-read as a host.
+/// No scheme means inspected L7 (the default).
+fn split_scheme(s: &str) -> Result<(Layer, &str), String> {
+    if let Some(rest) = s.strip_prefix("tcp://") {
+        return Ok((Layer::L4, rest));
+    }
+    if let Some(rest) = s.strip_prefix("https://") {
+        return Ok((Layer::L7, rest));
+    }
+    if let Some((scheme, _)) = s.split_once("://") {
+        return Err(format!(
+            "scheme `{scheme}://` is not supported in a rule — use `tcp://host:port` for a raw \
+             (uninspected) L4 tunnel, or `https://` (or a bare host) for an inspected L7 rule; the \
+             scheme selects only the layer, never the port (use `:port`). `http://` and `udp://` \
+             are not yet supported"
+        ));
+    }
+    Ok((Layer::L7, s))
 }
 
 /// Split an optional leading `{VERB,VERB,...}` method prefix off an entry, returning the method
@@ -697,28 +861,13 @@ fn parse_methods(spec: &str) -> Result<Methods, String> {
     Ok(Methods::Only(verbs))
 }
 
-/// Classify the syntactic [`RuleKind`] of an entry (already trimmed, and with any method prefix
-/// already stripped by [`classify`]). Order matters: a `re:` regex, then a `/`-bearing
-/// `host[:ports]/path` URL rule, then the `*.` wildcard, then an IP literal, then a bare hostname.
+/// Classify the syntactic [`RuleKind`] of an entry (already trimmed, with any method prefix and
+/// scheme already stripped by [`classify`], and `re:` already handled there). Order matters: a
+/// `/`-bearing `host[:ports]/path` URL rule, then the `*.` wildcard, then an IP literal, then a bare
+/// hostname.
 fn classify_kind(s: &str) -> Result<RuleKind, String> {
     if s.is_empty() {
         return Err("empty entry".to_string());
-    }
-    if let Some(pattern) = s.strip_prefix("re:") {
-        let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
-        return Ok(RuleKind::Regex {
-            pattern: pattern.to_string(),
-            re,
-        });
-    }
-    // A scheme has no meaning in a rule (it would only select a default port), so reject it
-    // rather than mis-read `https:` as a host. A scheme stays meaningful only on a *request*
-    // (`ops test net <url>`), which names one concrete connection.
-    if scheme_of(s).is_some() {
-        return Err(format!(
-            "remove the scheme from `{s}` — a rule takes a bare host and path, e.g. \
-             `example.com/path` or `example.com:443/path` (a scheme only names a request's port)"
-        ));
     }
     // A `/` marks a `host[:ports]/path` URL rule; without one the entry is host-level.
     if let Some(i) = s.find('/') {
@@ -745,10 +894,10 @@ fn classify_kind(s: &str) -> Result<RuleKind, String> {
 
 /// `*` as a host is a request to allow *every* host, which an allowlist entry deliberately
 /// cannot express — the point of `mode = "allowlist"` is deny-by-construction. Catch the bare
-/// wildcard in any form (`*`, `*:*`, `*:80`, `http://*`, `https://*:*`) and point the author
-/// at the posture switch instead of the generic "unrecognized entry"/"invalid port" message.
-/// `*.domain` is a *bounded* subdomain wildcard and is unaffected (its host is `*.domain`, not
-/// `*`).
+/// wildcard in any port form (`*`, `*:*`, `*:80`, and the `https://`/`tcp://` equivalents after the
+/// scheme is stripped) and point the author at the posture switch instead of the generic
+/// "unrecognized entry"/"invalid port" message. `*.domain` is a *bounded* subdomain wildcard and is
+/// unaffected (its host is `*.domain`, not `*`).
 fn reject_catch_all(host: &str) -> Result<(), String> {
     if host == "*" {
         return Err(
@@ -914,6 +1063,64 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
     Ok((canonical_host(host), port, path))
 }
 
+/// Parse a `tcp://host:port` target naming one **L4 request** (for `ops test net tcp://…`) into
+/// `(host, port)`. The port is **required** — an L4 test names one concrete port (there is no scheme
+/// default to fall back on, and a raw splice has no notion of the web ports). The host is a hostname,
+/// an IPv4 literal, or a bracketed IPv6 literal (`tcp://[::1]:22`); a raw stream carries no path, so
+/// any trailing `/…` is rejected. Like [`parse_url_target`], this is the *request* parser; allow/deny
+/// rules are parsed by [`classify`].
+pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
+    let authority = target
+        .strip_prefix("tcp://")
+        .ok_or_else(|| format!("`{target}` is not a tcp:// target"))?;
+    if authority.contains('/') {
+        return Err(format!(
+            "a tcp:// target is host:port only — `{target}` carries a path (a raw TCP stream has no HTTP path)"
+        ));
+    }
+    if authority.is_empty() {
+        return Err(format!("tcp:// target `{target}` has no host"));
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // a bracketed IPv6 host, `:port` required after the `]`
+        let (addr, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("tcp:// target `{target}` has an unterminated `[`"))?;
+        if addr.parse::<IpAddr>().is_err() {
+            return Err(format!(
+                "tcp:// target `{target}` has an invalid IP literal `[{addr}]`"
+            ));
+        }
+        let p = tail.strip_prefix(':').ok_or_else(|| {
+            format!("tcp:// target `{target}` needs an explicit `:port` (e.g. `tcp://[::1]:22`)")
+        })?;
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| format!("tcp:// target `{target}` has an invalid port `{p}`"))?;
+        (addr, port)
+    } else {
+        let (h, p) = authority.rsplit_once(':').ok_or_else(|| {
+            format!("tcp:// target `{target}` needs an explicit `:port` (e.g. `tcp://host:22`)")
+        })?;
+        reject_catch_all(h)?;
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| format!("tcp:// target `{target}` has an invalid port `{p}`"))?;
+        (h, port)
+    };
+    if port == 0 {
+        return Err(format!(
+            "tcp:// target `{target}` has port 0, which is not valid"
+        ));
+    }
+    if !(is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()) {
+        return Err(format!(
+            "tcp:// target `{target}` has an invalid host `{host}`"
+        ));
+    }
+    Ok((canonical_host(host), port))
+}
+
 /// Parse a `host[:ports]/path` entry into a `Url` rule. The part before the first `/` is the
 /// authority, parsed for its host and port set exactly like a host-level entry — so a path rule
 /// supports the same `:port`, comma-list, `lo-hi` range, and `:*` qualifiers (a bare host
@@ -1060,20 +1267,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_scheme_in_an_entry() {
-        // a scheme has no meaning in a rule (it would only pick a port); reject it with a
-        // pointer to the scheme-free form rather than mis-reading `https:` as a host
-        for bad in [
-            "https://example.com/x",
-            "http://example.com",
-            "https://example.com:8443/x",
-        ] {
+    fn a_scheme_selects_the_enforcement_layer() {
+        // `https://` (and a bare host) is inspected L7; `tcp://` is raw L4. The scheme selects only
+        // the layer, never a port — so `https://h` and bare `h` are the same rule.
+        assert_eq!(rule("https://example.com"), rule("example.com"));
+        assert_eq!(rule("example.com").layer, Layer::L7);
+        assert_eq!(rule("https://example.com:8443/x").layer, Layer::L7);
+        assert_eq!(
+            rule("tcp://ssh.example.com:22").kind,
+            RuleKind::Host("ssh.example.com".into(), Ports::Ranges(vec![(22, 22)]))
+        );
+        assert_eq!(rule("tcp://ssh.example.com:22").layer, Layer::L4);
+        // `tcp://` works on the IP and subdomain host kinds too.
+        assert_eq!(
+            rule("tcp://1.2.3.4:5432").kind,
+            RuleKind::Ip(
+                "1.2.3.4".parse().unwrap(),
+                Ports::Ranges(vec![(5432, 5432)])
+            )
+        );
+        assert_eq!(rule("tcp://1.2.3.4:5432").layer, Layer::L4);
+        assert_eq!(rule("tcp://*.corp:22").layer, Layer::L4);
+        assert!(matches!(
+            rule("tcp://*.corp:22").kind,
+            RuleKind::Subdomain(..)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_or_misplaced_scheme() {
+        // http:// is deferred, not yet supported; an arbitrary scheme is rejected; both name the
+        // tcp://-vs-https:// choice rather than mis-reading the scheme as a host.
+        for bad in ["http://example.com", "ssh://host:22", "udp://host:53"] {
             let err = classify(bad).unwrap_err();
             assert!(
-                err.contains("remove the scheme"),
-                "{bad:?} should be rejected with a scheme pointer, got: {err}"
+                err.contains("not supported in a rule") && err.contains("tcp://"),
+                "{bad:?} should be rejected with a layer pointer, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_tcp_rule_forbids_a_method_prefix_and_a_path() {
+        // L4 splices a raw stream: it has no HTTP method to filter and no path to match, so either
+        // on a `tcp://` rule is rejected fail-closed.
+        let m = classify("{GET} tcp://host:22").unwrap_err();
+        assert!(m.contains("method prefix"), "got: {m}");
+        let p = classify("tcp://host:22/admin").unwrap_err();
+        assert!(p.contains("host:port only"), "got: {p}");
+    }
+
+    #[test]
+    fn a_tcp_rule_round_trips_through_display() {
+        for s in [
+            "tcp://ssh.example.com:22",
+            "tcp://*.corp:5432",
+            "tcp://[::1]:22",
+        ] {
+            assert_eq!(rule(s).to_string(), s, "{s} should round-trip");
+        }
+        // a bare/https:// L7 rule shows no scheme (byte-for-byte unchanged).
+        assert_eq!(rule("github.com").to_string(), "github.com");
+        assert_eq!(rule("https://github.com").to_string(), "github.com");
     }
 
     #[test]
@@ -1891,5 +2146,116 @@ mod tests {
         // a method-less allow never reports a method-block
         let q = allow(&["api.test:443"]);
         assert!(!q.method_denied("api.test", 443, "/x", "POST"));
+    }
+
+    #[test]
+    fn a_tcp_allow_splices_only_its_host_and_port() {
+        let p = allow(&["tcp://ssh.example.com:22"]);
+        assert!(matches!(
+            p.l4_decision("ssh.example.com", 22),
+            L4Decision::Splice(_)
+        ));
+        // a different port on the same host is not the splice's concern → falls to the L7 path
+        assert_eq!(p.l4_decision("ssh.example.com", 2222), L4Decision::NoMatch);
+        // a different host is not spliced
+        assert_eq!(p.l4_decision("other.example.com", 22), L4Decision::NoMatch);
+        // and the host carries no L7 rule, so the inspected path denies it
+        assert_eq!(
+            p.explain("ssh.example.com", 22, "/", "GET"),
+            Decision::DeniedDefault
+        );
+    }
+
+    #[test]
+    fn the_l4_and_l7_layers_are_partitioned() {
+        // an L7 allow never enables a raw splice...
+        let l7 = allow(&["api.example.com:443"]);
+        assert_eq!(l7.l4_decision("api.example.com", 443), L4Decision::NoMatch);
+        // ...and a tcp:// (L4) allow never satisfies the inspected L7 verdict.
+        let l4 = allow(&["tcp://api.example.com:443"]);
+        assert_eq!(
+            l4.explain("api.example.com", 443, "/", "GET"),
+            Decision::DeniedDefault
+        );
+        assert!(matches!(
+            l4.l4_decision("api.example.com", 443),
+            L4Decision::Splice(_)
+        ));
+    }
+
+    #[test]
+    fn a_host_level_deny_suppresses_a_splice_deny_wins() {
+        // an L7 bare deny on the host suppresses a tcp:// allow → NoMatch (the connection goes to the
+        // inspected path, where it is denied) — `deny host` cannot be bypassed by a `tcp://` allow.
+        let p = EgressPolicy::new(
+            vec![rule("tcp://api.example.com:443")],
+            vec![rule("api.example.com")],
+        );
+        assert_eq!(p.l4_decision("api.example.com", 443), L4Decision::NoMatch);
+
+        // a tcp:// subdomain allow carved by a tcp:// host deny: the carved host is suppressed, a
+        // sibling still splices.
+        let q = EgressPolicy::new(
+            vec![rule("tcp://*.corp:5432")],
+            vec![rule("tcp://secret.corp:5432")],
+        );
+        assert_eq!(q.l4_decision("secret.corp", 5432), L4Decision::NoMatch);
+        assert!(matches!(
+            q.l4_decision("db.corp", 5432),
+            L4Decision::Splice(_)
+        ));
+
+        // a path/regex deny does NOT suppress a splice (not decidable pre-decrypt; a raw stream has
+        // no path) — the documented L4 tradeoff: a tcp:// allow forgoes path inspection on that host.
+        let r = EgressPolicy::new(
+            vec![rule("tcp://api.example.com:443")],
+            vec![rule("api.example.com/secret")],
+        );
+        assert!(matches!(
+            r.l4_decision("api.example.com", 443),
+            L4Decision::Splice(_)
+        ));
+    }
+
+    #[test]
+    fn a_splice_is_strictly_opt_in_even_under_allow_by_default() {
+        // a denylist (allow-by-default) posture must NOT silently splice everything — only an
+        // explicit tcp:// allow does, so an un-ruled host still takes the inspected L7 path.
+        let p = EgressPolicy::new(vec![], vec![]).with_default(DefaultAction::Allow);
+        assert_eq!(
+            p.l4_decision("anything.example.com", 22),
+            L4Decision::NoMatch
+        );
+    }
+
+    #[test]
+    fn parse_tcp_target_requires_an_explicit_port() {
+        assert_eq!(
+            parse_tcp_target("tcp://ssh.example.com:22").unwrap(),
+            ("ssh.example.com".to_string(), 22)
+        );
+        assert_eq!(
+            parse_tcp_target("tcp://[2001:db8::1]:5432").unwrap(),
+            ("2001:db8::1".to_string(), 5432)
+        );
+        // a bare IPv4 with a port
+        assert_eq!(
+            parse_tcp_target("tcp://10.0.0.1:6379").unwrap(),
+            ("10.0.0.1".to_string(), 6379)
+        );
+        // the port is required, a path is rejected, the scheme must be tcp://, and 0 is invalid
+        assert!(parse_tcp_target("tcp://ssh.example.com").is_err());
+        assert!(parse_tcp_target("tcp://ssh.example.com:22/x").is_err());
+        assert!(parse_tcp_target("https://ssh.example.com:22").is_err());
+        assert!(parse_tcp_target("tcp://ssh.example.com:0").is_err());
+        assert!(parse_tcp_target("tcp://ssh.example.com:notaport").is_err());
+    }
+
+    #[test]
+    fn a_secret_to_rule_is_l7_by_construction() {
+        // a `tcp://` rule is host-level only and `host_port_rule` (the ask-remembered rule) is L7 —
+        // both feed paths that must never be raw-spliced credential targets. (The secret `to`
+        // validator rejecting a tcp:// `to` is covered in the config tests; here just pin the layer.)
+        assert_eq!(host_port_rule("h", 443).layer, Layer::L7);
     }
 }

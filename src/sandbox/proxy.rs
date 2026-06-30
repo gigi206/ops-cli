@@ -13,6 +13,19 @@
 //! opens its own TLS connection to the true upstream, validating that upstream against the
 //! bundled root store so the interception never downgrades transport security.
 //!
+//! ## L4 (`tcp://`) raw splice
+//!
+//! A `tcp://` allow rule selects a **raw L4 splice** instead of inspection: at CONNECT time (on
+//! host:port alone, [`crate::allowlist::EgressPolicy::l4_decision`]) the proxy accepts the tunnel
+//! and copies the TCP byte stream verbatim to the upstream, without terminating TLS or parsing
+//! anything ([`splice_l4`]). This carries a non-HTTP protocol (SSH, a database wire protocol) that
+//! cannot be man-in-the-middled. A spliced flow keeps the controls a raw stream can bear — the empty
+//! netns, host-side DNS, the host:port allowlist, the SSRF guard, and a concurrent-splice cap — but
+//! **loses** path/method matching, Host/SNI anti-fronting, and the secret tripwires (there is no HTTP
+//! to inspect). It is strictly opt-in: a host with no `tcp://` rule is always inspected (the MITM
+//! path below). The split is decided pre-decrypt, so the splice and the MITM never both run for one
+//! connection.
+//!
 //! This module is the cert machinery and the serve loop; [`super::egress`] wires it into a
 //! launch (binding the socket into the cage, injecting the CA into the cage trust store,
 //! supervising its lifetime under the network-allowlist posture).
@@ -31,8 +44,9 @@
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
 //! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `ops net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
-//! | `403` | `ip-literal`             | the CONNECT target was an IP literal (a hostname is required) |
+//! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
+//! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target |
 //! | `400` | `bad-request`            | the request was malformed or used ambiguous framing |
 //! | `405` | `method-not-allowed`     | a non-CONNECT method (plain-HTTP egress is out of scope) |
@@ -98,7 +112,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -113,7 +128,7 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 
-use crate::allowlist::{self, Decision, EgressPolicy, Rule, RuleKind};
+use crate::allowlist::{self, Decision, EgressPolicy, L4Decision, Rule, RuleKind};
 
 use super::egress_stats::{EgressStats, StatKind};
 
@@ -507,6 +522,11 @@ pub(crate) struct ProxyCtx {
     /// stats are off. The launch ([`super::egress::start`]) attaches the session's
     /// [`EgressStats`] via [`Self::with_stats`]; tests leave it unset.
     stats: Option<Arc<EgressStats>>,
+    /// The number of raw L4 (`tcp://`) splices currently open. Each splice holds a host thread (and
+    /// its fds) for the connection's lifetime, so this caps how many an in-cage agent can open at
+    /// once (see [`MAX_CONCURRENT_SPLICES`]); the inspected L7 path never touches it. Shared across
+    /// connection threads through the [`Arc<ProxyCtx>`] the serve loop clones.
+    splices: AtomicUsize,
 }
 
 impl ProxyCtx {
@@ -534,6 +554,7 @@ impl ProxyCtx {
             manual: Arc::new(super::control::ManualRules::new()),
             notices: false,
             stats: None,
+            splices: AtomicUsize::new(0),
         })
     }
 
@@ -670,7 +691,7 @@ const ASK_PENDING_CAP: usize = 256;
 /// returns a [`write_refusal`] reason (an `X-Ops-Egress-Reason` category plus a text body) so the
 /// agent can tell an explicit policy refusal from an unreachable host or a name that did not
 /// resolve, instead of an opaque status or a dropped connection.
-fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<()> {
+fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // 1. The CONNECT head, read byte-by-byte so the stream sits exactly at the TLS ClientHello
     //    (a buffered read would swallow the start of the handshake).
     let head = read_head_raw(&mut client, HEAD_MAX)?;
@@ -693,8 +714,7 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
             "only CONNECT (HTTPS tunneling) is supported by this egress proxy",
         );
     }
-    // 2. The CONNECT authority. An IP-literal target carries no SNI to bind the cert to, so it is
-    //    refused (a hostname target is required in this slice).
+    // 2. The CONNECT authority.
     let Some((host, port)) = split_authority(&target) else {
         return write_refusal(
             &mut client,
@@ -703,15 +723,27 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
             "the CONNECT authority must be host:port",
         );
     };
+    let connect_host = allowlist::canonical_host(&host);
+
+    // 2b. The enforcement-layer decision, made from host:port alone (pre-decrypt). A `tcp://` (L4)
+    //     allow rule splices the connection raw — no TLS termination, no inspection — so this is
+    //     decided before the IP-literal refusal (a raw splice needs no SNI, so an IP-literal target
+    //     is fine for it). Anything else (the common case) falls through to the inspected L7 path.
+    if let L4Decision::Splice(rule) = ctx.policy.l4_decision(&connect_host, port) {
+        return splice_l4(client, &connect_host, port, rule, ctx);
+    }
+
+    // An IP-literal target carries no SNI to bind the minted leaf to, so the inspected L7 path
+    // refuses it (a hostname target is required to MITM; only the raw splice above accepts an IP).
     if host.parse::<IpAddr>().is_ok() {
         return write_refusal(
             &mut client,
             "403 Forbidden",
             "ip-literal",
-            "an IP-literal CONNECT target is refused; a hostname is required",
+            "an IP-literal CONNECT target is refused for inspected egress; a hostname is required \
+             (or allow it raw with a `tcp://` rule)",
         );
     }
-    let connect_host = allowlist::canonical_host(&host);
 
     // 3. Accept the tunnel, then terminate TLS with a leaf minted for the SNI host.
     write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
@@ -1032,6 +1064,158 @@ fn handle_client<S: Read + Write>(mut client: S, ctx: &ProxyCtx) -> io::Result<(
     } else {
         pump_to_eof(&mut upstream, br.get_mut())?;
     }
+    Ok(())
+}
+
+/// The most raw L4 (`tcp://`) splices open at once. Each one pins a host thread (and ~6 fds) for the
+/// connection's lifetime — there is no per-request turnaround as on the inspected L7 path — so an
+/// in-cage agent opening many would otherwise exhaust host threads. A new splice beyond this is
+/// refused (a `503` `splice-cap`, pre-200, so the client sees a clean reason) rather than queued.
+/// Generous for any realistic interactive use (SSH / database sessions), far below a thread bomb.
+const MAX_CONCURRENT_SPLICES: usize = 128;
+
+/// An RAII counter guard for the open-splice tally: it increments [`ProxyCtx::splices`] on
+/// construction and decrements on drop, so every `splice_l4` exit (including the over-cap refusal and
+/// every error path) releases its slot. [`Self::count`] reports the post-increment value, which the
+/// caller checks against [`MAX_CONCURRENT_SPLICES`].
+struct SpliceGuard<'a> {
+    counter: &'a AtomicUsize,
+    count: usize,
+}
+
+impl<'a> SpliceGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        SpliceGuard { counter, count }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl Drop for SpliceGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Handle a raw L4 (`tcp://`) splice: a `tcp://` allow rule opted this host:port into an uninspected
+/// tunnel ([`EgressPolicy::l4_decision`]). The connection keeps the controls a raw stream can carry —
+/// the host:port allowlist (already matched), host-side DNS, the open-splice cap, and the SSRF guard
+/// — but **loses** TLS termination, path/method matching, Host/SNI anti-fronting, and secret
+/// redaction (there is no HTTP head to inspect). Failures before the tunnel is accepted are reported
+/// as plain-HTTP refusals (the client is still speaking the CONNECT protocol); once `200` is sent the
+/// bytes are raw and a mid-stream error simply tears the tunnel down.
+fn splice_l4(
+    mut client: UnixStream,
+    connect_host: &str,
+    port: u16,
+    deciding: &Rule,
+    ctx: &ProxyCtx,
+) -> io::Result<()> {
+    // Reserve a splice slot up front; the guard releases it on every return below.
+    let guard = SpliceGuard::new(&ctx.splices);
+    if guard.count() > MAX_CONCURRENT_SPLICES {
+        ctx.record(connect_host, StatKind::Blocked);
+        return write_refusal(
+            &mut client,
+            "503 Service Unavailable",
+            "splice-cap",
+            "too many concurrent raw (tcp://) tunnels are open; retry when one closes",
+        );
+    }
+
+    // Resolve host-side. An IP-literal CONNECT target is allowed for a splice (it needs no SNI), so
+    // it is used directly; a hostname is resolved, and a failure is a clean 502 (not a dropped
+    // connection). Then the SSRF guard against the deciding rule — a private/metadata address is
+    // refused unless the rule names this exact host.
+    let ips = match connect_host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => match (ctx.resolve)(connect_host) {
+            Ok(ips) => ips,
+            Err(_) => {
+                return write_refusal(
+                    &mut client,
+                    "502 Bad Gateway",
+                    "dns-failure",
+                    &format!("DNS resolution failed for `{connect_host}`"),
+                )
+            }
+        },
+    };
+    let Some(ip) = ips
+        .into_iter()
+        .find(|ip| ip_permitted(*ip, connect_host, Some(deciding)))
+    else {
+        ctx.record(connect_host, StatKind::Blocked);
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "ssrf-blocked",
+            &format!(
+                "`{connect_host}` resolved only to disallowed addresses (a private or \
+                 metadata range)"
+            ),
+        );
+    };
+
+    // Open the raw upstream to the checked address (no TLS, no certificate validation — a raw splice
+    // is uninspected by design; the empty netns + the allowlist are the boundary).
+    let upstream = match TcpStream::connect((ip, port)) {
+        Ok(s) => s,
+        Err(_) => {
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "upstream-unreachable",
+                &format!("`{connect_host}:{port}` is allowed but could not be reached"),
+            )
+        }
+    };
+
+    // Accept the tunnel — from here every byte is raw and uninspected.
+    write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
+    ctx.record(connect_host, StatKind::Allow);
+    splice_copy(client, upstream)
+}
+
+/// Splice a raw TCP tunnel: copy bytes both directions between the cage `client` and the `upstream`
+/// until either side closes, then tear both down so neither copy thread can hang. The per-connection
+/// read/write timeouts are cleared first, so an idle long-lived tunnel (an interactive SSH session,
+/// say) is not killed mid-session. One direction runs in a spawned thread, the other in this thread;
+/// when the first ends, both sockets are shut down fully so the other's blocked read returns and the
+/// join always completes (no leaked host thread on a half-open or stalled peer).
+fn splice_copy(client: UnixStream, upstream: TcpStream) -> io::Result<()> {
+    // A raw tunnel may idle indefinitely between bursts, so drop the per-connection timeouts the
+    // serve loop set (they exist to bound a slow HTTP head, not a long-lived stream). Set on the
+    // originals before cloning, since the timeout is a socket-level option shared by the dups.
+    let _ = client.set_read_timeout(None);
+    let _ = client.set_write_timeout(None);
+    let _ = upstream.set_read_timeout(None);
+    let _ = upstream.set_write_timeout(None);
+
+    // Two handles per socket (read + write), plus one each to force a full teardown after the first
+    // direction ends. `try_clone` dups the fd, so every handle refers to the same socket.
+    let mut client_wr = client.try_clone()?;
+    let client_shut = client.try_clone()?;
+    let mut client_rd = client;
+    let mut up_rd = upstream.try_clone()?;
+    let up_shut = upstream.try_clone()?;
+    let mut up_wr = upstream;
+
+    let t = std::thread::spawn(move || {
+        let _ = io::copy(&mut client_rd, &mut up_wr);
+        // client → upstream finished: half-close the upstream's write so it observes EOF.
+        let _ = up_wr.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = io::copy(&mut up_rd, &mut client_wr);
+    // upstream → client finished: half-close the client's write, then force both sockets fully down
+    // so the spawned thread's blocked read returns and the join below always completes.
+    let _ = client_wr.shutdown(std::net::Shutdown::Write);
+    let _ = client_shut.shutdown(std::net::Shutdown::Both);
+    let _ = up_shut.shutdown(std::net::Shutdown::Both);
+    let _ = t.join();
     Ok(())
 }
 
@@ -3386,6 +3570,150 @@ mod tests {
         assert_eq!(
             out, b"nothing to see here",
             "a stream without a secret is untouched"
+        );
+    }
+
+    // ---- L4 (`tcp://`) raw splice -------------------------------------------------
+
+    /// A raw TCP echo "upstream" for the splice tests: it accepts one connection and echoes every
+    /// byte back until the peer closes its write half, then exits. Returns its loopback address.
+    fn spawn_raw_echo() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    /// A [`ProxyCtx`] whose resolver maps every name to loopback (so a `tcp://` rule reaches a local
+    /// echo upstream), with the given allow entries.
+    fn loopback_ctx(allow: &[&str]) -> Arc<ProxyCtx> {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        Arc::new(
+            ProxyCtx::new(ca, policy(allow))
+                .unwrap()
+                .with_resolver(Box::new(|_h| Ok(vec!["127.0.0.1".parse().unwrap()]))),
+        )
+    }
+
+    /// Drive a raw (non-HTTP) payload through the proxy over a fresh UDS: CONNECT, expect `200`, then
+    /// send `payload`, half-close, and read the echoed bytes back. Proves the L4 splice carries an
+    /// arbitrary byte stream end-to-end — the headline mechanism.
+    fn through_proxy_raw(
+        ctx: Arc<ProxyCtx>,
+        connect_host: &str,
+        connect_port: u16,
+        payload: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        write!(
+            sock,
+            "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+        )
+        .unwrap();
+        sock.flush().unwrap();
+        let established = read_until_blank(&mut sock)?;
+        assert!(
+            established.contains("200 Connection established"),
+            "CONNECT not accepted: {established:?}"
+        );
+        sock.write_all(payload)?;
+        sock.shutdown(std::net::Shutdown::Write)?;
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp)?;
+        Ok(resp)
+    }
+
+    /// Connect and read just the CONNECT-stage reply (a `200`, or a pre-tunnel refusal), for the
+    /// cases the proxy refuses before accepting the tunnel.
+    fn splice_connect_reply(ctx: Arc<ProxyCtx>, connect_host: &str, connect_port: u16) -> String {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        write!(
+            sock,
+            "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+        )
+        .unwrap();
+        sock.flush().unwrap();
+        read_until_blank(&mut sock).unwrap()
+    }
+
+    #[test]
+    fn a_tcp_rule_splices_a_raw_stream_end_to_end() {
+        let echo = spawn_raw_echo();
+        let ctx = loopback_ctx(&[&format!("tcp://splice.test:{}", echo.port())]);
+        let resp = through_proxy_raw(ctx, "splice.test", echo.port(), b"PING-OVER-RAW-L4").unwrap();
+        assert_eq!(
+            resp, b"PING-OVER-RAW-L4",
+            "the raw payload must round-trip through the splice uninspected"
+        );
+    }
+
+    #[test]
+    fn an_ip_literal_connect_splices_with_no_sni() {
+        // A raw splice needs no SNI, so an IP-literal CONNECT target is accepted when a `tcp://` Ip
+        // rule names it — unlike the inspected path, which refuses an IP literal.
+        let echo = spawn_raw_echo();
+        let ctx = loopback_ctx(&[&format!("tcp://127.0.0.1:{}", echo.port())]);
+        let resp = through_proxy_raw(ctx, "127.0.0.1", echo.port(), b"RAW-TO-IP").unwrap();
+        assert_eq!(resp, b"RAW-TO-IP");
+    }
+
+    #[test]
+    fn a_splice_to_a_private_address_is_ssrf_blocked_unless_the_rule_names_it() {
+        // A `*.corp` subdomain rule does not name an exact host, so the SSRF guard refuses the
+        // loopback (private) address it resolves to — a raw splice is still SSRF-guarded.
+        let echo = spawn_raw_echo();
+        let ctx = loopback_ctx(&[&format!("tcp://*.corp:{}", echo.port())]);
+        let reply = splice_connect_reply(ctx, "db.corp", echo.port());
+        assert!(
+            reply.contains("403") && reply.contains("ssrf-blocked"),
+            "a subdomain-ruled splice to a private address must be SSRF-blocked, got: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn the_splice_guard_counts_open_tunnels() {
+        let counter = AtomicUsize::new(0);
+        {
+            let g1 = SpliceGuard::new(&counter);
+            assert_eq!(g1.count(), 1);
+            let g2 = SpliceGuard::new(&counter);
+            assert_eq!(g2.count(), 2);
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "both guards released their slot on drop"
         );
     }
 }

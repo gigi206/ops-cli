@@ -288,6 +288,35 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
 }
 
 #[test]
+fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
+    let fx = Fixture::new();
+    // `net allow tcp://…` is a security-rule write: it must validate, persist, re-trust, and reload
+    // as a raw-splice rule. Bootstrap a fresh project with the tcp:// rule.
+    let out = fx.run(&["net", "allow", "tcp://ssh.example.com:22"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The round-trip: it persists with its scheme and reloads as a config rule (the layer visible).
+    let rules = fx.run(&["net", "rules"]);
+    assert!(
+        String::from_utf8_lossy(&rules.stdout).contains("allow tcp://ssh.example.com:22  (config)"),
+        "the persisted tcp:// rule must reload and show its scheme:\n{}",
+        String::from_utf8_lossy(&rules.stdout)
+    );
+
+    // And it decides a raw splice — the reloaded rule drives `l4_decision`, not just display.
+    let hit = fx.run(&["test", "net", "tcp://ssh.example.com:22"]);
+    assert!(
+        String::from_utf8_lossy(&hit.stdout).contains("SPLICED"),
+        "the persisted tcp:// rule must splice its host:port:\n{}",
+        String::from_utf8_lossy(&hit.stdout)
+    );
+}
+
+#[test]
 fn net_deny_on_a_fresh_project_is_refused_with_guidance() {
     let fx = Fixture::new();
     let out = fx.run(&["net", "deny", "evil.com"]);
@@ -1416,5 +1445,43 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
     assert!(
         String::from_utf8_lossy(&post.stdout).contains("DENIED"),
         "POST must be denied by a GET/HEAD-only rule"
+    );
+}
+
+#[test]
+fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
+    let fx = Fixture::new();
+    // a tcp:// (raw L4) allow for a specific host:port
+    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"tcp://ssh.example.com:22\"]\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // the rule listing shows the `tcp://` scheme, so the layer (the proto) is visible
+    let rules = fx.run(&["net", "rules", "--source", "config"]);
+    assert!(
+        String::from_utf8_lossy(&rules.stdout).contains("tcp://ssh.example.com:22"),
+        "the tcp:// scheme must be shown in the rule listing:\n{}",
+        String::from_utf8_lossy(&rules.stdout)
+    );
+
+    // the exact host:port is SPLICED (raw L4)
+    let hit = fx.run(&["test", "net", "tcp://ssh.example.com:22"]);
+    let h = String::from_utf8_lossy(&hit.stdout);
+    assert!(
+        h.contains("SPLICED"),
+        "the tcp:// rule must splice its host:port:\n{h}"
+    );
+
+    // a different port on the same host is NOT spliced (it would take the inspected L7 path)
+    let other_port = fx.run(&["test", "net", "tcp://ssh.example.com:2222"]);
+    assert!(
+        String::from_utf8_lossy(&other_port.stdout).contains("NOT SPLICED"),
+        "a port the tcp:// rule does not cover must not splice"
+    );
+
+    // a different host is not spliced
+    let other_host = fx.run(&["test", "net", "tcp://other.example.com:22"]);
+    assert!(
+        String::from_utf8_lossy(&other_host.stdout).contains("NOT SPLICED"),
+        "an unlisted host must not splice"
     );
 }

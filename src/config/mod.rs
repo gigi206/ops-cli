@@ -19,7 +19,7 @@ pub(crate) mod safety;
 mod schema;
 pub(crate) mod view;
 
-use crate::allowlist::{Methods, Rule, RuleKind};
+use crate::allowlist::{Layer, Methods, Rule, RuleKind};
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
@@ -2193,6 +2193,15 @@ fn validate_secret_target(to: &str) -> Result<Rule, String> {
         return Err(format!(
             "a secret `to` host carries no method prefix — remove the `{{...}}` from `{to}` \
              (a credential is injected for the host on every method)"
+        ));
+    }
+    // A credential is an HTTP-header injection, which only the inspected L7 (MITM) path can perform —
+    // a `tcp://` (raw L4) destination is spliced byte-for-byte, so there is no request head to inject
+    // into. Reject a `tcp://` `to` fail-closed rather than silently never injecting.
+    if rule.layer != Layer::L7 {
+        return Err(format!(
+            "a secret `to` host must be an inspected (L7) destination — remove the `tcp://` from \
+             `{to}` (a header credential cannot be injected into a raw, uninspected stream)"
         ));
     }
     match rule.kind {
@@ -5330,6 +5339,16 @@ mod tests {
         assert!(validate_secret_target("api.example.com").is_ok());
         let err = validate_secret_target("{POST} api.example.com").unwrap_err();
         assert!(err.contains("no method prefix"), "{err}");
+    }
+
+    #[test]
+    fn a_secret_to_host_rejects_a_tcp_scheme() {
+        // a header credential can only be injected on the inspected (L7) path — a `tcp://` (raw L4)
+        // destination is spliced byte-for-byte, with no request head to inject into. Rejected
+        // fail-closed rather than silently never injecting. The bare/https form still parses.
+        assert!(validate_secret_target("https://api.example.com").is_ok());
+        let err = validate_secret_target("tcp://api.example.com:443").unwrap_err();
+        assert!(err.contains("inspected (L7) destination"), "{err}");
     }
 
     #[test]

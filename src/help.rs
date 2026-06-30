@@ -486,24 +486,26 @@ const PAGES: &[Page] = &[
     // ---- test subcommands ---------------------------------------------------------
     Page {
         path: &["test", "net"],
-        synopsis: "ops test net [--app <name>] [-X|--method <verb>] <url>",
-        summary: "test a URL against the resolved network policy",
+        synopsis: "ops test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>",
+        summary: "test a URL (or a tcp:// target) against the resolved network policy",
         options: &[
-            ("<url>", "the URL (or a bare host, completed to https) to test"),
+            ("<url>", "the URL (or a bare host, completed to https) to test; `tcp://host:port` tests a raw L4 splice instead"),
             (
                 "-a, --app <name>",
                 "test against that app's effective policy (baseline + overlay), not the baseline",
             ),
             (
                 "-X, --method <verb>",
-                "the HTTP method to test (default GET); a method-scoped rule like `{GET} host` only matches that verb",
+                "the HTTP method to test (default GET); a method-scoped rule like `{GET} host` only matches that verb (ignored for a tcp:// target — a raw stream has no method)",
             ),
         ],
         details:
             "Reports ALLOWED/DENIED/WOULD ASK and the rule that decides it, against the effective\n\
             egress policy a launch serves: the built-in self-equip allow-set is included, and a\n\
             declared credential injection is noted (by header and source, never the value, and not\n\
-            resolved). Reflects the trust gate (an untrusted project's policy is dropped). No nix.",
+            resolved). A `tcp://host:port` target instead reports SPLICED/NOT SPLICED — whether a\n\
+            `tcp://` rule would tunnel it raw (uninspected) or it would take the inspected L7 path.\n\
+            Reflects the trust gate (an untrusted project's policy is dropped). No nix.",
     },
     // ---- net subcommands ----------------------------------------------------------
     Page {
@@ -527,8 +529,9 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
-            built-in, reflecting the trust gate (an untrusted project's rules are dropped). Under\n\
-            `shared`/`none` there are no rules. `--app <name>` shows what `ops app <name>` would\n\
+            built-in, reflecting the trust gate (an untrusted project's rules are dropped). A raw L4\n\
+            rule shows its `tcp://` scheme (the layer is visible); an inspected L7 rule shows none.\n\
+            Under `shared`/`none` there are no rules. `--app <name>` shows what `ops app <name>` would\n\
             launch with — the same effective policy `ops test net --app` tests a URL against. `--source\n\
             manual` instead queries this project's live ask sessions for the rules they remembered\n\
             from `--session` answers (it does not combine with `--app`). No launch, no nix.",
@@ -538,7 +541,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist an allow rule to a config file",
         options: &[
-            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs"),
+            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs, or `tcp://host:port` for a raw (uninspected) L4 tunnel"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
@@ -553,7 +556,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist a deny rule to a config file",
         options: &[
-            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs"),
+            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs, or `tcp://host:port` for a raw (uninspected) L4 tunnel"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),

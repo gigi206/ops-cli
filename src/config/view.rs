@@ -1279,6 +1279,7 @@ mod tests {
                     crate::allowlist::Ports::Any,
                 ),
                 methods: crate::allowlist::Methods::Any,
+                layer: crate::allowlist::Layer::L7,
             },
             header: "Authorization".into(),
             shape: crate::config::HeaderShape::new("Bearer ", false),

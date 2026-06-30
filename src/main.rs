@@ -2799,16 +2799,9 @@ fn net_test(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         config::NetworkPolicy::Allowlist(policy) => {
-            let (host, port, path) = match allowlist::parse_url_target(&url) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("ops: {e}");
-                    return ExitCode::from(2);
-                }
-            };
             // Build the *effective* policy a launch serves: the user rules plus the built-in
-            // built-in allow-set the proxy always unions — the single source of truth, so the
-            // verdict here matches the wire (e.g. a cache host reads as allowed, not deny-default).
+            // allow-set the proxy always unions — the single source of truth, so the verdict here
+            // matches the wire (e.g. a cache host reads as allowed, not deny-default).
             let effective = sandbox::union_with_builtin(policy.clone());
             // A one-line header so an ALLOWED/DENIED verdict on an arbitrary URL is
             // self-explanatory — it names the default the policy applies to an unmatched request.
@@ -2824,6 +2817,28 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 }
             };
             println!("{h}network{scope}:{r} {mode}");
+            // A `tcp://` target is a raw-splice question, decided on host:port alone through the same
+            // `l4_decision` the proxy uses (so the tester cannot drift from the wire). The L7 default
+            // action above does not apply to it — a raw splice is strictly opt-in via a `tcp://` rule.
+            if target.starts_with("tcp://") {
+                let (host, port) = match allowlist::parse_tcp_target(target) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("ops: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let l4 = effective.l4_decision(&host, port);
+                print!("{}", render_l4_decision(target, &l4, &pal));
+                return ExitCode::SUCCESS;
+            }
+            let (host, port, path) = match allowlist::parse_url_target(&url) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("ops: {e}");
+                    return ExitCode::from(2);
+                }
+            };
             let decision = effective.explain(&host, port, &path, &method);
             // Tag a request allowed *only* by the built-in set (not the user's own
             // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
@@ -2896,6 +2911,37 @@ fn render_net_decision(
             let _ = writeln!(
                 o,
                 "  {dim}no rule matches (ask-by-default — it would park for `ops net pending`){r}"
+            );
+        }
+    }
+    o
+}
+
+/// Render an L4 (`tcp://`) raw-splice decision for `ops test net tcp://host:port` — a pure presenter
+/// (its color is asserted in a test). A raw splice is strictly opt-in, so the verdict is binary:
+/// SPLICED (a `tcp://` allow rule covers this host:port and no host-level deny suppresses it — the
+/// proxy tunnels it uninspected) or NOT SPLICED (the connection would instead take the inspected L7
+/// path, which a non-HTTP protocol cannot satisfy). Every span is empty under a non-terminal, so a
+/// capture is plain text.
+fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (n, ok, err, dim, r) = (pal.name, pal.ok, pal.err, pal.dim, pal.reset);
+    let mut o = String::new();
+    match l4 {
+        allowlist::L4Decision::Splice(rule) => {
+            let _ = writeln!(
+                o,
+                "{ok}SPLICED{r}  {n}{target}{r} {dim}(raw L4 — uninspected){r}"
+            );
+            let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+        }
+        allowlist::L4Decision::NoMatch => {
+            let _ = writeln!(o, "{err}NOT SPLICED{r} {n}{target}{r}");
+            let _ = writeln!(
+                o,
+                "  {dim}no tcp:// rule covers this host:port — a raw tunnel needs an explicit \
+                 `tcp://host:port` allow (a bare/https:// rule is inspected L7, which a non-HTTP \
+                 protocol cannot satisfy){r}"
             );
         }
     }
