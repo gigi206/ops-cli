@@ -204,7 +204,7 @@ fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
         override_nix.as_deref(),
         owned_dir.as_deref(),
         &|p| engine_probe(p),
-        &|n| crate::pathfind::find_on_path(n),
+        &|n| crate::pathfind::find_all_on_path(n),
     )
 }
 
@@ -304,10 +304,11 @@ fn engine_verdict(file_uid: u32, mode: u32, euid: u32) -> Result<(), String> {
 /// This is a static-posture check (`stat` then `execve`), not a TOCTOU-proof gate: against a
 /// same-uid attacker — who already owns the account and could replace ops itself — nothing at
 /// this layer is a boundary. Its value is defense-in-depth: a foreign-owned or world-writable
-/// engine (a loosely-permissioned data dir, a world-writable first match on `PATH`) is refused
-/// rather than run. Note the `PATH` tier is the *first* match only (`find_on_path` does not
-/// scan past it), so this refuses a bad first match — it is not a full `PATH`-poisoning
-/// defense, which would need the lookup to skip-and-continue (a deferred option).
+/// engine (a loosely-permissioned data dir, a world-writable match on `PATH`) is refused
+/// rather than run. The `PATH` tier scans every match (`find_all_on_path`) and skips an
+/// untrusted one in favour of the next, so a world-writable early entry does not shadow a
+/// legitimate engine further down `PATH` — short of the same-uid attacker above, a poisoned
+/// early match is a non-event rather than a denial.
 fn engine_probe(path: &Path) -> EngineProbe {
     use std::os::unix::fs::MetadataExt;
     let meta = match std::fs::metadata(path) {
@@ -337,13 +338,15 @@ fn engine_probe(path: &Path) -> EngineProbe {
 /// override whose `nix` is **absent** is treated as unset and the next tier applies; one that
 /// is **present but untrusted** is refused outright (`None`), since it is a deliberate choice
 /// and silently substituting another engine would be worse. A lower tier (owned, then `PATH`)
-/// that is untrusted is skipped — with a warning — in favour of the next.
+/// that is untrusted is skipped — with a warning — in favour of the next; on `PATH` that means
+/// scanning past an untrusted match to a later trusted one, so a world-writable early entry does
+/// not shadow the legitimate engine.
 fn pick_engine_bin(
     name: &str,
     override_nix: Option<&Path>,
     owned_dir: Option<&Path>,
     probe: &dyn Fn(&Path) -> EngineProbe,
-    on_path: &dyn Fn(&str) -> Option<PathBuf>,
+    on_path: &dyn Fn(&str) -> Vec<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(nix) = override_nix {
         match probe(nix) {
@@ -361,7 +364,9 @@ fn pick_engine_bin(
             return Some(bin);
         }
     }
-    on_path(name).filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
+    on_path(name)
+        .into_iter()
+        .find(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
 }
 
 /// Given the path of the `nix` binary, the path of its sibling command `name` in the
@@ -460,7 +465,7 @@ pub(crate) fn resolve_bwrap(layout: Option<&Layout>) -> Option<BwrapChoice> {
         override_bin.as_deref(),
         owned_dir.as_deref(),
         &|p| engine_probe(p),
-        &|n| crate::pathfind::find_on_path(n),
+        &|n| crate::pathfind::find_all_on_path(n),
     )?;
     Some(BwrapChoice {
         path,
@@ -530,7 +535,7 @@ fn pick_bwrap(
     override_bin: Option<&Path>,
     owned_dir: Option<&Path>,
     probe: &dyn Fn(&Path) -> EngineProbe,
-    on_path: &dyn Fn(&str) -> Option<PathBuf>,
+    on_path: &dyn Fn(&str) -> Vec<PathBuf>,
 ) -> Option<(PathBuf, BwrapSource)> {
     if let Some(bin) = override_bin {
         match probe(bin) {
@@ -544,7 +549,8 @@ fn pick_bwrap(
         .filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
         .map(|p| (p, BwrapSource::Bundled));
     let host = on_path("bwrap")
-        .filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
+        .into_iter()
+        .find(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
         .map(|p| (p, BwrapSource::HostPath));
     if restricted {
         host.or(owned)
@@ -1619,7 +1625,7 @@ mod tests {
     fn pick_engine_bin_follows_override_then_owned_then_path() {
         let over = Path::new("/over/nix");
         let owned = Path::new("/data/engine");
-        let on_path = |n: &str| Some(PathBuf::from(format!("/usr/bin/{n}")));
+        let on_path = |n: &str| vec![PathBuf::from(format!("/usr/bin/{n}"))];
 
         // The override wins when its file is present and trusted; nix-store derives as a sibling.
         let all = |_: &Path| EngineProbe::Trusted;
@@ -1690,7 +1696,7 @@ mod tests {
         );
 
         // Nothing anywhere → None; the caller turns it into a pointed error.
-        let no_path = |_: &str| None;
+        let no_path = |_: &str| Vec::<PathBuf>::new();
         assert_eq!(
             pick_engine_bin("nix", None, None, &host_only, &no_path),
             None
@@ -1727,6 +1733,41 @@ mod tests {
         let path_untrusted = |_: &Path| EngineProbe::Untrusted;
         assert_eq!(
             pick_engine_bin("nix", None, None, &path_untrusted, &on_path),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_engine_bin_skips_an_untrusted_path_match_for_a_later_trusted_one() {
+        // `PATH` yields two `nix` candidates in order; the early one is world-writable
+        // (untrusted), the later one is fine. Resolution must scan past the bad match rather
+        // than stop at it — a poisoned early `PATH` entry does not shadow the real engine.
+        let early = PathBuf::from("/early/nix");
+        let late = PathBuf::from("/late/nix");
+        let two = {
+            let early = early.clone();
+            let late = late.clone();
+            move |_: &str| vec![early.clone(), late.clone()]
+        };
+        let early_untrusted = {
+            let early = early.clone();
+            move |p: &Path| {
+                if p == early {
+                    EngineProbe::Untrusted
+                } else {
+                    EngineProbe::Trusted
+                }
+            }
+        };
+        assert_eq!(
+            pick_engine_bin("nix", None, None, &early_untrusted, &two),
+            Some(late)
+        );
+
+        // Every match untrusted → nothing resolves (the skip exhausts the list, fail-closed).
+        let all_untrusted = |_: &Path| EngineProbe::Untrusted;
+        assert_eq!(
+            pick_engine_bin("nix", None, None, &all_untrusted, &two),
             None
         );
     }
@@ -1796,7 +1837,7 @@ mod tests {
     fn pick_bwrap_prefers_bundled_unless_apparmor_restricted() {
         let over = Path::new("/over/bwrap");
         let owned = Path::new("/data/engine");
-        let host = |n: &str| Some(PathBuf::from(format!("/usr/bin/{n}")));
+        let host = |n: &str| vec![PathBuf::from(format!("/usr/bin/{n}"))];
         let owned_bwrap = PathBuf::from("/data/engine/bwrap");
         let host_bwrap = PathBuf::from("/usr/bin/bwrap");
 
@@ -1851,7 +1892,7 @@ mod tests {
         // Restricted with no host engine → the bundled one is the last resort (it will fail
         // at userns creation, but that is a separate, already-reported failure, not a reason
         // to resolve nothing).
-        let no_host = |_: &str| None;
+        let no_host = |_: &str| Vec::<PathBuf>::new();
         assert_eq!(
             pick_bwrap(true, None, Some(owned), &all, &no_host),
             Some((owned_bwrap.clone(), BwrapSource::Bundled))
@@ -1899,6 +1940,31 @@ mod tests {
         // engine, nothing resolves.
         let host_untrusted = |_: &Path| EngineProbe::Untrusted;
         assert_eq!(pick_bwrap(false, None, None, &host_untrusted, &host), None);
+
+        // Skip-and-continue on the host `PATH`: an untrusted early `bwrap` does not shadow a
+        // later trusted one. This matters most under the AppArmor restriction, where the host
+        // tier leads — a poisoned early entry must not deny resolution of the real engine.
+        let early = PathBuf::from("/early/bwrap");
+        let late = PathBuf::from("/late/bwrap");
+        let two_hosts = {
+            let early = early.clone();
+            let late = late.clone();
+            move |_: &str| vec![early.clone(), late.clone()]
+        };
+        let early_host_untrusted = {
+            let early = early.clone();
+            move |p: &Path| {
+                if p == early {
+                    EngineProbe::Untrusted
+                } else {
+                    EngineProbe::Trusted
+                }
+            }
+        };
+        assert_eq!(
+            pick_bwrap(true, None, None, &early_host_untrusted, &two_hosts),
+            Some((late, BwrapSource::HostPath))
+        );
     }
 
     #[test]
