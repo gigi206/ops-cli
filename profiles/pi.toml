@@ -21,9 +21,10 @@ cmd = "pi"
 [packages]
 pi = "mise:aqua:earendil-works/pi"
 
+# An app is read-by-default ({GET,HEAD}); the API host the agent POSTs to is opened with `{*}`.
 [network]
 mode = "allowlist"
-allow = ["api.anthropic.com"]
+allow = ["{*} https://api.anthropic.com"]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the
 # cage. Provide it on the host as $ANTHROPIC_API_KEY (or point `from` at a resolver,

@@ -39,4 +39,6 @@ mode = "allowlist"
 # hard-coded download URL, which 301-redirects to www.codebuff.com. www.codebuff.com:
 # the real binary download AND Codebuff's runtime backend (REST + websocket). Add any
 # further runtime host the proxy reports on first real use.
-allow = ["registry.npmjs.org", "codebuff.com", "www.codebuff.com"]
+# An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/REST POSTs),
+# so each is opened to all verbs with `{*}`.
+allow = ["{*} https://registry.npmjs.org", "{*} https://codebuff.com", "{*} https://www.codebuff.com"]

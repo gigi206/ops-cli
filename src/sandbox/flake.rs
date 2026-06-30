@@ -353,6 +353,7 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),

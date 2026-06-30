@@ -140,10 +140,26 @@ distribution host, so the profile's `[network] allow` lists it. GitHub-distribut
 bucket (not all of GCS). If a future release moves hosts, the proxy reports the refused host
 — add it to `allow` (check ahead with `ops test net <url>`).
 
+## Read by default — declare the write hosts
+
+An **app is read-by-default**: every Mode-B agent's allow rules default to `{GET,HEAD}`, so a
+host the agent only reads needs no annotation, while a host it **writes** to (an API it POSTs
+completions to, an account it logs into, a package registry it installs from) must be opened to
+all verbs with a `{*}` prefix — e.g. `"{*} https://api.anthropic.com"`. Pure download/catalog
+hosts stay `"{GET,HEAD} https://models.dev"` (least privilege). This is why the shipped profiles
+prefix their API/install hosts with `{*}` and their catalog hosts with `{GET,HEAD}`. (The bare
+interactive `ops run`/`ops shell` — Mode A — is unaffected; it stays all-verbs.)
+
+To change an app's default for *unscoped* rules, set `[network] default_methods` in the profile
+(`["GET", "HEAD"]` is the built-in; `["*"]` opts the app out, back to all verbs; or a custom set
+like `["GET", "POST"]`). A method filter bounds the upstream's verb semantics, **not** raw
+exfiltration — a `GET` URL still carries data out; the host allowlist is the egress boundary.
+
 ## Adjusting the allowlist
 
 If a tool's request is refused, the proxy reports the host it blocked — add it to
-`allow`. You can check a URL's verdict ahead of time with `ops test net <url>`.
+`allow` (and a write verb may need a `{*}`/`{POST}` prefix — an app is read-by-default). You can
+check a URL's verdict ahead of time with `ops test net <url>` (or `--method POST`).
 
 ## Not here yet — and why
 

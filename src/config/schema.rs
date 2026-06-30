@@ -334,6 +334,14 @@ pub(crate) struct NetworkTable {
     /// means "inherit" — a layer that does not mention it does not change the inherited value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stats: Option<bool>,
+    /// The HTTP verbs an **app's** unscoped (`{...}`-less) allow rules default to — its read-by-default
+    /// posture. Only meaningful on an `[app.<name>.network]` (or an imported profile's `[network]`):
+    /// every Mode-B app defaults to `["GET","HEAD"]` so an agent reads but does not write unless a
+    /// rule opts a host out with `{*}`/`{VERB}`; this field overrides that default for the app (e.g.
+    /// `["GET","POST"]`, or `["*"]` for all verbs). Ignored on the baseline `[network]` — `ops run`/
+    /// `ops shell` (Mode A) stay all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_methods: Option<Vec<String>>,
 }
 
 /// Parse config bytes as TOML. The error is a human-readable string: the loader
@@ -658,6 +666,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
+                default_methods: None,
             }))
         );
     }
@@ -674,6 +683,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
+                default_methods: None,
             }))
         );
     }

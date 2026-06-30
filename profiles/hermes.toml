@@ -28,18 +28,20 @@ cmd = "hermes"
 # pinning a flake revision (and rolling it via `ops upgrade`) is not yet automated.
 hermes = "flake:github:NousResearch/hermes-agent#default"
 
+# An app is read-by-default ({GET,HEAD}); these are write/build hosts (API POSTs, and the
+# package-manager fetches the in-cage build needs), so each is opened to all verbs with `{*}`.
 [network]
 mode = "allowlist"
 allow = [
     # Runtime: the LLM provider — OpenRouter, Hermes' default BYOK endpoint.
-    "openrouter.ai",
+    "{*} https://openrouter.ai",
     # Runtime: the model catalog (TTL-cached on disk, fail-soft if this is blocked).
-    "hermes-agent.nousresearch.com",
+    "{*} https://hermes-agent.nousresearch.com",
     # Build-time (the in-cage `nix build`): uv2nix fetches Python wheels/sdists from PyPI,
     # and the bundled node front-ends (tui/web) fetch their JS dependencies from npm.
-    "files.pythonhosted.org",
-    "pypi.org",
-    "registry.npmjs.org",
+    "{*} https://files.pythonhosted.org",
+    "{*} https://pypi.org",
+    "{*} https://registry.npmjs.org",
     # (cache.nixos.org + github.com — the nix binary cache, the flake inputs, and Hermes'
     # fail-soft startup update check — are already in ops's built-in nix-cache allow-set,
     # so they need no entry here.)

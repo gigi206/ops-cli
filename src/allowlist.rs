@@ -138,36 +138,50 @@ pub(crate) enum RuleKind {
     Regex { pattern: String, re: Regex },
 }
 
-/// The HTTP methods a rule applies to. [`Methods::Any`] (the default — a rule with no `{...}`
-/// prefix) matches every method; [`Methods::Only`] pins an explicit set of verbs (uppercased,
-/// sorted, and de-duplicated so equal specs compare and display identically). A method constraint
-/// narrows a rule to particular verbs — e.g. `{GET,HEAD} host` permits reads but forbids writes to
-/// that host. It constrains what the agent can drive the upstream's API to do per the upstream's
-/// own verb semantics; it is not raw-exfiltration protection (a GET URL still carries data out).
+/// The HTTP methods a rule applies to.
+///
+/// - [`Methods::Unspecified`] — the rule carried no `{...}` prefix. It matches **every** verb on its
+///   own (the no-regression default), but it is the only state a per-app `default_methods` rewrites:
+///   at policy resolution an `Unspecified` allow rule becomes `Only(default_methods)` when that app
+///   declares one, so an unscoped host inherits the app's read-by-default posture.
+/// - [`Methods::Any`] — the rule carried an explicit `{*}` prefix: **all verbs, on purpose**. Unlike
+///   `Unspecified` it is never rewritten by `default_methods`, so `{*}` is how a rule opts a host
+///   back out to every verb under a read-by-default app.
+/// - [`Methods::Only`] — an explicit, non-empty set of uppercase verbs (sorted and de-duplicated so
+///   equal specs compare and display identically).
+///
+/// A method constraint narrows a rule to particular verbs — `{GET,HEAD} host` permits reads but
+/// forbids writes to that host. It bounds what the agent can drive the upstream's API to do per the
+/// upstream's own verb semantics; it is **not** raw-exfiltration protection (a GET URL still carries
+/// data out).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum Methods {
-    /// No method prefix — the rule applies to every verb.
+    /// No method prefix — all verbs, but subject to a per-app `default_methods` rewrite.
     #[default]
+    Unspecified,
+    /// An explicit `{*}` prefix — all verbs, never rewritten by `default_methods`.
     Any,
     /// An explicit, non-empty set of uppercase verbs, sorted and de-duplicated.
     Only(Vec<String>),
 }
 
 impl Methods {
-    /// Whether this set applies to `method` (already uppercased by the caller). `Any` admits
-    /// every verb; `Only` admits exactly the listed ones.
+    /// Whether this set applies to `method` (already uppercased by the caller). `Unspecified` and
+    /// `Any` both admit every verb (the difference between them is only whether `default_methods`
+    /// may rewrite them, resolved before matching); `Only` admits exactly the listed ones.
     fn admits(&self, method: &str) -> bool {
         match self {
-            Methods::Any => true,
+            Methods::Unspecified | Methods::Any => true,
             Methods::Only(ms) => ms.iter().any(|m| m == method),
         }
     }
 
-    /// The display prefix: empty for `Any` (the rule renders bare), else `{V,V,...} ` with the
-    /// verbs comma-joined and a trailing space before the rule body.
+    /// The display prefix: empty for `Unspecified` (the rule renders bare), `{*} ` for `Any`, else
+    /// `{V,V,...} ` with the verbs comma-joined and a trailing space before the rule body.
     fn prefix(&self) -> String {
         match self {
-            Methods::Any => String::new(),
+            Methods::Unspecified => String::new(),
+            Methods::Any => "{*} ".to_string(),
             Methods::Only(ms) => format!("{{{}}} ", ms.join(",")),
         }
     }
@@ -698,6 +712,26 @@ impl EgressPolicy {
         }
     }
 
+    /// Apply an app's read-by-default posture: rewrite every **allow** rule whose methods are
+    /// [`Methods::Unspecified`] (no explicit prefix) to `default`. Only a concrete [`Methods::Only`]
+    /// set narrows — an app whose default is [`Methods::Any`] (declared `default_methods = ["*"]`) or
+    /// an empty set leaves its unscoped rules all-verbs (a no-op). Explicit `{*}` ([`Methods::Any`])
+    /// and `{VERB}` rules keep their verbs (so `{*}` re-opens a host), **deny rules are untouched** (a
+    /// deny stays broad — narrowing it would weaken it), and a raw `tcp://` (L4) rule keeps no methods
+    /// (a prefix on it is rejected at classify). Applied once, at app-policy resolution, so the proxy,
+    /// `ops test net`, and `ops net rules` all consume the same resolved policy and cannot diverge.
+    pub(crate) fn apply_default_methods(&mut self, default: &Methods) {
+        let Methods::Only(set) = default else { return };
+        if set.is_empty() {
+            return;
+        }
+        for rule in &mut self.allow {
+            if rule.layer == Layer::L7 && rule.methods == Methods::Unspecified {
+                rule.methods = default.clone();
+            }
+        }
+    }
+
     /// The exact hosts that carry **both** a raw `tcp://` (L4) allow rule and an inspected (L7) rule
     /// (allow or deny) on an **overlapping** port — so the L7 rule is silently ineffective on that
     /// host's spliced traffic (a splice is uninspected). For surfacing a config warning, never for
@@ -793,15 +827,18 @@ pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> 
 /// `host:port` the answered request named, so re-running *that* request is decided without re-asking
 /// and nothing wider is opened. The host is canonicalized the same way the matcher canonicalizes a
 /// request host, so the remembered rule and a later request compare equal. (Deliberately *not*
-/// `classify(host)`, which defaults to the web ports {80, 443} and would fail to match a request
-/// that asked on a non-standard port — the very reason it reached `ask`.)
+/// `classify(host)`, which defaults to the https port {443} and would fail to match a request that
+/// asked on a non-standard port — the very reason it reached `ask`.)
 pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
-    // Method-agnostic by design ([`Methods::Any`]): a live `ask` answer approves the *host*, not a
-    // particular verb, so re-running any method to it is not re-asked. Inspected ([`Layer::L7`]): an
-    // `ask` park only ever happens on the MITM path, so the remembered rule is an L7 host rule.
+    // Method-agnostic by design ([`Methods::Unspecified`]): a live `ask` answer approves the *host*,
+    // not a particular verb, so re-running any method to it is not re-asked. `Unspecified` (rather
+    // than `Any`) keeps the remembered rule rendering bare — the user never typed a `{*}` — and is
+    // safe because a live `ask` overlay is never run through `apply_default_methods` (that rewrites
+    // a config-resolved *app* policy, not the runtime ask rules). Inspected ([`Layer::L7`]): an `ask`
+    // park only ever happens on the MITM path, so the remembered rule is an L7 host rule.
     Rule {
         kind: RuleKind::Host(canonical_host(host), Ports::Ranges(vec![(port, port)])),
-        methods: Methods::Any,
+        methods: Methods::Unspecified,
         layer: Layer::L7,
     }
 }
@@ -831,10 +868,11 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
     let (layer, body) = split_scheme(rest)?;
     let kind = classify_kind(body.trim())?;
     if layer == Layer::L4 {
-        if methods != Methods::Any {
+        if methods != Methods::Unspecified {
             return Err(format!(
-                "a `tcp://` (raw L4) rule carries no `{{...}}` method prefix — remove it from \
-                 `{entry}` (a raw stream is spliced byte-for-byte; it has no HTTP method to filter)"
+                "a `tcp://` (raw L4) rule carries no `{{...}}` method prefix (not even `{{*}}`) — \
+                 remove it from `{entry}` (a raw stream is spliced byte-for-byte; it has no HTTP \
+                 method to filter)"
             ));
         }
         if let RuleKind::Url { .. } = kind {
@@ -890,14 +928,23 @@ fn split_scheme(s: &str) -> Result<(Layer, &str), String> {
 /// `re:`, never at the very start). No `{` means [`Methods::Any`] and the whole entry as the body.
 fn split_method_prefix(s: &str) -> Result<(Methods, &str), String> {
     let Some(after) = s.strip_prefix('{') else {
-        return Ok((Methods::Any, s));
+        // No prefix: all verbs now, but a per-app `default_methods` may narrow it at resolution.
+        return Ok((Methods::Unspecified, s));
     };
     let Some(close) = after.find('}') else {
         return Err(
             "unterminated `{` in the method prefix (expected `{GET,POST} <rule>`)".to_string(),
         );
     };
-    Ok((parse_methods(&after[..close])?, &after[close + 1..]))
+    let spec = after[..close].trim();
+    // `{*}` is the explicit all-verbs escape — distinct from no prefix, it is never rewritten by
+    // `default_methods`, so it re-opens a host to every verb under a read-by-default app.
+    let methods = if spec == "*" {
+        Methods::Any
+    } else {
+        parse_methods(spec)?
+    };
+    Ok((methods, &after[close + 1..]))
 }
 
 /// Parse the inside of a `{...}` method prefix into a [`Methods::Only`] set: a non-empty,
@@ -924,6 +971,32 @@ fn parse_methods(spec: &str) -> Result<Methods, String> {
     verbs.sort();
     verbs.dedup();
     Ok(Methods::Only(verbs))
+}
+
+/// Parse a config `default_methods` list into the app default it expresses: `["*"]` →
+/// [`Methods::Any`] (all verbs — the unscoped rules are not narrowed), else a non-empty list of
+/// uppercase verbs → [`Methods::Only`] (sorted, de-duplicated, the same per-verb validation as a
+/// `{...}` prefix). An empty list, a `*` mixed with other verbs, or a non-uppercase verb is rejected
+/// (fail-closed) so a malformed override falls back to the built-in app default rather than silently
+/// narrowing to nothing or widening everything.
+pub(crate) fn parse_default_methods(verbs: &[String]) -> Result<Methods, String> {
+    if verbs.iter().any(|v| v.trim() == "*") {
+        return if verbs.len() == 1 {
+            Ok(Methods::Any)
+        } else {
+            Err(
+                "`*` (all verbs) cannot be combined with other verbs in `default_methods`"
+                    .to_string(),
+            )
+        };
+    }
+    if verbs.is_empty() {
+        return Err(
+            "`default_methods` is empty (use e.g. [\"GET\", \"HEAD\"], or [\"*\"] for all verbs)"
+                .to_string(),
+        );
+    }
+    parse_methods(&verbs.join(","))
 }
 
 /// Classify the syntactic [`RuleKind`] of an entry (already trimmed, with any method prefix and
@@ -2187,9 +2260,11 @@ mod tests {
     }
 
     #[test]
-    fn a_method_prefix_attaches_to_each_kind_and_a_bare_rule_is_any() {
-        // a method-less rule is `Any`
-        assert_eq!(rule("github.com").methods, Methods::Any);
+    fn a_method_prefix_attaches_to_each_kind_and_a_bare_rule_is_unspecified() {
+        // a method-less rule is `Unspecified` (all verbs now, but a per-app default may narrow it);
+        // an explicit `{*}` is `Any` (all verbs, never narrowed).
+        assert_eq!(rule("github.com").methods, Methods::Unspecified);
+        assert_eq!(rule("{*} github.com").methods, Methods::Any);
         // the prefix attaches to every structured kind and to a regex, verbs sorted + de-duped
         assert_eq!(
             rule("{GET,HEAD} github.com").methods,
@@ -2236,6 +2311,80 @@ mod tests {
         );
         // a method-less L7 rule renders the implicit scheme (its canonical equal form)
         assert_eq!(rule("github.com").to_string(), "https://github.com");
+        // an explicit `{*}` (all verbs) round-trips with its prefix
+        assert_eq!(rule("{*} github.com").to_string(), "{*} https://github.com");
+    }
+
+    #[test]
+    fn apply_default_methods_rewrites_only_unspecified_l7_allow_rules() {
+        // An app's read-by-default posture: an unscoped (Unspecified) L7 allow inherits the default;
+        // an explicit `{*}` or `{VERB}` keeps its verbs; a deny is untouched (stays broad); a raw
+        // `tcp://` rule has no methods and must not gain an (invalid) prefix. Distinct hosts so each
+        // verdict is unambiguous.
+        let mut p = EgressPolicy::new(
+            vec![
+                rule("read.test"),           // Unspecified L7 → rewritten to the default
+                rule("{*} open.test"),       // explicit all-verbs → kept
+                rule("{POST} post.test"),    // explicit set → kept
+                rule("tcp://raw.test:5432"), // L4 raw → untouched (no methods)
+            ],
+            vec![rule("evil.test")], // deny stays broad (all verbs)
+        );
+        p.apply_default_methods(&Methods::Only(vec!["GET".into(), "HEAD".into()]));
+        let allow = p.allow_rules();
+        assert_eq!(
+            allow[0].methods,
+            Methods::Only(vec!["GET".into(), "HEAD".into()]),
+            "an Unspecified L7 allow inherits the default"
+        );
+        assert_eq!(allow[1].methods, Methods::Any, "an explicit {{*}} is kept");
+        assert_eq!(
+            allow[2].methods,
+            Methods::Only(vec!["POST".into()]),
+            "an explicit verb set is kept"
+        );
+        assert_eq!(
+            allow[3].methods,
+            Methods::Unspecified,
+            "a raw tcp:// rule keeps no methods (it would be an invalid prefix)"
+        );
+        assert_eq!(
+            p.deny_rules()[0].methods,
+            Methods::Unspecified,
+            "a deny rule is never narrowed by default_methods"
+        );
+
+        // The effect is real at match time: the unscoped host is now read-only.
+        assert!(p.permits("read.test", 443, "/"), "GET still passes");
+        assert!(
+            matches!(
+                p.explain("read.test", 443, "/", "POST"),
+                Decision::DeniedDefault
+            ),
+            "POST to the unscoped host is denied after the default narrows it"
+        );
+        // the {*} host still takes every verb.
+        assert!(matches!(
+            p.explain("open.test", 443, "/", "POST"),
+            Decision::AllowedBy(_)
+        ));
+
+        // an `Any` default (an app's `default_methods = ["*"]`) is a no-op — it leaves rules
+        // all-verbs (Unspecified), so the app opts out of read-by-default.
+        let mut q = EgressPolicy::new(vec![rule("read.test")], vec![]);
+        q.apply_default_methods(&Methods::Any);
+        assert_eq!(q.allow_rules()[0].methods, Methods::Unspecified);
+
+        // parse_default_methods: `["*"]` → Any; a verb list → Only; empty / mixed-`*` rejected.
+        assert_eq!(parse_default_methods(&["*".into()]).unwrap(), Methods::Any);
+        assert_eq!(
+            parse_default_methods(&["POST".into(), "GET".into()]),
+            Ok(Methods::Only(vec!["GET".into(), "POST".into()])),
+            "verbs are sorted and de-duplicated"
+        );
+        assert!(parse_default_methods(&[]).is_err());
+        assert!(parse_default_methods(&["GET".into(), "*".into()]).is_err());
+        assert!(parse_default_methods(&["lower".into()]).is_err());
     }
 
     #[test]

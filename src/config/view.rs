@@ -744,6 +744,15 @@ fn app_view(
     // effective network is anything else, the launch injects none, so the roster shows none too —
     // the same posture `enforce_secret_posture` applies at merge, kept consistent across views.
     let injects = matches!(eff_network, NetworkPolicy::Allowlist(_));
+    // The roster shows the app's *own* network overlay; apply its read-by-default verb posture
+    // (`default_methods`) to a clone so the expanded rules render the verbs the launch enforces —
+    // matching `config show --app` and `net rules --app`, not the un-narrowed declared form.
+    let app_network = app.network.clone().map(|mut n| {
+        if let NetworkPolicy::Allowlist(p) = &mut n {
+            p.apply_default_methods(&app.default_methods);
+        }
+        n
+    });
     AppView {
         name: name.to_string(),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
@@ -769,7 +778,7 @@ fn app_view(
             .iter()
             .map(|p| package_view(p, flake_pins))
             .collect(),
-        network: app.network.as_ref().map(|n| match n {
+        network: app_network.as_ref().map(|n| match n {
             NetworkPolicy::Shared => AppNetworkView::Shared,
             NetworkPolicy::Isolated => AppNetworkView::Isolated,
             NetworkPolicy::Allowlist(a) => AppNetworkView::Allowlist {
@@ -841,9 +850,17 @@ fn app_detail_view(
     baseline: &Resolved,
     flake_pins: &BTreeMap<String, String>,
 ) -> AppDetailView {
-    // Effective network/GUI: the app's own posture when it set one, else the baseline's.
-    let eff_network = app.network.as_ref().unwrap_or(&baseline.network);
-    let network = network_view(eff_network);
+    // Effective network/GUI: the app's own posture when it set one, else the baseline's — then the
+    // app's read-by-default verb posture applied to it, mirroring `merge_app` so the detail view
+    // shows the verbs the launch enforces (the merge_app-agreement guard pins this).
+    let mut eff_network = app
+        .network
+        .clone()
+        .unwrap_or_else(|| baseline.network.clone());
+    if let NetworkPolicy::Allowlist(policy) = &mut eff_network {
+        policy.apply_default_methods(&app.default_methods);
+    }
+    let network = network_view(&eff_network);
     let network_origin = origin_or_inherited(app.network.is_some(), app.network_origin);
     let eff_gui = app.gui.unwrap_or(baseline.gui);
     let gui = match eff_gui {
@@ -901,7 +918,7 @@ fn app_detail_view(
     let mut eff_secrets = baseline.declared_secrets.clone();
     eff_secrets.extend(app.secrets.iter().cloned());
     let mut secret_notes = Vec::new();
-    super::enforce_secret_posture(eff_network, &mut eff_secrets, &mut secret_notes);
+    super::enforce_secret_posture(&eff_network, &mut eff_secrets, &mut secret_notes);
     let secrets_dropped =
         eff_secrets.is_empty() && !(baseline.declared_secrets.is_empty() && app.secrets.is_empty());
     let mut notes = app.warnings.clone();
@@ -1019,8 +1036,8 @@ mod tests {
             .collect();
         // a read-only built-in host shows its `{GET,HEAD}` scope and the implicit scheme
         assert!(builtin.contains(&"{GET,HEAD} https://cache.nixos.org"));
-        // github.com stays all-verbs (git may POST), so no method prefix
-        assert!(builtin.contains(&"https://github.com"));
+        // github.com is also {GET,HEAD} (tarball fetch is GET); a git POST is the user's to allow
+        assert!(builtin.contains(&"{GET,HEAD} https://github.com"));
         assert!(rules
             .iter()
             .filter(|r| r.source == RuleSourceView::Builtin)
@@ -1258,6 +1275,7 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
@@ -1336,6 +1354,7 @@ mod tests {
                 tasks_max: Some("99".into()),
             },
             secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Provenance::Global,
             network_origin: Provenance::Global,
             gui_origin: Provenance::Default,

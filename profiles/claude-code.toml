@@ -25,14 +25,16 @@ claude-code = "mise:aqua:anthropics/claude-code"
 # every verb. The agent may run on untrusted project code, but it can only reach these. (If a
 # future `claude-code` release moves hosts or needs another verb, the proxy reports the refusal
 # — add it; check ahead with `ops test net <url>`.)
+# An app is read-by-default ({GET,HEAD}): the API/MCP hosts the agent POSTs to are opened to
+# all verbs with `{*}`; the pure download hosts stay `{GET,HEAD}` (least privilege).
 [network]
 mode = "allowlist"
 allow = [
-    "api.anthropic.com:443",
-    "platform.claude.com:443",
-    "{GET,HEAD} downloads.claude.ai:443",
-    "mcp-proxy.anthropic.com:443",
-    "{GET,HEAD} storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
+    "{*} https://api.anthropic.com:443",
+    "{*} https://platform.claude.com:443",
+    "{GET,HEAD} https://downloads.claude.ai:443",
+    "{*} https://mcp-proxy.anthropic.com:443",
+    "{GET,HEAD} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
 # The real API key is read on the HOST and injected into the outbound request by

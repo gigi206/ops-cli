@@ -1589,7 +1589,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
         "the default must show compact rule counts:\n{stdout}"
     );
     assert!(
-        !stdout.contains("allow https://api.example.com"),
+        !stdout.contains("allow {GET,HEAD} https://api.example.com"),
         "the default must not expand the rules:\n{stdout}"
     );
 
@@ -1597,10 +1597,12 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     let out = fx.run(&["config", "show", "--details"]);
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // the app's unscoped allow hosts are read-by-default ({GET,HEAD}) — the roster shows the
+    // verbs the launch enforces, matching `config show --app` and `net rules --app`.
     assert!(
-        stdout.contains("allow https://api.example.com")
-            && stdout.contains("allow https://github.com"),
-        "--details must list the allow rules:\n{stdout}"
+        stdout.contains("allow {GET,HEAD} https://api.example.com")
+            && stdout.contains("allow {GET,HEAD} https://github.com"),
+        "--details must list the allow rules with the app's read-by-default verbs:\n{stdout}"
     );
     assert!(
         stdout.contains("deny") && stdout.contains("github.com/secret"),

@@ -1407,7 +1407,11 @@ fn net_rules_targets_an_app_effective_policy() {
         a.contains("network (app demo): deny"),
         "the header must name the app scope:\n{a}"
     );
-    assert!(a.contains("allow https://api.demo.test  (config)"), "{a}");
+    // the app's unscoped allow host is read-by-default ({GET,HEAD}); the deny is left broad.
+    assert!(
+        a.contains("allow {GET,HEAD} https://api.demo.test  (config)"),
+        "{a}"
+    );
     assert!(
         a.contains("deny  https://api.demo.test/secret  (config)"),
         "{a}"
@@ -1439,8 +1443,8 @@ fn net_rules_targets_an_app_effective_policy() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["rule"] == "https://api.demo.test"),
-        "the app's rule must be in the JSON:\n{v}"
+            .any(|r| r["rule"] == "{GET,HEAD} https://api.demo.test"),
+        "the app's rule must be in the JSON (read-by-default):\n{v}"
     );
 
     // An unknown app is a pointed, exit-2 error listing what exists.
@@ -1573,5 +1577,107 @@ fn test_net_reports_a_deny_suppressed_splice() {
     assert!(
         o.contains("NOT SPLICED") && o.contains("deny rule suppressed"),
         "a deny must suppress the splice and the tester must explain it:\n{o}"
+    );
+}
+
+#[test]
+fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
+    // The Mode-A vs Mode-B contrast: a trusted baseline allowlist is all-verbs for `ops run`/`ops
+    // shell` (Mode A), but an app (Mode B) that inherits that same allowlist is read-by-default
+    // ({GET,HEAD}) — so a POST the bare `ops test net` allows is denied under `--app`.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"allowlist\"\nallow = [\"shared.test\"]\n\
+         [app.agent]\ncmd = \"true\"\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // Baseline (no --app): all verbs — a POST is allowed.
+    let base_post = fx.run(&["test", "net", "-X", "POST", "https://shared.test/x"]);
+    assert!(
+        String::from_utf8_lossy(&base_post.stdout).contains("ALLOWED"),
+        "the baseline shell is all-verbs (Mode A open):\n{}",
+        String::from_utf8_lossy(&base_post.stdout)
+    );
+
+    // The app inherits the same allowlist but is read-by-default: GET passes, POST is denied.
+    let app_get = fx.run(&[
+        "test",
+        "net",
+        "--app",
+        "agent",
+        "-X",
+        "GET",
+        "https://shared.test/x",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&app_get.stdout).contains("ALLOWED"),
+        "GET under the app passes"
+    );
+    let app_post = fx.run(&[
+        "test",
+        "net",
+        "--app",
+        "agent",
+        "-X",
+        "POST",
+        "https://shared.test/x",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&app_post.stdout).contains("DENIED"),
+        "POST under the app is denied — the agent is read-by-default:\n{}",
+        String::from_utf8_lossy(&app_post.stdout)
+    );
+}
+
+#[test]
+fn an_app_declares_a_write_host_with_a_star_prefix() {
+    // An app's own allowlist: an unscoped host inherits the {GET,HEAD} default; a `{*}` host opts
+    // back out to every verb (the way a profile declares its API/write hosts).
+    let fx = Fixture::new();
+    fx.write_project(
+        "[app.agent]\ncmd = \"true\"\n\
+         [app.agent.network]\nmode = \"allowlist\"\nallow = [\"read.test\", \"{*} write.test\"]\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    // `net rules --app` shows the unscoped host narrowed and the {*} host kept.
+    let rules = fx.run(&["net", "rules", "--app", "agent"]);
+    let r = String::from_utf8_lossy(&rules.stdout);
+    assert!(
+        r.contains("allow {GET,HEAD} https://read.test"),
+        "an unscoped host is read-by-default:\n{r}"
+    );
+    assert!(
+        r.contains("allow {*} https://write.test"),
+        "a {{*}} host keeps every verb:\n{r}"
+    );
+
+    // The verdicts follow: POST denied on the read host, allowed on the write host.
+    let read_post = fx.run(&[
+        "test",
+        "net",
+        "--app",
+        "agent",
+        "-X",
+        "POST",
+        "https://read.test/x",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&read_post.stdout).contains("DENIED"),
+        "POST to the read-by-default host is denied"
+    );
+    let write_post = fx.run(&[
+        "test",
+        "net",
+        "--app",
+        "agent",
+        "-X",
+        "POST",
+        "https://write.test/x",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&write_post.stdout).contains("ALLOWED"),
+        "POST to the {{*}} write host is allowed"
     );
 }

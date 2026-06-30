@@ -559,6 +559,12 @@ pub(crate) struct ResolvedApp {
     pub(crate) limits: crate::sandbox::cgroup::Limits,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
+    /// The verbs this app's unscoped (`{...}`-less) allow rules default to — its read-by-default
+    /// posture. Every Mode-B app defaults to `Only(["GET","HEAD"])`; an `[app.<name>.network]
+    /// default_methods` override sets a different set (or `Any` for `["*"]`, all verbs). Applied to
+    /// the app's effective allowlist at [`merge_app`]; the baseline `ops run`/`ops shell` never gets
+    /// it (Mode A stays all-verbs).
+    pub(crate) default_methods: crate::allowlist::Methods,
     /// Per-field provenance of this app's *scalar* overlay fields, for the per-app `ops config`
     /// view — which app layer (`Global`/`Project`) set each. Read only when the app actually set
     /// the field; an unset scalar is shown as inherited from the baseline. `home_scope_origin` is
@@ -596,6 +602,12 @@ impl Resolved {
         }
         if let Some(network) = app.network {
             self.network = network;
+        }
+        // Apply the app's read-by-default verb posture to its *effective* allowlist — the app's own
+        // (just merged) or, when the app set none, the inherited baseline. Only Mode-B `ops app`
+        // launches reach `merge_app`; `ops run`/`ops shell` (Mode A) never do, so they stay all-verbs.
+        if let NetworkPolicy::Allowlist(policy) = &mut self.network {
+            policy.apply_default_methods(&app.default_methods);
         }
         if let Some(gui) = app.gui {
             self.gui = gui;
@@ -685,6 +697,9 @@ fn resolve(
     let mut egress_stats = true;
     if let Some(b) = global.network.as_ref().and_then(network_stats_of) {
         egress_stats = b;
+    }
+    if let Some(field) = global.network.as_ref() {
+        warn_if_baseline_sets_default_methods(&mut warnings, GLOBAL_CONFIG, field);
     }
     let mut network = match global
         .network
@@ -792,6 +807,7 @@ fn resolve(
                 if let Some(b) = network_stats_of(&value) {
                     egress_stats = b;
                 }
+                warn_if_baseline_sets_default_methods(&mut warnings, PROJECT_CONFIG, &value);
                 if let Some(policy) = validate_network(&mut warnings, PROJECT_CONFIG, value) {
                     network = policy;
                     network_origin = Provenance::Project;
@@ -912,6 +928,61 @@ fn network_stats_of(field: &NetworkField) -> Option<bool> {
     match field {
         NetworkField::Table(t) => t.stats,
         NetworkField::Posture(_) => None,
+    }
+}
+
+/// The `default_methods` override a `[network]` table carries, if any (peeked before the field moves
+/// into `validate_network`). The string posture form never carries one.
+fn network_default_methods_of(field: &NetworkField) -> Option<&Vec<String>> {
+    match field {
+        NetworkField::Table(t) => t.default_methods.as_ref(),
+        NetworkField::Posture(_) => None,
+    }
+}
+
+/// The built-in app default: a Mode-B agent's unscoped allow rules default to `{GET,HEAD}` (read by
+/// default; declare `{*}`/`{POST}` per host, or `default_methods` per app, to write). The baseline
+/// `ops run`/`ops shell` (Mode A) never gets this — it stays all-verbs.
+fn builtin_app_default_methods() -> crate::allowlist::Methods {
+    crate::allowlist::Methods::Only(vec!["GET".to_string(), "HEAD".to_string()])
+}
+
+/// Resolve an app layer's `default_methods` override (the raw verbs, peeked before the network field
+/// moved into `validate_network`) into the effective app default, warning (and falling back to the
+/// built-in `{GET,HEAD}`) on a malformed value. `None` (the layer set none) leaves the running
+/// default unchanged. Called only when the layer's network was honored, so an invalid value is not
+/// warned about for a dropped/untrusted network.
+fn resolve_app_default_methods(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: Option<Vec<String>>,
+) -> Option<crate::allowlist::Methods> {
+    let verbs = raw?;
+    Some(
+        crate::allowlist::parse_default_methods(&verbs).unwrap_or_else(|e| {
+            warnings.push(format!(
+                "{source}: ignoring invalid `default_methods` — {e}; using the built-in {{GET,HEAD}} \
+                 app default"
+            ));
+            builtin_app_default_methods()
+        }),
+    )
+}
+
+/// Warn when the **baseline** `[network]` carries a `default_methods`: it is an app-only posture
+/// (Mode-B agents read by default), and `ops run`/`ops shell` (Mode A) deliberately stay all-verbs,
+/// so a baseline value is parsed but ignored. Surfacing it keeps a user from believing they made
+/// their interactive shell read-only when they did not.
+fn warn_if_baseline_sets_default_methods(
+    warnings: &mut Vec<String>,
+    source: &str,
+    field: &NetworkField,
+) {
+    if network_default_methods_of(field).is_some() {
+        warnings.push(format!(
+            "{source}: ignoring `default_methods` under the baseline `[network]` — it is an app-only \
+             posture; `ops run`/`ops shell` stay all-verbs. Set it on an `[app.<name>.network]`"
+        ));
     }
 }
 
@@ -1158,6 +1229,8 @@ fn resolve_app(
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
     let mut network: Option<NetworkPolicy> = None;
+    // Every Mode-B app reads by default ({GET,HEAD}); a trusted layer's `default_methods` overrides it.
+    let mut default_methods = builtin_app_default_methods();
     let mut gui: Option<GuiPolicy> = None;
     // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
     // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
@@ -1199,9 +1272,13 @@ fn resolve_app(
         );
         if let Some(field) = app.network {
             warn_if_app_sets_stats(&mut warnings, &source, &field);
+            let raw_dm = network_default_methods_of(&field).cloned();
             if let Some(policy) = validate_network(&mut warnings, &source, field) {
                 network = Some(policy);
                 network_origin = Provenance::Global;
+                if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
+                    default_methods = m;
+                }
             }
         }
         if let Some(value) = app.gui {
@@ -1262,9 +1339,13 @@ fn resolve_app(
         if let Some(field) = app.network {
             if trusted {
                 warn_if_app_sets_stats(&mut warnings, &source, &field);
+                let raw_dm = network_default_methods_of(&field).cloned();
                 if let Some(policy) = validate_network(&mut warnings, &source, field) {
                     network = Some(policy);
                     network_origin = Provenance::Project;
+                    if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
+                        default_methods = m;
+                    }
                 }
             } else {
                 warnings.push(format!(
@@ -1364,6 +1445,7 @@ fn resolve_app(
         gui,
         limits,
         secrets,
+        default_methods,
         cmd_origin,
         network_origin,
         gui_origin,
@@ -2206,9 +2288,10 @@ fn file_source(file: &str) -> Result<SecretSource, String> {
 fn validate_secret_target(to: &str) -> Result<Rule, String> {
     let rule = crate::allowlist::classify(to).map_err(|e| format!("invalid `to` target — {e}"))?;
     // A credential is host-scoped — injected into every request to the destination, regardless of
-    // verb — so a `{...}` method prefix on the `to` host would silently inject *wider* than written.
-    // Reject it fail-closed (a method constraint belongs only on an allow/deny rule).
-    if rule.methods != Methods::Any {
+    // verb — so a `{...}` (or `{*}`) method prefix on the `to` host is meaningless and would only
+    // confuse. A bare `to` host classifies as `Methods::Unspecified`; anything else is an explicit
+    // prefix, rejected fail-closed (a method constraint belongs only on an allow/deny rule).
+    if rule.methods != Methods::Unspecified {
         return Err(format!(
             "a secret `to` host carries no method prefix — remove the `{{...}}` from `{to}` \
              (a credential is injected for the host on every method)"
@@ -3010,6 +3093,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
+                default_methods: None,
             })),
             ..RawConfig::default()
         }
@@ -3165,6 +3249,35 @@ mod tests {
     }
 
     #[test]
+    fn an_untrusted_project_app_cannot_widen_its_default_methods() {
+        // The flagship-analog for `default_methods`: the override rides the trusted-only `[network]`
+        // block, so an untrusted project app's `["*"]` widen attempt is dropped with the network —
+        // the app falls to the built-in `{GET,HEAD}`, never all-verbs. (Read-by-default only ever
+        // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
+        let net = NetworkField::Table(NetworkTable {
+            mode: "allowlist".into(),
+            allow: vec!["x.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: Some(vec!["*".into()]),
+        });
+        let project = raw_with_app("probe", raw_app(&["id"], &[], &[], &[], Some(net)));
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        let app = &r.apps["probe"];
+        assert!(
+            app.network.is_none(),
+            "the untrusted network (and its default_methods override) is dropped"
+        );
+        assert_eq!(
+            app.default_methods,
+            builtin_app_default_methods(),
+            "an untrusted app cannot widen to all-verbs — it keeps the built-in {{GET,HEAD}}"
+        );
+    }
+
+    #[test]
     fn an_untrusted_project_cannot_override_a_trusted_apps_command() {
         // The integrity-of-intent guard: `ops app claude` against an untrusted repo must run
         // the trusted app's command, never one the repo substituted.
@@ -3288,6 +3401,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
+                default_methods: None,
             })
         };
 
@@ -3353,6 +3467,7 @@ mod tests {
                 ask_timeout: timeout.map(|s| s.to_string()),
                 ask_notice: None,
                 stats: None,
+                default_methods: None,
             })
         };
         let mut w = Vec::new();
@@ -3388,6 +3503,7 @@ mod tests {
             ask_timeout: Some("90s".into()),
             ask_notice: None,
             stats: None,
+            default_methods: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
@@ -3407,6 +3523,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: notice,
                 stats: None,
+                default_methods: None,
             })
         };
         let mut w = Vec::new();
@@ -3434,6 +3551,7 @@ mod tests {
             ask_timeout: None,
             ask_notice: Some(false),
             stats: None,
+            default_methods: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
@@ -4152,6 +4270,7 @@ mod tests {
                 ..Default::default()
             },
             secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
@@ -4197,6 +4316,7 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
@@ -4227,6 +4347,7 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
@@ -4237,6 +4358,118 @@ mod tests {
         base.merge_app(app);
         assert_eq!(base.secrets.len(), 1);
         assert!(matches!(base.network, NetworkPolicy::Allowlist(_)));
+    }
+
+    #[test]
+    fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
+        use crate::allowlist::{classify, EgressPolicy, Methods};
+        let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
+        let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+            cmd: vec!["x".into()],
+            home_scope: AppHomeScope::Global,
+            env: vec![],
+            ro_binds: vec![],
+            packages: vec![],
+            network,
+            gui: None,
+            limits: Default::default(),
+            secrets: vec![],
+            default_methods,
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            limits_origin: Default::default(),
+            home_scope_origin: None,
+            warnings: vec![],
+        };
+
+        // (a) the app declares its own allowlist: an unscoped rule inherits the app's read-by-default
+        // posture; an explicit `{*}` rule keeps all verbs.
+        let mut base = resolve_no_plugins(raw_network("shared"), None);
+        base.merge_app(app_with(
+            Some(NetworkPolicy::Allowlist(EgressPolicy::new(
+                vec![
+                    classify("read.test").unwrap(),
+                    classify("{*} write.test").unwrap(),
+                ],
+                vec![],
+            ))),
+            read_default.clone(),
+        ));
+        let NetworkPolicy::Allowlist(p) = &base.network else {
+            panic!("expected an allowlist");
+        };
+        assert_eq!(
+            p.allow_rules()[0].methods,
+            read_default,
+            "an unscoped rule inherits the app's {{GET,HEAD}} default"
+        );
+        assert_eq!(
+            p.allow_rules()[1].methods,
+            Methods::Any,
+            "an explicit {{*}} rule keeps every verb"
+        );
+
+        // (b) the app sets no network (inherits the baseline allowlist) — the app's default still
+        // narrows the inherited rules at merge time (the forced read-by-default reaches Mode-B apps
+        // regardless of whose allowlist they run under).
+        let mut base2 = resolve_no_plugins(raw_network("shared"), None);
+        base2.network = NetworkPolicy::Allowlist(EgressPolicy::new(
+            vec![classify("inherited.test").unwrap()],
+            vec![],
+        ));
+        base2.merge_app(app_with(None, Methods::Only(vec!["GET".to_string()])));
+        let NetworkPolicy::Allowlist(p2) = &base2.network else {
+            panic!("expected an allowlist");
+        };
+        assert_eq!(
+            p2.allow_rules()[0].methods,
+            Methods::Only(vec!["GET".to_string()]),
+            "an inherited baseline rule is narrowed by the app's default at merge"
+        );
+    }
+
+    #[test]
+    fn a_baseline_default_methods_is_ignored_with_a_warning() {
+        use crate::allowlist::{Decision, Methods};
+        // `default_methods` is an app-only posture; on the baseline `[network]` it is parsed but
+        // ignored (Mode-A `ops run`/`ops shell` stays all-verbs), with a warning so it is not silent.
+        let global = RawConfig {
+            network: Some(NetworkField::Table(NetworkTable {
+                mode: "allowlist".into(),
+                allow: vec!["h.test".into()],
+                deny: vec![],
+                ask_timeout: None,
+                ask_notice: None,
+                stats: None,
+                default_methods: Some(vec!["GET".into()]),
+            })),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, None);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("default_methods") && w.contains("baseline")),
+            "a baseline `default_methods` must warn: {:?}",
+            r.warnings
+        );
+        // The baseline rule is NOT narrowed — the interactive shell stays open.
+        let NetworkPolicy::Allowlist(p) = &r.network else {
+            panic!("expected an allowlist");
+        };
+        assert_eq!(
+            p.allow_rules()[0].methods,
+            Methods::Unspecified,
+            "the baseline rule keeps all verbs (Mode A open)"
+        );
+        assert!(
+            matches!(
+                p.explain("h.test", 443, "/", "POST"),
+                Decision::AllowedBy(_)
+            ),
+            "a POST on the baseline is allowed — run/shell is not read-by-default"
+        );
     }
 
     #[test]
@@ -4259,6 +4492,7 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
@@ -4297,6 +4531,7 @@ mod tests {
             gui: None,
             limits: Default::default(),
             secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
@@ -5006,6 +5241,7 @@ mod tests {
                     ask_timeout: None,
                     ask_notice: None,
                     stats: None,
+                    default_methods: None,
                 })),
                 ..RawConfig::default()
             },
@@ -5106,6 +5342,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
+                default_methods: None,
             })),
             secret: Some(raw_secret_section(secrets)),
             ..RawConfig::default()
@@ -5158,6 +5395,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats,
+                default_methods: None,
             })),
             ..RawConfig::default()
         };
@@ -5212,6 +5450,7 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: Some(false),
+                default_methods: None,
             })),
         );
         let r = resolve_no_plugins(raw_with_app("demo", app), None);
@@ -5284,6 +5523,7 @@ mod tests {
             ask_timeout: None,
             ask_notice: None,
             stats: None,
+            default_methods: None,
         }))
     }
 

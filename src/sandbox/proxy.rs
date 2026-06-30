@@ -293,19 +293,20 @@ pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>
 /// the policy (`builtin_allow_rules`) and the `ops config` display can never drift.
 ///
 /// All pinned to :443 (every one is HTTPS-only, so closing port 80 is pure least-privilege). The
-/// pure download/metadata endpoints are further scoped to `{GET,HEAD}`: substitution, channel and
-/// tarball fetches, raw content, and the nixhub/mise version indexes are read-only by nature, so a
-/// write verb on this always-on lane serves no self-equip purpose and is refused. `github.com` and
-/// `api.github.com` are left **all-verbs** on purpose: git-over-HTTPS POSTs to `git-upload-pack`,
-/// and the GitHub API is broad enough that a verified-empirically scope is not worth the risk of
-/// silently breaking a `git+https`/`mise:github:` fetch. This bounds the lane's verb semantics, not
-/// raw exfiltration (a GET query string still carries data out).
+/// whole set is scoped to `{GET,HEAD}`: substitution, channel and tarball fetches (incl. the
+/// `github:`/`mise:github:` source and release downloads, which are GETs), raw content, and the
+/// nixhub/mise version indexes are all read-only, so a write verb on this always-on lane serves no
+/// self-equip purpose and is refused. A rare git-over-HTTPS push/clone that POSTs to
+/// `git-upload-pack` is the user's to allow explicitly (`allow {*} github.com`). The explicit
+/// `{GET,HEAD}` also makes every entry immune to a per-app `default_methods` rewrite (only an
+/// `Unspecified`/no-prefix rule is rewritten), independent of resolution order. This bounds the
+/// lane's verb semantics, not raw exfiltration (a GET query string still carries data out).
 pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
     &[
         "{GET,HEAD} cache.nixos.org:443",         // binary substitution
         "{GET,HEAD} *.nixos.org:443",             // channels / releases / tarballs
-        "github.com:443",     // `github:NixOS/nixpkgs/<rev>` source (git may POST)
-        "api.github.com:443", // the github tarball/redirect endpoint
+        "{GET,HEAD} github.com:443", // `github:NixOS/nixpkgs/<rev>` source (tarball fetch is GET)
+        "{GET,HEAD} api.github.com:443", // the github tarball/redirect endpoint
         "{GET,HEAD} codeload.github.com:443", // the github archive download host
         "{GET,HEAD} *.githubusercontent.com:443", // raw content / release assets
         "{GET,HEAD} search.devbox.sh:443", // the nixhub metadata endpoint the nix resolver GETs

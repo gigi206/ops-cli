@@ -45,15 +45,17 @@ cmd = "droid"
 nodejs = "nix:nodejs"
 droid = "mise:npm:droid"
 
+# An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/API POSTs), so
+# each is opened to all verbs with `{*}`.
 [network]
 mode = "allowlist"
 allow = [
     # Install: the npm package and its platform binary (an optional dep).
-    "registry.npmjs.org",
+    "{*} https://registry.npmjs.org",
     # Runtime: Factory's account/login and API gateway. Model traffic flows through Factory's
     # gateway by default (so no separate provider host is needed unless you switch to BYOK).
-    "app.factory.ai",
-    "api.factory.ai",
+    "{*} https://app.factory.ai",
+    "{*} https://api.factory.ai",
     # (Add `downloads.factory.ai` only if you let Droid self-update its binary, and a model
     #  provider host — e.g. `openrouter.ai` — only if you configure direct BYOK in settings.json.)
 ]

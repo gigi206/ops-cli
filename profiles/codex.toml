@@ -16,9 +16,10 @@ cmd = "codex"
 [packages]
 codex = "mise:aqua:openai/codex"
 
+# An app is read-by-default ({GET,HEAD}); the API host the agent POSTs to is opened with `{*}`.
 [network]
 mode = "allowlist"
-allow = ["api.openai.com"]
+allow = ["{*} https://api.openai.com"]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the
 # cage. Provide it on the host as $OPENAI_API_KEY (or a resolver). The placeholder
