@@ -2212,7 +2212,7 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     );
     let cfg_out = String::from_utf8_lossy(&cfg.stdout);
     assert!(
-        cfg_out.contains("Authorization -> cache.nixos.org")
+        cfg_out.contains("Authorization -> https://cache.nixos.org")
             && cfg_out.contains("from env OPS_E2E_SECRET"),
         "the trusted secret was not honored by `ops config`: {cfg_out}"
     );
@@ -2312,7 +2312,7 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     );
     let cfg_out = String::from_utf8_lossy(&cfg.stdout);
     assert!(
-        cfg_out.contains("Authorization -> cache.nixos.org")
+        cfg_out.contains("Authorization -> https://cache.nixos.org")
             && cfg_out.contains("from myscheme github/token"),
         "the plugin-backed secret was not honored by `ops config`: {cfg_out}"
     );
