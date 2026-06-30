@@ -15,7 +15,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 fn ops() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ops"))
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops` so an e2e never depends on
+    // the developer's global ops config; default it to a fixed empty dir under the test tree
+    // (no test here writes a global config, so a shared empty dir is race-free).
+    let mut cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    cfg.push("target/test-tmp/isolated-config");
+    let _ = std::fs::create_dir_all(&cfg);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    cmd.env("XDG_CONFIG_HOME", cfg);
+    cmd
 }
 
 /// A unique temp dir removed on drop.
