@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
         // And `RULES` reports the remembered rule with its exact port.
         assert!(
-            dispatch("RULES", &state, &manual).contains("manual allow api.test:8080"),
+            dispatch("RULES", &state, &manual).contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
         );
     }
@@ -897,7 +897,7 @@ mod tests {
         let rules = query_manual(data.path(), pid).unwrap();
         assert_eq!(rules.len(), 1);
         assert!(rules[0].is_allow);
-        assert_eq!(rules[0].rule, "api.test:8080");
+        assert_eq!(rules[0].rule, "https://api.test:8080");
 
         // The consumed seq is now gone — a second answer is NotFound (not a phantom success).
         match answer_request(data.path(), pid, seq, Verdict::Allow, false).unwrap() {

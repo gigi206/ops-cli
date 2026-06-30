@@ -291,18 +291,25 @@ pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>
 
 /// The hosts of the built-in self-equip allow-set, in allowlist-entry syntax. Sourced once so
 /// the policy (`builtin_allow_rules`) and the `ops config` display can never drift.
+///
+/// All pinned to :443 (every one is HTTPS-only, so closing port 80 is pure least-privilege). The
+/// pure download/metadata endpoints are further scoped to `{GET,HEAD}`: substitution, channel and
+/// tarball fetches, raw content, and the nixhub/mise version indexes are read-only by nature, so a
+/// write verb on this always-on lane serves no self-equip purpose and is refused. `github.com` and
+/// `api.github.com` are left **all-verbs** on purpose: git-over-HTTPS POSTs to `git-upload-pack`,
+/// and the GitHub API is broad enough that a verified-empirically scope is not worth the risk of
+/// silently breaking a `git+https`/`mise:github:` fetch. This bounds the lane's verb semantics, not
+/// raw exfiltration (a GET query string still carries data out).
 pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
     &[
-        // All pinned to :443 — every one of these is HTTPS-only, so closing port 80 is pure
-        // least-privilege (a bare entry would otherwise also admit :80).
-        "cache.nixos.org:443",         // binary substitution
-        "*.nixos.org:443",             // channels / releases / tarballs
-        "github.com:443",              // `github:NixOS/nixpkgs/<rev>` source
-        "api.github.com:443",          // the github tarball/redirect endpoint
-        "codeload.github.com:443",     // the github archive download host
-        "*.githubusercontent.com:443", // raw content / release assets
-        "search.devbox.sh:443",        // the nixhub metadata endpoint the nix resolver GETs
-        "mise-versions.jdx.dev:443", // mise's version index — the resolver any `mise:` backend GETs
+        "{GET,HEAD} cache.nixos.org:443",         // binary substitution
+        "{GET,HEAD} *.nixos.org:443",             // channels / releases / tarballs
+        "github.com:443",     // `github:NixOS/nixpkgs/<rev>` source (git may POST)
+        "api.github.com:443", // the github tarball/redirect endpoint
+        "{GET,HEAD} codeload.github.com:443", // the github archive download host
+        "{GET,HEAD} *.githubusercontent.com:443", // raw content / release assets
+        "{GET,HEAD} search.devbox.sh:443", // the nixhub metadata endpoint the nix resolver GETs
+        "{GET,HEAD} mise-versions.jdx.dev:443", // mise's version index — the resolver any `mise:` backend GETs
     ]
 }
 
@@ -314,7 +321,7 @@ pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
 /// release host) stay per-profile. Unioned into every policy regardless of trust (a user `deny`
 /// can still carve it). The exact set is refined empirically against a real self-equip and is
 /// shown in `ops config`, so it is never a silent allowance.
-fn builtin_allow_rules() -> Vec<Rule> {
+pub(crate) fn builtin_allow_rules() -> Vec<Rule> {
     builtin_allow_hosts()
         .iter()
         .map(|e| allowlist::classify(e).expect("a built-in self-equip entry must be a valid rule"))

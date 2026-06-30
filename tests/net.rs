@@ -83,15 +83,22 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // the mode header, the config allow/deny rules each tagged, and the built-in self-equip set
     assert!(stdout.contains("network: deny"), "{stdout}");
-    assert!(stdout.contains("allow github.com  (config)"), "{stdout}");
-    assert!(stdout.contains("allow *.nixos.org  (config)"), "{stdout}");
+    // each L7 host rule renders the implicit `https://`, so the layer is visible at a glance
     assert!(
-        stdout.contains("deny  evil.nixos.org  (config)"),
+        stdout.contains("allow https://github.com  (config)"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("allow cache.nixos.org:443  (builtin)"),
-        "the built-in self-equip set must be listed and tagged:\n{stdout}"
+        stdout.contains("allow https://*.nixos.org  (config)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("deny  https://evil.nixos.org  (config)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("allow {GET,HEAD} https://cache.nixos.org  (builtin)"),
+        "the built-in self-equip set must be listed and tagged (read-only hosts scoped):\n{stdout}"
     );
 
     // `--source builtin` shows only the built-in set; the config rules are gone.
@@ -134,7 +141,7 @@ fn net_rules_json_emits_the_mode_and_tagged_rules() {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("net rules --json emits valid JSON");
     assert_eq!(json["mode"], "deny");
-    assert_eq!(json["rules"][0]["rule"], "github.com");
+    assert_eq!(json["rules"][0]["rule"], "https://github.com");
     assert_eq!(json["rules"][0]["kind"], "Allow");
     assert_eq!(json["rules"][0]["source"], "Config");
 }
@@ -183,7 +190,7 @@ fn net_rules_reflects_the_trust_gate() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("allow global.example  (config)"),
+        stdout.contains("allow https://global.example  (config)"),
         "the global (trusted-by-location) rule must stand:\n{stdout}"
     );
     assert!(
@@ -277,7 +284,7 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
     // it as a config rule (a re-trust failure would have left it untrusted and dropped).
     let rules = fx.run(&["net", "rules"]);
     assert!(
-        String::from_utf8_lossy(&rules.stdout).contains("allow github.com  (config)"),
+        String::from_utf8_lossy(&rules.stdout).contains("allow https://github.com  (config)"),
         "the persisted, re-trusted rule must appear in `ops net rules`:\n{}",
         String::from_utf8_lossy(&rules.stdout)
     );
@@ -314,6 +321,29 @@ fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
         "the persisted tcp:// rule must splice its host:port:\n{}",
         String::from_utf8_lossy(&hit.stdout)
     );
+}
+
+#[test]
+fn net_allow_rejects_a_portless_tcp_rule() {
+    // A raw splice must name the port it opens — a port-less `tcp://` rule is refused at the CLI
+    // (exit 2), with a message pointing at the fix. (A bare L7 host, by contrast, defaults to 443.)
+    let fx = Fixture::new();
+    let out = fx.run(&["net", "allow", "tcp://ssh.example.com"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a port-less tcp:// rule must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("explicit `:port`"),
+        "the error must point at the missing port:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `tcp://host:*` (every port) is accepted — the explicit way to open all ports and protocols.
+    assert!(fx
+        .run(&["net", "allow", "tcp://ssh.example.com:*"])
+        .status
+        .success());
 }
 
 #[test]
@@ -479,8 +509,14 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
     let rules = fx.run(&["net", "rules"]);
     let r = String::from_utf8_lossy(&rules.stdout);
     assert!(r.contains("network: ask"), "net rules:\n{r}");
-    assert!(r.contains("allow github.com  (config)"), "net rules:\n{r}");
-    assert!(r.contains("deny  evil.com  (config)"), "net rules:\n{r}");
+    assert!(
+        r.contains("allow https://github.com  (config)"),
+        "net rules:\n{r}"
+    );
+    assert!(
+        r.contains("deny  https://evil.com  (config)"),
+        "net rules:\n{r}"
+    );
 
     // `ops test net` reports an unmatched host as "would ask" (no static verdict).
     let test = fx.run(&["test", "net", "https://unlisted.example.com/x"]);
@@ -1357,7 +1393,7 @@ fn net_rules_targets_an_app_effective_policy() {
     assert!(base.status.success());
     let b = String::from_utf8_lossy(&base.stdout);
     assert!(
-        b.contains("allow github.com  (config)") && !b.contains("api.demo.test"),
+        b.contains("allow https://github.com  (config)") && !b.contains("api.demo.test"),
         "the baseline listing must be the baseline, not the app:\n{b}"
     );
 
@@ -1371,14 +1407,17 @@ fn net_rules_targets_an_app_effective_policy() {
         a.contains("network (app demo): deny"),
         "the header must name the app scope:\n{a}"
     );
-    assert!(a.contains("allow api.demo.test  (config)"), "{a}");
-    assert!(a.contains("deny  api.demo.test/secret  (config)"), "{a}");
+    assert!(a.contains("allow https://api.demo.test  (config)"), "{a}");
+    assert!(
+        a.contains("deny  https://api.demo.test/secret  (config)"),
+        "{a}"
+    );
     assert!(
         !a.contains("github.com  (config)"),
         "the app's network overlay replaces the baseline's, so github.com must be gone:\n{a}"
     );
     assert!(
-        a.contains("allow cache.nixos.org:443  (builtin)"),
+        a.contains("allow {GET,HEAD} https://cache.nixos.org  (builtin)"),
         "the built-in self-equip set is app-invariant and still listed:\n{a}"
     );
 
@@ -1400,7 +1439,7 @@ fn net_rules_targets_an_app_effective_policy() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["rule"] == "api.demo.test"),
+            .any(|r| r["rule"] == "https://api.demo.test"),
         "the app's rule must be in the JSON:\n{v}"
     );
 
@@ -1455,11 +1494,11 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
     fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
-    // the prefix is shown in the rule listing
+    // the prefix is shown in the rule listing, with the implicit scheme (443 is the default → bare)
     let rules = fx.run(&["net", "rules", "--source", "config"]);
     assert!(
-        String::from_utf8_lossy(&rules.stdout).contains("{GET,HEAD} api.test:443"),
-        "the method prefix must be listed"
+        String::from_utf8_lossy(&rules.stdout).contains("{GET,HEAD} https://api.test"),
+        "the method prefix and scheme must be listed"
     );
 
     // GET (and the default verb) reach; POST does not
@@ -1515,5 +1554,24 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     assert!(
         String::from_utf8_lossy(&other_host.stdout).contains("NOT SPLICED"),
         "an unlisted host must not splice"
+    );
+}
+
+#[test]
+fn test_net_reports_a_deny_suppressed_splice() {
+    // deny wins even over a `tcp://` allow: a host-level deny suppresses the raw splice, and the
+    // tester says *why* (a covered host that does not splice must not read as "no rule covers it").
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"allowlist\"\n\
+         allow = [\"tcp://evil.com:443\"]\ndeny = [\"re:^https://evil\\\\.com\"]\n",
+    );
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["test", "net", "tcp://evil.com:443"]);
+    let o = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        o.contains("NOT SPLICED") && o.contains("deny rule suppressed"),
+        "a deny must suppress the splice and the tester must explain it:\n{o}"
     );
 }

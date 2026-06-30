@@ -2935,6 +2935,16 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
             );
             let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
         }
+        allowlist::L4Decision::Suppressed(rule) => {
+            let _ = writeln!(o, "{err}NOT SPLICED{r} {n}{target}{r}");
+            let _ = writeln!(
+                o,
+                "  {dim}a deny rule suppressed the raw splice (deny wins): the connection takes the \
+                 inspected L7 path, where it is denied (or, for a non-TLS protocol, the handshake \
+                 fails closed). To allow raw access, drop or narrow the deny.{r}"
+            );
+            let _ = writeln!(o, "  {dim}by deny rule:{r} {n}{rule}{r}");
+        }
         allowlist::L4Decision::NoMatch => {
             let _ = writeln!(o, "{err}NOT SPLICED{r} {n}{target}{r}");
             let _ = writeln!(

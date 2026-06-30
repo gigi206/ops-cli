@@ -481,10 +481,17 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // `mode = "allowlist"` is the backward-compatible alias of `deny`, so it renders as `deny`.
     assert!(stdout.contains("network: deny"), "stdout:\n{stdout}");
-    assert!(stdout.contains("allow github.com"), "stdout:\n{stdout}");
-    assert!(stdout.contains("allow *.nixos.org"), "stdout:\n{stdout}");
+    // each L7 host rule renders the implicit `https://`
     assert!(
-        stdout.contains("allow example.com/exact"),
+        stdout.contains("allow https://github.com"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("allow https://*.nixos.org"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("allow https://example.com/exact"),
         "stdout:\n{stdout}"
     );
     // the deny carve-out is shown too (deny wins over allow)
@@ -1026,7 +1033,7 @@ fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Authorization -> api.github.com"),
+        stdout.contains("Authorization -> https://api.github.com"),
         "the secret must be shown:\n{stdout}"
     );
     // the source is the plugin scheme + locator — by reference, never a value
@@ -1582,7 +1589,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
         "the default must show compact rule counts:\n{stdout}"
     );
     assert!(
-        !stdout.contains("allow api.example.com"),
+        !stdout.contains("allow https://api.example.com"),
         "the default must not expand the rules:\n{stdout}"
     );
 
@@ -1591,7 +1598,8 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("allow api.example.com") && stdout.contains("allow github.com"),
+        stdout.contains("allow https://api.example.com")
+            && stdout.contains("allow https://github.com"),
         "--details must list the allow rules:\n{stdout}"
     );
     assert!(
@@ -1972,7 +1980,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
         "the default must show a compact secret count:\n{stdout}"
     );
     assert!(
-        !stdout.contains("x-api-key -> api.example.com"),
+        !stdout.contains("x-api-key -> https://api.example.com"),
         "the default must not expand the credential:\n{stdout}"
     );
 
@@ -1982,7 +1990,8 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("x-api-key -> api.example.com") && stdout.contains("from env DEMO_API_KEY"),
+        stdout.contains("x-api-key -> https://api.example.com")
+            && stdout.contains("from env DEMO_API_KEY"),
         "--details must show the credential by destination and source locator:\n{stdout}"
     );
 }

@@ -263,11 +263,11 @@ pub(crate) fn net_rules_view(policy: &crate::allowlist::EgressPolicy) -> Vec<Net
             rule: r.to_string(),
         });
     }
-    for h in sandbox::builtin_allow_hosts() {
+    for r in sandbox::builtin_allow_rules() {
         rules.push(NetRuleView {
             kind: NetRuleKind::Allow,
             source: RuleSourceView::Builtin,
-            rule: h.to_string(),
+            rule: r.to_string(),
         });
     }
     rules
@@ -675,9 +675,9 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             ask_notice: ask_notice_view(a),
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
-            builtin: sandbox::builtin_allow_hosts()
+            builtin: sandbox::builtin_allow_rules()
                 .iter()
-                .map(|h| h.to_string())
+                .map(|r| r.to_string())
                 .collect(),
         },
     }
@@ -778,9 +778,9 @@ fn app_view(
                 ask_notice: ask_notice_view(a),
                 allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
                 deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
-                builtin: sandbox::builtin_allow_hosts()
+                builtin: sandbox::builtin_allow_rules()
                     .iter()
-                    .map(|h| h.to_string())
+                    .map(|r| r.to_string())
                     .collect(),
             },
         }),
@@ -1002,25 +1002,30 @@ mod tests {
             vec![classify("evil.com").unwrap()],
         );
         let rules = net_rules_view(&policy);
-        assert!(rules.iter().any(|r| r.rule == "github.com"
+        // Config rules render through the rule `Display`, so an L7 host shows the implicit scheme.
+        assert!(rules.iter().any(|r| r.rule == "https://github.com"
             && r.kind == NetRuleKind::Allow
             && r.source == RuleSourceView::Config));
-        assert!(rules.iter().any(|r| r.rule == "evil.com"
+        assert!(rules.iter().any(|r| r.rule == "https://evil.com"
             && r.kind == NetRuleKind::Deny
             && r.source == RuleSourceView::Config));
-        // Every built-in entry is an allow tagged `builtin`, and the set matches the one
-        // `network_view` surfaces (the same `builtin_allow_hosts` call) so the two cannot drift.
+        // Every built-in entry is an allow tagged `builtin`, rendered through the same rule `Display`
+        // (so it shows its scheme), and the set matches the one `network_view` surfaces (the same
+        // built-in source) so the two cannot drift.
         let builtin: Vec<&str> = rules
             .iter()
             .filter(|r| r.source == RuleSourceView::Builtin)
             .map(|r| r.rule.as_str())
             .collect();
-        assert!(builtin.contains(&"cache.nixos.org:443"));
+        // a read-only built-in host shows its `{GET,HEAD}` scope and the implicit scheme
+        assert!(builtin.contains(&"{GET,HEAD} https://cache.nixos.org"));
+        // github.com stays all-verbs (git may POST), so no method prefix
+        assert!(builtin.contains(&"https://github.com"));
         assert!(rules
             .iter()
             .filter(|r| r.source == RuleSourceView::Builtin)
             .all(|r| r.kind == NetRuleKind::Allow));
-        assert_eq!(builtin.len(), sandbox::builtin_allow_hosts().len());
+        assert_eq!(builtin.len(), sandbox::builtin_allow_rules().len());
     }
 
     #[test]

@@ -529,8 +529,9 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
-            built-in, reflecting the trust gate (an untrusted project's rules are dropped). A raw L4\n\
-            rule shows its `tcp://` scheme (the layer is visible); an inspected L7 rule shows none.\n\
+            built-in, reflecting the trust gate (an untrusted project's rules are dropped). Every\n\
+            rule names its layer: an inspected L7 rule shows `https://` (a bare host is https on 443),\n\
+            a raw L4 rule shows `tcp://`; a `re:` regex shows neither (its pattern carries its own).\n\
             Under `shared`/`none` there are no rules. `--app <name>` shows what `ops app <name>` would\n\
             launch with — the same effective policy `ops test net --app` tests a URL against. `--source\n\
             manual` instead queries this project's live ask sessions for the rules they remembered\n\
@@ -541,7 +542,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist an allow rule to a config file",
         options: &[
-            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs, or `tcp://host:port` for a raw (uninspected) L4 tunnel"),
+            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
@@ -556,7 +557,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist a deny rule to a config file",
         options: &[
-            ("<rule>", "an egress rule (a host, `*.domain`, `host/path`, IP, or `re:<regex>`), optionally prefixed `{GET,POST}` to scope it to those HTTP verbs, or `tcp://host:port` for a raw (uninspected) L4 tunnel"),
+            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),

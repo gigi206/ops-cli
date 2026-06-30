@@ -4911,7 +4911,11 @@ mod tests {
             NetworkPolicy::Allowlist(a) => {
                 assert!(a.permits("github.com", 443, "/"));
                 assert!(a.permits("cache.nixos.org", 443, "/nar/x"));
-                assert!(a.permits("1.2.3.4", 80, "/"));
+                assert!(a.permits("1.2.3.4", 443, "/"));
+                assert!(
+                    !a.permits("1.2.3.4", 80, "/"),
+                    "a bare IP defaults to the https port only"
+                );
                 assert!(a.permits("ex.com", 443, "/p"));
                 assert!(
                     !a.permits("ex.com", 443, "/other"),
