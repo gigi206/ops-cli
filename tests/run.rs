@@ -8,7 +8,17 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 fn ops() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ops"))
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops`: these e2es must not read the
+    // developer's global ops config (imported app profiles, a global `[network]` posture), or a
+    // test's outcome would depend on the host. Default it to a fixed empty dir under the test
+    // tree — no run.rs test writes a global config there (the profile-import test sets its own
+    // XDG_CONFIG_HOME, which overrides this default), so a shared empty dir is race-free.
+    let mut cfg = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    cfg.push("target/test-tmp/isolated-config");
+    let _ = std::fs::create_dir_all(&cfg);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    cmd.env("XDG_CONFIG_HOME", cfg);
+    cmd
 }
 
 /// A unique temp dir removed on drop.
