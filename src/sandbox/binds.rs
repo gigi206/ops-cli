@@ -173,6 +173,8 @@ struct SandboxPaths<'a> {
     mise_plugin_src: &'a Path,
     /// Synthetic interactive-shell rc; bound read-only at [`SHELL_RC_INCAGE`].
     shell_rc_src: &'a Path,
+    /// Generated egress contract; bound read-only at [`super::contract::EGRESS_CONTRACT_INCAGE`].
+    contract_src: &'a Path,
 }
 
 /// Assemble a [`SandboxSpec`] from already-resolved host paths. Pure: no I/O, no
@@ -249,6 +251,15 @@ fn assemble(
         Mount::RoBind {
             src: paths.shell_rc_src.to_path_buf(),
             dest: PathBuf::from(SHELL_RC_INCAGE),
+        },
+        // Zone 1 — the generated egress contract, read-only: a description of what the
+        // cage's network posture permits (reachable hosts, why a direct connection or
+        // `ping` fails). Informational only — it enforces nothing; the empty netns and the
+        // host proxy are the boundary. Bound from outside every writable mount so the agent
+        // cannot rewrite the contract it is told to read.
+        Mount::RoBind {
+            src: paths.contract_src.to_path_buf(),
+            dest: PathBuf::from(super::contract::EGRESS_CONTRACT_INCAGE),
         },
         // Zone 1 — synthetic identity (no host accounts leaked).
         Mount::RoBind {
@@ -348,6 +359,18 @@ fn assemble(
             "NIX_LD_LIBRARY_PATH".to_string(),
             join_paths(&userland.foreign_lib_paths),
         ),
+        // The sandbox-awareness handle: `OPS_SANDBOX=1` lets a process tell it is running
+        // inside an ops cage, and `OPS_EGRESS_CONTRACT` points it at the read-only contract
+        // describing the cage's network posture. Both are structural (lowest precedence): a
+        // trusted `[env]` could override them, but that only mispoints the project's own
+        // tools at its own value — self-sabotage of an informational handle, not an escape
+        // (the same class as `FONTCONFIG_FILE`/`WAYLAND_DISPLAY`) — so neither needs a
+        // denylist entry.
+        ("OPS_SANDBOX".to_string(), "1".to_string()),
+        (
+            "OPS_EGRESS_CONTRACT".to_string(),
+            super::contract::EGRESS_CONTRACT_INCAGE.to_string(),
+        ),
     ];
     env.extend(mise_env());
     for (key, val) in overlay.env {
@@ -407,11 +430,15 @@ pub(crate) fn flake_out_link_rev(name: &str, rev: &str) -> PathBuf {
 /// mount.
 pub(crate) const SHELL_RC_INCAGE: &str = "/opt/ops/bashrc";
 
-/// The synthetic interactive-shell rc: source the home's own `.bashrc` if the agent has
-/// written one, then activate mise so its activated tools manage PATH/env. Static (no
-/// per-project data, so the same bytes back every cage), bound read-only from outside
-/// every writable mount, so the agent cannot rewrite what its own shell sources.
+/// The synthetic interactive-shell rc: show the egress contract once (to stderr, so a
+/// captured stdout stays clean), source the home's own `.bashrc` if the agent has written
+/// one, then activate mise so its activated tools manage PATH/env. Static (no per-project
+/// data, so the same bytes back every cage), bound read-only from outside every writable
+/// mount, so the agent cannot rewrite what its own shell sources. The contract `cat` is
+/// guarded on the variable being set and readable, so it is a no-op where the handle is
+/// absent.
 const SHELL_RC_CONTENTS: &str = "\
+[ -r \"$OPS_EGRESS_CONTRACT\" ] && cat \"$OPS_EGRESS_CONTRACT\" >&2\n\
 [ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
 command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 
@@ -655,6 +682,7 @@ pub(crate) fn build_spec(
     overlay: &Overlay,
     extra_binds: &[ExtraBind],
     net: NetPolicy,
+    egress_contract: &str,
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
@@ -675,6 +703,12 @@ pub(crate) fn build_spec(
     let shell_rc = rt.etc_dir.join("bashrc");
     std::fs::write(&shell_rc, SHELL_RC_CONTENTS)?;
 
+    // Materialize the generated egress contract beside the rc (same outside-every-writable-
+    // mount placement, for the same reason: the agent must not be able to rewrite the
+    // contract it is told to read). Regenerated each launch, so it never goes stale.
+    let contract = rt.etc_dir.join("egress-contract.md");
+    std::fs::write(&contract, egress_contract)?;
+
     // Materialize the embedded mise `nix:` backend plugin (read-only, content-keyed,
     // shared across projects) and register it for this cage's mise: a symlink in the
     // writable mise data dir pointing at the read-only in-cage plugin. Both run on
@@ -689,6 +723,7 @@ pub(crate) fn build_spec(
         group_src: &group,
         mise_plugin_src: &mise_plugin,
         shell_rc_src: &shell_rc,
+        contract_src: &contract,
     };
     assemble(&paths, userland, nix, overlay, extra_binds, net, cmd).map_err(|e| {
         io::Error::new(
@@ -770,6 +805,7 @@ mod tests {
             group_src: Path::new("/data/ops/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
+            contract_src: Path::new("/store/egress-contract.md"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -929,6 +965,42 @@ mod tests {
         assert_eq!(joined[home_i + 1], "/home/sandbox");
         // the passthrough variable survived
         assert!(joined.iter().any(|s| s == "TERM"));
+        // the sandbox-awareness handles are present: a process can tell it is caged, and
+        // find the egress contract describing its network posture
+        let sandbox_i = joined.iter().position(|s| s == "OPS_SANDBOX").unwrap();
+        assert_eq!(joined[sandbox_i + 1], "1");
+        let contract_i = joined
+            .iter()
+            .position(|s| s == "OPS_EGRESS_CONTRACT")
+            .unwrap();
+        assert_eq!(
+            joined[contract_i + 1],
+            super::super::contract::EGRESS_CONTRACT_INCAGE
+        );
+    }
+
+    #[test]
+    fn the_egress_contract_is_bound_read_only() {
+        // The contract describes what the cage's network permits; it must be a read-only
+        // bind from the synthetic source, so the agent cannot rewrite the contract it is
+        // told to read.
+        // Key off the bind *source* — unique in the argv — since the in-cage destination
+        // path is also the value of the `OPS_EGRESS_CONTRACT` environment variable.
+        let argv = argv_strings(&assembled());
+        let src = argv
+            .iter()
+            .position(|s| s == "/store/egress-contract.md")
+            .expect("the egress contract is bound");
+        assert_eq!(
+            argv[src - 1],
+            "--ro-bind",
+            "the egress contract must be read-only"
+        );
+        assert_eq!(
+            argv[src + 1],
+            super::super::contract::EGRESS_CONTRACT_INCAGE,
+            "contract bound at the in-cage contract path"
+        );
     }
 
     #[test]
@@ -942,6 +1014,7 @@ mod tests {
             group_src: Path::new("/data/ops/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
+            contract_src: Path::new("/store/egress-contract.md"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1011,6 +1084,7 @@ mod tests {
             group_src: Path::new("/data/ops/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
+            contract_src: Path::new("/store/egress-contract.md"),
         };
         let overlay = Overlay {
             env: extra_env,
@@ -1151,6 +1225,8 @@ mod tests {
                 "PATH",
                 "NIX_LD",
                 "NIX_LD_LIBRARY_PATH",
+                "OPS_SANDBOX",
+                "OPS_EGRESS_CONTRACT",
                 "MISE_DATA_DIR",
                 "MISE_EXPERIMENTAL",
                 "MISE_YES",
@@ -1171,6 +1247,7 @@ mod tests {
             group_src: Path::new("/data/ops/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
+            contract_src: Path::new("/store/egress-contract.md"),
         };
         let nix = NixMount {
             src: PathBuf::from("/data/ops/projects/abc/store/nix"),
@@ -1419,6 +1496,7 @@ mod smoke {
             &overlay,
             &[],
             NetPolicy::Shared,
+            "",
             cmd,
         )
         .expect("build spec");
@@ -1578,6 +1656,7 @@ mod smoke {
             &bare,
             &[],
             NetPolicy::Shared,
+            "",
             vec![foreign.clone().into_os_string()],
         )
         .expect("build foreign spec");
@@ -1619,6 +1698,7 @@ mod smoke {
             &with_tool,
             &[],
             NetPolicy::Shared,
+            "",
             vec![OsString::from("hello")],
         )
         .expect("build cross spec");
@@ -1756,6 +1836,7 @@ mod smoke {
             &overlay,
             &[],
             NetPolicy::Shared,
+            "",
             cmd,
         )
         .expect("build spec");
@@ -1922,6 +2003,7 @@ mod smoke {
             &overlay,
             &[],
             NetPolicy::Shared,
+            "",
             cmd,
         )
         .expect("build spec");
@@ -2087,6 +2169,7 @@ mod smoke {
             &overlay,
             &[],
             NetPolicy::Shared,
+            "",
             cmd,
         )
         .expect("build spec");
@@ -2212,6 +2295,7 @@ mod smoke {
                 &overlay,
                 &[],
                 NetPolicy::Shared,
+                "",
                 cmd,
             )
             .expect("build spec");

@@ -1777,6 +1777,10 @@ fn build(
         ro_binds: &prep.cfg.ro_binds,
         bin_paths: &bin_paths,
     };
+    // Generate the in-cage egress contract from the resolved (post-`merge_app`) network
+    // posture, so a process inside the cage can see which hosts it can reach and why a
+    // direct connection or `ping` fails. Informational only; bound read-only by `build_spec`.
+    let egress_contract = super::contract::egress_contract(&prep.cfg.network);
     let spec = binds::build_spec(
         prep.layout.data_dir(),
         &prep.cwd,
@@ -1786,6 +1790,7 @@ fn build(
         &overlay,
         &extra_binds,
         net_policy(&prep.cfg.network),
+        &egress_contract,
         cmd,
     )
     .map_err(|e| {

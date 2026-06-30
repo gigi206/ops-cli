@@ -9,6 +9,7 @@
 mod argv;
 mod binds;
 pub(crate) mod cgroup;
+mod contract;
 pub(crate) mod control;
 pub(crate) mod egress;
 pub(crate) mod egress_stats;
