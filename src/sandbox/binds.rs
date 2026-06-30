@@ -380,6 +380,85 @@ fn assemble(
     SandboxSpec::new(paths.project.to_path_buf(), mounts, env, net, cmd)
 }
 
+/// The fixed in-cage destinations the structural mounts in [`assemble`] occupy — every mount
+/// destination that does not depend on the specific project or app. The runtime-derived paths are
+/// deliberately excluded (the project is mounted at its own absolute path, and a config bind that
+/// overlaps the project tree is normal; the launcher's extra binds live at ops's own paths), while
+/// the fixed `SANDBOX_HOME` is listed. A config bind whose canonical destination *nests* with one
+/// of these is not reconciled by the exact-destination shadowing `assemble` relies on, so
+/// [`structural_nesting_warning`] surfaces it. Kept in lockstep with `assemble` by
+/// `structural_dests_lists_every_fixed_mount_assemble_emits`, which fails if a new structural mount
+/// is added without being listed here.
+const STRUCTURAL_DESTS: &[&str] = &[
+    "/nix",
+    "/proc",
+    "/dev",
+    "/tmp",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/resolv.conf",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/lib64/ld-linux-x86-64.so.2",
+    SANDBOX_HOME,
+    SANDBOX_SHELL,
+    SANDBOX_ENV,
+    CAGE_CA_BUNDLE,
+    SHELL_RC_INCAGE,
+    super::miseplugin::INCAGE_DIR,
+    super::contract::EGRESS_CONTRACT_INCAGE,
+];
+
+/// How a config bind's destination overlaps a structural mount destination.
+enum Nesting {
+    /// The bind sits at or under the structural path: the cage mounts over it, so the bind is
+    /// shadowed and never appears inside.
+    Shadowed,
+    /// The bind contains the structural path: the cage mounts that path over part of the bound
+    /// directory, so that sub-path inside the cage is ops's, not the bind's.
+    Contains,
+}
+
+/// If the canonical config-bind destination `dest` *nests* with a fixed structural mount
+/// destination — it is a strict ancestor or descendant of one — return that structural path and
+/// the relationship. An *exact* match is deliberately not reported: that collision is reconciled
+/// correctly by [`assemble`] (the structural mount wins — the control that stops a config bind
+/// displacing `/nix`). A nesting overlap is *not* reconciled — a descendant is shadowed by the
+/// later mount and vanishes; an ancestor over-exposes the host directory around the structural
+/// files — so it is the footgun worth surfacing.
+fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
+    STRUCTURAL_DESTS.iter().find_map(|s| {
+        let structural = Path::new(s);
+        if dest == structural {
+            None
+        } else if dest.starts_with(structural) {
+            Some((*s, Nesting::Shadowed))
+        } else if structural.starts_with(dest) {
+            Some((*s, Nesting::Contains))
+        } else {
+            None
+        }
+    })
+}
+
+/// A warning when a config bind's canonical destination `dest` nests with one of the cage's own
+/// structural mounts, or `None` when it does not. The `binds` field is trusted-only, so this is an
+/// ergonomics tripwire (the launch does not drop the bind), not a security control — it tells the
+/// user their bind will not behave as a naive reading suggests.
+pub(crate) fn structural_nesting_warning(dest: &Path) -> Option<String> {
+    structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
+        Nesting::Shadowed => format!(
+            "bind `{}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
+             over it, so the bind is shadowed and will not appear inside",
+            dest.display()
+        ),
+        Nesting::Contains => format!(
+            "bind `{}` contains the sandbox's own mount `{structural}` — the cage mounts that path \
+             over part of it, so `{structural}` inside the cage is ops's, not your bind's",
+            dest.display()
+        ),
+    })
+}
+
 /// mise's data directory inside the cage, relative to the sandbox `$HOME`. The
 /// in-cage mise keeps its plugins, installs and state here — under the writable
 /// per-project home, so they persist across launches and never touch the host's
@@ -823,6 +902,50 @@ mod tests {
             vec![OsString::from("/bin/sh")],
         )
         .expect("valid spec")
+    }
+
+    #[test]
+    fn structural_dests_lists_every_fixed_mount_assemble_emits() {
+        // The bind-nesting warning checks a config bind against STRUCTURAL_DESTS, a hand-kept copy
+        // of the destinations `assemble` mounts. If a new structural mount is added without
+        // extending the const, the warning silently goes blind to it — so pin the two together.
+        // `assembled()` has no config binds and no extra binds, so its only runtime-variable
+        // destination is the project path; every other destination must be listed in the const.
+        let spec = assembled();
+        let project = Path::new("/home/u/proj");
+        for mount in &spec.mounts {
+            let dest = mount.dest();
+            if dest == project {
+                continue;
+            }
+            assert!(
+                STRUCTURAL_DESTS.iter().any(|s| Path::new(s) == dest),
+                "structural mount destination {dest:?} is not in STRUCTURAL_DESTS — list it, or \
+                 the bind-nesting warning will not catch a config bind that overlaps it"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_nesting_warning_flags_only_a_nesting_overlap() {
+        // A descendant of a structural mount is shadowed by it.
+        let w = structural_nesting_warning(Path::new("/tmp/secrets")).expect("descendant warns");
+        assert!(w.contains("shadowed"), "descendant message: {w}");
+        assert!(w.contains("/tmp"));
+
+        // An ancestor of structural files over-exposes the directory around them.
+        let w = structural_nesting_warning(Path::new("/etc")).expect("ancestor warns");
+        assert!(w.contains("contains"), "ancestor message: {w}");
+
+        // An exact match is reconciled by `assemble` (the structural mount wins) — not a footgun.
+        assert!(structural_nesting_warning(Path::new("/nix")).is_none());
+        assert!(structural_nesting_warning(Path::new("/etc/passwd")).is_none());
+
+        // A path that neither contains nor sits under any structural mount is fine. `/etcdata`
+        // shares a textual prefix with `/etc/...` but not a path lineage, so it must not warn.
+        assert!(structural_nesting_warning(Path::new("/srv/data")).is_none());
+        assert!(structural_nesting_warning(Path::new("/etcdata")).is_none());
+        assert!(structural_nesting_warning(Path::new("/home/u/proj")).is_none());
     }
 
     #[test]

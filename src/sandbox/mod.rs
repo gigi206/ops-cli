@@ -30,7 +30,7 @@ mod seccomp;
 mod smoke;
 mod spec;
 
-pub(crate) use binds::project_identity;
+pub(crate) use binds::{project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use flake::{
     pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,

@@ -13,7 +13,13 @@ impl TmpDir {
     fn new() -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
+        // Root the throwaway dirs under the build tree, not the system `/tmp`. `/tmp` is one of the
+        // cage's structural mounts, so a bind canonicalized under it would (correctly) trip the
+        // bind-nesting warning — an artifact of where the temp dir lives, not of the test's intent.
+        // The build tree (`<repo>/target/test-tmp`) nests with no structural mount, matching the
+        // other e2e suites.
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("target/test-tmp");
         d.push(format!("ops-config-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
@@ -421,6 +427,33 @@ fn trusting_the_project_applies_its_binds() {
     assert!(
         stdout.contains("PROJVAR=p  (project)"),
         "env provenance:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
+    // A trusted bind of `/etc` is an ancestor of the cage's synthetic `/etc/passwd`, so the cage
+    // layers its own files over part of it — the bind will not behave as a naive reading suggests.
+    // The bind is still honored (trusted field, not dropped), but the overlap is surfaced.
+    let fx = Fixture::new();
+    fx.write_project("binds = [\"/etc\"]\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The bind is kept (the warning does not drop it).
+    let canon = Path::new("/etc").canonicalize().unwrap();
+    assert!(
+        stdout.contains(&*canon.to_string_lossy()),
+        "the trusted bind must still be honored:\n{stdout}"
+    );
+    // ...and the structural-mount overlap is flagged.
+    assert!(
+        stderr.contains("sandbox's own mount"),
+        "a bind nesting with a structural mount must be warned:\n{stderr}"
     );
 }
 

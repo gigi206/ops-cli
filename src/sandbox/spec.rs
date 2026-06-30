@@ -36,6 +36,23 @@ pub(crate) enum Mount {
     Tmpfs { dest: PathBuf },
 }
 
+#[cfg(test)]
+impl Mount {
+    /// The in-cage destination this mount occupies; every variant has exactly one. Used by the
+    /// test that pins the structural-mount destination list against what `assemble` emits.
+    pub(crate) fn dest(&self) -> &std::path::Path {
+        match self {
+            Mount::RoBind { dest, .. }
+            | Mount::RoBindTry { dest, .. }
+            | Mount::Bind { dest, .. }
+            | Mount::Symlink { dest, .. }
+            | Mount::Proc { dest }
+            | Mount::Dev { dest }
+            | Mount::Tmpfs { dest } => dest,
+        }
+    }
+}
+
 /// Network posture. The egress allowlist is future work; for now a sandbox
 /// either shares the host network or is fully isolated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

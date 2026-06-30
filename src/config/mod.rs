@@ -2580,6 +2580,12 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     let mut canon_layer = BTreeMap::new();
     for p in declared {
         if let Some(canon) = canonicalize_one(&p, &mut resolved.warnings) {
+            // A bind that nests with one of the cage's own structural mounts will not behave as
+            // declared (a descendant is shadowed, an ancestor over-exposes); surface it. Trusted-
+            // only field, so this warns without dropping the bind.
+            if let Some(w) = crate::sandbox::structural_nesting_warning(&canon) {
+                resolved.warnings.push(w);
+            }
             if let Some(layer) = raw_layer.get(&p) {
                 canon_layer.insert(canon.clone(), *layer);
             }
@@ -2615,11 +2621,18 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     }
 }
 
-/// Canonicalize each bind source, dropping with a warning any that cannot be resolved.
+/// Canonicalize each bind source, dropping with a warning any that cannot be resolved and warning
+/// (without dropping) any whose destination nests with a structural mount.
 fn canonicalize_binds(binds: Vec<PathBuf>, warnings: &mut Vec<String>) -> Vec<PathBuf> {
     binds
         .into_iter()
-        .filter_map(|p| canonicalize_one(&p, warnings))
+        .filter_map(|p| {
+            let canon = canonicalize_one(&p, warnings)?;
+            if let Some(w) = crate::sandbox::structural_nesting_warning(&canon) {
+                warnings.push(w);
+            }
+            Some(canon)
+        })
         .collect()
 }
 
