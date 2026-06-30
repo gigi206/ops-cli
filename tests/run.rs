@@ -1537,7 +1537,14 @@ fn project_home_mise_shim(data: &Path, name: &str) -> Option<PathBuf> {
     let projects = data.join("ops").join("projects");
     for entry in std::fs::read_dir(&projects).ok()?.flatten() {
         let shim = entry.path().join("home/.local/share/mise/shims").join(name);
-        if shim.exists() {
+        // The shim is a symlink mise writes inside the cage, pointing at the cage's own mise
+        // (`/nix/store/<hash>-mise-<ver>/bin/mise` in the per-project store mounted at `/nix`).
+        // That target resolves only inside the cage, not on the host, so `exists()` — which
+        // follows the link — would report a correctly-created shim as absent whenever the host
+        // store happens not to carry that exact mise path. Check the link itself
+        // (`symlink_metadata`, which does not follow it): its presence is what proves the equip
+        // ran and placed the shim.
+        if shim.symlink_metadata().is_ok() {
             return Some(shim);
         }
     }
