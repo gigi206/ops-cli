@@ -905,6 +905,142 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
 }
 
 #[test]
+fn ops_net_logs_follow_streams_a_running_sessions_egress() {
+    // The `--follow` live tail end to end: while a background session under a trusted allowlist makes
+    // an allowed and a denied egress, a separate `ops net logs --follow --json` child streams its
+    // events (NDJSON, one object per line). A reader thread accumulates the child's stdout; the test
+    // polls it until the allow and the deny both appear (or a deadline), proving the poll loop's seed
+    // + per-session cursor + append. Skips (never fails) when the host cannot sandbox or the cache is
+    // unreachable.
+    use std::io::BufRead as _;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let project = TmpDir::new("logsf-proj");
+    let data = TmpDir::new("logsf-data");
+    let state = TmpDir::new("logsf-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping net logs --follow e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping net logs --follow e2e: the binary cache is unreachable");
+        return;
+    }
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The background session: one allowed and one denied egress, then a sleep long enough to tail.
+    let mut session = Command::new(env!("CARGO_BIN_EXE_ops"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
+             nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
+             sleep 30",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the background ops run");
+
+    // Give the session a moment to come up (the seed then catches early events).
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The follower streams new events as NDJSON over a pipe; a thread accumulates them so the test
+    // can watch the stream grow.
+    let mut follower = Command::new(env!("CARGO_BIN_EXE_ops"))
+        .args(["net", "logs", "--follow", "--interval", "1", "--json"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ops net logs --follow");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let reader = {
+        let sink = captured.clone();
+        let stdout = follower.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => sink.lock().unwrap().push_str(&line),
+                }
+            }
+        })
+    };
+
+    let line_has = |buf: &str, host: &str, verdict: &str| {
+        buf.lines().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .map(|v| v["host"] == host && v["verdict"] == verdict)
+                .unwrap_or(false)
+        })
+    };
+    // Poll the accumulating stream until both decisions appear, or a generous deadline — stopping as
+    // soon as they do keeps the test fast without a fragile fixed sleep.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        {
+            let buf = captured.lock().unwrap();
+            if line_has(&buf, "cache.nixos.org", "allow") && line_has(&buf, "example.com", "deny") {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    let _ = follower.kill();
+    let _ = follower.wait();
+    let _ = reader.join();
+    let _ = session.kill();
+    let _ = session.wait();
+
+    let out = captured.lock().unwrap().clone();
+    assert!(
+        line_has(&out, "cache.nixos.org", "allow"),
+        "the --follow stream must show the allowed host's allow:\n{out}"
+    );
+    assert!(
+        line_has(&out, "example.com", "deny"),
+        "the --follow stream must show the denied host's deny:\n{out}"
+    );
+}
+
+#[test]
 fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     // The L4 (`tcp://`) raw-splice path end to end through the real binary — the headline proof. A
     // trusted `network = "allowlist"` with a `tcp://` rule lets an in-cage client (curl tunnelling

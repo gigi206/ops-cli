@@ -3886,7 +3886,7 @@ fn render_stats(
 }
 
 /// The parsed `ops net logs` display options.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct LogView {
     json: bool,
     app: Option<String>,
@@ -3894,18 +3894,40 @@ struct LogView {
     verdict: Option<sandbox::control::LogVerdict>,
     limit: Option<usize>,
     with_query: bool,
+    /// `--follow`: after the initial listing, keep polling and append new events (a `tail -f`).
+    follow: bool,
+    /// The `--follow` poll interval in seconds (`-i`), default 1. Ignored without `--follow`.
+    interval_secs: u64,
 }
 
 /// Parse `ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
-/// [-n <N>] [--with-query] [--json]`. Pure (no I/O), so every reject path is unit-testable — a
-/// missing value, an unknown verdict, a non-numeric count, or an unknown flag is an error.
+/// [-n <N>] [--with-query] [--follow] [-i|--interval <secs>] [--json]`. Pure (no I/O), so every
+/// reject path is unit-testable — a missing value, an unknown verdict, a non-numeric count or
+/// interval, a zero interval, or an unknown flag is an error.
 fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
-    let mut v = LogView::default();
+    let mut v = LogView {
+        interval_secs: 1,
+        ..LogView::default()
+    };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--json") => v.json = true,
             Some("--with-query") => v.with_query = true,
+            Some("--follow") | Some("-f") => v.follow = true,
+            Some("-i") | Some("--interval") => {
+                let val = it.next().ok_or("`--interval` needs a value in seconds")?;
+                let secs: u64 = val.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                    format!(
+                        "invalid interval `{}` — expected a whole number of seconds",
+                        val.to_string_lossy()
+                    )
+                })?;
+                if secs == 0 {
+                    return Err("interval must be at least 1 second".into());
+                }
+                v.interval_secs = secs;
+            }
             Some("-a") | Some("--app") => {
                 let name = it.next().ok_or("`--app` needs an app name")?;
                 v.app = Some(name.to_string_lossy().into_owned());
@@ -3966,6 +3988,13 @@ fn collect_logs(
     (sessions, context)
 }
 
+/// Whether one event passes the ongoing `--host`/`--verdict` filters (the `-n` limit is separate —
+/// it caps the initial listing, not the followed stream). Shared by the one-shot listing and the
+/// `--follow` stream so a filter behaves identically in both.
+fn event_passes_filters(e: &sandbox::control::LogEvent, view: &LogView) -> bool {
+    view.host.as_deref().is_none_or(|h| e.host == h) && view.verdict.is_none_or(|v| e.verdict == v)
+}
+
 /// The events of one session that pass the `--host`/`--verdict` filters, then the `-n` limit (the
 /// most recent N, since the ring is oldest-first). Borrowed, so the render/JSON share one filter.
 fn filtered_log_events<'a>(
@@ -3974,8 +4003,7 @@ fn filtered_log_events<'a>(
 ) -> Vec<&'a sandbox::control::LogEvent> {
     let mut out: Vec<&sandbox::control::LogEvent> = events
         .iter()
-        .filter(|e| view.host.as_deref().is_none_or(|h| e.host == h))
-        .filter(|e| view.verdict.is_none_or(|v| e.verdict == v))
+        .filter(|e| event_passes_filters(e, view))
         .collect();
     if let Some(n) = view.limit {
         if out.len() > n {
@@ -4036,11 +4064,13 @@ fn net_logs(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    if view.follow {
+        return net_logs_follow(&data_dir, &view, &pal);
+    }
+
     let (sessions, context) = collect_logs(&data_dir, view.app.as_deref());
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let now_ms = now_epoch_ms();
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -4050,22 +4080,12 @@ fn net_logs(args: &[OsString]) -> ExitCode {
                 let ctx = ctx_of(s.pid);
                 let project = ctx.map(|(_, p, _)| p.display().to_string());
                 let label = ctx.map(|(_, _, l)| l.clone());
-                filtered_log_events(&s.snapshot.events, &view)
+                // Capture `view` by reference (it is used again below), the owned project/label by move.
+                let view = &view;
+                filtered_log_events(&s.snapshot.events, view)
                     .into_iter()
                     .map(move |e| {
-                        serde_json::json!({
-                            "pid": s.pid,
-                            "project": project,
-                            "label": label,
-                            // Epoch-ms fits u64, so consumers get a real number, not a string.
-                            "at_epoch_ms": e.at_epoch_ms as u64,
-                            "host": e.host,
-                            "port": e.port,
-                            "method": e.method,
-                            "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
-                            "verdict": e.verdict.as_str(),
-                            "reason": e.reason,
-                        })
+                        log_event_json(e, s.pid, project.as_deref(), label.as_deref(), view)
                     })
                     .collect::<Vec<_>>()
             })
@@ -4085,9 +4105,189 @@ fn net_logs(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_logs(&sessions, &context, now_ms, &view, &pal));
+    print!(
+        "{}",
+        render_logs(&sessions, &context, now_ms, &view, &pal, true)
+    );
     ExitCode::SUCCESS
+}
+
+/// The current wall-clock in epoch milliseconds (for an event's relative age / JSON stamp).
+fn now_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// `ops net logs --follow`: after seeding with the current listing, poll each reachable session on
+/// the interval and **append** the events past a per-session seq cursor — a `tail -f` for egress. A
+/// ring overflow between polls (`dropped` > 0) is announced, never dropped silently. A session that
+/// ends (its control socket vanishes) is noted once; a new one is picked up. Runs until interrupted
+/// (Ctrl-C); the append shape is pipe-friendly (unlike `pending watch`'s in-place redraw), so it
+/// needs no terminal. The `--follow` NDJSON stream (`--json`) emits one event object per line.
+fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> ExitCode {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+
+    let interval = std::time::Duration::from_secs(view.interval_secs.max(1));
+    // A per-session cursor: the last seq already shown. Seeded from the initial listing so the follow
+    // only ever appends genuinely new events.
+    let mut cursor: HashMap<u32, u64> = HashMap::new();
+    let (dim, r) = (pal.dim, pal.reset);
+    let ctx_of = |ctx: &[(u32, PathBuf, String)], pid: u32| {
+        ctx.iter()
+            .find(|(p, _, _)| *p == pid)
+            .map(|(_, proj, label)| (proj.display().to_string(), label.clone()))
+    };
+
+    // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
+    // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
+    // that pipes to `head` on an idle session emits no spurious line then spins.
+    let (sessions, context) = collect_logs(data_dir, view.app.as_deref());
+    let has_events = sessions
+        .iter()
+        .any(|s| !filtered_log_events(&s.snapshot.events, view).is_empty());
+    let mut seed = String::new();
+    if view.json {
+        for s in &sessions {
+            let c = ctx_of(&context, s.pid);
+            for e in filtered_log_events(&s.snapshot.events, view) {
+                let obj = log_event_json(
+                    e,
+                    s.pid,
+                    c.as_ref().map(|(p, _)| p.as_str()),
+                    c.as_ref().map(|(_, l)| l.as_str()),
+                    view,
+                );
+                let _ = writeln!(seed, "{obj}");
+            }
+        }
+    } else if has_events {
+        // No footer in the seed — events append below it, so the live-only note would land mid-stream.
+        seed = render_logs(&sessions, &context, now_epoch_ms(), view, pal, false);
+    }
+    for s in &sessions {
+        cursor.insert(s.pid, s.snapshot.head);
+    }
+    // A closed downstream pipe (`… | head`) ends the follow cleanly — Rust ignores SIGPIPE, so a
+    // write to a gone reader returns an error we must act on rather than spin forever.
+    if flush_stream(&seed).is_err() {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!("ops: following egress (Ctrl-C to quit)");
+
+    let mut last_pid: Option<u32> = None; // the session whose header was last printed (human view)
+    loop {
+        std::thread::sleep(interval);
+        let now_ms = now_epoch_ms();
+        let context = pending_session_context(data_dir);
+        let mut pids = sandbox::control::session_pids(data_dir);
+        if let Some(name) = view.app.as_deref() {
+            let allowed = session_pids_for_app(data_dir, name);
+            pids.retain(|p| allowed.contains(p));
+        }
+
+        // Build this tick's output into a buffer, then write it once — so a broken pipe is detected on
+        // the single write and ends the follow, and the ordering of every line is deterministic.
+        let mut tick = String::new();
+
+        // A session that had a cursor but no longer has a socket has ended — note it once and forget.
+        let live: std::collections::HashSet<u32> = pids.iter().copied().collect();
+        let ended: Vec<u32> = cursor
+            .keys()
+            .copied()
+            .filter(|p| !live.contains(p))
+            .collect();
+        for pid in ended {
+            cursor.remove(&pid);
+            if !view.json {
+                let _ = writeln!(tick, "  {dim}session {pid} ended{r}");
+                if last_pid == Some(pid) {
+                    last_pid = None;
+                }
+            }
+        }
+
+        for pid in pids {
+            let after = cursor.get(&pid).copied();
+            let Ok(snap) =
+                sandbox::control::read_log(&sandbox::control::control_socket(data_dir, pid), after)
+            else {
+                continue; // a session that vanished mid-read is handled next tick
+            };
+            // A gap between polls (the ring overflowed) — surfaced, never silent.
+            if snap.dropped > 0 {
+                if view.json {
+                    let _ = writeln!(
+                        tick,
+                        "{}",
+                        serde_json::json!({ "pid": pid, "dropped": snap.dropped })
+                    );
+                } else {
+                    let _ = writeln!(
+                        tick,
+                        "  {dim}[{pid}] {} event(s) dropped — the ring overflowed between polls{r}",
+                        snap.dropped
+                    );
+                }
+            }
+            let new: Vec<&sandbox::control::LogEvent> = snap
+                .events
+                .iter()
+                .filter(|e| event_passes_filters(e, view))
+                .collect();
+            if !new.is_empty() {
+                let c = ctx_of(&context, pid);
+                for e in new {
+                    if view.json {
+                        let obj = log_event_json(
+                            e,
+                            pid,
+                            c.as_ref().map(|(p, _)| p.as_str()),
+                            c.as_ref().map(|(_, l)| l.as_str()),
+                            view,
+                        );
+                        let _ = writeln!(tick, "{obj}");
+                    } else {
+                        // A session header only when the stream switches sessions, so a single-session
+                        // follow does not repeat it every event.
+                        if last_pid != Some(pid) {
+                            match &c {
+                                Some((proj, label)) => {
+                                    let _ =
+                                        writeln!(tick, "  {dim}session {pid} [{label}] {proj}{r}");
+                                }
+                                None => {
+                                    let _ =
+                                        writeln!(tick, "  {dim}session {pid} (unregistered){r}");
+                                }
+                            }
+                            last_pid = Some(pid);
+                        }
+                        let _ = writeln!(tick, "{}", render_log_line(e, now_ms, view, pal));
+                    }
+                }
+            }
+            cursor.insert(pid, snap.head);
+        }
+        if flush_stream(&tick).is_err() {
+            return ExitCode::SUCCESS; // downstream pipe closed
+        }
+    }
+}
+
+/// Write `s` to stdout and flush, returning the I/O result — a broken pipe (a closed `… | head`
+/// downstream) surfaces here rather than being swallowed, so a `--follow` loop can stop instead of
+/// spinning forever (Rust ignores SIGPIPE). An empty string is a successful no-op.
+fn flush_stream(s: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if s.is_empty() {
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(s.as_bytes())?;
+    out.flush()
 }
 
 /// The ANSI span for a verdict: green for `allow`, red for a refusal (`deny`/`blocked`), yellow for
@@ -4105,15 +4305,18 @@ fn verdict_color(verdict: sandbox::control::LogVerdict, pal: &style::Palette) ->
 /// header, then per session a context line and one line per event
 /// (`age · host:port · method path · verdict · reason`), oldest first. The `reason` is dropped for a
 /// plain `allow` (it would just repeat "allowed"). An empty result explains the log is live-only.
+/// `footer` appends the live-only note — on for the one-shot listing, off for the `--follow` seed
+/// (where events append below it, so the note would land mid-stream).
 fn render_logs(
     sessions: &[sandbox::control::SessionLog],
     context: &[(u32, PathBuf, String)],
     now_ms: u128,
     view: &LogView,
     pal: &style::Palette,
+    footer: bool,
 ) -> String {
     use std::fmt::Write as _;
-    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
     let mut o = String::new();
     let total: usize = sessions
         .iter()
@@ -4161,42 +4364,78 @@ fn render_logs(
             );
         }
         for e in events {
-            let hostport = if e.host.is_empty() {
-                "-".to_string()
-            } else {
-                format!("{}:{}", e.host, e.port)
-            };
-            let age = format_log_age(now_ms, e.at_epoch_ms);
-            let method = e
-                .method
-                .as_deref()
-                .map(|m| format!("{m} "))
-                .unwrap_or_default();
-            let path = e
-                .path
-                .as_deref()
-                .map(|p| display_log_path(p, view.with_query))
-                .unwrap_or("");
-            let vc = verdict_color(e.verdict, pal);
-            // `allowed` on an allow line just repeats the verdict — show the reason only when it adds
-            // something (every refusal / error category).
-            let reason = if e.verdict == sandbox::control::LogVerdict::Allow {
-                String::new()
-            } else {
-                format!("  {dim}({}){r}", e.reason)
-            };
-            let _ = writeln!(
-                o,
-                "    {dim}{age:>5}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}",
-                e.verdict.as_str()
-            );
+            let _ = writeln!(o, "{}", render_log_line(e, now_ms, view, pal));
         }
     }
-    let _ = writeln!(
-        o,
-        "  {dim}live view — this session's egress; nothing is kept after it exits{r}"
-    );
+    if footer {
+        let _ = writeln!(
+            o,
+            "  {dim}live view — this session's egress; nothing is kept after it exits{r}"
+        );
+    }
     o
+}
+
+/// One event's display line (indented, no trailing newline): `age · host:port · method path ·
+/// verdict · reason`. The `reason` is dropped for a plain `allow` (it would just repeat "allowed");
+/// a blank host (a malformed handshake) shows `-`. Shared by the one-shot render and the `--follow`
+/// stream so a line looks identical in both.
+fn render_log_line(
+    e: &sandbox::control::LogEvent,
+    now_ms: u128,
+    view: &LogView,
+    pal: &style::Palette,
+) -> String {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let hostport = if e.host.is_empty() {
+        "-".to_string()
+    } else {
+        format!("{}:{}", e.host, e.port)
+    };
+    let age = format_log_age(now_ms, e.at_epoch_ms);
+    let method = e
+        .method
+        .as_deref()
+        .map(|m| format!("{m} "))
+        .unwrap_or_default();
+    let path = e
+        .path
+        .as_deref()
+        .map(|p| display_log_path(p, view.with_query))
+        .unwrap_or("");
+    let vc = verdict_color(e.verdict, pal);
+    let reason = if e.verdict == sandbox::control::LogVerdict::Allow {
+        String::new()
+    } else {
+        format!("  {dim}({}){r}", e.reason)
+    };
+    format!(
+        "    {dim}{age:>5}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}",
+        e.verdict.as_str()
+    )
+}
+
+/// One event as a JSON object (for `--json` and the `--follow` NDJSON stream). Epoch-ms is a number
+/// (it fits u64); the path honors `--with-query`. Shared so the two JSON paths cannot diverge.
+fn log_event_json(
+    e: &sandbox::control::LogEvent,
+    pid: u32,
+    project: Option<&str>,
+    label: Option<&str>,
+    view: &LogView,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pid": pid,
+        "project": project,
+        "label": label,
+        "at_epoch_ms": e.at_epoch_ms as u64,
+        "host": e.host,
+        "port": e.port,
+        "method": e.method,
+        "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
+        "verdict": e.verdict.as_str(),
+        "reason": e.reason,
+    })
 }
 
 /// `ops net rules [--source config|builtin] [--filter <substr>] [--json]`: list the effective
@@ -6591,6 +6830,19 @@ mod tests {
         assert_eq!(v.verdict, Some(LogVerdict::Error));
         assert_eq!(v.limit, Some(5));
         assert!(v.with_query && v.json);
+        assert!(!v.follow, "follow is off unless asked");
+
+        // `--follow`/`-f` with an explicit interval; the default interval is 1s.
+        let f = parse_log_args(&osv(&["--follow", "--interval", "3"])).unwrap();
+        assert!(f.follow && f.interval_secs == 3);
+        assert!(parse_log_args(&osv(&["-f"])).unwrap().follow);
+        assert_eq!(parse_log_args(&osv(&["-f"])).unwrap().interval_secs, 1);
+        // A zero or non-numeric interval is refused (a zero would busy-poll).
+        assert!(parse_log_args(&osv(&["-i", "0"])).is_err());
+        assert!(parse_log_args(&osv(&["-i", "soon"]))
+            .unwrap_err()
+            .contains("soon"));
+        assert!(parse_log_args(&osv(&["-i"])).is_err());
 
         // Every verdict token parses through the flag (in particular `error`, the log-only one).
         for (tok, want) in [
@@ -6680,7 +6932,9 @@ mod tests {
         let now = 1_012_000u128; // 12s after the events' 1_000_000 stamp
 
         // Empty → a live-only note; under `--app`, it names the app.
-        assert!(render_logs(&[], &[], now, &LogView::default(), &p).contains("nothing to show"));
+        assert!(
+            render_logs(&[], &[], now, &LogView::default(), &p, true).contains("nothing to show")
+        );
         let scoped = render_logs(
             &[],
             &[],
@@ -6690,6 +6944,7 @@ mod tests {
                 ..LogView::default()
             },
             &p,
+            true,
         );
         assert!(scoped.contains("for app `claude-code`"), "{scoped}");
 
@@ -6732,7 +6987,7 @@ mod tests {
             "app:claude-code".to_string(),
         )];
 
-        let out = render_logs(&sessions, &context, now, &LogView::default(), &p);
+        let out = render_logs(&sessions, &context, now, &LogView::default(), &p, true);
         // The session header from the registry context.
         assert!(
             out.contains("session 4242 [app:claude-code] /home/u/proj"),
@@ -6774,6 +7029,7 @@ mod tests {
                 ..LogView::default()
             },
             &p,
+            true,
         );
         assert!(
             wq.contains("/v1/m?k=sec"),
@@ -6822,7 +7078,7 @@ mod tests {
 
         // The render says so, rather than silently showing the last 1000 as if they were all.
         let sessions = [SessionLog { pid: 7, snapshot }];
-        let out = render_logs(&sessions, &[], now, &LogView::default(), &p);
+        let out = render_logs(&sessions, &[], now, &LogView::default(), &p, true);
         assert!(
             out.contains("4000 earlier event(s) evicted from the ring"),
             "the ring overflow must be surfaced, not truncated silently:\n{out}"

@@ -679,7 +679,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "logs"],
         synopsis: "ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
-                   [-n <N>] [--with-query] [--json]",
+                   [-n <N>] [--with-query] [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
@@ -688,7 +688,10 @@ const PAGES: &[Page] = &[
             ("-n <N>", "show only the most recent N events (per session)"),
             ("--with-query", "keep the URL query in the shown path (dropped by default; already \
                               secret-redacted)"),
-            ("--json", "emit the events as JSON"),
+            ("-f, --follow", "after the initial listing, keep appending new events (a `tail -f`) \
+                              until Ctrl-C"),
+            ("-i, --interval <secs>", "the `--follow` poll interval in seconds (default 1)"),
+            ("--json", "emit the events as JSON (one object per line under `--follow`)"),
         ],
         details:
             "A chronological, per-request record of every egress decision the proxy made this\n\
@@ -707,8 +710,13 @@ const PAGES: &[Page] = &[
             \n\
             The URL query is dropped from the shown path by default (a token can ride in a query);\n\
             `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\
-            values before an event enters the log. Host-side and read-only — no launch, no nix, no\n\
-            network.",
+            values before an event enters the log.\n\
+            \n\
+            `--follow` prints the current listing, then appends new events as they happen (a\n\
+            `tail -f`) until Ctrl-C, polling every `--interval` seconds (default 1). If the ring\n\
+            overflowed between polls the dropped count is announced, never silently skipped; a\n\
+            session that ends is noted. The append shape is pipe-friendly, and `--json` streams one\n\
+            event object per line. Host-side and read-only — no launch, no nix, no network.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

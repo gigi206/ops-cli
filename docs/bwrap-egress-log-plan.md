@@ -126,8 +126,18 @@ log on the egress axis.
    no-silent-cap discipline the wire's `dropped=` gives `--follow`. 724 `--bins` + the live e2e
    (`ops_net_logs_reads_a_running_sessions_live_egress`: a background session's allow+deny read
    cross-process, teeth on method/path); fmt/clippy clean.
-3. **`--follow`** live tail (poll with a per-session seq cursor, mirror `net_pending_watch`, print
-   the `dropped=` gap marker) + help text.
+3. **`--follow` — DONE.** A `tail -f` for egress: seed with the current listing, then poll each
+   reachable session on `-i/--interval` (default 1s) and **append** the events past a per-session
+   seq cursor. Unlike `pending watch`'s in-place redraw, it appends (pipe-friendly, no terminal
+   needed); `--json` streams NDJSON (one object per line). A ring overflow between polls (`dropped`)
+   is announced, a session that ends is noted, a new one is picked up. Runs until Ctrl-C. Shared
+   `event_passes_filters`/`render_log_line`/`log_event_json` so the one-shot and stream cannot
+   diverge. Tested: parse (follow/interval/zero-reject) + a live e2e
+   (`ops_net_logs_follow_streams_a_running_sessions_egress`: a background session's allow+deny read
+   off the NDJSON stream by a reader thread). 725 `--bins` + 2 live e2e; fmt/clippy clean.
+
+**The `ops net logs` feature is complete** — the live, zero-disk egress log with filters, JSON, the
+eviction/overflow surfacing, and `--follow`.
 
 ## Non-goals
 
