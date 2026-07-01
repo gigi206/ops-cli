@@ -6,8 +6,9 @@
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls Anthropic's
 # standalone `claude` release binary) into the app's persistent home — no host
 # mutation, no nixpkgs lag, and none of the unfree-license gate nixpkgs imposes.
-# It is equipped at the latest upstream version on the first launch in a project;
-# advancing an already-installed version is not yet automated by `ops upgrade`.
+# It is equipped at the latest upstream version on the first launch in a project, then pinned to
+# that version. Advance an already-installed version with `ops upgrade mise`: it runs `mise upgrade`
+# in the app's own home and rolls the aqua package forward to the newest upstream release.
 cmd = "claude"
 
 [packages]
@@ -27,8 +28,18 @@ claude-code = "mise:aqua:anthropics/claude-code"
 # — add it; check ahead with `ops test net <url>`.)
 # An app is read-by-default ({GET,HEAD}): the API/MCP hosts the agent POSTs to are opened to
 # all verbs with `{*}`; the pure download hosts stay `{GET,HEAD}` (least privilege).
+#
+# Third-party telemetry (the CLI ships operational logs to Datadog) is NOT hard-denied here: in
+# `allowlist` mode any host absent from `allow` is already refused, so Datadog never gets out, and
+# the [env] telemetry cut below also stops the CLI from generating that traffic at the source. To
+# restore an explicit, self-documenting hard block — a backstop if the mode is ever loosened, and it
+# also covers every port plus the raw-TCP path — uncomment the rule below. `deny` always wins; the
+# `*.` wildcard covers the apex plus every regional intake host.
 [network]
 mode = "allowlist"
+# deny = [
+#     "*.datadoghq.com:*",  # Datadog telemetry / operational logs
+# ]
 allow = [
     "{*} https://api.anthropic.com:443",
     "{*} https://platform.claude.com:443",
@@ -37,15 +48,22 @@ allow = [
     "{GET,HEAD} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
-# The real API key is read on the HOST and injected into the outbound request by
-# the egress proxy — it never enters the cage. Provide it on the host as
-# $ANTHROPIC_API_KEY (or point `from` at a resolver, e.g. sops://secrets.yaml#anthropic).
-# The in-cage placeholder lets the CLI start and issue the request; the proxy
-# strips it and substitutes the real key on the wire.
+# BYOK (API-key auth) is commented out below, so this profile ships with no baked-in credential —
+# authenticate however you prefer: log in interactively (e.g. a subscription via `/login`, whose
+# token persists in the app's isolated home), OR uncomment the ANTHROPIC_API_KEY placeholder and the
+# [secret] block to inject an API key host-side. When injected, the real key is read on the HOST as
+# $ANTHROPIC_API_KEY (or a resolver, e.g. sops://secrets.yaml#anthropic) and swapped onto the wire by
+# the egress proxy; it never enters the cage — the in-cage value stays a placeholder.
 [env]
-ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+# Cut Claude Code's non-essential / telemetry / error-reporting traffic at the source, so the tool
+# never even generates it. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the umbrella (all non-essential
+# background traffic at once, except the WebFetch host-safety check, which keeps its own opt-out).
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+DISABLE_TELEMETRY = "1"
+DISABLE_ERROR_REPORTING = "1"
+# ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
 
-[secret."api.anthropic.com"]
-from = "env://ANTHROPIC_API_KEY"
-header = "x-api-key"
-type = "raw"
+# [secret."api.anthropic.com"]
+# from = "env://ANTHROPIC_API_KEY"
+# header = "x-api-key"
+# type = "raw"
