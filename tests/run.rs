@@ -776,6 +776,135 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 }
 
 #[test]
+fn ops_net_logs_reads_a_running_sessions_live_egress() {
+    // The live egress log end to end through the real binary: a background `ops run` under a
+    // trusted allowlist makes one allowed and one denied egress attempt, then sleeps; while it is
+    // alive, `ops net logs` (run from another process) reads its per-request events over the
+    // control socket. Teeth: the allowed host shows an `allow` and the denied host a `deny`, each
+    // carrying the request's method and path — proving the proxy's push, the ring, the socket wire,
+    // and the reader compose. Because the log is live-only (it dies with the session), the session
+    // MUST be alive during the read — hence the background child. Skips (never fails) when the host
+    // cannot sandbox or the cache is unreachable.
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let project = TmpDir::new("logs-proj");
+    let data = TmpDir::new("logs-data");
+    let state = TmpDir::new("logs-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the project store, so the background run starts warm).
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping net logs e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping net logs e2e: the binary cache is unreachable");
+        return;
+    }
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // A background session: one allowed fetch (logged `allow`), one denied fetch (logged `deny`),
+    // then a sleep long enough to read its live log. The denied fetch fails; `sh` continues.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ops"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
+             nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
+             sleep 30",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the background ops run");
+
+    // Poll the live log until both decisions have been recorded (or a generous deadline). The reader
+    // globs the one control socket in this isolated data dir, so no `--app` scope is needed.
+    let host_verdict = |rows: &[serde_json::Value], host: &str, verdict: &str| {
+        rows.iter()
+            .any(|r| r["host"] == host && r["verdict"] == verdict)
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    // Deferred init: the loop assigns `last` on its first iteration, before either break — so it is
+    // always set by the post-loop read, with no dead initial store.
+    let mut last;
+    let (mut saw_allow, mut saw_deny) = (false, false);
+    loop {
+        let out = ops_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["net", "logs", "--json"],
+        );
+        last = String::from_utf8_lossy(&out.stdout).into_owned();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last) {
+            if let Some(rows) = v["logs"].as_array() {
+                saw_allow = host_verdict(rows, "cache.nixos.org", "allow");
+                saw_deny = host_verdict(rows, "example.com", "deny");
+                if saw_allow && saw_deny {
+                    // Teeth on the record shape: the allowed event carries its method + path.
+                    let allow = rows
+                        .iter()
+                        .find(|r| r["host"] == "cache.nixos.org" && r["verdict"] == "allow")
+                        .unwrap();
+                    assert_eq!(allow["method"], "GET", "the allow event carries the method");
+                    assert_eq!(
+                        allow["path"], "/nix-cache-info",
+                        "the allow event carries the (query-dropped) path"
+                    );
+                    break;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // The human render also surfaces the live session (exercises `render_logs` through the binary).
+    let human = ops_in(project.path(), data.path(), state.path(), &["net", "logs"]);
+    let human_out = String::from_utf8_lossy(&human.stdout);
+
+    // Tear the background session down before asserting, so a failure never leaks a live cage.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        saw_allow && saw_deny,
+        "the live log must show the allowed host's allow and the denied host's deny:\n{last}"
+    );
+    assert!(
+        human_out.contains("egress log:") && human_out.contains("cache.nixos.org"),
+        "the human `ops net logs` must render the live session's events:\n{human_out}"
+    );
+}
+
+#[test]
 fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     // The L4 (`tcp://`) raw-splice path end to end through the real binary — the headline proof. A
     // trusted `network = "allowlist"` with a `tcp://` rule lets an in-cage client (curl tunnelling

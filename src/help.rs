@@ -132,8 +132,9 @@ const PAGES: &[Page] = &[
             "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
             `allow`/`deny <rule>` persist a rule to config; `pending` lists and answers requests\n\
             parked by the `ask` posture; `stats` reports the per-host allow/deny/blocked decision\n\
-            counters launches recorded. Host-side — no launch, no nix. (Distinct from `ops test\n\
-            net <url>`, which tests one URL against the policy.)",
+            counters launches recorded; `logs` is the live, per-request egress log of a running\n\
+            session. Host-side — no launch, no nix. (Distinct from `ops test net <url>`, which\n\
+            tests one URL against the policy.)",
     },
     Page {
         path: &["plugins"],
@@ -674,6 +675,40 @@ const PAGES: &[Page] = &[
             unreachable upstream, a malformed request) are not a policy verdict and are not counted.\n\
             Recording is on by default; a trusted `[network] stats = false` turns it off. Host-side\n\
             and read-only — no launch, no nix, no network.",
+    },
+    Page {
+        path: &["net", "logs"],
+        synopsis: "ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
+                   [-n <N>] [--with-query] [--json]",
+        summary: "the live, per-request egress log of a running session",
+        options: &[
+            ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
+            ("--host <h>", "only events whose destination host is exactly <h>"),
+            ("--verdict <v>", "only events with this verdict: allow, deny, blocked, or error"),
+            ("-n <N>", "show only the most recent N events (per session)"),
+            ("--with-query", "keep the URL query in the shown path (dropped by default; already \
+                              secret-redacted)"),
+            ("--json", "emit the events as JSON"),
+        ],
+        details:
+            "A chronological, per-request record of every egress decision the proxy made this\n\
+            session — when, host:port, method, path, verdict, and the reason category. It is read\n\
+            from the same control sockets `ops net pending` uses, and `log` is an accepted alias.\n\
+            \n\
+            LIVE-ONLY: the log lives in the running session's memory and is NEVER written to disk;\n\
+            once the session exits, nothing remains. It shows a session while it runs (watch it\n\
+            from another terminal), not after. Only a filtering posture (`allowlist`/`ask`) has a\n\
+            proxy, so only those sessions have a log.\n\
+            \n\
+            Verdicts are a superset of `ops net stats`: allow, deny, blocked (a security/protocol\n\
+            guard), and `error` — a request that was allowed but did not complete (DNS failure, an\n\
+            unreachable host, a rejected certificate). `error` is diagnostic and is NOT one of the\n\
+            stats counters, so the log's lines do not reconcile with `ops net stats` totals.\n\
+            \n\
+            The URL query is dropped from the shown path by default (a token can ride in a query);\n\
+            `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\
+            values before an event enters the log. Host-side and read-only — no launch, no nix, no\n\
+            network.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

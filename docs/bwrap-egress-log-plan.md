@@ -118,9 +118,14 @@ log on the egress axis.
    into `ProxyCtx`; emit one event at every decision site through `outcome` (stats+log) and the
    transport/malformed sites through `push_log` (log-only). Query redacted at push. 718 `--bins`
    green + 2 e2e (allowlist, L4 splice); fmt/clippy clean.
-2. **`ops net logs` reader** (`log`/`logs` alias) — dispatch + session discovery (reuse `pending`'s
-   `-a <app>` → pid) + **filters** (`--host`, `--verdict allow|deny|blocked|error`, `-n`) + render +
-   **`--json`** + the query-drop / `--with-query` (needle-redacted) display.
+2. **`ops net logs` reader — DONE.** (`log`/`logs` alias) dispatch + session discovery (reuse
+   `pending`'s `-a <app>` → pid) + **filters** (`--host`, `--verdict allow|deny|blocked|error`, `-n`)
+   + render + **`--json`** (epoch-ms as a number; a per-session `evicted` array) + the query-drop /
+   `--with-query` (needle-redacted) display. The one-shot listing **surfaces ring eviction** (an
+   `(N earlier events evicted)` line / JSON `evicted`) rather than truncating silently — the same
+   no-silent-cap discipline the wire's `dropped=` gives `--follow`. 724 `--bins` + the live e2e
+   (`ops_net_logs_reads_a_running_sessions_live_egress`: a background session's allow+deny read
+   cross-process, teeth on method/path); fmt/clippy clean.
 3. **`--follow`** live tail (poll with a per-session seq cursor, mirror `net_pending_watch`, print
    the `dropped=` gap marker) + help text.
 

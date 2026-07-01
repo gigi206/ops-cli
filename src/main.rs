@@ -2994,10 +2994,12 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
         Some("pending") => net_pending(&args[1..]),
         Some("stats") => net_stats(&args[1..]),
+        // `log` is an accepted alias for `logs` so a typo does not error.
+        Some("logs") | Some("log") => net_logs(&args[1..]),
         Some(other) => {
             eprintln!(
                 "ops: unknown `net` subcommand '{other}' (known: rules, allow, deny, pending, \
-                 stats)"
+                 stats, logs)"
             );
             ExitCode::from(2)
         }
@@ -3880,6 +3882,320 @@ fn render_stats(
             host, c.allow, c.deny, c.blocked
         );
     }
+    o
+}
+
+/// The parsed `ops net logs` display options.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LogView {
+    json: bool,
+    app: Option<String>,
+    host: Option<String>,
+    verdict: Option<sandbox::control::LogVerdict>,
+    limit: Option<usize>,
+    with_query: bool,
+}
+
+/// Parse `ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
+/// [-n <N>] [--with-query] [--json]`. Pure (no I/O), so every reject path is unit-testable — a
+/// missing value, an unknown verdict, a non-numeric count, or an unknown flag is an error.
+fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
+    let mut v = LogView::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_str() {
+            Some("--json") => v.json = true,
+            Some("--with-query") => v.with_query = true,
+            Some("-a") | Some("--app") => {
+                let name = it.next().ok_or("`--app` needs an app name")?;
+                v.app = Some(name.to_string_lossy().into_owned());
+            }
+            Some("--host") => {
+                let h = it.next().ok_or("`--host` needs a hostname")?;
+                v.host = Some(h.to_string_lossy().into_owned());
+            }
+            Some("--verdict") => {
+                let val = it
+                    .next()
+                    .ok_or("`--verdict` needs one of allow|deny|blocked|error")?;
+                let parsed = val
+                    .to_str()
+                    .and_then(sandbox::control::LogVerdict::parse)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid verdict `{}` — expected allow|deny|blocked|error",
+                            val.to_string_lossy()
+                        )
+                    })?;
+                v.verdict = Some(parsed);
+            }
+            Some("-n") => {
+                let val = it.next().ok_or("`-n` needs a count")?;
+                let n: usize = val.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                    format!(
+                        "invalid count `{}` — expected a whole number",
+                        val.to_string_lossy()
+                    )
+                })?;
+                v.limit = Some(n);
+            }
+            _ => {
+                return Err(format!("usage: {}", help::synopsis_of(&["net", "logs"])));
+            }
+        }
+    }
+    Ok(v)
+}
+
+/// Query the live control sockets for each session's recent egress events, scoped to one app's
+/// session(s) when `app` is set, and pair them with their registry context. The read-only gather
+/// step behind `ops net logs` — the log's analogue of [`collect_pending`]. No launch / nix / network.
+fn collect_logs(
+    data_dir: &Path,
+    app: Option<&str>,
+) -> (
+    Vec<sandbox::control::SessionLog>,
+    Vec<(u32, PathBuf, String)>,
+) {
+    let mut sessions = sandbox::control::log_all(data_dir);
+    if let Some(name) = app {
+        let pids = session_pids_for_app(data_dir, name);
+        sessions.retain(|s| pids.contains(&s.pid));
+    }
+    let context = pending_session_context(data_dir);
+    (sessions, context)
+}
+
+/// The events of one session that pass the `--host`/`--verdict` filters, then the `-n` limit (the
+/// most recent N, since the ring is oldest-first). Borrowed, so the render/JSON share one filter.
+fn filtered_log_events<'a>(
+    events: &'a [sandbox::control::LogEvent],
+    view: &LogView,
+) -> Vec<&'a sandbox::control::LogEvent> {
+    let mut out: Vec<&sandbox::control::LogEvent> = events
+        .iter()
+        .filter(|e| view.host.as_deref().is_none_or(|h| e.host == h))
+        .filter(|e| view.verdict.is_none_or(|v| e.verdict == v))
+        .collect();
+    if let Some(n) = view.limit {
+        if out.len() > n {
+            out = out.split_off(out.len() - n);
+        }
+    }
+    out
+}
+
+/// The path as displayed: the query string is dropped by default (a token can ride in a query, and
+/// the terminal scrollback is itself "at rest"), kept only under `--with-query` — where it is
+/// already secret-redacted, since the proxy masks configured needles before the event enters the ring.
+fn display_log_path(path: &str, with_query: bool) -> &str {
+    if with_query {
+        path
+    } else {
+        path.split('?').next().unwrap_or(path)
+    }
+}
+
+/// A compact relative age ("12s", "3m4s", "1h2m") from an event's epoch-ms stamp to now — the live
+/// view wants "how long ago", not a wall-clock. Saturating, so a clock skew never underflows.
+fn format_log_age(now_ms: u128, at_ms: u128) -> String {
+    let secs = now_ms.saturating_sub(at_ms) / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// How many of a session's oldest events fell off the ring before the retained window. Sequence
+/// numbers start at 1 and the window is contiguous, so the oldest retained event's `seq - 1` is the
+/// evicted count — surfaced (not silently truncated) even for the one-shot listing, distinct from any
+/// `-n`/`--host`/`--verdict` the user applied. Computed from the **unfiltered** snapshot.
+fn snapshot_evicted(snapshot: &sandbox::control::LogSnapshot) -> u64 {
+    snapshot.events.first().map(|e| e.seq - 1).unwrap_or(0)
+}
+
+/// `ops net logs [-a|--app <name>] [--host <h>] [--verdict …] [-n <N>] [--with-query] [--json]`:
+/// the live egress event log — a chronological, per-session record of every egress decision the
+/// proxy made, read from the same control sockets `ops net pending` uses. Live-only: it shows a
+/// running session's egress, and nothing remains once the session exits. No launch / nix / network.
+fn net_logs(args: &[OsString]) -> ExitCode {
+    let view = match parse_log_args(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ops: net logs: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (sessions, context) = collect_logs(&data_dir, view.app.as_deref());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    if view.json {
+        let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
+        let rows: Vec<_> = sessions
+            .iter()
+            .flat_map(|s| {
+                let ctx = ctx_of(s.pid);
+                let project = ctx.map(|(_, p, _)| p.display().to_string());
+                let label = ctx.map(|(_, _, l)| l.clone());
+                filtered_log_events(&s.snapshot.events, &view)
+                    .into_iter()
+                    .map(move |e| {
+                        serde_json::json!({
+                            "pid": s.pid,
+                            "project": project,
+                            "label": label,
+                            // Epoch-ms fits u64, so consumers get a real number, not a string.
+                            "at_epoch_ms": e.at_epoch_ms as u64,
+                            "host": e.host,
+                            "port": e.port,
+                            "method": e.method,
+                            "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
+                            "verdict": e.verdict.as_str(),
+                            "reason": e.reason,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Per-session ring-eviction counts (only where >0) — the overflow surfaced, not silent.
+        let evicted: Vec<_> = sessions
+            .iter()
+            .filter_map(|s| {
+                let n = snapshot_evicted(&s.snapshot);
+                (n > 0).then(|| serde_json::json!({ "pid": s.pid, "count": n }))
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "logs": rows, "evicted": evicted })
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_logs(&sessions, &context, now_ms, &view, &pal));
+    ExitCode::SUCCESS
+}
+
+/// The ANSI span for a verdict: green for `allow`, red for a refusal (`deny`/`blocked`), yellow for
+/// `error` (allowed but failed) — so a scan of the log reads at a glance.
+fn verdict_color(verdict: sandbox::control::LogVerdict, pal: &style::Palette) -> &str {
+    use sandbox::control::LogVerdict::*;
+    match verdict {
+        Allow => pal.ok,
+        Deny | Blocked => pal.err,
+        Error => pal.warn,
+    }
+}
+
+/// Render the live egress log — a pure presenter (its colored layout is asserted in a test): a
+/// header, then per session a context line and one line per event
+/// (`age · host:port · method path · verdict · reason`), oldest first. The `reason` is dropped for a
+/// plain `allow` (it would just repeat "allowed"). An empty result explains the log is live-only.
+fn render_logs(
+    sessions: &[sandbox::control::SessionLog],
+    context: &[(u32, PathBuf, String)],
+    now_ms: u128,
+    view: &LogView,
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    let total: usize = sessions
+        .iter()
+        .map(|s| filtered_log_events(&s.snapshot.events, view).len())
+        .sum();
+    if total == 0 {
+        let scope = view
+            .app
+            .as_deref()
+            .map(|a| format!(" for app `{a}`"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            o,
+            "{h}egress log:{r} {dim}(nothing to show{scope} — the log is live while a filtering \
+             posture (allowlist/ask) runs, and is not kept after a session exits){r}"
+        );
+        return o;
+    }
+    let _ = writeln!(o, "{h}egress log:{r}");
+    for session in sessions {
+        let events = filtered_log_events(&session.snapshot.events, view);
+        if events.is_empty() {
+            continue;
+        }
+        match context.iter().find(|(pid, _, _)| *pid == session.pid) {
+            Some((_, project, label)) => {
+                let _ = writeln!(
+                    o,
+                    "  {dim}session {} [{}] {}{r}",
+                    session.pid,
+                    label,
+                    project.display()
+                );
+            }
+            None => {
+                let _ = writeln!(o, "  {dim}session {} (unregistered){r}", session.pid);
+            }
+        }
+        // The ring is bounded; if it evicted older events, say so rather than truncate silently.
+        let evicted = snapshot_evicted(&session.snapshot);
+        if evicted > 0 {
+            let _ = writeln!(
+                o,
+                "    {dim}({evicted} earlier event(s) evicted from the ring){r}"
+            );
+        }
+        for e in events {
+            let hostport = if e.host.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{}:{}", e.host, e.port)
+            };
+            let age = format_log_age(now_ms, e.at_epoch_ms);
+            let method = e
+                .method
+                .as_deref()
+                .map(|m| format!("{m} "))
+                .unwrap_or_default();
+            let path = e
+                .path
+                .as_deref()
+                .map(|p| display_log_path(p, view.with_query))
+                .unwrap_or("");
+            let vc = verdict_color(e.verdict, pal);
+            // `allowed` on an allow line just repeats the verdict — show the reason only when it adds
+            // something (every refusal / error category).
+            let reason = if e.verdict == sandbox::control::LogVerdict::Allow {
+                String::new()
+            } else {
+                format!("  {dim}({}){r}", e.reason)
+            };
+            let _ = writeln!(
+                o,
+                "    {dim}{age:>5}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}",
+                e.verdict.as_str()
+            );
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  {dim}live view — this session's egress; nothing is kept after it exits{r}"
+    );
     o
 }
 
@@ -6228,6 +6544,289 @@ mod tests {
         // An unknown flag (e.g. the contradictory `--json`) is refused with a usage hint.
         assert!(parse_watch_args(&osv(&["--json"])).is_err());
         assert!(parse_watch_args(&osv(&["bogus"])).is_err());
+    }
+
+    // ── ops net logs ───────────────────────────────────────────────────────────────────────────
+
+    fn log_event(
+        seq: u64,
+        host: &str,
+        method: Option<&str>,
+        path: Option<&str>,
+        verdict: sandbox::control::LogVerdict,
+        reason: &str,
+    ) -> sandbox::control::LogEvent {
+        sandbox::control::LogEvent {
+            seq,
+            at_epoch_ms: 1_000_000,
+            host: host.into(),
+            port: 443,
+            method: method.map(str::to_string),
+            path: path.map(str::to_string),
+            verdict,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn parse_log_args_reads_every_flag_and_rejects_bad_input() {
+        use sandbox::control::LogVerdict;
+        let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+
+        let v = parse_log_args(&osv(&[
+            "--app",
+            "claude-code",
+            "--host",
+            "api.test",
+            "--verdict",
+            "error",
+            "-n",
+            "5",
+            "--with-query",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(v.app.as_deref(), Some("claude-code"));
+        assert_eq!(v.host.as_deref(), Some("api.test"));
+        assert_eq!(v.verdict, Some(LogVerdict::Error));
+        assert_eq!(v.limit, Some(5));
+        assert!(v.with_query && v.json);
+
+        // Every verdict token parses through the flag (in particular `error`, the log-only one).
+        for (tok, want) in [
+            ("allow", LogVerdict::Allow),
+            ("deny", LogVerdict::Deny),
+            ("blocked", LogVerdict::Blocked),
+            ("error", LogVerdict::Error),
+        ] {
+            assert_eq!(
+                parse_log_args(&osv(&["--verdict", tok])).unwrap().verdict,
+                Some(want)
+            );
+        }
+
+        // Rejects: an unknown verdict (naming it), a non-numeric count, a missing value, a bad flag.
+        assert!(parse_log_args(&osv(&["--verdict", "nope"]))
+            .unwrap_err()
+            .contains("nope"));
+        assert!(parse_log_args(&osv(&["-n", "lots"]))
+            .unwrap_err()
+            .contains("lots"));
+        assert!(parse_log_args(&osv(&["--host"])).is_err());
+        assert!(parse_log_args(&osv(&["--verdict"])).is_err());
+        assert!(parse_log_args(&osv(&["-n"])).is_err());
+        assert!(parse_log_args(&osv(&["--nonsense"])).is_err());
+    }
+
+    #[test]
+    fn filtered_log_events_applies_host_verdict_and_limit() {
+        use sandbox::control::LogVerdict::*;
+        let events = vec![
+            log_event(1, "a.test", Some("GET"), Some("/1"), Allow, "allowed"),
+            log_event(2, "b.test", Some("GET"), Some("/2"), Deny, "denied-default"),
+            log_event(
+                3,
+                "a.test",
+                Some("POST"),
+                Some("/3"),
+                Blocked,
+                "ssrf-blocked",
+            ),
+            log_event(4, "a.test", Some("GET"), Some("/4"), Error, "dns-failure"),
+        ];
+        let view = |host: Option<&str>, verdict, limit| LogView {
+            host: host.map(str::to_string),
+            verdict,
+            limit,
+            ..LogView::default()
+        };
+
+        // Host filter keeps only exact matches.
+        let by_host = filtered_log_events(&events, &view(Some("a.test"), None, None));
+        assert_eq!(by_host.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 3, 4]);
+        // Verdict filter, including the log-only `error`.
+        let errs = filtered_log_events(&events, &view(None, Some(Error), None));
+        assert_eq!(errs.iter().map(|e| e.seq).collect::<Vec<_>>(), [4]);
+        // `-n` keeps the most recent N (the ring is oldest-first).
+        let last2 = filtered_log_events(&events, &view(None, None, Some(2)));
+        assert_eq!(last2.iter().map(|e| e.seq).collect::<Vec<_>>(), [3, 4]);
+        // Filters compose: host a.test, then the last 1.
+        let combo = filtered_log_events(&events, &view(Some("a.test"), None, Some(1)));
+        assert_eq!(combo.iter().map(|e| e.seq).collect::<Vec<_>>(), [4]);
+    }
+
+    #[test]
+    fn display_log_path_drops_the_query_unless_asked() {
+        assert_eq!(display_log_path("/v1/x?token=abc", false), "/v1/x");
+        assert_eq!(display_log_path("/v1/x?token=abc", true), "/v1/x?token=abc");
+        assert_eq!(display_log_path("/v1/x", false), "/v1/x");
+    }
+
+    #[test]
+    fn format_log_age_is_compact_and_saturating() {
+        let now = 10_000_000u128;
+        assert_eq!(format_log_age(now, now), "0s");
+        assert_eq!(format_log_age(now, now - 12_000), "12s");
+        assert_eq!(format_log_age(now, now - 125_000), "2m5s");
+        assert_eq!(format_log_age(now, now - 3_725_000), "1h2m");
+        // A future stamp (clock skew) saturates to 0, never underflows.
+        assert_eq!(format_log_age(now, now + 5_000), "0s");
+    }
+
+    #[test]
+    fn render_logs_groups_events_by_session_with_verdict_and_reason() {
+        use sandbox::control::{LogVerdict::*, SessionLog};
+        let p = style::Palette::plain();
+        let now = 1_012_000u128; // 12s after the events' 1_000_000 stamp
+
+        // Empty → a live-only note; under `--app`, it names the app.
+        assert!(render_logs(&[], &[], now, &LogView::default(), &p).contains("nothing to show"));
+        let scoped = render_logs(
+            &[],
+            &[],
+            now,
+            &LogView {
+                app: Some("claude-code".into()),
+                ..LogView::default()
+            },
+            &p,
+        );
+        assert!(scoped.contains("for app `claude-code`"), "{scoped}");
+
+        let sessions = [SessionLog {
+            pid: 4242,
+            snapshot: sandbox::control::LogSnapshot {
+                events: vec![
+                    log_event(
+                        1,
+                        "api.test",
+                        Some("POST"),
+                        Some("/v1/m?k=sec"),
+                        Allow,
+                        "allowed",
+                    ),
+                    log_event(
+                        2,
+                        "evil.test",
+                        Some("GET"),
+                        Some("/x"),
+                        Deny,
+                        "denied-default",
+                    ),
+                    log_event(
+                        3,
+                        "api.test",
+                        Some("GET"),
+                        Some("/dl"),
+                        Error,
+                        "dns-failure",
+                    ),
+                ],
+                dropped: 0,
+                head: 3,
+            },
+        }];
+        let context = vec![(
+            4242u32,
+            std::path::PathBuf::from("/home/u/proj"),
+            "app:claude-code".to_string(),
+        )];
+
+        let out = render_logs(&sessions, &context, now, &LogView::default(), &p);
+        // The session header from the registry context.
+        assert!(
+            out.contains("session 4242 [app:claude-code] /home/u/proj"),
+            "{out}"
+        );
+        // An allow line: age, host:port, method+path (query DROPPED by default), the verdict, and NO
+        // redundant `(allowed)` reason.
+        assert!(
+            out.contains("api.test:443") && out.contains("POST /v1/m"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("k=sec"),
+            "the query must be dropped by default: {out}"
+        );
+        assert!(
+            !out.contains("(allowed)"),
+            "an allow line omits the redundant reason: {out}"
+        );
+        // A deny line shows the reason category.
+        assert!(
+            out.contains("evil.test:443") && out.contains("(denied-default)"),
+            "{out}"
+        );
+        // An error line (allowed-but-failed) shows its reason too.
+        assert!(out.contains("(dns-failure)"), "{out}");
+        // The age is relative ("12s" here).
+        assert!(out.contains("12s"), "{out}");
+        // The live-only footer.
+        assert!(out.contains("nothing is kept after it exits"), "{out}");
+
+        // `--with-query` keeps the (already-redacted) query.
+        let wq = render_logs(
+            &sessions,
+            &context,
+            now,
+            &LogView {
+                with_query: true,
+                ..LogView::default()
+            },
+            &p,
+        );
+        assert!(
+            wq.contains("/v1/m?k=sec"),
+            "--with-query keeps the query: {wq}"
+        );
+    }
+
+    #[test]
+    fn render_logs_surfaces_ring_eviction_rather_than_truncating_silently() {
+        use sandbox::control::{LogVerdict::*, SessionLog};
+        let p = style::Palette::plain();
+        let now = 1_012_000u128;
+
+        // A session whose ring already evicted its oldest events: the retained window starts at
+        // seq 4001, so 4000 older events fell off. `snapshot_evicted` reports the gap…
+        let snapshot = sandbox::control::LogSnapshot {
+            events: vec![
+                log_event(4001, "api.test", Some("GET"), Some("/a"), Allow, "allowed"),
+                log_event(
+                    4002,
+                    "api.test",
+                    Some("GET"),
+                    Some("/b"),
+                    Deny,
+                    "denied-default",
+                ),
+            ],
+            dropped: 0,
+            head: 4002,
+        };
+        assert_eq!(snapshot_evicted(&snapshot), 4000);
+        // …a fresh ring (seqs from 1) reports none.
+        let fresh = sandbox::control::LogSnapshot {
+            events: vec![log_event(
+                1,
+                "api.test",
+                Some("GET"),
+                Some("/a"),
+                Allow,
+                "allowed",
+            )],
+            dropped: 0,
+            head: 1,
+        };
+        assert_eq!(snapshot_evicted(&fresh), 0);
+
+        // The render says so, rather than silently showing the last 1000 as if they were all.
+        let sessions = [SessionLog { pid: 7, snapshot }];
+        let out = render_logs(&sessions, &[], now, &LogView::default(), &p);
+        assert!(
+            out.contains("4000 earlier event(s) evicted from the ring"),
+            "the ring overflow must be surfaced, not truncated silently:\n{out}"
+        );
     }
 
     #[test]

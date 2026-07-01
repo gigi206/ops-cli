@@ -729,12 +729,9 @@ fn parse_pending_line(line: &str) -> Option<PendingRow> {
     })
 }
 
-// The client half of the event log — the reader the `ops net logs` command connects through. The
-// server side (the `LOG` dispatch + the ring) is live now; the command that drives these is wired in
-// a following step, so they are `dead_code`-tolerated until then (the round-trip test exercises them).
+// The client half of the event log — the reader the `ops net logs` command connects through.
 
 /// One reachable session's recent egress events, for `ops net logs`.
-#[allow(dead_code)]
 pub(crate) struct SessionLog {
     pub(crate) pid: u32,
     pub(crate) snapshot: LogSnapshot,
@@ -743,7 +740,6 @@ pub(crate) struct SessionLog {
 /// Query one session's control socket for its recent egress events (`LOG`, or `LOG after=<seq>` for a
 /// follow read past a cursor). A session whose socket is gone (a dead/stale launch) fails the connect
 /// and the caller skips it.
-#[allow(dead_code)]
 pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnapshot> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -781,7 +777,6 @@ pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnaps
 /// filename's pid, and query it (with an optional per-nothing tail read — a shared cursor makes no
 /// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped.
 /// Sessions are returned ordered by pid for stable output.
-#[allow(dead_code)]
 pub(crate) fn log_all(data_dir: &Path) -> Vec<SessionLog> {
     let mut sessions = Vec::new();
     for pid in session_pids(data_dir) {
@@ -795,7 +790,6 @@ pub(crate) fn log_all(data_dir: &Path) -> Vec<SessionLog> {
 /// Parse one `event seq=… at=… port=… verdict=… reason=… [method=…] host=… [path=…]` line into an
 /// event, or `None` if it is malformed. Each token is split on its first `=`, so a `path` carrying a
 /// query string's `=` round-trips (it is the last field).
-#[allow(dead_code)]
 fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut seq = None;
     let mut at = None;
