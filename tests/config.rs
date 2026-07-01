@@ -789,7 +789,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!("skipping package PATH test: host cannot sandbox");
+        eprintln!("skipping package PATH test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
     fx.write_project("[packages]\nhello = \"nix:hello\"\n");
@@ -834,7 +834,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!("skipping unrealisable-package test: host cannot sandbox");
+        eprintln!("skipping unrealisable-package test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
     // a well-formed attribute (so it passes validation and reaches nix) that no real
@@ -1028,7 +1028,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!("skipping cross-channel pin test: host cannot sandbox");
+        eprintln!("skipping cross-channel pin test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 

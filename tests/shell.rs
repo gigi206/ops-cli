@@ -83,7 +83,7 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping ops shell smoke: host cannot sandbox");
+        eprintln!("skipping ops shell smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 

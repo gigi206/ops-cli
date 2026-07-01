@@ -1060,7 +1060,7 @@ fn scheme_of(s: &str) -> Option<(usize, u16)> {
 }
 
 /// Split an optional `:port-spec` suffix off a host-level entry, returning the host and its
-/// port set. A bare entry (`github.com`) gets the default web ports {80, 443}; `:*` admits
+/// port set. A bare entry (`github.com`) gets the default HTTPS port {443}; `:*` admits
 /// any port; a comma list of single ports and/or `lo-hi` ranges (`:80,443,8000-8100`) pins
 /// exactly those. An IPv6 literal carrying a port is **bracketed** (`[::1]:443`,
 /// `[2001:db8::1]:*`) so its own colons do not confuse the split; bare, it needs no brackets
@@ -1279,7 +1279,7 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
 /// Parse a `host[:ports]/path` entry into a `Url` rule. The part before the first `/` is the
 /// authority, parsed for its host and port set exactly like a host-level entry — so a path rule
 /// supports the same `:port`, comma-list, `lo-hi` range, and `:*` qualifiers (a bare host
-/// defaulting to the web ports {80, 443}). The rest, including the leading `/`, is the path. The
+/// defaulting to the HTTPS port {443}). The rest, including the leading `/`, is the path. The
 /// host must be concrete — an exact hostname or IP literal (bracketed for IPv6); a `*.domain`
 /// wildcard with a path is rejected (use `re:`). A trailing `/*` marks a subtree rule (the path
 /// and everything under it); without it the path matches exactly.
@@ -1355,7 +1355,7 @@ mod tests {
             rule("*.nixos.org").kind,
             RuleKind::Subdomain("nixos.org".into(), Ports::default())
         );
-        // a `/` makes it a path rule; a bare host defaults to the web ports {80, 443}
+        // a `/` makes it a path rule; a bare host defaults to the HTTPS port {443}
         assert_eq!(
             rule("example.com/exact/path").kind,
             RuleKind::Url {
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn a_path_rule_carries_the_same_port_syntax_as_a_host() {
-        // a bare `host/` is the root path on the default web ports {80, 443}
+        // a bare `host/` is the root path on the default HTTPS port {443}
         assert_eq!(
             rule("example.com/").kind,
             RuleKind::Url {
@@ -1701,7 +1701,7 @@ mod tests {
         assert!(a.permits("2001:db8::1", 8080, "/"));
         assert!(!a.permits("2001:db8::1", 443, "/"), "443 not in the set");
         assert!(!a.permits("2001:db8::2", 8080, "/"), "a different address");
-        // bare IPv6 opens the web ports only
+        // bare IPv6 opens the HTTPS port only
         let b = allow(&["::1"]);
         assert!(b.permits("::1", 443, "/"));
         assert!(!b.permits("::1", 8080, "/"));

@@ -117,7 +117,7 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
         .expect("spawn ops run")
         .success();
     if !can_sandbox {
-        eprintln!("skipping doctor launch-proof: host cannot sandbox");
+        eprintln!("skipping doctor launch-proof: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
@@ -155,7 +155,7 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         .expect("spawn ops run")
         .success();
     if !can_sandbox {
-        eprintln!("skipping bubblewrap-fault attribution: host cannot sandbox");
+        eprintln!("skipping bubblewrap-fault attribution: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 

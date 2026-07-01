@@ -308,7 +308,7 @@ fn stop_tears_down_a_supervised_app_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping ops stop supervised e2e: host cannot sandbox");
+        eprintln!("skipping ops stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
@@ -415,7 +415,7 @@ fn stop_all_stops_every_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping ops stop --all e2e: host cannot sandbox");
+        eprintln!("skipping ops stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
     let trusted = ops_run(
