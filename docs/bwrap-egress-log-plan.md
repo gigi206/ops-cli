@@ -68,8 +68,8 @@ singular **`ops net log` is accepted as an alias** (the dispatch matches `"logs"
 typo does not error.
 
 ```
-ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked]
-             [-n <N>] [--with-query] [--follow] [--json]
+ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
+             [-n <N>] [--with-query] [--with-status] [--follow] [-i <secs>] [--json]
 ```
 
 - default: recent events (newest-last), one line each, query dropped.
@@ -102,12 +102,18 @@ ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked]
 - timestamp: an epoch-ms stamp on each event (clean for `--json`); the human view renders a relative
   age ("12s ago").
 
-**Boundary — egress decision, not application response (settled 2026-07-01):** the log records
-whether a request was *allowed to leave* and ops's own errors. A **real upstream 4xx/5xx** (a 404/500
-from the allowed server) is **not** logged as a status — it is the application's answer to a
-successfully-delivered request, relayed verbatim and already visible to the agent. Capturing it would
-mean the proxy parsing every response's status line (L7-only, hot path); the user chose to keep the
-log on the egress axis.
+**Upstream status — opt-in via `--with-status` (revised 2026-07-01):** the log's *default* stays on
+the egress axis (whether a request was *allowed to leave*, plus ops's own errors). The **real upstream
+status** (a 200/404/5xx from the allowed server) is the application's answer to a successfully-delivered
+request — a *different* axis — so it is **captured but shown only under `--with-status`**. The proxy
+peeks the response's first line on the **L7** path (the response already streams through it; the bytes
+are chained back untouched, so redaction and framing are unaffected), and amends the already-pushed
+`allow` event by seq. An **L4 (`tcp://`) splice**, a refusal, or an `error` has no HTTP response, so it
+shows `-`/null. Capture is always-on (a few bytes per L7 response) so the flag works retroactively on a
+running session; `--with-status` gates display in both the human and JSON views (parity with
+`--with-query`). Because the event is pushed at the decision point and the status amended when the
+response returns, a `--follow` poll landing in that sub-millisecond window shows no status and is not
+updated retroactively — the one-shot listing always has it.
 
 ## Increment sketch (each: tests + advisor + user validation)
 
@@ -136,13 +142,22 @@ log on the egress axis.
    (`ops_net_logs_follow_streams_a_running_sessions_egress`: a background session's allow+deny read
    off the NDJSON stream by a reader thread). 725 `--bins` + 2 live e2e; fmt/clippy clean.
 
+4. **`--with-status` — DONE.** Capture the upstream HTTP status on the L7 path (best-effort peek of
+   the response's first line, chained back untouched so redaction/framing are unaffected) and amend
+   the pushed `allow` event by seq (`LogRing::set_status`). Always-on capture (so the flag works
+   retroactively); `--with-status` gates display in both the human (`-` when none) and JSON (`status`
+   number/null) views. L4 splices / refusals / errors carry no status. Tested: the pure parser
+   (`parse_status_code`/`read_status_prefix`), a proxy unit test with a controlled loopback upstream
+   (identical `allow`s, 200 vs 404 captured — teeth on the real response), the reader render/JSON
+   gating, and a live e2e proving `status=200` flows proxy→ring→`--with-status --json`.
+
 **The `ops net logs` feature is complete** — the live, zero-disk egress log with filters, JSON, the
-eviction/overflow surfacing, and `--follow`.
+eviction/overflow surfacing, `--follow`, and the opt-in upstream `--with-status`.
 
 ## Non-goals
 
 - Not a top-level `ops logs` (no lifecycle/provisioning log aggregation).
 - Not persisted. No post-session history. Not a raw-URL dump (query dropped by default).
-- **Not upstream response-status monitoring** — a real upstream 4xx/5xx is relayed verbatim and
-  agent-visible; the log stays on the egress-decision axis.
+- Not upstream **response-body** capture — only the status line is peeked (under `--with-status`);
+  the body is streamed through untouched. The default view stays on the egress-decision axis.
 - Never a bypass of the no-plaintext-secret invariant.

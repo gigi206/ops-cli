@@ -3894,6 +3894,9 @@ struct LogView {
     verdict: Option<sandbox::control::LogVerdict>,
     limit: Option<usize>,
     with_query: bool,
+    /// `--with-status`: show the captured upstream HTTP status (200/404/…) — for completed L7
+    /// requests only; blank/absent for an L4 splice, a refusal, or an error.
+    with_status: bool,
     /// `--follow`: after the initial listing, keep polling and append new events (a `tail -f`).
     follow: bool,
     /// The `--follow` poll interval in seconds (`-i`), default 1. Ignored without `--follow`.
@@ -3901,9 +3904,9 @@ struct LogView {
 }
 
 /// Parse `ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
-/// [-n <N>] [--with-query] [--follow] [-i|--interval <secs>] [--json]`. Pure (no I/O), so every
-/// reject path is unit-testable — a missing value, an unknown verdict, a non-numeric count or
-/// interval, a zero interval, or an unknown flag is an error.
+/// [-n <N>] [--with-query] [--with-status] [--follow] [-i|--interval <secs>] [--json]`. Pure (no
+/// I/O), so every reject path is unit-testable — a missing value, an unknown verdict, a non-numeric
+/// count or interval, a zero interval, or an unknown flag is an error.
 fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
     let mut v = LogView {
         interval_secs: 1,
@@ -3914,6 +3917,7 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
         match a.to_str() {
             Some("--json") => v.json = true,
             Some("--with-query") => v.with_query = true,
+            Some("--with-status") => v.with_status = true,
             Some("--follow") | Some("-f") => v.follow = true,
             Some("-i") | Some("--interval") => {
                 let val = it.next().ok_or("`--interval` needs a value in seconds")?;
@@ -4301,6 +4305,16 @@ fn verdict_color(verdict: sandbox::control::LogVerdict, pal: &style::Palette) ->
     }
 }
 
+/// The ANSI span for an upstream HTTP status class: green for 2xx, red for 4xx/5xx, yellow for the
+/// rest (1xx/3xx) — so a failing response stands out under `--with-status`.
+fn status_color(code: u16, pal: &style::Palette) -> &str {
+    match code {
+        200..=299 => pal.ok,
+        400..=599 => pal.err,
+        _ => pal.warn,
+    }
+}
+
 /// Render the live egress log — a pure presenter (its colored layout is asserted in a test): a
 /// header, then per session a context line and one line per event
 /// (`age · host:port · method path · verdict · reason`), oldest first. The `reason` is dropped for a
@@ -4409,14 +4423,27 @@ fn render_log_line(
     } else {
         format!("  {dim}({}){r}", e.reason)
     };
+    // The upstream status, only under `--with-status`: the code (colored by class) for a completed
+    // L7 request, or `-` where none was captured (an L4 splice, a refusal, or a not-yet-returned
+    // response) so the column is legible rather than mysteriously blank.
+    let status = if view.with_status {
+        match e.status {
+            Some(code) => format!("  {}{code}{r}", status_color(code, pal)),
+            None => format!("  {dim}-{r}"),
+        }
+    } else {
+        String::new()
+    };
     format!(
-        "    {dim}{age:>5}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}",
+        "    {dim}{age:>5}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{status}",
         e.verdict.as_str()
     )
 }
 
 /// One event as a JSON object (for `--json` and the `--follow` NDJSON stream). Epoch-ms is a number
-/// (it fits u64); the path honors `--with-query`. Shared so the two JSON paths cannot diverge.
+/// (it fits u64); the path honors `--with-query`. The `status` field is included only under
+/// `--with-status` (a number for a completed L7 request, else null) — parity with `--with-query`.
+/// Shared so the two JSON paths cannot diverge.
 fn log_event_json(
     e: &sandbox::control::LogEvent,
     pid: u32,
@@ -4424,7 +4451,7 @@ fn log_event_json(
     label: Option<&str>,
     view: &LogView,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "pid": pid,
         "project": project,
         "label": label,
@@ -4435,7 +4462,14 @@ fn log_event_json(
         "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
         "verdict": e.verdict.as_str(),
         "reason": e.reason,
-    })
+    });
+    if view.with_status {
+        obj["status"] = e
+            .status
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+    }
+    obj
 }
 
 /// `ops net rules [--source config|builtin] [--filter <substr>] [--json]`: list the effective
@@ -6804,6 +6838,7 @@ mod tests {
             path: path.map(str::to_string),
             verdict,
             reason: reason.into(),
+            status: None,
         }
     }
 
@@ -6831,6 +6866,13 @@ mod tests {
         assert_eq!(v.limit, Some(5));
         assert!(v.with_query && v.json);
         assert!(!v.follow, "follow is off unless asked");
+        assert!(!v.with_status, "status is off unless asked");
+        assert!(
+            parse_log_args(&osv(&["--with-status"]))
+                .unwrap()
+                .with_status,
+            "--with-status turns the status column on"
+        );
 
         // `--follow`/`-f` with an explicit interval; the default interval is 1s.
         let f = parse_log_args(&osv(&["--follow", "--interval", "3"])).unwrap();
@@ -6912,6 +6954,49 @@ mod tests {
         assert_eq!(display_log_path("/v1/x?token=abc", false), "/v1/x");
         assert_eq!(display_log_path("/v1/x?token=abc", true), "/v1/x?token=abc");
         assert_eq!(display_log_path("/v1/x", false), "/v1/x");
+    }
+
+    #[test]
+    fn status_shows_only_under_with_status_in_both_render_and_json() {
+        use sandbox::control::LogVerdict::*;
+        let p = style::Palette::plain();
+        let now = 1_000_000u128;
+
+        // A completed L7 allow carrying a 200, and an L4/error event carrying none.
+        let mut ok = log_event(1, "api.test", Some("GET"), Some("/p"), Allow, "allowed");
+        ok.status = Some(200);
+        let raw = log_event(2, "db.test", None, None, Allow, "allowed"); // status stays None
+
+        let on = LogView {
+            with_status: true,
+            ..LogView::default()
+        };
+        let off = LogView::default();
+
+        // Human render: the code appears only under `--with-status`; a status-less event shows `-`.
+        assert!(!render_log_line(&ok, now, &off, &p).contains("200"));
+        let line = render_log_line(&ok, now, &on, &p);
+        assert!(
+            line.contains("200"),
+            "the code shows under --with-status: {line}"
+        );
+        let bare = render_log_line(&raw, now, &on, &p);
+        assert!(
+            bare.trim_end().ends_with('-'),
+            "a status-less event shows `-` under --with-status: {bare}"
+        );
+
+        // JSON: the `status` key is present only under `--with-status` (a number, or null).
+        let j_off = log_event_json(&ok, 7, None, None, &off);
+        assert!(j_off.get("status").is_none(), "no status key by default");
+        let j_on = log_event_json(&ok, 7, None, None, &on);
+        assert_eq!(j_on["status"], serde_json::json!(200));
+        let j_raw = log_event_json(&raw, 7, None, None, &on);
+        assert_eq!(
+            j_raw["status"],
+            serde_json::Value::Null,
+            "null when none captured"
+        );
     }
 
     #[test]

@@ -343,6 +343,11 @@ pub(crate) struct LogEvent {
     pub(crate) path: Option<String>,
     pub(crate) verdict: LogVerdict,
     pub(crate) reason: String,
+    /// The upstream HTTP status code (200/404/…), for a **completed L7** request only — filled in by
+    /// [`LogRing::set_status`] once the response head returns, after the event was pushed at the
+    /// decision point. `None` for an L4 (`tcp://`) splice (no HTTP response to parse), a refusal, an
+    /// `error` (no response), or a request whose response has not yet arrived.
+    pub(crate) status: Option<u16>,
 }
 
 /// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
@@ -382,7 +387,9 @@ impl LogRing {
     }
 
     /// Append one decision, assigning it the next sequence number and evicting the oldest if the ring
-    /// is full. Called from the proxy with the path already query-redacted.
+    /// is full. Called from the proxy with the path already query-redacted. Returns the assigned
+    /// sequence number, so a later [`set_status`](LogRing::set_status) can amend this same event once
+    /// its upstream response returns.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &self,
@@ -392,7 +399,7 @@ impl LogRing {
         path: Option<&str>,
         verdict: LogVerdict,
         reason: &str,
-    ) {
+    ) -> u64 {
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -409,9 +416,23 @@ impl LogRing {
             path: path.map(str::to_string),
             verdict,
             reason: reason.to_string(),
+            status: None,
         });
         while g.events.len() > self.cap {
             g.events.pop_front();
+        }
+        seq
+    }
+
+    /// Amend an already-pushed event with the upstream HTTP status code its response returned. A no-op
+    /// if the event has already been evicted from the ring (a very bursty session between the push and
+    /// the response), so a late status never resurrects an evicted event. Events are appended in
+    /// sequence order, so a reverse scan finds the target quickly (the amend usually lands on the
+    /// newest events).
+    pub(crate) fn set_status(&self, seq: u64, status: u16) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+            ev.status = Some(status);
         }
     }
 
@@ -597,6 +618,9 @@ fn format_event_line(ev: &LogEvent) -> String {
         ev.verdict.as_str(),
         ev.reason,
     );
+    if let Some(status) = ev.status {
+        line.push_str(&format!(" status={status}"));
+    }
     if let Some(method) = &ev.method {
         line.push_str(&format!(" method={method}"));
     }
@@ -799,6 +823,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut method = None;
     let mut host = None;
     let mut path = None;
+    let mut status = None;
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "event" {
         return None;
@@ -814,6 +839,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
             "method" => method = Some(value.to_string()),
             "host" => host = Some(value.to_string()),
             "path" => path = Some(value.to_string()),
+            "status" => status = value.parse().ok(),
             _ => {}
         }
     }
@@ -826,6 +852,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         path,
         verdict: verdict?,
         reason: reason?,
+        status,
     })
 }
 
@@ -1514,6 +1541,68 @@ mod tests {
     }
 
     #[test]
+    fn set_status_amends_a_live_event_and_is_a_noop_once_evicted() {
+        let ring = LogRing::new(2);
+        let s1 = ring.push(
+            "a.test",
+            443,
+            Some("GET"),
+            Some("/1"),
+            LogVerdict::Allow,
+            "allowed",
+        );
+        let s2 = ring.push(
+            "b.test",
+            443,
+            Some("GET"),
+            Some("/2"),
+            LogVerdict::Allow,
+            "allowed",
+        );
+        // A status amends the matching still-resident event, and only it.
+        ring.set_status(s2, 404);
+        let snap = ring.snapshot(None);
+        assert_eq!(
+            snap.events[0].status, None,
+            "the untouched event keeps None"
+        );
+        assert_eq!(
+            snap.events[1].status,
+            Some(404),
+            "the amended event carries its code"
+        );
+
+        // Evict s1 and s2 (push two more, cap is 2), then a late status for s1 is a silent no-op —
+        // an evicted event is never resurrected.
+        ring.push(
+            "c.test",
+            443,
+            Some("GET"),
+            Some("/3"),
+            LogVerdict::Allow,
+            "allowed",
+        );
+        ring.push(
+            "d.test",
+            443,
+            Some("GET"),
+            Some("/4"),
+            LogVerdict::Allow,
+            "allowed",
+        );
+        ring.set_status(s1, 500);
+        let after = ring.snapshot(None);
+        assert!(
+            after.events.iter().all(|e| e.seq != s1),
+            "s1 is gone from the ring"
+        );
+        assert!(
+            after.events.iter().all(|e| e.status.is_none()),
+            "a late status for an evicted event resurrects nothing"
+        );
+    }
+
+    #[test]
     fn event_line_round_trips_through_the_wire() {
         // A full L7 event whose path carries a query string's `=` (the field that must stay last).
         let ev = LogEvent {
@@ -1523,12 +1612,17 @@ mod tests {
             port: 8443,
             method: Some("POST".into()),
             path: Some("/v1/x?a=1&b=2".into()),
-            verdict: LogVerdict::Blocked,
-            reason: "outbound-secret".into(),
+            verdict: LogVerdict::Allow,
+            reason: "allowed".into(),
+            // A captured upstream status round-trips on the wire alongside the query path.
+            status: Some(200),
         };
         let line = format_event_line(&ev);
         let parsed = parse_event_line(line.trim()).expect("a well-formed line parses");
-        assert_eq!(parsed, ev, "the event round-trips including the query path");
+        assert_eq!(
+            parsed, ev,
+            "the event round-trips including the status and query path"
+        );
 
         // An early-CONNECT / L4 event has no method/path — those tokens are omitted and parse None.
         let bare = LogEvent {
@@ -1540,9 +1634,13 @@ mod tests {
             path: None,
             verdict: LogVerdict::Allow,
             reason: "allowed".into(),
+            status: None,
         };
         let parsed = parse_event_line(format_event_line(&bare).trim()).unwrap();
-        assert_eq!(parsed, bare);
+        assert_eq!(
+            parsed, bare,
+            "a status-less L4 event omits the token and parses None"
+        );
 
         // Every verdict token round-trips — in particular `error` (allowed-but-failed), the one the
         // proxy tests only ever assert in memory, so a typo in its wire token would otherwise surface
@@ -1562,6 +1660,7 @@ mod tests {
                 path: Some("/p".into()),
                 verdict,
                 reason: "dns-failure".into(),
+                status: None,
             };
             let parsed = parse_event_line(format_event_line(&ev).trim()).unwrap();
             assert_eq!(

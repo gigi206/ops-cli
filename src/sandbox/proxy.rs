@@ -602,7 +602,7 @@ impl ProxyCtx {
         path: Option<&str>,
         kind: StatKind,
         reason: &str,
-    ) {
+    ) -> Option<u64> {
         if let Some(stats) = &self.stats {
             stats.record(host, kind);
         }
@@ -611,7 +611,7 @@ impl ProxyCtx {
             StatKind::Deny => super::control::LogVerdict::Deny,
             StatKind::Blocked => super::control::LogVerdict::Blocked,
         };
-        self.push_log(host, port, method, path, verdict, reason);
+        self.push_log(host, port, method, path, verdict, reason)
     }
 
     /// Push one event into the live log **without** touching the stat counters — for the outcomes the
@@ -627,10 +627,18 @@ impl ProxyCtx {
         path: Option<&str>,
         verdict: super::control::LogVerdict,
         reason: &str,
-    ) {
-        if let Some(log) = &self.log {
-            let redacted = path.map(|p| self.redact_query(p));
-            log.push(host, port, method, redacted.as_deref(), verdict, reason);
+    ) -> Option<u64> {
+        let log = self.log.as_ref()?;
+        let redacted = path.map(|p| self.redact_query(p));
+        Some(log.push(host, port, method, redacted.as_deref(), verdict, reason))
+    }
+
+    /// Amend the event `seq` (returned by a prior [`outcome`](Self::outcome)) with the upstream HTTP
+    /// status its response returned. A clean no-op when no log is configured or no event was pushed
+    /// (`seq` is `None`), or when the event has already been evicted from the ring.
+    fn set_status(&self, seq: Option<u64>, status: u16) {
+        if let (Some(log), Some(seq)) = (&self.log, seq) {
+            log.set_status(seq, status);
         }
     }
 
@@ -1266,7 +1274,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // The request is permitted and the upstream is up — it will now egress. Record the one `allow`
     // outcome here (a single count per request: a refusal above already returned, and the steps
     // below are I/O, not policy verdicts, so this is the sole place a forwarded request is counted).
-    ctx.outcome(
+    let allow_seq = ctx.outcome(
         &connect_host,
         port,
         Some(&imethod),
@@ -1290,6 +1298,16 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     copy_exact(&mut br, &mut upstream, body_len)?;
     upstream.flush().ok();
 
+    // 9b. Peek the response status line for the live log, best-effort. The bytes read here are NOT
+    //     consumed — they are chained back ahead of the rest of the response, so the relay (and its
+    //     redaction) still sees the whole stream unaltered. `set_status` amends the `allow` event
+    //     pushed above; on an L4 splice, a refusal, or an error there is no such amend (no response).
+    let prefix = read_status_prefix(&mut upstream);
+    if let Some(code) = parse_status_code(&prefix) {
+        ctx.set_status(allow_seq, code);
+    }
+    let mut response = io::Cursor::new(prefix).chain(&mut upstream);
+
     // 10. Response-side leak backstop: a configured secret can only re-enter the cage by being
     //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
     //     and later returns the credential). So mask the reflected value out of the response — but
@@ -1302,11 +1320,52 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             .iter()
             .any(|inj| names_exact_host(&connect_host, Some(&inj.rule)));
     if masks_reflection {
-        pump_redacting(&mut upstream, br.get_mut(), &ctx.redactions)?;
+        pump_redacting(&mut response, br.get_mut(), &ctx.redactions)?;
     } else {
-        pump_to_eof(&mut upstream, br.get_mut())?;
+        pump_to_eof(&mut response, br.get_mut())?;
     }
     Ok(())
+}
+
+/// Read the first bytes of an upstream response — up to and including the first `\n` (the status
+/// line's terminator), a small cap, or the first read that returns nothing/errors — so the HTTP
+/// status can be parsed for the live log. **Best-effort and non-consuming in effect:** the returned
+/// bytes are chained back ahead of the rest of the response by the caller, so nothing is lost; a
+/// partial read (a slow or silent upstream) simply yields no status rather than blocking a second
+/// time (the caller's relay then surfaces the same condition as before this peek existed).
+fn read_status_prefix<R: Read>(r: &mut R) -> Vec<u8> {
+    // A status line is short; 512 bytes is ample and bounds a no-newline flood.
+    const STATUS_LINE_MAX: usize = 512;
+    let mut prefix = Vec::new();
+    let mut buf = [0u8; 64];
+    while prefix.len() < STATUS_LINE_MAX {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                prefix.extend_from_slice(&buf[..n]);
+                if prefix.contains(&b'\n') {
+                    break;
+                }
+            }
+            // Any read error/timeout: return what we have rather than blocking again — the caller's
+            // relay re-hits the upstream and reports the condition as it would have without the peek.
+            Err(_) => break,
+        }
+    }
+    prefix
+}
+
+/// Parse the numeric HTTP status code from a response's opening bytes (`HTTP/1.1 200 OK\r\n`): the
+/// token after the first space, if it is a plausible status (100–599). `None` for anything that is
+/// not a well-formed HTTP/1.x status line (so a non-HTTP or truncated response records no status).
+fn parse_status_code(prefix: &[u8]) -> Option<u16> {
+    let line = prefix.split(|&b| b == b'\n').next()?;
+    let text = std::str::from_utf8(line).ok()?;
+    if !text.starts_with("HTTP/") {
+        return None;
+    }
+    let code: u16 = text.split_whitespace().nth(1)?.parse().ok()?;
+    (100..=599).contains(&code).then_some(code)
 }
 
 /// The most raw L4 (`tcp://`) splices open at once. Each one pins a host thread (and ~6 fds) for the
@@ -2229,6 +2288,159 @@ mod tests {
         assert_eq!(events[0].host, "upstream.test");
         assert_eq!(events[0].method.as_deref(), Some("GET"));
         assert_eq!(events[0].path.as_deref(), Some("/path"));
+    }
+
+    #[test]
+    fn parse_status_code_reads_a_well_formed_status_line_only() {
+        // A normal status line → the code.
+        assert_eq!(parse_status_code(b"HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(parse_status_code(b"HTTP/1.0 404 Not Found\r\n"), Some(404));
+        assert_eq!(parse_status_code(b"HTTP/2 503 \r\n"), Some(503));
+        // Only the first line is consulted, even when more of the head was read.
+        assert_eq!(
+            parse_status_code(b"HTTP/1.1 301 Moved\r\nLocation: /x\r\n"),
+            Some(301)
+        );
+        // Not HTTP, no code, or an implausible code → None (records no status).
+        assert_eq!(parse_status_code(b"garbage bytes\r\n"), None);
+        assert_eq!(parse_status_code(b"HTTP/1.1 OK\r\n"), None);
+        assert_eq!(parse_status_code(b"HTTP/1.1 999 X\r\n"), None);
+        assert_eq!(parse_status_code(b""), None);
+    }
+
+    #[test]
+    fn read_status_prefix_captures_the_status_line_and_loses_nothing() {
+        // It reads until it has seen the first `\n` (a chunk may carry bytes past it — those are kept,
+        // since the caller chains the whole prefix back ahead of the rest, so nothing is lost). The
+        // status line is present, so the code parses; any trailing head bytes are harmless.
+        let mut src = io::Cursor::new(b"HTTP/1.1 200 OK\r\nheader: v\r\n\r\nbody".to_vec());
+        let prefix = read_status_prefix(&mut src);
+        assert!(prefix.starts_with(b"HTTP/1.1 200 OK\r\n"), "{prefix:?}");
+        assert_eq!(parse_status_code(&prefix), Some(200));
+        // A stream cut before the code yields whatever it had (best-effort); with no code token there
+        // is nothing to parse, so the event simply records none.
+        let mut cut = io::Cursor::new(b"HTTP/1.".to_vec());
+        let partial = read_status_prefix(&mut cut);
+        assert_eq!(partial, b"HTTP/1.");
+        assert_eq!(parse_status_code(&partial), None);
+    }
+
+    /// The live log captures the **upstream** HTTP status for a completed L7 request (the
+    /// `--with-status` data). Teeth: two requests ops permits identically (both `allow`) reach two
+    /// upstreams that differ ONLY in their response status — so a recorded 200 vs 404 can come only
+    /// from reading the real response, never from ops's own verdict.
+    #[test]
+    fn an_allowed_request_records_the_upstream_status_code() {
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".as_slice(),
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        ] {
+            let (addr, upstream_ca, up) = spawn_upstream("upstream.test", response);
+            let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+            let proxy_ca_der = proxy_ca.ca_cert_der();
+            let mut roots = RootCertStore::empty();
+            roots.add(upstream_ca).unwrap();
+            let upstream_cfg = Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            );
+            let ctx = Arc::new(
+                ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                    .unwrap()
+                    .with_upstream(upstream_cfg)
+                    .with_log(log.clone())
+                    .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+            );
+            let _ = through_proxy(
+                ctx,
+                proxy_ca_der,
+                "upstream.test",
+                "upstream.test",
+                addr.port(),
+                b"GET /p HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            up.join().unwrap();
+        }
+
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 2, "one allow event per request: {events:?}");
+        // Both are `allow` (ops permitted both); only the captured upstream status differs.
+        assert!(events.iter().all(|e| e.verdict == LogVerdict::Allow));
+        assert_eq!(
+            events[0].status,
+            Some(200),
+            "the 200 upstream response is captured"
+        );
+        assert_eq!(
+            events[1].status,
+            Some(404),
+            "the 404 is captured — distinct from ops's allow verdict"
+        );
+    }
+
+    /// The status peek must not eat the response: a body larger than both the peek's first read and a
+    /// pump chunk forces the relay to continue reading from `upstream` past the drained status-line
+    /// cursor (the `Cursor::new(prefix).chain(upstream)` seam). Teeth: the whole body arrives
+    /// byte-identical AND the status is still captured off the front of the same stream. A tiny-body
+    /// test cannot see this — the entire response fits in the first peek read, so `upstream` is never
+    /// touched.
+    #[test]
+    fn a_large_response_body_relays_intact_past_the_status_peek() {
+        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        // 20 000 bytes > the 64-byte peek read AND the 8192-byte pump chunk, so the relay must read
+        // from `upstream` well past the cursor. A leaked static slice satisfies `spawn_upstream`.
+        let body = vec![b'x'; 20_000];
+        let mut resp =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        resp.extend_from_slice(&body);
+        let resp: &'static [u8] = Box::leak(resp.into_boxed_slice());
+
+        let (addr, upstream_ca, up) = spawn_upstream("upstream.test", resp);
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_log(log.clone())
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let got = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+
+        // The full 20k body survived the prefix→upstream chain, byte-identical.
+        let sep = got
+            .find("\r\n\r\n")
+            .expect("the relayed response has a head/body separator");
+        let relayed_body = &got[sep + 4..];
+        assert_eq!(relayed_body.len(), 20_000, "the whole body relayed intact");
+        assert!(
+            relayed_body.bytes().all(|b| b == b'x'),
+            "the body bytes are unaltered across the chain seam"
+        );
+        // …and the status was still read off the front of that same stream.
+        assert_eq!(log.snapshot(None).events[0].status, Some(200));
     }
 
     /// The event log redacts a configured secret out of a request's path **before** it enters the

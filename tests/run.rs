@@ -781,8 +781,9 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     // trusted allowlist makes one allowed and one denied egress attempt, then sleeps; while it is
     // alive, `ops net logs` (run from another process) reads its per-request events over the
     // control socket. Teeth: the allowed host shows an `allow` and the denied host a `deny`, each
-    // carrying the request's method and path — proving the proxy's push, the ring, the socket wire,
-    // and the reader compose. Because the log is live-only (it dies with the session), the session
+    // carrying the request's method and path — and, under `--with-status`, the allowed fetch's
+    // upstream `200` — proving the proxy's push, the status amend, the ring, the socket wire, and the
+    // reader compose. Because the log is live-only (it dies with the session), the session
     // MUST be alive during the read — hence the background child. Skips (never fails) when the host
     // cannot sandbox or the cache is unreachable.
     use std::process::{Command, Stdio};
@@ -842,8 +843,10 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
         .spawn()
         .expect("spawn the background ops run");
 
-    // Poll the live log until both decisions have been recorded (or a generous deadline). The reader
-    // globs the one control socket in this isolated data dir, so no `--app` scope is needed.
+    // Poll the live log until both decisions have been recorded AND the allowed request's upstream
+    // status has been amended in (or a generous deadline). The reader globs the one control socket in
+    // this isolated data dir, so no `--app` scope is needed. Reading with `--with-status` also
+    // exercises the status column through the binary.
     let host_verdict = |rows: &[serde_json::Value], host: &str, verdict: &str| {
         rows.iter()
             .any(|r| r["host"] == host && r["verdict"] == verdict)
@@ -852,13 +855,13 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     // Deferred init: the loop assigns `last` on its first iteration, before either break — so it is
     // always set by the post-loop read, with no dead initial store.
     let mut last;
-    let (mut saw_allow, mut saw_deny) = (false, false);
+    let (mut saw_allow, mut saw_deny, mut saw_status) = (false, false, false);
     loop {
         let out = ops_in(
             project.path(),
             data.path(),
             state.path(),
-            &["net", "logs", "--json"],
+            &["net", "logs", "--with-status", "--json"],
         );
         last = String::from_utf8_lossy(&out.stdout).into_owned();
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last) {
@@ -866,7 +869,9 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
                 saw_allow = host_verdict(rows, "cache.nixos.org", "allow");
                 saw_deny = host_verdict(rows, "example.com", "deny");
                 if saw_allow && saw_deny {
-                    // Teeth on the record shape: the allowed event carries its method + path.
+                    // Teeth on the record shape: the allowed event carries its method + path, and —
+                    // the status peek, flowing proxy→ring→reader — the upstream `200` from
+                    // nix-cache-info (amended in once the response returns, ~ms after the allow push).
                     let allow = rows
                         .iter()
                         .find(|r| r["host"] == "cache.nixos.org" && r["verdict"] == "allow")
@@ -876,7 +881,10 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
                         allow["path"], "/nix-cache-info",
                         "the allow event carries the (query-dropped) path"
                     );
-                    break;
+                    saw_status = allow["status"] == 200;
+                    if saw_status {
+                        break;
+                    }
                 }
             }
         }
@@ -897,6 +905,10 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     assert!(
         saw_allow && saw_deny,
         "the live log must show the allowed host's allow and the denied host's deny:\n{last}"
+    );
+    assert!(
+        saw_status,
+        "`--with-status` must surface the allowed fetch's upstream 200 (proxy→ring→reader):\n{last}"
     );
     assert!(
         human_out.contains("egress log:") && human_out.contains("cache.nixos.org"),

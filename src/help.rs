@@ -688,6 +688,8 @@ const PAGES: &[Page] = &[
             ("-n <N>", "show only the most recent N events (per session)"),
             ("--with-query", "keep the URL query in the shown path (dropped by default; already \
                               secret-redacted)"),
+            ("--with-status", "show the upstream HTTP status (200/404/…) — completed L7 requests \
+                               only; `-` for an L4 splice, a refusal, or an error"),
             ("-f, --follow", "after the initial listing, keep appending new events (a `tail -f`) \
                               until Ctrl-C"),
             ("-i, --interval <secs>", "the `--follow` poll interval in seconds (default 1)"),
@@ -707,6 +709,13 @@ const PAGES: &[Page] = &[
             guard), and `error` — a request that was allowed but did not complete (DNS failure, an\n\
             unreachable host, a rejected certificate). `error` is diagnostic and is NOT one of the\n\
             stats counters, so the log's lines do not reconcile with `ops net stats` totals.\n\
+            \n\
+            `--with-status` adds the upstream HTTP status (200/404/5xx) the server answered — for a\n\
+            completed L7 (inspected `https://`) request only; an L4 (`tcp://`) splice, a refusal, or\n\
+            an error shows `-` (no HTTP response to read). This is the server's answer to a delivered\n\
+            request, distinct from the egress verdict: an allowed request can still get a 404. In\n\
+            `--follow`, an event whose response has not yet returned shows no status and is not\n\
+            updated retroactively; the one-shot listing always has it.\n\
             \n\
             The URL query is dropped from the shown path by default (a token can ride in a query);\n\
             `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\
