@@ -697,8 +697,9 @@ const PAGES: &[Page] = &[
         ],
         details:
             "A chronological, per-request record of every egress decision the proxy made this\n\
-            session — when, host:port, method, path, verdict, and the reason category. It is read\n\
-            from the same control sockets `ops net pending` uses, and `log` is an accepted alias.\n\
+            session — the session id (the PID `ops ls` shows), the local `hh:mm:ss` time, host:port,\n\
+            method, path, verdict, and the reason category. It is read from the same control sockets\n\
+            `ops net pending` uses, and `log` is an accepted alias.\n\
             \n\
             LIVE-ONLY: the log lives in the running session's memory and is NEVER written to disk;\n\
             once the session exits, nothing remains. It shows a session while it runs (watch it\n\

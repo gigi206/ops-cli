@@ -4028,17 +4028,19 @@ fn display_log_path(path: &str, with_query: bool) -> &str {
     }
 }
 
-/// A compact relative age ("12s", "3m4s", "1h2m") from an event's epoch-ms stamp to now — the live
-/// view wants "how long ago", not a wall-clock. Saturating, so a clock skew never underflows.
-fn format_log_age(now_ms: u128, at_ms: u128) -> String {
-    let secs = now_ms.saturating_sub(at_ms) / 1000;
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+/// An event's wall-clock time of day as local `hh:mm:ss` — a stable, correlatable stamp for a log
+/// (the JSON keeps the absolute `at_epoch_ms`). Local time comes from the process timezone via the C
+/// library (`localtime_r`, the reentrant/thread-safe form); a conversion failure (an implausible
+/// stamp) renders `--:--:--` rather than panicking.
+fn format_log_time(at_epoch_ms: u128) -> String {
+    let secs = (at_epoch_ms / 1000) as libc::time_t;
+    // SAFETY: `localtime_r` writes the broken-down local time into our stack `tm` and reads only the
+    // `time_t` we pass; it is the thread-safe variant, so no shared state is mutated.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return "--:--:--".to_string();
     }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 /// How many of a session's oldest events fell off the ring before the retained window. Sequence
@@ -4074,7 +4076,6 @@ fn net_logs(args: &[OsString]) -> ExitCode {
     }
 
     let (sessions, context) = collect_logs(&data_dir, view.app.as_deref());
-    let now_ms = now_epoch_ms();
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -4109,19 +4110,8 @@ fn net_logs(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    print!(
-        "{}",
-        render_logs(&sessions, &context, now_ms, &view, &pal, true)
-    );
+    print!("{}", render_logs(&sessions, &context, &view, &pal, true));
     ExitCode::SUCCESS
-}
-
-/// The current wall-clock in epoch milliseconds (for an event's relative age / JSON stamp).
-fn now_epoch_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
 }
 
 /// `ops net logs --follow`: after seeding with the current listing, poll each reachable session on
@@ -4169,7 +4159,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         }
     } else if has_events {
         // No footer in the seed — events append below it, so the live-only note would land mid-stream.
-        seed = render_logs(&sessions, &context, now_epoch_ms(), view, pal, false);
+        seed = render_logs(&sessions, &context, view, pal, false);
     }
     for s in &sessions {
         cursor.insert(s.pid, s.snapshot.head);
@@ -4184,7 +4174,6 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     let mut last_pid: Option<u32> = None; // the session whose header was last printed (human view)
     loop {
         std::thread::sleep(interval);
-        let now_ms = now_epoch_ms();
         let context = pending_session_context(data_dir);
         let mut pids = sandbox::control::session_pids(data_dir);
         if let Some(name) = view.app.as_deref() {
@@ -4269,7 +4258,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                             }
                             last_pid = Some(pid);
                         }
-                        let _ = writeln!(tick, "{}", render_log_line(e, now_ms, view, pal));
+                        let _ = writeln!(tick, "{}", render_log_line(e, pid, view, pal));
                     }
                 }
             }
@@ -4317,14 +4306,13 @@ fn status_color(code: u16, pal: &style::Palette) -> &str {
 
 /// Render the live egress log — a pure presenter (its colored layout is asserted in a test): a
 /// header, then per session a context line and one line per event
-/// (`age · host:port · method path · verdict · reason`), oldest first. The `reason` is dropped for a
+/// (`time · host:port · method path · verdict · reason`), oldest first. The `reason` is dropped for a
 /// plain `allow` (it would just repeat "allowed"). An empty result explains the log is live-only.
 /// `footer` appends the live-only note — on for the one-shot listing, off for the `--follow` seed
 /// (where events append below it, so the note would land mid-stream).
 fn render_logs(
     sessions: &[sandbox::control::SessionLog],
     context: &[(u32, PathBuf, String)],
-    now_ms: u128,
     view: &LogView,
     pal: &style::Palette,
     footer: bool,
@@ -4378,7 +4366,7 @@ fn render_logs(
             );
         }
         for e in events {
-            let _ = writeln!(o, "{}", render_log_line(e, now_ms, view, pal));
+            let _ = writeln!(o, "{}", render_log_line(e, session.pid, view, pal));
         }
     }
     if footer {
@@ -4390,13 +4378,14 @@ fn render_logs(
     o
 }
 
-/// One event's display line (indented, no trailing newline): `age · host:port · method path ·
-/// verdict · reason`. The `reason` is dropped for a plain `allow` (it would just repeat "allowed");
-/// a blank host (a malformed handshake) shows `-`. Shared by the one-shot render and the `--follow`
-/// stream so a line looks identical in both.
+/// One event's display line (indented, no trailing newline): `session-id · time · host:port ·
+/// method path · verdict · reason`. The `pid` is the session id (the one `ops ls`/`attach`/`stop`
+/// use), led so a line is self-contained when scanned or piped. The `reason` is dropped for a plain
+/// `allow` (it would just repeat "allowed"); a blank host (a malformed handshake) shows `-`. Shared
+/// by the one-shot render and the `--follow` stream so a line looks identical in both.
 fn render_log_line(
     e: &sandbox::control::LogEvent,
-    now_ms: u128,
+    pid: u32,
     view: &LogView,
     pal: &style::Palette,
 ) -> String {
@@ -4406,7 +4395,7 @@ fn render_log_line(
     } else {
         format!("{}:{}", e.host, e.port)
     };
-    let age = format_log_age(now_ms, e.at_epoch_ms);
+    let time = format_log_time(e.at_epoch_ms);
     let method = e
         .method
         .as_deref()
@@ -4435,7 +4424,7 @@ fn render_log_line(
         String::new()
     };
     format!(
-        "    {dim}{age:>5}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{status}",
+        "    {dim}{pid}{r}  {dim}{time}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{status}",
         e.verdict.as_str()
     )
 }
@@ -6960,7 +6949,6 @@ mod tests {
     fn status_shows_only_under_with_status_in_both_render_and_json() {
         use sandbox::control::LogVerdict::*;
         let p = style::Palette::plain();
-        let now = 1_000_000u128;
 
         // A completed L7 allow carrying a 200, and an L4/error event carrying none.
         let mut ok = log_event(1, "api.test", Some("GET"), Some("/p"), Allow, "allowed");
@@ -6974,13 +6962,18 @@ mod tests {
         let off = LogView::default();
 
         // Human render: the code appears only under `--with-status`; a status-less event shows `-`.
-        assert!(!render_log_line(&ok, now, &off, &p).contains("200"));
-        let line = render_log_line(&ok, now, &on, &p);
+        assert!(!render_log_line(&ok, 4242, &off, &p).contains("200"));
+        let line = render_log_line(&ok, 4242, &on, &p);
         assert!(
             line.contains("200"),
             "the code shows under --with-status: {line}"
         );
-        let bare = render_log_line(&raw, now, &on, &p);
+        // The session id leads the line (before the time).
+        assert!(
+            line.trim_start().starts_with("4242"),
+            "the line leads with the session id: {line}"
+        );
+        let bare = render_log_line(&raw, 4242, &on, &p);
         assert!(
             bare.trim_end().ends_with('-'),
             "a status-less event shows `-` under --with-status: {bare}"
@@ -7000,30 +6993,40 @@ mod tests {
     }
 
     #[test]
-    fn format_log_age_is_compact_and_saturating() {
-        let now = 10_000_000u128;
-        assert_eq!(format_log_age(now, now), "0s");
-        assert_eq!(format_log_age(now, now - 12_000), "12s");
-        assert_eq!(format_log_age(now, now - 125_000), "2m5s");
-        assert_eq!(format_log_age(now, now - 3_725_000), "1h2m");
-        // A future stamp (clock skew) saturates to 0, never underflows.
-        assert_eq!(format_log_age(now, now + 5_000), "0s");
+    fn format_log_time_renders_local_hh_mm_ss() {
+        // Shape is always HH:MM:SS with each field two digits and in range — regardless of the host
+        // timezone (so the test is deterministic on any machine).
+        let t = format_log_time(1_700_000_000_123);
+        let parts: Vec<&str> = t.split(':').collect();
+        assert_eq!(parts.len(), 3, "HH:MM:SS: {t}");
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit())),
+            "two-digit fields: {t}"
+        );
+        let (h, m, s): (u32, u32, u32) = (
+            parts[0].parse().unwrap(),
+            parts[1].parse().unwrap(),
+            parts[2].parse().unwrap(),
+        );
+        assert!(h < 24 && m < 60 && s < 60, "each field in range: {t}");
+        // Seconds are timezone-independent (every real UTC offset is a whole number of minutes), so
+        // this is exact without pinning `TZ`: 1_700_000_000 mod 60 == 20, and epoch 0 is ...:00.
+        assert_eq!(s, 20, "the seconds field is exact across zones: {t}");
+        assert!(format_log_time(0).ends_with(":00"), "epoch 0 is HH:MM:00");
     }
 
     #[test]
     fn render_logs_groups_events_by_session_with_verdict_and_reason() {
         use sandbox::control::{LogVerdict::*, SessionLog};
         let p = style::Palette::plain();
-        let now = 1_012_000u128; // 12s after the events' 1_000_000 stamp
 
         // Empty → a live-only note; under `--app`, it names the app.
-        assert!(
-            render_logs(&[], &[], now, &LogView::default(), &p, true).contains("nothing to show")
-        );
+        assert!(render_logs(&[], &[], &LogView::default(), &p, true).contains("nothing to show"));
         let scoped = render_logs(
             &[],
             &[],
-            now,
             &LogView {
                 app: Some("claude-code".into()),
                 ..LogView::default()
@@ -7072,17 +7075,24 @@ mod tests {
             "app:claude-code".to_string(),
         )];
 
-        let out = render_logs(&sessions, &context, now, &LogView::default(), &p, true);
+        let out = render_logs(&sessions, &context, &LogView::default(), &p, true);
         // The session header from the registry context.
         assert!(
             out.contains("session 4242 [app:claude-code] /home/u/proj"),
             "{out}"
         );
-        // An allow line: age, host:port, method+path (query DROPPED by default), the verdict, and NO
-        // redundant `(allowed)` reason.
+        // Each event line leads with the session id (before the time) — proven by the id and the host
+        // landing on one line, not just the header.
         assert!(
-            out.contains("api.test:443") && out.contains("POST /v1/m"),
-            "{out}"
+            out.lines().any(|l| l.contains("4242")
+                && l.contains("api.test:443")
+                && l.contains("POST /v1/m")),
+            "the event line leads with the session id: {out}"
+        );
+        // …and carries the event's wall-clock time as local HH:MM:SS (the events' 1_000_000 ms stamp).
+        assert!(
+            out.contains(&format_log_time(1_000_000)),
+            "the line shows the local time: {out}"
         );
         assert!(
             !out.contains("k=sec"),
@@ -7099,8 +7109,6 @@ mod tests {
         );
         // An error line (allowed-but-failed) shows its reason too.
         assert!(out.contains("(dns-failure)"), "{out}");
-        // The age is relative ("12s" here).
-        assert!(out.contains("12s"), "{out}");
         // The live-only footer.
         assert!(out.contains("nothing is kept after it exits"), "{out}");
 
@@ -7108,7 +7116,6 @@ mod tests {
         let wq = render_logs(
             &sessions,
             &context,
-            now,
             &LogView {
                 with_query: true,
                 ..LogView::default()
@@ -7126,7 +7133,6 @@ mod tests {
     fn render_logs_surfaces_ring_eviction_rather_than_truncating_silently() {
         use sandbox::control::{LogVerdict::*, SessionLog};
         let p = style::Palette::plain();
-        let now = 1_012_000u128;
 
         // A session whose ring already evicted its oldest events: the retained window starts at
         // seq 4001, so 4000 older events fell off. `snapshot_evicted` reports the gap…
@@ -7163,7 +7169,7 @@ mod tests {
 
         // The render says so, rather than silently showing the last 1000 as if they were all.
         let sessions = [SessionLog { pid: 7, snapshot }];
-        let out = render_logs(&sessions, &[], now, &LogView::default(), &p, true);
+        let out = render_logs(&sessions, &[], &LogView::default(), &p, true);
         assert!(
             out.contains("4000 earlier event(s) evicted from the ring"),
             "the ring overflow must be surfaced, not truncated silently:\n{out}"

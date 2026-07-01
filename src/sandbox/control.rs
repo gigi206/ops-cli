@@ -335,7 +335,7 @@ impl LogVerdict {
 pub(crate) struct LogEvent {
     pub(crate) seq: u64,
     /// Wall-clock capture time in epoch milliseconds — a clean stamp for `--json`; the human view
-    /// renders it as a relative age.
+    /// renders it as a local `hh:mm:ss` time.
     pub(crate) at_epoch_ms: u128,
     pub(crate) host: String,
     pub(crate) port: u16,
