@@ -67,15 +67,16 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
     "npm_config_cafile",   // npm
 ];
 
-/// A running egress session's host-side resources: the bound proxy socket, the CA file, and — under
-/// the `ask` posture — the control socket a host-side `ops net pending` reaches. The proxy and
-/// control threads are detached and die when ops exits (right after the cage); this guard only owns
-/// the on-disk artifacts, unlinking them when the launch ends. The control socket is deliberately
-/// not among the cage's binds (see [`start`]).
+/// A running egress session's host-side resources: the bound proxy socket, the CA file, and the
+/// control socket a host-side `ops net pending`/`ops net log` reaches. The proxy and control threads
+/// are detached and die when ops exits (right after the cage); this guard only owns the on-disk
+/// artifacts, unlinking them when the launch ends. The control socket is deliberately not among the
+/// cage's binds (see [`start`]).
 pub(crate) struct Egress {
     host_uds: PathBuf,
     ca_file: PathBuf,
-    /// The `ask`-posture control socket, present only when the policy asks by default.
+    /// The per-session control socket (pending answers + the live egress log), present whenever the
+    /// proxy runs — always `Some` here, an `Option` only so the guard's unlink stays uniform.
     control_uds: Option<PathBuf>,
     /// The session's per-host decision counters, when stats are on. The guard owns a flush on a
     /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
@@ -196,36 +197,38 @@ pub(crate) fn start(
         None
     };
 
-    // Read the posture before the policy moves into the proxy context: only `ask` needs a control
-    // plane.
+    // Read the posture before the policy moves into the proxy context: only `ask` needs the pending
+    // queue wired into the proxy (to park), but every proxy posture stands the control socket up now
+    // — it also serves the live egress log (`ops net log`), which `allowlist` sessions want too.
     let asks = policy.default_action() == crate::allowlist::DefaultAction::Ask;
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
         .with_redactions(redactions);
 
-    // Under the `ask` posture, stand up the control socket the host-side `ops net pending` reaches
-    // to answer parked requests, sharing one pending queue with the proxy. It lives under the
-    // `0700` egress dir beside `<data>` and is **never** bound into the cage (only the proxy socket
-    // and the CA cross in) — in Mode B the in-cage agent must not be able to answer its own asks.
-    // Other postures never park, so they skip it entirely.
-    let control_uds = if asks {
+    // Stand up the control socket the host-side `ops net pending`/`ops net log` reach. It lives under
+    // the `0700` egress dir beside `<data>` and is **never** bound into the cage (only the proxy
+    // socket and the CA cross in) — in Mode B the in-cage agent must not answer its own asks or read
+    // its own log. One pending queue + manual-rule overlay + event ring are shared between the proxy
+    // and the control thread: the proxy parks into the queue / pushes into the ring, the control
+    // thread answers and reads them. The pending queue is wired into the proxy only under `ask` (no
+    // other posture parks); the ring is always wired, so every proxy session has a live log.
+    let control_uds = {
         let control_uds = dir.join(format!("control-{pid}.sock"));
         let _ = std::fs::remove_file(&control_uds);
-        // One pending queue and one manual-rule overlay, shared between the proxy and the control
-        // thread: the proxy parks into the queue and reads the overlay; the control thread answers
-        // the queue and appends to the overlay.
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
-        ctx = ctx.with_control(pending.clone(), manual.clone());
+        let log = Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP));
+        if asks {
+            ctx = ctx.with_control(pending.clone(), manual.clone());
+        }
+        ctx = ctx.with_log(log.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
-        // the launch is up — never a race with the first `ops net pending`.
+        // the launch is up — never a race with the first `ops net pending`/`ops net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
         std::thread::spawn(move || {
-            let _ = super::control::serve(control_listener, pending, manual);
+            let _ = super::control::serve(control_listener, pending, manual, log);
         });
         Some(control_uds)
-    } else {
-        None
     };
     if let Some(stats) = &stats {
         ctx = ctx.with_stats(stats.clone());
@@ -639,15 +642,32 @@ mod tests {
             .contains("BEGIN CERTIFICATE"));
 
         let (host_uds, ca_file) = (guard.host_uds.clone(), guard.ca_file.clone());
-        // a non-ask posture stands up no control socket
+        // Every proxy posture — even this allowlist (non-ask) one — now stands up the control
+        // socket, because it also serves the live egress log (`ops net logs`). It lives host-side…
+        let control = guard
+            .control_uds
+            .clone()
+            .expect("a proxy session stands up the control socket for the live log");
         assert!(
-            guard.control_uds.is_none(),
-            "deny mode needs no control socket"
+            control.exists(),
+            "the control socket must be bound host-side"
+        );
+        // …and is **never** bound into the cage (only the proxy socket and the CA cross in).
+        assert!(
+            !wiring
+                .binds
+                .iter()
+                .any(|b| b.src == control || b.dest == control),
+            "the control socket must not be a cage bind"
         );
         drop(guard);
-        // the guard unlinks both artifacts when the launch ends
+        // the guard unlinks every artifact when the launch ends — the new control socket included
         assert!(!host_uds.exists(), "the socket must be unlinked on drop");
         assert!(!ca_file.exists(), "the CA file must be unlinked on drop");
+        assert!(
+            !control.exists(),
+            "the control socket must be unlinked on drop"
+        );
     }
 
     /// The load-bearing security property of the `ask` posture: the control socket — over which a

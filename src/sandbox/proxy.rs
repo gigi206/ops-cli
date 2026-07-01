@@ -530,6 +530,11 @@ pub(crate) struct ProxyCtx {
     /// stats are off. The launch ([`super::egress::start`]) attaches the session's
     /// [`EgressStats`] via [`Self::with_stats`]; tests leave it unset.
     stats: Option<Arc<EgressStats>>,
+    /// The live event ring this launch pushes each decision into, read by `ops net log`, or `None`
+    /// when the log is off (tests). The launch ([`super::egress::start`]) attaches the session's
+    /// [`super::control::LogRing`] via [`Self::with_log`]; a decision's outcome is both counted in
+    /// `stats` and pushed here through the single [`Self::outcome`] chokepoint.
+    log: Option<Arc<super::control::LogRing>>,
     /// The number of raw L4 (`tcp://`) splices currently open. Each splice holds a host thread (and
     /// its fds) for the connection's lifetime, so this caps how many an in-cage agent can open at
     /// once (see [`MAX_CONCURRENT_SPLICES`]); the inspected L7 path never touches it. Shared across
@@ -562,6 +567,7 @@ impl ProxyCtx {
             manual: Arc::new(super::control::ManualRules::new()),
             notices: false,
             stats: None,
+            log: None,
             splices: AtomicUsize::new(0),
         })
     }
@@ -573,13 +579,72 @@ impl ProxyCtx {
         self
     }
 
-    /// Record one request's outcome for `host`, if stats are on (a no-op otherwise). The single
-    /// chokepoint the decision sites in [`handle_client`] call, so the bucket-per-site mapping is
-    /// the only place a request's outcome is classified.
-    fn record(&self, host: &str, kind: StatKind) {
+    /// Attach the session's live event ring, so each request's decision is pushed for `ops net log`.
+    /// Set once by the launch ([`super::egress::start`]) whenever the proxy runs.
+    pub(crate) fn with_log(mut self, log: Arc<super::control::LogRing>) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    /// The single decision chokepoint every site in [`handle_client`] calls: it both counts the
+    /// outcome for `ops net stats` and pushes one event for the live `ops net log`, so the two can
+    /// never drift and a missed site is a missed *pair*, not a silent stats/log mismatch. `method`
+    /// and `path` are the inspected request's (absent for an early-CONNECT block or a raw `tcp://`
+    /// splice); `reason` is the same stable category token the adjacent refusal writes (or `allowed`
+    /// for a permitted request). The path is query-redacted against the configured secret needles
+    /// **before** it enters the ring, so even the outbound-secret-blocked event — whose query is
+    /// exactly the one carrying a secret — is safe to hold in RAM.
+    fn outcome(
+        &self,
+        host: &str,
+        port: u16,
+        method: Option<&str>,
+        path: Option<&str>,
+        kind: StatKind,
+        reason: &str,
+    ) {
         if let Some(stats) = &self.stats {
             stats.record(host, kind);
         }
+        let verdict = match kind {
+            StatKind::Allow => super::control::LogVerdict::Allow,
+            StatKind::Deny => super::control::LogVerdict::Deny,
+            StatKind::Blocked => super::control::LogVerdict::Blocked,
+        };
+        self.push_log(host, port, method, path, verdict, reason);
+    }
+
+    /// Push one event into the live log **without** touching the stat counters — for the outcomes the
+    /// coarse stats taxonomy does not count but the diagnostic log should: a permitted request that
+    /// failed downstream (`Error` — DNS/unreachable/cert) and a request ops declined before any
+    /// verdict (`Blocked` — an IP-literal target or a malformed/smuggling request). Stats stay a
+    /// pure allow/deny/blocked policy counter; the log is the richer record.
+    fn push_log(
+        &self,
+        host: &str,
+        port: u16,
+        method: Option<&str>,
+        path: Option<&str>,
+        verdict: super::control::LogVerdict,
+        reason: &str,
+    ) {
+        if let Some(log) = &self.log {
+            let redacted = path.map(|p| self.redact_query(p));
+            log.push(host, port, method, redacted.as_deref(), verdict, reason);
+        }
+    }
+
+    /// Mask any configured secret value occurring verbatim in `path` with an equal-length run of
+    /// `*`, so a token that rode in a query string never enters the event ring in the clear. Reuses
+    /// the same needle set and masking as the outbound/response redaction; `*` is ASCII and
+    /// same-length, so the result stays valid UTF-8.
+    fn redact_query(&self, path: &str) -> String {
+        if self.redactions.is_empty() {
+            return path.to_string();
+        }
+        let mut bytes = path.as_bytes().to_vec();
+        redact_in_place(&mut bytes, &self.redactions);
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Wire the proxy to the launch's shared pending queue and manual-rule overlay, and turn on the
@@ -705,6 +770,17 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let head = read_head_raw(&mut client, HEAD_MAX)?;
     let parsed = parse_head(&head)?;
     let Some((method, target)) = request_line_parts(&parsed.request_line) else {
+        // A malformed request line carries no destination to attribute — log the attempt so it is
+        // not dark, but with no host/method/path (the raw line may hold whitespace the wire format
+        // cannot carry as a single field).
+        ctx.push_log(
+            "",
+            0,
+            None,
+            None,
+            super::control::LogVerdict::Blocked,
+            "bad-request",
+        );
         return write_refusal(
             &mut client,
             "400 Bad Request",
@@ -714,7 +790,17 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     };
     if method != "CONNECT" {
         // Plain-HTTP absolute-form egress (`GET http://host/…`) is out of scope for this slice;
-        // refuse it fail-closed rather than letting it reach a default branch.
+        // refuse it fail-closed rather than letting it reach a default branch. It has no clean
+        // host:port, but the method + raw target are exactly the "what is the agent trying to do"
+        // signal, so log them (host blank, target as the path).
+        ctx.push_log(
+            "",
+            0,
+            Some(method.as_str()),
+            Some(target.as_str()),
+            super::control::LogVerdict::Blocked,
+            "method-not-allowed",
+        );
         return write_refusal(
             &mut client,
             "405 Method Not Allowed",
@@ -724,6 +810,15 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     }
     // 2. The CONNECT authority.
     let Some((host, port)) = split_authority(&target) else {
+        // The authority is malformed (not host:port): log the raw target the agent asked for.
+        ctx.push_log(
+            "",
+            0,
+            Some(method.as_str()),
+            Some(target.as_str()),
+            super::control::LogVerdict::Blocked,
+            "bad-request",
+        );
         return write_refusal(
             &mut client,
             "400 Bad Request",
@@ -744,6 +839,16 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // An IP-literal target carries no SNI to bind the minted leaf to, so the inspected L7 path
     // refuses it (a hostname target is required to MITM; only the raw splice above accepts an IP).
     if host.parse::<IpAddr>().is_ok() {
+        // Log the attempt (host = the IP the agent tried to reach) before refusing. Pre-tunnel, so
+        // there is no method/path yet.
+        ctx.push_log(
+            &connect_host,
+            port,
+            None,
+            None,
+            super::control::LogVerdict::Blocked,
+            "ip-literal",
+        );
         return write_refusal(
             &mut client,
             "403 Forbidden",
@@ -770,7 +875,15 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         .map(|s| allowlist::canonical_host(s) != connect_host)
         .unwrap_or(true)
     {
-        ctx.record(&connect_host, StatKind::Blocked);
+        // Pre-parse: the inner request is not decoded yet, so there is no method/path to log.
+        ctx.outcome(
+            &connect_host,
+            port,
+            None,
+            None,
+            StatKind::Blocked,
+            "host-mismatch",
+        );
         return respond_refusal_tls(
             &mut br,
             "421 Misdirected Request",
@@ -781,6 +894,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
 
     let inner = parse_head(&inner_bytes)?;
     let Some((imethod, itarget)) = request_line_parts(&inner.request_line) else {
+        ctx.push_log(
+            &connect_host,
+            port,
+            None,
+            None,
+            super::control::LogVerdict::Blocked,
+            "bad-request",
+        );
         return respond_refusal_tls(
             &mut br,
             "400 Bad Request",
@@ -792,6 +913,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // refused. The check is on the start, not a substring, so a URL inside the query
     // (`/login?next=https://…`) is not mistaken for absolute-form.
     if !itarget.starts_with('/') {
+        ctx.push_log(
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            super::control::LogVerdict::Blocked,
+            "bad-request",
+        );
         return respond_refusal_tls(
             &mut br,
             "400 Bad Request",
@@ -805,6 +934,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         || inner.count("content-length") > 1
         || inner.count("host") > 1
     {
+        ctx.push_log(
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            super::control::LogVerdict::Blocked,
+            "bad-request",
+        );
         return respond_refusal_tls(
             &mut br,
             "400 Bad Request",
@@ -817,12 +954,20 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Some(v) => match v.trim().parse() {
             Ok(n) => n,
             Err(_) => {
+                ctx.push_log(
+                    &connect_host,
+                    port,
+                    Some(&imethod),
+                    Some(&itarget),
+                    super::control::LogVerdict::Blocked,
+                    "bad-request",
+                );
                 return respond_refusal_tls(
                     &mut br,
                     "400 Bad Request",
                     "bad-request",
                     "the Content-Length header is not a valid number",
-                )
+                );
             }
         },
         None => 0,
@@ -834,7 +979,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         .map(|h| allowlist::canonical_host(&strip_port(h)) != connect_host)
         .unwrap_or(true)
     {
-        ctx.record(&connect_host, StatKind::Blocked);
+        ctx.outcome(
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            StatKind::Blocked,
+            "host-mismatch",
+        );
         return respond_refusal_tls(
             &mut br,
             "421 Misdirected Request",
@@ -850,7 +1002,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     name or opens an upstream. A backstop against naive re-exfil only: it sees the head, not
     //     the streamed body, and matches the value byte-for-byte (any encoding evades it).
     if carries_secret(&inner_bytes, &ctx.redactions) {
-        ctx.record(&connect_host, StatKind::Blocked);
+        ctx.outcome(
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            StatKind::Blocked,
+            "outbound-secret",
+        );
         return respond_refusal_tls(
             &mut br,
             "403 Forbidden",
@@ -868,7 +1027,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // rule. The SSRF guard below then treats it as unnamed (private addresses refused).
         Decision::AllowedDefault => None,
         Decision::DeniedBy(_) => {
-            ctx.record(&connect_host, StatKind::Deny);
+            ctx.outcome(
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                StatKind::Deny,
+                "denied-by-rule",
+            );
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
@@ -877,14 +1043,28 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             );
         }
         Decision::DeniedDefault => {
-            ctx.record(&connect_host, StatKind::Deny);
             // Distinguish "this host is allowed, but not for this verb" from "this host is not
             // allowed at all": if an allow rule matches the host/path but its method set excludes
-            // the request's verb, say so, so the agent can tell a method-scoped deny apart.
-            if ctx
+            // the request's verb, say so, so the agent can tell a method-scoped deny apart. The
+            // reason is decided *before* the outcome is recorded, so the log carries the precise
+            // category (`denied-method`/`denied-default`), not a coarse one.
+            let method_denied = ctx
                 .policy
-                .method_denied(&connect_host, port, &itarget, &imethod)
-            {
+                .method_denied(&connect_host, port, &itarget, &imethod);
+            let reason = if method_denied {
+                "denied-method"
+            } else {
+                "denied-default"
+            };
+            ctx.outcome(
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                StatKind::Deny,
+                reason,
+            );
+            if method_denied {
                 return respond_refusal_tls(
                     &mut br,
                     "403 Forbidden",
@@ -911,7 +1091,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Decision::Ask => match ctx.manual.decide(&connect_host, port, &itarget) {
             Some(true) => Some(allowlist::host_port_rule(&connect_host, port)),
             Some(false) => {
-                ctx.record(&connect_host, StatKind::Deny);
+                ctx.outcome(
+                    &connect_host,
+                    port,
+                    Some(&imethod),
+                    Some(&itarget),
+                    StatKind::Deny,
+                    "asked-denied",
+                );
                 return respond_refusal_tls(
                     &mut br,
                     "403 Forbidden",
@@ -965,7 +1152,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                         Some(allowlist::host_port_rule(&connect_host, port))
                     }
                     super::control::Verdict::Deny => {
-                        ctx.record(&connect_host, StatKind::Deny);
+                        ctx.outcome(
+                            &connect_host,
+                            port,
+                            Some(&imethod),
+                            Some(&itarget),
+                            StatKind::Deny,
+                            "asked-denied",
+                        );
                         return respond_refusal_tls(
                             &mut br,
                             "403 Forbidden",
@@ -985,19 +1179,36 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let ips = match (ctx.resolve)(&connect_host) {
         Ok(ips) => ips,
         Err(_) => {
+            // Allowed, but the name did not resolve: an `error`, not a refusal — the log's whole
+            // point is that this reads differently from "we said no".
+            ctx.push_log(
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                super::control::LogVerdict::Error,
+                "dns-failure",
+            );
             return respond_refusal_tls(
                 &mut br,
                 "502 Bad Gateway",
                 "dns-failure",
                 &format!("DNS resolution failed for `{connect_host}`"),
-            )
+            );
         }
     };
     let Some(ip) = ips
         .into_iter()
         .find(|ip| ip_permitted(*ip, &connect_host, deciding.as_ref()))
     else {
-        ctx.record(&connect_host, StatKind::Blocked);
+        ctx.outcome(
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            StatKind::Blocked,
+            "ssrf-blocked",
+        );
         return respond_refusal_tls(
             &mut br,
             "403 Forbidden",
@@ -1016,14 +1227,30 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let mut upstream = match connect_upstream(ip, port, &connect_host, ctx) {
         Ok(u) => u,
         Err(UpstreamError::Unreachable) => {
+            ctx.push_log(
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                super::control::LogVerdict::Error,
+                "upstream-unreachable",
+            );
             return respond_refusal_tls(
                 &mut br,
                 "502 Bad Gateway",
                 "upstream-unreachable",
                 &format!("`{connect_host}` is allowed but could not be reached"),
-            )
+            );
         }
         Err(UpstreamError::CertRejected) => {
+            ctx.push_log(
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                super::control::LogVerdict::Error,
+                "upstream-cert-rejected",
+            );
             return respond_refusal_tls(
                 &mut br,
                 "502 Bad Gateway",
@@ -1032,14 +1259,21 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     "the TLS certificate presented by `{connect_host}` was rejected \
                      (upstream validation failed)"
                 ),
-            )
+            );
         }
     };
 
     // The request is permitted and the upstream is up — it will now egress. Record the one `allow`
     // outcome here (a single count per request: a refusal above already returned, and the steps
     // below are I/O, not policy verdicts, so this is the sole place a forwarded request is counted).
-    ctx.record(&connect_host, StatKind::Allow);
+    ctx.outcome(
+        &connect_host,
+        port,
+        Some(&imethod),
+        Some(&itarget),
+        StatKind::Allow,
+        "allowed",
+    );
 
     // 8. Inject any matching host-scoped credentials. This runs *after* the verdict, so a
     //    denied request never receives a secret, and is keyed on the already-verified
@@ -1125,7 +1359,15 @@ fn splice_l4(
     // Reserve a splice slot up front; the guard releases it on every return below.
     let guard = SpliceGuard::new(&ctx.splices);
     if guard.count() > MAX_CONCURRENT_SPLICES {
-        ctx.record(connect_host, StatKind::Blocked);
+        // A raw splice has no HTTP head, so there is no method/path to log.
+        ctx.outcome(
+            connect_host,
+            port,
+            None,
+            None,
+            StatKind::Blocked,
+            "splice-cap",
+        );
         return write_refusal(
             &mut client,
             "503 Service Unavailable",
@@ -1143,12 +1385,20 @@ fn splice_l4(
         Err(_) => match (ctx.resolve)(connect_host) {
             Ok(ips) => ips,
             Err(_) => {
+                ctx.push_log(
+                    connect_host,
+                    port,
+                    None,
+                    None,
+                    super::control::LogVerdict::Error,
+                    "dns-failure",
+                );
                 return write_refusal(
                     &mut client,
                     "502 Bad Gateway",
                     "dns-failure",
                     &format!("DNS resolution failed for `{connect_host}`"),
-                )
+                );
             }
         },
     };
@@ -1156,7 +1406,14 @@ fn splice_l4(
         .into_iter()
         .find(|ip| ip_permitted(*ip, connect_host, Some(deciding)))
     else {
-        ctx.record(connect_host, StatKind::Blocked);
+        ctx.outcome(
+            connect_host,
+            port,
+            None,
+            None,
+            StatKind::Blocked,
+            "ssrf-blocked",
+        );
         return write_refusal(
             &mut client,
             "403 Forbidden",
@@ -1173,18 +1430,26 @@ fn splice_l4(
     let upstream = match TcpStream::connect((ip, port)) {
         Ok(s) => s,
         Err(_) => {
+            ctx.push_log(
+                connect_host,
+                port,
+                None,
+                None,
+                super::control::LogVerdict::Error,
+                "upstream-unreachable",
+            );
             return write_refusal(
                 &mut client,
                 "502 Bad Gateway",
                 "upstream-unreachable",
                 &format!("`{connect_host}:{port}` is allowed but could not be reached"),
-            )
+            );
         }
     };
 
     // Accept the tunnel — from here every byte is raw and uninspected.
     write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
-    ctx.record(connect_host, StatKind::Allow);
+    ctx.outcome(connect_host, port, None, None, StatKind::Allow, "allowed");
     splice_copy(client, upstream)
 }
 
@@ -1915,11 +2180,15 @@ mod tests {
             "/t".into(),
             None,
         ));
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
         let ctx = Arc::new(
             ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
                 .unwrap()
                 .with_upstream(upstream_cfg)
                 .with_stats(stats.clone())
+                .with_log(log.clone())
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
 
@@ -1929,7 +2198,7 @@ mod tests {
             "upstream.test",
             "upstream.test",
             addr.port(),
-            b"GET / HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+            b"GET /path HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
         up.join().unwrap();
@@ -1947,6 +2216,61 @@ mod tests {
             stats.snapshot()["upstream.test"].allow,
             1,
             "an egressed request must record one allow"
+        );
+        // …and the same forwarded request emits exactly one `allow` log event carrying its method
+        // and path (the `allow` site the refusal-transcript test cannot reach).
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one allow event: {events:?}");
+        assert_eq!(
+            events[0].verdict,
+            crate::sandbox::control::LogVerdict::Allow
+        );
+        assert_eq!(events[0].reason, "allowed");
+        assert_eq!(events[0].host, "upstream.test");
+        assert_eq!(events[0].method.as_deref(), Some("GET"));
+        assert_eq!(events[0].path.as_deref(), Some("/path"));
+    }
+
+    /// The event log redacts a configured secret out of a request's path **before** it enters the
+    /// ring — the outbound-secret block is the sharp case, since its query is exactly the one
+    /// carrying the secret. So even in owner-only RAM the log never holds the raw credential.
+    #[test]
+    fn a_logged_path_has_its_secret_query_redacted_at_push() {
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["host.test:*"]))
+                .unwrap()
+                .with_log(log.clone())
+                .with_redactions(vec![SecretNeedle::new(b"s3cret-token-value".to_vec())])
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run on a secret leak")
+                })),
+        );
+        let resp = through_proxy(
+            ctx,
+            der,
+            "host.test",
+            "host.test",
+            8443,
+            b"GET /v1/x?token=s3cret-token-value HTTP/1.1\r\nHost: host.test\r\n\r\n",
+        )
+        .unwrap();
+        assert!(resp.contains("outbound-secret"), "{resp:?}");
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].verdict, LogVerdict::Blocked);
+        assert_eq!(events[0].reason, "outbound-secret");
+        let path = events[0].path.as_deref().unwrap();
+        assert!(
+            !path.contains("s3cret-token-value"),
+            "the secret must be masked out of the logged path: {path:?}"
+        );
+        assert!(
+            path.starts_with("/v1/x?token=") && path.contains('*'),
+            "the path is kept but the secret run is masked: {path:?}"
         );
     }
 
@@ -2441,10 +2765,14 @@ mod tests {
         );
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
         // NOTE: no `.with_upstream(...)` — the default webpki-roots config will reject the upstream
         let ctx = Arc::new(
             ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
                 .unwrap()
+                .with_log(log.clone())
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         let resp = through_proxy(
@@ -2464,6 +2792,14 @@ mod tests {
             resp.contains("upstream-cert-rejected"),
             "a cert rejection must be distinguishable from an unreachable host: {resp:?}"
         );
+        // Logged as an `error` (the host was allowed; its certificate failed downstream).
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one event: {events:?}");
+        assert_eq!(
+            events[0].verdict,
+            crate::sandbox::control::LogVerdict::Error
+        );
+        assert_eq!(events[0].reason, "upstream-cert-rejected");
     }
 
     /// A name that does not resolve, for an *allowed* host, must be a clean 502 with a
@@ -2472,11 +2808,14 @@ mod tests {
     /// reaches the resolve step, where the injected resolver fails.
     #[test]
     fn a_dns_failure_for_an_allowed_host_is_a_clean_502_not_a_dropped_connection() {
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let ctx = Arc::new(
             ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
                 .unwrap()
+                .with_log(log.clone())
                 .with_resolver(Box::new(|_| {
                     Err(io::Error::other("name resolution failed"))
                 })),
@@ -2487,7 +2826,7 @@ mod tests {
             "allowed.test",
             "allowed.test",
             8443,
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+            b"GET /q HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
         assert!(
@@ -2495,6 +2834,14 @@ mod tests {
             "a DNS failure for an allowed host must be a clean 502 naming the motif, \
              not a dropped connection: {resp:?}"
         );
+        // The log records it as an `error` (allowed but failed downstream), NOT a `deny`/`blocked`
+        // (we never refused it) — the distinction the log exists to make.
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one event: {events:?}");
+        assert_eq!(events[0].verdict, LogVerdict::Error);
+        assert_eq!(events[0].reason, "dns-failure");
+        assert_eq!(events[0].host, "allowed.test");
+        assert_eq!(events[0].path.as_deref(), Some("/q"));
     }
 
     /// CONNECT-host must equal the TLS SNI: a domain-fronting attempt (CONNECT one host, SNI
@@ -3025,12 +3372,18 @@ mod tests {
     /// sites is pinned here. The `allow` site (counted only after a real upstream connects) is pinned
     /// in the happy-path test and the live allowlist e2e. The counter is keyed on the CONNECT host.
     #[test]
-    fn each_refusal_site_records_its_stat_bucket() {
+    fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         use crate::allowlist::DefaultAction;
-        use crate::sandbox::control::{ManualRules, Verdict};
+        use crate::sandbox::control::{LogRing, LogVerdict, ManualRules, Verdict, LOG_RING_CAP};
         use crate::sandbox::egress_stats::{Counts, EgressStats};
 
         let dir = TmpDir::new();
+        // One shared event ring across every block: because `outcome` folds the stat and the log
+        // push into one call, proving each site records the right *bucket* AND emits the right
+        // *event* proves the two can never drift — a missed site is a missed pair. The blocks run
+        // sequentially, so the ring's events are a deterministic, ordered transcript asserted at the
+        // end.
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let seq = std::sync::atomic::AtomicU32::new(0);
         let fresh = || {
             let i = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3054,6 +3407,7 @@ mod tests {
                 ProxyCtx::new(ca, policy(&["allowed.test:*"]))
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run for a denied host")
                     })),
@@ -3088,6 +3442,7 @@ mod tests {
                 ProxyCtx::new(ca, denylist)
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run for a deny-rule host")
                     })),
@@ -3122,6 +3477,7 @@ mod tests {
                 ProxyCtx::new(ca, EgressPolicy::default().with_default(DefaultAction::Ask))
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     .with_manual(manual)
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run for a manual deny")
@@ -3155,6 +3511,7 @@ mod tests {
                 ProxyCtx::new(ca, policy(&["allowed.test:*", "evil.test:*"]))
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run on a fronting attempt")
                     })),
@@ -3187,6 +3544,7 @@ mod tests {
                 ProxyCtx::new(ca, policy(&["allowed.test:*"]))
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run on a host mismatch")
                     })),
@@ -3219,6 +3577,7 @@ mod tests {
                 ProxyCtx::new(ca, policy(&["host.test:*"]))
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     .with_redactions(vec![SecretNeedle::new(b"s3cret-reflected-value".to_vec())])
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run on a secret leak")
@@ -3252,6 +3611,7 @@ mod tests {
                 ProxyCtx::new(ca, policy(&["host.test:*"]))
                     .unwrap()
                     .with_stats(s.clone())
+                    .with_log(log.clone())
                     // the cloud metadata address — always refused, even for an exact-host rule
                     .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
             );
@@ -3271,6 +3631,37 @@ mod tests {
                     blocked: 1,
                     ..Default::default()
                 }
+            );
+        }
+
+        // The shared ring is the ordered transcript of the seven blocks above: each site emitted
+        // exactly one event with the host, verdict, and reason category it recorded. A mis-emitted
+        // or missing event here is a log/stats drift (or a missed site), even though the per-block
+        // stat assertions passed.
+        let events = log.snapshot(None).events;
+        let seen: Vec<(String, LogVerdict, String)> = events
+            .iter()
+            .map(|e| (e.host.clone(), e.verdict, e.reason.clone()))
+            .collect();
+        let expected = [
+            ("denied.test", LogVerdict::Deny, "denied-default"),
+            ("evil.test", LogVerdict::Deny, "denied-by-rule"),
+            ("blocked.test", LogVerdict::Deny, "asked-denied"),
+            ("allowed.test", LogVerdict::Blocked, "host-mismatch"),
+            ("allowed.test", LogVerdict::Blocked, "host-mismatch"),
+            ("host.test", LogVerdict::Blocked, "outbound-secret"),
+            ("host.test", LogVerdict::Blocked, "ssrf-blocked"),
+        ];
+        assert_eq!(
+            seen.len(),
+            expected.len(),
+            "one log event per decision site: {seen:?}"
+        );
+        for (i, (host, verdict, reason)) in expected.iter().enumerate() {
+            assert_eq!(
+                (seen[i].0.as_str(), seen[i].1, seen[i].2.as_str()),
+                (*host, *verdict, *reason),
+                "event {i} mismatched"
             );
         }
     }
@@ -3693,6 +4084,64 @@ mod tests {
         let ctx = loopback_ctx(&[&format!("tcp://127.0.0.1:{}", echo.port())]);
         let resp = through_proxy_raw(ctx, "127.0.0.1", echo.port(), b"RAW-TO-IP").unwrap();
         assert_eq!(resp, b"RAW-TO-IP");
+    }
+
+    #[test]
+    fn an_ip_literal_target_without_a_tcp_rule_is_refused_and_logged_blocked() {
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        // With no `tcp://` rule the inspected L7 path refuses an IP-literal CONNECT pre-tunnel; the
+        // attempt is logged (host = the IP the agent tried) as a block — a "what is it reaching for"
+        // record the stats bucketing never captured.
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_log(log.clone()),
+        );
+        let reply = splice_connect_reply(ctx, "127.0.0.1", 443);
+        assert!(reply.contains("ip-literal"), "{reply:?}");
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one event: {events:?}");
+        assert_eq!(events[0].verdict, LogVerdict::Blocked);
+        assert_eq!(events[0].reason, "ip-literal");
+        assert_eq!(events[0].host, "127.0.0.1");
+        assert_eq!(events[0].port, 443);
+        assert_eq!(events[0].method, None, "pre-tunnel: no method/path");
+    }
+
+    #[test]
+    fn a_plain_http_attempt_through_the_proxy_is_refused_and_logged() {
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        // A malformed-handshake case with no clean host:port — a plain-HTTP absolute-form request
+        // instead of a CONNECT tunnel. It is refused, and logged (host blank, method + raw target)
+        // as the "what is the agent trying to do" signal it is.
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_log(log.clone()),
+        );
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        sock.write_all(b"GET http://host.test/secret HTTP/1.1\r\nHost: host.test\r\n\r\n")
+            .unwrap();
+        sock.flush().unwrap();
+        let reply = read_until_blank(&mut sock).unwrap();
+        assert!(reply.contains("method-not-allowed"), "{reply:?}");
+        let events = log.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one event: {events:?}");
+        assert_eq!(events[0].verdict, LogVerdict::Blocked);
+        assert_eq!(events[0].reason, "method-not-allowed");
+        assert_eq!(events[0].host, "", "no clean host for a plain-HTTP attempt");
+        assert_eq!(events[0].method.as_deref(), Some("GET"));
+        assert_eq!(events[0].path.as_deref(), Some("http://host.test/secret"));
     }
 
     #[test]

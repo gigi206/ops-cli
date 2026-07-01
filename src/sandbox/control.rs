@@ -21,13 +21,13 @@
 //! every parked request at once (one `answered host=…` line each, then `ok` — an older server that
 //! predates this replies `err …`, which the CLI reports as unsupported).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::allowlist::Rule;
 
@@ -269,20 +269,194 @@ impl ManualRules {
     }
 }
 
+// ── The live egress event log ─────────────────────────────────────────────────────────────────
+//
+// A bounded, in-memory ring of the decisions the proxy makes, read live by `ops net log` over the
+// same per-session control socket. It is **never written to disk and never crosses into the cage**:
+// it lives in the launch process's owner-only RAM for the session's lifetime and dies with it, at
+// the same trust level as the injected secret the proxy already holds. The proxy redacts a request's
+// query against the configured secret needles *before* pushing, so even in RAM the ring never holds a
+// raw configured secret; the default `ops net log` display drops the query entirely.
+
+/// The default number of recent egress events a session retains for the live log.
+pub(crate) const LOG_RING_CAP: usize = 1000;
+
+/// The verdict class of a logged egress decision. A superset of the `ops net stats` taxonomy
+/// (allow/deny/blocked): the log is a diagnostic record, not a counter, so it also carries `error` —
+/// a request the policy permitted but that could not complete (DNS failed, the host was unreachable,
+/// its certificate was rejected). Keeping `error` distinct from `blocked` (a *refusal*) is the point:
+/// "allowed but it failed" reads differently from "we said no", which is the question the log exists
+/// to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogVerdict {
+    /// The request was permitted and egressed.
+    Allow,
+    /// The request was refused: a rule, a method scope, an `ask` decision/timeout, a security guard
+    /// (SSRF, host/SNI mismatch, an outbound-secret leak, the splice cap), or a malformed/IP-literal
+    /// request ops declines to forward. Every case where ops itself said no.
+    Deny,
+    /// A security guard or protocol check refused the request (SSRF, host/SNI mismatch, an
+    /// outbound-secret leak, the splice cap, an IP-literal target, a malformed/smuggling request).
+    Blocked,
+    /// The request was allowed but did not complete: the name did not resolve, the host was
+    /// unreachable, or its certificate was rejected. Not a refusal — a downstream failure.
+    Error,
+}
+
+impl LogVerdict {
+    /// The stable wire/display token for this verdict.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LogVerdict::Allow => "allow",
+            LogVerdict::Deny => "deny",
+            LogVerdict::Blocked => "blocked",
+            LogVerdict::Error => "error",
+        }
+    }
+
+    /// Parse a verdict token back, or `None` if it is not one of the four.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(LogVerdict::Allow),
+            "deny" => Some(LogVerdict::Deny),
+            "blocked" => Some(LogVerdict::Blocked),
+            "error" => Some(LogVerdict::Error),
+            _ => None,
+        }
+    }
+}
+
+/// One decided egress request captured for the live view: when, where, how, and why. `method`/`path`
+/// are present only for the inspected L7 path (an early-CONNECT block or a raw `tcp://` splice has no
+/// HTTP head to read). The `path` is stored **already query-redacted** by the proxy, so the ring is
+/// safe to hold in RAM; the `reason` is a stable category token (or `allowed`), never a rule's text
+/// or a secret name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogEvent {
+    pub(crate) seq: u64,
+    /// Wall-clock capture time in epoch milliseconds — a clean stamp for `--json`; the human view
+    /// renders it as a relative age.
+    pub(crate) at_epoch_ms: u128,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) method: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) verdict: LogVerdict,
+    pub(crate) reason: String,
+}
+
+/// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
+/// before that cursor (surfaced, not silently dropped — a bursty agent between `--follow` polls),
+/// and the newest sequence number (the cursor to pass next time, even when `events` is empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogSnapshot {
+    pub(crate) events: Vec<LogEvent>,
+    pub(crate) dropped: u64,
+    pub(crate) head: u64,
+}
+
+/// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
+/// (via `Arc`) between the proxy serve threads (which [`push`](LogRing::push)) and the control serve
+/// thread (which [`snapshot`](LogRing::snapshot)s for `ops net log`). Sequence numbers start at 1 and
+/// never repeat within a session, so a `--follow` cursor of 0 means "from the beginning" and can
+/// never collide with a real event.
+pub(crate) struct LogRing {
+    inner: Mutex<LogInner>,
+    cap: usize,
+}
+
+struct LogInner {
+    next_seq: u64,
+    events: VecDeque<LogEvent>,
+}
+
+impl LogRing {
+    pub(crate) fn new(cap: usize) -> Self {
+        LogRing {
+            inner: Mutex::new(LogInner {
+                next_seq: 1,
+                events: VecDeque::new(),
+            }),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Append one decision, assigning it the next sequence number and evicting the oldest if the ring
+    /// is full. Called from the proxy with the path already query-redacted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push(
+        &self,
+        host: &str,
+        port: u16,
+        method: Option<&str>,
+        path: Option<&str>,
+        verdict: LogVerdict,
+        reason: &str,
+    ) {
+        let at_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut g = self.inner.lock().unwrap();
+        let seq = g.next_seq;
+        g.next_seq += 1;
+        g.events.push_back(LogEvent {
+            seq,
+            at_epoch_ms,
+            host: host.to_string(),
+            port,
+            method: method.map(str::to_string),
+            path: path.map(str::to_string),
+            verdict,
+            reason: reason.to_string(),
+        });
+        while g.events.len() > self.cap {
+            g.events.pop_front();
+        }
+    }
+
+    /// The events past `after`, plus the eviction gap and the newest sequence. `after = None` is a
+    /// tail read (the whole retained window; never reports a gap — a first read has nothing to miss);
+    /// `after = Some(cursor)` is a follow read (events with `seq > cursor`, reporting how many between
+    /// the cursor and the retained window were evicted unseen).
+    pub(crate) fn snapshot(&self, after: Option<u64>) -> LogSnapshot {
+        let g = self.inner.lock().unwrap();
+        let head = g.next_seq - 1;
+        let cursor = after.unwrap_or(0);
+        let events: Vec<LogEvent> = g
+            .events
+            .iter()
+            .filter(|e| e.seq > cursor)
+            .cloned()
+            .collect();
+        let dropped = match (after, g.events.front()) {
+            (Some(a), Some(oldest)) if oldest.seq > a + 1 => oldest.seq - a - 1,
+            _ => 0,
+        };
+        LogSnapshot {
+            events,
+            dropped,
+            head,
+        }
+    }
+}
+
 /// Serve the control socket: one short-lived thread per connection, each handling exactly one
-/// command. A per-connection error is that connection's problem, never the server's. Both the
-/// pending queue and the manual-rule overlay are shared in (the same ones the proxy holds).
+/// command. A per-connection error is that connection's problem, never the server's. The pending
+/// queue, the manual-rule overlay, and the event log are shared in (the same ones the proxy holds).
 pub(crate) fn serve(
     listener: UnixListener,
     state: Arc<PendingState>,
     manual: Arc<ManualRules>,
+    log: Arc<LogRing>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         let state = state.clone();
         let manual = manual.clone();
+        let log = log.clone();
         std::thread::spawn(move || {
-            let _ = handle(stream, &state, &manual);
+            let _ = handle(stream, &state, &manual, &log);
         });
     }
     Ok(())
@@ -295,13 +469,18 @@ const CMD_MAX: u64 = 256;
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
 /// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
 /// timeout are belt-and-braces against a stuck or malformed caller.
-fn handle(stream: UnixStream, state: &PendingState, manual: &ManualRules) -> io::Result<()> {
+fn handle(
+    stream: UnixStream,
+    state: &PendingState,
+    manual: &ManualRules,
+    log: &LogRing,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), state, manual);
+    let response = dispatch(line.trim(), state, manual, log);
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
@@ -313,10 +492,12 @@ fn handle(stream: UnixStream, state: &PendingState, manual: &ManualRules) -> io:
 /// `ALLOW *`/`DENY *`
 /// drain *every* parked request, replying one `answered host=<host>` line each then `ok` (the
 /// `session` token remembers each); `RULES` returns the session's manual rules
-/// (`manual allow|deny <rule>` lines) then `ok`. `path` is emitted last on a `pending` line so a
-/// query string's `=` cannot be mistaken for a field separator (the reader splits each token on its
-/// first `=`).
-fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules) -> String {
+/// (`manual allow|deny <rule>` lines) then `ok`. `LOG` returns the recent egress events (a `dropped=`
+/// line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one `event …` line
+/// each) then `ok`; `LOG after=<seq>` returns only events past that cursor. `path` is emitted last on
+/// a `pending`/`event` line so a query string's `=` cannot be mistaken for a field separator (the
+/// reader splits each token on its first `=`).
+fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("LIST") => {
@@ -382,8 +563,49 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules) -> String {
             out.push_str("ok\n");
             out
         }
+        Some("LOG") => {
+            // An optional `after=<seq>` makes this a follow read (events past the cursor, with the
+            // eviction gap reported); absent, it is a tail read of the whole retained window.
+            let after = parts
+                .next()
+                .and_then(|t| t.strip_prefix("after=")?.parse().ok());
+            let snapshot = log.snapshot(after);
+            let mut out = String::new();
+            if snapshot.dropped > 0 {
+                out.push_str(&format!("dropped={}\n", snapshot.dropped));
+            }
+            out.push_str(&format!("head={}\n", snapshot.head));
+            for ev in &snapshot.events {
+                out.push_str(&format_event_line(ev));
+            }
+            out.push_str("ok\n");
+            out
+        }
         _ => "err bad-request\n".to_string(),
     }
+}
+
+/// Format one event as a control-wire line. Fields are `key=value` tokens split on their first `=`;
+/// `method`/`path` are omitted when absent, and `path` is emitted **last** so a query string's `=`
+/// round-trips (it is the only field that can carry one, and an HTTP request-target has no spaces).
+fn format_event_line(ev: &LogEvent) -> String {
+    let mut line = format!(
+        "event seq={} at={} port={} verdict={} reason={}",
+        ev.seq,
+        ev.at_epoch_ms,
+        ev.port,
+        ev.verdict.as_str(),
+        ev.reason,
+    );
+    if let Some(method) = &ev.method {
+        line.push_str(&format!(" method={method}"));
+    }
+    line.push_str(&format!(" host={}", ev.host));
+    if let Some(path) = &ev.path {
+        line.push_str(&format!(" path={path}"));
+    }
+    line.push('\n');
+    line
 }
 
 // ── Client side (the `ops net pending` process) ───────────────────────────────────────────────
@@ -504,6 +726,112 @@ fn parse_pending_line(line: &str) -> Option<PendingRow> {
         port: port?,
         path: path?,
         waiting_secs: waiting?,
+    })
+}
+
+// The client half of the event log — the reader the `ops net logs` command connects through. The
+// server side (the `LOG` dispatch + the ring) is live now; the command that drives these is wired in
+// a following step, so they are `dead_code`-tolerated until then (the round-trip test exercises them).
+
+/// One reachable session's recent egress events, for `ops net logs`.
+#[allow(dead_code)]
+pub(crate) struct SessionLog {
+    pub(crate) pid: u32,
+    pub(crate) snapshot: LogSnapshot,
+}
+
+/// Query one session's control socket for its recent egress events (`LOG`, or `LOG after=<seq>` for a
+/// follow read past a cursor). A session whose socket is gone (a dead/stale launch) fails the connect
+/// and the caller skips it.
+#[allow(dead_code)]
+pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnapshot> {
+    let stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let cmd = match after {
+        Some(seq) => format!("LOG after={seq}\n"),
+        None => "LOG\n".to_string(),
+    };
+    (&stream).write_all(cmd.as_bytes())?;
+    (&stream).flush()?;
+    let mut events = Vec::new();
+    let mut dropped = 0;
+    let mut head = 0;
+    for line in BufReader::new(&stream).lines() {
+        let line = line?;
+        if line == "ok" {
+            break;
+        }
+        if let Some(v) = line.strip_prefix("dropped=") {
+            dropped = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("head=") {
+            head = v.parse().unwrap_or(0);
+        } else if let Some(ev) = parse_event_line(&line) {
+            events.push(ev);
+        }
+    }
+    Ok(LogSnapshot {
+        events,
+        dropped,
+        head,
+    })
+}
+
+/// Discover every reachable session's recent egress events: glob the control sockets, parse each
+/// filename's pid, and query it (with an optional per-nothing tail read — a shared cursor makes no
+/// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped.
+/// Sessions are returned ordered by pid for stable output.
+#[allow(dead_code)]
+pub(crate) fn log_all(data_dir: &Path) -> Vec<SessionLog> {
+    let mut sessions = Vec::new();
+    for pid in session_pids(data_dir) {
+        if let Ok(snapshot) = read_log(&control_socket(data_dir, pid), None) {
+            sessions.push(SessionLog { pid, snapshot });
+        }
+    }
+    sessions
+}
+
+/// Parse one `event seq=… at=… port=… verdict=… reason=… [method=…] host=… [path=…]` line into an
+/// event, or `None` if it is malformed. Each token is split on its first `=`, so a `path` carrying a
+/// query string's `=` round-trips (it is the last field).
+#[allow(dead_code)]
+fn parse_event_line(line: &str) -> Option<LogEvent> {
+    let mut seq = None;
+    let mut at = None;
+    let mut port = None;
+    let mut verdict = None;
+    let mut reason = None;
+    let mut method = None;
+    let mut host = None;
+    let mut path = None;
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "event" {
+        return None;
+    }
+    for token in tokens {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "seq" => seq = value.parse().ok(),
+            "at" => at = value.parse().ok(),
+            "port" => port = value.parse().ok(),
+            "verdict" => verdict = LogVerdict::parse(value),
+            "reason" => reason = Some(value.to_string()),
+            "method" => method = Some(value.to_string()),
+            "host" => host = Some(value.to_string()),
+            "path" => path = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(LogEvent {
+        seq: seq?,
+        at_epoch_ms: at?,
+        host: host?,
+        port: port?,
+        method,
+        path,
+        verdict: verdict?,
+        reason: reason?,
     })
 }
 
@@ -827,13 +1155,14 @@ mod tests {
     fn dispatch_remembers_only_on_the_session_token() {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
 
         // A bare ALLOW answers but does not remember.
         let s = state.clone();
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
         assert_eq!(
-            dispatch(&format!("ALLOW {seq}"), &state, &manual),
+            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log),
             "ok host=api.test count=1\n"
         );
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
@@ -846,12 +1175,12 @@ mod tests {
         let s = state.clone();
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
-        let _ = dispatch(&format!("ALLOW {seq} session"), &state, &manual);
+        let _ = dispatch(&format!("ALLOW {seq} session"), &state, &manual, &log);
         parked.join().unwrap();
         assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
         // And `RULES` reports the remembered rule with its exact port.
         assert!(
-            dispatch("RULES", &state, &manual).contains("manual allow https://api.test:8080"),
+            dispatch("RULES", &state, &manual, &log).contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
         );
     }
@@ -869,12 +1198,14 @@ mod tests {
 
         let pending = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let listener = UnixListener::bind(&socket).unwrap();
         {
             let pending = pending.clone();
             let manual = manual.clone();
+            let log = log.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual);
+                let _ = serve(listener, pending, manual, log);
             });
         }
 
@@ -1029,12 +1360,13 @@ mod tests {
     fn dispatch_star_drains_all_and_remembers_only_with_session() {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
 
         // A bare `DENY *` drains every request but remembers nothing. Parked one at a time so the
         // response lines come back in a deterministic oldest-first order.
         let _ = park_next(&state, "x.test", 8080, 0);
         let _ = park_next(&state, "y.test", 8080, 1);
-        let response = dispatch("DENY *", &state, &manual);
+        let response = dispatch("DENY *", &state, &manual, &log);
         assert_eq!(response, "answered host=x.test\nanswered host=y.test\nok\n");
         assert!(
             manual.snapshot().1.is_empty(),
@@ -1044,12 +1376,12 @@ mod tests {
         // `ALLOW * session` drains and remembers each host:port as a manual rule.
         let _ = park_next(&state, "p.test", 8080, 0);
         let _ = park_next(&state, "q.test", 8080, 1);
-        let _ = dispatch("ALLOW * session", &state, &manual);
+        let _ = dispatch("ALLOW * session", &state, &manual, &log);
         let (allow, _) = manual.snapshot();
         assert_eq!(allow.len(), 2, "`* session` remembers each answered host");
 
         // An empty queue replies a clean `ok` with no `answered` lines.
-        assert_eq!(dispatch("ALLOW *", &state, &manual), "ok\n");
+        assert_eq!(dispatch("ALLOW *", &state, &manual, &log), "ok\n");
     }
 
     #[test]
@@ -1063,12 +1395,14 @@ mod tests {
 
         let pending = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let listener = UnixListener::bind(&socket).unwrap();
         {
             let pending = pending.clone();
             let manual = manual.clone();
+            let log = log.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual);
+                let _ = serve(listener, pending, manual, log);
             });
         }
 
@@ -1129,5 +1463,181 @@ mod tests {
             matches!(outcome, DrainOutcome::Unsupported),
             "an `err` reply must surface as Unsupported"
         );
+    }
+
+    // ── The live egress event log ──────────────────────────────────────────────────────────────
+
+    fn push_event(ring: &LogRing, host: &str, verdict: LogVerdict, reason: &str) {
+        ring.push(host, 443, Some("GET"), Some("/x"), verdict, reason);
+    }
+
+    #[test]
+    fn log_ring_assigns_monotonic_seqs_and_evicts_oldest_past_cap() {
+        let ring = LogRing::new(3);
+        for i in 0..5 {
+            push_event(&ring, &format!("h{i}.test"), LogVerdict::Allow, "allowed");
+        }
+        let snap = ring.snapshot(None);
+        // Cap is 3, so only the newest three survive; seqs are 1..=5 and never repeat.
+        assert_eq!(snap.events.len(), 3);
+        assert_eq!(snap.head, 5, "head is the newest seq assigned");
+        let seqs: Vec<u64> = snap.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 4, 5], "the oldest two were evicted");
+        assert_eq!(snap.events[0].host, "h2.test");
+        assert_eq!(snap.dropped, 0, "a tail read never reports a gap");
+    }
+
+    #[test]
+    fn log_ring_tail_returns_the_whole_window_with_no_gap() {
+        let ring = LogRing::new(LOG_RING_CAP);
+        push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
+        push_event(&ring, "b.test", LogVerdict::Deny, "denied-default");
+        let snap = ring.snapshot(None);
+        assert_eq!(snap.events.len(), 2);
+        assert_eq!(snap.dropped, 0);
+        assert_eq!(snap.head, 2);
+        assert_eq!(snap.events[1].verdict, LogVerdict::Deny);
+        assert_eq!(snap.events[1].reason, "denied-default");
+    }
+
+    #[test]
+    fn log_ring_follow_reports_the_eviction_gap_and_advances() {
+        let ring = LogRing::new(2);
+        // Push 4 events; the ring keeps only seqs 3 and 4.
+        for i in 0..4 {
+            push_event(&ring, &format!("h{i}.test"), LogVerdict::Allow, "allowed");
+        }
+        // A follower whose cursor is 1 missed seq 2 (evicted, never seen): report the gap.
+        let snap = ring.snapshot(Some(1));
+        let seqs: Vec<u64> = snap.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 4]);
+        assert_eq!(snap.dropped, 1, "seq 2 fell off the ring between polls");
+        // A follower already at the head sees nothing new and no gap.
+        let caught_up = ring.snapshot(Some(snap.head));
+        assert!(caught_up.events.is_empty());
+        assert_eq!(caught_up.dropped, 0);
+        assert_eq!(caught_up.head, 4);
+    }
+
+    #[test]
+    fn event_line_round_trips_through_the_wire() {
+        // A full L7 event whose path carries a query string's `=` (the field that must stay last).
+        let ev = LogEvent {
+            seq: 7,
+            at_epoch_ms: 1_700_000_000_123,
+            host: "api.test".into(),
+            port: 8443,
+            method: Some("POST".into()),
+            path: Some("/v1/x?a=1&b=2".into()),
+            verdict: LogVerdict::Blocked,
+            reason: "outbound-secret".into(),
+        };
+        let line = format_event_line(&ev);
+        let parsed = parse_event_line(line.trim()).expect("a well-formed line parses");
+        assert_eq!(parsed, ev, "the event round-trips including the query path");
+
+        // An early-CONNECT / L4 event has no method/path — those tokens are omitted and parse None.
+        let bare = LogEvent {
+            seq: 8,
+            at_epoch_ms: 1_700_000_000_456,
+            host: "raw.test".into(),
+            port: 22,
+            method: None,
+            path: None,
+            verdict: LogVerdict::Allow,
+            reason: "allowed".into(),
+        };
+        let parsed = parse_event_line(format_event_line(&bare).trim()).unwrap();
+        assert_eq!(parsed, bare);
+
+        // Every verdict token round-trips — in particular `error` (allowed-but-failed), the one the
+        // proxy tests only ever assert in memory, so a typo in its wire token would otherwise surface
+        // only when the CLI reads a live event over the socket.
+        for verdict in [
+            LogVerdict::Allow,
+            LogVerdict::Deny,
+            LogVerdict::Blocked,
+            LogVerdict::Error,
+        ] {
+            let ev = LogEvent {
+                seq: 9,
+                at_epoch_ms: 1_700_000_000_789,
+                host: "h.test".into(),
+                port: 443,
+                method: Some("GET".into()),
+                path: Some("/p".into()),
+                verdict,
+                reason: "dns-failure".into(),
+            };
+            let parsed = parse_event_line(format_event_line(&ev).trim()).unwrap();
+            assert_eq!(
+                parsed.verdict, verdict,
+                "verdict {verdict:?} must round-trip"
+            );
+            assert_eq!(parsed, ev);
+        }
+    }
+
+    #[test]
+    fn read_log_round_trips_over_the_socket() {
+        // The integration seam: the client `read_log`/`log_all` against a real `serve` over a bound
+        // socket, so the server's wire format and the client's parser are exercised together.
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 33333u32;
+        let socket = control_socket(data.path(), pid);
+
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        log.push(
+            "a.test",
+            443,
+            Some("GET"),
+            Some("/one"),
+            LogVerdict::Allow,
+            "allowed",
+        );
+        log.push(
+            "b.test",
+            443,
+            Some("POST"),
+            Some("/two?t=1"),
+            LogVerdict::Deny,
+            "denied-by-rule",
+        );
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        {
+            let pending = pending.clone();
+            let manual = manual.clone();
+            let log = log.clone();
+            thread::spawn(move || {
+                let _ = serve(listener, pending, manual, log);
+            });
+        }
+
+        // A tail read over the socket returns both events, newest last, with the fields intact.
+        let snap = read_log(&socket, None).unwrap();
+        assert_eq!(snap.events.len(), 2);
+        assert_eq!(snap.head, 2);
+        assert_eq!(snap.events[0].host, "a.test");
+        assert_eq!(snap.events[0].verdict, LogVerdict::Allow);
+        assert_eq!(snap.events[1].host, "b.test");
+        assert_eq!(snap.events[1].reason, "denied-by-rule");
+        assert_eq!(snap.events[1].path.as_deref(), Some("/two?t=1"));
+
+        // A follow read past the first event returns only the second, no gap.
+        let after = read_log(&socket, Some(1)).unwrap();
+        assert_eq!(after.events.len(), 1);
+        assert_eq!(after.events[0].seq, 2);
+        assert_eq!(after.dropped, 0);
+
+        // Discovery: `log_all` globs the egress dir and finds this session by its socket pid.
+        let sessions = log_all(data.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, pid);
+        assert_eq!(sessions[0].snapshot.events.len(), 2);
     }
 }
