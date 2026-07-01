@@ -132,9 +132,10 @@ pub(crate) struct NixMount {
 pub(crate) struct Overlay<'a> {
     /// Extra environment, upserted over the structural defaults.
     pub(crate) env: &'a [(String, String)],
-    /// Extra host paths to bind read-only (emitted before the structural mounts,
-    /// so a colliding structural mount shadows them).
-    pub(crate) ro_binds: &'a [PathBuf],
+    /// Extra host paths to bind, each read-only or read-write (emitted before the structural
+    /// mounts, so a colliding structural mount shadows them — a config bind can never displace
+    /// `/nix`, the identity files, or the loader, whatever its mode).
+    pub(crate) binds: &'a [crate::config::Bind],
     /// Tool `bin` directories, prepended to `PATH` ahead of the base userland.
     pub(crate) bin_paths: &'a [PathBuf],
 }
@@ -189,15 +190,20 @@ fn assemble(
     net: NetPolicy,
     cmd: Vec<OsString>,
 ) -> Result<SandboxSpec, SpecError> {
-    // Config-declared read-only binds come first, so any structural mount below
-    // shadows a colliding one — a config bind can never displace `/nix`, the
-    // synthetic `/etc/passwd`/`group`, the loader, or the project itself.
+    // Config-declared binds come first, so any structural mount below shadows a colliding one —
+    // a config bind can never displace `/nix`, the synthetic `/etc/passwd`/`group`, the loader,
+    // or the project itself, whether it is read-only or read-write. A `mode = "rw"` bind is a
+    // read-write mount (the cage writes through to the host path); the default is read-only.
     let mut mounts: Vec<Mount> = overlay
-        .ro_binds
+        .binds
         .iter()
-        .map(|src| Mount::RoBind {
-            src: src.clone(),
-            dest: src.clone(),
+        .map(|b| {
+            let (src, dest) = (b.path.clone(), b.path.clone());
+            if b.writable {
+                Mount::Bind { src, dest }
+            } else {
+                Mount::RoBind { src, dest }
+            }
         })
         .collect();
 
@@ -889,7 +895,7 @@ mod tests {
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
             env: &env,
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         assemble(
@@ -1141,7 +1147,7 @@ mod tests {
         };
         let overlay = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         let extra = [
@@ -1193,11 +1199,11 @@ mod tests {
         );
     }
 
-    /// Assemble with explicit config-supplied extra env, read-only binds, and
+    /// Assemble with explicit config-supplied extra env, binds, and
     /// prepended tool `bin` directories.
     fn assemble_with(
         extra_env: &[(String, String)],
-        extra_ro_binds: &[PathBuf],
+        extra_binds: &[crate::config::Bind],
         extra_bin_paths: &[PathBuf],
     ) -> SandboxSpec {
         let paths = SandboxPaths {
@@ -1211,7 +1217,7 @@ mod tests {
         };
         let overlay = Overlay {
             env: extra_env,
-            ro_binds: extra_ro_binds,
+            binds: extra_binds,
             bin_paths: extra_bin_paths,
         };
         assemble(
@@ -1305,11 +1311,27 @@ mod tests {
         assert_eq!(argv[rc - 2], "--ro-bind", "the shell rc must be read-only");
     }
 
+    /// A read-only config bind for the tests.
+    fn ro(path: &str) -> crate::config::Bind {
+        crate::config::Bind {
+            path: PathBuf::from(path),
+            writable: false,
+        }
+    }
+
+    /// A read-write config bind for the tests.
+    fn rw(path: &str) -> crate::config::Bind {
+        crate::config::Bind {
+            path: PathBuf::from(path),
+            writable: true,
+        }
+    }
+
     #[test]
     fn a_config_bind_precedes_the_structural_mounts() {
         // the extra bind is emitted first, so a colliding structural mount shadows
         // it — a config bind can never displace the store or the synthetic identity.
-        let spec = assemble_with(&[], &[PathBuf::from("/opt/data")], &[]);
+        let spec = assemble_with(&[], &[ro("/opt/data")], &[]);
         let argv = argv_strings(&spec);
         let extra = argv.iter().position(|s| s == "/opt/data").unwrap();
         let nix = argv.iter().position(|s| s == "/nix").unwrap();
@@ -1318,6 +1340,45 @@ mod tests {
             "the config bind must precede the structural /nix"
         );
         assert_eq!(argv[extra - 1], "--ro-bind", "a config bind is read-only");
+    }
+
+    #[test]
+    fn a_writable_config_bind_is_a_read_write_mount() {
+        // `mode = "rw"` maps to bwrap's `--bind` (read-write), while the default is `--ro-bind`.
+        let spec = assemble_with(&[], &[rw("/opt/data"), ro("/opt/ref")], &[]);
+        let argv = argv_strings(&spec);
+        let rw_i = argv.iter().position(|s| s == "/opt/data").unwrap();
+        assert_eq!(argv[rw_i - 1], "--bind", "a rw config bind is read-write");
+        let ro_i = argv.iter().position(|s| s == "/opt/ref").unwrap();
+        assert_eq!(argv[ro_i - 1], "--ro-bind", "a ro config bind is read-only");
+    }
+
+    #[test]
+    fn a_writable_config_bind_at_a_structural_dest_is_shadowed() {
+        // The safety invariant: a config bind — even read-write — is emitted before the
+        // structural mounts, so a rw bind aimed at `/nix` cannot make the store writable; the
+        // structural `/nix` mount is emitted last and wins. The rw bind still appears (earlier),
+        // but the structural mount shadows it at that dest.
+        let spec = assemble_with(&[], &[rw("/nix")], &[]);
+        let argv = argv_strings(&spec);
+        // The final mount at `/nix` is the structural store bind (from `nix_mount()`), read-only
+        // in this fixture — so the config rw bind did not turn the store writable.
+        let last_nix = argv
+            .iter()
+            .enumerate()
+            .rfind(|(_, s)| s.as_str() == "/nix")
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(
+            argv[last_nix - 1],
+            "/data/ops/store/nix",
+            "the structural store bind is the last mount at /nix"
+        );
+        assert_eq!(
+            argv[last_nix - 2],
+            "--ro-bind",
+            "the store stays read-only despite a rw config bind at /nix"
+        );
     }
 
     #[test]
@@ -1378,7 +1439,7 @@ mod tests {
         };
         let overlay = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         let spec = assemble(
@@ -1601,7 +1662,7 @@ mod smoke {
         let env = [("TERM".to_string(), "dumb".to_string())];
         let overlay = Overlay {
             env: &env,
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         // this smoke exercises the userland against the shared store, read-only — the
@@ -1767,7 +1828,7 @@ mod smoke {
 
         let bare = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         let foreign_spec = build_spec(
@@ -1809,7 +1870,7 @@ mod smoke {
         let bin_paths = vec![realise(&cross_ref, "hello", "bin/hello", "hello-cross").join("bin")];
         let with_tool = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &bin_paths,
         };
         let cross_spec = build_spec(
@@ -1939,7 +2000,7 @@ mod smoke {
         };
         let overlay = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         // the cage reads the base userland AND writes into `/nix` — proving the rw bind
@@ -2109,7 +2170,7 @@ mod smoke {
         };
         let overlay = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         let cmd = vec![
@@ -2275,7 +2336,7 @@ mod smoke {
         };
         let overlay = Overlay {
             env: &[],
-            ro_binds: &[],
+            binds: &[],
             bin_paths: &[],
         };
         let cmd = vec![
@@ -2401,7 +2462,7 @@ mod smoke {
             };
             let overlay = Overlay {
                 env: &[],
-                ro_binds: &[],
+                binds: &[],
                 bin_paths: &[],
             };
             let cmd = vec![

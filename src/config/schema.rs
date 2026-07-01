@@ -17,9 +17,10 @@ pub(crate) struct RawConfig {
     /// Extra environment variables for the sandbox.
     #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
-    /// Extra host paths to expose read-only inside the sandbox.
+    /// Extra host paths to expose inside the sandbox — read-only by default, or read-write
+    /// with the table form (see [`RawBind`]).
     #[serde(default)]
-    pub(crate) binds: Vec<String>,
+    pub(crate) binds: Vec<RawBind>,
     /// Tools to provision into the sandbox, as `name = "<backend>:<locator>"`. The name
     /// is a free label — the merge key across layers and the on-disk root name; the value
     /// carries a mandatory backend prefix (parsed downstream, not here): `nix:<attribute>`
@@ -71,6 +72,38 @@ pub(crate) struct RawConfig {
     /// memory ceiling) reduces the anti-DoS protection, a choice an untrusted project may not
     /// make. Each field is independent and falls back to the default when unset.
     pub(crate) limits: Option<RawLimits>,
+}
+
+/// One `binds` entry: a bare path string (bound **read-only**, the default) or a table
+/// `{ path = "...", mode = "rw" }` that marks the bind **read-write**. An untagged enum so
+/// both forms coexist in one array — `binds = ["/ro/path", { path = "/rw/path", mode = "rw" }]`
+/// — keeping the common read-only case a bare string, matching the string-or-table shape of
+/// `cmd`/`network`. On serialize a read-only bind written as a bare string round-trips as
+/// itself (the minimal, canonical form), a table form round-trips as a table.
+///
+/// `binds` is a security field either way (honored only from a trusted source): a read-only
+/// bind exposes the path's contents, a read-write one additionally lets the cage write through
+/// to the host path. An untrusted project gets no bind at all, so it can never obtain a
+/// writable one.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawBind {
+    /// A bare path: bound read-only.
+    Path(String),
+    /// A table: an explicit `path` plus an optional `mode` (`"ro"` default | `"rw"`).
+    Detailed(RawBindTable),
+}
+
+/// The table form of a `binds` entry: `{ path = "...", mode = "ro" | "rw" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawBindTable {
+    /// The host path to bind (absolute; validated downstream, like a bare-string bind).
+    pub(crate) path: String,
+    /// `"ro"` (the default) or `"rw"`. An unrecognized value is treated as read-only — the
+    /// fail-closed direction for a security field — with a warning, downstream. Absent means
+    /// read-only. Omitted on serialize when unset, so a plain read-only table stays minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
 }
 
 /// The `[limits]` table: optional overrides for the cage's cgroup resource limits.
@@ -126,9 +159,10 @@ pub(crate) struct RawApp {
     /// exported profile carries no noise `[env]` table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
-    /// Extra host paths to bind read-only for this app. A security field.
+    /// Extra host paths to bind for this app — read-only by default, or read-write with the
+    /// table form (see [`RawBind`]). A security field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) binds: Vec<String>,
+    pub(crate) binds: Vec<RawBind>,
     /// Extra tools to provision for this app, `name = "<backend>:<locator>"` (the same
     /// backend-prefixed form as the baseline `packages`), overriding a baseline tool of the
     /// same name.
@@ -389,7 +423,73 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.env.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(cfg.env.get("BAZ").map(String::as_str), Some("qux"));
-        assert_eq!(cfg.binds, vec!["/etc/ssl/custom", "/opt/data"]);
+        assert_eq!(
+            cfg.binds,
+            vec![
+                RawBind::Path("/etc/ssl/custom".into()),
+                RawBind::Path("/opt/data".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_a_mixed_ro_and_rw_bind_array() {
+        // A bare string is a read-only bind (the default); a table with `mode = "rw"` marks a
+        // read-write one. Both coexist in one array — the untagged enum tries `Path` first.
+        let cfg = parse(
+            br#"
+            binds = [
+                "/ro/path",
+                { path = "/rw/path", mode = "rw" },
+                { path = "/explicit/ro", mode = "ro" },
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.binds,
+            vec![
+                RawBind::Path("/ro/path".into()),
+                RawBind::Detailed(RawBindTable {
+                    path: "/rw/path".into(),
+                    mode: Some("rw".into()),
+                }),
+                RawBind::Detailed(RawBindTable {
+                    path: "/explicit/ro".into(),
+                    mode: Some("ro".into()),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mixed_bind_array_round_trips_through_toml() {
+        // The load-bearing spike: `serialize_app` must emit a heterogeneous string/table array
+        // that `parse_app` reads back identically — `toml::to_string` of a `Vec<untagged-enum>`
+        // where some elements are scalars and some are inline tables is the fragile corner.
+        let app = parse_app(
+            br#"
+            cmd = "demo-app"
+            binds = ["/ro/path", { path = "/rw/path", mode = "rw" }]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            app.binds,
+            vec![
+                RawBind::Path("/ro/path".into()),
+                RawBind::Detailed(RawBindTable {
+                    path: "/rw/path".into(),
+                    mode: Some("rw".into()),
+                }),
+            ]
+        );
+        let serialized = serialize_app(&app).unwrap();
+        let reparsed = parse_app(serialized.as_bytes()).unwrap();
+        assert_eq!(
+            app, reparsed,
+            "a mixed ro/rw bind array must round-trip:\n{serialized}"
+        );
     }
 
     #[test]

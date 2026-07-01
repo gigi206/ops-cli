@@ -181,6 +181,133 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
 }
 
 #[test]
+fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
+    // The headline of the ro/rw bind choice, with teeth on both sides. Two host directories are
+    // bound into a trusted project — one `mode = "rw"`, one read-only (the default). A cage that
+    // writes into the rw one must have its bytes appear at the *host* path (proving a real
+    // write-through, not a write into some cage-local tmpfs). The read-only one is proven genuinely
+    // mounted (the cage reads a pre-placed host file through it) and then integrity-protecting (a
+    // write fails with `EROFS` and leaves no new host file) — so "refused" cannot be confused with
+    // "not mounted". `binds` is trusted-only, so the project is trusted first. Skips (never fails)
+    // when the host cannot sandbox.
+    let project = TmpDir::new("rwbind-proj");
+    let data = TmpDir::new("rwbind-data");
+    let state = TmpDir::new("rwbind-state");
+    let rw = TmpDir::new("rwbind-rw");
+    let ro = TmpDir::new("rwbind-ro");
+    // Canonical paths: `load` canonicalizes each bind source, so the cage dest is the canonical
+    // path — write to and read from exactly that, or the in-cage path would not match the mount.
+    let rw_dir = std::fs::canonicalize(rw.path()).unwrap();
+    let ro_dir = std::fs::canonicalize(ro.path()).unwrap();
+
+    // Pre-place a file in the read-only bind so the test can prove the bind is actually mounted
+    // (the cage reads it) — otherwise a "write refused" could be confused with "bind absent".
+    std::fs::write(ro_dir.join("preexisting"), b"host-content\n").unwrap();
+
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        format!(
+            "binds = [\n  {{ path = \"{}\", mode = \"rw\" }},\n  \"{}\",\n]\n",
+            rw_dir.display(),
+            ro_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping rw-bind e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // `binds` is trusted-only, so trust the project before it takes effect.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The rw bind: the cage writes a marker, and it must land at the host path.
+    let rw_target = rw_dir.join("marker");
+    let write_rw = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("echo written-in-cage > {}", rw_target.display()),
+        ],
+    );
+    assert!(
+        write_rw.status.success(),
+        "writing into a rw bind failed: {}",
+        String::from_utf8_lossy(&write_rw.stderr)
+    );
+    let on_host = std::fs::read_to_string(&rw_target).unwrap_or_default();
+    assert_eq!(
+        on_host.trim(),
+        "written-in-cage",
+        "the cage's write did not reach the host path (rw bind not writing through)"
+    );
+
+    // The ro bind IS mounted (not merely absent): the cage reads the pre-placed host file
+    // through it, so a subsequent write refusal means "read-only", not "path not there".
+    let read_ro = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "cat",
+            &ro_dir.join("preexisting").display().to_string(),
+        ],
+    );
+    assert!(
+        read_ro.status.success()
+            && String::from_utf8_lossy(&read_ro.stdout).contains("host-content"),
+        "the read-only bind is not exposing the host path's contents: {}",
+        String::from_utf8_lossy(&read_ro.stderr)
+    );
+
+    // The ro bind: a write must fail, and no new host file may appear.
+    let ro_target = ro_dir.join("marker");
+    let write_ro = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("echo nope > {}", ro_target.display()),
+        ],
+    );
+    assert!(
+        !write_ro.status.success(),
+        "writing into a read-only bind unexpectedly succeeded"
+    );
+    assert!(
+        !ro_target.exists(),
+        "a read-only bind must not let the cage create a host file"
+    );
+}
+
+#[test]
 fn ops_app_launches_the_apps_command_with_its_overlay() {
     let project = TmpDir::new("appproj");
     let data = TmpDir::new("appdata");

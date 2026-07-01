@@ -347,7 +347,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: crate::config::AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages,
             network: None,
             gui: None,
@@ -370,7 +370,7 @@ mod tests {
         crate::config::Resolved {
             env: vec![],
             env_layer: Default::default(),
-            ro_binds: vec![],
+            binds: vec![],
             bind_layer: Default::default(),
             packages,
             nixpkgs_global: None,

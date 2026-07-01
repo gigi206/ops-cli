@@ -23,7 +23,7 @@ use crate::allowlist::{Layer, Methods, Rule, RuleKind};
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
-    NetworkField, NetworkTable, RawApp, RawConfig, RawHostSecret, RawHostSecrets,
+    NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
     RawSecretDefaults, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -430,8 +430,20 @@ pub(crate) struct LimitsOrigin {
     pub(crate) tasks_max: Provenance,
 }
 
+/// One resolved host bind: the canonical source/destination path and whether the cage may
+/// write to it. Read-only (the default) exposes the path's *contents*; read-write additionally
+/// lets the cage write *through* to the host path — strictly more privilege, so both are only
+/// honored from a trusted source (an untrusted project gets no bind at all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Bind {
+    /// The host path, bound at the same absolute path inside the cage.
+    pub(crate) path: PathBuf,
+    /// Whether the cage may write through to the host path (`mode = "rw"`); read-only otherwise.
+    pub(crate) writable: bool,
+}
+
 /// The resolved configuration the launcher applies: the layered environment and
-/// the read-only host binds, the declared tools, plus any warnings worth surfacing
+/// the host binds, the declared tools, plus any warnings worth surfacing
 /// (dropped fields, an unparseable or unsafe file). Nothing here is a hard error —
 /// a missing or broken config yields empty defaults, never a failed launch.
 #[derive(Clone)]
@@ -443,9 +455,9 @@ pub(crate) struct Resolved {
     /// the lookup matches what `env` lists). A display affordance for `ops config`; only the
     /// baseline resolution records it (an app overlay does not), and the launcher ignores it.
     pub(crate) env_layer: BTreeMap<String, Provenance>,
-    /// Extra host paths to bind read-only.
-    pub(crate) ro_binds: Vec<PathBuf>,
-    /// Which layer each effective bind came from, keyed by the *canonical* path `ro_binds`
+    /// Extra host paths to bind, each read-only or read-write.
+    pub(crate) binds: Vec<Bind>,
+    /// Which layer each effective bind came from, keyed by the *canonical* path `binds`
     /// lists (re-keyed after canonicalization in [`load`], so the lookup matches the displayed
     /// path). A display affordance for `ops config`, recorded only at the baseline.
     pub(crate) bind_layer: BTreeMap<PathBuf, Provenance>,
@@ -542,8 +554,9 @@ pub(crate) struct ResolvedApp {
     pub(crate) home_scope: AppHomeScope,
     /// Extra environment, in application order; folded over the baseline's so the app wins.
     pub(crate) env: Vec<(String, String)>,
-    /// Extra read-only host binds (absolute; canonicalized in [`load`], like the baseline).
-    pub(crate) ro_binds: Vec<PathBuf>,
+    /// Extra host binds this app adds (absolute; canonicalized in [`load`], like the baseline),
+    /// each read-only or read-write.
+    pub(crate) binds: Vec<Bind>,
     /// Extra tools, each tagged with its source's trust; override a baseline tool by name.
     pub(crate) packages: Vec<Package>,
     /// The app's own network posture, set only when a trusted source declared one. `Some`
@@ -595,9 +608,16 @@ impl Resolved {
         for pkg in app.packages {
             upsert_package(&mut self.packages, pkg.name, pkg.backend, pkg.state);
         }
-        for bind in app.ro_binds {
-            if !self.ro_binds.contains(&bind) {
-                self.ro_binds.push(bind);
+        // Merge by *path*: an app bind whose path the baseline already exposes overrides it in
+        // place (so a dest is never mounted twice, and the app's mode wins), consistent with how
+        // every other overlay field resolves — `env`/`packages`/`network`/`gui` all let the app
+        // win. Both layers are trusted, so this is a precedence choice, not a security one: an app
+        // may thus flip a baseline bind's mode (ro↔rw) or add a new path.
+        for bind in app.binds {
+            if let Some(existing) = self.binds.iter_mut().find(|b| b.path == bind.path) {
+                *existing = bind;
+            } else {
+                self.binds.push(bind);
             }
         }
         if let Some(network) = app.network {
@@ -655,7 +675,7 @@ fn resolve(
     let mut warnings = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut env_layer: BTreeMap<String, Provenance> = BTreeMap::new();
-    let mut binds: Vec<PathBuf> = Vec::new();
+    let mut binds: Vec<Bind> = Vec::new();
     let mut bind_layer: BTreeMap<PathBuf, Provenance> = BTreeMap::new();
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
@@ -900,7 +920,7 @@ fn resolve(
     Resolved {
         env,
         env_layer,
-        ro_binds: binds,
+        binds,
         bind_layer,
         packages,
         nixpkgs_global,
@@ -1225,7 +1245,7 @@ fn resolve_app(
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
-    let mut ro_binds: Vec<PathBuf> = Vec::new();
+    let mut binds: Vec<Bind> = Vec::new();
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
     let mut network: Option<NetworkPolicy> = None;
@@ -1261,7 +1281,7 @@ fn resolve_app(
     if let Some(app) = global {
         let source = app_source(GLOBAL_CONFIG, name);
         apply_env(&mut env, None, &mut warnings, &source, app.env, false);
-        apply_binds(&mut ro_binds, None, &mut warnings, &source, app.binds);
+        apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
         apply_packages(
             &mut packages,
             &mut warnings,
@@ -1321,7 +1341,7 @@ fn resolve_app(
         apply_env(&mut env, None, &mut warnings, &source, app.env, !trusted);
         if !app.binds.is_empty() {
             if trusted {
-                apply_binds(&mut ro_binds, None, &mut warnings, &source, app.binds);
+                apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
             } else {
                 warnings.push(dropped_binds_warning(state, app.binds.len()));
             }
@@ -1439,7 +1459,7 @@ fn resolve_app(
         cmd,
         home_scope,
         env,
-        ro_binds,
+        binds,
         packages,
         network,
         gui,
@@ -1537,23 +1557,43 @@ fn apply_env(
 /// full, so an extra bind is by definition an out-of-project path, and resolving a
 /// relative one against the working directory would be a surprise.
 fn apply_binds(
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<Bind>,
     mut origin: Option<(Provenance, &mut BTreeMap<PathBuf, Provenance>)>,
     warnings: &mut Vec<String>,
     source: &str,
-    binds: Vec<String>,
+    binds: Vec<RawBind>,
 ) {
     for b in binds {
-        let p = PathBuf::from(&b);
+        let (raw_path, writable) = match b {
+            RawBind::Path(p) => (p, false),
+            RawBind::Detailed(t) => {
+                let writable = match t.mode.as_deref() {
+                    None | Some("ro") => false,
+                    Some("rw") => true,
+                    // An unrecognized mode fails closed to read-only — the safe direction for a
+                    // security field — rather than guessing at a wider exposure.
+                    Some(other) => {
+                        warnings.push(format!(
+                            "{source}: bind `{}` has unknown mode `{other}`, binding read-only \
+                             (use `\"ro\"` or `\"rw\"`)",
+                            t.path
+                        ));
+                        false
+                    }
+                };
+                (t.path, writable)
+            }
+        };
+        let p = PathBuf::from(&raw_path);
         if p.is_absolute() {
             // Record the layer keyed by the raw declared path; [`load`] re-keys it to the
             // canonical form when it canonicalizes, so the displayed path is the lookup key.
             if let Some((layer, map)) = origin.as_mut() {
                 map.insert(p.clone(), *layer);
             }
-            out.push(p);
+            out.push(Bind { path: p, writable });
         } else {
-            warnings.push(format!("{source}: ignoring non-absolute bind `{b}`"));
+            warnings.push(format!("{source}: ignoring non-absolute bind `{raw_path}`"));
         }
     }
 }
@@ -2569,37 +2609,41 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     resolved.mise = mise;
 
     // Canonicalize the (already absolute) bind sources, dropping any that cannot be
-    // resolved — so `ro_binds` is the *effective* list, identical to what the
+    // resolved — so `binds` is the *effective* list, identical to what the
     // launch will bind, and `ops config` cannot advertise a bind the launch would
     // silently skip. Following symlinks here also pins each source against a swap.
-    // The per-layer provenance is re-keyed from the raw declared path to the canonical
-    // one as we go, so a lookup against the displayed (canonical) path resolves.
-    let declared = std::mem::take(&mut resolved.ro_binds);
+    // The bind's read-only/read-write mode carries through unchanged; the per-layer
+    // provenance is re-keyed from the raw declared path to the canonical one as we go,
+    // so a lookup against the displayed (canonical) path resolves.
+    let declared = std::mem::take(&mut resolved.binds);
     let raw_layer = std::mem::take(&mut resolved.bind_layer);
     let mut canon_binds = Vec::with_capacity(declared.len());
     let mut canon_layer = BTreeMap::new();
-    for p in declared {
-        if let Some(canon) = canonicalize_one(&p, &mut resolved.warnings) {
+    for bind in declared {
+        if let Some(canon) = canonicalize_one(&bind.path, &mut resolved.warnings) {
             // A bind that nests with one of the cage's own structural mounts will not behave as
             // declared (a descendant is shadowed, an ancestor over-exposes); surface it. Trusted-
             // only field, so this warns without dropping the bind.
             if let Some(w) = crate::sandbox::structural_nesting_warning(&canon) {
                 resolved.warnings.push(w);
             }
-            if let Some(layer) = raw_layer.get(&p) {
+            if let Some(layer) = raw_layer.get(&bind.path) {
                 canon_layer.insert(canon.clone(), *layer);
             }
-            canon_binds.push(canon);
+            canon_binds.push(Bind {
+                path: canon,
+                writable: bind.writable,
+            });
         }
     }
-    resolved.ro_binds = canon_binds;
+    resolved.binds = canon_binds;
     resolved.bind_layer = canon_layer;
 
     // Each app's binds are canonicalized the same way, into that app's own warnings — so an
     // app overlay also advertises only the binds the launch would actually make.
     for app in resolved.apps.values_mut() {
-        let declared = std::mem::take(&mut app.ro_binds);
-        app.ro_binds = canonicalize_binds(declared, &mut app.warnings);
+        let declared = std::mem::take(&mut app.binds);
+        app.binds = canonicalize_binds(declared, &mut app.warnings);
     }
 
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
@@ -2623,15 +2667,18 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
 
 /// Canonicalize each bind source, dropping with a warning any that cannot be resolved and warning
 /// (without dropping) any whose destination nests with a structural mount.
-fn canonicalize_binds(binds: Vec<PathBuf>, warnings: &mut Vec<String>) -> Vec<PathBuf> {
+fn canonicalize_binds(binds: Vec<Bind>, warnings: &mut Vec<String>) -> Vec<Bind> {
     binds
         .into_iter()
-        .filter_map(|p| {
-            let canon = canonicalize_one(&p, warnings)?;
+        .filter_map(|bind| {
+            let canon = canonicalize_one(&bind.path, warnings)?;
             if let Some(w) = crate::sandbox::structural_nesting_warning(&canon) {
                 warnings.push(w);
             }
-            Some(canon)
+            Some(Bind {
+                path: canon,
+                writable: bind.writable,
+            })
         })
         .collect()
 }
@@ -2829,6 +2876,19 @@ pub(crate) fn validate_profile(bytes: &[u8]) -> Result<ProfilePreview, String> {
 /// extra tools, the read-only binds, the network posture, and each injected credential by
 /// destination and source *locator*. A profile never carries a plaintext secret — only a locator
 /// (`env://VAR`, a `key`) — so this is safe to display and to share.
+/// Render one raw bind for the import posture summary: its path, with a ` (rw)` marker when the
+/// bind is read-write. An unknown mode is shown verbatim so a typo is visible before import.
+fn describe_raw_bind(bind: &RawBind) -> String {
+    match bind {
+        RawBind::Path(p) => p.clone(),
+        RawBind::Detailed(t) => match t.mode.as_deref() {
+            None | Some("ro") => t.path.clone(),
+            Some("rw") => format!("{} (rw)", t.path),
+            Some(other) => format!("{} (mode {other}?)", t.path),
+        },
+    }
+}
+
 fn describe_app_posture(app: &RawApp) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(cmd) = &app.cmd {
@@ -2843,7 +2903,8 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         lines.push(format!("packages: {}", names.join(", ")));
     }
     if !app.binds.is_empty() {
-        lines.push(format!("binds (read-only): {}", app.binds.join(", ")));
+        let descs: Vec<String> = app.binds.iter().map(describe_raw_bind).collect();
+        lines.push(format!("binds: {}", descs.join(", ")));
     }
     match &app.network {
         None => {}
@@ -3058,7 +3119,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
-            binds: binds.iter().map(|s| s.to_string()).collect(),
+            binds: binds.iter().map(|s| RawBind::Path(s.to_string())).collect(),
             packages: BTreeMap::new(),
             nixpkgs: None,
             network: None,
@@ -3066,6 +3127,15 @@ mod tests {
             secret: None,
             app: BTreeMap::new(),
             limits: None,
+        }
+    }
+
+    /// A resolved read-only bind at `path` (what `resolve` produces from a bare-string bind,
+    /// before `load`'s canonicalization).
+    fn ro_bind(path: &str) -> Bind {
+        Bind {
+            path: PathBuf::from(path),
+            writable: false,
         }
     }
 
@@ -3163,7 +3233,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            binds: binds.iter().map(|s| s.to_string()).collect(),
+            binds: binds.iter().map(|s| RawBind::Path(s.to_string())).collect(),
             packages: packages
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3246,7 +3316,7 @@ mod tests {
         let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
         let app = &r.apps["probe"];
         // Security fields drop under an untrusted project.
-        assert!(app.ro_binds.is_empty(), "binds must drop");
+        assert!(app.binds.is_empty(), "binds must drop");
         assert!(app.network.is_none(), "network must drop");
         // Free fields and the command survive; the package is carried, stamped untrusted, for
         // the launcher to weigh.
@@ -4274,7 +4344,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
             env: vec![("A".into(), "app".into()), ("C".into(), "app".into())],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
             gui: None,
@@ -4323,7 +4393,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network: None, // inherits the baseline's shared posture
             gui: None,
@@ -4352,7 +4422,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network: Some(NetworkPolicy::Allowlist(
                 crate::allowlist::EgressPolicy::new(vec![], vec![]),
@@ -4381,7 +4451,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network,
             gui: None,
@@ -4499,7 +4569,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network: None,
             gui: None,
@@ -4536,7 +4606,7 @@ mod tests {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network: Some(NetworkPolicy::Allowlist(
                 crate::allowlist::EgressPolicy::new(vec![], vec![]),
@@ -4572,7 +4642,7 @@ mod tests {
     fn global_only_is_honored_in_full() {
         let r = resolve_no_plugins(raw(&[("FOO", "g")], &["/srv/data"]), None);
         assert_eq!(get(&r.env, "FOO"), Some("g"));
-        assert_eq!(r.ro_binds, vec![PathBuf::from("/srv/data")]);
+        assert_eq!(r.binds, vec![ro_bind("/srv/data")]);
         assert!(r.warnings.is_empty());
     }
 
@@ -4590,8 +4660,8 @@ mod tests {
         assert_eq!(get(&r.env, "ONLYG"), Some("g"));
         // binds are the union, global first
         assert_eq!(
-            r.ro_binds,
-            vec![PathBuf::from("/srv/global"), PathBuf::from("/srv/project")]
+            r.binds,
+            vec![ro_bind("/srv/global"), ro_bind("/srv/project")]
         );
         assert!(r.warnings.is_empty());
     }
@@ -4608,7 +4678,7 @@ mod tests {
         // the free env field still applies
         assert_eq!(get(&r.env, "PROJVAR"), Some("v"));
         // the security bind is dropped, with a first-approval hint
-        assert!(r.ro_binds.is_empty());
+        assert!(r.binds.is_empty());
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("untrusted"));
         assert!(r.warnings[0].contains("run `ops trust`"));
@@ -4620,9 +4690,130 @@ mod tests {
             RawConfig::default(),
             Some((raw(&[], &["/etc/ssh"]), TrustState::Changed)),
         );
-        assert!(r.ro_binds.is_empty());
+        assert!(r.binds.is_empty());
         assert!(r.warnings[0].contains("changed since it was trusted"));
         assert!(r.warnings[0].contains("re-run `ops trust`"));
+    }
+
+    /// A `RawConfig` whose only field is the given `binds` list (raw, un-canonicalized).
+    fn raw_with_binds(binds: Vec<RawBind>) -> RawConfig {
+        RawConfig {
+            binds,
+            ..RawConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_trusted_rw_bind_resolves_writable() {
+        // A `{ path = "...", mode = "rw" }` bind from a trusted source resolves read-write; a
+        // bare-string sibling stays read-only. `resolve` does not canonicalize, so the paths are
+        // the declared ones.
+        let r = resolve_no_plugins(
+            raw_with_binds(vec![
+                RawBind::Path("/srv/ro".into()),
+                RawBind::Detailed(schema::RawBindTable {
+                    path: "/srv/rw".into(),
+                    mode: Some("rw".into()),
+                }),
+            ]),
+            None,
+        );
+        assert_eq!(
+            r.binds,
+            vec![
+                Bind {
+                    path: PathBuf::from("/srv/ro"),
+                    writable: false
+                },
+                Bind {
+                    path: PathBuf::from("/srv/rw"),
+                    writable: true
+                },
+            ]
+        );
+        assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_obtain_a_writable_bind() {
+        // The flagship property: a writable bind is strictly more privilege than a read-only one,
+        // and an untrusted project gets no bind at all — so it can never open a rw hole to the host.
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((
+                raw_with_binds(vec![RawBind::Detailed(schema::RawBindTable {
+                    path: "/etc".into(),
+                    mode: Some("rw".into()),
+                })]),
+                TrustState::Untrusted,
+            )),
+        );
+        assert!(r.binds.is_empty(), "an untrusted rw bind must drop");
+        assert!(r.warnings.iter().any(|w| w.contains("untrusted")));
+    }
+
+    #[test]
+    fn an_unknown_bind_mode_falls_closed_to_read_only() {
+        // A misspelled mode must not be guessed into a wider exposure — it binds read-only, with a
+        // warning naming the path and the accepted values.
+        let r = resolve_no_plugins(
+            raw_with_binds(vec![RawBind::Detailed(schema::RawBindTable {
+                path: "/srv/data".into(),
+                mode: Some("RW".into()),
+            })]),
+            None,
+        );
+        assert_eq!(
+            r.binds,
+            vec![Bind {
+                path: PathBuf::from("/srv/data"),
+                writable: false
+            }]
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("unknown mode `RW`")));
+    }
+
+    #[test]
+    fn an_app_bind_overrides_a_baseline_binds_mode_by_path() {
+        // `merge_app` merges by path: an app bind whose path the baseline exposes overrides it in
+        // place (the app's mode wins, consistent with every other overlay field), and a distinct
+        // app path is added. Built through the real resolve + merge path (a global config is
+        // trusted by location, so the app's rw binds are honored).
+        let mut cfg = raw_with_binds(vec![RawBind::Path("/shared".into())]);
+        cfg.app.insert(
+            "demo".into(),
+            RawApp {
+                cmd: Some(schema::RawCmd::Argv(vec!["demo".into()])),
+                binds: vec![
+                    RawBind::Detailed(schema::RawBindTable {
+                        path: "/shared".into(),
+                        mode: Some("rw".into()),
+                    }),
+                    RawBind::Detailed(schema::RawBindTable {
+                        path: "/app-only".into(),
+                        mode: Some("rw".into()),
+                    }),
+                ],
+                ..RawApp::default()
+            },
+        );
+        let mut r = resolve_no_plugins(cfg, None);
+        let app = r.apps["demo"].clone();
+        r.merge_app(app);
+        assert_eq!(
+            r.binds,
+            vec![
+                Bind {
+                    path: PathBuf::from("/shared"),
+                    writable: true
+                },
+                Bind {
+                    path: PathBuf::from("/app-only"),
+                    writable: true
+                },
+            ],
+            "the app's mode wins on a path collision (in place); a new app path is added"
+        );
     }
 
     #[test]
@@ -4729,7 +4920,7 @@ mod tests {
             RawConfig::default(),
             Some((raw(&[], &["relative/dir", "/abs/ok"]), TrustState::Trusted)),
         );
-        assert_eq!(r.ro_binds, vec![PathBuf::from("/abs/ok")]);
+        assert_eq!(r.binds, vec![ro_bind("/abs/ok")]);
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("non-absolute bind `relative/dir`"));
     }

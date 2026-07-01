@@ -935,6 +935,16 @@ fn opt_provenance_tag(
     origin.map_or_else(String::new, |o| provenance_tag(o, pal))
 }
 
+/// The mode marker appended after a bind path: a warning-hued ` (rw)` for a read-write bind
+/// (the more-privileged, exceptional case worth flagging), nothing for the read-only default.
+fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
+    if writable {
+        format!(" {}(rw){}", pal.warn, pal.reset)
+    } else {
+        String::new()
+    }
+}
+
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
     use config::view::{AppNetworkView, GuiView, LimitView, NetDefaultView, NetworkView};
     use std::fmt::Write as _;
@@ -968,12 +978,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     if view.binds.is_empty() {
         let _ = writeln!(o, "  {h}binds:{r} {dim}(none){r}");
     } else {
-        let _ = writeln!(o, "  {h}binds (read-only):{r}");
+        let _ = writeln!(o, "  {h}binds:{r}");
         for b in &view.binds {
             let _ = writeln!(
                 o,
-                "    {n}{}{r}{}",
+                "    {n}{}{r}{}{}",
                 b.path,
+                bind_mode_tag(b.writable, pal),
                 opt_provenance_tag(b.layer, pal)
             );
         }
@@ -1259,14 +1270,19 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
                 }
             }
-            // The read-only host binds this overlay adds — a security field, so what host paths
-            // `ops app <name>` exposes is visible here, the same as the baseline `binds` section. A
-            // count by default, each canonical path under `--details`.
+            // The host binds this overlay adds — a security field, so what host paths
+            // `ops app <name>` exposes (and whether read-write) is visible here, the same as the
+            // baseline `binds` section. A count by default, each canonical path under `--details`.
             if !app.binds.is_empty() {
                 if details {
-                    let _ = writeln!(o, "      {dim}binds (read-only):{r}");
+                    let _ = writeln!(o, "      {dim}binds:{r}");
                     for b in &app.binds {
-                        let _ = writeln!(o, "        {n}{b}{r}");
+                        let _ = writeln!(
+                            o,
+                            "        {n}{}{r}{}",
+                            b.path,
+                            bind_mode_tag(b.writable, pal)
+                        );
                     }
                 } else {
                     let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
@@ -1585,7 +1601,7 @@ fn render_app_detail(
     );
     if details {
         for b in &view.binds {
-            let _ = writeln!(o, "    {n}{b}{r}");
+            let _ = writeln!(o, "    {n}{}{r}{}", b.path, bind_mode_tag(b.writable, pal));
         }
     }
     let _ = writeln!(
@@ -7569,7 +7585,7 @@ mod tests {
         let cfg = |global: &str| config::Resolved {
             env: vec![],
             env_layer: Default::default(),
-            ro_binds: vec![],
+            binds: vec![],
             bind_layer: Default::default(),
             packages: vec![],
             nixpkgs_global: Some(global.to_string()),
@@ -7974,6 +7990,7 @@ mod tests {
             }],
             binds: vec![BindView {
                 path: "/data".into(),
+                writable: false,
                 layer: Some(ProvenanceView::Global),
             }],
             packages: vec![PackageView {
@@ -8756,7 +8773,11 @@ mod tests {
                         value: "vim".into(),
                     },
                 ],
-                binds: vec!["/data/cache".into()],
+                binds: vec![BindView {
+                    path: "/data/cache".into(),
+                    writable: false,
+                    layer: None,
+                }],
                 packages: vec![],
                 network: None,
                 gui: None,
@@ -8786,8 +8807,7 @@ mod tests {
             "--details must list each env entry as KEY=value:\n{expanded}"
         );
         assert!(
-            expanded.contains("      binds (read-only):")
-                && expanded.contains("        /data/cache"),
+            expanded.contains("      binds:") && expanded.contains("        /data/cache"),
             "--details must list each bind path:\n{expanded}"
         );
     }

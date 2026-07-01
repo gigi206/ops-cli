@@ -1774,7 +1774,7 @@ fn build(
 
     let overlay = binds::Overlay {
         env: &extra_env,
-        ro_binds: &prep.cfg.ro_binds,
+        binds: &prep.cfg.binds,
         bin_paths: &bin_paths,
     };
     // Generate the in-cage egress contract from the resolved (post-`merge_app`) network
@@ -2584,7 +2584,7 @@ mod tests {
         crate::config::Resolved {
             env: vec![],
             env_layer: Default::default(),
-            ro_binds: vec![],
+            binds: vec![],
             bind_layer: Default::default(),
             packages: vec![],
             nixpkgs_global: global.map(String::from),
@@ -2633,7 +2633,7 @@ mod tests {
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
             home_scope: scope,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages,
             network: None,
             gui: None,

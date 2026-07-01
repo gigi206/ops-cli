@@ -74,10 +74,13 @@ pub(crate) struct EnvVar {
     pub(crate) layer: Option<ProvenanceView>,
 }
 
-/// One extra read-only bind: the canonical host path and the layer that declared it.
+/// One extra bind: the canonical host path, whether the cage may write to it, and the layer
+/// that declared it (when known — an app overlay's binds carry no per-bind provenance).
 #[derive(Serialize)]
 pub(crate) struct BindView {
     pub(crate) path: String,
+    /// Whether the bind is read-write (`mode = "rw"`); read-only otherwise.
+    pub(crate) writable: bool,
     /// Which config layer declared the bind, when known.
     pub(crate) layer: Option<ProvenanceView>,
 }
@@ -92,6 +95,16 @@ pub(crate) enum ProvenanceView {
     Global,
     Project,
     Inherited,
+}
+
+/// A [`BindView`] for an app overlay's bind: path and mode, no per-bind provenance (an app's
+/// binds are its own additions, not tracked per layer like the baseline's).
+fn app_bind_view(bind: &super::Bind) -> BindView {
+    BindView {
+        path: bind.path.display().to_string(),
+        writable: bind.writable,
+        layer: None,
+    }
 }
 
 impl From<super::Provenance> for ProvenanceView {
@@ -365,10 +378,10 @@ pub(crate) struct AppView {
     /// the two are merged at launch) — the overlay's own entries, not the baseline-merged set. A
     /// count by default, each `KEY=value` under `--details`.
     pub(crate) env: Vec<AppEnvVar>,
-    /// The read-only host binds this overlay adds over the baseline — a security field, gated like
-    /// the baseline binds. The overlay's own paths, canonicalized to what a launch would mount. A
-    /// count by default, each path under `--details`.
-    pub(crate) binds: Vec<String>,
+    /// The host binds this overlay adds over the baseline — a security field, gated like the
+    /// baseline binds, each read-only or read-write. The overlay's own paths, canonicalized to what
+    /// a launch would mount. A count by default, each path (with its mode) under `--details`.
+    pub(crate) binds: Vec<BindView>,
     /// The packages this overlay declares — the same projection the baseline `packages` section
     /// carries (backend, locator, realisation, trust verdict, and a `flake:` pin), so an untrusted
     /// app package reads as withheld here exactly as it would be withheld at launch, and the
@@ -427,8 +440,9 @@ pub(crate) struct AppDetailView {
     /// baseline entries it inherits unchanged.
     pub(crate) env: Vec<AppEnvVar>,
     pub(crate) env_inherited: usize,
-    /// The read-only binds this app adds, and the count it inherits from the baseline.
-    pub(crate) binds: Vec<String>,
+    /// The binds this app adds (each read-only or read-write), and the count it inherits from the
+    /// baseline.
+    pub(crate) binds: Vec<BindView>,
     pub(crate) binds_inherited: usize,
     /// The packages this app declares (its own), and the count it inherits from the baseline.
     pub(crate) packages: Vec<PackageView>,
@@ -467,13 +481,14 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         .collect();
 
     let binds = resolved
-        .ro_binds
+        .binds
         .iter()
         .map(|b| BindView {
-            path: b.display().to_string(),
+            path: b.path.display().to_string(),
+            writable: b.writable,
             layer: resolved
                 .bind_layer
-                .get(b)
+                .get(&b.path)
                 .copied()
                 .map(ProvenanceView::from),
         })
@@ -768,11 +783,7 @@ fn app_view(
                 value: value.clone(),
             })
             .collect(),
-        binds: app
-            .ro_binds
-            .iter()
-            .map(|b| b.display().to_string())
-            .collect(),
+        binds: app.binds.iter().map(app_bind_view).collect(),
         packages: app
             .packages
             .iter()
@@ -950,15 +961,13 @@ fn app_detail_view(
             })
             .collect(),
         env_inherited,
-        binds: app
-            .ro_binds
-            .iter()
-            .map(|b| b.display().to_string())
-            .collect(),
+        binds: app.binds.iter().map(app_bind_view).collect(),
+        // Inherited baseline binds are those whose path the app does not shadow — the same
+        // path-keyed union `merge_app` performs, so the count matches what the launch mounts.
         binds_inherited: baseline
-            .ro_binds
+            .binds
             .iter()
-            .filter(|b| !app.ro_binds.contains(b))
+            .filter(|b| !app.binds.iter().any(|a| a.path == b.path))
             .count(),
         packages: app
             .packages
@@ -1089,6 +1098,7 @@ mod tests {
             }],
             binds: vec![BindView {
                 path: "/data".into(),
+                writable: false,
                 layer: Some(ProvenanceView::Global),
             }],
             packages: vec![PackageView {
@@ -1138,7 +1148,11 @@ mod tests {
                     key: "DEMO_API_KEY".into(),
                     value: "placeholder".into(),
                 }],
-                binds: vec!["/data/cache".into()],
+                binds: vec![BindView {
+                    path: "/data/cache".into(),
+                    writable: false,
+                    layer: None,
+                }],
                 packages: vec![PackageView {
                     name: "demo-tool".into(),
                     backend: "mise".into(),
@@ -1179,6 +1193,7 @@ mod tests {
         // The free-field provenance is part of the serialization contract.
         assert_eq!(json["env"][0]["layer"], "Project");
         assert_eq!(json["binds"][0]["path"], "/data");
+        assert_eq!(json["binds"][0]["writable"], false);
         assert_eq!(json["binds"][0]["layer"], "Global");
         assert_eq!(json["packages"][0]["trusted"], true);
         assert_eq!(json["mise"]["withheld_reason"], "the project is untrusted");
@@ -1206,7 +1221,8 @@ mod tests {
         // is flattened). The env value is the placeholder, a free field, never an injected secret.
         assert_eq!(json["apps"][0]["env"][0]["key"], "DEMO_API_KEY");
         assert_eq!(json["apps"][0]["env"][0]["value"], "placeholder");
-        assert_eq!(json["apps"][0]["binds"][0], "/data/cache");
+        assert_eq!(json["apps"][0]["binds"][0]["path"], "/data/cache");
+        assert_eq!(json["apps"][0]["binds"][0]["writable"], false);
         // An app overlay's packages serialize as the full package projection — the backend and
         // trust verdict the baseline `packages` carries — so the JSON form shows an untrusted app
         // package as withheld without a `--details` equivalent.
@@ -1269,7 +1285,7 @@ mod tests {
             cmd: vec!["pinned-tool".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![flake],
             network: None,
             gui: None,
@@ -1317,7 +1333,7 @@ mod tests {
         let baseline = Resolved {
             env: vec![],
             env_layer: Default::default(),
-            ro_binds: vec![],
+            binds: vec![],
             bind_layer: Default::default(),
             packages: vec![],
             nixpkgs_global: None,
@@ -1344,7 +1360,7 @@ mod tests {
             cmd: vec!["demo".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            ro_binds: vec![],
+            binds: vec![],
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
             gui: None,
