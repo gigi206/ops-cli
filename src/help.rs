@@ -100,9 +100,10 @@ const PAGES: &[Page] = &[
             "launch the app in the background as a session `ops ls`/`attach`/`stop` can see",
         )],
         details:
-            "`ops app <name>` launches a named application profile (an [app.<name>] table from\n\
-            the global or project config, or an imported <name>.toml) inside the project\n\
-            sandbox, each with its own persistent isolated home.",
+            "`ops app <name>` launches a named application profile (a project [app.<name>] overlay,\n\
+            or an imported apps/<name>.toml profile — a global app lives as a profile file, not\n\
+            inline in ops.toml) inside the project sandbox, each with its own persistent isolated\n\
+            home.",
     },
     Page {
         path: &["search"],
@@ -479,8 +480,8 @@ const PAGES: &[Page] = &[
         synopsis: "ops app rm <name>",
         summary: "remove an imported profile",
         options: &[("<name>", "the imported profile to remove")],
-        details: "Removes only an imported profile (a file in the profiles directory). An inline\n\
-            [app.<name>] lives in ops.toml and is yours to edit there.",
+        details: "Removes only an imported profile (a file in the profiles directory). A project\n\
+            [app.<name>] overlay lives in that project's .ops.toml and is yours to edit there.",
     },
     Page {
         path: &["app", "list"],

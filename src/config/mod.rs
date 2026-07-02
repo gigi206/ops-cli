@@ -2591,7 +2591,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     let global = if source.includes_global() {
         let mut global = read_global(&mut warnings);
         let profiles = read_profile_apps(&mut warnings);
-        fold_profile_apps(&mut global, profiles, &mut warnings);
+        merge_profile_apps(&mut global, profiles, &mut warnings);
         global
     } else {
         RawConfig::default()
@@ -2953,6 +2953,13 @@ pub(crate) fn profiles_dir() -> Option<PathBuf> {
     global_path().and_then(|p| p.parent().map(|d| d.join(PROFILES_DIR)))
 }
 
+/// The profile file for app `name` (`…/ops/apps/<name>.toml`), or `None` when no config base
+/// resolves. The counterpart of [`profiles_dir`] for a single app — the target an app-scoped
+/// global write (`ops net allow -a <name> --save -g`, `ops config … --app <name> -g`) reaches.
+pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
+    profiles_dir().map(|d| d.join(format!("{name}.toml")))
+}
+
 /// The posture an importable app profile would grant, in human-readable lines — shown so the
 /// deliberate `ops app import` is informed (it is the consent act; an imported profile is then
 /// honored even on an untrusted project, so what it grants must be visible).
@@ -3159,29 +3166,46 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
     out
 }
 
-/// Fold imported profile apps into the global config's app map. They are trusted by location, so
-/// they belong to the global layer. On a name collision an inline `[app.<name>]` in `ops.toml`
-/// wins — the more explicit, hand-authored statement — and the profile is skipped with a loud
-/// warning, never a silent merge of two definitions.
-fn fold_profile_apps(
+/// Make the imported profile apps the sole source of the global app layer. A global app lives only
+/// as a profile file under `apps/<name>.toml` — an inline `[app.<name>]` in `ops.toml` is forbidden
+/// (it used to shadow an entire imported profile: `cmd`/`packages`/`binds`/`env` and the profile's
+/// `[network]` all dropped, bricking the app). Any inline app present in the global config is
+/// therefore dropped inert with a loud, per-app migration warning, and the profiles take its place
+/// unconditionally — there is exactly one declaration site, so no collision is possible. `load`
+/// stays infallible: a bad state reachable only by manual editing never wedges the sandbox.
+fn merge_profile_apps(
     global: &mut RawConfig,
     profiles: BTreeMap<String, RawApp>,
     warnings: &mut Vec<String>,
 ) {
-    use std::collections::btree_map::Entry;
+    let apps_dir = profiles_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| format!("<config>/{PROFILES_DIR}"));
+    for name in global.app.keys() {
+        // Two shapes of the forbidden state need different remedies. When a profile of the same name
+        // already exists it is the one that runs, so the inline block is pure dead weight — say to
+        // delete it. Otherwise the inline block carries the only definition, so point at `export` to
+        // migrate it to a profile before it is dropped.
+        let remedy = if profiles.contains_key(name) {
+            format!(
+                "the profile {PROFILES_DIR}/{name}.toml already provides it — delete the inline \
+                 [app.{name}] from {GLOBAL_CONFIG}"
+            )
+        } else {
+            format!(
+                "migrate it with `ops app export {name} --out {apps_dir}/{name}.toml`, then delete \
+                 the inline [app.{name}] from {GLOBAL_CONFIG}"
+            )
+        };
+        warnings.push(format!(
+            "app `{name}`: an inline [app.{name}] in {GLOBAL_CONFIG} is forbidden — global apps \
+             live as profile files under {PROFILES_DIR}/<name>.toml. The inline declaration is \
+             ignored; {remedy}."
+        ));
+    }
+    global.app.clear();
     for (name, app) in profiles {
-        match global.app.entry(name) {
-            Entry::Occupied(occupied) => {
-                let name = occupied.key();
-                warnings.push(format!(
-                    "app `{name}`: an inline [app.{name}] in {GLOBAL_CONFIG} shadows the imported \
-                     profile of the same name (remove one)"
-                ));
-            }
-            Entry::Vacant(vacant) => {
-                vacant.insert(app);
-            }
-        }
+        global.app.insert(name, app);
     }
 }
 
@@ -3193,11 +3217,13 @@ fn fold_profile_apps(
 /// authored**, security fields and all, regardless of trust: import is the trust act, not export.
 /// Returns the bytes to emit, or a human-readable reason none was found.
 ///
-/// Note the precedence here is the **inverse** of [`fold_profile_apps`] at load: export prefers the
-/// imported profile, whereas a launch prefers an inline `[app.<name>]`. They only diverge when one
-/// name is *both* an imported profile and inline — a state the load-time collision warning already
-/// pushes the user to resolve — so `ops app export <name>` may emit the profile while `ops app
-/// <name>` would launch the inline definition. Keep at most one definition per name.
+/// Note the precedence here is the **inverse** of [`merge_profile_apps`] at load: export prefers
+/// the imported profile, whereas a launch drops an inline `[app.<name>]` in the global config
+/// (forbidden — see [`merge_profile_apps`]). They only diverge when one name is *both* an imported
+/// profile and an inline definition — a state the load-time migration warning already pushes the
+/// user to resolve — so `ops app export <name>` may emit the profile while `ops app <name>` would
+/// launch the profile (the inline is inert). Exporting the inline is itself the migration path off
+/// the forbidden form. Keep at most one definition per name.
 pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> {
     // 1. An imported profile: emit it verbatim (fidelity over re-serialization).
     if let Some(dir) = profiles_dir() {
@@ -4348,9 +4374,10 @@ mod tests {
     }
 
     #[test]
-    fn an_inline_app_shadows_a_profile_of_the_same_name() {
-        // On a name collision the hand-authored inline app wins, loudly; the unique profile is
-        // folded in.
+    fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
+        // A global app lives only as a profile file; an inline `[app.<name>]` in `ops.toml` is
+        // forbidden and dropped inert with a migration warning, so it can never shadow an imported
+        // profile of the same name. The profile takes the name; a non-colliding profile is added.
         let mut global = raw_with_app("demo-app", raw_app(&["inline"], &[], &[], &[], None));
         let profiles: BTreeMap<String, RawApp> = [
             (
@@ -4365,19 +4392,28 @@ mod tests {
         .into_iter()
         .collect();
         let mut warnings = Vec::new();
-        fold_profile_apps(&mut global, profiles, &mut warnings);
-        // The inline definition is untouched; the non-colliding profile is added.
+        merge_profile_apps(&mut global, profiles, &mut warnings);
+        // The inline definition is gone; the profile of the same name replaces it.
         assert_eq!(
             global.app["demo-app"]
                 .cmd
                 .as_ref()
                 .map(|c| c.clone().into_argv()),
-            Some(vec!["inline".to_string()])
+            Some(vec!["profile".to_string()])
         );
         assert!(global.app.contains_key("review"));
+        // Exactly the colliding inline app warns, with the "a profile already provides it" remedy —
+        // delete the stub, not re-export it (the profile already exists). The non-colliding profile
+        // `review` is added silently.
+        assert_eq!(warnings.len(), 1, "only the inline app warns: {warnings:?}");
+        let w = &warnings[0];
         assert!(
-            warnings.iter().any(|w| w.contains("shadows")),
-            "a collision must warn: {warnings:?}"
+            w.contains("demo-app") && w.contains("ignored") && w.contains("already provides it"),
+            "the colliding inline must be told to delete the stub: {w}"
+        );
+        assert!(
+            !w.contains("ops app export"),
+            "when a profile already exists, do not suggest export: {w}"
         );
     }
 

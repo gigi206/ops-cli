@@ -54,6 +54,15 @@ impl Fixture {
         std::fs::write(dir.join("ops.toml"), body).unwrap();
     }
 
+    /// Write an imported app profile `apps/<name>.toml` (a top-level `RawApp`) beside the global
+    /// config. Global apps live only as profile files — an inline `[app.<name>]` in `ops.toml` is
+    /// forbidden — so any test that needs a global app routes through here.
+    fn write_profile(&self, name: &str, body: &str) {
+        let dir = self.config_home.path().join("ops").join("apps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
     fn write_project(&self, body: &str) {
         std::fs::write(self.proj.path().join(".ops.toml"), body).unwrap();
     }
@@ -459,6 +468,176 @@ fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
             && body.contains("telemetry.example.com"),
         "both rules must land in the app's own network table:\n{body}"
     );
+    // NOTE: this still wholesale-replaces the app's effective network until the Inc 2 deep-merge
+    // lands — a project `[app.<name>.network]` with a mode replaces the profile's posture. Inc 2
+    // makes a mode-less overlay amend it instead.
+}
+
+#[test]
+fn net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields() {
+    let fx = Fixture::new();
+    // A full claude-code-style profile: cmd, packages, binds, env, and an `[network] mode="ask"`
+    // allowlist of 7 hosts. An app-scoped `--save -g` must AMEND the profile's allow array in place
+    // — preserving mode/cmd/packages/binds/env — and must NOT write a shadowing `[app.claude-code…]`
+    // into the global ops.toml (the brick bug).
+    fx.write_global("[network]\nmode = \"shared\"\n");
+    fx.write_profile(
+        "claude-code",
+        "cmd = \"claude\"\n\
+         \n\
+         [packages]\nclaude-code = \"mise:aqua:anthropics/claude-code\"\n\
+         \n\
+         [env]\nHOME = \"/home/gigi\"\nDISABLE_TELEMETRY = \"1\"\n\
+         \n\
+         [[binds]]\npath = \"/home/gigi/.claude\"\nmode = \"rw\"\n\
+         \n\
+         [network]\nmode = \"ask\"\nallow = [\n\
+         \t\"{*} api.anthropic.com:443\",\n\
+         \t\"{*} platform.claude.com:443\",\n\
+         \t\"{*} console.anthropic.com:443\",\n\
+         \t\"{*} mcp-proxy.anthropic.com:443\",\n\
+         \t\"claude.ai:443\",\n\
+         \t\"{GET,HEAD} downloads.claude.ai:443\",\n\
+         \t\"{GET,HEAD} storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*\",\n\
+         ]\n",
+    );
+
+    let out = fx.run(&["net", "allow", "new.host.com", "--app", "claude-code", "-g"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The rule landed in the PROFILE's `[network].allow`, mode="ask" preserved, and every other
+    // profile field (cmd/packages/env/binds) is untouched.
+    let profile = std::fs::read_to_string(
+        fx.config_home
+            .path()
+            .join("ops")
+            .join("apps")
+            .join("claude-code.toml"),
+    )
+    .unwrap();
+    assert!(
+        profile.contains("new.host.com") && profile.contains("mode = \"ask\""),
+        "the new host must append to the profile's allowlist with the mode preserved:\n{profile}"
+    );
+    assert!(
+        profile.contains("cmd = \"claude\"")
+            && profile.contains("mise:aqua:anthropics/claude-code")
+            && profile.contains("DISABLE_TELEMETRY")
+            && profile.contains("/home/gigi/.claude"),
+        "the profile's cmd/packages/env/binds must be preserved:\n{profile}"
+    );
+
+    // The global ops.toml must NOT carry a shadowing `[app.claude-code…]` stub.
+    let global =
+        std::fs::read_to_string(fx.config_home.path().join("ops").join("ops.toml")).unwrap();
+    assert!(
+        !global.contains("[app.claude-code"),
+        "no inline app stub must be written to the global config:\n{global}"
+    );
+
+    // The effective policy reflects the amended allowlist: 8 hosts, mode ask.
+    let rules = fx.run(&["net", "rules", "--app", "claude-code"]);
+    assert!(rules.status.success());
+    let r = String::from_utf8_lossy(&rules.stdout);
+    assert!(
+        r.contains("network (app claude-code): ask"),
+        "the app's mode stays ask:\n{r}"
+    );
+    assert!(
+        r.contains("new.host.com") && r.contains("api.anthropic.com"),
+        "both the new host and a profile host must be in the effective rules:\n{r}"
+    );
+}
+
+#[test]
+fn net_allow_app_save_global_creates_profile_when_absent() {
+    let fx = Fixture::new();
+    fx.write_global("[network]\nmode = \"shared\"\n");
+    // No profile exists for `newapp`. An app-scoped `--save -g` creates a minimal profile carrying
+    // a deny-by-default allowlist with the host (the Absent bootstrap).
+    let out = fx.run(&["net", "allow", "host.com", "--app", "newapp", "-g"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let profile = std::fs::read_to_string(
+        fx.config_home
+            .path()
+            .join("ops")
+            .join("apps")
+            .join("newapp.toml"),
+    )
+    .unwrap();
+    assert!(
+        profile.contains("[network]")
+            && profile.contains("mode = \"deny\"")
+            && profile.contains("host.com"),
+        "a fresh profile is created with a deny allowlist carrying the host:\n{profile}"
+    );
+    let rules = fx.run(&["net", "rules", "--app", "newapp"]);
+    assert!(rules.status.success());
+    assert!(
+        String::from_utf8_lossy(&rules.stdout).contains("host.com"),
+        "the new app's rule is visible"
+    );
+}
+
+#[test]
+fn inline_app_in_global_ops_toml_is_dropped_with_migration_guidance() {
+    let fx = Fixture::new();
+    // Simulate the pre-fix bad state: a hand-written `[app.foo]` in the global config. It must be
+    // dropped inert (never shadow a profile of the same name) with a per-app migration warning, and
+    // `ops net rules --app foo` must report no such app rather than launch a half-stub.
+    fx.write_global(
+        "[app.foo]\ncmd = \"true\"\n\
+         [app.foo.network]\nmode = \"deny\"\nallow = [\"api.foo.test\"]\n",
+    );
+    let rules = fx.run(&["net", "rules"]);
+    let stderr = String::from_utf8_lossy(&rules.stderr);
+    assert!(
+        stderr.contains("app `foo`") && stderr.contains("ops app export foo"),
+        "the dropped inline must warn with migration guidance:\n{stderr}"
+    );
+    let bad = fx.run(&["net", "rules", "--app", "foo"]);
+    assert_eq!(
+        bad.status.code(),
+        Some(2),
+        "the inline app is inert — it is not a resolvable app"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("no app named"),
+        "the inline app must not be launchable:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[test]
+fn net_allow_app_save_local_still_writes_project_ops_toml() {
+    let fx = Fixture::new();
+    fx.write_global("[network]\nmode = \"shared\"\n");
+    fx.write_profile(
+        "claude",
+        "cmd = \"claude\"\n[network]\nmode = \"ask\"\nallow = [\"api.anthropic.com\"]\n",
+    );
+    // `--save -l -a <app>` targets the project `.ops.toml [app.<app>.network]` (a project overlay is
+    // still allowed). Inc 1 leaves this path wholesale-replacing the profile's network at resolve
+    // time — the Inc 2 deep-merge fixes that. Here we only pin that the write lands in the project.
+    let out = fx.run(&["net", "allow", "h.com", "--app", "claude", "-l"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    assert!(
+        body.contains("[app.claude.network]") && body.contains("h.com"),
+        "the project overlay must land in .ops.toml:\n{body}"
+    );
 }
 
 #[test]
@@ -720,6 +899,133 @@ fn net_pending_all_save_global_drains_and_persists_each_host() {
     assert!(
         global.contains("blocked.example"),
         "the rule must be persisted to the global config:\n{global}"
+    );
+}
+
+#[test]
+fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_global_config() {
+    // The user's exact command: `net pending allow --all --save -g --app <name>`. The drained host
+    // must land in the app's PROFILE file (`apps/<name>.toml`), amending its `[network].allow` with
+    // `mode = "ask"` and every other field preserved — NOT a shadowing `[app.<name>.network]` stub in
+    // the global ops.toml (the brick bug) — and the summary must NAME the profile, never "the global
+    // config under app <name>" (the stale line that lied about where the rule went).
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixListener;
+
+    let fx = Fixture::new();
+    // A global baseline exists (so the "no inline stub" assertion is meaningful), plus the app's real
+    // profile: a cmd and an ask-mode allowlist the drain must preserve.
+    fx.write_global("[network]\nmode = \"shared\"\n");
+    fx.write_profile(
+        "claude-code",
+        "cmd = \"claude\"\n\
+         \n\
+         [network]\n\
+         mode = \"ask\"\n\
+         allow = [\"api.anthropic.com:443\"]\n",
+    );
+
+    // Register THIS process as a live GlobalApp session of `claude-code` so the `--app` filter finds
+    // it (liveness pruning keeps it — the process is alive and its start_ticks match). The record
+    // format is session.rs's serializer: `runtime=global-app:<name>`, filename `<pid>-<start_ticks>`.
+    let data = fx.data_home.path().join("ops");
+    let egress = data.join("egress");
+    let sessions = data.join("sessions");
+    std::fs::create_dir_all(&egress).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+    let pid = std::process::id();
+    let start_ticks: u64 = {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let after = &stat[stat.rfind(')').unwrap() + 1..];
+        after.split_whitespace().nth(19).unwrap().parse().unwrap()
+    };
+    let project_hex: String = fx
+        .proj
+        .path()
+        .canonicalize()
+        .unwrap()
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(
+        sessions.join(format!("{pid}-{start_ticks}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:claude-code\n\
+             project={project_hex}\n"
+        ),
+    )
+    .unwrap();
+
+    // The fake session answers the bulk drain with one host to be saved into the profile.
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        assert!(
+            cmd.starts_with("ALLOW *"),
+            "expected a bulk drain, got {cmd:?}"
+        );
+        (&stream)
+            .write_all(b"answered host=mcp.context7.com\nok\n")
+            .unwrap();
+    });
+
+    let out = fx.run(&[
+        "net",
+        "pending",
+        "allow",
+        "--all",
+        "--save",
+        "--global",
+        "--app",
+        "claude-code",
+    ]);
+    server.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The summary names the PROFILE, and never claims the global config (the old lie).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mcp.context7.com")
+            && stdout.contains("saved 1 allow rule(s) to the app profile `claude-code`"),
+        "the drain must report the profile as the target:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("to the global config"),
+        "the summary must not claim the rule went to the global config:\n{stdout}"
+    );
+
+    // The rule appended to the profile's allowlist, with mode ask and cmd preserved.
+    let profile = std::fs::read_to_string(
+        fx.config_home
+            .path()
+            .join("ops")
+            .join("apps")
+            .join("claude-code.toml"),
+    )
+    .unwrap();
+    assert!(
+        profile.contains("mcp.context7.com")
+            && profile.contains("mode = \"ask\"")
+            && profile.contains("cmd = \"claude\""),
+        "the host must append to the profile's allowlist, preserving mode and cmd:\n{profile}"
+    );
+
+    // No shadowing inline app stub was written to the global ops.toml.
+    let global =
+        std::fs::read_to_string(fx.config_home.path().join("ops").join("ops.toml")).unwrap();
+    assert!(
+        !global.contains("[app.claude-code"),
+        "no inline app stub must be written to the global config:\n{global}"
     );
 }
 
@@ -1296,20 +1602,19 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
 fn test_net_targets_an_app_effective_policy() {
     let fx = Fixture::new();
     // A global config (trusted by location, so no `ops trust` needed): a baseline allowlist that
-    // does NOT list the app's host, plus an app whose own overlay allows it and injects a key.
-    fx.write_global(
-        "[network]\n\
-         mode = \"deny\"\n\
-         allow = [\"github.com\"]\n\
+    // does NOT list the app's host. The app itself lives as an imported profile `apps/demo.toml`
+    // (a global app is a profile file, never an inline `[app.demo]` in `ops.toml`), whose own
+    // overlay allows the host and injects a key.
+    fx.write_global("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
+    fx.write_profile(
+        "demo",
+        "cmd = \"true\"\n\
          \n\
-         [app.demo]\n\
-         cmd = \"true\"\n\
-         \n\
-         [app.demo.network]\n\
+         [network]\n\
          mode = \"deny\"\n\
          allow = [\"api.demo.test\"]\n\
          \n\
-         [app.demo.secret.\"api.demo.test\"]\n\
+         [secret.\"api.demo.test\"]\n\
          from = \"env://DEMO_API_KEY\"\n\
          header = \"x-api-key\"\n\
          type = \"raw\"\n",
@@ -1370,18 +1675,16 @@ fn test_net_targets_an_app_effective_policy() {
 #[test]
 fn net_rules_targets_an_app_effective_policy() {
     let fx = Fixture::new();
-    // A global config (trusted by location): a baseline allowlist listing one host, plus an app
-    // whose OWN network overlay lists a different host and a path-scoped deny. `--app` must list the
-    // app's effective rules (its overlay replaces the baseline posture), not the baseline's.
-    fx.write_global(
-        "[network]\n\
-         mode = \"deny\"\n\
-         allow = [\"github.com\"]\n\
+    // A global config (trusted by location): a baseline allowlist listing one host. The app lives
+    // as an imported profile `apps/demo.toml` (a global app is a profile file), whose OWN network
+    // overlay lists a different host and a path-scoped deny. `--app` must list the app's effective
+    // rules (its overlay replaces the baseline posture), not the baseline's.
+    fx.write_global("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
+    fx.write_profile(
+        "demo",
+        "cmd = \"true\"\n\
          \n\
-         [app.demo]\n\
-         cmd = \"true\"\n\
-         \n\
-         [app.demo.network]\n\
+         [network]\n\
          mode = \"deny\"\n\
          allow = [\"api.demo.test\"]\n\
          deny = [\"api.demo.test/secret\"]\n",

@@ -221,19 +221,19 @@ fn app_targeted_net_test_is_plain_when_captured() {
     // renderer (raw `colored()` instead of the captured-stream palette) would leak ANSI here only.
     let home = TmpDir::new();
     let cwd = TmpDir::new();
-    // A global app (trusted by location) with its own allowlist and an injected credential.
-    let ops_dir = home.path().join("ops");
-    std::fs::create_dir_all(&ops_dir).unwrap();
+    // A global app lives as a profile file (trusted by location; an inline `[app.<name>]` in the
+    // global config is forbidden): a top-level `RawApp` with its own allowlist and injected credential.
+    let apps_dir = home.path().join("ops").join("apps");
+    std::fs::create_dir_all(&apps_dir).unwrap();
     std::fs::write(
-        ops_dir.join("ops.toml"),
-        "[app.demo]\n\
-         cmd = \"true\"\n\
+        apps_dir.join("demo.toml"),
+        "cmd = \"true\"\n\
          \n\
-         [app.demo.network]\n\
+         [network]\n\
          mode = \"deny\"\n\
          allow = [\"api.demo.test\"]\n\
          \n\
-         [app.demo.secret.\"api.demo.test\"]\n\
+         [secret.\"api.demo.test\"]\n\
          from = \"env://DEMO_API_KEY\"\n\
          header = \"x-api-key\"\n\
          type = \"raw\"\n",

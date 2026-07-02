@@ -1836,6 +1836,9 @@ fn config_get(args: &[OsString]) -> ExitCode {
     if positionals.len() != 1 {
         return config_usage("get");
     }
+    if let Some(code) = reject_app_global("get", &app, &scope) {
+        return code;
+    }
     let key = match effective_key("get", &positionals[0], &app) {
         Ok(k) => k,
         Err(code) => return code,
@@ -1873,6 +1876,29 @@ fn config_get(args: &[OsString]) -> ExitCode {
 fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
     if app.is_some() {
         eprintln!("ops: config {verb}: `--app` does not apply to `{verb}` (it takes no key)");
+        Some(config_usage(verb))
+    } else {
+        None
+    }
+}
+
+/// Refuse `--app <name>` together with `--global` on a key-taking verb. A global app lives only as a
+/// profile file (`apps/<name>.toml`) with top-level keys, so the `app.<name>.<key>` rewrite `--app`
+/// performs would write the wrong table shape into the global config (where `[app.*]` is forbidden).
+/// Edit the profile directly, or use `ops net allow -a <name> --save -g` for network rules. Full
+/// routing of `--app -g` to the profile is deferred. Returns the usage exit code when both flags are
+/// present, else `None`.
+fn reject_app_global(
+    verb: &str,
+    app: &Option<String>,
+    scope: &config::manage::Scope,
+) -> Option<ExitCode> {
+    if app.is_some() && matches!(scope, config::manage::Scope::Global) {
+        eprintln!(
+            "ops: config {verb}: `--app <name> --global` is not supported — a global app is a \
+             profile file under `apps/<name>.toml`; edit it directly, or use `ops net allow -a \
+             <name> --save -g` for network rules"
+        );
         Some(config_usage(verb))
     } else {
         None
@@ -1943,6 +1969,9 @@ fn config_set(args: &[OsString]) -> ExitCode {
     if positionals.len() != 2 {
         return config_usage("set");
     }
+    if let Some(code) = reject_app_global("set", &app, &scope) {
+        return code;
+    }
     let key = match effective_key("set", &positionals[0], &app) {
         Ok(k) => k,
         Err(code) => return code,
@@ -2000,6 +2029,9 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     };
     if positionals.len() != 1 {
         return config_usage("unset");
+    }
+    if let Some(code) = reject_app_global("unset", &app, &scope) {
+        return code;
     }
     let key = match effective_key("unset", &positionals[0], &app) {
         Ok(k) => k,
@@ -2566,8 +2598,9 @@ fn app_export(args: &[OsString]) -> ExitCode {
 }
 
 /// `ops app rm <name>`: remove an imported profile. Only an imported profile (a file in the
-/// profiles directory) is removed here — an inline `[app.<name>]` lives in `ops.toml` and is the
-/// user's to edit there. The name is validated before it is joined to a path (anti-traversal).
+/// profiles directory) is removed here — a project `[app.<name>]` overlay lives in that project's
+/// `.ops.toml` and is the user's to edit there (a global app is always a profile file, so there is
+/// nothing else to remove). The name is validated before it is joined to a path (anti-traversal).
 fn app_rm(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
         eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
@@ -2590,8 +2623,8 @@ fn app_rm(name: Option<&str>) -> ExitCode {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "ops: no imported profile '{name}' (an inline [app.{name}] lives in ops.toml — \
-                 edit it there)"
+                "ops: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
+                 project's .ops.toml — edit it there)"
             );
             ExitCode::FAILURE
         }
@@ -5014,16 +5047,24 @@ fn net_pending_drain_and_save(
         "{}",
         render_drain(past, session, app, &answered, &unsupported, &context, &pal)
     );
-    let target = if local {
-        "the project config".to_string()
-    } else {
-        "the global config".to_string()
-    };
-    let app_note = app.map(|a| format!(" under app `{a}`")).unwrap_or_default();
+    // Name the real write target — the same resolution the per-host save just used — so a global
+    // app's save is reported as its profile file, not "the global config under app" (the profile is
+    // where the rule actually landed). The target already carries the app, so there is no separate
+    // " under app" suffix. Resolving cannot fail on this success path: every host was just persisted
+    // to this same target; the fallback covers only the theoretical no-config-dir case.
+    let target = egress_write_target(scope, app, &cwd)
+        .map(|(_, _, t)| t)
+        .unwrap_or_else(|_| {
+            if local {
+                "the project config".to_string()
+            } else {
+                "the global config".to_string()
+            }
+        });
     match save_error {
         None => {
             println!(
-                "  saved {saved} {verb} rule(s) to {target}{app_note}{}",
+                "  saved {saved} {verb} rule(s) to {target}{}",
                 if local { " (re-trusted)" } else { "" }
             );
             if local {
@@ -5043,6 +5084,47 @@ fn net_pending_drain_and_save(
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolve where an egress-rule write lands and how to name it, shared by the single-rule
+/// [`persist_egress_rule`] and the bulk [`net_pending_drain_and_save`] so the two can never disagree
+/// about the file or the target its summary reports. Returns the file to edit, the in-file app key
+/// (`None` writes a top-level `[network]` — a profile's shape, or a baseline config; `Some(name)`
+/// writes `[app.<name>.network]` — a project overlay), and the human target description (which
+/// already carries the app, so no caller adds a separate " under app" suffix).
+///
+/// The one divergence from a plain scope→path map is an **app-scoped global** write: a global app
+/// lives as a profile file (`apps/<name>.toml`), never an inline `[app.<name>]` in the global config
+/// (which is forbidden), so it targets the profile with a top-level key.
+fn egress_write_target<'a>(
+    scope: &config::manage::Scope,
+    app: Option<&'a str>,
+    base: &Path,
+) -> Result<(PathBuf, Option<&'a str>, String), (u8, String)> {
+    use config::manage::{self, Scope};
+    let (path, app_key) = match (scope, app) {
+        (Scope::Global, Some(name)) => (
+            manage::scope_app_path(scope, base, name).map_err(|e| (1, e.to_string()))?,
+            None,
+        ),
+        (Scope::Local, Some(name)) => (
+            manage::scope_path(scope, base).map_err(|e| (1, e.to_string()))?,
+            Some(name),
+        ),
+        _ => (
+            manage::scope_path(scope, base).map_err(|e| (1, e.to_string()))?,
+            app,
+        ),
+    };
+    let target = match (scope, app) {
+        (Scope::Global, None) => "the global config".to_string(),
+        (Scope::Global, Some(a)) => format!("the app profile `{a}` ({})", path.display()),
+        (Scope::Local, None) => "the project config".to_string(),
+        (Scope::Local, Some(a)) => format!("the project config (app `{a}`)"),
+        (Scope::File(p), None) => p.display().to_string(),
+        (Scope::File(p), Some(a)) => format!("{} (app `{a}`)", p.display()),
+    };
+    Ok((path, app_key, target))
 }
 
 /// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
@@ -5072,10 +5154,14 @@ fn persist_egress_rule(
     }
     // `base` is the directory a `--local` scope resolves against: the cwd for `ops net allow|deny`,
     // or the *answered session's* project for `ops net pending --save` (so the rule lands in the
-    // project the agent runs in, not wherever the user happens to stand). Global ignores it.
-    let path = manage::scope_path(scope, base).map_err(|e| (1, e.to_string()))?;
+    // project the agent runs in, not wherever the user happens to stand). Global ignores it. The
+    // file, the in-file table shape (`app_key`), and the human `target` are resolved together — and
+    // shared with the drain path — so the write and the message it prints can never disagree about
+    // where the rule landed.
+    let (path, app_key, target) = egress_write_target(scope, app, base)?;
 
-    // A write to the project `.ops.toml` is trust-gated; the global config is trusted by location.
+    // A write to the project `.ops.toml` is trust-gated; the global config and the app profiles
+    // under `apps/` are trusted by location.
     let gated = matches!(scope, Scope::Local);
     let store =
         if gated {
@@ -5107,7 +5193,7 @@ fn persist_egress_rule(
     }
 
     let outcome =
-        manage::add_egress_rule(&path, app, list, rule).map_err(|e| (2, e.to_string()))?;
+        manage::add_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
 
     // Re-trust the project config after the write. Ordering is fail-safe: a crash between the write
     // and the trust leaves a correct-but-untrusted file, which the next launch drops — the rule does
@@ -5126,14 +5212,6 @@ fn persist_egress_rule(
         })?;
     }
 
-    let target = match (scope, app) {
-        (Scope::Global, None) => "the global config".to_string(),
-        (Scope::Global, Some(a)) => format!("the global config (app `{a}`)"),
-        (Scope::Local, None) => "the project config".to_string(),
-        (Scope::Local, Some(a)) => format!("the project config (app `{a}`)"),
-        (Scope::File(p), None) => p.display().to_string(),
-        (Scope::File(p), Some(a)) => format!("{} (app `{a}`)", p.display()),
-    };
     Ok(match outcome {
         AddOutcome::AlreadyPresent => {
             format!("{verb} {rule} is already present in {target} — no change")
@@ -7292,6 +7370,34 @@ mod tests {
         assert_eq!(folded, vec![("a.test", 3), ("b.test", 1)]);
         // The counts sum back to the request total — the invariant the drain header relies on.
         assert_eq!(folded.iter().map(|(_, n)| n).sum::<usize>(), hosts.len());
+    }
+
+    #[test]
+    fn egress_write_target_names_the_file_and_the_target_by_scope() {
+        // The single source of truth for both the single-rule and the drain summaries. A `--local`
+        // app targets the project `.ops.toml` with an `[app.<name>]` overlay key; an explicit `-c`
+        // file targets that path. Both are env-independent (the `--global` app arm resolves the
+        // profile path from the config home, so it is covered by the `net pending … --save -g --app`
+        // integration test instead). The target string must carry the app itself — a caller adds no
+        // separate " under app" suffix.
+        use config::manage::Scope;
+        let cwd = std::path::Path::new("/some/cwd");
+
+        let (path, key, target) = egress_write_target(&Scope::Local, Some("demo"), cwd).unwrap();
+        assert_eq!(path, cwd.join(config::PROJECT_CONFIG));
+        assert_eq!(key, Some("demo")); // a project overlay writes `[app.demo.network]`
+        assert_eq!(target, "the project config (app `demo`)");
+
+        let (_, key, target) = egress_write_target(&Scope::Local, None, cwd).unwrap();
+        assert_eq!(key, None);
+        assert_eq!(target, "the project config");
+
+        let explicit = std::path::PathBuf::from("/etc/ops.toml");
+        let (path, key, target) =
+            egress_write_target(&Scope::File(explicit.clone()), None, cwd).unwrap();
+        assert_eq!(path, explicit);
+        assert_eq!(key, None);
+        assert_eq!(target, "/etc/ops.toml");
     }
 
     #[test]

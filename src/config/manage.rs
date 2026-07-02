@@ -121,6 +121,21 @@ pub(crate) fn scope_path(scope: &Scope, cwd: &Path) -> Result<PathBuf, ManageErr
     }
 }
 
+/// Resolve a scope to the file an **app-scoped** operation targets. This diverges from
+/// [`scope_path`] only for [`Scope::Global`]: a global app lives as a profile file under
+/// `apps/<name>.toml` (an inline `[app.<name>]` in `ops.toml` is forbidden), so an app-scoped
+/// global write reaches the profile, not the global config. [`Scope::Local`] still targets the
+/// project `.ops.toml` (a project-scoped `[app.<name>]` overlay is allowed), and [`Scope::File`]
+/// targets the explicit path unchanged. The file need not exist yet — an app-scoped global write
+/// creates the profile.
+pub(crate) fn scope_app_path(scope: &Scope, cwd: &Path, app: &str) -> Result<PathBuf, ManageError> {
+    match scope {
+        Scope::Local => Ok(cwd.join(super::PROJECT_CONFIG)),
+        Scope::Global => super::profile_path(app).ok_or(ManageError::NoGlobalDir),
+        Scope::File(p) => Ok(p.clone()),
+    }
+}
+
 /// One config file in resolution order, for `ops config path`'s overview. `path` is `None` only
 /// for the global layer when no config directory resolves (no `$XDG_CONFIG_HOME`/`$HOME`).
 pub(crate) struct Layer {
@@ -697,6 +712,52 @@ mod tests {
         assert!(
             !body.contains("[app]\n") && !body.contains("[app.claude]\n"),
             "parent tables must be implicit:\n{body}"
+        );
+    }
+
+    #[test]
+    fn scope_app_path_local_targets_the_project_config_and_file_the_explicit_path() {
+        // `Local` targets the project `.ops.toml` (a project-scoped `[app.<name>]` overlay is still
+        // allowed); `File` targets the explicit path unchanged. The `Global` arm depends on the
+        // config-home env, so it is covered hermetically by the integration test
+        // `net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields` instead.
+        let cwd = std::path::Path::new("/some/cwd");
+        assert_eq!(
+            scope_app_path(&Scope::Local, cwd, "claude").unwrap(),
+            cwd.join(crate::config::PROJECT_CONFIG)
+        );
+        let explicit = std::path::PathBuf::from("/etc/ops.toml");
+        assert_eq!(
+            scope_app_path(&Scope::File(explicit.clone()), cwd, "x").unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_writes_a_top_level_network_table_into_a_profile_file() {
+        // A global app lives as a profile file (`apps/<name>.toml`), a top-level `RawApp` whose
+        // network lives at `[network]` (not `[app.<name>.network]`). An app-scoped global
+        // allow-rule save passes `app = None` so `add_egress_rule` writes the top-level table. On a
+        // fresh profile the Absent bootstrap creates a deny-by-default allowlist with the host.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join("apps").join("demo.toml");
+        add_egress_rule(&p, None, EgressList::Allow, "api.x.com").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("[network]")
+                && body.contains("mode = \"deny\"")
+                && body.contains("api.x.com"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("[app."),
+            "a profile carries a top-level `[network]`, never `[app.<name>.network]`:\n{body}"
+        );
+        // The written file parses as a top-level `RawApp` carrying the network field.
+        let app = crate::config::schema::parse_app(body.as_bytes()).expect("parses as a RawApp");
+        assert!(
+            app.network.is_some(),
+            "the profile carries the network field"
         );
     }
 

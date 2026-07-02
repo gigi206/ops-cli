@@ -1822,10 +1822,12 @@ fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
     fx.write_global(
         "[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
          [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
-         header = \"Authorization\"\ntype = \"bearer\"\n\
-         [app.wide]\ncmd = \"agent\"\n\
-         [app.narrow]\ncmd = \"agent\"\nnetwork = \"none\"\n",
+         header = \"Authorization\"\ntype = \"bearer\"\n",
     );
+    // The two apps live as imported profiles (a global app is a profile file, never an inline
+    // `[app.<name>]` in `ops.toml`): `wide` inherits the baseline allowlist, `narrow` cuts to none.
+    fx.write_profile("wide", "cmd = \"agent\"\n");
+    fx.write_profile("narrow", "cmd = \"agent\"\nnetwork = \"none\"\n");
 
     // `wide` keeps the network, so it inherits the baseline credential.
     let out = fx.run(&["config", "show", "--app", "wide"]);
@@ -1864,12 +1866,20 @@ fn config_show_compact_app_section_is_secret_posture_aware() {
     // `--app` detail view): an app declaring its own credential injects it only under an allowlist.
     // `wired` keeps an allowlist (injects); `solo` declares the same credential but cuts the network
     // to none (the launch injects nothing), so the roster must not claim an injection for it.
-    fx.write_global(
-        "[app.wired]\ncmd = \"agent\"\n[app.wired.network]\nmode = \"allowlist\"\n\
-         allow = [\"api.example.com\"]\n[app.wired.secret.\"api.example.com\"]\n\
-         from = \"env://DEMO_TOKEN\"\nheader = \"Authorization\"\ntype = \"bearer\"\n\
-         [app.solo]\ncmd = \"agent\"\nnetwork = \"none\"\n\
-         [app.solo.secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
+    // The two apps live as imported profiles (a global app is a profile file): `wired` keeps an
+    // allowlist with its own credential (injects); `solo` declares the same credential but cuts the
+    // network to none (the launch injects nothing).
+    fx.write_profile(
+        "wired",
+        "cmd = \"agent\"\n\
+         [network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
+         header = \"Authorization\"\ntype = \"bearer\"\n",
+    );
+    fx.write_profile(
+        "solo",
+        "cmd = \"agent\"\nnetwork = \"none\"\n\
+         [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
 
@@ -2060,24 +2070,25 @@ fn config_short_flags_alias_their_long_forms() {
         "-d must alias --default:\n{stdout}"
     );
 
-    // `-a` on the write verbs is `--app`: `set -a` writes under the app's table, `-g` targets the
-    // global file.
-    let out = fx.run(&["config", "set", "-a", "demo", "-g", "cmd", "mytool"]);
-    assert!(out.status.success(), "set -a -g must succeed");
-    let global = fx.config_home.path().join("ops").join("ops.toml");
-    let body = std::fs::read_to_string(&global).unwrap();
+    // `-a` on the write verbs is `--app`: `set -a` writes under the app's table. A global app is a
+    // profile file (an inline `[app.<name>]` in `ops.toml` is forbidden and `--app --global` is
+    // refused), so the project file is the write target here.
+    let out = fx.run(&["config", "set", "-a", "demo", "-l", "cmd", "mytool"]);
+    assert!(out.status.success(), "set -a -l must succeed");
+    let project = fx.proj.path().join(".ops.toml");
+    let body = std::fs::read_to_string(&project).unwrap();
     assert!(
         body.contains("[app.demo]") && body.contains("cmd = \"mytool\""),
-        "-a writes the app table into the -g (global) file:\n{body}"
+        "-a writes the app table into the -l (project) file:\n{body}"
     );
 
-    // `get -a -g` reads it back from the same global file.
-    let out = fx.run(&["config", "get", "-a", "demo", "-g", "cmd"]);
+    // `get -a -l` reads it back from the same project file.
+    let out = fx.run(&["config", "get", "-a", "demo", "-l", "cmd"]);
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mytool");
 
     // `-a` on `show` is `--app`: the per-app effective view (a distinct parser from the write verbs)
-    // — the global app just written is visible.
+    // — the project app just written is visible.
     let out = fx.run(&["config", "show", "-a", "demo"]);
     assert!(out.status.success(), "show -a must succeed");
     assert!(
