@@ -4846,9 +4846,20 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             return ExitCode::from(2);
         }
     }
-    // Validate the rule before touching any file (fail-closed: a `*` catch-all, a scheme, or an
-    // uncompilable regex is refused — the same classification the config resolver applies).
-    if let Err(e) = allowlist::classify(&rule) {
+    // Validate the rule before touching any file (fail-closed). A `@<name>` group reference is an
+    // alias for a `[net.groups]` group, expanded at load time — not itself a classifiable rule — so
+    // it is validated as a group name rather than through `classify` (which would reject the `@`). An
+    // undefined reference is not a write-time error (the group may be defined later); it warns loudly
+    // on the next load. Any other entry is classified: a `*` catch-all, a scheme, or an uncompilable
+    // regex is refused, the same classification the config resolver applies.
+    if let Some(group) = rule.trim().strip_prefix('@') {
+        if !config::is_valid_group_name(group) {
+            eprintln!(
+                "ops: invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
+            );
+            return ExitCode::from(2);
+        }
+    } else if let Err(e) = allowlist::classify(&rule) {
         eprintln!("ops: invalid rule {rule:?}: {e}");
         return ExitCode::from(2);
     }

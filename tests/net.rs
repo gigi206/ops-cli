@@ -440,6 +440,39 @@ fn net_allow_global_writes_the_global_config_without_a_trust_gate() {
 }
 
 #[test]
+fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
+    let fx = Fixture::new();
+    // A `@<group>` reference is an alias for a `[net.groups]` group (expanded at load time), not a
+    // classifiable host rule, so the write path validates it as a group *name* rather than through
+    // `classify` (which rejects the `@`) and persists it verbatim — a group can be added the same
+    // way a host is.
+    let out = fx.run(&["net", "allow", "@mcp", "--global"]);
+    assert!(
+        out.status.success(),
+        "a group reference must be accepted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let global = fx.config_home.path().join("ops").join("ops.toml");
+    let body = std::fs::read_to_string(&global).unwrap();
+    assert!(
+        body.contains("\"@mcp\""),
+        "the reference lands verbatim in the allow list:\n{body}"
+    );
+    // An invalid group name is refused (fail-closed), like a malformed host rule — nothing is
+    // written that a later load could not resolve to a legal reference.
+    let bad = fx.run(&["net", "allow", "@bad name", "--global"]);
+    assert!(
+        !bad.status.success(),
+        "an invalid group name must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("group name"),
+        "the error names the group-name rule: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[test]
 fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
     let fx = Fixture::new();
     let out = fx.run(&["net", "allow", "api.anthropic.com", "--app", "claude"]);

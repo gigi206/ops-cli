@@ -680,6 +680,19 @@ fn resolve(
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
 
+    // Reusable egress groups are defined only in the global config (trusted by location) and
+    // pre-classified once here; a `[network]` `allow`/`deny` list references one with `@<name>`.
+    // A project's `[net.groups]` is a security-relevant input it may not supply, so it is ignored.
+    let net_groups = build_net_groups(&mut warnings, std::mem::take(&mut global.net.groups));
+    if let Some((proj, _)) = &project {
+        if !proj.net.groups.is_empty() {
+            warnings.push(format!(
+                "{PROJECT_CONFIG}: ignoring `[net.groups]` — egress groups are defined in the \
+                 global config only; a project's `[network]` may reference them with `@<name>`"
+            ));
+        }
+    }
+
     // The global config is trusted by location, so it is honored in full: no
     // denylist, only key validation and the absolute-bind requirement.
     apply_env(
@@ -723,7 +736,7 @@ fn resolve(
     }
     let mut network = match global
         .network
-        .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v))
+        .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v, &net_groups))
     {
         Some(policy) => {
             network_origin = Provenance::Global;
@@ -828,7 +841,9 @@ fn resolve(
                     egress_stats = b;
                 }
                 warn_if_baseline_sets_default_methods(&mut warnings, PROJECT_CONFIG, &value);
-                if let Some(policy) = validate_network(&mut warnings, PROJECT_CONFIG, value) {
+                if let Some(policy) =
+                    validate_network(&mut warnings, PROJECT_CONFIG, value, &net_groups)
+                {
                     network = policy;
                     network_origin = Provenance::Project;
                 }
@@ -914,6 +929,7 @@ fn resolve(
         global_apps,
         project_apps,
         &secret_defaults,
+        &net_groups,
         plugins,
     );
 
@@ -1181,6 +1197,7 @@ fn resolve_apps(
     mut global_apps: BTreeMap<String, RawApp>,
     project_apps: Option<(BTreeMap<String, RawApp>, TrustState)>,
     secret_defaults: &SecretDefaults,
+    net_groups: &NetGroups,
     plugins: &PluginRegistry,
 ) -> BTreeMap<String, ResolvedApp> {
     let (mut project_apps, project_state) = match project_apps {
@@ -1209,7 +1226,7 @@ fn resolve_apps(
         }
         let global = global_apps.remove(&name);
         let project = project_apps.remove(&name).zip(project_state);
-        let resolved = resolve_app(&name, global, project, secret_defaults, plugins);
+        let resolved = resolve_app(&name, global, project, secret_defaults, net_groups, plugins);
         out.insert(name, resolved);
     }
     out
@@ -1241,6 +1258,7 @@ fn resolve_app(
     global: Option<RawApp>,
     project: Option<(RawApp, TrustState)>,
     secret_defaults: &SecretDefaults,
+    net_groups: &NetGroups,
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
@@ -1293,7 +1311,7 @@ fn resolve_app(
         if let Some(field) = app.network {
             warn_if_app_sets_stats(&mut warnings, &source, &field);
             let raw_dm = network_default_methods_of(&field).cloned();
-            if let Some(policy) = validate_network(&mut warnings, &source, field) {
+            if let Some(policy) = validate_network(&mut warnings, &source, field, net_groups) {
                 network = Some(policy);
                 network_origin = Provenance::Global;
                 if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
@@ -1360,7 +1378,7 @@ fn resolve_app(
             if trusted {
                 warn_if_app_sets_stats(&mut warnings, &source, &field);
                 let raw_dm = network_default_methods_of(&field).cloned();
-                if let Some(policy) = validate_network(&mut warnings, &source, field) {
+                if let Some(policy) = validate_network(&mut warnings, &source, field, net_groups) {
                     network = Some(policy);
                     network_origin = Provenance::Project;
                     if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
@@ -1774,6 +1792,7 @@ fn validate_network(
     warnings: &mut Vec<String>,
     source_label: &str,
     field: NetworkField,
+    groups: &NetGroups,
 ) -> Option<NetworkPolicy> {
     match field {
         NetworkField::Posture(value) => match value.as_str() {
@@ -1803,7 +1822,7 @@ fn validate_network(
                 None
             }
         },
-        NetworkField::Table(table) => validate_network_table(warnings, source_label, table),
+        NetworkField::Table(table) => validate_network_table(warnings, source_label, table, groups),
     }
 }
 
@@ -1814,6 +1833,7 @@ fn validate_network_table(
     warnings: &mut Vec<String>,
     source_label: &str,
     table: NetworkTable,
+    groups: &NetGroups,
 ) -> Option<NetworkPolicy> {
     match table.mode.as_str() {
         "none" => Some(NetworkPolicy::Isolated),
@@ -1824,8 +1844,8 @@ fn validate_network_table(
         // request for a live decision (allow rules auto-pass, deny rules auto-fail).
         "deny" | "allowlist" | "allow" | "ask" => {
             use crate::allowlist::DefaultAction;
-            let allow = classify_entries(warnings, source_label, "allow", table.allow);
-            let deny = classify_entries(warnings, source_label, "deny", table.deny);
+            let allow = classify_entries(warnings, source_label, "allow", table.allow, groups);
+            let deny = classify_entries(warnings, source_label, "deny", table.deny, groups);
             let policy = crate::allowlist::EgressPolicy::new(allow, deny);
             let policy = match table.mode.as_str() {
                 "allow" => policy.with_default(DefaultAction::Allow),
@@ -1897,24 +1917,96 @@ fn parse_ask_timeout(raw: &str) -> Result<Option<std::time::Duration>, String> {
     Ok((secs > 0).then(|| std::time::Duration::from_secs(secs)))
 }
 
-/// Classify the entries of one egress list (`allow` or `deny`), dropping a malformed
-/// entry with a warning that names which list it was in. Dropping fails closed: a bad
-/// `allow` entry leaves that host unreachable, and a bad `deny` entry leaves its carve-out
-/// off — never the reverse.
+/// Pre-classified reusable egress groups: each `[net.groups]` name mapped to the rules its
+/// entries classify to. Built once from the global config (trusted by location) and consulted
+/// when a `[network]` `allow`/`deny` list references a group with `@<name>`.
+type NetGroups = BTreeMap<String, Vec<crate::allowlist::Rule>>;
+
+/// Classify the entries of one egress list (`allow` or `deny`), expanding a leading `@<name>`
+/// into the rules of that named group (from `[net.groups]`). A malformed entry is dropped with
+/// a warning that names which list it was in; an unknown `@<name>` reference is dropped with a
+/// *loud* warning — a miss in a `deny` list silently drops a carve-out (the host would no longer
+/// be blocked), the one case where a typo fails open in intent, so an unresolved reference must
+/// never pass unnoticed. Only a leading `@` is a reference: a `@` anywhere else (a URL path like
+/// `host/@user`, a `re:` pattern) is a legitimate part of the entry and is classified as written.
 fn classify_entries(
     warnings: &mut Vec<String>,
     source_label: &str,
     list: &str,
     entries: Vec<String>,
+    groups: &NetGroups,
 ) -> Vec<crate::allowlist::Rule> {
     let mut rules = Vec::new();
     for entry in entries {
+        if let Some(name) = entry.trim().strip_prefix('@') {
+            match groups.get(name) {
+                Some(group_rules) => rules.extend(group_rules.iter().cloned()),
+                None => warnings.push(format!(
+                    "{source_label}: {list} references undefined group `@{name}` — define it under \
+                     `[net.groups]` in the global config, or remove the reference (the entry is \
+                     ignored, so nothing is {} for it)",
+                    if list == "deny" { "denied" } else { "allowed" }
+                )),
+            }
+            continue;
+        }
         match crate::allowlist::classify(&entry) {
             Ok(rule) => rules.push(rule),
             Err(e) => warnings.push(format!("{source_label}: ignoring {list} entry — {e}")),
         }
     }
     rules
+}
+
+/// Validate and pre-classify the global `[net.groups]` table into a [`NetGroups`] map. Each
+/// group's name is charset-validated (an invalid name is skipped with a warning), and each entry
+/// is classified like an `allow`/`deny` entry — a malformed one is dropped with a warning naming
+/// the group. A nested reference (`@other` inside a group) is rejected: a group is a flat list of
+/// egress entries in this version, so an unbounded or cyclic expansion is impossible by
+/// construction. Building every defined group here (not only referenced ones) surfaces a typo in
+/// an unused group early rather than only when some app first references it.
+fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String>>) -> NetGroups {
+    let mut groups = NetGroups::new();
+    for (name, entries) in raw {
+        if !is_valid_group_name(&name) {
+            warnings.push(format!(
+                "{GLOBAL_CONFIG}: ignoring net group `{name}`: a name must be 1–64 of [A-Za-z0-9._-]"
+            ));
+            continue;
+        }
+        let mut rules = Vec::new();
+        for entry in entries {
+            if entry.trim().starts_with('@') {
+                warnings.push(format!(
+                    "{GLOBAL_CONFIG}: net group `{name}`: ignoring nested reference `{}` — a group \
+                     is a flat list of egress entries and may not reference another group",
+                    entry.trim()
+                ));
+                continue;
+            }
+            match crate::allowlist::classify(&entry) {
+                Ok(rule) => rules.push(rule),
+                Err(e) => warnings.push(format!(
+                    "{GLOBAL_CONFIG}: net group `{name}`: ignoring entry `{entry}` — {e}"
+                )),
+            }
+        }
+        groups.insert(name, rules);
+    }
+    groups
+}
+
+/// Whether a `[net.groups]` name is a safe, referenceable identifier. A group name is not a path
+/// component (unlike an app name), so `.`/`..` are harmless; it is charset- and length-bounded so
+/// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `ops net`.
+/// Shared with the `ops net allow/deny` write path so a persisted `@<name>` reference is validated
+/// by the same rule the resolver uses to name a group.
+pub(crate) fn is_valid_group_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Validate and fold a layer's `[secret]` host entries into `out`, expanding any terse `key`
@@ -3257,6 +3349,18 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::collections::BTreeMap;
 
+    /// Test shim: [`super::validate_network`] with no egress groups defined — the common case in
+    /// these unit tests. It shadows the glob-imported real function so the many bare 3-argument
+    /// calls read as before; the `[net.groups]` expansion has its own dedicated tests that call
+    /// `super::validate_network` (or `build_net_groups`) directly with a populated group table.
+    fn validate_network(
+        warnings: &mut Vec<String>,
+        source_label: &str,
+        field: NetworkField,
+    ) -> Option<NetworkPolicy> {
+        super::validate_network(warnings, source_label, field, &NetGroups::new())
+    }
+
     fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         RawConfig {
             env: env
@@ -3271,7 +3375,224 @@ mod tests {
             secret: None,
             app: BTreeMap::new(),
             limits: None,
+            net: Default::default(),
         }
+    }
+
+    /// Build a `[network]` field in table form for the egress-group tests.
+    fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
+        NetworkField::Table(NetworkTable {
+            mode: mode.into(),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+        })
+    }
+
+    /// Build and pre-classify a `[net.groups]` table from `(name, entries)` pairs, returning the
+    /// map and any warnings `build_net_groups` emitted.
+    fn make_groups(defs: &[(&str, &[&str])]) -> (NetGroups, Vec<String>) {
+        let mut w = Vec::new();
+        let raw: BTreeMap<String, Vec<String>> = defs
+            .iter()
+            .map(|(n, es)| (n.to_string(), es.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        (build_net_groups(&mut w, raw), w)
+    }
+
+    #[test]
+    fn a_group_reference_expands_in_an_allow_list() {
+        let (g, gw) = make_groups(&[("mcp", &["{*} a.example.com:443", "{*} b.example.com:443"])]);
+        assert!(gw.is_empty(), "a clean group builds no warnings: {gw:?}");
+        let mut w = Vec::new();
+        let policy = super::validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            net_field("deny", &["@mcp", "c.example.com:443"], &[]),
+            &g,
+        )
+        .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        // The two group entries plus the one literal → three allow rules.
+        assert_eq!(p.allow_rules().len(), 3);
+        assert!(w.is_empty(), "no warnings for a resolved reference: {w:?}");
+    }
+
+    #[test]
+    fn a_group_reference_expands_in_a_deny_list_too() {
+        let (g, _) = make_groups(&[("telemetry", &["*.datadoghq.com:*", "*.sentry.io:*"])]);
+        let mut w = Vec::new();
+        let policy = super::validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            net_field("allow", &[], &["@telemetry"]),
+            &g,
+        )
+        .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        assert_eq!(p.deny_rules().len(), 2);
+    }
+
+    #[test]
+    fn an_undefined_group_reference_is_dropped_with_a_loud_warning() {
+        let (g, _) = make_groups(&[("mcp", &["a.example.com:443"])]);
+        let mut w = Vec::new();
+        // Reference a group that does not exist, in a DENY list — the case where a silent drop
+        // would fail open in intent (the host would no longer be blocked).
+        let policy = super::validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            net_field("allow", &[], &["@telemetr"]),
+            &g,
+        )
+        .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        assert!(
+            p.deny_rules().is_empty(),
+            "an unresolved reference denies nothing (fail closed)"
+        );
+        assert_eq!(w.len(), 1, "exactly one warning: {w:?}");
+        assert!(
+            w[0].contains("undefined group `@telemetr`"),
+            "the warning is loud and names the reference: {}",
+            w[0]
+        );
+        assert!(
+            w[0].contains("nothing is denied"),
+            "the warning spells out the deny-list consequence: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn build_net_groups_validates_names_entries_and_rejects_nesting() {
+        let (g, w) = make_groups(&[
+            ("ok", &["good.example.com:443"]),
+            ("bad name!", &["x.example.com:443"]), // invalid charset → skipped
+            ("nested", &["@ok"]),                  // a nested reference → rejected
+            ("malformed", &["https://*"]),         // a classify error → dropped
+        ]);
+        // The valid group is present with its one rule; the invalid-named one never lands.
+        assert_eq!(g.get("ok").map(|r| r.len()), Some(1));
+        assert!(!g.contains_key("bad name!"));
+        // `nested` and `malformed` exist but drop their (only) offending entry → empty.
+        assert_eq!(g.get("nested").map(|r| r.len()), Some(0));
+        assert_eq!(g.get("malformed").map(|r| r.len()), Some(0));
+        assert_eq!(
+            w.len(),
+            3,
+            "one warning each for name/nesting/malformed: {w:?}"
+        );
+        assert!(w
+            .iter()
+            .any(|m| m.contains("ignoring net group `bad name!`")));
+        assert!(w.iter().any(|m| m.contains("nested reference `@ok`")));
+        assert!(w.iter().any(|m| m.contains("net group `malformed`")));
+    }
+
+    #[test]
+    fn an_at_sign_inside_an_entry_is_not_a_group_reference() {
+        // Only a *leading* `@` is a reference; a `@` in a URL path is a normal part of the entry
+        // and must classify as written, not be misread as a group reference.
+        let (g, _) = make_groups(&[]);
+        let mut w = Vec::new();
+        let policy = super::validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            net_field("deny", &["example.com:443/@handle"], &[]),
+            &g,
+        )
+        .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        assert_eq!(
+            p.allow_rules().len(),
+            1,
+            "the URL-with-@ classifies as one rule"
+        );
+        assert!(w.is_empty(), "no undefined-group warning: {w:?}");
+    }
+
+    #[test]
+    fn an_app_references_a_global_egress_group() {
+        // The DRY payoff, driven through the full resolve → resolve_apps → resolve_app path (not the
+        // `validate_network` unit alone): a group declared once in the global config is referenced by
+        // `@name` from an app declared in a *trusted project*, and the app's effective policy carries
+        // the group's expanded rules — so a set of hosts is shared, not rewritten per app.
+        let mut global = RawConfig::default();
+        global.net.groups.insert(
+            "mcp".into(),
+            vec![
+                "{*} a.example.com:443".into(),
+                "{*} b.example.com:443".into(),
+            ],
+        );
+        let app = raw_app(
+            &["true"],
+            &[],
+            &[],
+            &[],
+            Some(net_field("deny", &["@mcp"], &[])),
+        );
+        let r = resolve_no_plugins(
+            global,
+            Some((raw_with_app("demo", app), TrustState::Trusted)),
+        );
+        let demo = r.apps.get("demo").expect("the app resolves");
+        let Some(NetworkPolicy::Allowlist(p)) = &demo.network else {
+            panic!("expected the app to carry an allowlist policy");
+        };
+        assert_eq!(
+            p.allow_rules().len(),
+            2,
+            "the global group expanded into the project app's allow list"
+        );
+    }
+
+    #[test]
+    fn a_bare_group_entry_inherits_the_apps_read_by_default_posture() {
+        use crate::allowlist::Methods;
+        // Security-relevant: a *method-less* group entry (the common case) must receive the Mode-B
+        // app's read-by-default `{GET,HEAD}` posture at merge, exactly like a directly-written bare
+        // host — otherwise a group would be a way to open a POST endpoint that a directly-written
+        // entry would have kept read-only. `apply_default_methods` runs in `merge_app`, so this drives
+        // the full resolve → merge_app path (past where the DRY test above stops, at `resolve_app`).
+        let mut global = RawConfig::default();
+        global
+            .net
+            .groups
+            .insert("mcp".into(), vec!["m.example.com:443".into()]); // bare: no `{VERB}` prefix
+        let app = raw_app(
+            &["true"],
+            &[],
+            &[],
+            &[],
+            Some(net_field("deny", &["@mcp"], &[])),
+        );
+        let mut r = resolve_no_plugins(
+            global,
+            Some((raw_with_app("demo", app), TrustState::Trusted)),
+        );
+        let demo = r.apps.remove("demo").expect("the app resolves");
+        r.merge_app(demo);
+        let NetworkPolicy::Allowlist(p) = &r.network else {
+            panic!("expected the merged app to carry an allowlist policy");
+        };
+        assert_eq!(
+            p.allow_rules()[0].methods,
+            Methods::Only(vec!["GET".into(), "HEAD".into()]),
+            "a bare group entry inherits the app's {{GET,HEAD}} read-by-default posture, not all verbs"
+        );
     }
 
     /// A resolved read-only bind at `path` (what `resolve` produces from a bare-string bind,

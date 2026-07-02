@@ -551,7 +551,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist an allow rule to a config file",
         options: &[
-            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol"),
+            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
@@ -566,7 +566,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist a deny rule to a config file",
         options: &[
-            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol"),
+            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),

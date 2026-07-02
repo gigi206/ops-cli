@@ -72,6 +72,27 @@ pub(crate) struct RawConfig {
     /// memory ceiling) reduces the anti-DoS protection, a choice an untrusted project may not
     /// make. Each field is independent and falls back to the default when unset.
     pub(crate) limits: Option<RawLimits>,
+    /// Network-scoped config that is not itself a posture — currently the reusable egress
+    /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
+    /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
+    /// shared across apps instead of being rewritten per profile. Groups are a security-relevant
+    /// input (they expand to egress rules), so they are honored only from the global config
+    /// (trusted by location); a project's `[net.groups]` is ignored.
+    #[serde(default)]
+    pub(crate) net: RawNet,
+}
+
+/// The `[net]` table: config under the `net` namespace that is not a per-launch posture. For now
+/// it carries only `[net.groups]`. Kept a distinct struct (rather than folding `groups` onto
+/// `RawConfig`) so the `net` namespace can grow without crowding the top level.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawNet {
+    /// Named reusable egress groups, `[net.groups]` — each `name = [ "<entry>", … ]`, where an
+    /// entry is any egress rule string the `allow`/`deny` lists accept (an IP, host, `*.domain`,
+    /// exact URL, `re:` regex, or `tcp://` L4 target, with an optional `{VERB,…}` method prefix).
+    /// A `[network]` list references a group by `@<name>`; the reference expands to these entries.
+    #[serde(default)]
+    pub(crate) groups: BTreeMap<String, Vec<String>>,
 }
 
 /// One `binds` entry: a bare path string (bound **read-only**, the default) or a table
