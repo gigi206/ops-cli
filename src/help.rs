@@ -520,7 +520,7 @@ const PAGES: &[Page] = &[
     // ---- net subcommands ----------------------------------------------------------
     Page {
         path: &["net", "rules"],
-        synopsis: "ops net rules [-a|--app <name>] [-s|--source config|builtin|manual] [-f|--filter <substr>] [--json]",
+        synopsis: "ops net rules [-a|--app <name>] [-s|--source config|builtin|manual] [-f|--filter <substr>] [-e|--expand] [--json]",
         summary: "list the effective egress rules by source",
         options: &[
             (
@@ -533,7 +533,11 @@ const PAGES: &[Page] = &[
             ),
             (
                 "-f, --filter <substr>",
-                "show only rules whose text contains <substr> (case-insensitive)",
+                "show only rules whose text contains <substr> (case-insensitive); implies --expand, so a host inside a group still matches",
+            ),
+            (
+                "-e, --expand",
+                "expand each `[net.groups]` group to its hosts (each tagged `@<group>`); by default a group shows as one `@<name>` row",
             ),
             ("--json", "emit the mode and rules as JSON"),
         ],
@@ -542,10 +546,13 @@ const PAGES: &[Page] = &[
             built-in, reflecting the trust gate (an untrusted project's rules are dropped). Every\n\
             rule names its layer: an inspected L7 rule shows `https://` (a bare host is https on 443),\n\
             a raw L4 rule shows `tcp://`; a `re:` regex shows neither (its pattern carries its own).\n\
-            Under `shared`/`none` there are no rules. `--app <name>` shows what `ops app <name>` would\n\
-            launch with — the same effective policy `ops test net --app` tests a URL against. `--source\n\
-            manual` instead queries this project's live ask sessions for the rules they remembered\n\
-            from `--session` answers (it does not combine with `--app`). No launch, no nix.",
+            A rule that came from a `[net.groups]` group shows as a single `@<name>` reference;\n\
+            `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
+            directly with `ops net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
+            <name>` shows what `ops app <name>` would launch with — the same effective policy `ops\n\
+            test net --app` tests a URL against. `--source manual` instead queries this project's live\n\
+            ask sessions for the rules they remembered from `--session` answers (it does not combine\n\
+            with `--app`). No launch, no nix.",
     },
     Page {
         path: &["net", "groups"],

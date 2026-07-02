@@ -4522,10 +4522,12 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     let mut filter: Option<String> = None;
     let mut app: Option<String> = None;
     let mut json = false;
+    let mut expand = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
             Some("--json") => json = true,
+            Some("--expand") | Some("-e") => expand = true,
             Some("--app") | Some("-a") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
                     eprintln!("ops: net rules: `--app` needs an app name");
@@ -4602,6 +4604,12 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         }
     }
 
+    // A `--filter` is a search for a host, so it forces expansion: otherwise the substring would run
+    // against a collapsed `@<group>` row and a host *inside* a group would be reported absent though
+    // it is allowed — a filter must never hide a matching rule. (`ops test net <url>` is the
+    // authoritative "does this resolve" check regardless.)
+    let expand = expand || filter.is_some();
+
     // The effective posture decides the mode word and whether there are rules at all. The built-in
     // built-in set is unioned by the proxy, which runs only under a filtering posture, so it is
     // absent (with every other rule) under `shared`/`none`.
@@ -4610,7 +4618,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         config::NetworkPolicy::Isolated => ("none", Vec::new()),
         config::NetworkPolicy::Allowlist(policy) => (
             net_mode_word(policy.default_action().into()),
-            config::view::net_rules_view(policy),
+            config::view::net_rules_view(policy, expand),
         ),
     };
 
@@ -4839,6 +4847,7 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
                 },
                 source: RuleSourceView::Manual,
                 rule: row.rule,
+                group: None,
             };
             if !rules
                 .iter()
@@ -4947,16 +4956,19 @@ fn render_net_rules(
             RuleSourceView::Builtin => "builtin",
             RuleSourceView::Manual => "manual",
         };
+        // A group-expanded rule notes its origin `@<group>` beside the source — but only in the
+        // expanded view: a collapsed row's text is already `@<group>`, so the annotation would just
+        // repeat it.
+        let tag = match &rule.group {
+            Some(g) if rule.rule != format!("@{g}") => format!("{source}, @{g}"),
+            _ => source.to_string(),
+        };
         match rule.kind {
             NetRuleKind::Allow => {
-                let _ = writeln!(o, "  allow {n}{}{r}  {dim}({source}){r}", rule.rule);
+                let _ = writeln!(o, "  allow {n}{}{r}  {dim}({tag}){r}", rule.rule);
             }
             NetRuleKind::Deny => {
-                let _ = writeln!(
-                    o,
-                    "  {warn}deny{r}  {n}{}{r}  {dim}({source}){r}",
-                    rule.rule
-                );
+                let _ = writeln!(o, "  {warn}deny{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
             }
         }
     }
@@ -6918,6 +6930,7 @@ mod tests {
             kind,
             source,
             rule: rule.into(),
+            group: None,
         };
         let rules = [
             mk(NetRuleKind::Allow, RuleSourceView::Config, "github.com"),
@@ -6958,6 +6971,40 @@ mod tests {
         // An empty result distinguishes "nothing declared" from "the filter matched nothing".
         assert!(render_net_rules("deny", "", &[], 0, &p).contains("no rules declared"));
         assert!(render_net_rules("deny", "", &[], 3, &p).contains("no rules match the filter"));
+    }
+
+    #[test]
+    fn render_net_rules_annotates_only_an_expanded_group_rule() {
+        use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
+        let p = style::Palette::plain();
+
+        // A collapsed group row — the rule text is already `@mcp`, so the origin note would just
+        // repeat it and is omitted.
+        let collapsed = NetRuleView {
+            kind: NetRuleKind::Allow,
+            source: RuleSourceView::Config,
+            rule: "@mcp".into(),
+            group: Some("mcp".into()),
+        };
+        let out = render_net_rules("deny", "", &[&collapsed], 1, &p);
+        assert!(out.contains("allow @mcp  (config)"), "{out}");
+        assert!(
+            !out.contains("@mcp, @mcp"),
+            "no redundant annotation:\n{out}"
+        );
+
+        // An expanded group row — the rule is the host, so the source tag notes its `@mcp` origin.
+        let expanded = NetRuleView {
+            kind: NetRuleKind::Allow,
+            source: RuleSourceView::Config,
+            rule: "{*} https://a.example.com".into(),
+            group: Some("mcp".into()),
+        };
+        let out = render_net_rules("deny", "", &[&expanded], 1, &p);
+        assert!(
+            out.contains("(config, @mcp)"),
+            "an expanded group rule must note its origin:\n{out}"
+        );
     }
 
     #[test]

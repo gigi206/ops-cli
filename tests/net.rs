@@ -527,6 +527,58 @@ fn net_groups_lists_resolves_and_errors_on_unknown() {
 }
 
 #[test]
+fn net_rules_collapses_a_group_and_expands_on_demand() {
+    let fx = Fixture::new();
+    // A group defined globally, referenced by an app profile beside it.
+    fx.write_global("[net.groups]\nmcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n");
+    fx.write_profile(
+        "demo",
+        "cmd = \"true\"\n\
+         [network]\nmode = \"deny\"\nallow = [\"@mcp\", \"{*} api.anthropic.com:443\"]\n",
+    );
+
+    // Default (collapsed): the group is one `@mcp` row; its hosts are not spelled out.
+    let out = fx.run(&["net", "rules", "-a", "demo", "--source", "config"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("allow @mcp  (config)"),
+        "the group collapses to a `@mcp` row:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("mcp.context7.com"),
+        "the collapsed view must not spell out the group's hosts:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("api.anthropic.com"),
+        "a non-group rule is shown as itself:\n{stdout}"
+    );
+
+    // `--expand`: the group unfolds to its hosts, each noting its `@mcp` origin.
+    let out = fx.run(&[
+        "net", "rules", "-a", "demo", "--source", "config", "--expand",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mcp.context7.com") && stdout.contains("mcp.exa.ai"),
+        "--expand spells out the group's hosts:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(config, @mcp)"),
+        "an expanded group host notes its origin:\n{stdout}"
+    );
+
+    // `--filter` by a host *inside* the group must find it (a filter implies --expand, so a group
+    // never hides a matching host behind its collapsed `@mcp` row).
+    let out = fx.run(&["net", "rules", "-a", "demo", "--filter", "context7"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mcp.context7.com") && stdout.contains("(config, @mcp)"),
+        "filtering by a group's host must find it (forced expansion):\n{stdout}"
+    );
+}
+
+#[test]
 fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
     let fx = Fixture::new();
     let out = fx.run(&["net", "allow", "api.anthropic.com", "--app", "claude"]);

@@ -1985,7 +1985,13 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
                 continue;
             }
             match crate::allowlist::classify(&entry) {
-                Ok(rule) => rules.push(rule),
+                // Tag each rule with the group it came from, so a `@<name>` expansion carries its
+                // origin into the resolved policy for `ops net rules` to render (excluded from the
+                // rule's equality, so this affects only display).
+                Ok(mut rule) => {
+                    rule.group = Some(name.clone());
+                    rules.push(rule);
+                }
                 Err(e) => warnings.push(format!(
                     "{GLOBAL_CONFIG}: net group `{name}`: ignoring entry `{entry}` — {e}"
                 )),

@@ -75,12 +75,30 @@ use regex::Regex;
 /// rule with no `{...}` method prefix carries [`Methods::Any`]; a method-qualified rule
 /// (`{GET,HEAD} host`) applies only to those verbs. A bare or `https://` rule is [`Layer::L7`]
 /// (inspected, the default); a `tcp://` rule is [`Layer::L4`] (raw-spliced, host:port only).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct Rule {
     pub(crate) kind: RuleKind,
     pub(crate) methods: Methods,
     pub(crate) layer: Layer,
+    /// The `[net.groups]` group this rule was expanded from (`@<name>`), or `None` for a
+    /// directly-written or built-in rule. Display-only provenance for `ops net rules` — it names
+    /// where a rule came from, and is deliberately **excluded from equality** (a rule's identity is
+    /// its match, not its origin), so adding it changes no matching, dedup, or policy-comparison
+    /// behavior. It travels with the rule: `apply_default_methods` mutates methods in place and
+    /// `merge_app` moves the whole policy, so the origin survives to the point it is rendered.
+    pub(crate) group: Option<String>,
 }
+
+/// Equality ignores [`Rule::group`] — a rule's identity is what it matches (kind, methods, layer),
+/// not which group it was expanded from — so provenance never affects matching, dedup, or the
+/// derived equality of an [`EgressPolicy`] built from these rules.
+impl PartialEq for Rule {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.methods == other.methods && self.layer == other.layer
+    }
+}
+
+impl Eq for Rule {}
 
 /// The enforcement layer a rule's scheme selects. [`Layer::L7`] (the default — a bare or `https://`
 /// rule) is **inspected**: the proxy terminates the TLS, parses the HTTP request, and enforces the
@@ -840,6 +858,7 @@ pub(crate) fn host_port_rule(host: &str, port: u16) -> Rule {
         kind: RuleKind::Host(canonical_host(host), Ports::Ranges(vec![(port, port)])),
         methods: Methods::Unspecified,
         layer: Layer::L7,
+        group: None,
     }
 }
 
@@ -863,6 +882,7 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
             },
             methods,
             layer: Layer::L7,
+            group: None,
         });
     }
     let (layer, body) = split_scheme(rest)?;
@@ -893,6 +913,7 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
         kind,
         methods,
         layer,
+        group: None,
     })
 }
 
@@ -1335,6 +1356,23 @@ mod tests {
     /// An allow-only policy (no deny rules), for the single-list matching tests.
     fn allow(entries: &[&str]) -> EgressPolicy {
         EgressPolicy::new(entries.iter().map(|s| rule(s)).collect(), vec![])
+    }
+
+    #[test]
+    fn rule_equality_ignores_group_provenance() {
+        // A rule's identity is its match (kind/methods/layer), not which `[net.groups]` group it was
+        // expanded from — so a `group` tag never affects equality (and thus never affects dedup or an
+        // `EgressPolicy` comparison). This is the load-bearing property that lets provenance travel
+        // on the rule without disturbing matching.
+        let a = rule("github.com");
+        let mut tagged = rule("github.com");
+        tagged.group = Some("gh".into());
+        assert_eq!(a, tagged, "group provenance must not affect rule equality");
+        assert_eq!(
+            EgressPolicy::new(vec![a], vec![]),
+            EgressPolicy::new(vec![tagged], vec![]),
+            "a policy comparison must be unaffected by a rule's group tag"
+        );
     }
 
     #[test]

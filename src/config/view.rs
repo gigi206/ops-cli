@@ -248,39 +248,88 @@ pub(crate) enum RuleSourceView {
     Manual,
 }
 
-/// One egress rule projected for `ops net rules`: its kind, its source, and its display text.
+/// One egress rule projected for `ops net rules`: its kind, its source, its display text, and — for
+/// a rule expanded from a `[net.groups]` group — the group's name (`None` otherwise). In the default
+/// (collapsed) view a contiguous run of one group's rules is a single row whose `rule` is `@<name>`;
+/// under `--expand` each rule is its own row carrying `group` so the renderer can note its origin.
 #[derive(Serialize, Clone)]
 pub(crate) struct NetRuleView {
     pub(crate) kind: NetRuleKind,
     pub(crate) source: RuleSourceView,
     pub(crate) rule: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) group: Option<String>,
+}
+
+/// Project one config list (allow or deny) into rows. Collapsed (`expand == false`): a maximal
+/// contiguous run of rules sharing one group becomes a single `@<name>` row, so a group reads as the
+/// reference the user wrote instead of its expanded hosts. Expanded (`expand == true`): every rule is
+/// its own row, carrying its `group` so the renderer can annotate the origin.
+fn project_config_rules(
+    rules: &[crate::allowlist::Rule],
+    kind: NetRuleKind,
+    expand: bool,
+    out: &mut Vec<NetRuleView>,
+) {
+    if expand {
+        for r in rules {
+            out.push(NetRuleView {
+                kind,
+                source: RuleSourceView::Config,
+                rule: r.to_string(),
+                group: r.group.clone(),
+            });
+        }
+        return;
+    }
+    let mut i = 0;
+    while i < rules.len() {
+        match &rules[i].group {
+            Some(g) => {
+                let mut j = i + 1;
+                while j < rules.len() && rules[j].group.as_deref() == Some(g.as_str()) {
+                    j += 1;
+                }
+                out.push(NetRuleView {
+                    kind,
+                    source: RuleSourceView::Config,
+                    rule: format!("@{g}"),
+                    group: Some(g.clone()),
+                });
+                i = j;
+            }
+            None => {
+                out.push(NetRuleView {
+                    kind,
+                    source: RuleSourceView::Config,
+                    rule: rules[i].to_string(),
+                    group: None,
+                });
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Project a filtered-egress policy's rules for listing: the config allow rules, then the config
-/// deny rules, then the built-in allow set — each tagged with its source. The built-in
-/// set is the same one [`network_view`] surfaces, so the two cannot drift. Only meaningful under a
-/// filtering posture; `shared`/`none` carry no rules, which the caller handles.
-pub(crate) fn net_rules_view(policy: &crate::allowlist::EgressPolicy) -> Vec<NetRuleView> {
+/// deny rules, then the built-in allow set — each tagged with its source. A group-expanded config
+/// rule collapses to a `@<name>` row unless `expand` is set (see [`project_config_rules`]). The
+/// built-in set is the same one [`network_view`] surfaces, so the two cannot drift, and never
+/// carries a group. Only meaningful under a filtering posture; `shared`/`none` carry no rules,
+/// which the caller handles.
+pub(crate) fn net_rules_view(
+    policy: &crate::allowlist::EgressPolicy,
+    expand: bool,
+) -> Vec<NetRuleView> {
     let mut rules = Vec::new();
-    for r in policy.allow_rules() {
-        rules.push(NetRuleView {
-            kind: NetRuleKind::Allow,
-            source: RuleSourceView::Config,
-            rule: r.to_string(),
-        });
-    }
-    for r in policy.deny_rules() {
-        rules.push(NetRuleView {
-            kind: NetRuleKind::Deny,
-            source: RuleSourceView::Config,
-            rule: r.to_string(),
-        });
-    }
+    project_config_rules(policy.allow_rules(), NetRuleKind::Allow, expand, &mut rules);
+    project_config_rules(policy.deny_rules(), NetRuleKind::Deny, expand, &mut rules);
     for r in sandbox::builtin_allow_rules() {
         rules.push(NetRuleView {
             kind: NetRuleKind::Allow,
             source: RuleSourceView::Builtin,
             rule: r.to_string(),
+            group: None,
         });
     }
     rules
@@ -1027,7 +1076,7 @@ mod tests {
             vec![classify("github.com").unwrap()],
             vec![classify("evil.com").unwrap()],
         );
-        let rules = net_rules_view(&policy);
+        let rules = net_rules_view(&policy, false);
         // Config rules render through the rule `Display`, so an L7 host shows the implicit scheme.
         assert!(rules.iter().any(|r| r.rule == "https://github.com"
             && r.kind == NetRuleKind::Allow
@@ -1052,6 +1101,43 @@ mod tests {
             .filter(|r| r.source == RuleSourceView::Builtin)
             .all(|r| r.kind == NetRuleKind::Allow));
         assert_eq!(builtin.len(), sandbox::builtin_allow_rules().len());
+    }
+
+    #[test]
+    fn net_rules_view_collapses_a_group_and_expands_on_demand() {
+        use crate::allowlist::{classify, EgressPolicy};
+        // Two rules tagged as one group, plus a directly-written rule.
+        let mut g1 = classify("{*} a.example.com:443").unwrap();
+        g1.group = Some("mcp".into());
+        let mut g2 = classify("{*} b.example.com:443").unwrap();
+        g2.group = Some("mcp".into());
+        let direct = classify("{*} api.example.com:443").unwrap();
+        let policy = EgressPolicy::new(vec![g1, g2, direct], vec![]);
+
+        // Collapsed: the contiguous group run becomes a single `@mcp` row; the direct rule stays.
+        let collapsed: Vec<_> = net_rules_view(&policy, false)
+            .into_iter()
+            .filter(|r| r.source == RuleSourceView::Config)
+            .collect();
+        assert_eq!(collapsed.len(), 2, "the group collapses to one row");
+        assert_eq!(collapsed[0].rule, "@mcp");
+        assert_eq!(collapsed[0].group.as_deref(), Some("mcp"));
+        assert!(collapsed[1].rule.contains("api.example.com") && collapsed[1].group.is_none());
+
+        // Expanded: both group hosts appear, each carrying its group; the direct rule has none.
+        let expanded: Vec<_> = net_rules_view(&policy, true)
+            .into_iter()
+            .filter(|r| r.source == RuleSourceView::Config)
+            .collect();
+        assert_eq!(expanded.len(), 3, "every rule is its own row when expanded");
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|r| r.group.as_deref() == Some("mcp"))
+                .count(),
+            2,
+            "both expanded group hosts carry their origin"
+        );
     }
 
     #[test]
@@ -1319,6 +1405,7 @@ mod tests {
                 ),
                 methods: crate::allowlist::Methods::Any,
                 layer: crate::allowlist::Layer::L7,
+                group: None,
             },
             header: "Authorization".into(),
             shape: crate::config::HeaderShape::new("Bearer ", false),
