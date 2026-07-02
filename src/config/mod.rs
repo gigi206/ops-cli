@@ -3474,6 +3474,27 @@ mod tests {
     }
 
     #[test]
+    fn a_group_admits_every_rule_form() {
+        // A group entry is classified by the same `allowlist::classify` as a direct allow/deny entry,
+        // so every rule form works inside a group: a `re:` regex, a `{VERB}`-scoped host, and a raw
+        // `tcp://` L4 tunnel, on top of the host/subdomain/URL forms the other tests cover.
+        let (g, w) = make_groups(&[(
+            "mixed",
+            &[
+                "re:^https://api\\.example\\.com/v[0-9]+/",
+                "{POST} write.example.com:443",
+                "tcp://ssh.example.com:22",
+            ],
+        )]);
+        assert!(w.is_empty(), "every form is valid, so no warnings: {w:?}");
+        assert_eq!(
+            g.get("mixed").map(|r| r.len()),
+            Some(3),
+            "all three forms classify into rules"
+        );
+    }
+
+    #[test]
     fn build_net_groups_validates_names_entries_and_rejects_nesting() {
         let (g, w) = make_groups(&[
             ("ok", &["good.example.com:443"]),
