@@ -38,7 +38,9 @@
 //! redundant copy discarded — the winner's identical, content-addressed path is
 //! already in place — and the database registration goes through `nix-store
 //! --load-db`, whose concurrent merges serialise on the project database's own
-//! SQLite locking. The broader case — a seed racing a live in-cage `nix build`, or
+//! SQLite locking (and a lost lock race under heavy parallel load is retried, the
+//! merge being idempotent — so this needs no lock of ops's own here either). The
+//! broader case — a seed racing a live in-cage `nix build`, or
 //! two agents building into one project store — rests on nix's own concurrent
 //! store-access guarantee (that database locking plus the per-store-path `.lock`
 //! files a build takes); it is nix's domain, not ops's, and is not exercised here.
@@ -474,6 +476,33 @@ fn load_db(
     project_store: &Path,
     closure: &[PathBuf],
 ) -> io::Result<()> {
+    // Retry a lost lock race. Several sandboxes of the same project can seed at once, and the
+    // `--load-db` merge serialises on the project database's own lock (SQLite); under heavy
+    // parallel load one attempt can exhaust nix's internal busy timeout and exit with the database
+    // locked. The merge is idempotent — re-loading the same closure re-registers already-present
+    // paths as a no-op — so a bounded retry after a short backoff clears transient contention while
+    // a genuinely broken seed (a malformed dump) still fails, its captured reason surfaced.
+    retry_transient(
+        LOAD_DB_ATTEMPTS,
+        || load_db_once(nix_store, shared_store, project_store, closure),
+        |e| e.to_string().contains("--load-db"),
+    )
+}
+
+/// How many times [`load_db`] attempts the registration merge before giving up. Small: a lost lock
+/// race clears in well under a second, and a deterministic failure should surface promptly.
+const LOAD_DB_ATTEMPTS: u32 = 6;
+
+/// One `--dump-db | --load-db` registration pass (see [`load_db`], which retries this on a lost
+/// lock race). The `--load-db` half's stderr is captured so a failure carries nix's reason (a
+/// locked database vs. a real error), which is both what makes the retry predicate precise and
+/// what the caller reports.
+fn load_db_once(
+    nix_store: &Path,
+    shared_store: &Path,
+    project_store: &Path,
+    closure: &[PathBuf],
+) -> io::Result<()> {
     use std::process::{Command, Stdio};
     let mut dump = Command::new(nix_store)
         .env("NIX_REMOTE", "")
@@ -487,22 +516,69 @@ fn load_db(
     let dump_out = dump.stdout.take().expect("stdout was requested as a pipe");
     // The reader child consumes the pipe directly, so a large dump never blocks on
     // a full pipe buffer; reap the writer only once the reader has finished.
-    let load_status = Command::new(nix_store)
+    let load = Command::new(nix_store)
         .env("NIX_REMOTE", "")
         .arg("--store")
         .arg(project_store)
         .arg("--load-db")
         .stdin(Stdio::from(dump_out))
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::piped())
+        .output()?;
     let dump_status = dump.wait()?;
+    // Attribute the failure to the right half. `--load-db` reads its whole stdin (the dump) before
+    // committing the merge in one transaction, so a lock loss makes `load` exit non-zero while
+    // `dump` still writes its full output and exits 0 — the error is correctly pinned on the load
+    // half and thus retried. Checking dump first stays right for that reason; do not reorder it (a
+    // genuine dump crash must surface as a dump failure, which is not retried).
     if !dump_status.success() {
         return Err(io::Error::other("nix-store --dump-db failed"));
     }
-    if !load_status.success() {
-        return Err(io::Error::other("nix-store --load-db failed"));
+    if !load.status.success() {
+        let reason = String::from_utf8_lossy(&load.stderr);
+        let reason = reason.trim();
+        return Err(io::Error::other(if reason.is_empty() {
+            "nix-store --load-db failed".to_string()
+        } else {
+            format!("nix-store --load-db failed: {reason}")
+        }));
     }
     Ok(())
+}
+
+/// Retry `op` while it fails with an error `transient` deems worth retrying, up to `attempts` total
+/// tries with a short backoff between them. A non-transient error (or a success) returns at once, so
+/// a real failure surfaces without burning the whole budget. Pure control flow over the closures —
+/// no knowledge of what is being retried — so it is unit-testable without spawning a process.
+fn retry_transient<T>(
+    attempts: u32,
+    mut op: impl FnMut() -> io::Result<T>,
+    transient: impl Fn(&io::Error) -> bool,
+) -> io::Result<T> {
+    let mut last = op();
+    for _ in 1..attempts {
+        match &last {
+            Err(e) if transient(e) => {
+                // A base delay plus a per-thread jitter: concurrent seeders that lost the same lock
+                // race must not re-collide in lockstep on the next attempt. The jitter is constant
+                // per thread (so a single-threaded caller — and the tests — back off deterministically)
+                // but differs across threads, spreading their retries apart.
+                std::thread::sleep(std::time::Duration::from_millis(50 + backoff_jitter_ms()));
+                last = op();
+            }
+            _ => break,
+        }
+    }
+    last
+}
+
+/// A small per-thread backoff offset (0..40 ms), derived from the thread id so it is stable within
+/// a thread yet distinct across concurrent ones — enough to desynchronise retriers that lost the
+/// same lock race, without a randomness source.
+fn backoff_jitter_ms() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    h.finish() % 40
 }
 
 /// The project store's garbage-collector roots directory. `nix-store --gc` keeps every
@@ -884,6 +960,76 @@ mod tests {
             !tmp.exists(),
             "the temp was not discarded after a hard placement failure"
         );
+    }
+
+    #[test]
+    fn retry_transient_retries_a_transient_error_then_succeeds() {
+        use std::cell::Cell;
+        // The load-db retry's control flow, exercised without a process: an error the predicate
+        // deems transient is retried, and a success on a later attempt is returned. The counter
+        // proves it actually re-ran (twice failing, then ok).
+        let calls = Cell::new(0);
+        let out = retry_transient(
+            6,
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n < 3 {
+                    Err(io::Error::other(
+                        "nix-store --load-db failed: database is locked",
+                    ))
+                } else {
+                    Ok(n)
+                }
+            },
+            |e| e.to_string().contains("--load-db"),
+        );
+        assert_eq!(out.unwrap(), 3, "it must succeed on the third attempt");
+        assert_eq!(
+            calls.get(),
+            3,
+            "it must have retried exactly to the success"
+        );
+    }
+
+    #[test]
+    fn retry_transient_stops_after_the_attempt_budget() {
+        use std::cell::Cell;
+        // A persistently transient error is retried up to the budget, then the last error is
+        // returned — it never loops unbounded.
+        let calls = Cell::new(0);
+        let out: io::Result<()> = retry_transient(
+            4,
+            || {
+                calls.set(calls.get() + 1);
+                Err(io::Error::other("nix-store --load-db failed: still locked"))
+            },
+            |e| e.to_string().contains("--load-db"),
+        );
+        assert!(out.is_err());
+        assert_eq!(
+            calls.get(),
+            4,
+            "it must try exactly the budgeted number of times"
+        );
+    }
+
+    #[test]
+    fn retry_transient_does_not_retry_a_non_transient_error() {
+        use std::cell::Cell;
+        // A failure the predicate does not recognise (a real, deterministic error) surfaces at once,
+        // without burning the retry budget — so a genuinely broken seed fails promptly.
+        let calls = Cell::new(0);
+        let out: io::Result<()> = retry_transient(
+            6,
+            || {
+                calls.set(calls.get() + 1);
+                Err(io::Error::other("nix-store --dump-db failed"))
+            },
+            |e| e.to_string().contains("--load-db"),
+        );
+        assert!(out.is_err());
+        assert_eq!(calls.get(), 1, "a non-transient error must not be retried");
     }
 }
 
