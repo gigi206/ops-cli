@@ -104,6 +104,7 @@ Never: `/etc/shadow`, the **host's** `/etc/passwd`.
 | sandbox `$HOME` | `…/ops/projects/<id>/home`, **rw** | **NOT** the host `$HOME`; tool caches, agent config |
 | `/tmp` | fresh tmpfs | ephemeral, private |
 | store (upper) | per-project overlay, **rw** | cf. §3 |
+| a trusted `binds` entry with `mode = "rw"` | host path, **rw** | opt-in, **trusted-only** (an untrusted project gets no bind at all, so never a writable one); bound at its own absolute path, **after** the structural mounts in precedence so it can never make `/nix` or the identity files writable. A rw bind over ops's own control plane (the data/engine, trust-marker, or config directory) is **forced read-only** — else in-cage code could rewrite a host-executed engine binary or forge a trust marker for another project. A read-only `binds` entry (the default) exposes contents only; per the box above, read-only protects integrity, **not** confidentiality. |
 
 ## 3. The store model (corrected)
 

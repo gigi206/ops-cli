@@ -1434,7 +1434,8 @@ pub(crate) fn effective_lock_target(
 
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`prepare`] drives this: a trust-gated `.ops.toml` adds
-/// environment and read-only binds (its security fields honored only once trusted)
+/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
+/// fields honored only once trusted)
 /// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
 /// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
 /// since it is a stated requirement.

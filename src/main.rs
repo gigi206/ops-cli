@@ -674,8 +674,9 @@ fn render_untrust_result(path: &Path, existed: bool, pal: &style::Palette) -> St
 
 /// `ops config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
 /// shows the resolved configuration for the current project — the layered global + project
-/// environment and read-only binds, after the trust gate has dropped anything an untrusted
-/// project may not set. The human form renders a colored document with warnings on stderr;
+/// environment and host binds (each read-only or read-write), after the trust gate has dropped
+/// anything an untrusted project may not set. The human form renders a colored document with
+/// warnings on stderr;
 /// `--json` prints the same resolved model as a JSON document. The verbs read and edit a single
 /// raw layer file (the project `.ops.toml`, the global config, or an explicit path).
 fn config_cmd(args: Vec<OsString>) -> ExitCode {
@@ -926,8 +927,8 @@ fn app_provenance_parts(
     }
 }
 
-/// The provenance tag for an optional origin — the free fields (`env`/`binds`) whose value may
-/// carry no recorded layer. Empty when the origin is unknown.
+/// The provenance tag for an optional origin — a per-entry value (an `env` variable, a bind) whose
+/// declaring layer may not be recorded (an app overlay's binds carry none). Empty when unknown.
 fn opt_provenance_tag(
     origin: Option<config::view::ProvenanceView>,
     pal: &style::Palette,
@@ -960,7 +961,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     // captured output stays byte-for-byte the plain text the integration tests pin.
     let _ = writeln!(o, "{h}ops config{r} — resolved for {n}{}{r}", view.cwd);
 
-    // The layered environment and read-only binds, after the trust gate.
+    // The layered environment and host binds (read-only or read-write), after the trust gate.
     if view.env.is_empty() {
         let _ = writeln!(o, "  {h}env:{r}   {dim}(none){r}");
     } else {
@@ -8060,6 +8061,29 @@ mod tests {
         // The free-field provenance tag is plain parenthesized text on its line.
         assert!(out.contains("    EDITOR=vim  (project)"), "{out}");
         assert!(out.contains("    /data  (global)"), "{out}");
+        // A read-only bind carries no mode marker.
+        assert!(
+            !out.contains("/data (rw)"),
+            "a read-only bind must not be marked:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_render_marks_a_writable_bind() {
+        // The `(rw)` marker: a writable bind is flagged so a host write-through hole is
+        // visible in `ops config show`; the marker precedes the provenance tag. A read-only bind
+        // (the default, covered above) carries none.
+        let mut view = sample_config_view();
+        view.binds = vec![config::view::BindView {
+            path: "/data".into(),
+            writable: true,
+            layer: Some(config::view::ProvenanceView::Global),
+        }];
+        let out = render_config(&view, &style::Palette::plain(), false);
+        assert!(
+            out.contains("    /data (rw)  (global)"),
+            "a writable bind must be marked (rw) before its provenance tag:\n{out}"
+        );
     }
 
     #[test]

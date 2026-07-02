@@ -458,6 +458,101 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
 }
 
 #[test]
+fn a_read_write_bind_is_honored_and_marked() {
+    // A trusted `mode = "rw"` bind resolves read-write, and `ops config show` marks it `(rw)` so a
+    // writable host hole is visible; `--json` carries `writable: true`.
+    let fx = Fixture::new();
+    let rw = fx.bind_target("writable");
+    fx.write_project(&format!(
+        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+        rw.display()
+    ));
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let canon = rw.canonicalize().unwrap();
+    assert!(
+        stdout.contains(&format!("{} (rw)", canon.to_string_lossy())),
+        "a writable bind must be marked (rw):\n{stdout}"
+    );
+
+    let json = fx.run(&["config", "show", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(doc["binds"][0]["writable"], true);
+}
+
+#[test]
+fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
+    // The same path bound by the global layer (read-only) and the trusted project (read-write)
+    // must resolve to ONE bind, read-write — the launch would otherwise mount the dest twice and
+    // `ops config` would double-list it while the cage silently got the project's mode. Last
+    // declaration (project) wins, matching how the launch's later mount wins.
+    let fx = Fixture::new();
+    let shared = fx.bind_target("shared");
+    let canon = shared.canonicalize().unwrap();
+    fx.write_global(&format!("binds = [\"{}\"]\n", shared.display()));
+    fx.write_project(&format!(
+        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+        shared.display()
+    ));
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let json = fx.run(&["config", "show", "--json"]);
+    assert!(json.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let binds = doc["binds"].as_array().expect("binds array");
+    assert_eq!(
+        binds.len(),
+        1,
+        "the duplicated path must collapse to one: {binds:?}"
+    );
+    assert_eq!(binds[0]["path"], canon.to_string_lossy().as_ref());
+    assert_eq!(
+        binds[0]["writable"], true,
+        "the project's read-write mode must win over the global read-only"
+    );
+}
+
+#[test]
+fn a_read_write_bind_over_ops_own_config_dir_is_forced_read_only() {
+    // The global config directory (`<config>/ops`) is one of ops's control-plane roots — a
+    // read-write bind over it would let in-cage untrusted code rewrite the trusted-by-location
+    // global config for a future launch. Even from a trusted project the bind is forced read-only,
+    // with a warning naming ops's control plane. The dir exists because the global config does.
+    let fx = Fixture::new();
+    fx.write_global("[env]\nGLOBALVAR = \"g\"\n");
+    let ops_config_dir = fx.config_home.path().join("ops");
+    fx.write_project(&format!(
+        "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+        ops_config_dir.display()
+    ));
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("control plane"),
+        "a rw bind over ops's control plane must warn:\n{stderr}"
+    );
+
+    let json = fx.run(&["config", "show", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let binds = doc["binds"].as_array().expect("binds array");
+    assert_eq!(
+        binds.len(),
+        1,
+        "the bind is kept (downgraded, not dropped): {binds:?}"
+    );
+    assert_eq!(
+        binds[0]["writable"], false,
+        "a rw bind over ops's control plane must be forced read-only"
+    );
+}
+
+#[test]
 fn the_network_posture_is_a_trust_gated_security_field() {
     let fx = Fixture::new();
     fx.write_project("network = \"none\"\n");

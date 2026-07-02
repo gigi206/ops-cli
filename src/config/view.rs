@@ -1333,7 +1333,17 @@ mod tests {
         let baseline = Resolved {
             env: vec![],
             env_layer: Default::default(),
-            binds: vec![],
+            // One bind the app shadows by path (with a different mode), one it inherits unchanged.
+            binds: vec![
+                crate::config::Bind {
+                    path: std::path::PathBuf::from("/shared"),
+                    writable: false,
+                },
+                crate::config::Bind {
+                    path: std::path::PathBuf::from("/base-only"),
+                    writable: false,
+                },
+            ],
             bind_layer: Default::default(),
             packages: vec![],
             nixpkgs_global: None,
@@ -1360,7 +1370,17 @@ mod tests {
             cmd: vec!["demo".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
-            binds: vec![],
+            // Shadows the baseline `/shared` (read-write) and adds a new `/app-only`.
+            binds: vec![
+                crate::config::Bind {
+                    path: std::path::PathBuf::from("/shared"),
+                    writable: true,
+                },
+                crate::config::Bind {
+                    path: std::path::PathBuf::from("/app-only"),
+                    writable: true,
+                },
+            ],
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
             gui: None,
@@ -1425,6 +1445,20 @@ mod tests {
             detail.secrets.len() + detail.secrets_inherited,
             merged.secrets.len(),
             "effective credential count must match merge_app"
+        );
+
+        // Binds must agree too: the app's own binds plus the count it inherits must equal the
+        // path-keyed union merge_app mounts — so `binds_inherited` cannot drift from the launch. The
+        // app shadows `/shared` and adds `/app-only`; only `/base-only` is inherited.
+        assert_eq!(detail.binds.len(), 2, "the app lists its own two binds");
+        assert_eq!(
+            detail.binds_inherited, 1,
+            "only the un-shadowed baseline bind is inherited"
+        );
+        assert_eq!(
+            detail.binds.len() + detail.binds_inherited,
+            merged.binds.len(),
+            "effective bind count must match merge_app's path-keyed union"
         );
     }
 }

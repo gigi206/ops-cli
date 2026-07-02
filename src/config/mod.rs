@@ -1552,6 +1552,30 @@ fn apply_env(
     }
 }
 
+/// Interpret a bind table's optional `mode`: `None`/`"ro"` → read-only, `"rw"` → read-write. An
+/// unrecognized value falls closed to read-only — the safe direction for a security field, never
+/// a wider exposure than declared — returning a reason (with a case-variant hint) so the caller
+/// can warn. The one place `"ro"`/`"rw"` are given meaning, shared by resolution and the display.
+fn bind_mode(mode: Option<&str>) -> (bool, Option<String>) {
+    match mode {
+        None | Some("ro") => (false, None),
+        Some("rw") => (true, None),
+        Some(other) => {
+            let hint = if other.eq_ignore_ascii_case("rw") || other.eq_ignore_ascii_case("ro") {
+                format!(" (did you mean `\"{}\"`?)", other.to_ascii_lowercase())
+            } else {
+                String::new()
+            };
+            (
+                false,
+                Some(format!(
+                    "has unknown mode `{other}`, binding read-only (use `\"ro\"` or `\"rw\"`){hint}"
+                )),
+            )
+        }
+    }
+}
+
 /// Fold a layer's binds into `out`, requiring each to be an absolute path. A
 /// relative bind is dropped with a warning: the project is already mounted in
 /// full, so an extra bind is by definition an out-of-project path, and resolving a
@@ -1567,21 +1591,17 @@ fn apply_binds(
         let (raw_path, writable) = match b {
             RawBind::Path(p) => (p, false),
             RawBind::Detailed(t) => {
-                let writable = match t.mode.as_deref() {
-                    None | Some("ro") => false,
-                    Some("rw") => true,
-                    // An unrecognized mode fails closed to read-only — the safe direction for a
-                    // security field — rather than guessing at a wider exposure.
-                    Some(other) => {
-                        warnings.push(format!(
-                            "{source}: bind `{}` has unknown mode `{other}`, binding read-only \
-                             (use `\"ro\"` or `\"rw\"`)",
-                            t.path
-                        ));
-                        false
-                    }
+                // A table without a `path` is skipped with a warning — never dropped the whole
+                // layer (the parse layer keeps `path` optional exactly so one such typo cannot).
+                let Some(path) = t.path else {
+                    warnings.push(format!("{source}: ignoring a bind table without a `path`"));
+                    continue;
                 };
-                (t.path, writable)
+                let (writable, reason) = bind_mode(t.mode.as_deref());
+                if let Some(reason) = reason {
+                    warnings.push(format!("{source}: bind `{path}` {reason}"));
+                }
+                (path, writable)
             }
         };
         let p = PathBuf::from(&raw_path);
@@ -2615,25 +2635,46 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // The bind's read-only/read-write mode carries through unchanged; the per-layer
     // provenance is re-keyed from the raw declared path to the canonical one as we go,
     // so a lookup against the displayed (canonical) path resolves.
+    let ops_roots = ops_control_plane_roots();
     let declared = std::mem::take(&mut resolved.binds);
     let raw_layer = std::mem::take(&mut resolved.bind_layer);
-    let mut canon_binds = Vec::with_capacity(declared.len());
+    let mut canon_binds: Vec<Bind> = Vec::with_capacity(declared.len());
     let mut canon_layer = BTreeMap::new();
     for bind in declared {
-        if let Some(canon) = canonicalize_one(&bind.path, &mut resolved.warnings) {
-            // A bind that nests with one of the cage's own structural mounts will not behave as
-            // declared (a descendant is shadowed, an ancestor over-exposes); surface it. Trusted-
-            // only field, so this warns without dropping the bind.
-            if let Some(w) = crate::sandbox::structural_nesting_warning(&canon) {
-                resolved.warnings.push(w);
-            }
-            if let Some(layer) = raw_layer.get(&bind.path) {
-                canon_layer.insert(canon.clone(), *layer);
-            }
+        let Some(canon) = canonicalize_one(&bind.path, &mut resolved.warnings) else {
+            continue;
+        };
+        // A read-write bind reaching one of ops's own control-plane roots is forced read-only
+        // (fail closed): the cage runs untrusted code, and writing there is host-side code
+        // execution or a forged trust/config, beyond the accepted self-harm class.
+        let writable = downgrade_control_plane(
+            canon.as_path(),
+            bind.writable,
+            &ops_roots,
+            &mut resolved.warnings,
+        );
+        if let Some(layer) = raw_layer.get(&bind.path) {
+            canon_layer.insert(canon.clone(), *layer);
+        }
+        // Merge by canonical path: the last declaration of a path wins (project over global),
+        // updated in place so a destination is never mounted twice — matching how `merge_app`
+        // folds an app's binds, so `ops config` shows exactly what the launch mounts.
+        if let Some(existing) = canon_binds.iter_mut().find(|b| b.path == canon) {
+            existing.writable = writable;
+        } else {
             canon_binds.push(Bind {
                 path: canon,
-                writable: bind.writable,
+                writable,
             });
+        }
+    }
+    // Nesting warnings once per effective bind (after dedup, so the reported mode is the one the
+    // launch will use): a bind that nests with a structural mount will not behave as declared (a
+    // descendant is shadowed, an ancestor over-exposes). Trusted-only field, so this warns
+    // without dropping the bind.
+    for bind in &canon_binds {
+        if let Some(w) = crate::sandbox::structural_nesting_warning(&bind.path, bind.writable) {
+            resolved.warnings.push(w);
         }
     }
     resolved.binds = canon_binds;
@@ -2643,7 +2684,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // app overlay also advertises only the binds the launch would actually make.
     for app in resolved.apps.values_mut() {
         let declared = std::mem::take(&mut app.binds);
-        app.binds = canonicalize_binds(declared, &mut app.warnings);
+        app.binds = canonicalize_binds(declared, &ops_roots, &mut app.warnings);
     }
 
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
@@ -2665,22 +2706,93 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     }
 }
 
-/// Canonicalize each bind source, dropping with a warning any that cannot be resolved and warning
-/// (without dropping) any whose destination nests with a structural mount.
-fn canonicalize_binds(binds: Vec<Bind>, warnings: &mut Vec<String>) -> Vec<Bind> {
-    binds
-        .into_iter()
-        .filter_map(|bind| {
-            let canon = canonicalize_one(&bind.path, warnings)?;
-            if let Some(w) = crate::sandbox::structural_nesting_warning(&canon) {
-                warnings.push(w);
-            }
-            Some(Bind {
+/// Canonicalize each bind source, dropping with a warning any that cannot be resolved; forcing a
+/// read-write bind over an ops control-plane root back to read-only; de-duplicating by canonical
+/// path (last wins); and warning (without dropping) any whose destination nests with a structural
+/// mount. The same treatment the baseline binds get, so an app overlay advertises exactly what its
+/// launch would mount.
+fn canonicalize_binds(
+    binds: Vec<Bind>,
+    roots: &[PathBuf],
+    warnings: &mut Vec<String>,
+) -> Vec<Bind> {
+    let mut out: Vec<Bind> = Vec::with_capacity(binds.len());
+    for bind in binds {
+        let Some(canon) = canonicalize_one(&bind.path, warnings) else {
+            continue;
+        };
+        let writable = downgrade_control_plane(canon.as_path(), bind.writable, roots, warnings);
+        if let Some(existing) = out.iter_mut().find(|b| b.path == canon) {
+            existing.writable = writable;
+        } else {
+            out.push(Bind {
                 path: canon,
-                writable: bind.writable,
-            })
-        })
+                writable,
+            });
+        }
+    }
+    for bind in &out {
+        if let Some(w) = crate::sandbox::structural_nesting_warning(&bind.path, bind.writable) {
+            warnings.push(w);
+        }
+    }
+    out
+}
+
+/// The ops-owned control-plane roots a read-write config bind must never expose to the cage: the
+/// data directory (its engine binaries are `execve`'d host-side; its plugin and store trees run
+/// host-side too), the trust-marker store (a forged marker would approve another project's config),
+/// and the global-config directory (trusted by location). Resolved from the environment like every
+/// other ops path; a component whose base does not resolve is simply omitted.
+fn ops_control_plane_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(layout) = crate::store::Layout::from_env() {
+        roots.push(layout.data_dir().to_path_buf());
+    }
+    if let Some(trusted) = trust::default_store_dir() {
+        roots.push(trusted);
+    }
+    if let Some(dir) = global_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        roots.push(dir);
+    }
+    // Canonicalize best-effort: a config bind is compared canonicalized (symlinks resolved), so the
+    // roots must be too, or a symlinked `$HOME` component would let a bind slip past the guard. A
+    // root that does not exist yet keeps its raw form (nothing to resolve).
+    roots
+        .into_iter()
+        .map(|r| r.canonicalize().unwrap_or(r))
         .collect()
+}
+
+/// If `writable` and `canon` reaches an ops control-plane root — it nests with one in either
+/// direction (the bind is an ancestor-or-equal of a root, or sits under one) — push a named
+/// warning and return `false` (read-only). Otherwise return `writable` unchanged. Fail closed: a
+/// writable bind there could alter what ops runs or trusts on the host, which exceeds the accepted
+/// trusted-config self-harm class (it is cross-project and persistent).
+fn downgrade_control_plane(
+    canon: &Path,
+    writable: bool,
+    roots: &[PathBuf],
+    warnings: &mut Vec<String>,
+) -> bool {
+    if !writable {
+        return false;
+    }
+    match roots
+        .iter()
+        .find(|r| canon.starts_with(r) || r.starts_with(canon))
+    {
+        Some(root) => {
+            warnings.push(format!(
+                "bind `{}` is read-write over ops's own control plane `{}` — binding it read-only \
+                 instead (a writable bind there could alter what ops runs or trusts on the host)",
+                canon.display(),
+                root.display()
+            ));
+            false
+        }
+        None => true,
+    }
 }
 
 /// Read the global config (trusted by location, so no trust marker), defaulting to
@@ -2872,23 +2984,29 @@ pub(crate) fn validate_profile(bytes: &[u8]) -> Result<ProfilePreview, String> {
     })
 }
 
-/// Build the posture summary for a raw app profile: the command, the persistent-home scope, the
-/// extra tools, the read-only binds, the network posture, and each injected credential by
-/// destination and source *locator*. A profile never carries a plaintext secret — only a locator
-/// (`env://VAR`, a `key`) — so this is safe to display and to share.
 /// Render one raw bind for the import posture summary: its path, with a ` (rw)` marker when the
-/// bind is read-write. An unknown mode is shown verbatim so a typo is visible before import.
+/// bind is read-write (the more-privileged, exceptional case worth flagging before import). An
+/// unrecognized mode is shown verbatim (`(mode X?)`) so a typo is visible, and a table missing its
+/// `path` reads as `(bind without a path)` so a malformed entry is not silently blank.
 fn describe_raw_bind(bind: &RawBind) -> String {
     match bind {
         RawBind::Path(p) => p.clone(),
-        RawBind::Detailed(t) => match t.mode.as_deref() {
-            None | Some("ro") => t.path.clone(),
-            Some("rw") => format!("{} (rw)", t.path),
-            Some(other) => format!("{} (mode {other}?)", t.path),
-        },
+        RawBind::Detailed(t) => {
+            let path = t.path.as_deref().unwrap_or("(bind without a path)");
+            match t.mode.as_deref() {
+                None | Some("ro") => path.to_string(),
+                Some("rw") => format!("{path} (rw)"),
+                Some(other) => format!("{path} (mode {other}?)"),
+            }
+        }
     }
 }
 
+/// Build the posture summary for a raw app profile: the command, the persistent-home scope, the
+/// extra tools, the binds (each read-only or read-write, a `(rw)` marker flagging the latter), the
+/// network posture, and each injected credential by destination and source *locator*. A profile
+/// never carries a plaintext secret — only a locator (`env://VAR`, a `key`) — so this is safe to
+/// display and to share.
 fn describe_app_posture(app: &RawApp) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(cmd) = &app.cmd {
@@ -3136,6 +3254,14 @@ mod tests {
         Bind {
             path: PathBuf::from(path),
             writable: false,
+        }
+    }
+
+    /// A resolved read-write bind at `path` (what `resolve` produces from a `mode = "rw"` table).
+    fn rw_bind(path: &str) -> Bind {
+        Bind {
+            path: PathBuf::from(path),
+            writable: true,
         }
     }
 
@@ -4712,25 +4838,13 @@ mod tests {
             raw_with_binds(vec![
                 RawBind::Path("/srv/ro".into()),
                 RawBind::Detailed(schema::RawBindTable {
-                    path: "/srv/rw".into(),
+                    path: Some("/srv/rw".into()),
                     mode: Some("rw".into()),
                 }),
             ]),
             None,
         );
-        assert_eq!(
-            r.binds,
-            vec![
-                Bind {
-                    path: PathBuf::from("/srv/ro"),
-                    writable: false
-                },
-                Bind {
-                    path: PathBuf::from("/srv/rw"),
-                    writable: true
-                },
-            ]
-        );
+        assert_eq!(r.binds, vec![ro_bind("/srv/ro"), rw_bind("/srv/rw")]);
         assert!(r.warnings.is_empty());
     }
 
@@ -4742,7 +4856,7 @@ mod tests {
             RawConfig::default(),
             Some((
                 raw_with_binds(vec![RawBind::Detailed(schema::RawBindTable {
-                    path: "/etc".into(),
+                    path: Some("/etc".into()),
                     mode: Some("rw".into()),
                 })]),
                 TrustState::Untrusted,
@@ -4758,18 +4872,12 @@ mod tests {
         // warning naming the path and the accepted values.
         let r = resolve_no_plugins(
             raw_with_binds(vec![RawBind::Detailed(schema::RawBindTable {
-                path: "/srv/data".into(),
+                path: Some("/srv/data".into()),
                 mode: Some("RW".into()),
             })]),
             None,
         );
-        assert_eq!(
-            r.binds,
-            vec![Bind {
-                path: PathBuf::from("/srv/data"),
-                writable: false
-            }]
-        );
+        assert_eq!(r.binds, vec![ro_bind("/srv/data")]);
         assert!(r.warnings.iter().any(|w| w.contains("unknown mode `RW`")));
     }
 
@@ -4786,11 +4894,11 @@ mod tests {
                 cmd: Some(schema::RawCmd::Argv(vec!["demo".into()])),
                 binds: vec![
                     RawBind::Detailed(schema::RawBindTable {
-                        path: "/shared".into(),
+                        path: Some("/shared".into()),
                         mode: Some("rw".into()),
                     }),
                     RawBind::Detailed(schema::RawBindTable {
-                        path: "/app-only".into(),
+                        path: Some("/app-only".into()),
                         mode: Some("rw".into()),
                     }),
                 ],
@@ -4802,18 +4910,152 @@ mod tests {
         r.merge_app(app);
         assert_eq!(
             r.binds,
-            vec![
-                Bind {
-                    path: PathBuf::from("/shared"),
-                    writable: true
-                },
-                Bind {
-                    path: PathBuf::from("/app-only"),
-                    writable: true
-                },
-            ],
+            vec![rw_bind("/shared"), rw_bind("/app-only")],
             "the app's mode wins on a path collision (in place); a new app path is added"
         );
+    }
+
+    #[test]
+    fn an_app_bind_can_flip_a_baseline_rw_bind_back_to_read_only_in_place() {
+        // The reverse of the previous test — the flip must work in *both* directions (an
+        // upgrade-only merge would pass the ro→rw test yet silently keep a baseline rw bind
+        // writable). The baseline carries two rw binds so the override's *position* is pinned: the
+        // app downgrades the first to ro and leaves the second untouched, in place.
+        let mut cfg = raw_with_binds(vec![
+            RawBind::Detailed(schema::RawBindTable {
+                path: Some("/first".into()),
+                mode: Some("rw".into()),
+            }),
+            RawBind::Detailed(schema::RawBindTable {
+                path: Some("/second".into()),
+                mode: Some("rw".into()),
+            }),
+        ]);
+        cfg.app.insert(
+            "demo".into(),
+            RawApp {
+                cmd: Some(schema::RawCmd::Argv(vec!["demo".into()])),
+                binds: vec![RawBind::Path("/first".into())],
+                ..RawApp::default()
+            },
+        );
+        let mut r = resolve_no_plugins(cfg, None);
+        let app = r.apps["demo"].clone();
+        r.merge_app(app);
+        assert_eq!(
+            r.binds,
+            vec![ro_bind("/first"), rw_bind("/second")],
+            "the app downgrades the first bind to read-only in place, leaving the second rw"
+        );
+    }
+
+    #[test]
+    fn a_read_write_bind_over_an_ops_control_plane_root_is_forced_read_only() {
+        // A writable bind that reaches an ops control-plane root — in either nesting direction —
+        // is downgraded to read-only with a named warning, while an unrelated writable bind is left
+        // alone and a read-only bind is never touched. Pure, over explicit roots (no environment).
+        let roots = vec![PathBuf::from("/home/u/.config/ops")];
+        let mut warnings = Vec::new();
+
+        // Exact match → downgraded.
+        assert!(!downgrade_control_plane(
+            Path::new("/home/u/.config/ops"),
+            true,
+            &roots,
+            &mut warnings
+        ));
+        // An ancestor of the root (a broad `~/.config` bind) → downgraded (root sits under it).
+        assert!(!downgrade_control_plane(
+            Path::new("/home/u/.config"),
+            true,
+            &roots,
+            &mut warnings
+        ));
+        // A descendant of the root (aiming straight at a trust marker) → downgraded.
+        assert!(!downgrade_control_plane(
+            Path::new("/home/u/.config/ops/apps"),
+            true,
+            &roots,
+            &mut warnings
+        ));
+        assert_eq!(warnings.len(), 3, "each downgrade warns: {warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("control plane")));
+
+        // A sibling that merely shares a textual prefix is not a conflict.
+        let mut w2 = Vec::new();
+        assert!(downgrade_control_plane(
+            Path::new("/home/u/.config/opsimposter"),
+            true,
+            &roots,
+            &mut w2
+        ));
+        // A read-only bind is never downgraded and never warns, even at the root itself.
+        assert!(!downgrade_control_plane(
+            Path::new("/home/u/.config/ops"),
+            false,
+            &roots,
+            &mut w2
+        ));
+        assert!(w2.is_empty(), "no warning for the safe cases: {w2:?}");
+    }
+
+    #[test]
+    fn describe_raw_bind_marks_read_write_and_flags_malformed_entries() {
+        // The import posture summary: a bare path and an explicit `"ro"` render plain; a
+        // `"rw"` bind carries the `(rw)` marker (the more-privileged case worth flagging before an
+        // import); an unrecognized mode and a table without a `path` are shown so they are visible.
+        assert_eq!(describe_raw_bind(&RawBind::Path("/data".into())), "/data");
+        assert_eq!(
+            describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
+                path: Some("/data".into()),
+                mode: Some("ro".into()),
+            })),
+            "/data"
+        );
+        assert_eq!(
+            describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
+                path: Some("/data".into()),
+                mode: Some("rw".into()),
+            })),
+            "/data (rw)"
+        );
+        assert_eq!(
+            describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
+                path: Some("/data".into()),
+                mode: Some("write".into()),
+            })),
+            "/data (mode write?)"
+        );
+        assert_eq!(
+            describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
+                path: None,
+                mode: Some("rw".into()),
+            })),
+            "(bind without a path) (rw)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_bind_mode_hints_a_case_variant() {
+        // A mere case slip (`"RW"`) earns a "did you mean" nudge, while a genuinely unknown
+        // token does not — both still fall closed to read-only.
+        let (writable, reason) = bind_mode(Some("RW"));
+        assert!(!writable);
+        let reason = reason.expect("an unknown mode reports a reason");
+        assert!(
+            reason.contains("did you mean `\"rw\"`?"),
+            "reason: {reason}"
+        );
+
+        let (_, reason) = bind_mode(Some("write"));
+        assert!(
+            !reason.unwrap().contains("did you mean"),
+            "an unrelated token gets no case hint"
+        );
+
+        assert_eq!(bind_mode(None), (false, None));
+        assert_eq!(bind_mode(Some("ro")), (false, None));
+        assert_eq!(bind_mode(Some("rw")), (true, None));
     }
 
     #[test]

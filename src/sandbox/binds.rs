@@ -447,21 +447,31 @@ fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
 }
 
 /// A warning when a config bind's canonical destination `dest` nests with one of the cage's own
-/// structural mounts, or `None` when it does not. The `binds` field is trusted-only, so this is an
+/// structural mounts, or `None` when it does not. `writable` marks a `mode = "rw"` bind, which the
+/// `Contains` case flags specially: a read-write ancestor bind grants the cage write-through to the
+/// host files around the structural mount. The `binds` field is trusted-only, so this is an
 /// ergonomics tripwire (the launch does not drop the bind), not a security control — it tells the
 /// user their bind will not behave as a naive reading suggests.
-pub(crate) fn structural_nesting_warning(dest: &Path) -> Option<String> {
+pub(crate) fn structural_nesting_warning(dest: &Path, writable: bool) -> Option<String> {
     structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
         Nesting::Shadowed => format!(
             "bind `{}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
              over it, so the bind is shadowed and will not appear inside",
             dest.display()
         ),
-        Nesting::Contains => format!(
-            "bind `{}` contains the sandbox's own mount `{structural}` — the cage mounts that path \
-             over part of it, so `{structural}` inside the cage is ops's, not your bind's",
-            dest.display()
-        ),
+        Nesting::Contains => {
+            let write_note = if writable {
+                " — and being read-write, the cage can write through to the host files around it"
+            } else {
+                ""
+            };
+            format!(
+                "bind `{}` contains the sandbox's own mount `{structural}` — the cage mounts that \
+                 path over part of it, so `{structural}` inside the cage is ops's, not your \
+                 bind's{write_note}",
+                dest.display()
+            )
+        }
     })
 }
 
@@ -935,23 +945,36 @@ mod tests {
     #[test]
     fn structural_nesting_warning_flags_only_a_nesting_overlap() {
         // A descendant of a structural mount is shadowed by it.
-        let w = structural_nesting_warning(Path::new("/tmp/secrets")).expect("descendant warns");
+        let w =
+            structural_nesting_warning(Path::new("/tmp/secrets"), false).expect("descendant warns");
         assert!(w.contains("shadowed"), "descendant message: {w}");
         assert!(w.contains("/tmp"));
 
         // An ancestor of structural files over-exposes the directory around them.
-        let w = structural_nesting_warning(Path::new("/etc")).expect("ancestor warns");
+        let w = structural_nesting_warning(Path::new("/etc"), false).expect("ancestor warns");
         assert!(w.contains("contains"), "ancestor message: {w}");
+        // A read-only ancestor says nothing about writing.
+        assert!(
+            !w.contains("write through"),
+            "ro ancestor must not mention writing: {w}"
+        );
+
+        // A read-write ancestor additionally flags the host write-through.
+        let w = structural_nesting_warning(Path::new("/etc"), true).expect("rw ancestor warns");
+        assert!(
+            w.contains("write through"),
+            "a rw ancestor bind must flag host write-through: {w}"
+        );
 
         // An exact match is reconciled by `assemble` (the structural mount wins) — not a footgun.
-        assert!(structural_nesting_warning(Path::new("/nix")).is_none());
-        assert!(structural_nesting_warning(Path::new("/etc/passwd")).is_none());
+        assert!(structural_nesting_warning(Path::new("/nix"), false).is_none());
+        assert!(structural_nesting_warning(Path::new("/etc/passwd"), true).is_none());
 
         // A path that neither contains nor sits under any structural mount is fine. `/etcdata`
         // shares a textual prefix with `/etc/...` but not a path lineage, so it must not warn.
-        assert!(structural_nesting_warning(Path::new("/srv/data")).is_none());
-        assert!(structural_nesting_warning(Path::new("/etcdata")).is_none());
-        assert!(structural_nesting_warning(Path::new("/home/u/proj")).is_none());
+        assert!(structural_nesting_warning(Path::new("/srv/data"), true).is_none());
+        assert!(structural_nesting_warning(Path::new("/etcdata"), false).is_none());
+        assert!(structural_nesting_warning(Path::new("/home/u/proj"), false).is_none());
     }
 
     #[test]

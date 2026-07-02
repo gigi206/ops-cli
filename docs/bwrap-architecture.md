@@ -160,11 +160,15 @@ runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** mo
 > `run` and `shell`). Env precedence: the structural `HOME`/`PATH`/`LD_LIBRARY_PATH`
 > are emitted first and the config env is **upserted** over them, so a *trusted*
 > override wins (an untrusted one has already lost its reserved keys). Bind
-> resolution — absolute-only, canonicalized, missing dropped — lives in
-> `config::load`, **not** the launch, so `ops config` advertises the *effective*
-> binds and cannot drift from what the launch binds. Config `ro_binds` are emitted
-> **before** the structural mounts, so a colliding one is shadowed and can never
-> displace `/nix`, the synthetic `/etc/passwd`/`group`, the loader, or the project.
+> resolution — absolute-only, canonicalized, missing dropped, de-duplicated by
+> canonical path (last declaration wins) — lives in `config::load`, **not** the
+> launch, so `ops config` advertises the *effective* binds and cannot drift from what
+> the launch binds. A bind is **read-only by default**, or **read-write** with the
+> table form `{ path = "...", mode = "rw" }` (mapped to bwrap's `--bind`); a
+> read-write bind over one of ops's own control-plane roots (the data/engine, trust,
+> or config directory) is forced read-only. Config binds are emitted **before** the
+> structural mounts, so a colliding one is shadowed and can never displace `/nix`, the
+> synthetic `/etc/passwd`/`group`, the loader, or the project — whatever its mode.
 >
 > **Known limitation (non-blocking, trusted-only): config binds interact with
 > structural mounts by path *nesting*, and prepend resolves only *exact-dest*

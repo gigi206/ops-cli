@@ -97,8 +97,12 @@ pub(crate) enum RawBind {
 /// The table form of a `binds` entry: `{ path = "...", mode = "ro" | "rw" }`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawBindTable {
-    /// The host path to bind (absolute; validated downstream, like a bare-string bind).
-    pub(crate) path: String,
+    /// The host path to bind (absolute; validated downstream, like a bare-string bind). Optional
+    /// at the parse layer so a table missing its `path` — a typo, or the tell-tale of a
+    /// wrongly-authored entry — is skipped with a per-entry warning downstream rather than failing
+    /// the untagged-enum parse and dropping the *whole* config layer (env, packages, apps and all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
     /// `"ro"` (the default) or `"rw"`. An unrecognized value is treated as read-only — the
     /// fail-closed direction for a security field — with a warning, downstream. Absent means
     /// read-only. Omitted on serialize when unset, so a plain read-only table stays minimal.
@@ -451,12 +455,45 @@ mod tests {
             vec![
                 RawBind::Path("/ro/path".into()),
                 RawBind::Detailed(RawBindTable {
-                    path: "/rw/path".into(),
+                    path: Some("/rw/path".into()),
                     mode: Some("rw".into()),
                 }),
                 RawBind::Detailed(RawBindTable {
-                    path: "/explicit/ro".into(),
+                    path: Some("/explicit/ro".into()),
                     mode: Some("ro".into()),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_bind_missing_its_path_still_parses_the_rest_of_the_config() {
+        // The tolerant-parse property: a table entry without `path` must NOT fail the untagged
+        // enum and drop the whole layer — it parses to `path: None` (skipped, with a warning, at
+        // resolve time) while every sibling field survives. Here the `env` table and the well-formed
+        // sibling bind must both remain.
+        let cfg = parse(
+            br#"
+            [env]
+            FOO = "bar"
+            [[binds]]
+            mode = "rw"
+            [[binds]]
+            path = "/ok"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            cfg.binds,
+            vec![
+                RawBind::Detailed(RawBindTable {
+                    path: None,
+                    mode: Some("rw".into()),
+                }),
+                RawBind::Detailed(RawBindTable {
+                    path: Some("/ok".into()),
+                    mode: None,
                 }),
             ]
         );
@@ -479,7 +516,7 @@ mod tests {
             vec![
                 RawBind::Path("/ro/path".into()),
                 RawBind::Detailed(RawBindTable {
-                    path: "/rw/path".into(),
+                    path: Some("/rw/path".into()),
                     mode: Some("rw".into()),
                 }),
             ]
