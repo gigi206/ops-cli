@@ -2896,6 +2896,17 @@ fn read_global(warnings: &mut Vec<String>) -> RawConfig {
     read_layer(&path, warnings).unwrap_or_default()
 }
 
+/// The reusable egress groups declared in the global config (`[net.groups]`), as their raw authored
+/// entries keyed by name, plus any load warnings. Global-only — matching the resolver, which honors
+/// groups only from the global config — so this lists exactly the set a `@<name>` reference can
+/// resolve to. A read-only, network-free view for `ops net groups`; entries are returned verbatim
+/// (unclassified), so the caller displays them as declared and may flag a malformed one on its own.
+pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let global = read_global(&mut warnings);
+    (global.net.groups, warnings)
+}
+
 /// Read the project config and decide its trust on the *same bytes* it parses, so
 /// the verdict and the applied content cannot belong to two different files. An
 /// absent file is simply no project layer; an unsafe or unparseable one is dropped

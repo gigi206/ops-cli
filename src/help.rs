@@ -131,11 +131,12 @@ const PAGES: &[Page] = &[
         options: &[],
         details:
             "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
-            `allow`/`deny <rule>` persist a rule to config; `pending` lists and answers requests\n\
-            parked by the `ask` posture; `stats` reports the per-host allow/deny/blocked decision\n\
-            counters launches recorded; `logs` is the live, per-request egress log of a running\n\
-            session. Host-side — no launch, no nix. (Distinct from `ops test net <url>`, which\n\
-            tests one URL against the policy.)",
+            `groups` lists the reusable `[net.groups]` egress groups (referenced by `@<name>`) and\n\
+            resolves one to its entries; `allow`/`deny <rule>` persist a rule to config; `pending`\n\
+            lists and answers requests parked by the `ask` posture; `stats` reports the per-host\n\
+            allow/deny/blocked decision counters launches recorded; `logs` is the live, per-request\n\
+            egress log of a running session. Host-side — no launch, no nix. (Distinct from `ops test\n\
+            net <url>`, which tests one URL against the policy.)",
     },
     Page {
         path: &["plugins"],
@@ -545,6 +546,25 @@ const PAGES: &[Page] = &[
             launch with — the same effective policy `ops test net --app` tests a URL against. `--source\n\
             manual` instead queries this project's live ask sessions for the rules they remembered\n\
             from `--session` answers (it does not combine with `--app`). No launch, no nix.",
+    },
+    Page {
+        path: &["net", "groups"],
+        synopsis: "ops net groups [<name>…] [--json]",
+        summary: "list reusable egress groups, or resolve one to its entries",
+        options: &[
+            (
+                "<name>…",
+                "resolve the named group(s) to their authored entries (with no name, list every group and its entry count)",
+            ),
+            ("--json", "emit the groups and their entries as JSON"),
+        ],
+        details:
+            "A `[net.groups]` group is a named set of egress entries declared once in the global\n\
+            config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts\n\
+            is shared across apps instead of rewritten per profile. Groups are global-only, so this\n\
+            command has no scope flag — it always reads the global config. `ops net groups` lists the\n\
+            groups; `ops net groups <name>` shows what `@<name>` expands to. A malformed or nested\n\
+            entry is flagged. Add a reference with `ops net allow @<name>`. Read-only, no launch.",
     },
     Page {
         path: &["net", "allow"],

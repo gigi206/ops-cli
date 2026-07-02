@@ -3040,6 +3040,7 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
 fn net_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("rules") => net_rules(&args[1..]),
+        Some("groups") => net_groups(&args[1..]),
         Some("allow") => net_add_rule(config::manage::EgressList::Allow, &args[1..]),
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
         Some("pending") => net_pending(&args[1..]),
@@ -3048,8 +3049,8 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("logs") | Some("log") => net_logs(&args[1..]),
         Some(other) => {
             eprintln!(
-                "ops: unknown `net` subcommand '{other}' (known: rules, allow, deny, pending, \
-                 stats, logs)"
+                "ops: unknown `net` subcommand '{other}' (known: rules, groups, allow, deny, \
+                 pending, stats, logs)"
             );
             ExitCode::from(2)
         }
@@ -4645,6 +4646,159 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_net_rules(mode, &scope, &shown, total, &pal));
     ExitCode::SUCCESS
+}
+
+/// `ops net groups [<name>…] [--json]`: list the reusable egress groups declared in the global
+/// config (`[net.groups]`), or resolve named ones to their entries. Groups are global-only (the
+/// resolver honors them only from the global config), so there is no scope flag — this always reads
+/// the global config. Read-only, network-free. With no name it lists each group and its entry count;
+/// with names it prints each named group's authored entries, flagging a malformed or nested one.
+fn net_groups(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    let mut names: Vec<String> = Vec::new();
+    for arg in args {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            Some(s) if s.starts_with('-') => {
+                eprintln!("ops: net groups: unknown flag `{s}`");
+                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "groups"]));
+                return ExitCode::from(2);
+            }
+            Some(s) => names.push(s.to_string()),
+            None => {
+                eprintln!("ops: net groups: a group name must be valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (groups, warnings) = config::net_groups();
+    for w in &warnings {
+        diag::warn(w);
+    }
+
+    // A named group that does not exist is an explicit error (never a blank success). Report every
+    // missing name at once, and point at what *is* defined.
+    if !names.is_empty() {
+        let missing: Vec<&str> = names
+            .iter()
+            .filter(|n| !groups.contains_key(*n))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            eprintln!("ops: net groups: no such group: {}", missing.join(", "));
+            if groups.is_empty() {
+                eprintln!(
+                    "ops: no egress groups are defined — declare them under [net.groups] in the \
+                     global config"
+                );
+            } else {
+                let avail: Vec<&str> = groups.keys().map(String::as_str).collect();
+                eprintln!("ops: defined groups: {}", avail.join(", "));
+            }
+            return ExitCode::from(2);
+        }
+    }
+
+    if json {
+        // name → [ { entry, invalid } ], all groups (sorted) or the named subset (given order).
+        let selected: Vec<(&String, &Vec<String>)> = if names.is_empty() {
+            groups.iter().collect()
+        } else {
+            names
+                .iter()
+                .filter_map(|n| groups.get_key_value(n))
+                .collect()
+        };
+        let obj: Vec<_> = selected
+            .iter()
+            .map(|(name, entries)| {
+                let rows: Vec<_> = entries
+                    .iter()
+                    .map(|e| serde_json::json!({ "entry": e, "invalid": net_group_entry_issue(e) }))
+                    .collect();
+                serde_json::json!({ "name": name, "entries": rows })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "groups": obj }));
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_net_groups(&groups, &names, &pal));
+    ExitCode::SUCCESS
+}
+
+/// Why a group entry is not a usable rule, or `None` if it is fine. Mirrors what `build_net_groups`
+/// does at resolve time: a leading `@` is a nested reference (a group is flat, so it is ignored);
+/// anything else is classified, and a classification error is the reason. Used to flag an entry in
+/// the `ops net groups <name>` listing so a typo in a group is visible where the group is inspected.
+fn net_group_entry_issue(entry: &str) -> Option<String> {
+    if entry.trim().starts_with('@') {
+        return Some("nested group reference — ignored (a group is a flat list of entries)".into());
+    }
+    allowlist::classify(entry).err()
+}
+
+/// Render `ops net groups` — a pure presenter (its layout is asserted in a test). With no names it
+/// lists each group and its entry count; with names it prints each named group's entries (as a
+/// `@name` block), appending a note to any entry that would be ignored or is malformed.
+fn render_net_groups(
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+    names: &[String],
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let plural = |count: usize| if count == 1 { "entry" } else { "entries" };
+    let mut o = String::new();
+
+    if names.is_empty() {
+        let _ = writeln!(o, "{h}egress groups{r} {dim}({}){r}", groups.len());
+        if groups.is_empty() {
+            let _ = writeln!(
+                o,
+                "  {dim}none defined — declare them under [net.groups] in the global config{r}"
+            );
+            return o;
+        }
+        let name_w = groups.keys().map(String::len).max().unwrap_or(0);
+        for (name, entries) in groups {
+            let _ = writeln!(
+                o,
+                "  {n}{name:<name_w$}{r}  {dim}({} {}){r}",
+                entries.len(),
+                plural(entries.len())
+            );
+        }
+        let _ = writeln!(o, "  {dim}resolve one with `ops net groups <name>`{r}");
+        return o;
+    }
+
+    for name in names {
+        let Some(entries) = groups.get(name) else {
+            continue; // an unknown name was already reported by the caller
+        };
+        let _ = writeln!(
+            o,
+            "{h}@{name}{r} {dim}({} {}){r}",
+            entries.len(),
+            plural(entries.len())
+        );
+        if entries.is_empty() {
+            let _ = writeln!(o, "  {dim}(empty){r}");
+        }
+        for e in entries {
+            match net_group_entry_issue(e) {
+                None => {
+                    let _ = writeln!(o, "  {e}");
+                }
+                Some(issue) => {
+                    let _ = writeln!(o, "  {e}  {dim}({issue}){r}");
+                }
+            }
+        }
+    }
+    o
 }
 
 /// `ops net rules --source manual`: the live manual rules this project's ask sessions remembered
@@ -6804,6 +6958,53 @@ mod tests {
         // An empty result distinguishes "nothing declared" from "the filter matched nothing".
         assert!(render_net_rules("deny", "", &[], 0, &p).contains("no rules declared"));
         assert!(render_net_rules("deny", "", &[], 3, &p).contains("no rules match the filter"));
+    }
+
+    #[test]
+    fn net_group_entry_issue_flags_malformed_and_nested_entries() {
+        // A well-formed entry of any kind is fine.
+        assert!(net_group_entry_issue("github.com:443").is_none());
+        assert!(net_group_entry_issue("{*} api.example.com:443").is_none());
+        assert!(net_group_entry_issue("re:^https://x/").is_none());
+        // A nested reference is ignored (a group is flat) — reported so a typo is visible.
+        let nested = net_group_entry_issue("@other").expect("a nested ref is flagged");
+        assert!(nested.contains("nested group reference"), "{nested}");
+        // A malformed entry carries the classifier's reason.
+        assert!(net_group_entry_issue("https://*").is_some());
+    }
+
+    #[test]
+    fn render_net_groups_lists_and_resolves() {
+        use std::collections::BTreeMap;
+        let p = style::Palette::plain();
+        let groups: BTreeMap<String, Vec<String>> = [
+            ("mcp".to_string(), vec!["{*} a.example.com:443".to_string()]),
+            (
+                "telemetry".to_string(),
+                vec!["*.datadoghq.com:*".to_string(), "*.sentry.io:*".to_string()],
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // List mode (no names): a count header and one line per group with its entry count.
+        let list = render_net_groups(&groups, &[], &p);
+        assert!(list.contains("egress groups (2)"), "{list}");
+        assert!(list.contains("mcp") && list.contains("(1 entry)"), "{list}");
+        assert!(
+            list.contains("telemetry") && list.contains("(2 entries)"),
+            "{list}"
+        );
+
+        // Resolve mode (a name): a `@name` block listing the authored entries verbatim.
+        let resolved = render_net_groups(&groups, &["mcp".to_string()], &p);
+        assert!(resolved.contains("@mcp (1 entry)"), "{resolved}");
+        assert!(resolved.contains("{*} a.example.com:443"), "{resolved}");
+        // Only the named group is shown, not the whole set.
+        assert!(!resolved.contains("telemetry"), "{resolved}");
+
+        // Empty set: an explicit "none defined" line, not a blank output.
+        assert!(render_net_groups(&BTreeMap::new(), &[], &p).contains("none defined"));
     }
 
     #[test]

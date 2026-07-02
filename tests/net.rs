@@ -473,6 +473,60 @@ fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
 }
 
 #[test]
+fn net_groups_lists_resolves_and_errors_on_unknown() {
+    let fx = Fixture::new();
+    fx.write_global(
+        "[net.groups]\n\
+         mcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n\
+         telemetry = [\"*.datadoghq.com:*\"]\n",
+    );
+
+    // List: both groups with their entry counts.
+    let out = fx.run(&["net", "groups"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mcp") && stdout.contains("(2 entries)"),
+        "the list names each group and its count:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("telemetry") && stdout.contains("(1 entry)"),
+        "{stdout}"
+    );
+
+    // Resolve: the named group expands to its authored entries under a `@name` header.
+    let out = fx.run(&["net", "groups", "mcp"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("@mcp"), "{stdout}");
+    assert!(
+        stdout.contains("{*} mcp.context7.com:443") && stdout.contains("{*} mcp.exa.ai:443"),
+        "the group resolves to its entries:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("telemetry"),
+        "only the named group is shown:\n{stdout}"
+    );
+
+    // Unknown name: an explicit error (exit 2) that lists what is defined, never a blank success.
+    let out = fx.run(&["net", "groups", "nope"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no such group: nope") && stderr.contains("mcp"),
+        "the error names the miss and lists the defined groups:\n{stderr}"
+    );
+
+    // JSON carries the resolved entries.
+    let out = fx.run(&["net", "groups", "mcp", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"name\":\"mcp\"") && stdout.contains("mcp.context7.com"),
+        "the JSON view carries the group and its entries:\n{stdout}"
+    );
+}
+
+#[test]
 fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
     let fx = Fixture::new();
     let out = fx.run(&["net", "allow", "api.anthropic.com", "--app", "claude"]);
