@@ -579,6 +579,84 @@ fn net_rules_collapses_a_group_and_expands_on_demand() {
 }
 
 #[test]
+fn net_groups_export_import_round_trips_between_configs() {
+    let src = Fixture::new();
+    src.write_global(
+        "[net.groups]\n\
+         mcp = [\"{*} mcp.context7.com:443\"]\n\
+         telemetry = [\"*.datadoghq.com:*\"]\n",
+    );
+    // Export just `mcp` to a file.
+    let frag = src.proj.path().join("frag.toml");
+    let out = src.run(&[
+        "net",
+        "groups",
+        "export",
+        "mcp",
+        "--out",
+        frag.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Import it into a *different* config, then it resolves there.
+    let dst = Fixture::new();
+    let out = dst.run(&["net", "groups", "import", frag.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resolved = dst.run(&["net", "groups", "mcp"]);
+    assert!(
+        String::from_utf8_lossy(&resolved.stdout).contains("mcp.context7.com"),
+        "the imported group must resolve in the destination:\n{}",
+        String::from_utf8_lossy(&resolved.stdout)
+    );
+
+    // Re-import → a collision is refused (nothing written); `--force` overwrites.
+    let again = dst.run(&["net", "groups", "import", frag.to_str().unwrap()]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("already defined"),
+        "a collision must be refused: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let forced = dst.run(&["net", "groups", "import", frag.to_str().unwrap(), "--force"]);
+    assert!(
+        forced.status.success(),
+        "--force must overwrite: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+}
+
+#[test]
+fn net_groups_import_flags_entries_that_will_not_resolve() {
+    let fx = Fixture::new();
+    // A fragment whose group carries a malformed and a nested entry — the import succeeds (names are
+    // valid), but the consent moment flags that those entries will not resolve.
+    let frag = fx.proj.path().join("frag.toml");
+    std::fs::write(
+        &frag,
+        "[net.groups]\ngood = [\"github.com:443\"]\nbad = [\"https://*\", \"@nested\"]\n",
+    )
+    .unwrap();
+    let out = fx.run(&["net", "groups", "import", frag.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "import itself succeeds (the names are valid)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("will not resolve") && stderr.contains("bad") && !stderr.contains("good"),
+        "the dead-entry group is flagged by name, the clean one is not:\n{stderr}"
+    );
+}
+
+#[test]
 fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
     let fx = Fixture::new();
     let out = fx.run(&["net", "allow", "api.anthropic.com", "--app", "claude"]);

@@ -51,6 +51,9 @@ pub(crate) enum ManageError {
     /// The `network` field is neither a posture string nor a table (a malformed config) — refuse
     /// rather than guess.
     MalformedNetwork(String),
+    /// An egress-group import named one or more groups that already exist and `--force` was not
+    /// given — nothing was written, so the user can decide (overwrite with `--force`, or rename).
+    GroupCollision(Vec<String>),
 }
 
 /// Which egress list a rule is added to.
@@ -107,6 +110,12 @@ impl std::fmt::Display for ManageError {
             ManageError::MalformedNetwork(s) => {
                 write!(f, "the `network` field is malformed ({s}) — edit it with `ops config edit`")
             }
+            ManageError::GroupCollision(names) => write!(
+                f,
+                "{} already defined: {} — re-run with --force to overwrite",
+                if names.len() == 1 { "group" } else { "groups" },
+                names.join(", ")
+            ),
         }
     }
 }
@@ -463,6 +472,92 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
     })
 }
 
+/// The result of [`import_net_groups`]: the group names newly added and those overwritten (only
+/// possible under `force`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ImportGroupsOutcome {
+    pub(crate) added: Vec<String>,
+    pub(crate) overwritten: Vec<String>,
+}
+
+/// Serialize a set of egress groups as a portable `[net.groups]` TOML fragment — the value
+/// `ops net groups export` writes. Fresh formatting (source comments are not carried); each name
+/// maps to its entries as a string array, in the map's (sorted) order. The inverse merge is
+/// [`import_net_groups`], and the fragment round-trips through [`super::read_net_groups_fragment`].
+pub(crate) fn export_net_groups(
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> String {
+    let mut inner = Table::new();
+    for (name, entries) in groups {
+        let mut arr = Array::new();
+        for e in entries {
+            arr.push(e.as_str());
+        }
+        inner.insert(name, value(arr));
+    }
+    // Nest as `[net.groups]`, marking `[net]` implicit so only the `[net.groups]` header is emitted.
+    let mut net = Table::new();
+    net.set_implicit(true);
+    net.insert("groups", Item::Table(inner));
+    let mut doc = DocumentMut::new();
+    doc.insert("net", Item::Table(net));
+    doc.to_string()
+}
+
+/// Merge egress-group definitions into the config at `path` (the global config), preserving every
+/// existing group, comment and formatting via `toml_edit`. A group whose name already exists is
+/// overwritten only when `force` is set; otherwise the collisions are returned and **nothing is
+/// written**, so the merge is all-or-nothing. Written atomically.
+pub(crate) fn import_net_groups(
+    path: &Path,
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+    force: bool,
+) -> Result<ImportGroupsOutcome, ManageError> {
+    let mut doc = read_or_empty(path)?;
+    // Navigate to (creating if absent) the `[net.groups]` table, keeping `[net]` implicit.
+    let net = doc
+        .as_table_mut()
+        .entry("net")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ManageError::NotScalar("net".to_string()))?;
+    net.set_implicit(true);
+    let groups_tbl = net
+        .entry("groups")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ManageError::NotScalar("net.groups".to_string()))?;
+
+    // Collision check first, so a refused import writes nothing (all-or-nothing).
+    if !force {
+        let collisions: Vec<String> = groups
+            .keys()
+            .filter(|n| groups_tbl.contains_key(n))
+            .cloned()
+            .collect();
+        if !collisions.is_empty() {
+            return Err(ManageError::GroupCollision(collisions));
+        }
+    }
+
+    let mut added = Vec::new();
+    let mut overwritten = Vec::new();
+    for (name, entries) in groups {
+        if groups_tbl.contains_key(name) {
+            overwritten.push(name.clone());
+        } else {
+            added.push(name.clone());
+        }
+        let mut arr = Array::new();
+        for e in entries {
+            arr.push(e.as_str());
+        }
+        groups_tbl.insert(name, value(arr));
+    }
+    write_doc(path, &doc)?;
+    Ok(ImportGroupsOutcome { added, overwritten })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,5 +884,73 @@ mod tests {
             add_egress_rule(&p, None, EgressList::Allow, "x.com"),
             Err(ManageError::MalformedNetwork(_))
         ));
+    }
+
+    fn groups_of(pairs: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(n, es)| (n.to_string(), es.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn export_net_groups_emits_a_net_groups_fragment() {
+        let g = groups_of(&[("mcp", &["{*} a.example.com:443"]), ("t", &["*.x.com:*"])]);
+        let out = export_net_groups(&g);
+        assert!(out.contains("[net.groups]"), "{out}");
+        // `[net]` is implicit — only the `[net.groups]` header is emitted.
+        assert!(
+            !out.contains("[net]"),
+            "the [net] header must stay implicit:\n{out}"
+        );
+        assert!(out.contains("mcp = [\"{*} a.example.com:443\"]"), "{out}");
+        assert!(out.contains("t = [\"*.x.com:*\"]"), "{out}");
+    }
+
+    #[test]
+    fn import_net_groups_merges_preserving_existing_and_refuses_collisions() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "# keep me\n[net.groups]\n# existing\nother = [\"github.com:443\"]\n",
+        );
+
+        // A fresh name is added; the existing group and its comment survive.
+        let out = import_net_groups(
+            &p,
+            &groups_of(&[("mcp", &["{*} a.example.com:443"])]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.added, vec!["mcp".to_string()]);
+        assert!(out.overwritten.is_empty());
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("# keep me") && body.contains("other") && body.contains("mcp"),
+            "the merge preserves existing content:\n{body}"
+        );
+
+        // A colliding name without force is refused and writes nothing.
+        let before = std::fs::read_to_string(&p).unwrap();
+        let clash = groups_of(&[("mcp", &["{*} b.example.com:443"])]);
+        match import_net_groups(&p, &clash, false) {
+            Err(ManageError::GroupCollision(names)) => assert_eq!(names, vec!["mcp".to_string()]),
+            other => panic!("expected a collision, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused import must write nothing"
+        );
+
+        // With force, the colliding group is overwritten.
+        let out = import_net_groups(&p, &clash, true).unwrap();
+        assert_eq!(out.overwritten, vec!["mcp".to_string()]);
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("b.example.com"),
+            "force must overwrite the entry"
+        );
     }
 }

@@ -556,7 +556,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "groups"],
-        synopsis: "ops net groups [<name>…] [--json]",
+        synopsis: "ops net groups [<name>…] [--json] | ops net groups export|import …",
         summary: "list reusable egress groups, or resolve one to its entries",
         options: &[
             (
@@ -570,8 +570,40 @@ const PAGES: &[Page] = &[
             config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts\n\
             is shared across apps instead of rewritten per profile. Groups are global-only, so this\n\
             command has no scope flag — it always reads the global config. `ops net groups` lists the\n\
-            groups; `ops net groups <name>` shows what `@<name>` expands to. A malformed or nested\n\
-            entry is flagged. Add a reference with `ops net allow @<name>`. Read-only, no launch.",
+            groups; `ops net groups <name>` shows what `@<name>` expands to; `export`/`import` move\n\
+            groups between machines. A malformed or nested entry is flagged. Add a reference with\n\
+            `ops net allow @<name>`. Read-only (except `import`), no launch.",
+    },
+    Page {
+        path: &["net", "groups", "export"],
+        synopsis: "ops net groups export [<name>…] [-o|--out <file>]",
+        summary: "write egress groups as a portable [net.groups] fragment",
+        options: &[
+            ("<name>…", "export only the named group(s) (default: every group)"),
+            ("-o, --out <file>", "write to <file> instead of stdout"),
+        ],
+        details:
+            "Emits the reusable egress groups as a portable `[net.groups]` TOML fragment — to stdout\n\
+            by default (`ops net groups export > groups.toml`), or to `--out <file>`. The inverse of\n\
+            `import`. Source comments are not carried (a group is data). Read-only, no launch.",
+    },
+    Page {
+        path: &["net", "groups", "import"],
+        synopsis: "ops net groups import <file> [-f|--force]",
+        summary: "merge a [net.groups] fragment into the global config",
+        options: &[
+            ("<file>", "a `[net.groups]` fragment (e.g. from `ops net groups export`)"),
+            ("-f, --force", "overwrite a group whose name already exists (default: refuse)"),
+        ],
+        details:
+            "Merges the fragment's groups into the global config, preserving every existing group and\n\
+            comment (`toml_edit`). Groups are global-only, so the target is always the global config,\n\
+            which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
+            cannot run it), so there is no prompt. A name that already exists is refused unless\n\
+            `--force`; the merge is all-or-nothing. A group carrying an entry that will not resolve (a\n\
+            malformed or nested one) is flagged after the import — inspect it with `ops net groups\n\
+            <name>`. Imported groups are inert until referenced by a `[network]` allow/deny with\n\
+            `@<name>`.",
     },
     Page {
         path: &["net", "allow"],

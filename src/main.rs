@@ -4656,12 +4656,24 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `ops net groups` — the reusable-egress-group surface. `export`/`import` move groups between
+/// configs (they are reserved subcommand verbs, so a group named `export`/`import` is listable and
+/// referenceable as `@export` but not resolvable by bare name — use the listing); anything else is
+/// the list/resolve reader ([`net_groups_list`]).
+fn net_groups(args: &[OsString]) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("export") => net_groups_export(&args[1..]),
+        Some("import") => net_groups_import(&args[1..]),
+        _ => net_groups_list(args),
+    }
+}
+
 /// `ops net groups [<name>…] [--json]`: list the reusable egress groups declared in the global
 /// config (`[net.groups]`), or resolve named ones to their entries. Groups are global-only (the
 /// resolver honors them only from the global config), so there is no scope flag — this always reads
 /// the global config. Read-only, network-free. With no name it lists each group and its entry count;
 /// with names it prints each named group's authored entries, flagging a malformed or nested one.
-fn net_groups(args: &[OsString]) -> ExitCode {
+fn net_groups_list(args: &[OsString]) -> ExitCode {
     let mut json = false;
     let mut names: Vec<String> = Vec::new();
     for arg in args {
@@ -4734,6 +4746,215 @@ fn net_groups(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_net_groups(&groups, &names, &pal));
     ExitCode::SUCCESS
+}
+
+/// `ops net groups export [<name>…] [--out <file>]`: write the reusable egress groups as a portable
+/// `[net.groups]` TOML fragment — every group, or the named subset — to stdout (the default,
+/// composable and clobber-safe: `ops net groups export > groups.toml`) or to `--out <file>`. The
+/// inverse of `import`. Read-only on the config; no launch, no nix.
+fn net_groups_export(args: &[OsString]) -> ExitCode {
+    let mut out: Option<PathBuf> = None;
+    let mut names: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--out") | Some("-o") => {
+                let Some(v) = it.next() else {
+                    eprintln!("ops: net groups export: `--out` needs a file path");
+                    return ExitCode::from(2);
+                };
+                out = Some(PathBuf::from(v));
+            }
+            Some(s) if s.starts_with('-') => {
+                eprintln!("ops: net groups export: unknown flag `{s}`");
+                eprintln!(
+                    "ops: usage: {}",
+                    help::synopsis_of(&["net", "groups", "export"])
+                );
+                return ExitCode::from(2);
+            }
+            Some(s) => names.push(s.to_string()),
+            None => {
+                eprintln!("ops: net groups export: a group name must be valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let (groups, warnings) = config::net_groups();
+    for w in &warnings {
+        diag::warn(w);
+    }
+
+    // Select all groups (sorted) or the named subset. An unknown name is an explicit error.
+    let selected: std::collections::BTreeMap<String, Vec<String>> = if names.is_empty() {
+        groups.clone()
+    } else {
+        let missing: Vec<&str> = names
+            .iter()
+            .filter(|n| !groups.contains_key(*n))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "ops: net groups export: no such group: {}",
+                missing.join(", ")
+            );
+            return ExitCode::from(2);
+        }
+        names
+            .iter()
+            .filter_map(|n| groups.get_key_value(n).map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
+    };
+    if selected.is_empty() {
+        eprintln!(
+            "ops: net groups export: no egress groups to export (none are defined under \
+             [net.groups] in the global config)"
+        );
+        return ExitCode::from(2);
+    }
+
+    let fragment = config::manage::export_net_groups(&selected);
+    match &out {
+        None => {
+            print!("{fragment}");
+            ExitCode::SUCCESS
+        }
+        Some(path) => match std::fs::write(path, &fragment) {
+            Ok(()) => {
+                let n = selected.len();
+                let s = if n == 1 { "" } else { "s" };
+                println!("exported {n} egress group{s} to {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "ops: net groups export: cannot write {}: {e}",
+                    path.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+/// `ops net groups import <file> [--force]`: merge a portable `[net.groups]` fragment into the
+/// global config, preserving every existing group and comment (`toml_edit`). Groups are global-only,
+/// so the target is always the global config; the deliberate command is the consent (an agent in the
+/// cage cannot run it), and the global config is trusted by location, so there is no prompt. A name
+/// that already exists is refused unless `--force` overwrites it. The imported groups are inert until
+/// referenced by a `[network]` `allow`/`deny` with `@<name>`.
+fn net_groups_import(args: &[OsString]) -> ExitCode {
+    let mut force = false;
+    let mut file: Option<PathBuf> = None;
+    for arg in args {
+        match arg.to_str() {
+            Some("--force") | Some("-f") => force = true,
+            Some(s) if s.starts_with('-') => {
+                eprintln!("ops: net groups import: unknown flag `{s}`");
+                eprintln!(
+                    "ops: usage: {}",
+                    help::synopsis_of(&["net", "groups", "import"])
+                );
+                return ExitCode::from(2);
+            }
+            _ => {
+                if file.is_some() {
+                    eprintln!("ops: net groups import: expected exactly one file");
+                    return ExitCode::from(2);
+                }
+                file = Some(PathBuf::from(arg));
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!(
+            "ops: usage: {}",
+            help::synopsis_of(&["net", "groups", "import"])
+        );
+        return ExitCode::from(2);
+    };
+
+    let groups = match config::read_net_groups_fragment(&file) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("ops: net groups import: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // Validate every name before writing (a name keys a referenceable identifier and, if invalid,
+    // would be dropped at load) — fail closed, naming the offender.
+    if let Some(bad) = groups.keys().find(|n| !config::is_valid_group_name(n)) {
+        eprintln!(
+            "ops: net groups import: invalid group name `{bad}` (1–64 of [A-Za-z0-9._-]); nothing imported"
+        );
+        return ExitCode::from(2);
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: net groups import: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match config::manage::import_net_groups(&path, &groups, force) {
+        Ok(outcome) => {
+            let mut parts = Vec::new();
+            if !outcome.added.is_empty() {
+                parts.push(format!("added {}", outcome.added.join(", ")));
+            }
+            if !outcome.overwritten.is_empty() {
+                parts.push(format!("overwrote {}", outcome.overwritten.join(", ")));
+            }
+            let summary = if parts.is_empty() {
+                "nothing to do".to_string()
+            } else {
+                parts.join("; ")
+            };
+            println!(
+                "imported {} egress group(s) into {} — {summary}",
+                groups.len(),
+                path.display()
+            );
+            // Import is the one moment the user consciously brings in someone else's data, so flag any
+            // entry that will not resolve (a malformed or nested one) right here — the same inspect-time
+            // check `ops net groups <name>` applies — rather than let it surface only at the next launch.
+            let dead: Vec<String> = groups
+                .iter()
+                .filter(|(_, entries)| entries.iter().any(|e| net_group_entry_issue(e).is_some()))
+                .map(|(name, _)| name.clone())
+                .collect();
+            if !dead.is_empty() {
+                diag::warn(&format!(
+                    "some entries will not resolve in: {} — inspect with `ops net groups <name>`",
+                    dead.join(", ")
+                ));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(config::manage::ManageError::GroupCollision(names)) => {
+            eprintln!(
+                "ops: net groups import: {} already defined: {} — re-run with --force to overwrite, \
+                 or rename in the fragment (nothing was written)",
+                if names.len() == 1 { "group" } else { "groups" },
+                names.join(", ")
+            );
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("ops: net groups import: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Why a group entry is not a usable rule, or `None` if it is fine. Mirrors what `build_net_groups`

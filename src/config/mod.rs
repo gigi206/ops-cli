@@ -2913,6 +2913,26 @@ pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     (global.net.groups, warnings)
 }
 
+/// Read a portable `[net.groups]` fragment from `path` (the file `ops net groups import` is given),
+/// returning its groups. The file goes through the same safety gate as any config (owner-owned,
+/// non-world-writable, a plain regular file). An error names why: unsafe/unreadable, not valid TOML,
+/// or carrying no `[net.groups]` (the tell-tale of the wrong file). The entries are returned
+/// verbatim — the caller validates the group names before writing them, and a malformed entry is
+/// flagged at load like any other, so the import is deliberately not a second validation surface.
+pub(crate) fn read_net_groups_fragment(
+    path: &Path,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let bytes = safety::read_safe_bytes(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if raw.net.groups.is_empty() {
+        return Err(format!(
+            "{} has no `[net.groups]` table to import (is it an export of `ops net groups export`?)",
+            path.display()
+        ));
+    }
+    Ok(raw.net.groups)
+}
+
 /// Read the project config and decide its trust on the *same bytes* it parses, so
 /// the verdict and the applied content cannot belong to two different files. An
 /// absent file is simply no project layer; an unsafe or unparseable one is dropped
@@ -3631,6 +3651,22 @@ mod tests {
             Methods::Only(vec!["GET".into(), "HEAD".into()]),
             "a bare group entry inherits the app's {{GET,HEAD}} read-by-default posture, not all verbs"
         );
+    }
+
+    #[test]
+    fn read_net_groups_fragment_reads_groups_and_rejects_a_groupless_file() {
+        let tmp = TmpDir::new();
+        let good = tmp.path().join("frag.toml");
+        std::fs::write(&good, "[net.groups]\nmcp = [\"{*} a.example.com:443\"]\n").unwrap();
+        let g = read_net_groups_fragment(&good).expect("a `[net.groups]` fragment reads");
+        assert_eq!(g.get("mcp").map(|v| v.len()), Some(1));
+
+        // A file with no `[net.groups]` is the tell-tale of the wrong file — refused, not a silent
+        // empty import.
+        let bad = tmp.path().join("nope.toml");
+        std::fs::write(&bad, "[env]\nFOO = \"bar\"\n").unwrap();
+        let err = read_net_groups_fragment(&bad).unwrap_err();
+        assert!(err.contains("no `[net.groups]`"), "{err}");
     }
 
     /// A resolved read-only bind at `path` (what `resolve` produces from a bare-string bind,
