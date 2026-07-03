@@ -3618,6 +3618,58 @@ mod tests {
     }
 
     #[test]
+    fn a_project_net_groups_is_ignored_with_a_warning_even_when_trusted() {
+        // Groups are global-only: a project's `[net.groups]` is not honored — even from a TRUSTED
+        // project — so it warns, and a `@ref` to a project-defined group does not resolve (it is
+        // undefined). This is the security property: a project cannot smuggle a group definition into
+        // an app's egress, only reference one the global config already trusts.
+        let mut project = RawConfig::default();
+        project
+            .net
+            .groups
+            .insert("evil".into(), vec!["evil.example.com:443".into()]);
+        // An app in the same (trusted) project references its own project-defined group.
+        project.app.insert(
+            "demo".into(),
+            raw_app(
+                &["true"],
+                &[],
+                &[],
+                &[],
+                Some(net_field("deny", &["@evil"], &[])),
+            ),
+        );
+
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+        // The baseline warns that the project's `[net.groups]` is ignored.
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("[net.groups]") && w.contains("global config only")),
+            "a project's [net.groups] must warn: {:?}",
+            r.warnings
+        );
+        // The app's `@evil` reference resolves to nothing (the group is undefined from a project),
+        // and the app reports the reference as undefined.
+        let demo = r.apps.get("demo").expect("the app resolves");
+        let Some(NetworkPolicy::Allowlist(p)) = &demo.network else {
+            panic!("expected the app to carry an allowlist policy");
+        };
+        assert!(
+            p.allow_rules().is_empty(),
+            "a project-defined group must not resolve: {:?}",
+            p.allow_rules()
+        );
+        assert!(
+            demo.warnings
+                .iter()
+                .any(|w| w.contains("undefined group `@evil`")),
+            "the @evil reference must be reported undefined: {:?}",
+            demo.warnings
+        );
+    }
+
+    #[test]
     fn a_bare_group_entry_inherits_the_apps_read_by_default_posture() {
         use crate::allowlist::Methods;
         // Security-relevant: a *method-less* group entry (the common case) must receive the Mode-B
