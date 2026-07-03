@@ -181,7 +181,7 @@ the cage's seccomp denylist; bwrap + seccomp + the netns *is* the boundary) plus
 `--ozone-platform=wayland --disable-gpu --disable-dev-shm-usage` — these are **app argv** (a
 profile's `cmd`), not hole state.
 
-**Composition with `network = "allowlist"` (proven).** The real desktop-agent posture opens the
+**Composition with a filtering `network` posture (e.g. `mode = "deny"`, proven).** The real desktop-agent posture opens the
 display hole *and* a filtered egress at once. They coexist with no special-casing: the display is a
 local **Unix** socket (so it connects inside the empty netns the allowlist imposes — it needs no
 network route), and its binds/env are disjoint from the egress machinery (the proxy socket + CA under

@@ -325,7 +325,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
 /// The posture matrix (the caller's trust check is separate and runs first): an absent network with
 /// `allow` bootstraps a deny-by-default allowlist with the rule, while with `deny` it is a
 /// [`ManageError::DenyNeedsPosture`] (a deny must not open a posture); a bare-string
-/// `deny`/`allow`/`allowlist` is promoted to the table form keeping its mode; a bare-string
+/// `deny`/`allow` is promoted to the table form keeping its mode; a bare-string
 /// `shared`/`none` is a [`ManageError::NonFilteringPosture`] (do not flip a deliberate choice); and
 /// an existing `[network]` table (regular or inline) gets the rule appended, idempotent on the exact
 /// string. Preserves comments/formatting and writes atomically. The outcome names any posture it
@@ -354,7 +354,7 @@ pub(crate) fn add_egress_rule(
         Some(Item::Value(v)) if v.is_str() => {
             let s = v.as_str().unwrap_or_default().to_string();
             match s.as_str() {
-                "deny" | "allow" | "allowlist" | "ask" => NetCase::BareFiltering(s),
+                "deny" | "allow" | "ask" => NetCase::BareFiltering(s),
                 "shared" | "none" => NetCase::BareNonFiltering(s),
                 _ => NetCase::Malformed(format!("unknown posture {s:?}")),
             }
@@ -434,7 +434,7 @@ pub(crate) fn add_egress_rule(
 /// that never takes effect.
 fn refuse_non_filtering(mode: Option<&str>) -> Result<(), ManageError> {
     match mode {
-        None | Some("deny" | "allow" | "allowlist" | "ask") => Ok(()),
+        None | Some("deny" | "allow" | "ask") => Ok(()),
         Some(m @ ("shared" | "none")) => Err(ManageError::NonFilteringPosture(m.to_string())),
         Some(other) => Err(ManageError::MalformedNetwork(format!(
             "unknown mode {other:?}"

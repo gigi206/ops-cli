@@ -1,6 +1,6 @@
 //! Integration tests for `ops stop`.
 //!
-//! The headline property: stopping a **supervised** session (the `network = "allowlist"` path,
+//! The headline property: stopping a **supervised** session (the `network = "deny"` path,
 //! where the registered pid is the ops supervisor rather than bubblewrap itself) tears the whole
 //! cage down — the supervisor exits *and* no in-cage process is left orphaned. That is the path
 //! where teardown is non-trivial: it relies on bubblewrap dying with its parent. The exec path
@@ -302,7 +302,7 @@ fn stop_tears_down_a_supervised_app_session() {
         "[app.probe]\n\
          cmd = [\"sleep\", \"31337\"]\n\
          [app.probe.network]\n\
-         mode = \"allowlist\"\n\
+         mode = \"deny\"\n\
          allow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();

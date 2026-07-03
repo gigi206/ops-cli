@@ -48,7 +48,7 @@ droid = "mise:npm:droid"
 # An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/API POSTs), so
 # each is opened to all verbs with `{*}`.
 [network]
-mode = "allowlist"
+mode = "deny"
 allow = [
     # Install: the npm package and its platform binary (an optional dep).
     "{*} https://registry.npmjs.org",

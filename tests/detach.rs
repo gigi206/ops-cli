@@ -189,7 +189,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         "[app.sup]\n\
          cmd = [\"sleep\", \"31337\"]\n\
          [app.sup.network]\n\
-         mode = \"allowlist\"\n\
+         mode = \"deny\"\n\
          allow = [\"cache.nixos.org\"]\n\
          [app.plain]\n\
          cmd = [\"sleep\", \"31338\"]\n",

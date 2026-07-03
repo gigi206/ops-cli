@@ -40,8 +40,8 @@ pub(crate) struct RawConfig {
     /// (filtered egress, deny-by-default — only the built-in hosts reach), or `"allow"`
     /// (filtered egress, allow-by-default — a denylist, every public host reaches except the
     /// carve-outs), or `"ask"` (filtered egress, park-and-confirm — an undecided host blocks until
-    /// you answer) — or a table that adds the `allow`/`deny` carve-out lists to a `deny`/`allow`
-    /// (or the `"allowlist"` alias of `deny`) mode. A security field: honored from the global
+    /// you answer) — or a table that adds the `allow`/`deny` carve-out lists to a
+    /// `deny`/`allow`/`ask` mode. A security field: honored from the global
     /// config or a trusted project, ignored from an untrusted one, since narrowing or widening
     /// the network is a confidentiality choice an untrusted project may not make.
     pub(crate) network: Option<NetworkField>,
@@ -614,7 +614,7 @@ mod tests {
             [packages]
             demo-tool = "demo-tool"
             [network]
-            mode = "allowlist"
+            mode = "deny"
             allow = ["api.example.com"]
             "#,
         )
@@ -655,7 +655,7 @@ mod tests {
             [packages]
             demo-tool = "mise:aqua:example/demo-tool"
             [network]
-            mode = "allowlist"
+            mode = "deny"
             allow = ["api.example.com", "*.nixos.org"]
             deny = ["evil.example.com"]
             [limits]
@@ -801,11 +801,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_network_allowlist_table_form() {
+    fn parses_the_network_deny_table_form() {
         let cfg = parse(
             br#"
             [network]
-            mode = "allowlist"
+            mode = "deny"
             allow = ["github.com", "*.nixos.org", "1.2.3.4", "https://example.com/x"]
             deny  = ["evil.nixos.org"]
             "#,
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".into(),
+                mode: "deny".into(),
                 allow: vec![
                     "github.com".into(),
                     "*.nixos.org".into(),
@@ -832,11 +832,11 @@ mod tests {
 
     #[test]
     fn a_network_table_without_allow_or_deny_defaults_to_empty() {
-        let cfg = parse(b"[network]\nmode = \"allowlist\"\n").unwrap();
+        let cfg = parse(b"[network]\nmode = \"deny\"\n").unwrap();
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".into(),
+                mode: "deny".into(),
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: None,

@@ -869,7 +869,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
 #[test]
 fn a_network_allowlist_filters_egress_through_the_proxy() {
     // The Model-B egress path end to end through the real binary: a trusted
-    // `network = "allowlist"` stands up the host filtering proxy on a bound socket, the
+    // `network = "deny"` stands up the host filtering proxy on a bound socket, the
     // empty-netns cage reaches it *only* through the in-cage socat forwarder, the cage trusts
     // the proxy's injected per-session CA, and the allowlist decides each request. Teeth: an
     // allowed host's fetch returns the real content (the known nix-cache-info hash); a denied
@@ -883,7 +883,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     let state = TmpDir::new("egress-state");
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
 
@@ -1040,7 +1040,7 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     let state = TmpDir::new("logs-state");
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
 
@@ -1180,7 +1180,7 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
     let state = TmpDir::new("logsf-state");
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
 
@@ -1301,7 +1301,7 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
 #[test]
 fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     // The L4 (`tcp://`) raw-splice path end to end through the real binary — the headline proof. A
-    // trusted `network = "allowlist"` with a `tcp://` rule lets an in-cage client (curl tunnelling
+    // trusted `network = "deny"` with a `tcp://` rule lets an in-cage client (curl tunnelling
     // via HTTP CONNECT to the in-cage forwarder) reach a host-side **plain-HTTP** upstream through
     // the empty-netns → forwarder → host proxy → splice chain. Teeth: the upstream speaks plain HTTP,
     // not TLS, so the exchange can only complete if the proxy *spliced* the bytes uninspected — had
@@ -1343,7 +1343,7 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
 
     std::fs::write(
         project.path().join(".ops.toml"),
-        format!("[network]\nmode = \"allowlist\"\nallow = [\"tcp://127.0.0.1:{port}\"]\n"),
+        format!("[network]\nmode = \"deny\"\nallow = [\"tcp://127.0.0.1:{port}\"]\n"),
     )
     .unwrap();
 
@@ -1509,7 +1509,7 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
 
 #[test]
 fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
-    // The real desktop-agent posture: `gui = "wayland"` AND `network = "allowlist"` open at once,
+    // The real desktop-agent posture: `gui = "wayland"` AND `network = "deny"` open at once,
     // each stacking its own binds and env into one cage. The display socket (a local Unix socket,
     // bound read-only), the fonts (seeded + a generated config), and the egress machinery (the
     // bound proxy socket + the injected CA + the empty netns) must coexist — neither hole displaces
@@ -1533,7 +1533,7 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     std::fs::write(
         project.path().join(".ops.toml"),
         "gui = \"wayland\"\n\
-         [network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\
+         [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
          [packages]\nwayland-utils = \"nix:wayland-utils\"\nfontconfig = \"nix:fontconfig\"\n",
     )
     .unwrap();
@@ -1859,7 +1859,7 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
 #[test]
 fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     // The headline self-equip path (`ops mise install`) under the headline security posture (a
-    // trusted `network = "allowlist"`). mise reads its CA roots from the certificate *file*, not
+    // trusted `network = "deny"`). mise reads its CA roots from the certificate *file*, not
     // the CA-bundle env variables, so this is the exact case where the two halves of the trust
     // setup must combine: the hermetic cacert (a real bundle at the file path, which mise needs
     // present to load any roots at all) and the egress proxy's per-session MITM CA (injected via
@@ -1874,7 +1874,7 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     let state = TmpDir::new("ma-state");
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
 
@@ -1981,7 +1981,7 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
 #[test]
 fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     // The headline posture the shipped profiles use: a non-`nix:` tool auto-equipped under a
-    // trusted `network = "allowlist"`. This is the discriminating case the shared-net test above
+    // trusted `network = "deny"`. This is the discriminating case the shared-net test above
     // cannot reach — it forces BOTH (1) the wrap composition (the auto-equip wrap nests *inside*
     // the egress wrap, so the forwarder is up before the install fetches) and (2) mise's *own*
     // reqwest through the MITM proxy on a direct download (aqua fetches from github, already in
@@ -1994,7 +1994,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     let state = TmpDir::new("aql-state");
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
     std::fs::write(
@@ -2070,7 +2070,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
          [app.cc.packages]\n\
          claude-code = \"mise:aqua:anthropics/claude-code\"\n\
          [app.cc.network]\n\
-         mode = \"allowlist\"\n\
+         mode = \"deny\"\n\
          allow = [\"api.anthropic.com\", \"storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*\"]\n",
     )
     .unwrap();
@@ -2254,7 +2254,7 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
     };
     std::fs::write(
         project.path().join(".ops.toml"),
-        toml("allowlist", "allow = [\"cache.nixos.org\"]\n"),
+        toml("deny", "allow = [\"cache.nixos.org\"]\n"),
     )
     .unwrap();
 
@@ -2359,7 +2359,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
         project.path().join(".ops.toml"),
         format!(
             "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
-             [network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n"
+             [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n"
         ),
     )
     .unwrap();
@@ -2490,7 +2490,7 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     let state = TmpDir::new("gc-state");
     let flake_cfg = format!(
         "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
-         [network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n"
+         [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n"
     );
     std::fs::write(project.path().join(".ops.toml"), &flake_cfg).unwrap();
 
@@ -2588,7 +2588,7 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     // outcome reached by an overwrite, which the `wrap_flake_equip` unit test covers. ----
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
     let retrust = ops_in(
@@ -2766,7 +2766,7 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     let secret_value = "ops-e2e-secret-must-not-leak-4b7x";
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\n\
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
          [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     )
@@ -2869,7 +2869,7 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
 
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\n\
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
          [secret.\"cache.nixos.org\"]\nfrom = \"myscheme://github/token\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     )
@@ -2953,7 +2953,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     let secret_value = "ops-e2e-leak-canary-9z3k";
     std::fs::write(
         project.path().join(".ops.toml"),
-        "[network]\nmode = \"allowlist\"\nallow = [\"cache.nixos.org\"]\n\n\
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
          [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_LEAK\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     )

@@ -1911,7 +1911,7 @@ fn validate_network(
 }
 
 /// Validate the table form of `network`: `none`/`shared` behave as the string form,
-/// `allowlist` classifies each declared entry (a malformed one is dropped with a
+/// while `deny`/`allow`/`ask` classify each declared entry (a malformed one is dropped with a
 /// warning, fail-closed — that host simply stays unreachable, never silently allowed).
 fn validate_network_table(
     warnings: &mut Vec<String>,
@@ -1922,11 +1922,11 @@ fn validate_network_table(
     match table.mode.as_str() {
         "none" => Some(NetworkPolicy::Isolated),
         "shared" => Some(NetworkPolicy::Shared),
-        // `deny` is the canonical name for the classic deny-by-default allowlist; `allowlist`
-        // is its permanently-kept backward-compatible alias. `allow` is the denylist: everything
-        // public reaches except the `deny` carve-outs, proxy still active. `ask` parks an unmatched
-        // request for a live decision (allow rules auto-pass, deny rules auto-fail).
-        "deny" | "allowlist" | "allow" | "ask" => {
+        // `deny` is the classic deny-by-default allow-list: only what `allow` lists reaches. `allow`
+        // is the denylist: everything public reaches except the `deny` carve-outs, proxy still
+        // active. `ask` parks an unmatched request for a live decision (allow rules auto-pass, deny
+        // rules auto-fail).
+        "deny" | "allow" | "ask" => {
             use crate::allowlist::DefaultAction;
             let allow = classify_entries(warnings, source_label, "allow", table.allow, groups);
             let deny = classify_entries(warnings, source_label, "deny", table.deny, groups);
@@ -1951,7 +1951,7 @@ fn validate_network_table(
                         .with_ask_timeout(timeout)
                         .with_ask_notice(table.ask_notice.unwrap_or(true))
                 }
-                _ => policy, // `deny` / the `allowlist` alias: deny-by-default
+                _ => policy, // `deny`: deny-by-default
             };
             // An `ask_timeout` outside `ask` mode is moot — flag it rather than silently drop it.
             if table.mode != "ask" && table.ask_timeout.is_some() {
@@ -1970,7 +1970,7 @@ fn validate_network_table(
         other => {
             warnings.push(format!(
                 "{source_label}: ignoring unknown network mode `{other}` (expected \"none\", \
-                 \"shared\", \"deny\", \"allow\", \"ask\", or the \"allowlist\" alias)"
+                 \"shared\", \"deny\", \"allow\", or \"ask\")"
             ));
             None
         }
@@ -3369,7 +3369,7 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         // standalone, they would not. Any of the filtering spellings counts (table or bare string).
         let filtered = match &app.network {
             Some(NetworkField::Table(t)) => {
-                matches!(t.mode.as_str(), "allowlist" | "deny" | "allow" | "ask")
+                matches!(t.mode.as_str(), "deny" | "allow" | "ask")
             }
             Some(NetworkField::Posture(p)) => matches!(p.as_str(), "deny" | "allow" | "ask"),
             None => false,
@@ -3943,7 +3943,7 @@ mod tests {
     fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".to_string(),
+                mode: "deny".to_string(),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
@@ -4111,7 +4111,7 @@ mod tests {
         // the app falls to the built-in `{GET,HEAD}`, never all-verbs. (Read-by-default only ever
         // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
         let net = NetworkField::Table(NetworkTable {
-            mode: "allowlist".into(),
+            mode: "deny".into(),
             allow: vec!["x.com".into()],
             deny: vec![],
             ask_timeout: None,
@@ -4286,29 +4286,34 @@ mod tests {
                 if p.default_action() == DefaultAction::Allow && p.deny_rules().len() == 1
         ));
 
-        // `allowlist` is the permanently-kept backward-compatible alias of `deny`.
-        let alias = validate_network(
-            &mut w,
-            GLOBAL_CONFIG,
-            tbl("allowlist", &["github.com"], &[]),
-        )
-        .unwrap();
-        let canon =
-            validate_network(&mut w, GLOBAL_CONFIG, tbl("deny", &["github.com"], &[])).unwrap();
-        assert_eq!(
-            alias, canon,
-            "`allowlist` must resolve identically to `deny`"
-        );
-
         assert!(w.is_empty(), "every valid mode warns nothing: {w:?}");
 
-        // An unknown mode warns and yields nothing (fail-closed: the prior posture is kept).
+        // An unknown mode warns and yields nothing. This is *not* fail-closed: a dropped network
+        // field resolves to `NetworkPolicy::default()` == `Shared` (the open host network), so an
+        // invalid posture reopens the network — which is why the warning must be loud.
         assert!(
             validate_network(&mut w, GLOBAL_CONFIG, NetworkField::Posture("yolo".into())).is_none()
         );
         assert!(
             w.len() == 1 && w[0].contains("yolo"),
             "unknown mode must warn: {w:?}"
+        );
+
+        // `allowlist` was removed as an alias of `deny`; the table form now rejects it as an unknown
+        // mode, by name (a future re-add of the arm without the message would fail this).
+        let mut wr = Vec::new();
+        assert!(
+            validate_network(
+                &mut wr,
+                GLOBAL_CONFIG,
+                tbl("allowlist", &["github.com"], &[])
+            )
+            .is_none(),
+            "`allowlist` is no longer a valid mode"
+        );
+        assert!(
+            wr.iter().any(|m| m.contains("unknown network mode")),
+            "rejecting `allowlist` must warn by name: {wr:?}"
         );
     }
 
@@ -5045,7 +5050,7 @@ mod tests {
             br#"
             cmd = "demo-app"
             [network]
-            mode = "allowlist"
+            mode = "deny"
             allow = ["api.example.com"]
             [secret."api.example.com"]
             from = "env://DEMO_API_KEY"
@@ -5056,15 +5061,15 @@ mod tests {
         .unwrap();
         let joined = ok.summary.join("\n");
         assert!(joined.contains("command: demo-app"), "{joined}");
-        assert!(joined.contains("network: allowlist"), "{joined}");
+        assert!(joined.contains("network: deny"), "{joined}");
         // The secret shows its destination and source locator — never a value (a profile has none).
         assert!(
             joined.contains("api.example.com") && joined.contains("env://DEMO_API_KEY"),
             "{joined}"
         );
-        // `allowlist`/`deny`/`allow` are all filtering postures, so a secret declared under any of
-        // them carries no "would not be injected" note. (The `allowlist` profile above already has
-        // a secret and is filtering, so its summary must not warn.)
+        // `deny`/`allow`/`ask` are all filtering postures, so a secret declared under any of them
+        // carries no "would not be injected" note. (The `deny` profile above already has a secret
+        // and is filtering, so its summary must not warn.)
         assert!(
             !joined.contains("injected only under"),
             "a filtering-posture profile must not warn its secrets are uninjected:\n{joined}"
@@ -5302,7 +5307,7 @@ mod tests {
         // ignored (Mode-A `ops run`/`ops shell` stays all-verbs), with a warning so it is not silent.
         let global = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".into(),
+                mode: "deny".into(),
                 allow: vec!["h.test".into()],
                 deny: vec![],
                 ask_timeout: None,
@@ -6636,7 +6641,7 @@ mod tests {
     fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".into(),
+                mode: "deny".into(),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
                 ask_timeout: None,
@@ -6689,7 +6694,7 @@ mod tests {
         // A `[network]` table carrying an explicit `stats` value.
         let net = |stats: Option<bool>| RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".into(),
+                mode: "deny".into(),
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 ask_timeout: None,
@@ -6703,7 +6708,7 @@ mod tests {
         // Default: nothing set → recording is on.
         assert!(resolve_no_plugins(RawConfig::default(), None).egress_stats);
         // A bare-string posture carries no `stats` key → stays on.
-        assert!(resolve_no_plugins(raw_network("allowlist"), None).egress_stats);
+        assert!(resolve_no_plugins(raw_network("deny"), None).egress_stats);
         // Global `stats = false` (trusted by location) → off.
         assert!(!resolve_no_plugins(net(Some(false)), None).egress_stats);
         // A TRUSTED project may turn its own audit off.
@@ -6744,7 +6749,7 @@ mod tests {
             &[],
             &[],
             Some(NetworkField::Table(NetworkTable {
-                mode: "allowlist".into(),
+                mode: "deny".into(),
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 ask_timeout: None,
@@ -6817,7 +6822,7 @@ mod tests {
     /// A trusted-shaped network allowlist for the given hosts.
     fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         Some(NetworkField::Table(NetworkTable {
-            mode: "allowlist".into(),
+            mode: "deny".into(),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
             ask_timeout: None,

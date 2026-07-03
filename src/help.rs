@@ -742,7 +742,7 @@ const PAGES: &[Page] = &[
             "Reports, per destination host, how many requests this project's launches allowed,\n\
             denied by a rule (or an `ask` decision), or had blocked by a security guard — SSRF, an\n\
             outbound-secret tripwire, or a domain-fronting host mismatch. Each request is counted\n\
-            once. Counters accrue while a filtering posture (allowlist / ask) runs and persist after\n\
+            once. Counters accrue while a filtering posture (deny / allow / ask) runs and persist after\n\
             the session; they are owner-only under the data dir. Transport/protocol failures (DNS, an\n\
             unreachable upstream, a malformed request) are not a policy verdict and are not counted.\n\
             Recording is on by default; a trusted `[network] stats = false` turns it off. Host-side\n\
@@ -775,7 +775,7 @@ const PAGES: &[Page] = &[
             \n\
             LIVE-ONLY: the log lives in the running session's memory and is NEVER written to disk;\n\
             once the session exits, nothing remains. It shows a session while it runs (watch it\n\
-            from another terminal), not after. Only a filtering posture (`allowlist`/`ask`) has a\n\
+            from another terminal), not after. Only a filtering posture (`deny`/`allow`/`ask`) has a\n\
             proxy, so only those sessions have a log.\n\
             \n\
             Verdicts are a superset of `ops net stats`: allow, deny, blocked (a security/protocol\n\

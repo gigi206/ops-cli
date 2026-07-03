@@ -206,7 +206,7 @@ pub(crate) fn start(
 
     // Read the posture before the policy moves into the proxy context: only `ask` needs the pending
     // queue wired into the proxy (to park), but every proxy posture stands the control socket up now
-    // — it also serves the live egress log (`ops net log`), which `allowlist` sessions want too.
+    // — it also serves the live egress log (`ops net log`), which filtering-posture sessions want too.
     let asks = policy.default_action() == crate::allowlist::DefaultAction::Ask;
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)

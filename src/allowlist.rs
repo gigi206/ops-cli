@@ -1082,7 +1082,7 @@ fn classify_kind(s: &str) -> Result<RuleKind, String> {
 }
 
 /// `*` as a host is a request to allow *every* host, which an allowlist entry deliberately
-/// cannot express — the point of `mode = "allowlist"` is deny-by-construction. Catch the bare
+/// cannot express — the point of `mode = "deny"` is deny-by-construction. Catch the bare
 /// wildcard in any port form (`*`, `*:*`, `*:80`, and the `https://`/`tcp://` equivalents after the
 /// scheme is stripped) and point the author at the posture switch instead of the generic
 /// "unrecognized entry"/"invalid port" message. `*.domain` is a *bounded* subdomain wildcard and is

@@ -681,7 +681,7 @@ fn the_network_posture_is_a_trust_gated_security_field() {
 fn the_network_allowlist_is_a_trust_gated_security_field() {
     let fx = Fixture::new();
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\nallow = [\"github.com\", \"*.nixos.org\", \"example.com/exact\"]\ndeny = [\"evil.nixos.org\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"github.com\", \"*.nixos.org\", \"example.com/exact\"]\ndeny = [\"evil.nixos.org\"]\n",
     );
 
     // Untrusted: the allowlist is dropped to the default (shared), with an explanation.
@@ -702,7 +702,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // `mode = "allowlist"` is the backward-compatible alias of `deny`, so it renders as `deny`.
+    // `config show` renders the resolved posture, so a deny-by-default policy reads as `deny`.
     assert!(stdout.contains("network: deny"), "stdout:\n{stdout}");
     // each L7 host rule renders the implicit `https://`
     assert!(
@@ -739,7 +739,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
 fn the_egress_stats_toggle_is_shown_and_trust_gated() {
     // A trusted project that turns its audit off reads `stats: off`.
     let fx = Fixture::new();
-    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"github.com\"]\nstats = false\n");
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\nstats = false\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
@@ -753,8 +753,8 @@ fn the_egress_stats_toggle_is_shown_and_trust_gated() {
     // so the global filtering posture's recording stays on — a project cannot disable the auditing
     // of its own egress.
     let fx = Fixture::new();
-    fx.write_global("[network]\nmode = \"allowlist\"\nallow = [\"github.com\"]\n");
-    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"github.com\"]\nstats = false\n");
+    fx.write_global("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\nstats = false\n");
     // deliberately NOT trusting the project
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -773,7 +773,7 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
     // Security boundary: an UNTRUSTED project must not be able to *open* egress with allow mode —
     // it falls back to the default (shared) with an explanation. Opening egress is exactly the
     // capability an untrusted project may not gain; `allow` is a filtering posture but still a
-    // trust-gated security field, gated identically to `none`/`shared`/`deny`/`allowlist`.
+    // trust-gated security field, gated identically to `none`/`shared`/`deny`/`ask`.
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1247,7 +1247,7 @@ fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
         "type = \"resolver\"\nscheme = \"pass\"\nexec = \"resolve\"\n",
     );
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\nallow = [\"api.github.com\"]\n\n\
+        "[network]\nmode = \"deny\"\nallow = [\"api.github.com\"]\n\n\
          [secret.\"api.github.com\"]\nfrom = \"pass://github/token\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
@@ -1271,7 +1271,7 @@ fn an_unregistered_resolver_scheme_drops_the_secret_with_a_warning() {
     let fx = Fixture::new();
     // no plugin claims `vault`
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\nallow = [\"api.github.com\"]\n\n\
+        "[network]\nmode = \"deny\"\nallow = [\"api.github.com\"]\n\n\
          [secret.\"api.github.com\"]\nfrom = \"vault://secret/x\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
@@ -1775,7 +1775,7 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
     // field included — even with no project trust, exactly like a global `[app.<name>]`.
     fx.write_profile(
         "demo-app",
-        "cmd = \"demo-app\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n",
+        "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n",
     );
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
@@ -1799,7 +1799,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
     // baseline `network` section never prints here, because the baseline is not an allowlist).
     fx.write_profile(
         "demo-app",
-        "cmd = \"demo-app\"\n[network]\nmode = \"allowlist\"\n\
+        "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\n\
          allow = [\"api.example.com\", \"github.com\"]\ndeny = [\"github.com/secret\"]\n",
     );
 
@@ -1847,7 +1847,7 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
     fx.write_global("[limits]\nmemory_high = \"70%\"\n");
     fx.write_profile(
         "demo",
-        "cmd = \"demo-agent\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+        "cmd = \"demo-agent\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          [limits]\ntasks_max = 2048\n[env]\nDEMO_TOKEN = \"placeholder\"\n",
     );
 
@@ -1915,7 +1915,7 @@ fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
     // to none (so the launch injects nothing). The per-app view must match the launch — it must not
     // report a credential `ops app narrow` would silently drop.
     fx.write_global(
-        "[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+        "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
@@ -1967,7 +1967,7 @@ fn config_show_compact_app_section_is_secret_posture_aware() {
     fx.write_profile(
         "wired",
         "cmd = \"agent\"\n\
-         [network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
@@ -2001,7 +2001,9 @@ fn config_show_single_source_views_restrict_to_one_layer() {
     // A free env var and a security field in the global config; a different free env var in the
     // project. Each single-source view shows what *that* layer contributes (over the defaults), so
     // its provenance tags read as that layer's own additions.
-    fx.write_global("[env]\nGLOBAL_VAR = \"g\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n");
+    fx.write_global(
+        "[env]\nGLOBAL_VAR = \"g\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n",
+    );
     fx.write_project("[env]\nPROJECT_VAR = \"p\"\n");
 
     // --global: the global's var (tagged global) and its network; the project's var is absent.
@@ -2202,7 +2204,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     // host, shape, and the source *locator* (the variable name, `env DEMO_API_KEY`).
     fx.write_profile(
         "demo-app",
-        "cmd = \"demo-app\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+        "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          [secret.\"api.example.com\"]\nfrom = \"env://DEMO_API_KEY\"\n\
          header = \"x-api-key\"\ntype = \"raw\"\n",
     );
@@ -2300,7 +2302,7 @@ fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project(
     // the repo hijacking it. The profile sets the command and a network allowlist.
     fx.write_profile(
         "claude",
-        "cmd = \"claude\"\n[network]\nmode = \"allowlist\"\nallow = [\"api.anthropic.com\"]\n",
+        "cmd = \"claude\"\n[network]\nmode = \"deny\"\nallow = [\"api.anthropic.com\"]\n",
     );
     // An untrusted project tries to override the very same app's command and widen its network.
     fx.write_project("[app.claude]\ncmd = [\"evil\"]\nnetwork = \"shared\"\n");
@@ -2336,7 +2338,7 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
     std::fs::write(
         fx.proj.path().join("demo-app.toml"),
         "cmd = \"demo-app\"\n\
-         [network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n\
+         [network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          [secret.\"api.example.com\"]\nfrom = \"env://DEMO_API_KEY\"\n\
          header = \"x-api-key\"\ntype = \"raw\"\n",
     )
@@ -2431,7 +2433,7 @@ fn ops_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
     // (a) An imported profile exports verbatim — comments and formatting survive.
     let profile_body = "# my demo-app profile\n\
                         cmd = \"demo-app\"\n\
-                        [network]\nmode = \"allowlist\"\nallow = [\"api.example.com\"]\n";
+                        [network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n";
     fx.write_profile("demo-app", profile_body);
     let exp = fx.run(&["app", "export", "demo-app"]);
     assert!(

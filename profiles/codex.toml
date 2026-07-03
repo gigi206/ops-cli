@@ -18,7 +18,7 @@ codex = "mise:aqua:openai/codex"
 
 # An app is read-by-default ({GET,HEAD}); the API host the agent POSTs to is opened with `{*}`.
 [network]
-mode = "allowlist"
+mode = "deny"
 allow = ["{*} https://api.openai.com"]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the

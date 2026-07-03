@@ -361,7 +361,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
     // The same host:port carries a raw tcp:// allow AND an inspected (L7) path deny — the splice is
     // uninspected, so the L7 deny silently does not apply. The config load must warn about it.
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\nallow = [\"tcp://api.example.com:443\"]\ndeny = [\"api.example.com/secret\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"tcp://api.example.com:443\"]\ndeny = [\"api.example.com/secret\"]\n",
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
@@ -376,7 +376,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
 
     // A host reached by only one layer does not warn (no false positive).
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\nallow = [\"tcp://ssh.example.com:22\", \"api.example.com\"]\n",
+        "[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\", \"api.example.com\"]\n",
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
     let clean = fx.run(&["net", "rules"]);
@@ -2015,7 +2015,7 @@ fn test_net_reflects_the_built_in_set_both_directions() {
 fn test_net_method_scopes_a_rule_to_its_verbs() {
     let fx = Fixture::new();
     // a GET/HEAD-only allow for the host
-    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
     // the prefix is shown in the rule listing, with the implicit scheme (443 is the default → bare)
@@ -2047,7 +2047,7 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
 fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     let fx = Fixture::new();
     // a tcp:// (raw L4) allow for a specific host:port
-    fx.write_project("[network]\nmode = \"allowlist\"\nallow = [\"tcp://ssh.example.com:22\"]\n");
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\"]\n");
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 
     // the rule listing shows the `tcp://` scheme, so the layer (the proto) is visible
@@ -2087,7 +2087,7 @@ fn test_net_reports_a_deny_suppressed_splice() {
     // tester says *why* (a covered host that does not splice must not read as "no rule covers it").
     let fx = Fixture::new();
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\n\
+        "[network]\nmode = \"deny\"\n\
          allow = [\"tcp://evil.com:443\"]\ndeny = [\"re:^https://evil\\\\.com\"]\n",
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
@@ -2107,7 +2107,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
     // ({GET,HEAD}) — so a POST the bare `ops test net` allows is denied under `--app`.
     let fx = Fixture::new();
     fx.write_project(
-        "[network]\nmode = \"allowlist\"\nallow = [\"shared.test\"]\n\
+        "[network]\nmode = \"deny\"\nallow = [\"shared.test\"]\n\
          [app.agent]\ncmd = \"true\"\n",
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
@@ -2157,7 +2157,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
     let fx = Fixture::new();
     fx.write_project(
         "[app.agent]\ncmd = \"true\"\n\
-         [app.agent.network]\nmode = \"allowlist\"\nallow = [\"read.test\", \"{*} write.test\"]\n",
+         [app.agent.network]\nmode = \"deny\"\nallow = [\"read.test\", \"{*} write.test\"]\n",
     );
     assert!(fx.run(&["trust", ".ops.toml"]).status.success());
 

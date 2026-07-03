@@ -1102,8 +1102,9 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine, pal));
 
     // The network posture — a security field. `shared` keeps the host network; `none` cuts it
-    // off; an `allowlist` lists exactly what egress is permitted (deny wins over allow), plus the
-    // always-allowed built-in set so the self-equip allowance is never silent.
+    // off; a filtering posture (`deny`/`allow`/`ask`) routes egress through the proxy — `deny`
+    // permits only what is listed (deny wins over allow), plus the always-allowed built-in set so
+    // the self-equip allowance is never silent.
     let net_tag = provenance_tag(view.network_origin, pal);
     match &view.network {
         NetworkView::Shared => {

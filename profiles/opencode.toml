@@ -19,7 +19,7 @@ cmd = "opencode"
 opencode = "mise:opencode"
 
 [network]
-mode = "allowlist"
+mode = "deny"
 # api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
 # and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
 allow = ["{*} https://api.anthropic.com", "{GET,HEAD} https://models.dev"]

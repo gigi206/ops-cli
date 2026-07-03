@@ -31,7 +31,7 @@ hermes = "flake:github:NousResearch/hermes-agent#default"
 # An app is read-by-default ({GET,HEAD}); these are write/build hosts (API POSTs, and the
 # package-manager fetches the in-cage build needs), so each is opened to all verbs with `{*}`.
 [network]
-mode = "allowlist"
+mode = "deny"
 allow = [
     # Runtime: the LLM provider — OpenRouter, Hermes' default BYOK endpoint.
     "{*} https://openrouter.ai",

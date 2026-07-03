@@ -1190,7 +1190,7 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///
 /// Residuals (named, not fixed here), both because a signal terminates a supervisor without running
 /// its RAII drops:
-/// - the `network = "allowlist"` supervisor leaves its per-session egress socket and CA under
+/// - the `network = "deny"` supervisor leaves its per-session egress socket and CA under
 ///   `<data>/egress/` on disk — the same leak any crash or `SIGKILL` of that process already
 ///   produces; a future sweep of stale egress artefacts (alongside the session housekeeping) is the
 ///   clean fix.
@@ -1845,8 +1845,8 @@ fn build(
 
 /// Translate the resolved configuration's network posture into the cage's net
 /// policy. The two enums are kept separate on purpose: the config vocabulary
-/// (`none`/`shared`/`allowlist`) is the user's, while the cage's posture type is the
-/// sandbox's. The allowlist posture maps to an **isolated** (empty) namespace by
+/// (`none`/`shared`/`deny`/`allow`/`ask`) is the user's, while the cage's posture type is the
+/// sandbox's. A filtering posture maps to an **isolated** (empty) namespace by
 /// design — that is the Model-B foundation: with no route of its own, the cage's only
 /// egress is the bound socket `build` wires to the host filtering proxy. So the netns
 /// is identical to `none`; the filtering lives in the proxy on top, not in the netns.

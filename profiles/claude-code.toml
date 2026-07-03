@@ -11,6 +11,15 @@
 # in the app's own home and rolls the aqua package forward to the newest upstream release.
 cmd = "claude"
 
+# Your host Claude config, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir;
+# `mode = "rw"` lets the caged claude write back to these host files (login refresh,
+# history, project state).
+binds = [
+    { path = "~/.claude", mode = "rw" },
+    { path = "~/.claude.json", mode = "rw" },
+]
+
 [packages]
 claude-code = "mise:aqua:anthropics/claude-code"
 
@@ -30,13 +39,13 @@ claude-code = "mise:aqua:anthropics/claude-code"
 # all verbs with `{*}`; the pure download hosts stay `{GET,HEAD}` (least privilege).
 #
 # Third-party telemetry (the CLI ships operational logs to Datadog) is NOT hard-denied here: in
-# `allowlist` mode any host absent from `allow` is already refused, so Datadog never gets out, and
+# `deny` mode any host absent from `allow` is already refused, so Datadog never gets out, and
 # the [env] telemetry cut below also stops the CLI from generating that traffic at the source. To
 # restore an explicit, self-documenting hard block — a backstop if the mode is ever loosened, and it
 # also covers every port plus the raw-TCP path — uncomment the rule below. `deny` always wins; the
 # `*.` wildcard covers the apex plus every regional intake host.
 [network]
-mode = "allowlist"
+mode = "deny"
 # deny = [
 #     "*.datadoghq.com:*",  # Datadog telemetry / operational logs
 # ]
@@ -45,6 +54,7 @@ allow = [
     "{*} https://platform.claude.com:443",
     "{GET,HEAD} https://downloads.claude.ai:443",
     "{*} https://mcp-proxy.anthropic.com:443",
+    "{*} console.anthropic.com:443",
     "{GET,HEAD} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 

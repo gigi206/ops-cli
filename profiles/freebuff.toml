@@ -34,7 +34,7 @@ nodejs = "nix:nodejs"
 freebuff = "mise:npm:freebuff"
 
 [network]
-mode = "allowlist"
+mode = "deny"
 # registry.npmjs.org: the npm install of the launcher. codebuff.com: the launcher's
 # hard-coded download URL, which 301-redirects to www.codebuff.com. www.codebuff.com:
 # the real binary download AND Codebuff's runtime backend (REST + websocket). Add any

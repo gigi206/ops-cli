@@ -177,7 +177,7 @@ key = "npm_token"                                  # = "npm_token@sops" to pin o
 
 # transport (orthogonal to the secret)
 [network]
-mode  = "allowlist"
+mode  = "deny"
 allow = ["api.github.com/repos/*"]   # MITM-filtered lane (host+path+regex, content-aware)
 ```
 
@@ -188,7 +188,7 @@ an injection target. Host-scoped by default, path on opt-in (git-credential's
 
 ### 6.1 6.3a schema locks (from the architecture review)
 
-- **`http-header` injection requires `[network] mode = "allowlist"`.** Injection happens
+- **`http-header` injection requires a filtering `[network]` mode (`deny`/`allow`/`ask`).** Injection happens
   *inside the MITM proxy*, which only exists under the allowlist posture (`egress::start`
   is gated on `NetworkPolicy::Allowlist`). A `http-header` secret under `shared`/`none`/no
   network table must **warn loudly or fail-closed at config/launch — never a silent
