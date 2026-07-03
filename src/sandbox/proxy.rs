@@ -2354,7 +2354,7 @@ mod tests {
         );
         // …and the same forwarded request emits exactly one `allow` log event carrying its method
         // and path (the `allow` site the refusal-transcript test cannot reach).
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 1, "one allow event: {events:?}");
         assert_eq!(
             events[0].verdict,
@@ -2443,7 +2443,7 @@ mod tests {
             up.join().unwrap();
         }
 
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 2, "one allow event per request: {events:?}");
         // Both are `allow` (ops permitted both); only the captured upstream status differs.
         assert!(events.iter().all(|e| e.verdict == LogVerdict::Allow));
@@ -2516,7 +2516,7 @@ mod tests {
             "the body bytes are unaltered across the chain seam"
         );
         // …and the status was still read off the front of that same stream.
-        assert_eq!(log.snapshot(None).events[0].status, Some(200));
+        assert_eq!(log.snapshot(None, None).events[0].status, Some(200));
     }
 
     /// The event log redacts a configured secret out of a request's path **before** it enters the
@@ -2547,7 +2547,7 @@ mod tests {
         )
         .unwrap();
         assert!(resp.contains("outbound-secret"), "{resp:?}");
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "outbound-secret");
@@ -3081,7 +3081,7 @@ mod tests {
             "a cert rejection must be distinguishable from an unreachable host: {resp:?}"
         );
         // Logged as an `error` (the host was allowed; its certificate failed downstream).
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(
             events[0].verdict,
@@ -3124,7 +3124,7 @@ mod tests {
         );
         // The log records it as an `error` (allowed but failed downstream), NOT a `deny`/`blocked`
         // (we never refused it) — the distinction the log exists to make.
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Error);
         assert_eq!(events[0].reason, "dns-failure");
@@ -3926,7 +3926,7 @@ mod tests {
         // exactly one event with the host, verdict, and reason category it recorded. A mis-emitted
         // or missing event here is a log/stats drift (or a missed site), even though the per-block
         // stat assertions passed.
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         let seen: Vec<(String, LogVerdict, String)> = events
             .iter()
             .map(|e| (e.host.clone(), e.verdict, e.reason.clone()))
@@ -4388,7 +4388,7 @@ mod tests {
         );
         let reply = splice_connect_reply(ctx, "127.0.0.1", 443);
         assert!(reply.contains("ip-literal"), "{reply:?}");
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "ip-literal");
@@ -4423,7 +4423,7 @@ mod tests {
         sock.flush().unwrap();
         let reply = read_until_blank(&mut sock).unwrap();
         assert!(reply.contains("method-not-allowed"), "{reply:?}");
-        let events = log.snapshot(None).events;
+        let events = log.snapshot(None, None).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "method-not-allowed");

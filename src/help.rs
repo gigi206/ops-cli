@@ -781,9 +781,11 @@ const PAGES: &[Page] = &[
             `--with-status` adds the upstream HTTP status (200/404/5xx) the server answered — for a\n\
             completed L7 (inspected `https://`) request only; an L4 (`tcp://`) splice, a refusal, or\n\
             an error shows `-` (no HTTP response to read). This is the server's answer to a delivered\n\
-            request, distinct from the egress verdict: an allowed request can still get a 404. In\n\
-            `--follow`, an event whose response has not yet returned shows no status and is not\n\
-            updated retroactively; the one-shot listing always has it.\n\
+            request, distinct from the egress verdict: an allowed request can still get a 404. Under\n\
+            `--follow --with-status`, an event whose response has not yet returned first appears with\n\
+            no status, then reappears once — carrying its status — when the response lands (a live\n\
+            `tail` cannot un-print a line, so the status arrives as a follow-up); the one-shot\n\
+            listing shows each event's status directly.\n\
             \n\
             The URL query is dropped from the shown path by default (a token can ride in a query);\n\
             `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\

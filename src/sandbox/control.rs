@@ -348,16 +348,24 @@ pub(crate) struct LogEvent {
     /// decision point. `None` for an L4 (`tcp://`) splice (no HTTP response to parse), a refusal, an
     /// `error` (no response), or a request whose response has not yet arrived.
     pub(crate) status: Option<u16>,
+    /// The amendment sequence at which [`LogRing::set_status`] filled in `status`, or `None` while
+    /// the status is unset. It is a SECOND monotonic cursor (distinct from `seq`): a `--follow`
+    /// reader that already passed this event's `seq` uses it to pick the event up again once its
+    /// status arrives, so `--with-status` is not blank in follow mode. Server-side only — never sent
+    /// over the wire (the reader tracks the ring's amend cursor from the `amended=` reply line).
+    pub(crate) amend_seq: Option<u64>,
 }
 
 /// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
 /// before that cursor (surfaced, not silently dropped — a bursty agent between `--follow` polls),
-/// and the newest sequence number (the cursor to pass next time, even when `events` is empty).
+/// the newest sequence number (the seq cursor to pass next time, even when `events` is empty), and
+/// the newest amendment sequence (the amend cursor to pass next time, for retroactive status).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogSnapshot {
     pub(crate) events: Vec<LogEvent>,
     pub(crate) dropped: u64,
     pub(crate) head: u64,
+    pub(crate) amend_head: u64,
 }
 
 /// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
@@ -372,6 +380,9 @@ pub(crate) struct LogRing {
 
 struct LogInner {
     next_seq: u64,
+    /// The next amendment sequence [`LogRing::set_status`] will stamp — a second monotonic counter,
+    /// bumped only when a status is filled in, so a follow reader can pick up retroactive statuses.
+    next_amend: u64,
     events: VecDeque<LogEvent>,
 }
 
@@ -380,6 +391,7 @@ impl LogRing {
         LogRing {
             inner: Mutex::new(LogInner {
                 next_seq: 1,
+                next_amend: 1,
                 events: VecDeque::new(),
             }),
             cap: cap.max(1),
@@ -417,6 +429,7 @@ impl LogRing {
             verdict,
             reason: reason.to_string(),
             status: None,
+            amend_seq: None,
         });
         while g.events.len() > self.cap {
             g.events.pop_front();
@@ -430,26 +443,45 @@ impl LogRing {
     /// sequence order, so a reverse scan finds the target quickly (the amend usually lands on the
     /// newest events).
     pub(crate) fn set_status(&self, seq: u64, status: u16) {
-        let mut g = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.status = Some(status);
+            // Stamp the amendment cursor so a follow reader that already passed this event's `seq`
+            // re-reads it once (with its status now filled) on its next poll.
+            ev.amend_seq = Some(g.next_amend);
+            g.next_amend += 1;
         }
     }
 
-    /// The events past `after`, plus the eviction gap and the newest sequence. `after = None` is a
+    /// The events past `after`, plus the eviction gap and the newest sequences. `after = None` is a
     /// tail read (the whole retained window; never reports a gap — a first read has nothing to miss);
     /// `after = Some(cursor)` is a follow read (events with `seq > cursor`, reporting how many between
     /// the cursor and the retained window were evicted unseen).
-    pub(crate) fn snapshot(&self, after: Option<u64>) -> LogSnapshot {
+    ///
+    /// `after_amend = Some(a)` additionally RE-EMITS an already-seen event (`seq <= after`) whose
+    /// status was filled in since amendment cursor `a` — so a `--follow --with-status` reader sees a
+    /// status that arrives after it passed the event's `seq`. A brand-new event (`seq > after`) is
+    /// already included, so it is not re-emitted (no duplicate). `after_amend = None` (a tail read, or
+    /// an old reader that does not track the amend cursor) does no retroactive re-emission.
+    pub(crate) fn snapshot(&self, after: Option<u64>, after_amend: Option<u64>) -> LogSnapshot {
         let g = self.inner.lock().unwrap();
         let head = g.next_seq - 1;
+        let amend_head = g.next_amend - 1;
         let cursor = after.unwrap_or(0);
-        let events: Vec<LogEvent> = g
+        let mut events: Vec<LogEvent> = g
             .events
             .iter()
             .filter(|e| e.seq > cursor)
             .cloned()
             .collect();
+        if let Some(a) = after_amend {
+            for e in g.events.iter() {
+                if e.seq <= cursor && e.amend_seq.is_some_and(|s| s > a) {
+                    events.push(e.clone());
+                }
+            }
+        }
         let dropped = match (after, g.events.front()) {
             (Some(a), Some(oldest)) if oldest.seq > a + 1 => oldest.seq - a - 1,
             _ => 0,
@@ -458,6 +490,7 @@ impl LogRing {
             events,
             dropped,
             head,
+            amend_head,
         }
     }
 }
@@ -592,16 +625,25 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
         }
         Some("LOG") => {
             // An optional `after=<seq>` makes this a follow read (events past the cursor, with the
-            // eviction gap reported); absent, it is a tail read of the whole retained window.
-            let after = parts
-                .next()
-                .and_then(|t| t.strip_prefix("after=")?.parse().ok());
-            let snapshot = log.snapshot(after);
+            // eviction gap reported); absent, it is a tail read of the whole retained window. An
+            // optional `amended=<seq>` opts into retroactive status re-emission (a `--with-status`
+            // follow); an old reader that omits it gets today's behavior (no re-emission).
+            let mut after = None;
+            let mut after_amend = None;
+            for token in parts {
+                if let Some(v) = token.strip_prefix("after=") {
+                    after = v.parse().ok();
+                } else if let Some(v) = token.strip_prefix("amended=") {
+                    after_amend = v.parse().ok();
+                }
+            }
+            let snapshot = log.snapshot(after, after_amend);
             let mut out = String::new();
             if snapshot.dropped > 0 {
                 out.push_str(&format!("dropped={}\n", snapshot.dropped));
             }
             out.push_str(&format!("head={}\n", snapshot.head));
+            out.push_str(&format!("amended={}\n", snapshot.amend_head));
             for ev in &snapshot.events {
                 out.push_str(&format_event_line(ev));
             }
@@ -770,19 +812,29 @@ pub(crate) struct SessionLog {
 /// Query one session's control socket for its recent egress events (`LOG`, or `LOG after=<seq>` for a
 /// follow read past a cursor). A session whose socket is gone (a dead/stale launch) fails the connect
 /// and the caller skips it.
-pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnapshot> {
+pub(crate) fn read_log(
+    socket: &Path,
+    after: Option<u64>,
+    after_amend: Option<u64>,
+) -> io::Result<LogSnapshot> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let cmd = match after {
-        Some(seq) => format!("LOG after={seq}\n"),
-        None => "LOG\n".to_string(),
-    };
+    let mut cmd = String::from("LOG");
+    if let Some(seq) = after {
+        cmd.push_str(&format!(" after={seq}"));
+    }
+    // Only sent for a `--with-status` follow; an older session ignores the token (no re-emission).
+    if let Some(a) = after_amend {
+        cmd.push_str(&format!(" amended={a}"));
+    }
+    cmd.push('\n');
     (&stream).write_all(cmd.as_bytes())?;
     (&stream).flush()?;
     let mut events = Vec::new();
     let mut dropped = 0;
     let mut head = 0;
+    let mut amend_head = 0;
     for line in BufReader::new(&stream).lines() {
         let line = line?;
         if line == "ok" {
@@ -792,6 +844,8 @@ pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnaps
             dropped = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("head=") {
             head = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("amended=") {
+            amend_head = v.parse().unwrap_or(0);
         } else if let Some(ev) = parse_event_line(&line) {
             events.push(ev);
         }
@@ -800,6 +854,7 @@ pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnaps
         events,
         dropped,
         head,
+        amend_head,
     })
 }
 
@@ -810,7 +865,7 @@ pub(crate) fn read_log(socket: &Path, after: Option<u64>) -> io::Result<LogSnaps
 pub(crate) fn log_all(data_dir: &Path) -> Vec<SessionLog> {
     let mut sessions = Vec::new();
     for pid in session_pids(data_dir) {
-        if let Ok(snapshot) = read_log(&control_socket(data_dir, pid), None) {
+        if let Ok(snapshot) = read_log(&control_socket(data_dir, pid), None, None) {
             sessions.push(SessionLog { pid, snapshot });
         }
     }
@@ -859,6 +914,8 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         verdict: verdict?,
         reason: reason?,
         status,
+        // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
+        amend_seq: None,
     })
 }
 
@@ -1509,7 +1566,7 @@ mod tests {
         for i in 0..5 {
             push_event(&ring, &format!("h{i}.test"), LogVerdict::Allow, "allowed");
         }
-        let snap = ring.snapshot(None);
+        let snap = ring.snapshot(None, None);
         // Cap is 3, so only the newest three survive; seqs are 1..=5 and never repeat.
         assert_eq!(snap.events.len(), 3);
         assert_eq!(snap.head, 5, "head is the newest seq assigned");
@@ -1524,7 +1581,7 @@ mod tests {
         let ring = LogRing::new(LOG_RING_CAP);
         push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
         push_event(&ring, "b.test", LogVerdict::Deny, "denied-default");
-        let snap = ring.snapshot(None);
+        let snap = ring.snapshot(None, None);
         assert_eq!(snap.events.len(), 2);
         assert_eq!(snap.dropped, 0);
         assert_eq!(snap.head, 2);
@@ -1540,12 +1597,12 @@ mod tests {
             push_event(&ring, &format!("h{i}.test"), LogVerdict::Allow, "allowed");
         }
         // A follower whose cursor is 1 missed seq 2 (evicted, never seen): report the gap.
-        let snap = ring.snapshot(Some(1));
+        let snap = ring.snapshot(Some(1), None);
         let seqs: Vec<u64> = snap.events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![3, 4]);
         assert_eq!(snap.dropped, 1, "seq 2 fell off the ring between polls");
         // A follower already at the head sees nothing new and no gap.
-        let caught_up = ring.snapshot(Some(snap.head));
+        let caught_up = ring.snapshot(Some(snap.head), None);
         assert!(caught_up.events.is_empty());
         assert_eq!(caught_up.dropped, 0);
         assert_eq!(caught_up.head, 4);
@@ -1572,7 +1629,7 @@ mod tests {
         );
         // A status amends the matching still-resident event, and only it.
         ring.set_status(s2, 404);
-        let snap = ring.snapshot(None);
+        let snap = ring.snapshot(None, None);
         assert_eq!(
             snap.events[0].status, None,
             "the untouched event keeps None"
@@ -1602,7 +1659,7 @@ mod tests {
             "allowed",
         );
         ring.set_status(s1, 500);
-        let after = ring.snapshot(None);
+        let after = ring.snapshot(None, None);
         assert!(
             after.events.iter().all(|e| e.seq != s1),
             "s1 is gone from the ring"
@@ -1610,6 +1667,46 @@ mod tests {
         assert!(
             after.events.iter().all(|e| e.status.is_none()),
             "a late status for an evicted event resurrects nothing"
+        );
+    }
+
+    #[test]
+    fn a_follow_reader_gets_a_status_amended_after_it_passed_the_event() {
+        let ring = LogRing::new(8);
+        let s1 = ring.push(
+            "a.test",
+            443,
+            Some("GET"),
+            Some("/1"),
+            LogVerdict::Allow,
+            "allowed",
+        );
+        // A follow reader catches up: it has seen seq s1, with no amendment yet.
+        let seen = ring.snapshot(Some(s1), Some(0));
+        assert!(seen.events.is_empty(), "nothing new past the head");
+        let (seq_cursor, amend_cursor) = (seen.head, seen.amend_head);
+
+        // The response returns later and the status is filled in — after the reader passed s1.
+        ring.set_status(s1, 200);
+
+        // The next follow poll RE-EMITS the already-seen event, now carrying its status.
+        let after = ring.snapshot(Some(seq_cursor), Some(amend_cursor));
+        assert_eq!(after.events.len(), 1, "the amended event resurfaces");
+        assert_eq!(after.events[0].seq, s1);
+        assert_eq!(after.events[0].status, Some(200));
+
+        // A reader that does NOT track the amend cursor gets today's behavior: no re-emission.
+        let no_amend = ring.snapshot(Some(seq_cursor), None);
+        assert!(
+            no_amend.events.is_empty(),
+            "without the amend cursor there is no retroactive status"
+        );
+
+        // Once the reader advances its amend cursor, the amendment is not shown a second time.
+        let caught_up = ring.snapshot(Some(after.head), Some(after.amend_head));
+        assert!(
+            caught_up.events.is_empty(),
+            "an amendment resurfaces exactly once"
         );
     }
 
@@ -1627,6 +1724,7 @@ mod tests {
             reason: "allowed".into(),
             // A captured upstream status round-trips on the wire alongside the query path.
             status: Some(200),
+            amend_seq: None,
         };
         let line = format_event_line(&ev);
         let parsed = parse_event_line(line.trim()).expect("a well-formed line parses");
@@ -1646,6 +1744,7 @@ mod tests {
             verdict: LogVerdict::Allow,
             reason: "allowed".into(),
             status: None,
+            amend_seq: None,
         };
         let parsed = parse_event_line(format_event_line(&bare).trim()).unwrap();
         assert_eq!(
@@ -1672,6 +1771,7 @@ mod tests {
                 verdict,
                 reason: "dns-failure".into(),
                 status: None,
+                amend_seq: None,
             };
             let parsed = parse_event_line(format_event_line(&ev).trim()).unwrap();
             assert_eq!(
@@ -1723,7 +1823,7 @@ mod tests {
         }
 
         // A tail read over the socket returns both events, newest last, with the fields intact.
-        let snap = read_log(&socket, None).unwrap();
+        let snap = read_log(&socket, None, None).unwrap();
         assert_eq!(snap.events.len(), 2);
         assert_eq!(snap.head, 2);
         assert_eq!(snap.events[0].host, "a.test");
@@ -1733,7 +1833,7 @@ mod tests {
         assert_eq!(snap.events[1].path.as_deref(), Some("/two?t=1"));
 
         // A follow read past the first event returns only the second, no gap.
-        let after = read_log(&socket, Some(1)).unwrap();
+        let after = read_log(&socket, Some(1), None).unwrap();
         assert_eq!(after.events.len(), 1);
         assert_eq!(after.events[0].seq, 2);
         assert_eq!(after.dropped, 0);

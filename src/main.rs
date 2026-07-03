@@ -4234,9 +4234,9 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     use std::fmt::Write as _;
 
     let interval = std::time::Duration::from_secs(view.interval_secs.max(1));
-    // A per-session cursor: the last seq already shown. Seeded from the initial listing so the follow
-    // only ever appends genuinely new events.
-    let mut cursor: HashMap<u32, u64> = HashMap::new();
+    // A per-session cursor: the last seq already shown, plus the amendment cursor (for retroactive
+    // status). Seeded from the initial listing so the follow only ever appends genuinely new events.
+    let mut cursor: HashMap<u32, (u64, u64)> = HashMap::new();
     let (dim, r) = (pal.dim, pal.reset);
     let ctx_of = |ctx: &[(u32, PathBuf, String)], pid: u32| {
         ctx.iter()
@@ -4271,7 +4271,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         seed = render_logs(&sessions, &context, view, pal, false);
     }
     for s in &sessions {
-        cursor.insert(s.pid, s.snapshot.head);
+        cursor.insert(s.pid, (s.snapshot.head, s.snapshot.amend_head));
     }
     // A closed downstream pipe (`… | head`) ends the follow cleanly — Rust ignores SIGPIPE, so a
     // write to a gone reader returns an error we must act on rather than spin forever.
@@ -4312,10 +4312,20 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         }
 
         for pid in pids {
-            let after = cursor.get(&pid).copied();
-            let Ok(snap) =
-                sandbox::control::read_log(&sandbox::control::control_socket(data_dir, pid), after)
-            else {
+            let entry = cursor.get(&pid).copied();
+            let after = entry.map(|(seq, _)| seq);
+            // Request retroactive status re-emission only under `--with-status` — otherwise a status
+            // filling in is invisible and re-showing the line would be pure duplication.
+            let after_amend = if view.with_status {
+                entry.map(|(_, amend)| amend)
+            } else {
+                None
+            };
+            let Ok(snap) = sandbox::control::read_log(
+                &sandbox::control::control_socket(data_dir, pid),
+                after,
+                after_amend,
+            ) else {
                 continue; // a session that vanished mid-read is handled next tick
             };
             // A gap between polls (the ring overflowed) — surfaced, never silent.
@@ -4371,7 +4381,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                     }
                 }
             }
-            cursor.insert(pid, snap.head);
+            cursor.insert(pid, (snap.head, snap.amend_head));
         }
         if flush_stream(&tick).is_err() {
             return ExitCode::SUCCESS; // downstream pipe closed
@@ -7478,6 +7488,7 @@ mod tests {
             verdict,
             reason: reason.into(),
             status: None,
+            amend_seq: None,
         }
     }
 
@@ -7717,6 +7728,7 @@ mod tests {
                 ],
                 dropped: 0,
                 head: 3,
+                amend_head: 0,
             },
         }];
         let context = vec![(
@@ -7800,6 +7812,7 @@ mod tests {
             ],
             dropped: 0,
             head: 4002,
+            amend_head: 0,
         };
         assert_eq!(snapshot_evicted(&snapshot), 4000);
         // …a fresh ring (seqs from 1) reports none.
@@ -7814,6 +7827,7 @@ mod tests {
             )],
             dropped: 0,
             head: 1,
+            amend_head: 0,
         };
         assert_eq!(snapshot_evicted(&fresh), 0);
 
