@@ -2774,10 +2774,11 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         let Some(canon) = canonicalize_one(&bind.path, &mut resolved.warnings) else {
             continue;
         };
-        // A read-write bind reaching one of ops's own control-plane roots is forced read-only
-        // (fail closed): the cage runs untrusted code, and writing there is host-side code
-        // execution or a forged trust/config, beyond the accepted self-harm class.
-        let writable = downgrade_control_plane(
+        // A read-write bind overlapping ops's own control plane is either forced read-only (a bind
+        // at or under a root — fail closed: writing there is host-side code execution or a forged
+        // trust/config, beyond the accepted self-harm class) or kept read-write with its
+        // control-plane paths pinned in place by the launcher (a bind that merely contains a root).
+        let writable = control_plane_mode(
             canon.as_path(),
             bind.writable,
             &ops_roots,
@@ -2836,11 +2837,12 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     }
 }
 
-/// Canonicalize each bind source, dropping with a warning any that cannot be resolved; forcing a
-/// read-write bind over an ops control-plane root back to read-only; de-duplicating by canonical
-/// path (last wins); and warning (without dropping) any whose destination nests with a structural
-/// mount. The same treatment the baseline binds get, so an app overlay advertises exactly what its
-/// launch would mount.
+/// Canonicalize each bind source, dropping with a warning any that cannot be resolved; resolving a
+/// read-write bind that overlaps an ops control-plane root (forced read-only when it is at or under
+/// one, kept read-write with its control-plane paths pinned when it merely contains one — see
+/// [`control_plane_mode`]); de-duplicating by canonical path (last wins); and warning (without
+/// dropping) any whose destination nests with a structural mount. The same treatment the baseline
+/// binds get, so an app overlay advertises exactly what its launch would mount.
 fn canonicalize_binds(
     binds: Vec<Bind>,
     roots: &[PathBuf],
@@ -2851,7 +2853,7 @@ fn canonicalize_binds(
         let Some(canon) = canonicalize_one(&bind.path, warnings) else {
             continue;
         };
-        let writable = downgrade_control_plane(canon.as_path(), bind.writable, roots, warnings);
+        let writable = control_plane_mode(canon.as_path(), bind.writable, roots, warnings);
         if let Some(existing) = out.iter_mut().find(|b| b.path == canon) {
             existing.writable = writable;
         } else {
@@ -2894,12 +2896,23 @@ fn ops_control_plane_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-/// If `writable` and `canon` reaches an ops control-plane root — it nests with one in either
-/// direction (the bind is an ancestor-or-equal of a root, or sits under one) — push a named
-/// warning and return `false` (read-only). Otherwise return `writable` unchanged. Fail closed: a
-/// writable bind there could alter what ops runs or trusts on the host, which exceeds the accepted
-/// trusted-config self-harm class (it is cross-project and persistent).
-fn downgrade_control_plane(
+/// Decide the read-write mode of a config bind `canon` that may overlap ops's control plane, and
+/// warn. Three cases, resolved in this order so the fail-closed one wins any ambiguity:
+///
+/// - The bind is **at or under** a control-plane root: the whole bind is control plane, there is
+///   nothing to keep writable, so it is forced **read-only** with a warning naming the consequence.
+///   Fail closed — a writable bind there is host-side code execution or a forged trust/config,
+///   beyond the accepted (single-project, self-harm) class.
+/// - The bind **strictly contains** one or more roots: it stays **read-write** — the launcher pins
+///   each contained root's path in place ([`control_plane_pins`]), so the cage cannot substitute
+///   what ops runs or trusts on the host while the rest of the bound tree stays writable. An
+///   informational note names the protected paths.
+/// - The bind is unrelated to the control plane: its mode is returned unchanged.
+///
+/// The two overlaps are checked in the above order because the root set is disjoint (no root
+/// contains another), so a bind cannot be both — but checking the read-only case first means any
+/// future overlap defaults to the safe direction.
+fn control_plane_mode(
     canon: &Path,
     writable: bool,
     roots: &[PathBuf],
@@ -2908,21 +2921,98 @@ fn downgrade_control_plane(
     if !writable {
         return false;
     }
-    match roots
-        .iter()
-        .find(|r| canon.starts_with(r) || r.starts_with(canon))
-    {
-        Some(root) => {
-            warnings.push(format!(
-                "bind `{}` is read-write over ops's own control plane `{}` — binding it read-only \
-                 instead (a writable bind there could alter what ops runs or trusts on the host)",
-                canon.display(),
-                root.display()
-            ));
-            false
-        }
-        None => true,
+    // At or under a root: the bind is entirely control plane → read-only.
+    if let Some(root) = roots.iter().find(|r| canon.starts_with(r)) {
+        warnings.push(format!(
+            "bind `{}` is read-write over ops's own control plane `{}` — binding it read-only \
+             instead (a writable bind there could alter what ops runs or trusts on the host)",
+            canon.display(),
+            root.display()
+        ));
+        return false;
     }
+    // Strictly contains one or more roots: stays read-write; the launcher pins those roots' host
+    // paths so the cage cannot rename a writable parent to substitute them.
+    let contained: Vec<String> = roots
+        .iter()
+        .filter(|r| r.starts_with(canon) && r.as_path() != canon)
+        .map(|r| r.display().to_string())
+        .collect();
+    if !contained.is_empty() {
+        warnings.push(format!(
+            "bind `{}` is read-write and contains ops's own control plane ({}) — the tree stays \
+             writable, but those paths are pinned read-only in place so the cage cannot alter what \
+             ops runs or trusts on the host",
+            canon.display(),
+            contained.join(", ")
+        ));
+    }
+    true
+}
+
+/// The mountpoint-chain pins that protect ops's control plane from path substitution when a
+/// read-write bind strictly contains it. Without them a read-write ancestor bind lets in-cage code
+/// rename a writable parent directory to move a control-plane root aside and recreate a forged one
+/// at the same host path — which ops would then read or `execve` on its next run. Each root is
+/// pinned by making every path component below the containing bind a mountpoint (a mountpoint
+/// cannot be renamed or removed — the kernel refuses with `EBUSY`): the intermediates read-write
+/// (the rest of the tree stays writable), the root itself read-only (its host contents cannot be
+/// written through).
+///
+/// Returns those mounts as host binds (source == destination), deduplicated and ordered
+/// shallow-to-deep so a parent mountpoint is always established before its child — a child bound
+/// first would be shadowed when the parent is later mounted over it, silently defeating the
+/// protection. The caller binds them last (the final word on those paths) and creates each before
+/// binding (a root the agent could otherwise create fresh). Iterates the same root set as
+/// [`control_plane_mode`], so a root added there is pinned here automatically.
+pub(crate) fn control_plane_pins(binds: &[Bind]) -> Vec<Bind> {
+    control_plane_pins_for(binds, &ops_control_plane_roots())
+}
+
+/// The pure core of [`control_plane_pins`], taking the roots explicitly so it is testable without
+/// the environment.
+fn control_plane_pins_for(binds: &[Bind], roots: &[PathBuf]) -> Vec<Bind> {
+    let mut pins: Vec<Bind> = Vec::new();
+    let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for bind in binds.iter().filter(|b| b.writable) {
+        for root in roots
+            .iter()
+            .filter(|r| r.starts_with(&bind.path) && r.as_path() != bind.path)
+        {
+            // Each directory strictly between the containing bind and the root, shallow-to-deep: a
+            // mountpoint (read-write) so it cannot be renamed to substitute the path below it.
+            for ancestor in ancestors_between(&bind.path, root) {
+                if seen.insert(ancestor.clone()) {
+                    pins.push(Bind {
+                        path: ancestor,
+                        writable: true,
+                    });
+                }
+            }
+            // The root itself, read-only: a mountpoint (cannot be renamed/removed) whose host
+            // contents also cannot be written through.
+            if seen.insert(root.clone()) {
+                pins.push(Bind {
+                    path: root.clone(),
+                    writable: false,
+                });
+            }
+        }
+    }
+    pins
+}
+
+/// The directories strictly between `bind` (exclusive) and `root` (exclusive), shallow-to-deep.
+/// `bind` must be an ancestor of `root`. Used to enumerate the intermediate mountpoints a pin needs.
+fn ancestors_between(bind: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = root
+        .ancestors()
+        .filter(|a| *a != root && *a != bind && a.starts_with(bind))
+        .map(Path::to_path_buf)
+        .collect();
+    // `Path::ancestors` yields deep-to-shallow; pins need shallow-to-deep (parent before child).
+    v.reverse();
+    v
 }
 
 /// Read the global config (trusted by location, so no trust marker), defaulting to
@@ -5465,53 +5555,174 @@ mod tests {
     }
 
     #[test]
-    fn a_read_write_bind_over_an_ops_control_plane_root_is_forced_read_only() {
-        // A writable bind that reaches an ops control-plane root — in either nesting direction —
-        // is downgraded to read-only with a named warning, while an unrelated writable bind is left
-        // alone and a read-only bind is never touched. Pure, over explicit roots (no environment).
+    fn control_plane_mode_forces_ro_at_or_under_a_root_and_keeps_rw_above_it() {
+        // A writable bind AT or UNDER an ops control-plane root is forced read-only (the whole bind
+        // is control plane). A writable bind that merely CONTAINS a root stays read-write (the
+        // launcher pins the root in place). An unrelated writable bind is left alone; a read-only
+        // bind is never touched. Pure, over explicit roots (no environment).
         let roots = vec![PathBuf::from("/home/u/.config/ops")];
         let mut warnings = Vec::new();
 
-        // Exact match → downgraded.
-        assert!(!downgrade_control_plane(
+        // Exact match → forced read-only.
+        assert!(!control_plane_mode(
             Path::new("/home/u/.config/ops"),
             true,
             &roots,
             &mut warnings
         ));
-        // An ancestor of the root (a broad `~/.config` bind) → downgraded (root sits under it).
-        assert!(!downgrade_control_plane(
-            Path::new("/home/u/.config"),
-            true,
-            &roots,
-            &mut warnings
-        ));
-        // A descendant of the root (aiming straight at a trust marker) → downgraded.
-        assert!(!downgrade_control_plane(
+        // A descendant of the root (aiming straight at a trust marker) → forced read-only.
+        assert!(!control_plane_mode(
             Path::new("/home/u/.config/ops/apps"),
             true,
             &roots,
             &mut warnings
         ));
-        assert_eq!(warnings.len(), 3, "each downgrade warns: {warnings:?}");
-        assert!(warnings.iter().all(|w| w.contains("control plane")));
+        assert_eq!(warnings.len(), 2, "each read-only case warns: {warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("read-only instead")),
+            "the at-or-under case names the downgrade: {warnings:?}"
+        );
 
-        // A sibling that merely shares a textual prefix is not a conflict.
+        // An ancestor of the root (a broad `~/.config`, or a whole-home bind) → stays read-write,
+        // with an informational note that its control-plane paths are pinned.
         let mut w2 = Vec::new();
-        assert!(downgrade_control_plane(
-            Path::new("/home/u/.config/opsimposter"),
+        assert!(control_plane_mode(
+            Path::new("/home/u/.config"),
             true,
             &roots,
             &mut w2
         ));
-        // A read-only bind is never downgraded and never warns, even at the root itself.
-        assert!(!downgrade_control_plane(
+        assert_eq!(
+            w2.len(),
+            1,
+            "the contains-a-root case notes the pinning: {w2:?}"
+        );
+        assert!(
+            w2[0].contains("pinned read-only in place") && w2[0].contains("/home/u/.config/ops"),
+            "the note names the protected path: {w2:?}"
+        );
+
+        // A sibling that merely shares a textual prefix is not a conflict, and warns nothing.
+        let mut w3 = Vec::new();
+        assert!(control_plane_mode(
+            Path::new("/home/u/.config/opsimposter"),
+            true,
+            &roots,
+            &mut w3
+        ));
+        // A read-only bind is never touched and never warns, even at the root itself.
+        assert!(!control_plane_mode(
             Path::new("/home/u/.config/ops"),
             false,
             &roots,
-            &mut w2
+            &mut w3
         ));
-        assert!(w2.is_empty(), "no warning for the safe cases: {w2:?}");
+        assert!(w3.is_empty(), "no warning for the safe cases: {w3:?}");
+    }
+
+    #[test]
+    fn control_plane_pins_freezes_each_contained_roots_path_chain() {
+        // A whole-home read-write bind that contains three control-plane roots yields the mountpoint
+        // chain that pins each: every intermediate directory read-write, each root read-only,
+        // deduplicated (the shared `.local` appears once) and ordered shallow-to-deep so a parent is
+        // always established before its child (a child bound first would be shadowed by the parent).
+        let roots = vec![
+            PathBuf::from("/home/u/.local/share/ops"),
+            PathBuf::from("/home/u/.local/state/ops/trusted"),
+            PathBuf::from("/home/u/.config/ops"),
+        ];
+        let binds = vec![Bind {
+            path: PathBuf::from("/home/u"),
+            writable: true,
+        }];
+        let pins = control_plane_pins_for(&binds, &roots);
+
+        // Every root is present read-only; every non-root pin is a read-write intermediate.
+        for root in &roots {
+            assert!(
+                pins.iter().any(|p| &p.path == root && !p.writable),
+                "root pinned read-only: {} in {pins:?}",
+                root.display()
+            );
+        }
+        assert!(
+            pins.iter()
+                .filter(|p| p.writable)
+                .all(|p| !roots.contains(&p.path)),
+            "read-write pins are intermediates, never a root: {pins:?}"
+        );
+        // The shared ancestor `.local` is pinned exactly once (dedup across the two roots under it).
+        assert_eq!(
+            pins.iter()
+                .filter(|p| p.path == Path::new("/home/u/.local"))
+                .count(),
+            1,
+            "the shared intermediate is deduplicated: {pins:?}"
+        );
+        // Parent-before-child: each pin's index is greater than every strict ancestor pin's index.
+        for (i, p) in pins.iter().enumerate() {
+            for (j, q) in pins.iter().enumerate() {
+                if p.path.starts_with(&q.path) && p.path != q.path {
+                    assert!(
+                        j < i,
+                        "ancestor {} must precede {}: {pins:?}",
+                        q.path.display(),
+                        p.path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_plane_pins_only_covers_roots_a_bind_strictly_contains() {
+        let roots = vec![
+            PathBuf::from("/home/u/.local/share/ops"),
+            PathBuf::from("/home/u/.config/ops"),
+        ];
+
+        // A partial-ancestor bind covers only the root it contains, and its chain starts below the
+        // bind boundary (never re-pinning the bind itself).
+        let partial = vec![Bind {
+            path: PathBuf::from("/home/u/.local"),
+            writable: true,
+        }];
+        let pins = control_plane_pins_for(&partial, &roots);
+        assert!(
+            pins.iter()
+                .any(|p| p.path == Path::new("/home/u/.local/share/ops") && !p.writable),
+            "the contained root is pinned: {pins:?}"
+        );
+        assert!(
+            pins.iter()
+                .all(|p| p.path != Path::new("/home/u/.config/ops")),
+            "an uncontained root is not pinned: {pins:?}"
+        );
+        assert!(
+            pins.iter().all(|p| p.path != Path::new("/home/u/.local")),
+            "the bind boundary itself is never a pin: {pins:?}"
+        );
+
+        // A descendant/exact bind (at or under a root) yields no pins — that bind is forced
+        // read-only by `control_plane_mode`, so it is not writable here anyway.
+        let under = vec![Bind {
+            path: PathBuf::from("/home/u/.config/ops/apps"),
+            writable: true,
+        }];
+        assert!(
+            control_plane_pins_for(&under, &roots).is_empty(),
+            "a bind under a root pins nothing"
+        );
+
+        // A read-only ancestor bind pins nothing (only a read-write bind needs the protection).
+        let ro = vec![Bind {
+            path: PathBuf::from("/home/u"),
+            writable: false,
+        }];
+        assert!(
+            control_plane_pins_for(&ro, &roots).is_empty(),
+            "a read-only bind pins nothing"
+        );
     }
 
     #[test]

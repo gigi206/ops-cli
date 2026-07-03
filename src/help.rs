@@ -337,10 +337,12 @@ const PAGES: &[Page] = &[
             or app tables. A `binds` entry is an absolute host path, bound read-only by default;\n\
             write it as a table `{ path = \"/abs/path\", mode = \"rw\" }` to bind it read-write\n\
             (the cage writes through to the host path). `binds` is a security field, honored only\n\
-            from a trusted source. A read-write bind covering ops's own state (its data, trust, or\n\
-            config directory — e.g. a broad `mode = \"rw\"` bind of your home) is forced read-only\n\
-            with a warning, so the agent cannot alter what ops runs or trusts; bind the narrower\n\
-            path you actually need read-write instead.\n\
+            from a trusted source. ops's own state (its data, trust, and config directories) is\n\
+            protected either way: a read-write bind aimed at or inside one of them is forced\n\
+            read-only with a warning, while a broad read-write bind that merely contains them (e.g.\n\
+            `mode = \"rw\"` on your whole home) stays read-write with those directories pinned\n\
+            read-only in place — so the rest of the tree is writable but the agent still cannot\n\
+            alter what ops runs or trusts.\n\
             An edit that changes a file you had trusted re-arms its trust gate, so it warns to\n\
             re-run `ops trust`; pass --trust to re-trust as the editor closes.",
     },

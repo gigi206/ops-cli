@@ -308,6 +308,125 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
 }
 
 #[test]
+fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
+    // The security teeth of the mountpoint-chain protection. A whole-home read-write bind that
+    // *contains* ops's own control plane (data dir, trust store, config dir) stays read-write —
+    // but each control-plane path is pinned as a mountpoint chain, so in-cage code cannot rename a
+    // writable parent to move a root aside and substitute a forged one (which ops would then read
+    // or `execve` on the host). Proven with teeth on both sides in one real launch:
+    //   DENY — a write into a pinned root is `EROFS`; renaming or removing any chain component is
+    //          `EBUSY`; and the pre-placed host trust marker survives untouched (the substitution
+    //          attack fails).
+    //   ALLOW — the cage runs at all (its `sh`/coreutils come from `/nix`, whose source lives
+    //          *under* the read-only-pinned data dir — so read-through works despite the pin), the
+    //          rest of the home is writable, and `/nix` itself is still writable (per-mount, not
+    //          per-inode: the read-only pin on the data-dir path does not freeze the store the rw
+    //          `/nix` mount is backed by).
+    // Interdependency: the pin's protection also assumes in-cage code cannot `umount` it — which
+    // holds by cap-drop (no CAP_SYS_ADMIN) and the seccomp `umount2` denial (covered by the seccomp
+    // membership + enforcement tests); the base cage carries no `umount` binary, so this e2e
+    // exercises the reachable filesystem attack (rename/remove), not a raw syscall. Skips (never
+    // fails) where the host cannot sandbox.
+    let home = TmpDir::new("cp-home");
+    // A fabricated `$HOME` with ops's XDG roots inside it, so the control plane lives under the
+    // read-write bind. Canonical, because `load` canonicalizes the bind source and the roots.
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let data = h.join(".local/share");
+    let state = h.join(".local/state");
+    let config = h.join(".config");
+    let project = h.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(config.join("ops")).unwrap();
+    // The global config (trusted by location) binds the whole fabricated home read-write.
+    std::fs::write(
+        config.join("ops/ops.toml"),
+        format!(
+            "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
+            h.display()
+        ),
+    )
+    .unwrap();
+    // A pre-placed trust marker whose survival proves the pin defeats path substitution.
+    let sentinel = state.join("ops/trusted/sentinel");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"REAL").unwrap();
+
+    let run = |script: &str| {
+        ops()
+            .arg("run")
+            .arg("--")
+            .arg("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&project)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .expect("spawn ops run")
+    };
+
+    // capability probe (also seeds the base store and exercises the pin path); skip if incapable.
+    let probe = run("true");
+    if !probe.status.success() {
+        eprintln!(
+            "skipping control-plane pin e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let script = format!(
+        r#"H="{h}"
+echo "A:$(touch "$H/writeprobe" 2>/dev/null && echo OK || echo FAIL)"
+echo "B:$(echo x > "$H/.local/state/ops/trusted/forged" 2>/dev/null && echo BAD || echo RO)"
+echo "C:$(mv "$H/.local/state" "$H/.local/state.bak" 2>/dev/null && echo BAD || echo EBUSY)"
+echo "D:$(mv "$H/.local/state/ops/trusted" "$H/stolen" 2>/dev/null && echo BAD || echo EBUSY)"
+echo "E:$(rmdir "$H/.config/ops" 2>/dev/null && echo BAD || echo BLOCKED)"
+echo "F:$(touch /nix/.ops-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
+"#,
+        h = h.display()
+    );
+    let out = run(&script);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the pinned launch failed: {}\nstdout: {stdout}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ALLOW: the home is writable and the store `/nix` is still writable despite the data-dir pin.
+    assert!(
+        stdout.contains("A:OK"),
+        "the home must stay writable: {stdout}"
+    );
+    assert!(
+        stdout.contains("F:OK"),
+        "the per-project store `/nix` must stay writable despite the data-dir pin: {stdout}"
+    );
+    // DENY: no write through a pinned root, and no chain component can be renamed or removed.
+    assert!(
+        stdout.contains("B:RO"),
+        "a write into a pinned control-plane root must be refused: {stdout}"
+    );
+    assert!(
+        stdout.contains("C:EBUSY") && stdout.contains("D:EBUSY"),
+        "renaming a pinned chain component must fail with EBUSY: {stdout}"
+    );
+    assert!(
+        stdout.contains("E:BLOCKED"),
+        "removing a pinned leaf mountpoint must fail: {stdout}"
+    );
+    // The decisive teeth: the host trust marker is untouched — the substitution attack failed.
+    let after = std::fs::read_to_string(&sentinel).unwrap_or_default();
+    assert_eq!(
+        after.trim(),
+        "REAL",
+        "the pinned trust marker was altered or moved aside — the control plane was substituted"
+    );
+}
+
+#[test]
 fn ops_app_launches_the_apps_command_with_its_overlay() {
     let project = TmpDir::new("appproj");
     let data = TmpDir::new("appdata");

@@ -1439,6 +1439,25 @@ pub(crate) fn effective_lock_target(
 /// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
 /// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
 /// since it is a stated requirement.
+/// Establish the mountpoint-chain pins that protect ops's control plane: create each pin's host
+/// path (they are ops's own directories — creating a not-yet-existent root here is what stops the
+/// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. On the first
+/// path that cannot be created, return the error so the caller can fail the launch closed: a pin
+/// that cannot be established would leave the containing read-write bind unprotected.
+fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<binds::ExtraBind>> {
+    pins.iter()
+        .map(|pin| {
+            std::fs::create_dir_all(&pin.path)
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", pin.path.display())))?;
+            Ok(binds::ExtraBind {
+                src: pin.path.clone(),
+                dest: pin.path.clone(),
+                writable: pin.writable,
+            })
+        })
+        .collect()
+}
+
 fn build(
     prep: &Prepared,
     runtime: binds::Runtime,
@@ -1754,6 +1773,29 @@ fn build(
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
     extra_binds.extend(gui_binds);
+
+    // Pin ops's own control plane in place whenever a read-write bind contains it: each root's host
+    // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
+    // code cannot rename a writable parent to move a control-plane root aside and recreate a forged
+    // one at the same path — which ops would otherwise read or `execve` on its next run. The bind
+    // stays read-write; only these specific host paths are protected. Appended last, so the pins
+    // are the final word on those paths (nothing structural touches them).
+    //
+    // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
+    // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
+    // filter denies `umount2`/`unshare`/`mount` — a change loosening either would silently break it.
+    match establish_control_plane_pins(&crate::config::control_plane_pins(&prep.cfg.binds)) {
+        Ok(pins) => extra_binds.extend(pins),
+        Err(e) => {
+            // Fail closed: if a pin cannot be established the containing read-write bind would be
+            // unprotected, so abort the launch rather than run with a gap. An extreme case — a
+            // mkdir failing in ops's own data/config tree.
+            eprintln!(
+                "ops: cannot protect ops's control plane ({e}) — a read-write bind contains it"
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    }
 
     // Environment, lowest precedence first: host passthrough, then ops's hermetic CA bundle, then
     // the Wayland GUI keys, then the non-nix auto-equip variable, then a trusted project's mise
@@ -2490,6 +2532,54 @@ mod tests {
     use std::path::PathBuf;
 
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+
+    #[test]
+    fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {
+        // A pin's host path is created (so a not-yet-existent control-plane root is present to be
+        // frozen) and turned into a same-path extra bind that carries the pin's mode: a read-write
+        // intermediate, a read-only leaf.
+        let tmp = TmpDir::new();
+        let inter = tmp.path().join("chain/intermediate");
+        let leaf = tmp.path().join("chain/intermediate/root");
+        let pins = vec![
+            crate::config::Bind {
+                path: inter.clone(),
+                writable: true,
+            },
+            crate::config::Bind {
+                path: leaf.clone(),
+                writable: false,
+            },
+        ];
+        let binds = establish_control_plane_pins(&pins).expect("pins establish");
+        assert!(inter.is_dir() && leaf.is_dir(), "each pin path is created");
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[0].src, inter);
+        assert_eq!(binds[0].dest, inter);
+        assert!(binds[0].writable, "the intermediate is read-write");
+        assert_eq!(binds[1].dest, leaf);
+        assert!(!binds[1].writable, "the leaf is read-only");
+    }
+
+    #[test]
+    fn establish_control_plane_pins_fails_closed_when_a_pin_cannot_be_created() {
+        // If a pin's path cannot be established (here a file sits where a parent directory must be),
+        // the helper errors rather than returning a partial set — so the launch aborts instead of
+        // running with the containing read-write bind left unprotected. The failure names the path.
+        let tmp = TmpDir::new();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"a file, not a directory").unwrap();
+        let pins = vec![crate::config::Bind {
+            // Under a regular file, so `create_dir_all` cannot succeed.
+            path: blocker.join("root"),
+            writable: false,
+        }];
+        let err = establish_control_plane_pins(&pins).expect_err("a blocked pin must fail closed");
+        assert!(
+            err.to_string().contains("blocker"),
+            "the failure names the unestablishable path: {err}"
+        );
+    }
 
     #[test]
     fn session_runtime_maps_each_launch_runtime_to_its_owned_form() {

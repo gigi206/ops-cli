@@ -165,8 +165,12 @@ runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** mo
 > launch, so `ops config` advertises the *effective* binds and cannot drift from what
 > the launch binds. A bind is **read-only by default**, or **read-write** with the
 > table form `{ path = "...", mode = "rw" }` (mapped to bwrap's `--bind`); a
-> read-write bind over one of ops's own control-plane roots (the data/engine, trust,
-> or config directory) is forced read-only. Config binds are emitted **before** the
+> read-write bind *at or inside* one of ops's own control-plane roots (the data/engine,
+> trust, or config directory) is forced read-only, while a broad read-write bind that
+> merely *contains* them stays read-write with each such root **pinned read-only in
+> place** (its directory chain made mountpoints, appended last, so in-cage code cannot
+> rename a writable parent to substitute it — a mountpoint cannot be renamed or removed).
+> Config binds are emitted **before** the
 > structural mounts, so a colliding one is shadowed and can never displace `/nix`, the
 > synthetic `/etc/passwd`/`group`, the loader, or the project — whatever its mode.
 >

@@ -275,6 +275,10 @@ mod tests {
             // mount/ns family
             libc::SYS_unshare,
             libc::SYS_mount,
+            // `umount2` is load-bearing beyond LPE surface reduction: the control-plane pins rely
+            // on in-cage code being unable to tear a pinned mountpoint down (a launch-side
+            // interdependency), so its removal here must fail a test.
+            libc::SYS_umount2,
             libc::SYS_pivot_root,
             libc::SYS_setns,
         ] {
