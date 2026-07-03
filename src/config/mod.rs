@@ -789,6 +789,12 @@ fn resolve(
     }
 
     let mut nixpkgs_project = None;
+    // The secret resolver defaults a PROJECT-LOCAL app resolves against: the global defaults, plus
+    // a trusted project's own `[secret.defaults]` (captured below), so an app declared in the
+    // project's `.ops.toml` honors the project's resolver order/bindings. A GLOBAL app keeps the
+    // global defaults, so a project can never steer how a globally-declared app's credentials
+    // resolve. Stays global when there is no project or the project sets no `[secret.defaults]`.
+    let mut project_secret_defaults = secret_defaults.clone();
     if let Some((proj, state)) = project {
         let trusted = state == TrustState::Trusted;
         // `env` is a free field — applied from any project, minus the reserved-key
@@ -906,6 +912,8 @@ fn resolve(
                     Some(raw_defaults) => secret_defaults.merged_with(raw_defaults),
                     None => secret_defaults.clone(),
                 };
+                // Carry these merged defaults to the project's own apps (below).
+                project_secret_defaults = effective.clone();
                 apply_secret_section(
                     &mut secrets,
                     &mut warnings,
@@ -938,6 +946,7 @@ fn resolve(
         global_apps,
         project_apps,
         &secret_defaults,
+        &project_secret_defaults,
         &net_groups,
         plugins,
     );
@@ -1206,6 +1215,7 @@ fn resolve_apps(
     mut global_apps: BTreeMap<String, RawApp>,
     project_apps: Option<(BTreeMap<String, RawApp>, TrustState)>,
     secret_defaults: &SecretDefaults,
+    project_secret_defaults: &SecretDefaults,
     net_groups: &NetGroups,
     plugins: &PluginRegistry,
 ) -> BTreeMap<String, ResolvedApp> {
@@ -1235,7 +1245,15 @@ fn resolve_apps(
         }
         let global = global_apps.remove(&name);
         let project = project_apps.remove(&name).zip(project_state);
-        let resolved = resolve_app(&name, global, project, secret_defaults, net_groups, plugins);
+        let resolved = resolve_app(
+            &name,
+            global,
+            project,
+            secret_defaults,
+            project_secret_defaults,
+            net_groups,
+            plugins,
+        );
         out.insert(name, resolved);
     }
     out
@@ -1267,6 +1285,7 @@ fn resolve_app(
     global: Option<RawApp>,
     project: Option<(RawApp, TrustState)>,
     secret_defaults: &SecretDefaults,
+    project_secret_defaults: &SecretDefaults,
     net_groups: &NetGroups,
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
@@ -1435,12 +1454,16 @@ fn resolve_app(
         }
         if let Some(section) = app.secret {
             if trusted {
+                // A project-local app resolves its secrets against the project-effective defaults
+                // (global + the project's own `[secret.defaults]`), unlike the global-layer site
+                // above which uses the global defaults — a project's resolver order/bindings reach
+                // its own apps, never a globally-declared one.
                 apply_app_secret(
                     &mut secrets,
                     &mut warnings,
                     &source,
                     section,
-                    secret_defaults,
+                    project_secret_defaults,
                     plugins,
                 );
             } else {
@@ -6883,6 +6906,59 @@ mod tests {
                 file: "staging.yaml".into(),
                 key: Some("tok".into()),
             }]
+        );
+    }
+
+    #[test]
+    fn a_project_secret_default_reaches_a_project_app_but_not_a_global_app() {
+        // A trusted project's `[secret.defaults]` steers its OWN apps' secret resolution, while a
+        // globally-declared app keeps the global defaults — so a project cannot redirect how a
+        // global app's credentials resolve, but its own apps honor its resolver order/bindings.
+        let app_with_secret = |host: &str, key: &str| RawApp {
+            cmd: Some(schema::RawCmd::Line("run".into())),
+            network: allowlist_net(&[host]),
+            secret: Some(terse_section(RawSecretDefaults::default(), host, key)),
+            ..RawApp::default()
+        };
+        let mut global = RawConfig {
+            secret: Some(RawSecretSection {
+                defaults: Some(raw_defaults(&["sops"], Some("prod.yaml"), None, None)),
+                hosts: BTreeMap::new(),
+            }),
+            ..RawConfig::default()
+        };
+        global.app.insert(
+            "globalapp".into(),
+            app_with_secret("api.example.com", "gtok"),
+        );
+        let mut proj = RawConfig {
+            // the project overrides the sops binding to staging; the order is inherited from global
+            secret: Some(RawSecretSection {
+                defaults: Some(raw_defaults(&[], Some("staging.yaml"), None, None)),
+                hosts: BTreeMap::new(),
+            }),
+            ..RawConfig::default()
+        };
+        proj.app
+            .insert("projapp".into(), app_with_secret("api.example.com", "ptok"));
+        let r = resolve_no_plugins(global, Some((proj, TrustState::Trusted)));
+        // the project app resolved through the PROJECT's sops binding (staging)
+        assert_eq!(
+            r.apps["projapp"].secrets[0].sources,
+            vec![SecretSource::Sops {
+                file: "staging.yaml".into(),
+                key: Some("ptok".into()),
+            }],
+            "a project app must honor the project's `[secret.defaults]`"
+        );
+        // the global app kept the GLOBAL sops binding (prod), untouched by the project's default
+        assert_eq!(
+            r.apps["globalapp"].secrets[0].sources,
+            vec![SecretSource::Sops {
+                file: "prod.yaml".into(),
+                key: Some("gtok".into()),
+            }],
+            "a global app must NOT inherit the project's `[secret.defaults]`"
         );
     }
 
