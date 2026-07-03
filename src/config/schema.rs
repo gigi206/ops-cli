@@ -24,8 +24,9 @@ pub(crate) struct RawConfig {
     /// Tools to provision into the sandbox, as `name = "<backend>:<locator>"`. The name
     /// is a free label — the merge key across layers and the on-disk root name; the value
     /// carries a mandatory backend prefix (parsed downstream, not here): `nix:<attribute>`
-    /// for a nixpkgs attribute provisioned host-side (e.g. `nix:nodejs_20`), or
-    /// `mise:<token>` for a mise backend equipped in-cage (e.g. `mise:aqua:openai/codex`).
+    /// for a nixpkgs attribute provisioned host-side (e.g. `nix:nodejs_20`), `mise:<token>`
+    /// for a mise backend equipped in-cage (e.g. `mise:aqua:openai/codex`), or `flake:<ref>`
+    /// for a flake output built in-cage (e.g. `flake:github:owner/repo#attr`).
     /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, String>,

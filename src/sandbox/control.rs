@@ -291,9 +291,9 @@ pub(crate) const LOG_RING_CAP: usize = 1000;
 pub(crate) enum LogVerdict {
     /// The request was permitted and egressed.
     Allow,
-    /// The request was refused: a rule, a method scope, an `ask` decision/timeout, a security guard
-    /// (SSRF, host/SNI mismatch, an outbound-secret leak, the splice cap), or a malformed/IP-literal
-    /// request ops declines to forward. Every case where ops itself said no.
+    /// The request was refused by *policy*: a matching deny rule, a method scope, or an `ask`
+    /// decision/timeout. (Security-guard and malformed/IP-literal refusals are recorded as
+    /// [`Blocked`](Self::Blocked), not here.)
     Deny,
     /// A security guard or protocol check refused the request (SSRF, host/SNI mismatch, an
     /// outbound-secret leak, the splice cap, an IP-literal target, a malformed/smuggling request).
@@ -486,6 +486,12 @@ pub(crate) fn serve(
 /// The largest control command accepted — commands are short (`ALLOW <seq>`), so anything larger is
 /// malformed; bounding the read keeps a confused or hostile peer from making us buffer unboundedly.
 const CMD_MAX: u64 = 256;
+
+/// The largest control *reply* accepted. Unlike a command, a reply carries the destination the agent
+/// reached (`ok host=<h> …`), which for a URL rule can be far longer than `CMD_MAX` — bounding it at
+/// `CMD_MAX` would truncate the host and, with `--save`, persist a wrong (agent-influenceable) rule.
+/// Still bounded (a URL is not unbounded) so a hostile peer cannot make the reader buffer forever.
+const REPLY_MAX: u64 = 8 * 1024;
 
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
 /// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
@@ -914,7 +920,12 @@ pub(crate) fn answer_request(
     (&stream).write_all(cmd.as_bytes())?;
     (&stream).flush()?;
     let mut response = String::new();
-    BufReader::new((&stream).take(CMD_MAX)).read_line(&mut response)?;
+    let n = BufReader::new((&stream).take(REPLY_MAX)).read_line(&mut response)?;
+    // If the reply filled the bound with no terminating newline it was truncated — refuse to parse a
+    // partial host (which `--save` would persist as a wrong rule) and report it as not answered.
+    if n as u64 >= REPLY_MAX && !response.ends_with('\n') {
+        return Ok(AnswerOutcome::NotFound);
+    }
     Ok(parse_answer_reply(response.trim()))
 }
 

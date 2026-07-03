@@ -211,15 +211,16 @@ fn programs() -> [Vec<u8>; 2] {
     ]
 }
 
-/// Seal each compiled filter into an anonymous in-memory file, ready to hand to
+/// Write each compiled filter into an anonymous in-memory file, ready to hand to
 /// `bwrap --add-seccomp-fd`. The descriptors are deliberately **not**
 /// close-on-exec so bwrap inherits them across the launch; the caller must keep
-/// the returned files alive until bwrap has read them.
+/// the returned files alive until bwrap has read them. (No `memfd` seal is applied
+/// or needed — the file is written, rewound, and read once by bwrap.)
 pub(crate) fn memfds() -> io::Result<Vec<File>> {
-    programs().into_iter().map(memfd_sealing).collect()
+    programs().into_iter().map(write_to_memfd).collect()
 }
 
-fn memfd_sealing(bytes: Vec<u8>) -> io::Result<File> {
+fn write_to_memfd(bytes: Vec<u8>) -> io::Result<File> {
     // SAFETY: the name is a valid NUL-terminated C string and `flags = 0` yields a
     // descriptor without O_CLOEXEC, so it survives the exec into bwrap.
     let fd = unsafe { libc::memfd_create(c"ops-seccomp".as_ptr(), 0) };

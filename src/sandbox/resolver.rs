@@ -160,19 +160,10 @@ fn cage_spec(
         },
     ];
 
-    // The grant's extra read-only paths. Each becomes a separate `--ro-bind-try <src> <dest>`
-    // argv pair (see [`to_argv`]) — never interpolated into a shell string — so a residual `$`
-    // a manifest's small path expansion left behind is an inert literal here, not an injection.
-    // `try` keeps a manifest portable: a path that names a runtime artifact (e.g. the gpg-agent
-    // socket directory under `$XDG_RUNTIME_DIR`) is skipped where it is absent, and the resolver
-    // fails closed inside if it genuinely needs what is missing.
-    for p in &plugin.sandbox.allow_paths {
-        mounts.push(Mount::RoBindTry {
-            src: p.clone(),
-            dest: p.clone(),
-        });
-    }
-
+    // The structural pseudo-filesystems first, so the grant's own binds layer ON TOP of them. In
+    // particular the `/tmp` tmpfs must precede the grant paths: `CAGE_HOME` is `/tmp`, and bwrap
+    // applies mounts in argv order, so a tmpfs mounted AFTER a grant path under `/tmp` would shadow
+    // it (a manifest granting e.g. an agent socket under `/tmp/...` would silently vanish).
     mounts.push(Mount::Proc {
         dest: PathBuf::from("/proc"),
     });
@@ -182,6 +173,19 @@ fn cage_spec(
     mounts.push(Mount::Tmpfs {
         dest: PathBuf::from(CAGE_HOME),
     });
+
+    // The grant's extra read-only paths, layered over the structural mounts above. Each becomes a
+    // separate `--ro-bind-try <src> <dest>` argv pair (see [`to_argv`]) — never interpolated into a
+    // shell string — so a residual `$` a manifest's small path expansion left behind is an inert
+    // literal here, not an injection. `try` keeps a manifest portable: a path that names a runtime
+    // artifact (e.g. the gpg-agent socket directory under `$XDG_RUNTIME_DIR`) is skipped where it is
+    // absent, and the resolver fails closed inside if it genuinely needs what is missing.
+    for p in &plugin.sandbox.allow_paths {
+        mounts.push(Mount::RoBindTry {
+            src: p.clone(),
+            dest: p.clone(),
+        });
+    }
 
     // A network grant shares the host network and binds the DNS + TLS files a resolver needs to
     // reach a remote secret store; without it the cage gets an empty network namespace (no egress

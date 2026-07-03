@@ -118,24 +118,32 @@ fn total_size(nix_store: &Path, store_dir: &Path, paths: &[String]) -> io::Resul
     if paths.is_empty() {
         return Ok(0);
     }
-    let out = Command::new(nix_store)
-        .env("NIX_REMOTE", "")
-        .arg("--store")
-        .arg(store_dir)
-        .arg("--query")
-        .arg("--size")
-        .args(paths)
-        .output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nix-store --query --size failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+    // Query in bounded batches: passing every dead path as one argv overflows the kernel's argv
+    // limit (E2BIG) on a large store, which would abort the whole GC (including `--prune`). Store
+    // paths are ~100 bytes each, so a few thousand per call stays well under any ARG_MAX.
+    const BATCH: usize = 2048;
+    let mut total = 0u64;
+    for chunk in paths.chunks(BATCH) {
+        let out = Command::new(nix_store)
+            .env("NIX_REMOTE", "")
+            .arg("--store")
+            .arg(store_dir)
+            .arg("--query")
+            .arg("--size")
+            .args(chunk)
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "nix-store --query --size failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        total += String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u64>().ok())
+            .sum::<u64>();
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u64>().ok())
-        .sum())
+    Ok(total)
 }
 
 /// Delete every dead path in `store_dir`'s store.

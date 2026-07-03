@@ -185,23 +185,41 @@ fn delegated_controllers() -> Vec<String> {
     let Some(path) = content.lines().find_map(|l| l.strip_prefix("0::")) else {
         return Vec::new();
     };
-    // Walk up to the `user@<uid>.service` component — the root of this session's
-    // delegated subtree. Anything below it (the app slice, our own scope) inherits
-    // a subset, so the service's controller set is the sound upper bound.
-    let Some(end) = path.find("/user@").map(|i| {
-        path[i + 1..]
-            .find('/')
-            .map(|j| i + 1 + j)
-            .unwrap_or(path.len())
-    }) else {
+    // SAFETY: `getuid` always succeeds and only reads the caller's id.
+    let uid = unsafe { libc::getuid() };
+    let Some(service) = delegation_root(path, uid) else {
         return Vec::new();
     };
-    let service = &path[..end];
     let file = format!("/sys/fs/cgroup{service}/cgroup.controllers");
     match std::fs::read_to_string(&file) {
         Ok(s) => s.split_whitespace().map(str::to_owned).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// The cgroup path of the user manager's delegation root (`user@<uid>.service`) for a process whose
+/// own cgroup is `cgroup_path`, or `None` when there is no user manager to delegate.
+///
+/// When the process already runs inside that service tree (a desktop terminal spawned by the user
+/// manager) its own `user@<uid>.service` component is the root. But a login/SSH/TTY session lives at
+/// `/user.slice/user-<uid>.slice/session-N.scope` — a *sibling* of `user@<uid>.service`, with no
+/// `/user@` in its own path — while `systemd-run --user` still registers its scope under
+/// `user@<uid>.service`; so for a process under this user's slice the canonical service path is the
+/// sound controller upper bound, and searching only the current path (the old behavior) wrongly
+/// found nothing and dropped the limits for every SSH launch. A cgroup outside this user's slice (a
+/// system service, a container) has no user manager and yields `None`.
+fn delegation_root(cgroup_path: &str, uid: u32) -> Option<String> {
+    if let Some(i) = cgroup_path.find("/user@") {
+        let end = cgroup_path[i + 1..]
+            .find('/')
+            .map(|j| i + 1 + j)
+            .unwrap_or(cgroup_path.len());
+        return Some(cgroup_path[..end].to_string());
+    }
+    if cgroup_path.contains(&format!("/user-{uid}.slice")) {
+        return Some(format!("/user.slice/user-{uid}.slice/user@{uid}.service"));
+    }
+    None
 }
 
 /// The systemd unit properties that can actually be enforced here: the profile
@@ -370,6 +388,31 @@ mod tests {
         assert!(p
             .iter()
             .any(|(c, v)| *c == "pids" && v.starts_with("TasksMax=")));
+    }
+
+    #[test]
+    fn delegation_root_covers_the_session_scope_not_only_the_service_tree() {
+        // A desktop terminal already inside the user manager's service tree: its own service is root.
+        assert_eq!(
+            delegation_root(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope",
+                1000
+            )
+            .as_deref(),
+            Some("/user.slice/user-1000.slice/user@1000.service")
+        );
+        // An SSH/TTY login session is a SIBLING of user@<uid>.service with no `/user@` of its own —
+        // the canonical service path is derived from the uid so the limits are not silently dropped.
+        assert_eq!(
+            delegation_root("/user.slice/user-1000.slice/session-5.scope", 1000).as_deref(),
+            Some("/user.slice/user-1000.slice/user@1000.service")
+        );
+        // A cgroup outside this user's slice has no user manager to delegate.
+        assert_eq!(delegation_root("/system.slice/sshd.service", 1000), None);
+        assert_eq!(
+            delegation_root("/user.slice/user-42.slice/session-1.scope", 1000),
+            None
+        );
     }
 
     #[test]

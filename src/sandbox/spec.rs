@@ -53,8 +53,10 @@ impl Mount {
     }
 }
 
-/// Network posture. The egress allowlist is future work; for now a sandbox
-/// either shares the host network or is fully isolated.
+/// Network posture at the namespace level: the cage either shares the host network or gets a fresh
+/// empty netns. The egress allowlist (a filtering posture) is built ON `Isolated` — the cage's only
+/// egress is then a bound Unix socket to the host MITM proxy, where the filtering actually lives (see
+/// the `Isolated` variant), so this enum stays the two namespace choices, not the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetPolicy {
     /// Keep the host network namespace — no network isolation (the `network = "shared"` posture).

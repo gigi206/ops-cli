@@ -42,6 +42,7 @@
 //! |---|---|---|
 //! | `403` | `denied-default`         | no allow rule matched the host / port / path |
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
+//! | `403` | `denied-method`          | an allow rule matched the host but not the request's HTTP method (a `{VERB}`-scoped rule) |
 //! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `ops net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
@@ -157,9 +158,15 @@ pub(crate) struct Ca {
     cert_der: CertificateDer<'static>,
     /// The CA certificate in PEM, for injection into the cage trust store.
     cert_pem: String,
-    /// Minted leaves, cached by host so a repeated connection reuses one certificate.
+    /// Minted leaves, cached by host so a repeated connection reuses one certificate. Bounded at
+    /// [`LEAF_CACHE_CAP`] — the key is the attacker-controlled SNI, so it must not grow without end.
     leaves: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
+
+/// The most host leaves cached at once. Past this, a new host is minted per request but not stored,
+/// so a flood of unique SNIs from the cage cannot grow host memory without bound. Far above the
+/// handful of hosts any real workload contacts.
+const LEAF_CACHE_CAP: usize = 1024;
 
 // A manual `Debug` that never prints key material — and frees us from requiring `Debug` on the
 // rcgen key/cert types. Needed because the resolver that holds a `Ca` must be `Debug`.
@@ -215,10 +222,14 @@ impl Ca {
             return Ok(ck.clone());
         }
         let ck = self.mint_leaf(host)?;
-        self.leaves
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), ck.clone());
+        // The cache key is the attacker-controlled SNI, minted before any policy check, so it must
+        // not grow without bound: past the cap, mint per request but stop inserting (a legitimate
+        // workload reaches few hosts; only a flood of unique SNIs hits the cap). This bounds host
+        // memory; the connection cap bounds the concurrent keygen cost.
+        let mut leaves = self.leaves.lock().unwrap();
+        if leaves.len() < LEAF_CACHE_CAP {
+            leaves.insert(host.to_string(), ck.clone());
+        }
         Ok(ck)
     }
 
@@ -540,6 +551,11 @@ pub(crate) struct ProxyCtx {
     /// once (see [`MAX_CONCURRENT_SPLICES`]); the inspected L7 path never touches it. Shared across
     /// connection threads through the [`Arc<ProxyCtx>`] the serve loop clones.
     splices: AtomicUsize,
+    /// The number of connection-handling threads currently live. Each in-cage connection spawns a
+    /// host thread (and holds host fds), so this caps how many an in-cage agent can open at once
+    /// (see [`MAX_CONCURRENT_CONNS`]) — a burst of connections cannot exhaust host threads/fds and
+    /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
+    conns: AtomicUsize,
 }
 
 impl ProxyCtx {
@@ -569,6 +585,7 @@ impl ProxyCtx {
             stats: None,
             log: None,
             splices: AtomicUsize::new(0),
+            conns: AtomicUsize::new(0),
         })
     }
 
@@ -744,9 +761,34 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
 /// or hung peer cannot pin a thread forever.
 pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()> {
     for stream in listener.incoming() {
-        let stream = stream?;
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                // A transient accept error (host fd exhaustion, an aborted connection) must not
+                // take the whole session's egress down — skip this connection and keep serving. A
+                // short sleep avoids a hot spin if the condition persists.
+                eprintln!("ops: egress proxy: accept error: {e}");
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        // Cap live connection threads: a new connection beyond the cap is refused (closed) rather
+        // than spawned, so an in-cage agent cannot exhaust host threads/fds by opening connections
+        // faster than they complete. The guard decrements on the handler thread's exit.
+        if ctx.conns.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNS {
+            drop(stream);
+            continue;
+        }
+        ctx.conns.fetch_add(1, Ordering::Relaxed);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            struct ConnGuard<'a>(&'a AtomicUsize);
+            impl Drop for ConnGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let _guard = ConnGuard(&ctx.conns);
             let _ = stream.set_read_timeout(Some(ctx.timeout));
             let _ = stream.set_write_timeout(Some(ctx.timeout));
             // an error on one connection is that connection's problem, never the proxy's
@@ -755,6 +797,12 @@ pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()
     }
     Ok(())
 }
+
+/// The most connection-handling threads alive at once. A connection beyond this is refused
+/// (fail-closed) rather than spawned, bounding the host threads/fds an in-cage agent can tie up
+/// (including a slowloris drip-feed that holds each thread through the per-read timeout window). Far
+/// above any realistic concurrent-fetch workload from a single cage.
+const MAX_CONCURRENT_CONNS: usize = 512;
 
 /// The largest request head (CONNECT or the decrypted inner request) the proxy will buffer.
 const HEAD_MAX: usize = 16 * 1024;
@@ -1295,6 +1343,16 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    reserialized with `Connection: close` forced so a keep-alive upstream closes after the
     //    one response (otherwise there is no EOF and the read would block until the timeout).
     upstream.write_all(&reserialize_request(&inner, &injected))?;
+    // If the client announced `Expect: 100-continue` it withholds the body until it sees a 100.
+    // The request is already permitted and the upstream is up, so answer the continue now — else
+    // `copy_exact` below would block reading a body the client will not send, until the timeout.
+    // `Expect` is stripped from the forwarded head (see `reserialize_request`), so the upstream does
+    // not run the handshake a second time.
+    if body_len > 0 && head_expects_continue(&inner) {
+        let client = br.get_mut();
+        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = client.flush();
+    }
     copy_exact(&mut br, &mut upstream, body_len)?;
     upstream.flush().ok();
 
@@ -1303,8 +1361,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     redaction) still sees the whole stream unaltered. `set_status` amends the `allow` event
     //     pushed above; on an L4 splice, a refusal, or an error there is no such amend (no response).
     let prefix = read_status_prefix(&mut upstream);
+    // Record only a FINAL status (>= 200). An interim 1xx (`100 Continue`, `103 Early Hints`) is
+    // the first line here but is not the request's outcome, so recording it would mislabel the
+    // event; skip it (the log simply carries no status in that rare case) rather than log a 100.
     if let Some(code) = parse_status_code(&prefix) {
-        ctx.set_status(allow_seq, code);
+        if code >= 200 {
+            ctx.set_status(allow_seq, code);
+        }
     }
     let mut response = io::Cursor::new(prefix).chain(&mut upstream);
 
@@ -1708,7 +1771,12 @@ fn reserialize_request(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
     out.push_str(&head.request_line);
     out.push_str("\r\n");
     for (k, v) in &head.headers {
-        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("proxy-connection") {
+        if k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("proxy-connection")
+            // `Expect: 100-continue` is answered by the proxy to the client directly; forwarding it
+            // would make the upstream expect a body-handshake the proxy has already resolved.
+            || k.eq_ignore_ascii_case("expect")
+        {
             continue;
         }
         // strip any client copy of a header ops is about to inject (all spellings), so the
@@ -1729,6 +1797,14 @@ fn reserialize_request(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
     }
     out.push_str("Connection: close\r\n\r\n");
     out.into_bytes()
+}
+
+/// Whether the request head carries `Expect: 100-continue` (case-insensitive) — the client will
+/// withhold its body until it sees a `100 Continue`, so the proxy answers one on the upstream's behalf.
+fn head_expects_continue(head: &Head) -> bool {
+    head.headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"))
 }
 
 /// Whether two header names denote the same header for stripping: case-insensitive, and

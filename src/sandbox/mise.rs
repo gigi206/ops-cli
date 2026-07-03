@@ -274,6 +274,11 @@ fn bwrap_argv(
     // leaks into mise and no helper outlives ops.
     a.push(lit("--clearenv"));
     a.push(lit("--die-with-parent"));
+    // The same unconditional capability drop the main cage's `to_argv` applies (bwrap then also
+    // sets no_new_privs itself). This argv is hand-built — mise runs before a `SandboxSpec` exists —
+    // so it is set explicitly here rather than inherited; keep it in step with `to_argv`'s baseline.
+    a.push(lit("--cap-drop"));
+    a.push(lit("ALL"));
 
     // The store backs the relocated binary; the private home is the sole writable
     // surface. `/proc`, `/dev`, and a `/tmp` tmpfs round out a minimal usable root.

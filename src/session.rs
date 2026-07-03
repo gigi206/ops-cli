@@ -408,7 +408,12 @@ impl Registry {
         let mut live = Vec::new();
         let mut pruned = 0;
         for entry in entries {
-            let path = entry?.path();
+            // A single unreadable directory entry must not abort the whole listing: the caller's
+            // live-session guard (used by `ops gc` to skip a project with a running session) would
+            // then see zero live sessions and could collect an in-use one. Skip the bad entry so
+            // every other live record still appears — a far smaller exposure than losing them all.
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
             // Skip dotfiles (in-flight temp records) and anything not a plain file.
             let is_dotfile = path
                 .file_name()
@@ -532,6 +537,13 @@ fn is_alive(session: &Session) -> bool {
 fn read_start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_start_ticks(&stat)
+}
+
+/// This process's own start-time ticks, pairing with its pid to identify this incarnation across
+/// pid reuse. `None` if `/proc/self/stat` is unreadable. Used to name per-session files uniquely so
+/// a later process that happens to reuse the pid cannot clobber a prior session's persisted file.
+pub(crate) fn current_start_ticks() -> Option<u64> {
+    read_start_ticks(std::process::id())
 }
 
 /// Extract field 22 (start time) from the contents of `/proc/<pid>/stat`.

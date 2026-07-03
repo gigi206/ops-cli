@@ -267,13 +267,21 @@ pub(crate) fn provision(
         let pin = match lock.get(&tool.pkg, &tool.version, system) {
             Some(pin) => pin,
             None => {
-                let pin = resolve(nix, layout, tool, system).map_err(|e| {
+                let pin = resolve(nix, layout, tool, system, false).map_err(|e| {
                     io::Error::other(format!(
                         "cannot resolve nix tool `{}@{}`: {e}",
                         tool.pkg, tool.version
                     ))
                 })?;
                 lock.insert(&tool.pkg, &tool.version, system, &pin);
+                // Persist each freshly-resolved pin at once, ADDITIVELY: re-read the on-disk lock,
+                // merge just this pin, and write. This way a later tool's provision failure does not
+                // discard the pins resolved so far (the old whole-loop write-at-the-end lost them),
+                // and a concurrent `ops upgrade mise` that rolled a *different* entry is merged in
+                // rather than clobbered by a stale whole-lock rewrite.
+                let mut disk = ResolutionLock::read(&lock_path);
+                disk.insert(&tool.pkg, &tool.version, system, &pin);
+                disk.write(&lock_path)?;
                 pin
             }
         };
@@ -295,7 +303,8 @@ pub(crate) fn provision(
         bins.push(logical.join(BIN));
         tool_roots.push(logical);
     }
-    lock.write(&lock_path)?;
+    // No final whole-lock rewrite: each new pin was already persisted additively above, so a warm
+    // launch (every tool already pinned) writes nothing and cannot clobber a concurrent upgrade.
     Ok(Provisioned {
         bins,
         roots: tool_roots,
@@ -390,7 +399,7 @@ pub(crate) fn upgrade_tools(
                 continue;
             }
         }
-        match resolve(nix, layout, tool, system) {
+        match resolve(nix, layout, tool, system, true) {
             Ok(pin) => {
                 let outcome = match &existing {
                     None => ToolUpgrade::Pinned {
@@ -483,6 +492,7 @@ impl ResolutionLock {
                 {
                     if is_valid_pkg(pkg)
                         && is_valid_version(version)
+                        && is_valid_system(system)
                         && is_commit(commit)
                         && is_valid_attr(attr)
                         && is_valid_version(resolved)
@@ -552,8 +562,9 @@ pub(crate) fn resolve(
     layout: &Layout,
     tool: &NixTool,
     system: &str,
+    fresh: bool,
 ) -> io::Result<Pin> {
-    let metadata = fetch_metadata(nix, layout, &tool.pkg)?;
+    let metadata = fetch_metadata(nix, layout, &tool.pkg, fresh)?;
     select_release(&metadata, &tool.version, system).ok_or_else(|| {
         io::Error::other(format!(
             "no nixpkgs release of `{}` matches version `{}` for {system}",
@@ -569,15 +580,18 @@ pub(crate) fn fetch_metadata(
     nix: &Path,
     layout: &Layout,
     pkg: &str,
+    fresh: bool,
 ) -> io::Result<serde_json::Value> {
     if !is_valid_pkg(pkg) {
         return Err(io::Error::other(format!(
             "refusing to fetch metadata for invalid package name `{pkg}`"
         )));
     }
-    // `pkg` is restricted to `[A-Za-z0-9._+-]`, so it carries no quote, `$`, or
-    // backslash and cannot escape the quoted nix string or the URL's `name=`.
-    fetch_url_json(nix, layout, &format!("{NIXHUB_BASE}{pkg}"))
+    // `pkg` is restricted to `[A-Za-z0-9._+-]`, so it carries no quote, `$`, or backslash to
+    // escape the quoted nix string. Percent-encode it into the query nonetheless, so a legal `+`
+    // reaches nixhub as `%2B` rather than being decoded server-side as a space (a wrong lookup).
+    let encoded = super::search::percent_encode(pkg);
+    fetch_url_json(nix, layout, &format!("{NIXHUB_BASE}{encoded}"), fresh)
 }
 
 /// Fetch a URL's body and parse it as JSON, using nix's `fetchurl` + `readFile` so the
@@ -592,12 +606,20 @@ pub(crate) fn fetch_url_json(
     nix: &Path,
     layout: &Layout,
     url: &str,
+    fresh: bool,
 ) -> io::Result<serde_json::Value> {
     let expr = format!(
         "builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"ops-nixhub\"; }})"
     );
-    let out = store::nix_command(nix, layout)
-        .args(["--extra-experimental-features", "nix-command flakes"])
+    let mut cmd = store::nix_command(nix, layout);
+    cmd.args(["--extra-experimental-features", "nix-command flakes"]);
+    // `builtins.fetchurl` caches by `tarball-ttl` (an hour by default), so a repeat within the
+    // window returns the OLD body. `ops upgrade` explicitly wants the newest metadata, so it forces
+    // a re-fetch with `tarball-ttl 0`; the launch/search paths keep the cache for speed.
+    if fresh {
+        cmd.args(["--option", "tarball-ttl", "0"]);
+    }
+    let out = cmd
         .args(["eval", "--impure", "--raw", "--expr", &expr])
         .output()?;
     if !out.status.success() {
@@ -717,6 +739,16 @@ fn is_valid_attr(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+}
+
+/// A nix system double like `x86_64-linux`: non-empty, lowercase alphanumerics plus `_`/`-`. The
+/// `system` field is only a lock map key, but validating it too keeps the whole line's provenance
+/// clean (a corrupt line self-heals by re-resolution rather than seeding an odd key).
+fn is_valid_system(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
 /// A git revision: exactly 40 lowercase hex characters, so nixhub-supplied metadata
@@ -985,7 +1017,7 @@ mod resolve_tests {
             pkg: "jq".into(),
             version: "latest".into(),
         };
-        let pin = match resolve(&nix, &layout, &tool, &current_system()) {
+        let pin = match resolve(&nix, &layout, &tool, &current_system(), false) {
             Ok(p) => p,
             Err(e) => {
                 // the GET needs the network; treat an unreachable nixhub as a skip

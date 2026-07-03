@@ -730,7 +730,7 @@ const PAGES: &[Page] = &[
         summary: "per-host egress decision counters (allow / deny / blocked)",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
-            ("--reset", "clear this project's recorded stat files instead of showing them"),
+            ("--reset", "clear this project's recorded stat files instead of showing them (ended sessions; a live session's counters reappear on its next request)"),
             ("--json", "emit the counters as JSON"),
         ],
         details:
@@ -746,7 +746,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "logs"],
         synopsis: "ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
-                   [-n <N>] [--with-query] [-f|--follow] [-i|--interval <secs>] [--json]",
+                   [-n <N>] [--with-query] [--with-status] [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),

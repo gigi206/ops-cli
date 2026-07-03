@@ -14,9 +14,11 @@
 //!   flush-on-drop would silently persist nothing for exactly the sessions worth auditing. Each
 //!   recorded decision rewrites the (tiny — one line per distinct host) session file atomically, so
 //!   the file is current as of the last completed request regardless of how the session dies.
-//! - **One file per session, aggregated at read.** Files are keyed by pid (`stats-<pid>`), so two
-//!   sessions of the same project never contend on a write; `ops net stats` sums every session
-//!   file whose embedded `project=` header matches the project the user stands in. The project key
+//! - **One file per session, aggregated at read.** Files are keyed by this process *incarnation*
+//!   (`stats-<pid>-<start-ticks>`), so two sessions of the same project never contend on a write and
+//!   a later process reusing the pid cannot clobber a prior session's still-wanted file; `ops net
+//!   stats` sums every session file whose embedded `project=` header matches the project the user
+//!   stands in. The project key
 //!   is the canonical path [`super::binds::project_identity`] derives, the same on the write and
 //!   read sides, so a launch's record and a later read cannot drift apart.
 
@@ -65,7 +67,7 @@ impl Counts {
 /// Shared (via `Arc`) across the proxy's per-connection threads; each [`record`](EgressStats::record)
 /// updates the in-memory map and rewrites the session file atomically.
 pub(crate) struct EgressStats {
-    /// The session file this flushes to (`<data>/egress/stats-<pid>`).
+    /// The session file this flushes to (`<data>/egress/stats-<pid>-<start-ticks>`).
     path: PathBuf,
     /// The canonical project path (the `project=` header), for read-side attribution.
     project: String,
@@ -255,6 +257,11 @@ pub(crate) fn aggregate(
 /// Delete every session file matching `project` (and `app`, when given), returning how many were
 /// removed — `ops net stats --reset`. Best-effort per file: a removal error is skipped, so a
 /// partially-removable set still clears what it can.
+///
+/// This clears the persisted counters of *ended* sessions. A still-**live** session keeps its
+/// counters in memory and rewrites its file on the next decision, so its lifetime totals reappear —
+/// `--reset` does not zero a running agent's counters (that would need a control message to the live
+/// proxy; not implemented). Reset after the sessions you want cleared have exited.
 pub(crate) fn reset(egress_dir: &Path, project: &str, app: Option<&str>) -> usize {
     let Ok(entries) = std::fs::read_dir(egress_dir) else {
         return 0;

@@ -178,6 +178,13 @@ pub(crate) fn start(
     let ca_file = dir.join(format!("ca-{pid}.pem"));
     let _ = std::fs::remove_file(&host_uds);
 
+    // The persisted stats file outlives its session (it is aggregated later), so it must be keyed
+    // by this *incarnation* — pid plus start-time ticks — not the pid alone: a later process that
+    // reuses the pid would otherwise overwrite a prior session's still-wanted counters.
+    let session_tag = crate::session::current_start_ticks()
+        .map(|ticks| format!("{pid}-{ticks}"))
+        .unwrap_or_else(|| pid.to_string());
+
     // Per-host decision counters for this session, keyed by the project's canonical path (the same
     // identity `ops net stats` derives from a cwd, so a launch's record and a later read agree).
     // Disabled by `[network] stats = false`; otherwise best-effort — a project that cannot be
@@ -188,7 +195,7 @@ pub(crate) fn start(
             .ok()
             .map(|(_, canon)| {
                 Arc::new(super::egress_stats::EgressStats::new(
-                    dir.join(format!("stats-{pid}")),
+                    dir.join(format!("stats-{session_tag}")),
                     canon.display().to_string(),
                     app.map(str::to_string),
                 ))
@@ -727,7 +734,18 @@ mod tests {
 
     #[test]
     fn the_stats_toggle_controls_whether_a_session_file_is_written() {
-        let pid = std::process::id();
+        // Whether any per-session stats file (`stats-<pid>-<ticks>`) was written under the dir.
+        let has_stats_file = |layout: &Layout| {
+            std::fs::read_dir(layout.data_dir().join("egress"))
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("stats-") && !n.contains(".tmp."))
+                    })
+                })
+                .unwrap_or(false)
+        };
 
         // stats OFF → no session file, even after the guard's final flush on drop.
         let off = TmpDir::new();
@@ -745,16 +763,11 @@ mod tests {
         .expect("start with stats off");
         drop(guard);
         assert!(
-            !layout
-                .data_dir()
-                .join("egress")
-                .join(format!("stats-{pid}"))
-                .exists(),
+            !has_stats_file(&layout),
             "stats off must write no session file"
         );
 
-        // stats ON → the guard's final flush writes the session file (a separate data dir so the
-        // pid-keyed name cannot collide with the off case's).
+        // stats ON → the guard's final flush writes the session file (a separate data dir).
         let on = TmpDir::new();
         let layout = Layout::under(on.path());
         std::fs::create_dir_all(layout.data_dir()).unwrap();
@@ -770,11 +783,7 @@ mod tests {
         .expect("start with stats on");
         drop(guard);
         assert!(
-            layout
-                .data_dir()
-                .join("egress")
-                .join(format!("stats-{pid}"))
-                .exists(),
+            has_stats_file(&layout),
             "stats on must write a session file"
         );
     }

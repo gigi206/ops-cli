@@ -678,13 +678,22 @@ pub(crate) fn update(
 
 /// Remove a configured store from the cache, deleting its whole directory. A name that is not
 /// configured is a clear error rather than a silent success.
+///
+/// The directory is renamed aside first (an atomic step), then the renamed tree is deleted — so a
+/// concurrent reader sees the store either fully present or fully gone, never the half-deleted tree
+/// an in-place `remove_dir_all` would leave if it failed partway.
 pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), String> {
     crate::plugins::validate_install_name(name)?;
     let dir = layout.store_path(name);
     if !dir.exists() {
         return Err(format!("no store named `{name}` is configured"));
     }
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove store `{name}`: {e}"))
+    let tomb = dir.with_file_name(format!(".{name}.removing.{}", std::process::id()));
+    std::fs::rename(&dir, &tomb).map_err(|e| format!("cannot remove store `{name}`: {e}"))?;
+    // The store is already gone from its real path; a failure to delete the renamed tree only
+    // leaves a collectable leftover, not a torn store.
+    let _ = std::fs::remove_dir_all(&tomb);
+    Ok(())
 }
 
 /// Atomically replace the live store directory `dest` with the freshly staged `stage` by
@@ -796,17 +805,57 @@ fn decode_key(hex: &str) -> Result<[u8; 32], String> {
     })
 }
 
+/// The most a store-root artifact (catalogue or signature) may be — a generous bound over any real
+/// catalogue, so a fetched store cannot make ops read an unbounded file (a symlink to `/dev/zero`)
+/// into memory before its signature is even checked.
+const STORE_FILE_MAX: u64 = 8 * 1024 * 1024;
+
+/// Read a store-root file into memory, refusing a symlink or a non-regular file and bounding the
+/// size — these bytes come from an untrusted fetched repository and are read BEFORE the Ed25519
+/// verification, so the read itself must not be a lever (an unbounded `/dev/zero` symlink, a device
+/// node). `O_NOFOLLOW` refuses a symlink at the leaf without a TOCTOU window; the size is checked on
+/// the open fd. `missing` is the precise message when the file is simply absent.
+fn read_store_file(path: &Path, what: &str, missing: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => missing.to_string(),
+            _ => format!("cannot read `{what}`: {e} (a symlink is refused)"),
+        })?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("cannot read `{what}`: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("`{what}` is not a regular file"));
+    }
+    if meta.len() > STORE_FILE_MAX {
+        return Err(format!(
+            "`{what}` is too large ({} bytes; the limit is {STORE_FILE_MAX})",
+            meta.len()
+        ));
+    }
+    let mut buf = Vec::new();
+    f.take(STORE_FILE_MAX)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("cannot read `{what}`: {e}"))?;
+    Ok(buf)
+}
+
 /// Read the detached signature file and decode it from hex. The signature is stored hex-encoded
 /// (not raw bytes) so it survives a git checkout unchanged regardless of the repository's
 /// line-ending configuration.
 fn read_signature(path: &Path) -> Result<Vec<u8>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("the store has no `{CATALOGUE_SIG}` (an unsigned store is refused)")
-        } else {
-            format!("cannot read `{CATALOGUE_SIG}`: {e}")
-        }
-    })?;
+    let bytes = read_store_file(
+        path,
+        CATALOGUE_SIG,
+        &format!("the store has no `{CATALOGUE_SIG}` (an unsigned store is refused)"),
+    )?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| format!("the `{CATALOGUE_SIG}` is not valid text"))?;
     crate::plugin_store::decode_hex(&text)
         .map_err(|e| format!("the catalogue signature is not valid hex: {e}"))
 }
@@ -814,13 +863,11 @@ fn read_signature(path: &Path) -> Result<Vec<u8>, String> {
 /// Read the catalogue file, mapping its absence to a precise refusal (a repository without a
 /// catalogue is not a plugin store).
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("the store has no `{CATALOGUE}` (it is not a plugin store)")
-        } else {
-            format!("cannot read `{CATALOGUE}`: {e}")
-        }
-    })
+    read_store_file(
+        path,
+        CATALOGUE,
+        &format!("the store has no `{CATALOGUE}` (it is not a plugin store)"),
+    )
 }
 
 /// A store URL: non-empty and free of control characters. The latter keeps the URL a single
@@ -907,6 +954,28 @@ mod tests {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+
+    #[test]
+    fn read_store_file_reads_a_regular_file_but_refuses_a_symlink() {
+        let dir = crate::testutil::TmpDir::new();
+        let real = dir.path().join("catalogue.toml");
+        std::fs::write(&real, b"name = \"x\"\n").unwrap();
+        assert_eq!(
+            read_store_file(&real, "catalogue.toml", "missing").unwrap(),
+            b"name = \"x\"\n"
+        );
+        // A symlink (the untrusted repo's own leaf) is refused, so a `/dev/zero`-style unbounded
+        // read can never happen before verification.
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_store_file(&link, "catalogue.toml", "missing").is_err());
+        // An absent file maps to the precise `missing` message.
+        let gone = dir.path().join("nope.toml");
+        assert_eq!(
+            read_store_file(&gone, "catalogue.toml", "the-missing-note").unwrap_err(),
+            "the-missing-note"
+        );
     }
 
     fn pubkey_of(kp: &Ed25519KeyPair) -> [u8; 32] {

@@ -210,8 +210,10 @@ fn doctor() -> ExitCode {
     report_resource_limits(&pal, &config::global_limits());
 
     // The nix that drives the store. Its absence is load-bearing too — without
-    // nix, ops cannot provision a project's tools. Resolution is read-only here
-    // (override, then an ops-owned engine, then `PATH`), so doctor writes nothing.
+    // nix, ops cannot provision a project's tools. Resolution follows override,
+    // then an ops-owned engine, then `PATH`; it makes no store or config change,
+    // though a `bundled-nix` build materializes its embedded engine under
+    // `<data>/engine/` on first use (idempotent), which a launch would do anyway.
     match store::resolve_nix(layout.as_ref()) {
         Some(nix) => {
             println!("  {} nix               {}", tag_ok(&pal), nix.display());
@@ -564,14 +566,44 @@ fn trust_store_dir() -> Result<std::path::PathBuf, ExitCode> {
 }
 
 /// `ops trust [path]` vouches for a project config's current contents;
-/// `ops trust --show [path]` reports its trust state without changing it.
+/// `ops trust --show [path]` reports its trust state without changing it. `--show` is honored in
+/// any position, and an unknown flag or a second path is a usage error — recording trust is the
+/// most security-sensitive write in the tool, so a mistyped `--show` must never fall through to it.
 fn trust_cmd(args: Vec<OsString>) -> ExitCode {
-    let mut args = args.into_iter();
-    let first = args.next();
-    if first.as_deref().and_then(|s| s.to_str()) == Some("--show") {
-        return show_trust(config_path_arg(args.next()));
+    let (show, path) = match parse_trust_args(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("ops: {msg} — usage: ops trust [--show] [path]");
+            return ExitCode::from(2);
+        }
+    };
+    let path = config_path_arg(path);
+    if show {
+        show_trust(path)
+    } else {
+        record_trust(path)
     }
-    record_trust(config_path_arg(first))
+}
+
+/// Parse `ops trust`'s arguments into `(show, path)`. `--show` is honored in any position and an
+/// unknown flag or a second path is an error — recording trust is the tool's most security-sensitive
+/// write, so a mistyped or trailing `--show` must never fall through to it. A pure helper (tested).
+fn parse_trust_args(args: Vec<OsString>) -> Result<(bool, Option<OsString>), String> {
+    let mut show = false;
+    let mut path: Option<OsString> = None;
+    for arg in args {
+        match arg.to_str() {
+            Some("--show") => show = true,
+            Some(tok) if tok.starts_with('-') => return Err(format!("unknown flag {tok}")),
+            _ => {
+                if path.is_some() {
+                    return Err("trust takes a single path".to_string());
+                }
+                path = Some(arg);
+            }
+        }
+    }
+    Ok((show, path))
 }
 
 /// Record trust for a config's current contents, so its security-relevant fields
@@ -1818,8 +1850,9 @@ fn config_cwd() -> Result<PathBuf, ExitCode> {
 
 /// `ops config get <key>`: print the value declared at a dotted key in the target layer file
 /// (`--local` by default). This reads the *raw declared* value in that one file; for the
-/// *effective resolved* value across layers, use `ops config show` / `ops config show --json`. An unset key
-/// exits 1 (so a script can tell "absent" from a real error), a usage problem exits 2.
+/// *effective resolved* value across layers, use `ops config show` / `ops config show --json`. An
+/// unset key OR a read/parse error both exit 1 (each prints a distinct stderr line saying which); a
+/// usage problem exits 2.
 fn config_get(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
@@ -2315,14 +2348,39 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
         Some("list") => app_list(),
-        // Otherwise the first non-flag token names an app to launch; `--detach` runs it in the
-        // background as a session `ops ls`/`attach`/`stop` can see.
+        // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
+        // background as a session `ops ls`/`attach`/`stop` can see. An unknown flag or a second
+        // token is a usage error, so a typo cannot silently launch a different posture (e.g. a
+        // mistyped `--detach` running attached, or extra tokens dropped without a word).
         _ => {
-            let detach = args.iter().any(|a| a.to_str() == Some("--detach"));
-            let name = args
-                .iter()
-                .filter_map(|a| a.to_str())
-                .find(|a| !a.starts_with('-'));
+            let mut detach = false;
+            let mut name: Option<&str> = None;
+            for a in &args {
+                match a.to_str() {
+                    Some("--detach") => detach = true,
+                    Some(tok) if tok.starts_with('-') => {
+                        eprintln!("ops: unknown flag {tok} — usage: {}", help::synopsis("app"));
+                        return ExitCode::from(2);
+                    }
+                    Some(tok) => {
+                        if name.is_some() {
+                            eprintln!(
+                                "ops: app takes a single name — usage: {}",
+                                help::synopsis("app")
+                            );
+                            return ExitCode::from(2);
+                        }
+                        name = Some(tok);
+                    }
+                    None => {
+                        eprintln!(
+                            "ops: app name must be valid text — usage: {}",
+                            help::synopsis("app")
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             let Some(name) = name else {
                 eprintln!("ops: usage: {}", help::synopsis("app"));
                 return ExitCode::from(2);
@@ -5550,6 +5608,15 @@ fn persist_egress_rule(
             format!("`ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
         ));
     }
+    // Validate the app name here, in the shared writer, so every path that persists a rule is
+    // covered — including `ops net pending --save --app <name>`, whose by-id form does not
+    // pre-check the name. An invalid or reserved name keys a table `resolve_apps` drops at load,
+    // so the rule would be silently inert; refuse it rather than report a durable restriction.
+    if let Some(name) = app {
+        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+            return Err((2, format!("`{name}` is not a valid app name")));
+        }
+    }
     // `base` is the directory a `--local` scope resolves against: the cwd for `ops net allow|deny`,
     // or the *answered session's* project for `ops net pending --save` (so the rule lands in the
     // project the agent runs in, not wherever the user happens to stand). Global ignores it. The
@@ -6476,12 +6543,20 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // Parse the target before touching anything, so a typo fails cleanly. `all` covers
     // every managed channel: the nixpkgs channel (base + native `[packages]`) and the
     // project's `nix:` mise tools.
-    let what = match args.first().and_then(|s| s.to_str()).unwrap_or("all") {
-        w @ ("all" | "nix" | "mise" | "flake") => w,
-        other => {
-            eprintln!("ops: unknown upgrade target '{other}' (known: all, nix, mise, flake)");
-            return ExitCode::from(2);
-        }
+    // No target means `all`; a target that is present but unrecognized (including one that is not
+    // valid UTF-8) is an error, not a silent fall-through to `all`.
+    let what = match args.first() {
+        None => "all",
+        Some(arg) => match arg.to_str() {
+            Some(w @ ("all" | "nix" | "mise" | "flake")) => w,
+            _ => {
+                eprintln!(
+                    "ops: unknown upgrade target '{}' (known: all, nix, mise, flake)",
+                    arg.to_string_lossy()
+                );
+                return ExitCode::from(2);
+            }
+        },
     };
     // Exactly one (optional) target. A trailing token — a mistyped flag or a second target —
     // is rejected, not silently swallowed (so `ops upgrade nix mise` does not roll only `nix`).
@@ -8008,6 +8083,27 @@ mod tests {
             render_trust_verdict(path, trust::TrustState::Changed, &p),
             "ops: /p/.ops.toml is changed since it was trusted — re-run `ops trust` to re-approve"
         );
+    }
+
+    #[test]
+    fn parse_trust_args_honors_show_in_any_position_and_rejects_stray_tokens() {
+        let os = |s: &str| OsString::from(s);
+        // `--show` after the path must SHOW, not record trust — the security-sensitive default.
+        let (show, path) = parse_trust_args(vec![os("./repo/.ops.toml"), os("--show")]).unwrap();
+        assert!(show, "trailing --show must be honored");
+        assert_eq!(
+            path.as_deref(),
+            Some(std::ffi::OsStr::new("./repo/.ops.toml"))
+        );
+        // `--show` first, path after.
+        let (show, path) = parse_trust_args(vec![os("--show"), os("p.toml")]).unwrap();
+        assert!(show);
+        assert_eq!(path.as_deref(), Some(std::ffi::OsStr::new("p.toml")));
+        // No args: record the default path.
+        assert_eq!(parse_trust_args(vec![]).unwrap(), (false, None));
+        // An unknown flag or a second path is rejected (so a typo cannot fall through to a record).
+        assert!(parse_trust_args(vec![os("--shwo")]).is_err());
+        assert!(parse_trust_args(vec![os("a.toml"), os("b.toml")]).is_err());
     }
 
     #[test]

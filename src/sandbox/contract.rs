@@ -50,8 +50,12 @@ fn allowlist_contract(policy: &crate::allowlist::EgressPolicy) -> String {
         .collect();
     hosts.sort();
     hosts.dedup();
+    // A neutral placeholder, not "nothing is reachable": the `closing` line below states what the
+    // default action does, which is what an empty allow list actually means — and under an
+    // allow-by-default (denylist) posture an empty list does NOT mean nothing is reachable. (In
+    // practice the built-in self-equip rules keep this non-empty; the placeholder is defensive.)
     let hosts = if hosts.is_empty() {
-        "  (no allow rules — nothing is reachable by default)".to_string()
+        "  (no explicit allow rules — see the default below)".to_string()
     } else {
         hosts.join("\n")
     };

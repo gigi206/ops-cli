@@ -102,8 +102,14 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
 /// byte-identical to hashing the single file — or an unambiguous framing of the
 /// `.ops.toml` and *every* mise file when it has some. Each part is domain-tagged
 /// (the mise parts by filename) and length-prefixed, never a bare concatenation, so
-/// no two distinct input sets share an encoding: a change to any file — or moving
-/// an entry between files — always changes the hash.
+/// among *has-mise* inputs no two distinct sets share an encoding: a change to any
+/// file — or moving an entry between files — always changes the hash.
+///
+/// The no-mise fast path is an intentional exception (it hashes the raw file, for the
+/// backward-compatible marker). A cross-mode collision — a no-mise state hashing the same
+/// as a has-mise one — would require the trusted `.ops.toml` bytes to *begin with the internal
+/// framing header* (`ops.toml\0` + a length), which a real, user-reviewed TOML config never does
+/// (it embeds a NUL), so the "any change re-arms trust" guarantee holds for every real input.
 pub(crate) fn content_hash(ops_bytes: &[u8], mise_inputs: &[(String, Vec<u8>)]) -> String {
     if mise_inputs.is_empty() {
         return hash_bytes(ops_bytes);

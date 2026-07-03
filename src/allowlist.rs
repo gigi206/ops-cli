@@ -72,9 +72,10 @@ use regex::Regex;
 
 /// One classified match rule, used in either the allow or the deny list: a syntactic [`RuleKind`],
 /// the set of HTTP [`Methods`] it applies to, and the enforcement [`Layer`] its scheme selects. A
-/// rule with no `{...}` method prefix carries [`Methods::Any`]; a method-qualified rule
-/// (`{GET,HEAD} host`) applies only to those verbs. A bare or `https://` rule is [`Layer::L7`]
-/// (inspected, the default); a `tcp://` rule is [`Layer::L4`] (raw-spliced, host:port only).
+/// rule with no `{...}` method prefix carries [`Methods::Unspecified`] (later resolved to the
+/// context default by `apply_default_methods`); a method-qualified rule (`{GET,HEAD} host`) applies
+/// only to those verbs, and an explicit `{*}` is [`Methods::Any`]. A bare or `https://` rule is
+/// [`Layer::L7`] (inspected, the default); a `tcp://` rule is [`Layer::L4`] (raw-spliced, host:port).
 #[derive(Debug, Clone)]
 pub(crate) struct Rule {
     pub(crate) kind: RuleKind,
@@ -253,9 +254,20 @@ impl Ports {
     /// The display suffix: empty for the default {443} (rendered as a bare/`https://` host), `:*`
     /// for any, else `:` plus a comma list where each item is `p` or `lo-hi`.
     fn suffix(&self) -> String {
+        self.render_suffix(false)
+    }
+
+    /// Like [`suffix`](Self::suffix) but never omits the `:443` default — used for an L4 (`tcp://`)
+    /// rule, which must always name its port (a `tcp://host` with no port re-classifies as an
+    /// error), so `tcp://host:443` round-trips instead of rendering as `tcp://host`.
+    fn suffix_explicit(&self) -> String {
+        self.render_suffix(true)
+    }
+
+    fn render_suffix(&self, explicit: bool) -> String {
         match self {
             Ports::Any => ":*".to_string(),
-            Ports::Ranges(rs) if rs.as_slice() == [(443, 443)] => String::new(),
+            Ports::Ranges(rs) if !explicit && rs.as_slice() == [(443, 443)] => String::new(),
             Ports::Ranges(rs) => {
                 let parts: Vec<String> = rs
                     .iter()
@@ -506,29 +518,47 @@ impl fmt::Display for Rule {
             Layer::L7 if matches!(self.kind, RuleKind::Regex { .. }) => "",
             Layer::L7 => "https://",
         };
-        write!(f, "{}{scheme}{}", self.methods.prefix(), self.kind)
+        // L4 must always name its port (a `tcp://host` with no port fails to re-classify), so its
+        // kind renders with the port explicit; L7 keeps the compact `:443`-omitted form.
+        let kind = self.kind.render(matches!(self.layer, Layer::L4));
+        write!(f, "{}{scheme}{kind}", self.methods.prefix())
+    }
+}
+
+impl RuleKind {
+    /// Render the kind, choosing whether the port suffix keeps the `:443` default explicit. L7 uses
+    /// the compact form (443 omitted); L4 forces the port so a `tcp://host:443` rule round-trips.
+    fn render(&self, explicit_ports: bool) -> String {
+        let suffix = |ports: &Ports| {
+            if explicit_ports {
+                ports.suffix_explicit()
+            } else {
+                ports.suffix()
+            }
+        };
+        match self {
+            RuleKind::Ip(ip, ports) => {
+                let s = suffix(ports);
+                // bracket an IPv6 literal when it carries a port, so `:port` is unambiguous
+                if !s.is_empty() && ip.is_ipv6() {
+                    format!("[{ip}]{s}")
+                } else {
+                    format!("{ip}{s}")
+                }
+            }
+            RuleKind::Host(h, ports) => format!("{h}{}", suffix(ports)),
+            RuleKind::Subdomain(d, ports) => format!("*.{d}{}", suffix(ports)),
+            RuleKind::Url {
+                host, ports, path, ..
+            } => format!("{}{}{path}", display_host(host), suffix(ports)),
+            RuleKind::Regex { pattern, .. } => format!("re:{pattern}"),
+        }
     }
 }
 
 impl fmt::Display for RuleKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RuleKind::Ip(ip, ports) => {
-                let suffix = ports.suffix();
-                // bracket an IPv6 literal when it carries a port, so `:port` is unambiguous
-                if !suffix.is_empty() && ip.is_ipv6() {
-                    write!(f, "[{ip}]{suffix}")
-                } else {
-                    write!(f, "{ip}{suffix}")
-                }
-            }
-            RuleKind::Host(h, ports) => write!(f, "{h}{}", ports.suffix()),
-            RuleKind::Subdomain(d, ports) => write!(f, "*.{d}{}", ports.suffix()),
-            RuleKind::Url {
-                host, ports, path, ..
-            } => write!(f, "{}{}{path}", display_host(host), ports.suffix()),
-            RuleKind::Regex { pattern, .. } => write!(f, "re:{pattern}"),
-        }
+        f.write_str(&self.render(false))
     }
 }
 
@@ -1552,6 +1582,9 @@ mod tests {
             "tcp://ssh.example.com:22",
             "tcp://*.corp:5432",
             "tcp://[::1]:22",
+            // Port 443 must stay explicit on an L4 rule — the `:443`-omitting shortcut an L7 host
+            // rule uses would render this as `tcp://host`, which re-classifies as an error.
+            "tcp://host.example.com:443",
         ] {
             assert_eq!(rule(s).to_string(), s, "{s} should round-trip");
         }

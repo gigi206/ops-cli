@@ -38,6 +38,10 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     if spec.net == NetPolicy::Isolated {
         a.push(lit("--unshare-net"));
     }
+    // A fresh UTS namespace inherits the host's hostname at creation, so set a neutral one — the
+    // cage should not be able to read the host's identity out of `hostname`/`uname`.
+    a.push(lit("--hostname"));
+    a.push(lit("sandbox"));
 
     // Free hardening — pure removals, always emitted: start from a clean
     // environment (before anything is set into it), drop every capability, and
@@ -156,6 +160,10 @@ mod tests {
         // capabilities are dropped as a pair
         let i = index_of(&argv, "--cap-drop").expect("--cap-drop present");
         assert_eq!(argv[i + 1], OsString::from("ALL"));
+        // a neutral hostname is set as a pair, so the cage cannot read the host's identity out of
+        // its fresh UTS namespace (which would otherwise inherit the host's hostname)
+        let h = index_of(&argv, "--hostname").expect("--hostname present");
+        assert_eq!(argv[h + 1], OsString::from("sandbox"));
     }
 
     #[test]

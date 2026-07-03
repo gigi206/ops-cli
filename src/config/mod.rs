@@ -88,7 +88,11 @@ pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
 fn is_reserved_env_key(key: &str) -> bool {
     key.starts_with("LD_")
         || is_proxy_env_key(key)
-        || crate::sandbox::egress::CA_FILE_ENV_KEYS.contains(&key)
+        // The CA-bundle keys are matched case-insensitively: env names are case-sensitive, but a
+        // nonstandard tool reading a lowercase variant must not slip a swapped CA past the gate.
+        || crate::sandbox::egress::CA_FILE_ENV_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(key))
         || matches!(
             key,
             "HOME"
@@ -100,6 +104,11 @@ fn is_reserved_env_key(key: &str) -> bool {
                 | "NIX_CONF_DIR"
                 | "BASH_ENV"
                 | "ENV"
+                // Interactive-shell code-exec hooks: bash runs `PROMPT_COMMAND` before each prompt
+                // and evaluates `$(...)` in `PS1`, so an untrusted `[env]` setting them would run
+                // code in the user's later Mode-A `ops shell`, exactly like `BASH_ENV`/`ENV`.
+                | "PROMPT_COMMAND"
+                | "PS1"
                 | "IFS"
                 | "GCONV_PATH"
                 | "GLIBC_TUNABLES"
@@ -5601,6 +5610,8 @@ mod tests {
             "NIX_CONF_DIR",
             "BASH_ENV",
             "ENV",
+            "PROMPT_COMMAND",
+            "PS1",
             "IFS",
             "GCONV_PATH",
             "GLIBC_TUNABLES",
@@ -5618,6 +5629,10 @@ mod tests {
             "CURL_CA_BUNDLE",
             "NODE_EXTRA_CA_CERTS",
             "npm_config_cafile",
+            // the CA-bundle keys are matched case-insensitively (a nonstandard tool may read a
+            // lowercase variant), so an off-case spelling is reserved too.
+            "ssl_cert_file",
+            "Curl_CA_Bundle",
         ] {
             assert!(is_reserved_env_key(k), "{k} should be reserved");
         }

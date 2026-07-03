@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
+use toml_edit::{value, Array, DocumentMut, Item, Table, TableLike, Value};
 
 /// Which config file an operation targets.
 pub(crate) enum Scope {
@@ -42,6 +42,9 @@ pub(crate) enum ManageError {
     BadKey(String),
     /// The key resolves onto or through a non-scalar (an array or a table) — use `$EDITOR`.
     NotScalar(String),
+    /// The value would make the whole layer unparseable (a type the schema rejects), so the write
+    /// was refused rather than committed — a committed invalid layer is silently dropped at load.
+    InvalidValue(String, String),
     /// A `deny` rule was added but there is no filtering posture to carry it (and a `deny` must
     /// not silently create an open denylist) — the user must set a posture first.
     DenyNeedsPosture,
@@ -96,6 +99,11 @@ impl std::fmt::Display for ManageError {
             ManageError::NotScalar(k) => write!(
                 f,
                 "{k} is not a single value (it is an array or table) — edit it with `ops config edit`"
+            ),
+            ManageError::InvalidValue(k, detail) => write!(
+                f,
+                "the value for {k} is not valid there ({detail}) — nothing was written; \
+                 check the expected type with `ops config edit`"
             ),
             ManageError::DenyNeedsPosture => write!(
                 f,
@@ -180,9 +188,11 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table = doc.as_table();
+    let mut table: &dyn TableLike = doc.as_table();
     for seg in parents {
-        match table.get(seg).and_then(Item::as_table) {
+        // Descend through both regular and inline tables, so a key inside `network = { ... }` is
+        // read, not misreported as absent.
+        match table.get(seg).and_then(Item::as_table_like) {
             Some(t) => table = t,
             None => return Ok(None),
         }
@@ -191,46 +201,99 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
         None => Ok(None),
         Some(Item::Value(v)) if v.is_str() => Ok(v.as_str().map(str::to_string)),
         Some(Item::Value(v)) if !v.is_array() && !v.is_inline_table() => {
+            // Render only the value literal — clearing the decor drops any trailing inline comment
+            // (`4096 # note`) so `get` returns a clean, scriptable scalar like the string branch.
+            let mut v = v.clone();
+            v.decor_mut().set_prefix("");
+            v.decor_mut().set_suffix("");
             Ok(Some(v.to_string().trim().to_string()))
         }
         Some(_) => Err(ManageError::NotScalar(key.to_string())),
     }
 }
 
-/// Set a string value at a dotted key, preserving the rest of the file. Creates the file and any
+/// Set a value at a dotted key, preserving the rest of the file. Creates the file and any
 /// intermediate tables as needed. Returns whether the key was created (vs updated in place).
+///
+/// The value is written with its natural TOML type — a bare `true`/`false` as a boolean, a bare
+/// integer as an integer — so a typed schema key (a `bool`/number knob) round-trips; a value that
+/// leaves the layer unparseable in the typed form is retried as a plain string. A value that makes
+/// the layer invalid in BOTH forms is **refused without writing**: a committed unparseable layer is
+/// silently dropped whole at the next load (e.g. a filtering `network` posture reverting to open
+/// egress), so this fails closed and loud rather than reporting success over a broken file.
 pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<bool, ManageError> {
     let mut doc = read_or_empty(path)?;
+    let created = put_scalar(&mut doc, key, scalar_value(val))?;
+    if validate_layer(&doc).is_err() {
+        // The natural type broke the layer — write the value as a string instead.
+        put_scalar(&mut doc, key, Value::from(val))?;
+        if let Err(detail) = validate_layer(&doc) {
+            return Err(ManageError::InvalidValue(key.to_string(), detail));
+        }
+    }
+    write_doc(path, &doc)?;
+    Ok(created)
+}
+
+/// Insert or replace a scalar leaf at a dotted `key`, creating intermediate tables as needed.
+/// Returns whether the leaf was created (vs replaced in place, keeping its surrounding comments).
+fn put_scalar(doc: &mut DocumentMut, key: &str, v: Value) -> Result<bool, ManageError> {
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
     for seg in parents {
+        // Create a missing parent as a regular table; descend through an existing regular OR inline
+        // table, so a scalar can be set inside `network = { ... }` instead of failing as non-scalar.
+        if !table.contains_key(seg) {
+            table.insert(seg, Item::Table(Table::new()));
+        }
         table = table
-            .entry(seg)
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
+            .get_mut(seg)
+            .and_then(Item::as_table_like_mut)
             .ok_or_else(|| ManageError::NotScalar(key.to_string()))?;
     }
-    let created = match table.get_mut(leaf[0]) {
+    match table.get_mut(leaf[0]) {
         // A new key: insert it with default formatting.
         None => {
-            table.insert(leaf[0], value(val));
-            true
+            table.insert(leaf[0], Item::Value(v));
+            Ok(true)
         }
         // An existing scalar: replace only its content, keeping the surrounding decor (the
         // comments and whitespace around it) — a plain `insert` would drop them.
-        Some(Item::Value(v)) if !v.is_array() && !v.is_inline_table() => {
-            let mut replacement = Value::from(val);
-            *replacement.decor_mut() = v.decor().clone();
-            *v = replacement;
-            false
+        Some(Item::Value(existing)) if !existing.is_array() && !existing.is_inline_table() => {
+            let mut replacement = v;
+            *replacement.decor_mut() = existing.decor().clone();
+            *existing = replacement;
+            Ok(false)
         }
         // An array or table leaf: refuse rather than silently drop what the user meant to edit.
-        Some(_) => return Err(ManageError::NotScalar(key.to_string())),
-    };
-    write_doc(path, &doc)?;
-    Ok(created)
+        Some(_) => Err(ManageError::NotScalar(key.to_string())),
+    }
+}
+
+/// The TOML value for a raw command-line string: a bare `true`/`false` becomes a boolean and a bare
+/// integer becomes an integer, so a typed schema key round-trips; anything else stays a string. The
+/// caller validates the result and falls back to a string, so an over-eager guess is never
+/// committed — the point is only to let `ops config set network.stats false` write a real boolean.
+fn scalar_value(val: &str) -> Value {
+    match val {
+        "true" => Value::from(true),
+        "false" => Value::from(false),
+        _ => match val.parse::<i64>() {
+            // Reject forms an integer render would not reproduce (`+1`, `007`), so they stay
+            // strings and round-trip verbatim.
+            Ok(n) if n.to_string() == val => Value::from(n),
+            _ => Value::from(val),
+        },
+    }
+}
+
+/// Whether the edited document still parses as a config layer. A `set`/`unset` that leaves the
+/// layer unparseable is worse than a no-op: the loader drops the WHOLE layer with only a warning,
+/// silently reverting every security field it carried, so a write is validated before it commits.
+fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
+    super::schema::parse(doc.to_string().as_bytes()).map(|_| ())
 }
 
 /// Remove a dotted key. Returns whether it existed. An absent file or parent is simply "not
@@ -240,9 +303,11 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
     for seg in parents {
-        match table.get_mut(seg).and_then(Item::as_table_mut) {
+        // Descend through both regular and inline tables, so a key inside `network = { ... }` is
+        // removed, not reported as already-absent.
+        match table.get_mut(seg).and_then(Item::as_table_like_mut) {
             Some(t) => table = t,
             None => return Ok(false),
         }
@@ -361,14 +426,19 @@ pub(crate) fn add_egress_rule(
     Ok(outcome)
 }
 
-/// Refuse adding an allow/deny rule to an explicit non-filtering posture (`shared`/`none`), where
-/// the lists are ignored at resolution — the same guard the bare-string path applies, so the table
-/// and inline-table forms cannot silently accept an inert rule. A missing or filtering `mode` is
-/// fine (the rule takes effect).
+/// Validate the `mode` of a `[network]` table/inline-table before appending an allow/deny rule to
+/// it — the same guard the bare-string path applies, so the table forms cannot silently accept an
+/// inert rule. A filtering mode (or a missing one, left to the schema) takes the rule; an explicit
+/// non-filtering `shared`/`none` is refused (its lists are ignored at resolution); and an unknown
+/// mode is refused too — it is dropped at resolution, so appending to it would report a rule "added"
+/// that never takes effect.
 fn refuse_non_filtering(mode: Option<&str>) -> Result<(), ManageError> {
     match mode {
+        None | Some("deny" | "allow" | "allowlist" | "ask") => Ok(()),
         Some(m @ ("shared" | "none")) => Err(ManageError::NonFilteringPosture(m.to_string())),
-        _ => Ok(()),
+        Some(other) => Err(ManageError::MalformedNetwork(format!(
+            "unknown mode {other:?}"
+        ))),
     }
 }
 
@@ -456,7 +526,12 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
 /// truncated config a launch would then fail to parse. Creates the parent directory as needed —
 /// the global config dir (or an explicit `-c dir/file.toml` whose directory does not exist yet)
 /// may be absent on a first write.
+///
+/// A fresh file is written owner-only (`0600`), independent of the caller's umask, so ops's own
+/// write always passes its safety gate (a world-writable config is later refused); an existing
+/// file keeps its mode. The temp name carries the pid so two concurrent writers do not collide.
 fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
+    use std::os::unix::fs::PermissionsExt as _;
     let err = |e: std::io::Error| ManageError::Write(path.to_path_buf(), e.to_string());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(err)?;
@@ -464,8 +539,15 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("ops.toml");
-    let tmp = dir.join(format!(".{name}.ops-tmp"));
+    let mode = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let tmp = dir.join(format!(".{name}.ops-tmp.{}", std::process::id()));
     std::fs::write(&tmp, doc.to_string()).map_err(err)?;
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err(e));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         err(e)
@@ -660,6 +742,82 @@ mod tests {
         assert!(matches!(
             set(&p, "env", "y"),
             Err(ManageError::NotScalar(_))
+        ));
+    }
+
+    #[test]
+    fn set_writes_a_typed_key_with_its_natural_type_and_keeps_the_layer_valid() {
+        // A bool-valued schema knob must be written as a real boolean, not the string "false" —
+        // the string form makes the untagged `network` field unparseable, so the loader would drop
+        // the WHOLE layer (reverting the filtering posture to open egress). Pin that it round-trips.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+        assert!(set(&p, "network.stats", "false").unwrap(), "stats is new");
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("stats = false"),
+            "written as a boolean, not a string:\n{after}"
+        );
+        assert!(
+            super::super::schema::parse(after.as_bytes()).is_ok(),
+            "the edited layer still parses, so a load honors it:\n{after}"
+        );
+    }
+
+    #[test]
+    fn set_refuses_a_value_that_would_invalidate_the_layer_without_writing() {
+        // A value the schema rejects in every form must fail closed: the file is left untouched, so
+        // a launch keeps honoring the last-good layer instead of silently dropping it as invalid.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert!(matches!(
+            set(&p, "network.stats", "maybe"),
+            Err(ManageError::InvalidValue(_, _))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused set must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn get_set_unset_descend_into_an_inline_table() {
+        // A key inside `network = { ... }` must be readable, settable, and removable — the inline
+        // form is a first-class shape the same module authors elsewhere, not an absent key.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "network = { mode = \"deny\", stats = true }\n");
+        assert_eq!(get(&p, "network.mode").unwrap().as_deref(), Some("deny"));
+        // set a new inline key and flip an existing one
+        assert!(!set(&p, "network.stats", "false").unwrap(), "stats existed");
+        assert_eq!(get(&p, "network.stats").unwrap().as_deref(), Some("false"));
+        assert!(unset(&p, "network.stats").unwrap(), "stats removed");
+        assert_eq!(get(&p, "network.stats").unwrap(), None);
+        // the field stays inline and valid after editing
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains('{'), "still inline:\n{after}");
+        assert!(super::super::schema::parse(after.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn get_strips_a_trailing_comment_from_a_non_string_scalar() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[limits]\ntasks_max = 4096 # per advisor\n");
+        assert_eq!(
+            get(&p, "limits.tasks_max").unwrap().as_deref(),
+            Some("4096")
+        );
+    }
+
+    #[test]
+    fn add_egress_rule_refuses_an_unknown_mode_rather_than_reporting_an_inert_rule() {
+        // An unknown mode is dropped at resolution, so appending to it would silently be inert.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[network]\nmode = \"bogus\"\n");
+        assert!(matches!(
+            add_egress_rule(&p, None, EgressList::Allow, "example.com"),
+            Err(ManageError::MalformedNetwork(_))
         ));
     }
 

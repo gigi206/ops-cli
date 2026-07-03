@@ -41,10 +41,22 @@ pub(crate) fn find_all_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) 
 }
 
 fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    // A regular file this process can actually execute. `access(X_OK)` asks the kernel, weighing our
+    // uid/gid against the file's owner/group/other bits together — unlike a raw `mode & 0o111 != 0`
+    // test, which would accept a file whose only exec bit is for a user we are not, so an
+    // unexecutable early `PATH` match would shadow a working later one.
+    let is_file = std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false);
+    is_file && access_x_ok(p)
+}
+
+/// Whether the current process may execute `p` (`access(2)` with `X_OK`).
+fn access_x_ok(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated path; `access` only reads and returns a status.
+    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
 #[cfg(test)]

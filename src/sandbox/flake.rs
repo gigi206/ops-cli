@@ -31,9 +31,12 @@ pub(crate) struct FlakePin {
 }
 
 /// A git revision: exactly 40 lowercase hex characters. Validated before a stored value flows
-/// back into a flake reference or an on-disk path component.
+/// back into a flake reference or an on-disk path component. Lowercase-only, matching how nix and
+/// [`crate::store::valid_revision`] spell a rev — an off-case value is a corrupt lock line, refused.
 fn is_rev(s: &str) -> bool {
-    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    s.len() == 40
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A locked reference is the metadata URL (plus optional `#<attr>`): non-empty, single-line, no
@@ -216,6 +219,28 @@ pub(crate) fn declared_refs(cfg: &crate::config::Resolved) -> Vec<String> {
     refs
 }
 
+/// Every declared `flake:` reference across the baseline and each app overlay, **regardless of
+/// trust state** — the universe `ops upgrade flake` prunes against, so a lock entry is removed only
+/// when its package is genuinely gone from the config, never merely because the project is currently
+/// untrusted. (Rolling forward stays trusted-only via [`declared_refs`]; this decides only removal.)
+fn all_declared_refs(cfg: &crate::config::Resolved) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    let mut collect = |pkgs: &[crate::config::Package]| {
+        for p in pkgs {
+            if let crate::config::Backend::Flake(reference) = &p.backend {
+                set.insert(reference.clone());
+            }
+        }
+    };
+    collect(&cfg.packages);
+    for app in cfg.apps.values() {
+        let mut merged = cfg.clone();
+        merged.merge_app(app.clone());
+        collect(&merged.packages);
+    }
+    set
+}
+
 /// How many declared `flake:` packages are withheld for being untrusted — across the project
 /// baseline and each app's own overlay. A count only: the per-package withholding reason is
 /// already warned on the launch path, so `ops upgrade` just needs to not read as "none declared".
@@ -254,12 +279,16 @@ pub(crate) fn upgrade(
     let mut lock = pins(layout, project_id);
     let mut outcomes = Vec::new();
 
-    // Prune entries whose reference is no longer declared, before re-resolving the rest.
-    let declared_set: std::collections::BTreeSet<&str> =
-        declared.iter().map(String::as_str).collect();
+    // Prune entries whose reference is truly no longer declared — measured against ALL declared
+    // refs regardless of trust, NOT the trusted-only `declared` set. A withheld (untrusted/Changed)
+    // project's refs are absent from `declared`, so pruning against it would drop a still-declared
+    // package's pin, silently unpinning it — a later re-trust would then float to the latest
+    // upstream revision, exactly the movement the pin model forbids. Re-resolution below stays
+    // trusted-only (over `declared`); pruning is state-agnostic.
+    let prune_universe = all_declared_refs(cfg);
     let stale: Vec<String> = lock
         .keys()
-        .filter(|k| !declared_set.contains(k.as_str()))
+        .filter(|k| !prune_universe.contains(k.as_str()))
         .cloned()
         .collect();
     for reference in stale {
@@ -323,11 +352,14 @@ mod tests {
     }
 
     #[test]
-    fn is_rev_accepts_only_40_hex() {
+    fn is_rev_accepts_only_40_lowercase_hex() {
         assert!(is_rev(REV));
         assert!(!is_rev("abc"));
         assert!(!is_rev(&"z".repeat(40)));
         assert!(!is_rev(&format!("{REV}0")));
+        // Uppercase hex is refused — nix and `store::valid_revision` spell a rev lowercase, so an
+        // off-case value is a corrupt lock line.
+        assert!(!is_rev(&REV.to_uppercase()));
     }
 
     fn flake_pkg(name: &str, reference: &str, trusted: bool) -> crate::config::Package {
@@ -412,6 +444,26 @@ mod tests {
         let refs = declared_refs(&cfg);
         // Baseline first, then the app's new ref; the duplicate and the untrusted one are gone.
         assert_eq!(refs, vec!["github:o/a#default", "github:o/b#default"]);
+    }
+
+    #[test]
+    fn all_declared_refs_keeps_untrusted_refs_so_upgrade_never_prunes_a_withheld_pin() {
+        // The prune universe must NOT drop a still-declared ref just because the project is
+        // untrusted — otherwise `ops upgrade flake` on a Changed project unpins it and a later
+        // re-trust floats to latest. Unlike `declared_refs`, this keeps the untrusted ref.
+        let cfg = resolved(
+            vec![
+                flake_pkg("a", "github:o/a#default", true),
+                flake_pkg("evil", "github:o/evil#x", false), // untrusted: still in the universe
+            ],
+            vec![],
+        );
+        let universe = all_declared_refs(&cfg);
+        assert!(universe.contains("github:o/a#default"));
+        assert!(
+            universe.contains("github:o/evil#x"),
+            "a withheld-but-declared ref must survive pruning"
+        );
     }
 
     #[test]

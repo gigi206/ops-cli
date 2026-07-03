@@ -86,7 +86,7 @@ pub(crate) fn run(
         percent_encode(query)
     );
     // The search GET is the report: if it fails there is nothing to show, so propagate.
-    let json = super::nixhub::fetch_url_json(nix, layout, &url)?;
+    let json = super::nixhub::fetch_url_json(nix, layout, &url, false)?;
     let matches = parse_matches(&json);
 
     // An exact (case-insensitive) hit means the user named a package, not just a
@@ -97,7 +97,7 @@ pub(crate) fn run(
         .iter()
         .find(|m| m.name.eq_ignore_ascii_case(query))
         .map(
-            |m| match super::nixhub::fetch_metadata(nix, layout, &m.name) {
+            |m| match super::nixhub::fetch_metadata(nix, layout, &m.name, false) {
                 Ok(meta) => Exact::Resolved {
                     pkg: m.name.clone(),
                     summary: m.summary.clone(),
@@ -115,8 +115,9 @@ pub(crate) fn run(
 /// Percent-encode a free-form query for a URL query value: keep the RFC 3986 unreserved
 /// set verbatim, encode every other byte as `%XX` (uppercase). This both makes the value
 /// URL-safe and guarantees it carries no character (`"`, `$`, `\`, space, control) that
-/// could escape the nix string literal the URL is interpolated into.
-fn percent_encode(query: &str) -> String {
+/// could escape the nix string literal the URL is interpolated into. Shared with the
+/// resolver, whose package names may carry a `+` a raw query would decode as a space.
+pub(crate) fn percent_encode(query: &str) -> String {
     let mut out = String::with_capacity(query.len());
     for &b in query.as_bytes() {
         match b {

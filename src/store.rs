@@ -185,11 +185,29 @@ mod bundled {
     include!(concat!(env!("OUT_DIR"), "/bundled_nix.rs"));
 }
 
+/// Read an engine-override env var as an **absolute** path, ignoring (with a warning) a relative
+/// value. A relative override would be resolved against the current working directory — an
+/// attacker-controlled project directory — so the host-side engine choice must not depend on it;
+/// this mirrors the absolute-path requirement on the store directory.
+fn absolute_override(env_key: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(env_key)?;
+    let path = PathBuf::from(&value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        eprintln!(
+            "ops: ignoring {env_key}={} — an engine override must be an absolute path",
+            path.display()
+        );
+        None
+    }
+}
+
 /// Shared resolution for an engine command `name` (`nix`/`nix-store`), reading the
 /// real environment, data directory, and `PATH`. The precedence is factored into
 /// [`pick_engine_bin`] so it is unit-testable without touching any of them.
 fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
-    let override_nix = std::env::var_os(ENGINE_OVERRIDE_ENV).map(PathBuf::from);
+    let override_nix = absolute_override(ENGINE_OVERRIDE_ENV);
     let owned_dir = layout.map(Layout::engine_dir);
     // When ops ships its own static nix, lay it into the owned engine directory (once;
     // idempotent thereafter) so the owned tier below resolves it. Best-effort: a failure
@@ -359,9 +377,16 @@ fn pick_engine_bin(
         }
     }
     if let Some(dir) = owned_dir {
-        let bin = dir.join(name);
-        if matches!(probe(bin.as_path()), EngineProbe::Trusted) {
-            return Some(bin);
+        // Sibling-paired like the override, anchored on the owned `nix`: only when that anchor is
+        // trusted does the owned tier apply, and then `name` is taken from beside it (a missing or
+        // untrusted sibling yields None, fail-closed). Resolving `name` independently here would let
+        // a trusted owned `nix` pair with a `nix-store` from `PATH` — one store driven by two
+        // different engines. An absent/untrusted anchor skips the owned tier for every name alike,
+        // so nix and nix-store fall through together.
+        let anchor = dir.join("nix");
+        if matches!(probe(anchor.as_path()), EngineProbe::Trusted) {
+            let bin = dir.join(name);
+            return matches!(probe(bin.as_path()), EngineProbe::Trusted).then_some(bin);
         }
     }
     on_path(name)
@@ -453,7 +478,7 @@ pub(crate) struct BwrapChoice {
 /// directory (once; idempotent) before resolving; best-effort, so a failure simply leaves
 /// that tier empty and resolution falls through.
 pub(crate) fn resolve_bwrap(layout: Option<&Layout>) -> Option<BwrapChoice> {
-    let override_bin = std::env::var_os(BWRAP_OVERRIDE_ENV).map(PathBuf::from);
+    let override_bin = absolute_override(BWRAP_OVERRIDE_ENV);
     let owned_dir = layout.map(Layout::engine_dir);
     #[cfg(feature = "bundled-bwrap")]
     if let Some(dir) = owned_dir.as_deref() {
@@ -544,18 +569,25 @@ fn pick_bwrap(
             EngineProbe::Trusted => return Some((bin.to_path_buf(), BwrapSource::Override)),
         }
     }
-    let owned = owned_dir
-        .map(|d| d.join("bwrap"))
-        .filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
-        .map(|p| (p, BwrapSource::Bundled));
-    let host = on_path("bwrap")
-        .into_iter()
-        .find(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
-        .map(|p| (p, BwrapSource::HostPath));
+    // Probe each tier lazily so only the tier actually consulted is examined — probing eagerly
+    // would warn (via `probe`) about an untrusted candidate in the fallback tier even when the
+    // leading tier resolves and the fallback is never used.
+    let owned = || {
+        owned_dir
+            .map(|d| d.join("bwrap"))
+            .filter(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
+            .map(|p| (p, BwrapSource::Bundled))
+    };
+    let host = || {
+        on_path("bwrap")
+            .into_iter()
+            .find(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
+            .map(|p| (p, BwrapSource::HostPath))
+    };
     if restricted {
-        host.or(owned)
+        host().or_else(owned)
     } else {
-        owned.or(host)
+        owned().or_else(host)
     }
 }
 
@@ -1734,6 +1766,33 @@ mod tests {
         assert_eq!(
             pick_engine_bin("nix", None, None, &path_untrusted, &on_path),
             None
+        );
+    }
+
+    #[test]
+    fn pick_engine_bin_pairs_the_owned_tier_and_never_mixes_with_path() {
+        let owned = Path::new("/data/engine");
+        let on_path = |n: &str| vec![PathBuf::from(format!("/usr/bin/{n}"))];
+        // The owned `nix` is trusted, but its `nix-store` sibling is absent. `nix-store` must NOT
+        // fall through to the host `PATH` — driving one store with an owned nix and a PATH
+        // nix-store is the mix this pairing forbids; it fails closed instead.
+        // Trusted: the owned `nix` and everything on the host `PATH`. The owned `nix-store` sibling
+        // is absent, so the pairing must refuse rather than borrow the host's.
+        let owned_nix_only = |p: &Path| {
+            if p == Path::new("/data/engine/nix") || p.starts_with("/usr/bin") {
+                EngineProbe::Trusted
+            } else {
+                EngineProbe::Absent
+            }
+        };
+        assert_eq!(
+            pick_engine_bin("nix", None, Some(owned), &owned_nix_only, &on_path),
+            Some(PathBuf::from("/data/engine/nix"))
+        );
+        assert_eq!(
+            pick_engine_bin("nix-store", None, Some(owned), &owned_nix_only, &on_path),
+            None,
+            "owned nix-store missing must fail closed, not borrow the host's"
         );
     }
 

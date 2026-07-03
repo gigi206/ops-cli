@@ -479,9 +479,12 @@ fn load_db(
     // Retry a lost lock race. Several sandboxes of the same project can seed at once, and the
     // `--load-db` merge serialises on the project database's own lock (SQLite); under heavy
     // parallel load one attempt can exhaust nix's internal busy timeout and exit with the database
-    // locked. The merge is idempotent — re-loading the same closure re-registers already-present
-    // paths as a no-op — so a bounded retry after a short backoff clears transient contention while
-    // a genuinely broken seed (a malformed dump) still fails, its captured reason surfaced.
+    // locked. The predicate deliberately retries ANY `--load-db`-half failure, not only a
+    // recognized "locked" message — matching nix's exact lock wording would be fragile, and the
+    // merge is idempotent (re-loading the same closure re-registers already-present paths as a
+    // no-op), so a bounded retry is harmless even for a non-lock error: a genuinely broken seed (a
+    // malformed dump) simply exhausts the small attempt budget and then fails, its captured reason
+    // surfaced. The `--load-db` marker only distinguishes the load half from the dump half.
     retry_transient(
         LOAD_DB_ATTEMPTS,
         || load_db_once(nix_store, shared_store, project_store, closure),
@@ -490,13 +493,12 @@ fn load_db(
 }
 
 /// How many times [`load_db`] attempts the registration merge before giving up. Small: a lost lock
-/// race clears in well under a second, and a deterministic failure should surface promptly.
+/// race clears in well under a second, and a deterministic failure exhausts the budget promptly.
 const LOAD_DB_ATTEMPTS: u32 = 6;
 
 /// One `--dump-db | --load-db` registration pass (see [`load_db`], which retries this on a lost
 /// lock race). The `--load-db` half's stderr is captured so a failure carries nix's reason (a
-/// locked database vs. a real error), which is both what makes the retry predicate precise and
-/// what the caller reports.
+/// locked database vs. a real error) — surfaced to the caller after the retry budget is spent.
 fn load_db_once(
     nix_store: &Path,
     shared_store: &Path,
@@ -525,14 +527,13 @@ fn load_db_once(
         .stderr(Stdio::piped())
         .output()?;
     let dump_status = dump.wait()?;
-    // Attribute the failure to the right half. `--load-db` reads its whole stdin (the dump) before
-    // committing the merge in one transaction, so a lock loss makes `load` exit non-zero while
-    // `dump` still writes its full output and exits 0 — the error is correctly pinned on the load
-    // half and thus retried. Checking dump first stays right for that reason; do not reorder it (a
-    // genuine dump crash must surface as a dump failure, which is not retried).
-    if !dump_status.success() {
-        return Err(io::Error::other("nix-store --dump-db failed"));
-    }
+    // Attribute the failure to the LOAD half first, with its captured stderr — it is the consumer,
+    // and every real failure is best explained by its reason: a lock loss makes `load` exit
+    // non-zero after draining (dump exits 0), and a `load` that dies *early* makes `dump` then hit
+    // EPIPE and also fail — checking dump first there would misattribute the death to dump and
+    // discard load's captured root cause. A bare dump failure is reported only when load itself did
+    // not fail, which for a truncated/failed dump is effectively never; retrying it (the message
+    // still names `--load-db`) is bounded and harmless.
     if !load.status.success() {
         let reason = String::from_utf8_lossy(&load.stderr);
         let reason = reason.trim();
@@ -541,6 +542,9 @@ fn load_db_once(
         } else {
             format!("nix-store --load-db failed: {reason}")
         }));
+    }
+    if !dump_status.success() {
+        return Err(io::Error::other("nix-store --dump-db failed"));
     }
     Ok(())
 }
@@ -571,12 +575,15 @@ fn retry_transient<T>(
     last
 }
 
-/// A small per-thread backoff offset (0..40 ms), derived from the thread id so it is stable within
-/// a thread yet distinct across concurrent ones — enough to desynchronise retriers that lost the
-/// same lock race, without a randomness source.
+/// A small backoff offset (0..40 ms), derived from the pid AND the thread id so it is stable within
+/// one caller yet distinct across concurrent ones — enough to desynchronise retriers that lost the
+/// same lock race, without a randomness source. The pid is essential: the real racers are separate
+/// `ops` processes seeding the same project, and each on its main thread would hash the same thread
+/// id and re-collide in lockstep; mixing the (process-unique) pid spreads them apart.
 fn backoff_jitter_ms() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::process::id().hash(&mut h);
     std::thread::current().id().hash(&mut h);
     h.finish() % 40
 }
@@ -620,13 +627,14 @@ fn gcroot_roots(store_dir: &Path, roots: &[PathBuf]) -> io::Result<()> {
         // A stale temp from a crashed seed would block the symlink; clear it first.
         let _ = fs::remove_file(&tmp);
         std::os::unix::fs::symlink(root, &tmp)?;
-        match fs::rename(&tmp, &link) {
-            Ok(()) => {}
-            // Lost the race or the link already existed: another seed placed an identical
-            // root, so discard the temp and accept it.
-            Err(_) => {
-                let _ = fs::remove_file(&tmp);
-            }
+        // `rename` atomically REPLACES any existing link — including one a concurrent seed just
+        // placed (which points at the same content-addressed root anyway) — so it does not fail on
+        // "the link already exists". A failure here is therefore a genuine I/O error (out of space,
+        // a read-only store), not a lost race: clean up the temp, then propagate it rather than
+        // silently leaving the seed path unrooted (a later GC could then collect it).
+        if let Err(e) = fs::rename(&tmp, &link) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
     }
     Ok(())
