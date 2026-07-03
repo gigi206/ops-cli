@@ -743,10 +743,17 @@ fn resolve(
     if let Some(field) = global.network.as_ref() {
         warn_if_baseline_sets_default_methods(&mut warnings, GLOBAL_CONFIG, field);
     }
-    let mut network = match global
-        .network
-        .and_then(|v| validate_network(&mut warnings, GLOBAL_CONFIG, v, &net_groups))
-    {
+    // The parent of the global layer is ops's built-in default (`Shared`): a global `[network]`
+    // table that omits `mode` has no lower posture to inherit, so it falls back to `deny`.
+    let mut network = match global.network.and_then(|v| {
+        validate_network(
+            &mut warnings,
+            GLOBAL_CONFIG,
+            v,
+            &net_groups,
+            &NetworkPolicy::default(),
+        )
+    }) {
         Some(policy) => {
             network_origin = Provenance::Global;
             policy
@@ -856,8 +863,10 @@ fn resolve(
                     egress_stats = b;
                 }
                 warn_if_baseline_sets_default_methods(&mut warnings, PROJECT_CONFIG, &value);
+                // A project `[network]` table without a `mode` inherits it from the resolved global
+                // posture (`network` as it stands after the global layer).
                 if let Some(policy) =
-                    validate_network(&mut warnings, PROJECT_CONFIG, value, &net_groups)
+                    validate_network(&mut warnings, PROJECT_CONFIG, value, &net_groups, &network)
                 {
                     network = policy;
                     network_origin = Provenance::Project;
@@ -948,6 +957,7 @@ fn resolve(
         &secret_defaults,
         &project_secret_defaults,
         &net_groups,
+        &network,
         plugins,
     );
 
@@ -1210,6 +1220,7 @@ fn warn_l4_l7_conflicts(network: &NetworkPolicy, warnings: &mut Vec<String>) {
 /// global and project app tables; each app is layered global-under-project and gated by the
 /// trust of the layer that supplied each field — identical to the baseline. An app whose name
 /// is not a safe path component is dropped with a warning before it can ever key a directory.
+#[allow(clippy::too_many_arguments)]
 fn resolve_apps(
     warnings: &mut Vec<String>,
     mut global_apps: BTreeMap<String, RawApp>,
@@ -1217,6 +1228,7 @@ fn resolve_apps(
     secret_defaults: &SecretDefaults,
     project_secret_defaults: &SecretDefaults,
     net_groups: &NetGroups,
+    baseline_network: &NetworkPolicy,
     plugins: &PluginRegistry,
 ) -> BTreeMap<String, ResolvedApp> {
     let (mut project_apps, project_state) = match project_apps {
@@ -1252,6 +1264,7 @@ fn resolve_apps(
             secret_defaults,
             project_secret_defaults,
             net_groups,
+            baseline_network,
             plugins,
         );
         out.insert(name, resolved);
@@ -1280,6 +1293,7 @@ pub(crate) fn is_valid_app_name(name: &str) -> bool {
 /// are honored only from a trusted source; `env` is free (denylisted for an untrusted
 /// project); the command may come from either (the project wins). Each app collects its own
 /// warnings, surfaced when the app is launched rather than on every `ops run`.
+#[allow(clippy::too_many_arguments)]
 fn resolve_app(
     name: &str,
     global: Option<RawApp>,
@@ -1287,6 +1301,7 @@ fn resolve_app(
     secret_defaults: &SecretDefaults,
     project_secret_defaults: &SecretDefaults,
     net_groups: &NetGroups,
+    baseline_network: &NetworkPolicy,
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
@@ -1339,7 +1354,12 @@ fn resolve_app(
         if let Some(field) = app.network {
             warn_if_app_sets_stats(&mut warnings, &source, &field);
             let raw_dm = network_default_methods_of(&field).cloned();
-            if let Some(policy) = validate_network(&mut warnings, &source, field, net_groups) {
+            // A mode-less app `[network]` inherits its mode from the resolved baseline (the app's
+            // own rules are kept). At the global app layer nothing has overridden it yet, so the
+            // parent is the baseline.
+            let parent = network.as_ref().unwrap_or(baseline_network);
+            let resolved = validate_network(&mut warnings, &source, field, net_groups, parent);
+            if let Some(policy) = resolved {
                 network = Some(policy);
                 network_origin = Provenance::Global;
                 if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
@@ -1406,7 +1426,11 @@ fn resolve_app(
             if trusted {
                 warn_if_app_sets_stats(&mut warnings, &source, &field);
                 let raw_dm = network_default_methods_of(&field).cloned();
-                if let Some(policy) = validate_network(&mut warnings, &source, field, net_groups) {
+                // A mode-less table inherits from whatever posture is in effect so far — the app's
+                // own global layer if it set one, else the baseline.
+                let parent = network.as_ref().unwrap_or(baseline_network);
+                let resolved = validate_network(&mut warnings, &source, field, net_groups, parent);
+                if let Some(policy) = resolved {
                     network = Some(policy);
                     network_origin = Provenance::Project;
                     if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
@@ -1868,15 +1892,18 @@ fn validate_gui(
     }
 }
 
-/// Validate a `network` field — either a posture string or an allowlist table —
-/// mapping it to a policy and warning on anything unrecognized. A typo must never
-/// silently leave the network in the wrong posture; returning `None` keeps the prior
-/// (default or global) posture rather than guessing.
+/// Validate a `network` field — either a posture string or a `[network]` table — mapping it to a
+/// policy and warning on anything unrecognized. A typo must never silently leave the network in the
+/// wrong posture; returning `None` keeps the prior (default or global) posture rather than guessing.
+/// `parent` is the network of the layer immediately below (the global default for the baseline
+/// global layer, the resolved baseline for a project/app): a `[network]` table that omits `mode`
+/// inherits its mode from `parent` (see [`mode_from_parent`]).
 fn validate_network(
     warnings: &mut Vec<String>,
     source_label: &str,
     field: NetworkField,
     groups: &NetGroups,
+    parent: &NetworkPolicy,
 ) -> Option<NetworkPolicy> {
     match field {
         NetworkField::Posture(value) => match value.as_str() {
@@ -1906,75 +1933,95 @@ fn validate_network(
                 None
             }
         },
-        NetworkField::Table(table) => validate_network_table(warnings, source_label, table, groups),
+        NetworkField::Table(table) => {
+            validate_network_table(warnings, source_label, table, groups, parent)
+        }
     }
 }
 
-/// Validate the table form of `network`: `none`/`shared` behave as the string form,
-/// while `deny`/`allow`/`ask` classify each declared entry (a malformed one is dropped with a
-/// warning, fail-closed — that host simply stays unreachable, never silently allowed).
+/// The default action a mode-less `[network]` table inherits from its parent config layer. Only a
+/// filtering `Deny`/`Ask` is inherited; an `Allow` (allow-by-default denylist), `Shared`, or
+/// `Isolated` parent falls back to the safe `Deny`, so a table that lists `allow` rules is never
+/// silently turned into a wide-open denylist (which would make its own allow-list inert — the exact
+/// `allow`-vs-`deny` footgun) or into the open host network.
+fn mode_from_parent(parent: &NetworkPolicy) -> crate::allowlist::DefaultAction {
+    use crate::allowlist::DefaultAction;
+    match parent {
+        NetworkPolicy::Allowlist(p) => match p.default_action() {
+            DefaultAction::Ask => DefaultAction::Ask,
+            DefaultAction::Deny | DefaultAction::Allow => DefaultAction::Deny,
+        },
+        NetworkPolicy::Shared | NetworkPolicy::Isolated => DefaultAction::Deny,
+    }
+}
+
+/// Validate the table form of `network`: `none`/`shared` behave as the string form; `deny`/`allow`/
+/// `ask` classify each declared entry (a malformed one is dropped with a warning, fail-closed —
+/// that host simply stays unreachable, never silently allowed); and an **omitted** `mode` inherits
+/// the filtering mode from `parent` while keeping this table's own rules.
 fn validate_network_table(
     warnings: &mut Vec<String>,
     source_label: &str,
     table: NetworkTable,
     groups: &NetGroups,
+    parent: &NetworkPolicy,
 ) -> Option<NetworkPolicy> {
-    match table.mode.as_str() {
-        "none" => Some(NetworkPolicy::Isolated),
-        "shared" => Some(NetworkPolicy::Shared),
-        // `deny` is the classic deny-by-default allow-list: only what `allow` lists reaches. `allow`
-        // is the denylist: everything public reaches except the `deny` carve-outs, proxy still
-        // active. `ask` parks an unmatched request for a live decision (allow rules auto-pass, deny
-        // rules auto-fail).
-        "deny" | "allow" | "ask" => {
-            use crate::allowlist::DefaultAction;
-            let allow = classify_entries(warnings, source_label, "allow", table.allow, groups);
-            let deny = classify_entries(warnings, source_label, "deny", table.deny, groups);
-            let policy = crate::allowlist::EgressPolicy::new(allow, deny);
-            let policy = match table.mode.as_str() {
-                "allow" => policy.with_default(DefaultAction::Allow),
-                "ask" => {
-                    // A configured `ask_timeout` bounds the parked wait; a malformed value falls
-                    // back to indefinite (warned), never a hard config failure.
-                    let timeout = match &table.ask_timeout {
-                        None => None,
-                        Some(raw) => parse_ask_timeout(raw).unwrap_or_else(|reason| {
-                            warnings.push(format!(
-                                "{source_label}: ignoring invalid `ask_timeout` — {reason}; \
-                                 parked requests will wait indefinitely"
-                            ));
-                            None
-                        }),
-                    };
-                    policy
-                        .with_default(DefaultAction::Ask)
-                        .with_ask_timeout(timeout)
-                        .with_ask_notice(table.ask_notice.unwrap_or(true))
-                }
-                _ => policy, // `deny`: deny-by-default
-            };
-            // An `ask_timeout` outside `ask` mode is moot — flag it rather than silently drop it.
-            if table.mode != "ask" && table.ask_timeout.is_some() {
-                warnings.push(format!(
-                    "{source_label}: `ask_timeout` is only meaningful under `mode = \"ask\"` — ignored"
-                ));
-            }
-            // Likewise an `ask_notice` outside `ask` mode is moot (parity with `ask_timeout`).
-            if table.mode != "ask" && table.ask_notice.is_some() {
-                warnings.push(format!(
-                    "{source_label}: `ask_notice` is only meaningful under `mode = \"ask\"` — ignored"
-                ));
-            }
-            Some(NetworkPolicy::Allowlist(policy))
-        }
-        other => {
+    use crate::allowlist::DefaultAction;
+    // The default action: from an explicit `mode`, or — when omitted — inherited from the parent
+    // layer. `none`/`shared` are non-filtering postures that carry no rules, so they return early.
+    let action = match table.mode.as_deref() {
+        Some("none") => return Some(NetworkPolicy::Isolated),
+        Some("shared") => return Some(NetworkPolicy::Shared),
+        // `deny` = deny-by-default (only what `allow` lists reaches). `allow` = the denylist
+        // (everything public reaches except the `deny` carve-outs, proxy still active). `ask` parks
+        // an unmatched request for a live decision (allow rules auto-pass, deny rules auto-fail).
+        Some("deny") => DefaultAction::Deny,
+        Some("allow") => DefaultAction::Allow,
+        Some("ask") => DefaultAction::Ask,
+        Some(other) => {
             warnings.push(format!(
                 "{source_label}: ignoring unknown network mode `{other}` (expected \"none\", \
                  \"shared\", \"deny\", \"allow\", or \"ask\")"
             ));
-            None
+            return None;
+        }
+        None => mode_from_parent(parent),
+    };
+    let allow = classify_entries(warnings, source_label, "allow", table.allow, groups);
+    let deny = classify_entries(warnings, source_label, "deny", table.deny, groups);
+    let mut policy = crate::allowlist::EgressPolicy::new(allow, deny).with_default(action);
+    if action == DefaultAction::Ask {
+        // A configured `ask_timeout` bounds the parked wait; a malformed value falls back to
+        // indefinite (warned), never a hard config failure.
+        let timeout = match &table.ask_timeout {
+            None => None,
+            Some(raw) => parse_ask_timeout(raw).unwrap_or_else(|reason| {
+                warnings.push(format!(
+                    "{source_label}: ignoring invalid `ask_timeout` — {reason}; \
+                     parked requests will wait indefinitely"
+                ));
+                None
+            }),
+        };
+        policy = policy
+            .with_ask_timeout(timeout)
+            .with_ask_notice(table.ask_notice.unwrap_or(true));
+    } else {
+        // `ask_timeout`/`ask_notice` are moot outside the effective `ask` mode — flag them rather
+        // than silently drop (the effective mode may be inherited, so key off `action`, not the raw
+        // `mode` string).
+        if table.ask_timeout.is_some() {
+            warnings.push(format!(
+                "{source_label}: `ask_timeout` is only meaningful under `mode = \"ask\"` — ignored"
+            ));
+        }
+        if table.ask_notice.is_some() {
+            warnings.push(format!(
+                "{source_label}: `ask_notice` is only meaningful under `mode = \"ask\"` — ignored"
+            ));
         }
     }
+    Some(NetworkPolicy::Allowlist(policy))
 }
 
 /// Parse an `ask_timeout` duration string: a non-negative integer with an optional unit suffix
@@ -3338,7 +3385,12 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         None => {}
         Some(NetworkField::Posture(p)) => lines.push(format!("network: {p}")),
         Some(NetworkField::Table(t)) => {
-            let mut s = format!("network: {}", t.mode);
+            let mut s = format!(
+                "network: {}",
+                t.mode
+                    .as_deref()
+                    .unwrap_or("(mode inherited from the parent layer)")
+            );
             if !t.allow.is_empty() {
                 s.push_str(&format!(" — allow {}", t.allow.join(", ")));
             }
@@ -3363,13 +3415,15 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
                 any = true;
             }
         }
-        // A credential is injected only under a filtering posture (`deny`/`allow` — the proxy
+        // A credential is injected only under a filtering posture (`deny`/`allow`/`ask` — the proxy
         // performs the injection). If the profile declares secrets but not its own filtering
         // posture, say so — otherwise the summary reads as if they would be injected when,
-        // standalone, they would not. Any of the filtering spellings counts (table or bare string).
+        // standalone, they would not. Any filtering spelling counts (table or bare string); a
+        // mode-less table inherits a filtering mode (`deny`/`ask`, or the `deny` fallback), so it
+        // counts too.
         let filtered = match &app.network {
             Some(NetworkField::Table(t)) => {
-                matches!(t.mode.as_str(), "deny" | "allow" | "ask")
+                matches!(t.mode.as_deref(), None | Some("deny" | "allow" | "ask"))
             }
             Some(NetworkField::Posture(p)) => matches!(p.as_str(), "deny" | "allow" | "ask"),
             None => false,
@@ -3560,16 +3614,23 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::collections::BTreeMap;
 
-    /// Test shim: [`super::validate_network`] with no egress groups defined — the common case in
-    /// these unit tests. It shadows the glob-imported real function so the many bare 3-argument
-    /// calls read as before; the `[net.groups]` expansion has its own dedicated tests that call
-    /// `super::validate_network` (or `build_net_groups`) directly with a populated group table.
+    /// Test shim: [`super::validate_network`] with no egress groups and the built-in `Shared`
+    /// default as the inheritance parent — the common case in these unit tests. It shadows the
+    /// glob-imported real function so the many bare 3-argument calls read as before; the
+    /// `[net.groups]` expansion and the mode-inheritance tests call `super::validate_network`
+    /// directly with a populated group table or a specific parent posture.
     fn validate_network(
         warnings: &mut Vec<String>,
         source_label: &str,
         field: NetworkField,
     ) -> Option<NetworkPolicy> {
-        super::validate_network(warnings, source_label, field, &NetGroups::new())
+        super::validate_network(
+            warnings,
+            source_label,
+            field,
+            &NetGroups::new(),
+            &NetworkPolicy::default(),
+        )
     }
 
     fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
@@ -3593,7 +3654,7 @@ mod tests {
     /// Build a `[network]` field in table form for the egress-group tests.
     fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
         NetworkField::Table(NetworkTable {
-            mode: mode.into(),
+            mode: Some(mode.into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
             ask_timeout: None,
@@ -3624,6 +3685,7 @@ mod tests {
             GLOBAL_CONFIG,
             net_field("deny", &["@mcp", "c.example.com:443"], &[]),
             &g,
+            &NetworkPolicy::default(),
         )
         .unwrap();
         let NetworkPolicy::Allowlist(p) = policy else {
@@ -3643,6 +3705,7 @@ mod tests {
             GLOBAL_CONFIG,
             net_field("allow", &[], &["@telemetry"]),
             &g,
+            &NetworkPolicy::default(),
         )
         .unwrap();
         let NetworkPolicy::Allowlist(p) = policy else {
@@ -3662,6 +3725,7 @@ mod tests {
             GLOBAL_CONFIG,
             net_field("allow", &[], &["@telemetr"]),
             &g,
+            &NetworkPolicy::default(),
         )
         .unwrap();
         let NetworkPolicy::Allowlist(p) = policy else {
@@ -3742,6 +3806,7 @@ mod tests {
             GLOBAL_CONFIG,
             net_field("deny", &["example.com:443/@handle"], &[]),
             &g,
+            &NetworkPolicy::default(),
         )
         .unwrap();
         let NetworkPolicy::Allowlist(p) = policy else {
@@ -3943,7 +4008,7 @@ mod tests {
     fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "deny".to_string(),
+                mode: Some("deny".to_string()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
@@ -4111,7 +4176,7 @@ mod tests {
         // the app falls to the built-in `{GET,HEAD}`, never all-verbs. (Read-by-default only ever
         // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
         let net = NetworkField::Table(NetworkTable {
-            mode: "deny".into(),
+            mode: Some("deny".into()),
             allow: vec!["x.com".into()],
             deny: vec![],
             ask_timeout: None,
@@ -4251,7 +4316,7 @@ mod tests {
         let mut w = Vec::new();
         let tbl = |mode: &str, allow: &[&str], deny: &[&str]| {
             NetworkField::Table(NetworkTable {
-                mode: mode.into(),
+                mode: Some(mode.into()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 ask_timeout: None,
@@ -4318,11 +4383,134 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
+        use crate::allowlist::{DefaultAction, EgressPolicy};
+        // A `[network]` table that lists a rule but omits `mode`.
+        let no_mode = || {
+            NetworkField::Table(NetworkTable {
+                mode: None,
+                allow: vec!["api.foo.com".to_string()],
+                deny: vec![],
+                ask_timeout: None,
+                ask_notice: None,
+                stats: None,
+                default_methods: None,
+            })
+        };
+        let filtering =
+            |action| NetworkPolicy::Allowlist(EgressPolicy::default().with_default(action));
+        // Resolve the mode-less table against a given parent, asserting the effective default action
+        // and that the table's own allow rule survives (inheritance is of the mode only).
+        let effective = |parent: &NetworkPolicy| {
+            let mut w = Vec::new();
+            let p = super::validate_network(
+                &mut w,
+                GLOBAL_CONFIG,
+                no_mode(),
+                &NetGroups::new(),
+                parent,
+            )
+            .unwrap();
+            let NetworkPolicy::Allowlist(pol) = p else {
+                panic!("a mode-less table always resolves to a filtering policy")
+            };
+            assert_eq!(pol.allow_rules().len(), 1, "the table keeps its own rule");
+            assert!(w.is_empty(), "inheriting a mode warns nothing: {w:?}");
+            pol.default_action()
+        };
+        // A filtering `deny`/`ask` parent is inherited.
+        assert_eq!(
+            effective(&filtering(DefaultAction::Deny)),
+            DefaultAction::Deny
+        );
+        assert_eq!(
+            effective(&filtering(DefaultAction::Ask)),
+            DefaultAction::Ask
+        );
+        // An `allow` (allow-by-default denylist) parent is NOT inherited — it would make the child's
+        // allow-list inert and leave it wide open. Falls back to the safe `deny`.
+        assert_eq!(
+            effective(&filtering(DefaultAction::Allow)),
+            DefaultAction::Deny,
+            "an allow-by-default parent must never be inherited into a rule-listing child"
+        );
+        // A non-filtering `shared`/`none` parent also falls back to `deny` (never to the open host
+        // network — the child declared rules, so it wants filtering).
+        assert_eq!(effective(&NetworkPolicy::Shared), DefaultAction::Deny);
+        assert_eq!(effective(&NetworkPolicy::Isolated), DefaultAction::Deny);
+    }
+
+    #[test]
+    fn a_mode_less_project_network_table_inherits_the_global_mode() {
+        use crate::allowlist::DefaultAction;
+        // Global sets `ask`; a trusted project's `[network]` lists its own host but omits `mode`.
+        let global = raw_network("ask");
+        let project = RawConfig {
+            network: Some(NetworkField::Table(NetworkTable {
+                mode: None,
+                allow: vec!["api.proj.com".to_string()],
+                deny: vec![],
+                ask_timeout: None,
+                ask_notice: None,
+                stats: None,
+                default_methods: None,
+            })),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+        let NetworkPolicy::Allowlist(p) = &r.network else {
+            panic!("a mode-less project table resolves to a filtering policy")
+        };
+        assert_eq!(
+            p.default_action(),
+            DefaultAction::Ask,
+            "the project inherits the global's `ask` mode"
+        );
+        assert_eq!(p.allow_rules().len(), 1, "the project keeps its own rule");
+        assert_eq!(r.network_origin, Provenance::Project);
+    }
+
+    #[test]
+    fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
+        use crate::allowlist::DefaultAction;
+        // Baseline (global) is `ask`; a global app lists its own host but omits `mode`.
+        let mut global = raw_network("ask");
+        global.app.insert(
+            "demo".to_string(),
+            RawApp {
+                cmd: Some(schema::RawCmd::Line("demo".to_string())),
+                network: Some(NetworkField::Table(NetworkTable {
+                    mode: None,
+                    allow: vec!["api.app.com".to_string()],
+                    deny: vec![],
+                    ask_timeout: None,
+                    ask_notice: None,
+                    stats: None,
+                    default_methods: None,
+                })),
+                ..RawApp::default()
+            },
+        );
+        let r = resolve_no_plugins(global, None);
+        let app = r.apps.get("demo").expect("the app resolves");
+        let NetworkPolicy::Allowlist(p) = app.network.as_ref().expect("the app sets a network")
+        else {
+            panic!("a mode-less app table resolves to a filtering policy")
+        };
+        assert_eq!(
+            p.default_action(),
+            DefaultAction::Ask,
+            "the app inherits the baseline's `ask` mode"
+        );
+        assert_eq!(p.allow_rules().len(), 1, "the app keeps its own rule");
+    }
+
+    #[test]
     fn ask_mode_parses_and_carries_an_optional_timeout() {
         use crate::allowlist::DefaultAction;
         let ask_table = |timeout: Option<&str>| {
             NetworkField::Table(NetworkTable {
-                mode: "ask".into(),
+                mode: Some("ask".into()),
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: timeout.map(|s| s.to_string()),
@@ -4358,7 +4546,7 @@ mod tests {
 
         // An `ask_timeout` under a non-ask mode is moot — warned and ignored.
         let moot = NetworkField::Table(NetworkTable {
-            mode: "deny".into(),
+            mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
             ask_timeout: Some("90s".into()),
@@ -4378,7 +4566,7 @@ mod tests {
         use crate::allowlist::DefaultAction;
         let ask = |notice: Option<bool>| {
             NetworkField::Table(NetworkTable {
-                mode: "ask".into(),
+                mode: Some("ask".into()),
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: None,
@@ -4406,7 +4594,7 @@ mod tests {
 
         // An `ask_notice` under a non-ask mode is moot — warned and ignored.
         let moot = NetworkField::Table(NetworkTable {
-            mode: "deny".into(),
+            mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
             ask_timeout: None,
@@ -5307,7 +5495,7 @@ mod tests {
         // ignored (Mode-A `ops run`/`ops shell` stays all-verbs), with a warning so it is not silent.
         let global = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "deny".into(),
+                mode: Some("deny".into()),
                 allow: vec!["h.test".into()],
                 deny: vec![],
                 ask_timeout: None,
@@ -6540,7 +6728,7 @@ mod tests {
         let r = resolve_no_plugins(
             RawConfig {
                 network: Some(NetworkField::Table(NetworkTable {
-                    mode: "bogus".into(),
+                    mode: Some("bogus".into()),
                     allow: vec![],
                     deny: vec![],
                     ask_timeout: None,
@@ -6641,7 +6829,7 @@ mod tests {
     fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "deny".into(),
+                mode: Some("deny".into()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
                 ask_timeout: None,
@@ -6694,7 +6882,7 @@ mod tests {
         // A `[network]` table carrying an explicit `stats` value.
         let net = |stats: Option<bool>| RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
-                mode: "deny".into(),
+                mode: Some("deny".into()),
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 ask_timeout: None,
@@ -6749,7 +6937,7 @@ mod tests {
             &[],
             &[],
             Some(NetworkField::Table(NetworkTable {
-                mode: "deny".into(),
+                mode: Some("deny".into()),
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 ask_timeout: None,
@@ -6822,7 +7010,7 @@ mod tests {
     /// A trusted-shaped network allowlist for the given hosts.
     fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         Some(NetworkField::Table(NetworkTable {
-            mode: "deny".into(),
+            mode: Some("deny".into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
             ask_timeout: None,

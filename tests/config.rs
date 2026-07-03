@@ -1908,6 +1908,43 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
 }
 
 #[test]
+fn a_mode_less_app_network_inherits_the_baseline_mode() {
+    let fx = Fixture::new();
+    // The headline scenario: the global config sets `ask`; a profile (trusted by location) lists
+    // its own hosts but omits `mode`, so it inherits `ask` while keeping its own allow-list — the
+    // whole point of making `mode` optional. (If it did not inherit, it would fall back to `deny`.)
+    fx.write_global("network = \"ask\"\n");
+    fx.write_profile(
+        "demo",
+        "cmd = \"demo-agent\"\n[network]\nallow = [\"api.example.com\"]\n",
+    );
+
+    let out = fx.run(&["config", "show", "--app", "demo"]);
+    assert!(
+        out.status.success(),
+        "config show --app must succeed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("network: ask"),
+        "a mode-less app must inherit the baseline's `ask`, not fall back to `deny`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 allow"),
+        "the app keeps its own allow-list:\n{stdout}"
+    );
+
+    // `--details` lists the app's own rule under the inherited `ask` posture.
+    let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("api.example.com"),
+        "the app's own rule must be listed:\n{stdout}"
+    );
+}
+
+#[test]
 fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
     let fx = Fixture::new();
     // A baseline credential (global, trusted by location) under a network allowlist, and two apps:

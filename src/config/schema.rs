@@ -41,9 +41,11 @@ pub(crate) struct RawConfig {
     /// (filtered egress, allow-by-default — a denylist, every public host reaches except the
     /// carve-outs), or `"ask"` (filtered egress, park-and-confirm — an undecided host blocks until
     /// you answer) — or a table that adds the `allow`/`deny` carve-out lists to a
-    /// `deny`/`allow`/`ask` mode. A security field: honored from the global
-    /// config or a trusted project, ignored from an untrusted one, since narrowing or widening
-    /// the network is a confidentiality choice an untrusted project may not make.
+    /// `deny`/`allow`/`ask` mode. A table may **omit** `mode` to inherit it from the parent config
+    /// layer (an app takes the baseline's, a project takes the global's) while keeping its own
+    /// rules — see [`NetworkTable::mode`]. A security field: honored from the global config or a
+    /// trusted project, ignored from an untrusted one, since narrowing or widening the network is a
+    /// confidentiality choice an untrusted project may not make.
     pub(crate) network: Option<NetworkField>,
     /// The sandbox's GUI posture: `"none"` (the default — no display access) or `"wayland"`
     /// (bind the host's Wayland compositor socket read-only so a graphical app can map a
@@ -376,7 +378,12 @@ pub(crate) enum NetworkField {
 /// `ask_notice = false` silences the inline stderr park alert (the request still parks).
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
-    pub(crate) mode: String,
+    /// The egress mode. Absent means "inherit the mode from the parent config layer" (an app takes
+    /// the baseline's mode, a project takes the global's) while keeping this table's own
+    /// `allow`/`deny` rules; only a filtering `deny`/`ask` is inherited — an `allow` denylist,
+    /// `shared`/`none`, or no parent posture all fall back to the safe `deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
     #[serde(default)]
     pub(crate) allow: Vec<String>,
     #[serde(default)]
@@ -698,6 +705,27 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_less_network_table_round_trips_without_a_mode_line() {
+        // `ops app export` of a profile that inherits its mode must not materialize a `mode` line —
+        // that would pin the mode and break the inheritance the author chose.
+        let app = parse_app(b"cmd = \"demo\"\n[network]\nallow = [\"api.foo.com\"]\n").unwrap();
+        let out = serialize_app(&app).unwrap();
+        assert!(
+            !out.contains("mode"),
+            "a mode-less table must not gain a `mode` line:\n{out}"
+        );
+        let reparsed = parse_app(out.as_bytes()).unwrap();
+        assert_eq!(
+            app, reparsed,
+            "a mode-less network must round-trip losslessly"
+        );
+        assert!(matches!(
+            reparsed.network,
+            Some(NetworkField::Table(NetworkTable { mode: None, .. }))
+        ));
+    }
+
+    #[test]
     fn serializing_skips_empty_collections_and_round_trips_a_bare_command() {
         // A minimal app serializes to a minimal profile — no noise `[env]`/`[packages]` tables or
         // `binds = []`, and an unset option is omitted entirely.
@@ -814,7 +842,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
-                mode: "deny".into(),
+                mode: Some("deny".into()),
                 allow: vec![
                     "github.com".into(),
                     "*.nixos.org".into(),
@@ -836,7 +864,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
-                mode: "deny".into(),
+                mode: Some("deny".into()),
                 allow: vec![],
                 deny: vec![],
                 ask_timeout: None,
@@ -845,6 +873,51 @@ mod tests {
                 default_methods: None,
             }))
         );
+    }
+
+    #[test]
+    fn a_network_table_may_omit_mode_to_inherit_it() {
+        // A `[network]` table with rules but no `mode` parses to `mode: None` (the loader resolves
+        // the effective mode by inheriting from the parent layer).
+        let cfg = parse(b"[network]\nallow = [\"api.foo.com\"]\n").unwrap();
+        assert_eq!(
+            cfg.network,
+            Some(NetworkField::Table(NetworkTable {
+                mode: None,
+                allow: vec!["api.foo.com".into()],
+                deny: vec![],
+                ask_timeout: None,
+                ask_notice: None,
+                stats: None,
+                default_methods: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_bare_string_network_still_parses_as_a_posture_not_a_table() {
+        // With `mode` optional, the untagged enum must still route a bare string to `Posture`, never
+        // silently to an (empty, mode-less) `Table`.
+        assert_eq!(
+            parse(b"network = \"deny\"\n").unwrap().network,
+            Some(NetworkField::Posture("deny".into()))
+        );
+    }
+
+    #[test]
+    fn a_network_table_with_an_unknown_field_is_ignored_not_a_parse_error() {
+        // The schema is deliberately additive (unknown fields ignored) so a config using a *newer*
+        // ops field still loads on an older ops. `[network]` must not break that: `NetworkField` is
+        // an untagged enum, so a parse error there fails the WHOLE `RawConfig` → the loader drops the
+        // entire layer → the network silently reverts to the open `shared` default (a fail-OPEN on a
+        // security field). So an unknown `[network]` field is ignored, and the table still parses.
+        // (A `mode` typo therefore lands here too — the table parses mode-less and *inherits*,
+        // resolving to `deny`/`ask`, never `shared`: it fails safe.)
+        let cfg = parse(b"[network]\nmode = \"deny\"\nfuturefield = 1\n").unwrap();
+        assert!(matches!(
+            cfg.network,
+            Some(NetworkField::Table(NetworkTable { ref mode, .. })) if mode.as_deref() == Some("deny")
+        ));
     }
 
     /// Pull the single secret declared for `host` out of a parsed section, failing the test if

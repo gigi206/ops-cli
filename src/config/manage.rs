@@ -858,6 +858,25 @@ mod tests {
     }
 
     #[test]
+    fn add_egress_rule_on_a_mode_less_table_keeps_it_mode_less() {
+        // A `[network]` table that inherits its mode (no `mode` key) must stay mode-less after
+        // `ops net allow` appends a rule — materializing a `mode` would silently pin it and break
+        // the inheritance the author chose.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[network]\nallow = [\"a.test\"]\n");
+        add_egress_rule(&p, None, EgressList::Allow, "b.test").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("\"a.test\"") && body.contains("\"b.test\""),
+            "both rules must be present:\n{body}"
+        );
+        assert!(
+            !body.contains("mode"),
+            "appending a rule must not materialize a `mode` on a mode-less table:\n{body}"
+        );
+    }
+
+    #[test]
     fn add_egress_rule_refuses_a_deny_with_no_posture_without_writing() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".ops.toml");
