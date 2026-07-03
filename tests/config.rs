@@ -484,6 +484,101 @@ fn a_read_write_bind_is_honored_and_marked() {
 }
 
 #[test]
+fn a_bind_path_expands_a_leading_home_variable() {
+    // A `binds` source may start with `~`/`$HOME`/`$XDG_RUNTIME_DIR`, expanded from the launching
+    // user's environment, so a portable global config need not hard-code an absolute home path. An
+    // unrecognized `$VAR` at the head is refused (no arbitrary interpolation into a mount source).
+    // Driven through the built binary with a controlled child `HOME`, so the assertion is
+    // deterministic and free of any process-global environment race.
+    let fx = Fixture::new();
+    let home = TmpDir::new();
+    std::fs::create_dir_all(home.path().join("sub")).unwrap();
+    std::fs::create_dir_all(home.path().join("other")).unwrap();
+    // Global config (trusted by location): `~` and `$HOME` expand and are honored; the unsupported
+    // `$NOPE` is dropped.
+    fx.write_global(
+        "binds = [{ path = \"~/sub\", mode = \"rw\" }, { path = \"$HOME/other\" }, \
+         { path = \"$NOPE/x\" }]\n",
+    );
+
+    let out = fx
+        .ops(&["config", "show", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .expect("spawn ops");
+    assert!(
+        out.status.success(),
+        "config must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let binds = doc["binds"].as_array().expect("binds array");
+
+    let home_canon = home.path().canonicalize().unwrap();
+    let sub = home_canon.join("sub");
+    let other = home_canon.join("other");
+    // `~/sub` expanded to the child's home and stayed read-write.
+    assert!(
+        binds
+            .iter()
+            .any(|b| b["path"] == sub.to_string_lossy().as_ref() && b["writable"] == true),
+        "`~/sub` must expand to the home and stay read-write: {binds:?}"
+    );
+    // `$HOME/other` expanded too (read-only, the default mode).
+    assert!(
+        binds
+            .iter()
+            .any(|b| b["path"] == other.to_string_lossy().as_ref() && b["writable"] == false),
+        "`$HOME/other` must expand to the home: {binds:?}"
+    );
+    // The unsupported variable was dropped, never mounted as a literal `$NOPE` directory, and the
+    // drop is surfaced by name (in `--json` the warnings ride the document, not stderr).
+    assert!(
+        binds
+            .iter()
+            .all(|b| !b["path"].as_str().unwrap_or_default().contains("$NOPE")),
+        "an unsupported variable must be dropped, never mounted literally: {binds:?}"
+    );
+    let warnings = doc["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported variable")),
+        "the dropped bind must be surfaced by name: {warnings:?}"
+    );
+}
+
+#[test]
+fn app_export_preserves_a_tilde_bind_verbatim_for_portability() {
+    // Expansion is a *load-time* convenience; `ops app export` must emit the raw `~` form, not the
+    // author's expanded home path — otherwise a shared profile would hard-code one machine's home
+    // and lose portability, the reason `~` exists. Correct by construction (export serializes the
+    // untouched raw declaration), locked here against a future "canonicalize everything" refactor.
+    let fx = Fixture::new();
+    fx.write_project("[app.demo]\ncmd = \"sh\"\nbinds = [{ path = \"~/sub\", mode = \"rw\" }]\n");
+    let out = fx
+        .ops(&["app", "export", "demo"])
+        .env("HOME", "/home/someone")
+        .output()
+        .expect("spawn ops");
+    assert!(
+        out.status.success(),
+        "export must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let profile = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        profile.contains("\"~/sub\""),
+        "export must keep the raw `~` form:\n{profile}"
+    );
+    assert!(
+        !profile.contains("/home/someone"),
+        "export must not hard-code the author's expanded home:\n{profile}"
+    );
+}
+
+#[test]
 fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
     // The same path bound by the global layer (read-only) and the trusted project (read-write)
     // must resolve to ONE bind, read-write — the launch would otherwise mount the dest twice and

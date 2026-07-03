@@ -362,6 +362,11 @@ impl Expansion {
 /// the home directory and a leading `$XDG_RUNTIME_DIR` to the runtime directory (the gpg-agent
 /// socket and similar runtime sockets live there); **any other `$` is rejected** — there is no
 /// arbitrary environment interpolation into a bind path. A literal path must be absolute.
+///
+/// This shares its expandable-prefix set with the config layer's `binds` expander
+/// (`config::expand_bind_path`) so the user sees one variable vocabulary, but the two differ
+/// intentionally: this resolver allowlist rejects *any* stray `$`, whereas a `binds` source keeps
+/// a literal `$` past the head (a real mount path may contain one). Keep them separate.
 fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<PathBuf, String> {
     if raw.is_empty() {
         return Err("an `allow_paths` entry is empty".to_string());

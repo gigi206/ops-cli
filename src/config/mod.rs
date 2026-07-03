@@ -1637,6 +1637,10 @@ fn apply_binds(
     source: &str,
     binds: Vec<RawBind>,
 ) {
+    // A leading `~`/`$HOME`/`$XDG_RUNTIME_DIR` is expanded from the environment of the user
+    // launching ops, so a portable config need not hard-code an absolute home path. Read once.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     for b in binds {
         let (raw_path, writable) = match b {
             RawBind::Path(p) => (p, false),
@@ -1654,10 +1658,17 @@ fn apply_binds(
                 (path, writable)
             }
         };
-        let p = PathBuf::from(&raw_path);
+        let p = match expand_bind_path(&raw_path, home.as_deref(), runtime.as_deref()) {
+            Ok(p) => p,
+            Err(reason) => {
+                warnings.push(format!("{source}: ignoring bind `{raw_path}`: {reason}"));
+                continue;
+            }
+        };
         if p.is_absolute() {
-            // Record the layer keyed by the raw declared path; [`load`] re-keys it to the
-            // canonical form when it canonicalizes, so the displayed path is the lookup key.
+            // Record the layer keyed by the expanded path; [`load`] re-keys it to the canonical
+            // form when it canonicalizes, so the displayed path is the lookup key. The `Bind` and
+            // the origin entry use the same `PathBuf` so a later `raw_layer.get(&bind.path)` hits.
             if let Some((layer, map)) = origin.as_mut() {
                 map.insert(p.clone(), *layer);
             }
@@ -1666,6 +1677,47 @@ fn apply_binds(
             warnings.push(format!("{source}: ignoring non-absolute bind `{raw_path}`"));
         }
     }
+}
+
+/// Expand a leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` in a `binds` source to an absolute host
+/// path, using the environment of the user launching ops (a config need not hard-code
+/// `/home/<user>`). Only the head component — before the first `/` — is a variable; an
+/// unrecognized `$VAR` at the head is rejected (fail closed: no arbitrary environment
+/// interpolation into a mount source). A path with no recognized head is returned unchanged, and
+/// the caller's absolute-path check still applies to the result.
+///
+/// The expandable-prefix set is deliberately identical to the resolver-plugin `allow_paths`
+/// expander, so the user sees one variable vocabulary. It differs in one intentional way: a
+/// literal `$` **past** the head is kept verbatim here, because a bind source is a real filesystem
+/// path that may legitimately contain one (e.g. an exFAT/NTFS mount's `$RECYCLE.BIN`), whereas a
+/// resolver allowlist can afford to reject any stray `$`. Do not merge the two behind one helper.
+fn expand_bind_path(
+    raw: &str,
+    home: Option<&Path>,
+    runtime: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let (head, rest) = match raw.split_once('/') {
+        Some((h, r)) => (h, Some(r)),
+        None => (raw, None),
+    };
+    let base = match head {
+        "~" | "$HOME" => home
+            .ok_or_else(|| "needs `$HOME`, which is not set".to_string())?
+            .to_path_buf(),
+        "$XDG_RUNTIME_DIR" => runtime
+            .ok_or_else(|| "needs `$XDG_RUNTIME_DIR`, which is not set".to_string())?
+            .to_path_buf(),
+        other if other.starts_with('$') => {
+            return Err("uses an unsupported variable \
+                        (only `~`, `$HOME`, `$XDG_RUNTIME_DIR` are expanded)"
+                .to_string());
+        }
+        _ => return Ok(PathBuf::from(raw)),
+    };
+    Ok(match rest {
+        Some(r) => base.join(r),
+        None => base,
+    })
 }
 
 /// Fold a layer's packages into `out`, validating the label and parsing the value's
@@ -5723,6 +5775,76 @@ mod tests {
             control_plane_pins_for(&ro, &roots).is_empty(),
             "a read-only bind pins nothing"
         );
+    }
+
+    #[test]
+    fn expand_bind_path_expands_a_leading_home_or_runtime_variable() {
+        let home = Path::new("/home/u");
+        let runtime = Path::new("/run/user/1000");
+        let h = Some(home);
+        let r = Some(runtime);
+
+        // A bare `~`/`$HOME` becomes the home directory; a suffix joins under it.
+        assert_eq!(expand_bind_path("~", h, r).unwrap(), home);
+        assert_eq!(expand_bind_path("$HOME", h, r).unwrap(), home);
+        assert_eq!(
+            expand_bind_path("~/projects/x", h, r).unwrap(),
+            Path::new("/home/u/projects/x")
+        );
+        assert_eq!(
+            expand_bind_path("$HOME/.config", h, r).unwrap(),
+            Path::new("/home/u/.config")
+        );
+        // `$XDG_RUNTIME_DIR` expands to the runtime directory (runtime sockets live there).
+        assert_eq!(
+            expand_bind_path("$XDG_RUNTIME_DIR/gnupg", h, r).unwrap(),
+            Path::new("/run/user/1000/gnupg")
+        );
+    }
+
+    #[test]
+    fn expand_bind_path_keeps_a_literal_path_verbatim_including_a_dollar_past_the_head() {
+        let h = Some(Path::new("/home/u"));
+        let r = Some(Path::new("/run/user/1000"));
+
+        // An absolute literal is unchanged.
+        assert_eq!(
+            expand_bind_path("/data/work", h, r).unwrap(),
+            Path::new("/data/work")
+        );
+        // The intentional divergence from `allow_paths`: a literal `$` *past* the head is kept —
+        // a real mount source may contain one (an exFAT/NTFS recycle bin), so it must not be
+        // rejected as a variable.
+        assert_eq!(
+            expand_bind_path("/mnt/win/$RECYCLE.BIN", h, r).unwrap(),
+            Path::new("/mnt/win/$RECYCLE.BIN")
+        );
+        // A relative literal is returned as-is (Ok) so the caller's absolute-path check still
+        // drops it with the "non-absolute" warning — expansion never invents a root.
+        let rel = expand_bind_path("relative/dir", h, r).unwrap();
+        assert!(
+            !rel.is_absolute(),
+            "a relative literal stays relative: {rel:?}"
+        );
+        // `~user` is not a supported form: no `$`, not `~`, so it stays literal (and non-absolute,
+        // dropped downstream) rather than being mistaken for a variable.
+        let tilde_user = expand_bind_path("~alice/x", h, r).unwrap();
+        assert_eq!(tilde_user, Path::new("~alice/x"));
+    }
+
+    #[test]
+    fn expand_bind_path_rejects_unsupported_and_unset_variables() {
+        let h = Some(Path::new("/home/u"));
+        let r = Some(Path::new("/run/user/1000"));
+
+        // An unrecognized `$VAR` at the head is refused — no arbitrary environment interpolation.
+        assert!(expand_bind_path("$SECRET_DIR/x", h, r).is_err());
+        assert!(expand_bind_path("$PATH", h, r).is_err());
+        // A recognized head whose variable is unset is refused (fail closed, named in the message)
+        // rather than silently expanding to an empty/relative path.
+        assert!(expand_bind_path("~/x", None, r).is_err());
+        assert!(expand_bind_path("$HOME", None, r).is_err());
+        assert!(expand_bind_path("$XDG_RUNTIME_DIR/s", h, None).is_err());
     }
 
     #[test]

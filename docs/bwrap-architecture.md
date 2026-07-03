@@ -160,10 +160,14 @@ runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** mo
 > `run` and `shell`). Env precedence: the structural `HOME`/`PATH`/`LD_LIBRARY_PATH`
 > are emitted first and the config env is **upserted** over them, so a *trusted*
 > override wins (an untrusted one has already lost its reserved keys). Bind
-> resolution — absolute-only, canonicalized, missing dropped, de-duplicated by
+> resolution — a leading `~`/`$HOME`/`$XDG_RUNTIME_DIR` expanded from the launching
+> user's environment (any other `$VAR` at the head refused, fail-closed), then
+> absolute-only, canonicalized, missing dropped, de-duplicated by
 > canonical path (last declaration wins) — lives in `config::load`, **not** the
 > launch, so `ops config` advertises the *effective* binds and cannot drift from what
-> the launch binds. A bind is **read-only by default**, or **read-write** with the
+> the launch binds. Expansion runs *before* the control-plane guard, which sees the
+> canonical path, so `~/.local/share/ops` is still forced read-only like the absolute
+> form — no bypass. A bind is **read-only by default**, or **read-write** with the
 > table form `{ path = "...", mode = "rw" }` (mapped to bwrap's `--bind`); a
 > read-write bind *at or inside* one of ops's own control-plane roots (the data/engine,
 > trust, or config directory) is forced read-only, while a broad read-write bind that

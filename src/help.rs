@@ -336,7 +336,10 @@ const PAGES: &[Page] = &[
             fields `set` does not handle as a single value, such as binds, an allowlist, secrets,\n\
             or app tables. A `binds` entry is an absolute host path, bound read-only by default;\n\
             write it as a table `{ path = \"/abs/path\", mode = \"rw\" }` to bind it read-write\n\
-            (the cage writes through to the host path). `binds` is a security field, honored only\n\
+            (the cage writes through to the host path). A leading `~`, `$HOME`, or\n\
+            `$XDG_RUNTIME_DIR` is expanded from your environment, so a portable config need not\n\
+            hard-code an absolute home path; any other `$VAR` is refused. `binds` is a security\n\
+            field, honored only\n\
             from a trusted source. ops's own state (its data, trust, and config directories) is\n\
             protected either way: a read-write bind aimed at or inside one of them is forced\n\
             read-only with a warning, while a broad read-write bind that merely contains them (e.g.\n\
