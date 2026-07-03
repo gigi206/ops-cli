@@ -41,6 +41,7 @@ const BASE_TOOLS: &[(&str, &str, &str)] = &[
     ("gnused", "bin/sed", "gnused"),
     ("gawk", "bin/awk", "gawk"),
     ("findutils", "bin/find", "findutils"),
+    ("jq", "bin/jq", "jq"),
     ("which", "bin/which", "which"),
 ];
 
@@ -133,10 +134,10 @@ pub(crate) fn resolve_userland(
 
     // Curated base CLI tools: a small, broadly-useful set every project gets without
     // per-project provisioning — an HTTP client, version control, a pager, the text-processing
-    // trio, file search, and `which`. Each is nix-built, so it shares the base glibc (the
-    // one-channel rule) and runs from the relocated store; its closure joins the seed and its
-    // `bin` joins the base PATH. Heavier or language-specific tooling stays a project concern
-    // (`[packages]` or a `nix:` mise tool), not the base.
+    // trio, file search, a JSON query tool, and `which`. Each is nix-built, so it shares the
+    // base glibc (the one-channel rule) and runs from the relocated store; its closure joins the
+    // seed and its `bin` joins the base PATH. Heavier or language-specific tooling stays a
+    // project concern (`[packages]` or a `nix:` mise tool), not the base.
     let tools = BASE_TOOLS
         .iter()
         .map(|(attr, marker, name)| realise(attr, marker, name))

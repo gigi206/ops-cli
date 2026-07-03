@@ -1594,6 +1594,7 @@ fn the_curated_base_tools_run_in_the_cage() {
              sed --version >/dev/null; \
              awk --version >/dev/null; \
              find --version >/dev/null; \
+             jq --version >/dev/null; \
              less --version >/dev/null; \
              which ls >/dev/null; \
              echo ALL_TOOLS_OK",
@@ -1680,6 +1681,59 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ENV-SHEBANG-OK"),
         "a `#!/usr/bin/env node` shebang did not resolve in the cage: {log}"
+    );
+}
+
+#[test]
+fn a_bin_bash_shebang_resolves_in_the_cage() {
+    // A `#!/bin/bash` shebang resolves in a hermetic cage. The cage carries no host `/bin/bash`
+    // — it synthesises `/bin/bash` as a second name for the same nix shell `/bin/sh` already
+    // exposes — so the kernel can exec a script that declares `#!/bin/bash`. The script is run
+    // by its own absolute path so the shebang (not an explicit `bash`) drives execution; that
+    // is the only path through `/bin/bash`, which is the facade this proves. No `[packages]`
+    // or network are needed beyond the base store seed. Skips (never fails) when the host
+    // cannot sandbox or the cache is unreachable (the base closure is fetched on first launch).
+    let project = TmpDir::new("bash-proj");
+    let data = TmpDir::new("bash-data");
+    let state = TmpDir::new("bash-state");
+    // an executable script whose shebang names `/bin/bash` directly
+    let script = project.path().join("sb.sh");
+    std::fs::write(&script, "#!/bin/bash\necho BASH-SHEBANG-OK\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping bin-bash e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping bin-bash e2e: the network is unreachable");
+        return;
+    }
+
+    // run the script by its own absolute path, so the shebang (not an explicit `bash`) drives
+    // execution — the path through `/bin/bash`.
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", script.to_str().unwrap()],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("BASH-SHEBANG-OK"),
+        "a `#!/bin/bash` shebang did not resolve in the cage: {log}"
     );
 }
 

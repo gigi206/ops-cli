@@ -29,11 +29,19 @@ const SANDBOX_HOME: &str = "/home/sandbox";
 /// here, and the synthetic passwd points its shell field at the same path.
 const SANDBOX_SHELL: &str = "/bin/sh";
 
+/// The in-sandbox `/bin/bash`, synthesised as a symlink to the same nix shell as
+/// `/bin/sh`. A great many upstream scripts carry a `#!/bin/bash` shebang (a host
+/// path a hermetic cage lacks), so the kernel cannot exec them without this name.
+/// It is the *same* binary `/bin/sh` already exposes — a second name for an
+/// interpreter already present, not a new mount — so it adds no exposure, only the
+/// name a `#!/bin/bash` shebang assumes.
+const SANDBOX_BASH: &str = "/bin/bash";
+
 /// The in-sandbox `/usr/bin/env`, synthesised as a symlink to coreutils' `env`. An
 /// interpreted tool's `#!/usr/bin/env <interp>` shebang resolves through it (a hermetic
-/// cage has no host `/usr`). With `/bin/sh` these are the two — and only two — FHS paths
-/// nix's own ecosystem standardises, so synthesising it follows nix convention rather than
-/// working around it.
+/// cage has no host `/usr`). With `/bin/sh` and `/bin/bash` these are the three FHS
+/// paths nix's own ecosystem standardises, so synthesising it follows nix convention
+/// rather than working around it.
 const SANDBOX_ENV: &str = "/usr/bin/env";
 
 /// The resolved hermetic userland (provided by the nix resolver). A nix binary
@@ -75,9 +83,9 @@ pub(crate) struct Userland {
     pub(crate) shell_bin: PathBuf,
     /// The coreutils `env` binary `/usr/bin/env` links to, so an interpreted tool's
     /// `#!/usr/bin/env <interp>` shebang resolves. A hermetic cage has no host `/usr`;
-    /// this and `/bin/sh` are the only two FHS paths nix's own ecosystem standardizes,
-    /// so synthesising it follows nix convention. An in-sandbox logical path (it
-    /// resolves through the store bound at `/nix`).
+    /// `/bin/sh`, `/bin/bash` and `/usr/bin/env` are the FHS paths nix's own ecosystem
+    /// standardizes, so synthesising it follows nix convention. An in-sandbox logical
+    /// path (it resolves through the store bound at `/nix`).
     pub(crate) env_bin: PathBuf,
     /// The in-cage egress forwarder (`socat`), as an in-sandbox logical path. Invoked
     /// by absolute path from the allowlist-posture wrapper; off `PATH` and untouched by
@@ -235,10 +243,19 @@ fn assemble(
             target: userland.shell_bin.clone(),
             dest: PathBuf::from(SANDBOX_SHELL),
         },
+        // Zone 1 — the synthetic `/bin/bash`: a second name for the same shell, so a
+        // `#!/bin/bash` shebang (extremely common in upstream scripts) resolves. A
+        // hermetic cage has no host `/bin/bash`; without this name the kernel refuses
+        // such scripts with "bad interpreter: No such file or directory".
+        Mount::Symlink {
+            target: userland.shell_bin.clone(),
+            dest: PathBuf::from(SANDBOX_BASH),
+        },
         // Zone 1 — the synthetic `/usr/bin/env`: an interpreted tool's
         // `#!/usr/bin/env <interp>` shebang resolves here to coreutils' `env`. The cage
-        // carries no host `/usr`; this is the second FHS path (beside `/bin/sh`) that nix's
-        // own ecosystem standardises, the affordance every shebang-based CLI assumes.
+        // carries no host `/usr`; this is the third FHS path (beside `/bin/sh` and
+        // `/bin/bash`) that nix's own ecosystem standardises, the affordance every
+        // shebang-based CLI assumes.
         Mount::Symlink {
             target: userland.env_bin.clone(),
             dest: PathBuf::from(SANDBOX_ENV),
@@ -407,6 +424,7 @@ const STRUCTURAL_DESTS: &[&str] = &[
     "/lib64/ld-linux-x86-64.so.2",
     SANDBOX_HOME,
     SANDBOX_SHELL,
+    SANDBOX_BASH,
     SANDBOX_ENV,
     CAGE_CA_BUNDLE,
     SHELL_RC_INCAGE,
@@ -767,6 +785,21 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
 // The I/O orchestrator threads resolved inputs into the pure `assemble`; the grouping
 // discipline (`SandboxPaths`) keeps that *audited* core at the argument limit, so the
 // wrapper carrying one more resolved slice is the right place to absorb it.
+/// Write `bytes` to `path` atomically: a unique temp sibling (named by pid, so concurrent launches
+/// do not collide on it) written then renamed over `path`. A concurrent cage that binds this file
+/// read-only then sees either the complete old or complete new content — never a torn half-write —
+/// and, because the rename installs a fresh inode, a cage already bound to the prior inode keeps its
+/// own view rather than observing a later launch's overwrite.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_spec(
     data_dir: &Path,
@@ -796,13 +829,15 @@ pub(crate) fn build_spec(
     // (outside every writable mount, so it has no writable alias the agent could use to
     // rewrite it); `ops shell` binds it read-only and points bash's `--rcfile` at it.
     let shell_rc = rt.etc_dir.join("bashrc");
-    std::fs::write(&shell_rc, SHELL_RC_CONTENTS)?;
+    write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
 
     // Materialize the generated egress contract beside the rc (same outside-every-writable-
     // mount placement, for the same reason: the agent must not be able to rewrite the
-    // contract it is told to read). Regenerated each launch, so it never goes stale.
+    // contract it is told to read). Regenerated each launch, so it never goes stale. Written
+    // atomically (temp + rename) because this directory is shared by concurrent cages of the
+    // same project — an in-place write could show a running cage a torn, half-written file.
     let contract = rt.etc_dir.join("egress-contract.md");
-    std::fs::write(&contract, egress_contract)?;
+    write_atomic(&contract, egress_contract.as_bytes())?;
 
     // Materialize the embedded mise `nix:` backend plugin (read-only, content-keyed,
     // shared across projects) and register it for this cage's mise: a symlink in the
@@ -1302,8 +1337,8 @@ mod tests {
     #[test]
     fn usr_bin_env_is_symlinked_to_coreutils_env() {
         // An interpreted tool's `#!/usr/bin/env <interp>` shebang must resolve: the cage
-        // synthesises `/usr/bin/env` as a symlink to coreutils' `env`, the second FHS path
-        // beside `/bin/sh`. bwrap creates the `/usr/bin` parent for the symlink.
+        // synthesises `/usr/bin/env` as a symlink to coreutils' `env`, one of the FHS paths
+        // beside `/bin/sh` and `/bin/bash`. bwrap creates the `/usr/bin` parent for the symlink.
         let argv = argv_strings(&assembled());
         let env = argv
             .iter()
@@ -1315,6 +1350,34 @@ mod tests {
             "/usr/bin/env links to coreutils' env"
         );
         assert_eq!(argv[env - 2], "--symlink", "/usr/bin/env is a symlink");
+    }
+
+    #[test]
+    fn bin_bash_is_symlinked_to_the_same_shell_as_bin_sh() {
+        // A `#!/bin/bash` shebang must resolve in a cage with no host `/bin/bash`: the cage
+        // synthesises `/bin/bash` as a symlink to the SAME nix shell `/bin/sh` points at (bash
+        // selects POSIX-vs-full mode from argv[0], so one binary serves both names).
+        let argv = argv_strings(&assembled());
+        let bash = argv
+            .iter()
+            .position(|s| s == "/bin/bash")
+            .expect("/bin/bash is synthesised");
+        assert_eq!(
+            argv[bash - 1],
+            "/store/bash/bin/bash",
+            "/bin/bash links to the shell binary"
+        );
+        assert_eq!(argv[bash - 2], "--symlink", "/bin/bash is a symlink");
+        // it points at the exact same target as `/bin/sh`, not a second shell
+        let sh = argv
+            .iter()
+            .position(|s| s == "/bin/sh")
+            .expect("/bin/sh is synthesised");
+        assert_eq!(
+            argv[bash - 1],
+            argv[sh - 1],
+            "/bin/bash and /bin/sh must be the same shell binary"
+        );
     }
 
     #[test]
@@ -2123,17 +2186,18 @@ mod smoke {
             eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
             return;
         };
-        // jq: realised into the shared store but NOT a seeded root — the discriminant's
-        // non-seeded dependency.
-        let jq = crate::store::provision(
+        // hello: realised into the shared store but NOT a seeded root — the discriminant's
+        // non-seeded dependency. (jq was the original probe but is now in the curated base
+        // toolset, so it IS seeded and could no longer serve as the non-seeded discriminant.)
+        let hello = crate::store::provision(
             &nix,
             &layout,
-            &data.path().join("roots").join("jq"),
+            &data.path().join("roots").join("hello"),
             &base_ref,
-            "jq",
-            "bin/jq",
+            "hello",
+            "bin/hello",
         )
-        .expect("provision jq");
+        .expect("provision hello");
 
         let project = TmpDir::new();
         let proj = project.path().canonicalize().unwrap();
@@ -2155,15 +2219,15 @@ mod smoke {
                 .replace("@CU@", &cu_store.to_string_lossy()),
         )
         .unwrap();
-        // the discriminant: its only input is jq, which is in the shared store but not in
-        // the seed — `builtins.storePath` against the per-project store rejects it, so the
-        // build fails offline. That a *seeded* path succeeds while this one fails proves
-        // the cage runs from the seed, not from the shared store at large.
+        // the discriminant: its only input is hello, which is in the shared store but not
+        // in the seed — `builtins.storePath` against the per-project store rejects it, so
+        // the build fails offline. That a *seeded* path succeeds while this one fails
+        // proves the cage runs from the seed, not from the shared store at large.
         let discriminant = proj.join("discriminant.nix");
         std::fs::write(
             &discriminant,
-            r#"let j = builtins.storePath "@JQ@"; in derivation { name = "ops-discriminant"; system = builtins.currentSystem; builder = "${j}/bin/jq"; args = ["-n" "null"]; }"#
-                .replace("@JQ@", &jq.to_string_lossy()),
+            r#"let j = builtins.storePath "@HELLO@"; in derivation { name = "ops-discriminant"; system = builtins.currentSystem; builder = "${j}/bin/hello"; args = []; }"#
+                .replace("@HELLO@", &hello.to_string_lossy()),
         )
         .unwrap();
 
@@ -2521,19 +2585,21 @@ mod smoke {
         let shared_paths = layout.store_dir().join("nix").join("store");
         let before = fingerprint(&shared_paths);
 
-        // cage 1: activate jq — writes the global mise config + a shim into the
-        // persistent home, builds jq into the project's own store.
-        let (ok, _out, err) = run_script("mise use -g nix:jq 1>&2");
-        assert!(ok, "`mise use -g nix:jq` failed:\n{err}");
+        // cage 1: activate rg (ripgrep) — writes the global mise config + a shim into
+        // the persistent home, builds rg into the project's own store. rg is chosen over
+        // jq because jq is in the curated base toolset, so the base `jq` bin would already
+        // be on PATH and muddy the shim-vs-real-bin distinction this test asserts.
+        let (ok, _out, err) = run_script("mise use -g nix:ripgrep 1>&2");
+        assert!(ok, "`mise use -g nix:ripgrep` failed:\n{err}");
 
-        // cage 2: a brand-new spec. The shims dir on PATH resolves jq for a direct
+        // cage 2: a brand-new spec. The shims dir on PATH resolves rg for a direct
         // (non-interactive) command; bash with the synthetic `--rcfile` activates mise,
-        // which puts the real jq bin on PATH. The inner interactive bash has no
+        // which puts the real rg bin on PATH. The inner interactive bash has no
         // controlling terminal here, so its job-control notice is sent to /dev/null.
         let script = "set +e\n\
-             echo \"SHIM_WHICH=$(command -v jq || echo NONE)\"\n\
-             echo \"SHIM_VER=$(jq --version 2>/dev/null)\"\n\
-             bash --rcfile /opt/ops/bashrc -i -c 'echo \"ACT_WHICH=$(command -v jq || echo NONE)\"; echo \"ACT_VER=$(jq --version 2>/dev/null)\"' 2>/dev/null\n";
+             echo \"SHIM_WHICH=$(command -v rg || echo NONE)\"\n\
+             echo \"SHIM_VER=$(rg --version 2>/dev/null)\"\n\
+             bash --rcfile /opt/ops/bashrc -i -c 'echo \"ACT_WHICH=$(command -v rg || echo NONE)\"; echo \"ACT_VER=$(rg --version 2>/dev/null)\"' 2>/dev/null\n";
         let (ok, out, err) = run_script(script);
         assert!(ok, "the later launch failed:\n{err}\nstdout:\n{out}");
         let marker = |key: &str| {
@@ -2542,30 +2608,30 @@ mod smoke {
                 .unwrap_or_else(|| panic!("missing marker {key} in:\n{out}"))
         };
 
-        // `ops run` (non-interactive): jq is on PATH via the shims dir, resolved through
+        // `ops run` (non-interactive): rg is on PATH via the shims dir, resolved through
         // the shim itself, and runs.
         assert!(
-            marker("SHIM_WHICH").ends_with("/shims/jq"),
-            "jq did not resolve through the shims dir: {}",
+            marker("SHIM_WHICH").ends_with("/shims/rg"),
+            "rg did not resolve through the shims dir: {}",
             marker("SHIM_WHICH")
         );
         assert!(
-            marker("SHIM_VER").starts_with("jq"),
-            "the shimmed jq did not run: {}",
+            marker("SHIM_VER").starts_with("ripgrep"),
+            "the shimmed rg did not run: {}",
             marker("SHIM_VER")
         );
 
         // `ops shell` (interactive): mise activate (via `--rcfile`) puts the *real* tool
-        // bin on PATH — ending in `/bin/jq`, not `/shims/jq`, so this proves activation
+        // bin on PATH — ending in `/bin/rg`, not `/shims/rg`, so this proves activation
         // engaged rather than the shim doing the work again.
         assert!(
-            marker("ACT_WHICH").ends_with("/bin/jq") && marker("ACT_WHICH").contains("/nix/store/"),
-            "mise activate did not put the real jq bin on PATH: {}",
+            marker("ACT_WHICH").ends_with("/bin/rg") && marker("ACT_WHICH").contains("/nix/store/"),
+            "mise activate did not put the real rg bin on PATH: {}",
             marker("ACT_WHICH")
         );
         assert!(
-            marker("ACT_VER").starts_with("jq"),
-            "the activated jq did not run: {}",
+            marker("ACT_VER").starts_with("ripgrep"),
+            "the activated rg did not run: {}",
             marker("ACT_VER")
         );
 
