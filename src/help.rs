@@ -55,30 +55,60 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["shell"],
-        synopsis: "ops shell",
+        synopsis: "ops shell [--config <toml|@file>] [--env KEY=VALUE]",
         summary: "open an interactive sandboxed shell in the current project",
-        options: &[],
+        options: &[
+            (
+                "--config <toml|@file>",
+                "one-shot config override for this launch: inline TOML (or @file) shaped like an \
+                 ops.toml; repeatable, later wins",
+            ),
+            (
+                "--env KEY=VALUE",
+                "one-shot override of a single cage environment variable; repeatable",
+            ),
+        ],
         details:
             "Launches an interactive shell inside the project sandbox, with job control and a\n\
             synthetic identity. The project's trusted config drives the environment; the\n\
             host home and the rest of the host filesystem are absent (confidentiality by\n\
-            absence).",
+            absence).\n\n\
+            A one-shot override (`--config`/`--env`, or the `OPS_CONFIG`/`OPS_ENV_<KEY>`\n\
+            environment) is the final word for this launch — see `ops help run` for the rules.",
     },
     Page {
         path: &["run"],
-        synopsis: "ops run [--detach] [--] <command> [args...]",
+        synopsis: "ops run [--detach] [--config <toml|@file>] [--env KEY=VALUE] [--] <command> [args...]",
         summary: "run a command inside the project sandbox",
         options: &[
             (
                 "--detach",
                 "run in the background as a session `ops ls`/`attach`/`stop` can see",
             ),
+            (
+                "--config <toml|@file>",
+                "one-shot config override for this launch: inline TOML (or @file) shaped like an \
+                 ops.toml; repeatable, later wins",
+            ),
+            (
+                "--env KEY=VALUE",
+                "one-shot override of a single cage environment variable; repeatable",
+            ),
             ("--", "end ops's own flags; everything after runs literally"),
         ],
         details:
             "Runs <command> inside the project sandbox and propagates its exit status. A `--`\n\
             separates ops's flags from the command's, so `ops run -- --detach` runs the\n\
-            literal `--detach`.",
+            literal `--detach`.\n\n\
+            One-shot overrides let you change any configuration field for a single launch without\n\
+            editing a file. `--config` takes inline TOML (or `@<file>`) shaped exactly like an\n\
+            `ops.toml`, so it can set any field; `--env KEY=VALUE` sets one cage variable. The same\n\
+            override is available through the environment as `OPS_CONFIG` (the TOML blob) and\n\
+            `OPS_ENV_<KEY>` (one variable each). Precedence, lowest to highest:\n\
+            `OPS_CONFIG < OPS_ENV_<KEY> < --config < --env` — the command line always beats the\n\
+            environment. An override is the final word: it beats a trusted project config and an\n\
+            app's own posture. A malformed override is a hard error (it never silently launches a\n\
+            different posture); a security field set from the environment prints a notice.",
     },
     Page {
         path: &["mise"],
@@ -93,12 +123,23 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app"],
-        synopsis: "ops app <name> [--detach] [-- <args>...]",
+        synopsis: "ops app <name> [--detach] [--config <toml|@file>] [--env KEY=VALUE] [-- <args>...]",
         summary: "launch or manage named application profiles",
-        options: &[(
-            "--detach",
-            "launch the app in the background as a session `ops ls`/`attach`/`stop` can see",
-        )],
+        options: &[
+            (
+                "--detach",
+                "launch the app in the background as a session `ops ls`/`attach`/`stop` can see",
+            ),
+            (
+                "--config <toml|@file>",
+                "one-shot config override for this launch, beating the app's own posture; \
+                 repeatable (see `ops help run`)",
+            ),
+            (
+                "--env KEY=VALUE",
+                "one-shot override of a single cage environment variable; repeatable",
+            ),
+        ],
         details:
             "`ops app <name>` launches a named application profile (a project [app.<name>] overlay,\n\
             or an imported apps/<name>.toml profile — a global app lives as a profile file, not\n\
@@ -108,7 +149,11 @@ const PAGES: &[Page] = &[
             flag to the launched program without editing the profile — e.g. `ops app claude-code\n\
             -- -c` runs the profile's `claude` command with `-c` (resume the previous session).\n\
             They are ordinary launch-time arguments; the app's posture (network, binds, secrets,\n\
-            home) is fixed by the profile and unchanged.",
+            home) is fixed by the profile and unchanged.\n\n\
+            A one-shot override (`--config`/`--env`, or the `OPS_CONFIG`/`OPS_ENV_<KEY>`\n\
+            environment) is applied *after* the app's overlay, so it is the final word — e.g.\n\
+            `ops app claude-code --config 'network=\"none\"'` cuts the app's network for one run.\n\
+            See `ops help run` for the full precedence rules.",
     },
     Page {
         path: &["search"],

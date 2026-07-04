@@ -78,15 +78,20 @@ struct Prepared {
 
 /// `ops run [--] <cmd>`: run a command inside the project sandbox, replacing the
 /// ops process so the command's exit status becomes ops's.
-pub(crate) fn run(cmd: Vec<OsString>, detach: bool) -> ExitCode {
+pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override) -> ExitCode {
     if cmd.is_empty() {
         eprintln!("ops: usage: {}", crate::help::synopsis("run"));
         return ExitCode::from(2);
     }
-    let prep = match prepare() {
+    let mut prep = match prepare_with(&ov) {
         Ok(p) => p,
         Err(code) => return code,
     };
+    // The override is the authoritative final word over the resolved baseline (`ops run`/`ops
+    // shell` have no app overlay, so here is that final point).
+    if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
+        return code;
+    }
     launch(
         prep,
         binds::Runtime::ProjectDefault,
@@ -95,6 +100,22 @@ pub(crate) fn run(cmd: Vec<OsString>, detach: bool) -> ExitCode {
         detach,
         "run",
     )
+}
+
+/// Apply the (non-channel) part of a one-shot override to a prepared config, aborting the launch
+/// with a pointed error (exit 2) when it sets an invalid scalar security value — there is no safe
+/// baseline fallback for one, so it is refused rather than run at the wrong posture. Shared by
+/// `run`/`shell`/`app`, each applying the override at its own final point (after any app overlay).
+fn apply_launch_override(
+    cfg: &mut crate::config::Resolved,
+    ov: crate::config::Override,
+) -> Result<(), ExitCode> {
+    cfg.apply_override(ov).map_err(|errs| {
+        for e in errs {
+            eprintln!("ops: {e}");
+        }
+        ExitCode::from(2)
+    })
 }
 
 /// Build the cage, register it, and run it — either in the foreground (this process becomes or
@@ -408,8 +429,13 @@ fn redirect_to_log(log: &File) {
 /// locked-down posture as `ops run`; the overlay's security fields took effect only if their
 /// source was trusted (the global config or a trusted project), so launching an app on
 /// untrusted code is as safe as `ops run` there.
-pub(crate) fn app(name: &str, detach: bool, extra: Vec<OsString>) -> ExitCode {
-    let mut prep = match prepare() {
+pub(crate) fn app(
+    name: &str,
+    detach: bool,
+    extra: Vec<OsString>,
+    ov: crate::config::Override,
+) -> ExitCode {
+    let mut prep = match prepare_with(&ov) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -436,6 +462,11 @@ pub(crate) fn app(name: &str, detach: bool, extra: Vec<OsString>) -> ExitCode {
     };
     eprintln!("ops: launching app `{name}`");
     prep.cfg.merge_app(app);
+    // The override is the authoritative final word — applied *after* the app overlay so a one-shot
+    // `ops app <name> --config …`/`OPS_*` beats the app's own posture, not the other way round.
+    if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
+        return code;
+    }
 
     // An interactive foreground launch (a real terminal on stdin) runs under the pty supervisor:
     // the agent's TUI gets a private controlling terminal and live terminal-resize propagation
@@ -479,7 +510,8 @@ fn available_apps(cfg: &crate::config::Resolved) -> String {
 pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
     let mut cmd = vec![OsString::from("mise")];
     cmd.extend(args);
-    run(cmd, false)
+    // `ops mise` is a passthrough — every argument is mise's, so it takes no one-shot override.
+    run(cmd, false, crate::config::Override::none())
 }
 
 /// Which persistent home a `mise:` package group is equipped in, owning its app name so a
@@ -1064,7 +1096,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
 
 /// `ops shell`: an interactive shell inside the project sandbox, under a pty
 /// supervisor so job control works.
-pub(crate) fn shell() -> ExitCode {
+pub(crate) fn shell(ov: crate::config::Override) -> ExitCode {
     // SAFETY: `isatty` only inspects fd 0. An interactive shell needs a real
     // terminal to make raw; refuse cleanly rather than corrupt a pipe.
     if unsafe { libc::isatty(0) } != 1 {
@@ -1073,10 +1105,13 @@ pub(crate) fn shell() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let prep = match prepare() {
+    let mut prep = match prepare_with(&ov) {
         Ok(p) => p,
         Err(code) => return code,
     };
+    if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
+        return code;
+    }
     launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
 }
 
@@ -1366,6 +1401,15 @@ fn attach_app_shell(mut prep: Prepared, name: &str, global_home: bool) -> ExitCo
 /// chooses the channel the **whole** launch resolves against — base userland and
 /// tools alike (see [`Prepared`] for why they must be one).
 fn prepare() -> Result<Prepared, ExitCode> {
+    prepare_with(&crate::config::Override::none())
+}
+
+/// [`prepare`] with a one-shot override applied. The override's **nixpkgs channel** is applied to
+/// the loaded config *before* the lock target is chosen (the channel decides which lock the whole
+/// launch resolves against), so a `-o nixpkgs=…` / `OPS_CONFIG` channel takes effect. The rest of
+/// the override (env, binds, network, gui, limits, secret) is applied by the caller with
+/// [`crate::config::Resolved::apply_override`] — after any app overlay merges, so it beats that too.
+fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     // The data directory is resolved first: it is where ops looks for (and, under the
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
     let Some(layout) = Layout::from_env() else {
@@ -1394,7 +1438,22 @@ fn prepare() -> Result<Prepared, ExitCode> {
             return Err(ExitCode::FAILURE);
         }
     };
-    let cfg = crate::config::load(&cwd);
+    let mut cfg = crate::config::load(&cwd);
+    // The override's nixpkgs channel must land before the lock target is chosen below. A set-but-
+    // invalid channel is a hard error (no safe baseline fallback for a supply-chain field).
+    if let Err(e) = cfg.apply_override_channel(ov) {
+        eprintln!("ops: {e}");
+        return Err(ExitCode::from(2));
+    }
+    // Reject a mistyped scalar security value (network/gui/limits) now — before the expensive
+    // channel/userland resolution below — so a typo aborts fast rather than after a provision. The
+    // full override (this plus the additive fields) is applied at the launch's final point.
+    if let Err(errs) = cfg.validate_override(ov) {
+        for e in errs {
+            eprintln!("ops: {e}");
+        }
+        return Err(ExitCode::from(2));
+    }
 
     let nixpkgs =
         match effective_lock_target(&cwd, &layout, &cfg).and_then(|t| t.resolve(&nix, &layout)) {

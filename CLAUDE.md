@@ -95,6 +95,59 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **One-shot config override — increment 1: the `--config`/`--env` + `OPS_*` overlay (DONE
+  2026-07-04)** (`src/config/overrides.rs` [new] + `config/mod.rs` + `config/schema.rs` +
+  `config/view.rs` + `sandbox/launch.rs` + `main.rs` + `help.rs` + `tests/{run,config}.rs`): a
+  one-shot override so **any** config field can be changed for a single launch without editing a
+  file. Carried by `--config <toml|@file>` (repeatable) + `OPS_CONFIG` — a full `RawConfig` overlay
+  (covers every field by construction) — and `--env KEY=VALUE` (repeatable) + `OPS_ENV_<KEY>` for one
+  cage variable (the per-key shape confirmed with the user over `OPS_ENV="K=V …"`). It is the
+  **authoritative final word** — it beats a trusted project config **and** a named app's overlay —
+  because it comes from the invoker, whose authority over the host process's argv/env no lower-trust
+  context can reach (**verified**: cage passthrough is `TERM`/`LANG` only, no self-exec, `--detach`
+  forks not re-execs). So it is **trusted by invocation**, distinct from the direnv content-trust of a
+  project config (it touches no trust marker). **Precedence**, low→high:
+  `OPS_CONFIG < OPS_ENV_<KEY> < --config < --env` (the CLI always beats the environment; within a
+  source the typed flag beats the blob). `overrides::collect` merges the inputs into one overlay
+  (fail-closed on a parse error), and application is split by the launch flow's channel/rest seam:
+  `apply_override_channel` (nixpkgs) runs in `prepare_with` **before** the lock is chosen; a pure
+  `validate_override` runs there too, **before** the expensive provisioning; and `apply_override` (the
+  real apply) runs at each verb's final point — after `prepare` for `run`/`shell`, **after
+  `merge_app`** for `app`, so it beats the app. **Fail-closed is the load-bearing property (an
+  advisor review caught it half-done):** a malformed TOML was already a hard error, but a *set-but-
+  invalid VALUE* (a `network="nonee"` typo) MUST be too — silently keeping the baseline could leave a
+  *wider* posture than the mistyped intent (the exact fail-open the feature must not have), so a
+  set-but-invalid scalar security field (`network`/`gui`/`[limits]`/`nixpkgs`) is a **hard error, exit
+  2, aborting ~10 ms before any provisioning**; the additive fields (`env`/`binds`/`packages`) instead
+  fail *closed* by dropping a bad entry (a missing bind/tool is less capability, never a wider
+  posture), so they warn and skip. **Two fail-open bugs the golden-rule live verification caught:**
+  the invalid-value fall-through above, and `fold_launch_fields` having dropped `limits` from the
+  merge entirely (fixed + a `every_launch_field_survives_the_merge` regression guard). **Env footgun
+  (user chose "all fields, if secure"):** the environment can set security fields, but each security
+  field sourced from the env prints a stderr notice (anti stale-`OPS_NETWORK=shared`); the CLI is
+  silent (explicit per-invocation). **`ops config show`** reflects an ambient override (`OPS_*`) in the
+  full view and tags values `(override)` (a new `Provenance::Override`, warn hue), so it never lies
+  about what a launch would do; a set-but-invalid ambient override surfaces as an error note (baseline
+  stands). Three `Clone` derives on `NetworkField`/`NetworkTable`/`RawLimits` enable the borrowing
+  early-validate. **Residuals (documented):** `[net.groups]`/`[app.*]` in an override are
+  ignored+noticed (not launch concepts); an override `[network]` has no `@group` vocabulary (fails
+  closed); on `run`/`shell` an override that *opens* the network does not resurrect a baseline secret
+  the baseline posture cleared (fail-closed, marginal); overriding an app's `network` drops the app's
+  read-by-default `default_methods` → all-verbs (like a Mode-A baseline; `{VERB}` prefixes are the
+  opt-in to restrict — user: no preference, kept as-is); `config show --app`/attach/`ops test net`
+  don't preview the override yet. **Increment 2 (next):** ergonomic typed security flags
+  `--net/--gui/--bind/--nixpkgs/--limit/--package` + their `OPS_*` equivalents, layered per the same
+  precedence. **Full `cargo test` green under load** (unit 821 + config 79 + run 38 + the rest;
+  net-new: ~14 `overrides` unit incl. the merge-survival guard, 9 `apply_override`/validate unit incl.
+  the flagship override-beats-app and invalid-value-hard-error, a `config show` `(override)`-tag
+  integration case, and run.rs e2e — env reaches the cage + CLI-beats-env, malformed AND invalid-value
+  → exit 2, and **override beats an app overlay through the real dispatch** [the after-`merge_app`
+  ordering, which ran a real cage]). fmt/clippy `-D warnings` clean, **std-only** for the config side
+  (no new dep). Advisor-reviewed (plan AND impl AND the fail-closed fix — the review caught the
+  invalid-value hole, blessed the validate-against-baseline correctness, and required the app-
+  precedence e2e + the `config show` tag guard). *(The pre-existing `tests/shell.rs` pty-resize flake
+  this increment's heavier run.rs tipped over its 45 s deadline is fixed in a separate commit —
+  deadline raised to 180 s.)*
   **Engine independence — the binary ships its own nix + bwrap (DONE 2026-06-25)** (`build.rs` +
   `Cargo.toml` + `mise.toml` + `src/store.rs` + `src/sandbox/launch.rs` + `src/main.rs`): the two
   host couplings that contradicted the self-contained-binary promise — host nix and host

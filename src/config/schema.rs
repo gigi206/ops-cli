@@ -140,7 +140,7 @@ pub(crate) struct RawBindTable {
 /// `tasks_max` is the process/thread cap (a count like `8192`, or `"infinity"`). Each value's
 /// syntax is validated downstream against exactly what systemd accepts, so a malformed one is
 /// dropped with a warning rather than reaching `systemd-run` and failing the launch.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawLimits {
     pub(crate) memory_high: Option<RawLimit>,
     pub(crate) memory_max: Option<RawLimit>,
@@ -361,7 +361,7 @@ pub(crate) enum SecretFrom {
 /// The two shapes the `network` field accepts: a bare posture string, or a table for the
 /// filtered-egress carve-out lists. An untagged enum so both TOML forms parse — `network = "none"`
 /// and `[network] mode = "deny"` (or `"allow"`/`"ask"`) — keeping the simple case a one-liner.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum NetworkField {
     /// `network = "none"` | `"shared"` | `"deny"` | `"allow"` | `"ask"`.
@@ -376,7 +376,7 @@ pub(crate) enum NetworkField {
 /// `deny` auto-fails, everything else parks. `deny` always wins. `ask_timeout` (a duration like
 /// `"90s"`/`"5m"`, or absent for an indefinite wait) bounds a parked `ask` request, and
 /// `ask_notice = false` silences the inline stderr park alert (the request still parks).
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct NetworkTable {
     /// The egress mode. Absent means "inherit the mode from the parent config layer" (an app takes
     /// the baseline's mode, a project takes the global's) while keeping this table's own

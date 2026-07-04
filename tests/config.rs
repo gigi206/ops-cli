@@ -198,6 +198,45 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
 }
 
 #[test]
+fn config_show_reflects_and_tags_an_ambient_override() {
+    // `ops config show` must reflect an ambient `OPS_CONFIG` — otherwise it would lie about what a
+    // launch in this environment does — and tag the overridden value's provenance as `override`
+    // (distinct from the persisted `default`/`global`/`project`). No project config, so the baseline
+    // network is the default `shared`; the ambient override isolates it.
+    let fx = Fixture::new();
+    let out = fx
+        .ops(&["config", "show"])
+        .env("OPS_CONFIG", "network=\"none\"")
+        .output()
+        .expect("spawn ops");
+    assert!(out.status.success(), "config show should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("network: none") && stdout.contains("(override)"),
+        "config show must reflect and tag the ambient override:\n{stdout}"
+    );
+
+    // A set-but-invalid ambient override is surfaced (as an error note), never silently ignored: the
+    // baseline stands, so the view neither lies that a bad value took effect nor hides the mistake.
+    let bad = fx
+        .ops(&["config", "show"])
+        .env("OPS_CONFIG", "network=\"nonee\"")
+        .output()
+        .expect("spawn ops");
+    let text =
+        String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        text.contains("refusing to launch") || text.contains("invalid value"),
+        "a set-but-invalid ambient override must be surfaced:\n{text}"
+    );
+    // and the shown posture falls back to the untouched baseline (not the bad value).
+    assert!(
+        String::from_utf8_lossy(&bad.stdout).contains("network: shared"),
+        "the baseline posture must stand when the override is invalid"
+    );
+}
+
+#[test]
 fn config_show_rejects_an_unknown_argument() {
     let fx = Fixture::new();
     let out = fx.run(&["config", "show", "--bogus"]);

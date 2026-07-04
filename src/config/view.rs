@@ -95,6 +95,8 @@ pub(crate) enum ProvenanceView {
     Global,
     Project,
     Inherited,
+    /// A one-shot command-line/environment override — the final word for this invocation.
+    Override,
 }
 
 /// A [`BindView`] for an app overlay's bind: path and mode, no per-bind provenance (an app's
@@ -113,6 +115,7 @@ impl From<super::Provenance> for ProvenanceView {
             super::Provenance::Default => ProvenanceView::Default,
             super::Provenance::Global => ProvenanceView::Global,
             super::Provenance::Project => ProvenanceView::Project,
+            super::Provenance::Override => ProvenanceView::Override,
         }
     }
 }
@@ -517,7 +520,29 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
 /// restricted form projects the same model from fewer layers, so each value's provenance tag reads
 /// as what that source contributes over the built-in defaults.
 pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
-    let resolved = super::load_scoped(cwd, source);
+    let mut resolved = super::load_scoped(cwd, source);
+
+    // Reflect an ambient one-shot override (`OPS_CONFIG`/`OPS_ENV_*`) in the full view, so
+    // `ops config show` does not lie about what a launch in this environment would do — its values
+    // then carry the `override` provenance tag. Only the full (`All`) view: the single-source
+    // `--global/--local/--default` views show what one config *file* contributes, which an override
+    // is not. Per-invocation CLI `--config`/`--env` are not previewed here (run the launch to see
+    // them); only the ambient environment is read.
+    if matches!(source, super::Source::All) {
+        if let Ok(ov) = super::overrides::collect(&[], &[]) {
+            if !ov.is_empty() {
+                // A set-but-invalid override value would abort a real launch; here (a read-only view)
+                // surface the error as a note and show the untouched baseline, so `ops config show`
+                // neither lies about the override nor pretends a bad value took effect.
+                if let Err(e) = resolved.apply_override_channel(&ov) {
+                    resolved.warnings.push(e);
+                }
+                if let Err(errs) = resolved.apply_override(ov) {
+                    resolved.warnings.extend(errs);
+                }
+            }
+        }
+    }
 
     let env = resolved
         .env

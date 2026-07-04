@@ -15,9 +15,12 @@
 //! on the same inode.
 
 pub(crate) mod manage;
+pub(crate) mod overrides;
 pub(crate) mod safety;
 mod schema;
 pub(crate) mod view;
+
+pub(crate) use overrides::Override;
 
 use crate::allowlist::{Layer, Methods, Rule, RuleKind};
 use crate::plugins::PluginRegistry;
@@ -34,6 +37,9 @@ use std::path::{Path, PathBuf};
 const GLOBAL_CONFIG: &str = "ops.toml";
 /// The project config file name, in the project root.
 pub(crate) const PROJECT_CONFIG: &str = ".ops.toml";
+/// The source label a one-shot override's warnings carry, so a dropped/malformed override field
+/// reads as `override: …` rather than as coming from a config file.
+const OVERRIDE_SOURCE: &str = "override";
 /// The directory of imported app profiles, beside the global config (`…/ops/apps/`). A profile
 /// is a standalone TOML file (a top-level [`schema::RawApp`]) whose *filename* is the app name;
 /// it is trusted by location, exactly like the global config, so its apps join the global app
@@ -427,6 +433,9 @@ pub(crate) enum Provenance {
     Global,
     /// The project `.ops.toml`.
     Project,
+    /// A one-shot command-line/environment override (`--config`/`--env`/`OPS_*`), trusted by
+    /// invocation — the final word, applied over every config layer.
+    Override,
 }
 
 /// The per-field provenance of the cage's cgroup limits. Each of the three limits is a standalone
@@ -660,6 +669,288 @@ impl Resolved {
         }
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
     }
+
+    /// Apply a one-shot override's **nixpkgs channel**, if it set one, as the authoritative pin for
+    /// this launch. Called from `prepare` *before* the lock target is chosen, because the channel
+    /// decides which lock the whole launch (base userland and tools alike) resolves against — too
+    /// late to set once [`crate::sandbox::effective_lock_target`] has read it.
+    ///
+    /// It reuses `nixpkgs_project` (the highest-precedence effective source), so an override wins
+    /// over a trusted project's own pin. One display residual: the channel line then reads as a
+    /// project-level source rather than "override" — the launched value is correct, only its label
+    /// is coarse. The rest of the override is applied by [`Resolved::apply_override`], after any app
+    /// overlay merges.
+    /// A set-but-invalid channel is a **hard error** (`Err`): unlike a config layer, an override has
+    /// no safe fallback — keeping the baseline would resolve a *different* source than the user's
+    /// (mistyped) explicit one, a silent fail-open on a supply-chain field. The caller aborts the
+    /// launch. `Ok(())` when the override set no channel or set a valid one.
+    pub(crate) fn apply_override_channel(&mut self, ov: &Override) -> Result<(), String> {
+        let Some(value) = ov.raw.nixpkgs.clone() else {
+            return Ok(());
+        };
+        let mut notes = Vec::new();
+        match validate_nixpkgs(&mut notes, OVERRIDE_SOURCE, value) {
+            Some(valid) => {
+                self.nixpkgs_project = Some(valid);
+                Ok(())
+            }
+            None => Err(notes
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| format!("{OVERRIDE_SOURCE}: invalid `nixpkgs` value"))),
+        }
+    }
+
+    /// Apply a one-shot override as the authoritative **final word** on this resolved configuration
+    /// — after the project layer (for `ops run`/`ops shell`) or after a named app's overlay (for
+    /// `ops app`), so it beats both. Consumes the override. The nixpkgs channel is handled earlier
+    /// by [`Resolved::apply_override_channel`] (the lock is already chosen by now), so it is skipped.
+    ///
+    /// Trusted **by invocation**: every field is honored, since the invoker owns the process argv
+    /// and environment (no lower-trust context can reach them). Each field it sets is stamped
+    /// [`Provenance::Override`] for `ops config show`; its binds are canonicalized and its secret
+    /// posture re-checked exactly as the layered fields are, so this is a faithful final layer, not
+    /// a raw assignment. `[net.groups]`/`[app.*]` in an override are ignored (noticed at collection
+    /// time), so they never reach here.
+    ///
+    /// A set-but-invalid **scalar security posture** (`network`/`gui`/`[limits]`) is a **hard error**
+    /// (`Err`, the launch aborts): there is no safe fallback — silently keeping the baseline could
+    /// leave a *wider* posture than the user's explicit (mistyped) intent, the exact fail-open this
+    /// feature must not have. The additive fields (`env`/`binds`/`packages`) instead fail *closed* by
+    /// dropping a bad entry (a missing bind or unbuilt tool is less capability, never a wider
+    /// posture), so they warn and skip rather than abort. On a hard error nothing is applied (the
+    /// scalars are validated up front, before any mutation), so a caller that surfaces the error can
+    /// still show the untouched baseline.
+    pub(crate) fn apply_override(&mut self, ov: Override) -> Result<(), Vec<String>> {
+        let Override { raw, .. } = ov;
+        let RawConfig {
+            env,
+            binds,
+            packages,
+            network,
+            gui,
+            limits,
+            secret,
+            // The channel is applied earlier (before the lock is chosen); groups/apps are not
+            // launch-shaping and were noticed and dropped at collection time.
+            nixpkgs: _,
+            net: _,
+            app: _,
+        } = raw;
+
+        // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
+        // and nothing must be mutated before that verdict. Validation warnings accumulate locally so
+        // a *fatal* one is promoted into the returned error (printed before aborting) rather than
+        // lost with the dropped config; on success they merge into `self.warnings`.
+        let mut notes = Vec::new();
+        let (scalars, fatal) =
+            build_override_scalars(&self.network, network, gui, limits, &mut notes);
+        if !fatal.is_empty() {
+            return Err(override_fatal_error(fatal, notes));
+        }
+        let OverrideScalars {
+            network: new_network,
+            gui: new_gui,
+            limits: new_limits,
+        } = scalars;
+
+        // No fatal — apply. Promote the (non-fatal) validation notes to the resolved warnings.
+        self.warnings.extend(notes);
+
+        // `env` — a free field; upsert over the resolved set, stamping the override provenance.
+        apply_env(
+            &mut self.env,
+            Some((Provenance::Override, &mut self.env_layer)),
+            &mut self.warnings,
+            OVERRIDE_SOURCE,
+            env,
+            false,
+        );
+
+        // `binds` — validate to absolute, canonicalize (as `load` does for the layered binds), then
+        // merge by canonical path so the override's mode wins on a collision. The provenance is
+        // recorded keyed by the *canonical* path, matching the displayed bind. Fail-closed: a
+        // malformed/missing entry is warned and skipped (fewer binds, never a wider exposure).
+        if !binds.is_empty() {
+            let mut resolved_binds: Vec<Bind> = Vec::new();
+            apply_binds(
+                &mut resolved_binds,
+                None,
+                &mut self.warnings,
+                OVERRIDE_SOURCE,
+                binds,
+            );
+            let roots = ops_control_plane_roots();
+            for bind in canonicalize_binds(resolved_binds, &roots, &mut self.warnings) {
+                self.bind_layer
+                    .insert(bind.path.clone(), Provenance::Override);
+                if let Some(existing) = self.binds.iter_mut().find(|b| b.path == bind.path) {
+                    *existing = bind;
+                } else {
+                    self.binds.push(bind);
+                }
+            }
+        }
+
+        // `packages` — trusted by invocation; upsert by name over the resolved set.
+        if !packages.is_empty() {
+            apply_packages(
+                &mut self.packages,
+                &mut self.warnings,
+                OVERRIDE_SOURCE,
+                packages,
+                TrustState::Trusted,
+                false,
+            );
+        }
+
+        // The scalar postures validated above.
+        if let Some((policy, stats)) = new_network {
+            if let Some(b) = stats {
+                self.egress_stats = b;
+            }
+            self.network = policy;
+            self.network_origin = Provenance::Override;
+        }
+        if let Some(policy) = new_gui {
+            self.gui = policy;
+            self.gui_origin = Provenance::Override;
+        }
+        if let Some(over) = new_limits {
+            mark_limit_origins(&mut self.limits_origin, &over, Provenance::Override);
+            overlay_limits(&mut self.limits, over);
+        }
+
+        // `[secret]` — trusted by invocation; the credentials add to the effective set, resolved
+        // through the override's own `[secret.defaults]`. The plaintext still never enters the cage
+        // (the proxy injects it host-side). The secret↔posture invariant is re-checked against the
+        // possibly-just-overridden posture below.
+        if let Some(section) = secret {
+            let defaults = section
+                .defaults
+                .as_ref()
+                .map(SecretDefaults::from_raw)
+                .unwrap_or_default();
+            let plugins = match crate::store::Layout::from_env() {
+                Some(layout) => PluginRegistry::load(&layout.plugins_dir(), &mut self.warnings),
+                None => PluginRegistry::default(),
+            };
+            apply_secret_section(
+                &mut self.secrets,
+                &mut self.warnings,
+                OVERRIDE_SOURCE,
+                section.hosts,
+                &defaults,
+                &plugins,
+            );
+        }
+        enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
+        Ok(())
+    }
+
+    /// Validate a one-shot override's scalar security postures **without applying anything**, so a
+    /// launch can reject a mistyped value *before* the expensive channel/userland resolution rather
+    /// than after. Same verdict [`Resolved::apply_override`] would reach for those fields (the
+    /// baseline is the mode-inheritance parent — and a mode-less table never *fails*, only resolves
+    /// to a different valid policy, so validating against the baseline catches exactly the fatal
+    /// values an app overlay would too). Borrows the override, so the scalar fields are cloned.
+    pub(crate) fn validate_override(&self, ov: &Override) -> Result<(), Vec<String>> {
+        let mut notes = Vec::new();
+        let (_, fatal) = build_override_scalars(
+            &self.network,
+            ov.raw.network.clone(),
+            ov.raw.gui.clone(),
+            ov.raw.limits.clone(),
+            &mut notes,
+        );
+        if fatal.is_empty() {
+            Ok(())
+        } else {
+            Err(override_fatal_error(fatal, notes))
+        }
+    }
+}
+
+/// The validated scalar security postures a one-shot override sets: each `Some` only when the
+/// override declared it and it validated. Built once by [`build_override_scalars`] and consumed by
+/// both the pre-launch check ([`Resolved::validate_override`], which discards it) and the real
+/// application ([`Resolved::apply_override`], which assigns from it).
+#[derive(Default)]
+struct OverrideScalars {
+    /// The resolved network policy plus the egress-stats toggle the `[network]` table carried.
+    network: Option<(NetworkPolicy, Option<bool>)>,
+    gui: Option<GuiPolicy>,
+    limits: Option<crate::sandbox::cgroup::Limits>,
+}
+
+/// Validate an override's scalar security postures (`network`/`gui`/`[limits]`) against `baseline`
+/// (the mode-inheritance parent). Returns the built policies and the list of *fatal* field names —
+/// a set-but-invalid one, which has no safe fallback for an override. Non-fatal validator notes are
+/// pushed to `notes`. Consuming (the fields move into the validators), so a borrowing caller clones.
+fn build_override_scalars(
+    baseline: &NetworkPolicy,
+    network: Option<NetworkField>,
+    gui: Option<String>,
+    limits: Option<schema::RawLimits>,
+    notes: &mut Vec<String>,
+) -> (OverrideScalars, Vec<String>) {
+    let mut fatal = Vec::new();
+    let mut scalars = OverrideScalars::default();
+
+    if let Some(field) = network {
+        let stats = network_stats_of(&field);
+        warn_if_baseline_sets_default_methods(notes, OVERRIDE_SOURCE, &field);
+        // An override has no `@group` vocabulary (groups are a global-config concept), so a
+        // mode-less table inherits from `baseline` and an `@ref` fails closed at the matcher.
+        let groups = build_net_groups(notes, BTreeMap::new());
+        match validate_network(notes, OVERRIDE_SOURCE, field, &groups, baseline) {
+            Some(policy) => scalars.network = Some((policy, stats)),
+            None => fatal.push("network".to_string()),
+        }
+    }
+    if let Some(value) = gui {
+        match validate_gui(notes, OVERRIDE_SOURCE, value) {
+            Some(policy) => scalars.gui = Some(policy),
+            None => fatal.push("gui".to_string()),
+        }
+    }
+    if let Some(raw_limits) = limits {
+        // Which fields the override set — a set field that validates to `None` is invalid.
+        let set = (
+            raw_limits.memory_high.is_some(),
+            raw_limits.memory_max.is_some(),
+            raw_limits.tasks_max.is_some(),
+        );
+        let over = validate_limits(notes, OVERRIDE_SOURCE, Some(raw_limits));
+        if set.0 && over.memory_high.is_none() {
+            fatal.push("limits.memory_high".to_string());
+        }
+        if set.1 && over.memory_max.is_none() {
+            fatal.push("limits.memory_max".to_string());
+        }
+        if set.2 && over.tasks_max.is_none() {
+            fatal.push("limits.tasks_max".to_string());
+        }
+        scalars.limits = Some(over);
+    }
+    (scalars, fatal)
+}
+
+/// Assemble the hard-error message list for a one-shot override with invalid scalar values: a
+/// summary naming the offending fields, then the specific validator notes (so the exact reason
+/// survives the aborted launch, which discards `self.warnings`).
+fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
+    let fields = fatal
+        .iter()
+        .map(|f| format!("`{f}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut errs = vec![format!(
+        "{OVERRIDE_SOURCE}: invalid value for {fields} — refusing to launch (a one-shot override \
+         must be exact; it does not fall back to the baseline for a security field)"
+    )];
+    errs.extend(notes);
+    errs
 }
 
 /// Layer the global config (trusted by location) under the project config, gating
@@ -6875,6 +7166,199 @@ mod tests {
     /// [`resolve`] with no installed plugins — the default for the layering tests.
     fn resolve_no_plugins(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resolved {
         super::resolve(global, project, &PluginRegistry::default())
+    }
+
+    // --- one-shot override application (`apply_override` / `apply_override_channel`) ---
+
+    /// Apply a one-shot override built from `raw` onto a resolved config, returning the result.
+    /// Expects the override to be valid (the hard-error path is covered by its own test).
+    fn with_override(mut resolved: Resolved, raw: RawConfig) -> Resolved {
+        resolved
+            .apply_override(Override::for_test(raw))
+            .expect("the override applies");
+        resolved
+    }
+
+    #[test]
+    fn a_set_but_invalid_override_security_value_is_a_hard_error_and_mutates_nothing() {
+        // The fail-closed contract on the security half: a typo'd `network` value has no safe
+        // fallback — it must be a hard error, never a silent revert to the (possibly wider) baseline.
+        let mut resolved = resolve_no_plugins(RawConfig::default(), None);
+        assert_eq!(resolved.network, NetworkPolicy::Shared);
+        let errs = resolved
+            .apply_override(Override::for_test(RawConfig {
+                network: Some(NetworkField::Posture("nonee".into())),
+                ..RawConfig::default()
+            }))
+            .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("network")),
+            "the error should name the offending field: {errs:?}"
+        );
+        // and nothing was applied — the baseline posture stands (never a silent wider fallback).
+        assert_eq!(resolved.network, NetworkPolicy::Shared);
+        assert_eq!(resolved.network_origin, Provenance::Default);
+    }
+
+    #[test]
+    fn a_set_but_invalid_override_channel_is_a_hard_error() {
+        let mut resolved = resolve_no_plugins(RawConfig::default(), None);
+        let err = resolved
+            .apply_override_channel(&Override::for_test(RawConfig {
+                nixpkgs: Some("git+https://evil".into()),
+                ..RawConfig::default()
+            }))
+            .unwrap_err();
+        assert!(err.contains("nixpkgs"), "{err}");
+        assert_eq!(resolved.nixpkgs_project, None);
+    }
+
+    #[test]
+    fn an_additive_override_field_fails_closed_by_skipping_a_bad_entry() {
+        // An override's *additive* fields (a relative bind here) fail closed — the bad entry is
+        // dropped with a warning, not a hard error, because a missing bind is less capability, never
+        // a wider posture. So this must still be `Ok` (unlike an invalid scalar posture).
+        let resolved = resolve_no_plugins(RawConfig::default(), None);
+        let before = resolved.binds.len();
+        let r = with_override(
+            resolved,
+            RawConfig {
+                binds: vec![RawBind::Path("relative/path".into())],
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(r.binds.len(), before, "the relative bind is dropped");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("override")),
+            "the dropped bind should be warned: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn an_override_replaces_the_network_posture_and_beats_a_trusted_project() {
+        // A trusted project sets an allowlist; the override forces `none`. The override wins, and the
+        // winning posture is stamped `Override` for `ops config show`.
+        let project = RawConfig {
+            network: Some(net_field("deny", &["github.com"], &[])),
+            ..RawConfig::default()
+        };
+        let resolved =
+            resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+        assert!(matches!(resolved.network, NetworkPolicy::Allowlist(_)));
+        let r = with_override(
+            resolved,
+            RawConfig {
+                network: Some(NetworkField::Posture("none".into())),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(r.network, NetworkPolicy::Isolated);
+        assert_eq!(r.network_origin, Provenance::Override);
+    }
+
+    #[test]
+    fn an_override_beats_an_app_overlay() {
+        // The flagship: `ops app <name> --config network="shared"` must beat the app's own posture,
+        // because the override is applied *after* the app overlay merges.
+        let app = raw_app(
+            &["true"],
+            &[],
+            &[],
+            &[],
+            Some(net_field("deny", &["github.com"], &[])),
+        );
+        let mut resolved = resolve_no_plugins(raw_with_app("demo", app), None);
+        let app_cfg = resolved.apps.remove("demo").expect("the app resolves");
+        resolved.merge_app(app_cfg);
+        assert!(matches!(resolved.network, NetworkPolicy::Allowlist(_)));
+        let r = with_override(
+            resolved,
+            RawConfig {
+                network: Some(NetworkField::Posture("shared".into())),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(r.network, NetworkPolicy::Shared);
+        assert_eq!(r.network_origin, Provenance::Override);
+    }
+
+    #[test]
+    fn an_override_upserts_env_over_the_baseline_with_override_provenance() {
+        let resolved = resolve_no_plugins(
+            RawConfig {
+                env: BTreeMap::from([("FOO".to_string(), "base".to_string())]),
+                ..RawConfig::default()
+            },
+            None,
+        );
+        let r = with_override(
+            resolved,
+            RawConfig {
+                env: BTreeMap::from([
+                    ("FOO".to_string(), "over".to_string()),
+                    ("NEW".to_string(), "1".to_string()),
+                ]),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(
+            r.env
+                .iter()
+                .find(|(k, _)| k == "FOO")
+                .map(|(_, v)| v.as_str()),
+            Some("over")
+        );
+        assert_eq!(r.env_layer.get("FOO").copied(), Some(Provenance::Override));
+        assert_eq!(r.env_layer.get("NEW").copied(), Some(Provenance::Override));
+    }
+
+    #[test]
+    fn an_override_gui_and_limits_win_and_are_stamped_override() {
+        let resolved = resolve_no_plugins(RawConfig::default(), None);
+        let r = with_override(
+            resolved,
+            RawConfig {
+                gui: Some("wayland".into()),
+                limits: Some(schema::RawLimits {
+                    memory_high: None,
+                    memory_max: None,
+                    tasks_max: Some(schema::RawLimit::Number(4096)),
+                }),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(r.gui, GuiPolicy::Wayland);
+        assert_eq!(r.gui_origin, Provenance::Override);
+        assert_eq!(r.limits.tasks_max.as_deref(), Some("4096"));
+        assert_eq!(r.limits_origin.tasks_max, Provenance::Override);
+    }
+
+    #[test]
+    fn the_override_channel_pins_nixpkgs_authoritatively() {
+        let mut resolved = resolve_no_plugins(RawConfig::default(), None);
+        assert_eq!(resolved.nixpkgs_project, None);
+        resolved
+            .apply_override_channel(&Override::for_test(RawConfig {
+                nixpkgs: Some("nixos-23.11".into()),
+                ..RawConfig::default()
+            }))
+            .expect("a valid channel applies");
+        assert_eq!(resolved.nixpkgs_project.as_deref(), Some("nixos-23.11"));
+    }
+
+    #[test]
+    fn an_empty_override_leaves_the_resolved_config_untouched() {
+        let resolved = resolve_no_plugins(RawConfig::default(), None);
+        let (net, origin, warns) = (
+            resolved.network.clone(),
+            resolved.network_origin,
+            resolved.warnings.len(),
+        );
+        let r = with_override(resolved, RawConfig::default());
+        assert_eq!(r.network, net);
+        assert_eq!(r.network_origin, origin);
+        assert_eq!(r.warnings.len(), warns);
     }
 
     #[test]

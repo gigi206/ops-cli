@@ -195,6 +195,155 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
 }
 
 #[test]
+fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
+    // Fail-closed: a malformed `--config` is a usage error (exit 2) surfaced before any sandbox
+    // work — never a silent drop that would launch a different posture than asked. Needs no capable
+    // host (it fails at parse time).
+    let project = TmpDir::new("ov-bad-proj");
+    let data = TmpDir::new("ov-bad-data");
+    let bad_toml = ops()
+        .args(["run", "--config", "x = = not toml", "--", "true"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn ops run");
+    assert_eq!(
+        bad_toml.status.code(),
+        Some(2),
+        "a malformed override must exit 2"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_toml.stderr).contains("--config"),
+        "the error should name the offending override: {}",
+        String::from_utf8_lossy(&bad_toml.stderr)
+    );
+
+    // The security-critical half: a *set-but-invalid* value in well-formed TOML (a typo'd security
+    // posture) is also a hard error (exit 2) that refuses to launch — never a silent fall-back to
+    // the baseline posture, which for a `network` typo would be the wide default `shared` while the
+    // user believed they isolated the cage. It aborts *before* provisioning, so it needs no capable
+    // host, and it must not have launched (`false` would exit 1 if it ran; the abort is 2).
+    let bad_value = ops()
+        .args(["run", "--config", "network=\"nonee\"", "--", "false"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn ops run");
+    assert_eq!(
+        bad_value.status.code(),
+        Some(2),
+        "a set-but-invalid security value must exit 2, not launch: {}",
+        String::from_utf8_lossy(&bad_value.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&bad_value.stderr);
+    assert!(
+        stderr.contains("network") && stderr.contains("refusing to launch"),
+        "the error should name the field and refuse: {stderr}"
+    );
+}
+
+#[test]
+fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
+    // The flagship, end to end through the real binary: `ops app <name> --env` must beat the app's
+    // own `env` overlay — proving the dispatch applies the override *after* `merge_app`, the load-
+    // bearing ordering a unit test that calls the two by hand cannot cover. Skips (never fails) when
+    // the host cannot sandbox.
+    let project = TmpDir::new("ov-app-proj");
+    let data = TmpDir::new("ov-app-data");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[app.greet]\ncmd = [\"printenv\", \"APPVAR\"]\n[app.greet.env]\nAPPVAR = \"from-app\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping override-vs-app e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // Without an override, the app's own env overlay wins.
+    let base = app_in(project.path(), data.path(), "greet");
+    assert_eq!(
+        String::from_utf8_lossy(&base.stdout).trim(),
+        "from-app",
+        "the app overlay should set APPVAR"
+    );
+
+    // With `--env`, the override is the final word — it beats the app overlay.
+    let overridden = ops()
+        .args(["app", "greet", "--env", "APPVAR=from-override"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn ops app");
+    assert_eq!(
+        String::from_utf8_lossy(&overridden.stdout).trim(),
+        "from-override",
+        "the override did not beat the app overlay (ordering wrong?): stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&overridden.stdout),
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+}
+
+#[test]
+fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() {
+    // The one-shot override, proven end to end through a real launch: `--env`/`OPS_ENV_<KEY>`/
+    // `--config` all reach the cage environment, and the documented precedence holds — the command
+    // line beats the environment. Observed by `printenv` inside the cage. Skips (never fails) when
+    // the host cannot sandbox.
+    let project = TmpDir::new("ov-env-proj");
+    let data = TmpDir::new("ov-env-data");
+
+    // capability probe
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping override e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // Run `ops run` with arbitrary leading flags and process env, reading one cage variable.
+    let read = |args: &[&str], env: &[(&str, &str)]| -> String {
+        let mut cmd = ops();
+        cmd.arg("run").args(args);
+        cmd.args(["--", "printenv", "OVMARK"]);
+        cmd.current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn ops run");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // `--env KEY=VALUE` reaches the cage.
+    assert_eq!(read(&["--env", "OVMARK=cli"], &[]), "cli");
+    // `OPS_ENV_<KEY>` in the environment reaches the cage.
+    assert_eq!(read(&[], &[("OPS_ENV_OVMARK", "env")]), "env");
+    // The `--config` TOML blob's `[env]` reaches the cage.
+    assert_eq!(read(&["--config", "env.OVMARK = \"blob\""], &[]), "blob");
+    // Precedence: the command line beats the environment (a stale `OPS_ENV_*` cannot win).
+    assert_eq!(
+        read(&["--env", "OVMARK=cli"], &[("OPS_ENV_OVMARK", "env")]),
+        "cli"
+    );
+    // Precedence within the command line: the typed `--env` beats the `--config` blob.
+    assert_eq!(
+        read(
+            &["--config", "env.OVMARK = \"blob\"", "--env", "OVMARK=cli"],
+            &[]
+        ),
+        "cli"
+    );
+}
+
+#[test]
 fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     // The headline of the ro/rw bind choice, with teeth on both sides. Two host directories are
     // bound into a trusted project — one `mode = "rw"`, one read-only (the default). A cage that
