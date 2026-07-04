@@ -89,3 +89,18 @@ rename a control-plane directory out of the way and substitute a forged one. See
 
 An `[app.<name>]` overlay can add its own `binds`, layered onto the baseline. Same
 gating (security field), same rules. See [`[app.<name>]`](apps.md).
+
+## One-shot override
+
+To add a host bind for a single launch without editing the file, use `--bind`
+(repeatable) or `OPS_BIND`:
+
+```sh
+ops run --bind /opt/data -- ./tool          # read-only (the default)
+ops run --bind /work/scratch:rw -- ./tool   # read-write
+OPS_BIND=/etc/ssl/custom:ro ops shell
+```
+
+The mode is the suffix after the **last** `:`, and only when it is exactly `ro` or
+`rw`. A one-shot bind *adds* to whatever the config binds. The command line beats the
+environment, and both beat the config file. See [One-shot overrides](overrides.md).

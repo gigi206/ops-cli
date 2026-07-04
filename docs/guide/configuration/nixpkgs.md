@@ -68,3 +68,17 @@ pin refreshes to itself (a no-op). See [Upgrading](../housekeeping/upgrade.md).
 ops config show    # the effective source: project pin / global / default
 ops doctor         # the store's channel revision (accurate to disk)
 ```
+
+## One-shot override
+
+To resolve against a different channel or revision for a single launch without editing
+the file, use `--nixpkgs` or `OPS_NIXPKGS`:
+
+```sh
+ops run --nixpkgs nixos-23.11 -- ./build.sh
+OPS_NIXPKGS=nixos-unstable ops shell
+```
+
+`--nixpkgs` takes a branch/channel name or a 40-hex revision (same as the field). The
+command line beats the environment, and both beat the config file. See
+[One-shot overrides](overrides.md).

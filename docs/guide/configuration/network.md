@@ -86,3 +86,19 @@ ops net allow api.github.com          # bootstrap a deny-by-default allowlist
 ops net deny evil.example.com --global
 ops config edit --trust               # edit the table by hand, then re-trust
 ```
+
+## One-shot override
+
+To set the posture for a single launch without editing the file, use `--net` or
+`OPS_NET`:
+
+```sh
+ops run --net none -- ./build.sh                # cut the network for one run
+ops run --net allow=api.github.com -- ./ci.sh   # a one-shot allowlist
+OPS_NET=shared ops shell
+```
+
+`--net` takes `none | shared | ask | allow=h1,h2 | deny=h1,h2` (a bare `allow`/`deny`
+is refused as ambiguous). The command line beats the environment, and both beat the
+config file. For the full grammar and the four-tier precedence, see
+[One-shot overrides](overrides.md).

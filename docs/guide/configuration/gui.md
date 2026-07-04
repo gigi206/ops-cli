@@ -68,3 +68,16 @@ See [`[app.<name>]`](apps.md).
 cmd = "some-electron-app"
 gui = "wayland"
 ```
+
+## One-shot override
+
+To set the display posture for a single launch without editing the file, use `--gui`
+or `OPS_GUI`:
+
+```sh
+ops run --gui wayland -- some-electron-app
+OPS_GUI=none ops shell
+```
+
+`--gui` takes `none | wayland`. The command line beats the environment, and both beat
+the config file. See [One-shot overrides](overrides.md).

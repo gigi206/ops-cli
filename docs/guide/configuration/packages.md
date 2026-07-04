@@ -99,3 +99,18 @@ and a project's [`[tools]`](tools.md).
 ops config show          # each package with its backend and gating
 ops config show --json   # machine-readable
 ```
+
+## One-shot override
+
+To add a package for a single launch without editing the file, use `--package
+<name>=<backend:locator>` (repeatable) or `OPS_PACKAGE_<name>`:
+
+```sh
+ops run --package jq=nix:jq -- ./tool
+OPS_PACKAGE_ripgrep=mise:aqua:BurntSushi/ripgrep ops shell
+```
+
+The value carries the same mandatory backend prefix as the field
+(`nix:`/`mise:`/`flake:`). A one-shot package *adds* to whatever the config declares.
+The command line beats the environment, and both beat the config file. See
+[One-shot overrides](overrides.md).

@@ -79,3 +79,18 @@ ops config show            # a `limits:` line only when a field is overridden
 ops config show --app cap  # an app's effective limits, tagged inherited or set
 ops doctor                 # the host's resource-limiting capability
 ```
+
+## One-shot override
+
+To tune a single limit for one launch without editing the file, use `--limit
+<key>=<value>` (repeatable) or `OPS_LIMIT_<key>`:
+
+```sh
+ops run --limit tasks_max=8192 -- ./build.sh
+OPS_LIMIT_MEMORY_MAX=16G ops shell
+```
+
+The key is one of `memory_high` / `memory_max` / `tasks_max` (the `OPS_LIMIT_` suffix
+is case-insensitive). A one-shot limit tunes that field without dropping the others.
+The command line beats the environment, and both beat the config file. See
+[One-shot overrides](overrides.md).

@@ -46,7 +46,7 @@ Ergonomic shorthands for a single field, each with an `OPS_*` environment equiva
 ```sh
 ops run --net none --limit tasks_max=8192 -- ./build.sh
 ops app claude-code --net none            # cut the app's network for one run
-OPS_NET=deny OPS_BIND=/opt/data:ro ops shell
+OPS_NET=none OPS_BIND=/opt/data:ro ops shell
 ```
 
 #### The `--net` posture
