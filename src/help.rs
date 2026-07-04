@@ -607,7 +607,7 @@ const PAGES: &[Page] = &[
     // ---- net subcommands ----------------------------------------------------------
     Page {
         path: &["net", "rules"],
-        synopsis: "ops net rules [-a|--app <name>] [-s|--source config|builtin|manual] [-f|--filter <substr>] [-e|--expand] [--json]",
+        synopsis: "ops net rules [-a|--app <name>] [-s|--source config|builtin|session] [-f|--filter <substr>] [-e|--expand] [--json]",
         summary: "list the effective egress rules by source",
         options: &[
             (
@@ -616,7 +616,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "-s, --source <src>",
-                "show only one source: config (the .ops.toml/global rules), builtin (the always-allowed self-equip set), or manual (live `--session` rules)",
+                "show only one source: config (the .ops.toml/global rules), builtin (the always-allowed self-equip set), or session (live `--session` rules; `manual` is accepted as an alias)",
             ),
             (
                 "-f, --filter <substr>",
@@ -637,7 +637,7 @@ const PAGES: &[Page] = &[
             `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
             directly with `ops net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
             <name>` shows what `ops app <name>` would launch with — the same effective policy `ops\n\
-            test net --app` tests a URL against. `--source manual` instead queries this project's live\n\
+            test net --app` tests a URL against. `--source session` instead queries this project's live\n\
             ask sessions for the rules they remembered from `--session` answers (it does not combine\n\
             with `--app`). No launch, no nix.",
     },

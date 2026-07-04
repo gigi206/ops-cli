@@ -28,7 +28,7 @@ ops net rules                        # the baseline effective rules
 ops net rules -a claude              # what `ops app claude` would launch with
 ops net rules --source config        # only the .ops.toml/global rules
 ops net rules --source builtin       # only the always-allowed self-equip set
-ops net rules --source manual        # rules a live ask-session remembered (--session)
+ops net rules --source session        # rules a live ask-session remembered (--session)
 ops net rules --expand               # unfold each @group to its hosts
 ops net rules --filter github        # only rules whose text contains "github"
 ops net rules --json
@@ -224,7 +224,7 @@ append shape is pipe-friendly, and `--json` streams one event object per line.
 
 - [Network modes](modes.md) — the postures these surfaces describe.
 - [Rule grammar](rules.md) — how a rule is written, tested, and rendered.
-- [Ask mode](ask.md) — `ops net rules --source manual` and the parked-request flow.
+- [Ask mode](ask.md) — `ops net rules --source session` and the parked-request flow.
 - [Architecture](architecture.md) — the SSRF guard and anti-fronting checks behind
   the `blocked` verdicts.
 - Design: [egress event log plan](../../bwrap-egress-log-plan.md) — the live-only

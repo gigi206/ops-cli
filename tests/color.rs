@@ -91,7 +91,7 @@ fn captured_output_carries_no_ansi_escapes() {
         &["plugins", "store", "list"],
         &["test", "net", "https://example.com/x"],
         &["net", "rules"],
-        &["net", "rules", "--source", "manual"],
+        &["net", "rules", "--source", "session"],
         &["net", "pending"],
         // The bulk-drain presenter (`--all`) — a no-op with no live session, but it must still build
         // its "no pending requests" line from the captured-stream palette.

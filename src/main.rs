@@ -4760,7 +4760,7 @@ fn log_event_json(
     obj
 }
 
-/// `ops net rules [--source config|builtin] [--filter <substr>] [--json]`: list the effective
+/// `ops net rules [--source config|builtin|session] [--filter <substr>] [--json]`: list the effective
 /// egress rules, each tagged by source, optionally filtered. Reflects the trust gate (an untrusted
 /// project's rules are dropped), and does no launch / nix / network — the read-only posture of
 /// `ops config show` and `ops test net`.
@@ -4785,16 +4785,18 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             }
             Some("--source") | Some("-s") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("ops: `--source` needs a value (config, builtin, manual)");
+                    eprintln!("ops: `--source` needs a value (config, builtin, session)");
                     return ExitCode::from(2);
                 };
                 source = Some(match v {
                     "config" => RuleSourceView::Config,
                     "builtin" => RuleSourceView::Builtin,
-                    "manual" => RuleSourceView::Manual,
+                    // `session` is the live `--session`-answered overlay; `manual` is kept as an
+                    // accepted alias for the same source.
+                    "session" | "manual" => RuleSourceView::Manual,
                     other => {
                         eprintln!(
-                            "ops: unknown rule source '{other}' (known: config, builtin, manual)"
+                            "ops: unknown rule source '{other}' (known: config, builtin, session)"
                         );
                         return ExitCode::from(2);
                     }
@@ -4814,13 +4816,13 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         }
     }
 
-    // `--app` folds a declared config overlay; `--source manual` lists live session rules that no
+    // `--app` folds a declared config overlay; `--source session` lists live session rules that no
     // config produces — orthogonal, so the combination is refused rather than silently ignored
     // (mirroring how `ops config show` rejects `--app` alongside a source flag).
     if app.is_some() && source == Some(RuleSourceView::Manual) {
         eprintln!(
-            "ops: net rules: `--app` does not combine with `--source manual` \
-             (manual rules are live session state, not a config overlay)"
+            "ops: net rules: `--app` does not combine with `--source session` \
+             (session rules are live runtime state, not a config overlay)"
         );
         return ExitCode::from(2);
     }
@@ -4832,8 +4834,8 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // `--source manual` is live runtime state, not config: query this project's ask sessions for the
-    // rules they remembered from `--session` answers, rather than reading the static config policy.
+    // `--source session` is live runtime state, not config: query this project's ask sessions for
+    // the rules they remembered from `--session` answers, rather than reading the static config policy.
     if source == Some(config::view::RuleSourceView::Manual) {
         return net_rules_manual(&cwd, filter.as_deref(), json);
     }
@@ -5278,7 +5280,7 @@ fn render_net_groups(
     o
 }
 
-/// `ops net rules --source manual`: the live manual rules this project's ask sessions remembered
+/// `ops net rules --source session`: the live session rules this project's ask sessions remembered
 /// from `--session` answers. These live in the sessions' memory (not config) and are gone when the
 /// sessions end. Cross-references the registry to find the sessions for this project (by the
 /// canonical project root the registry keys on), queries each one's control socket, and lists the
@@ -5335,7 +5337,7 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
 
     if json {
         let value = serde_json::json!({
-            "mode": "manual",
+            "mode": "session",
             "rules": shown.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
         });
         println!("{value}");
@@ -5343,7 +5345,7 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_net_rules("manual", "", &shown, total, &pal));
+    print!("{}", render_net_rules("session", "", &shown, total, &pal));
     ExitCode::SUCCESS
 }
 
@@ -5360,7 +5362,7 @@ fn render_net_rules(
 ) -> String {
     use config::view::{NetRuleKind, RuleSourceView};
     use std::fmt::Write as _;
-    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let (h, n, ok, err, dim, r) = (pal.head, pal.name, pal.ok, pal.err, pal.dim, pal.reset);
     let mut o = String::new();
 
     match mode {
@@ -5392,12 +5394,12 @@ fn render_net_rules(
                  allow rules auto-pass, deny rules auto-fail{r}"
             );
         }
-        // The live manual-rule listing (`--source manual`): runtime rules from `--session` answers,
-        // not config — framed as such so they are not mistaken for the static policy.
-        "manual" => {
+        // The live session-rule listing (`--source session`): runtime rules from `--session`
+        // answers, not config — framed as such so they are not mistaken for the static policy.
+        "session" => {
             let _ = writeln!(
                 o,
-                "{h}manual egress rules{r} {dim}— live, from `ops net pending … --session` answers \
+                "{h}session egress rules{r} {dim}— live, from `ops net pending … --session` answers \
                  in this project's ask sessions (gone when they end){r}"
             );
         }
@@ -5423,7 +5425,7 @@ fn render_net_rules(
         let source = match rule.source {
             RuleSourceView::Config => "config",
             RuleSourceView::Builtin => "builtin",
-            RuleSourceView::Manual => "manual",
+            RuleSourceView::Manual => "session",
         };
         // A group-expanded rule notes its origin `@<group>` beside the source — but only in the
         // expanded view: a collapsed row's text is already `@<group>`, so the annotation would just
@@ -5434,10 +5436,10 @@ fn render_net_rules(
         };
         match rule.kind {
             NetRuleKind::Allow => {
-                let _ = writeln!(o, "  allow {n}{}{r}  {dim}({tag}){r}", rule.rule);
+                let _ = writeln!(o, "  {ok}allow{r} {n}{}{r}  {dim}({tag}){r}", rule.rule);
             }
             NetRuleKind::Deny => {
-                let _ = writeln!(o, "  {warn}deny{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
+                let _ = writeln!(o, "  {err}deny{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
             }
         }
     }
@@ -7426,6 +7428,8 @@ mod tests {
                 RuleSourceView::Builtin,
                 "cache.nixos.org",
             ),
+            // A live `--session`-answered rule is tagged `session`, not `manual`.
+            mk(NetRuleKind::Deny, RuleSourceView::Manual, "adhoc.test"),
         ];
         let refs: Vec<&NetRuleView> = rules.iter().collect();
 
@@ -7435,6 +7439,12 @@ mod tests {
         assert!(out.contains("allow github.com  (config)"), "{out}");
         assert!(out.contains("deny  evil.com  (config)"), "{out}");
         assert!(out.contains("allow cache.nixos.org  (builtin)"), "{out}");
+        assert!(out.contains("deny  adhoc.test  (session)"), "{out}");
+
+        // Colored: `allow` carries the green span, `deny` the red one.
+        let c = render_net_rules("deny", "", &refs, refs.len(), &style::Palette::colored());
+        assert!(c.contains("\x1b[32mallow\x1b[0m"), "allow is green: {c:?}");
+        assert!(c.contains("\x1b[1;31mdeny\x1b[0m"), "deny is red: {c:?}");
 
         // allow mode frames it as a denylist.
         assert!(render_net_rules("allow", "", &refs, refs.len(), &p).contains("network: allow"));

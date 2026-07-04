@@ -99,7 +99,7 @@ the global config is trusted by location. A saved rule is scoped to a host; the 
 addresses one live session's destination.
 
 The persisted rules a session remembered from `--session` answers are visible with
-[`ops net rules --source manual`](observability.md).
+[`ops net rules --source session`](observability.md).
 
 ---
 
@@ -157,7 +157,7 @@ that omits them leaves the inherited value unchanged).
 - [Network modes](modes.md#ask) — where `ask` sits among the five postures.
 - [Rule grammar](rules.md) — what `allow`/`deny` entries decide *before* a request
   reaches the park.
-- [Observability](observability.md) — `ops net rules --source manual` (the rules a
+- [Observability](observability.md) — `ops net rules --source session` (the rules a
   session remembered), `ops net logs` (watch every decision live).
 - [`ops net pending` CLI reference](../cli/net.md)
 - [The trust gate](../concepts/trust.md) — what `--save` re-trusts.
