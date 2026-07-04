@@ -40,7 +40,15 @@ is the host network by default and can be narrowed to a deny-by-default allowlis
   (binds, network, secrets, packages, app definitions); the trust gate binds
   approval to the file's content hash — the direnv model (`ops trust`).
 
-See [`docs/`](docs/) for the architecture, threat model, and security stack.
+## Documentation
+
+The complete, task-oriented **user guide** lives in
+[`docs/guide/`](docs/guide/README.md) — split into small, cross-linked pages covering
+the concepts, the full `.ops.toml` configuration reference, every command, apps and
+profiles, networking/egress, and secrets. Start there.
+
+For the design rationale and threat analysis, see the `docs/*.md` design documents (the
+architecture, threat model, and security stack), linked from the guide.
 
 ## Build
 

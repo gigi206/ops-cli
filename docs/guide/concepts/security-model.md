@@ -1,0 +1,91 @@
+# Security model
+
+`ops`'s security rests on one central idea: the cage runs **as your uid**
+(same-uid), so **the bind layout is the security control**. This page explains what
+that means and what it protects.
+
+For the full threat analysis and the exact bind zones, see the design document
+[`bwrap-threat-model-and-binds.md`](../../bwrap-threat-model-and-binds.md).
+
+See also: [The trust gate](trust.md) · [Enforcement stack](enforcement.md) · [`binds`](../configuration/binds.md).
+
+## Same-uid: confidentiality by absence
+
+The sandbox does **not** run as a different user. It runs as *you*. That has a sharp
+consequence:
+
+> A read-only bind protects **integrity**, not **confidentiality**. A secret is
+> protected by being **absent** from the cage, not by being mounted read-only.
+
+If a file is bound into the cage — even read-only — the process inside can read it,
+because it runs as the uid that owns the file. So the way `ops` keeps your `~/.ssh`,
+your browser profile, and your cloud credentials safe from an untrusted agent is
+simply that **they are not mounted at all**. The host filesystem is absent by
+default; only what a *trusted* config explicitly binds appears.
+
+This is why `ops` is not a container manager: there is no separate identity to lean
+on. The mount set *is* the boundary.
+
+## The hard requirement
+
+There is no security boundary without **capability-bearing unprivileged user
+namespaces**. `ops` treats their absence as a hard failure, never a silent fallback
+to emulation (which would isolate nothing while looking sandboxed). See
+[`ops doctor`](../getting-started/doctor.md).
+
+## The synthetic identity
+
+Inside the cage the process sees a synthetic identity — `uid=1000(sandbox)` — with a
+synthetic `/etc/passwd` and `/etc/group` generated **outside** every writable mount,
+so the identity's integrity holds even when the agent can write elsewhere. The host
+home and the rest of the host filesystem are not present.
+
+## The bind zones
+
+The cage's filesystem is assembled from a small, explicit set of binds, layered so a
+project's own binds cannot displace `ops`'s structural mounts:
+
+- **The hermetic FHS** — a minimal `/bin/sh`, `/usr/bin/env`, `/nix` (the store),
+  and the synthetic `/etc`. No host `/usr`, no ambient system libraries.
+- **The project** — the current working directory, bound so the tool can work on the
+  code.
+- **Explicitly granted paths** — whatever a *trusted* [`binds`](../configuration/binds.md)
+  declares, read-only by default.
+
+A config bind is emitted *before* the structural mounts, so a colliding entry is
+shadowed rather than overriding `/nix` or the synthetic identity. (One known nuance:
+a config bind that *nests* with a structural mount — a descendant of `/tmp`, say — is
+handled fail-closed and warned about; see [`binds`](../configuration/binds.md).)
+
+## The control plane is pinned
+
+`ops`'s own state — its data, trust, and config directories, all under your `$HOME` —
+is protected even inside a broad read-write bind:
+
+- A read-write bind aimed **at or inside** one of `ops`'s directories is forced
+  read-only, with a warning.
+- A broad read-write bind that merely **contains** them (e.g. `mode = "rw"` on your
+  whole home) stays read-write, but each of `ops`'s roots is **pinned read-only in
+  place** — so the rest of the tree is writable while the agent still cannot alter
+  what `ops` runs or trusts.
+
+This closes an escalation where a writable parent directory would let the agent
+substitute a forged control-plane directory. See [`binds`](../configuration/binds.md)
+for the details and [The trust gate](trust.md) for why it matters.
+
+## What the trust gate protects
+
+An untrusted project's `.ops.toml` **cannot** touch security-relevant fields — binds,
+network, secrets, packages, GUI, limits, app definitions. Only the free `env` field
+applies from an untrusted project (minus a reserved-key denylist). Trust is bound to
+the file's content hash on the direnv model, so any edit re-arms the gate. See
+[The trust gate](trust.md).
+
+## Defense in depth
+
+Beyond the bind layout, every cage runs with an always-on [enforcement
+stack](enforcement.md): bubblewrap drops all capabilities and sets `no_new_privs`, a
+seccomp denylist removes the kernel-LPE syscall surface, and cgroup v2 limits bound
+resource use where the host supports them. Network egress can be narrowed from the
+host network to a [deny-by-default allowlist](../networking/README.md) enforced by a
+host-side proxy.

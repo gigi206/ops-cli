@@ -1,0 +1,67 @@
+# The app framework
+
+An **app** is a named, reusable agent launcher — the flagship surface of `ops`. It
+bundles a command with a security and tooling overlay so you can run an autonomous
+agent *on* untrusted code, safely and repeatably.
+
+```sh
+ops app import profiles/claude-code.toml   # a deliberate trust act
+ops app claude-code                        # launch it, sandboxed
+```
+
+See also: [`[app.<name>]` config](../configuration/apps.md) · [Per-app home](home.md) · [Portable profiles](profiles.md) · [Profile catalog](catalog.md) · [`ops app`](../cli/app.md).
+
+## The two-layer model
+
+An app is an **overlay** over the sandbox baseline:
+
+```
+sandbox baseline  +  [app.<name>] overlay  →  what `ops app <name>` launches
+```
+
+The baseline is your project's resolved config (global + project). The overlay adds the
+app's `cmd`, `env`, `packages`, `binds`, `network`, `gui`, `secret`, and `limits`. Each
+overlay field is [gated by trust](../concepts/trust.md) exactly like the baseline, then
+merged onto it. A one-shot [override](../configuration/overrides.md) applies *after* the
+overlay, as the final word.
+
+## Every app is Mode B
+
+An app is the locked-down [agent posture](../concepts/overview.md#the-two-actor-modes):
+
+- Its own **persistent isolated `$HOME`** — the agent's config, login state, and
+  history never bleed into your project shell or another app. See [Per-app home](home.md).
+- **Read-by-default egress** — an app's allow rules default to `{GET,HEAD}`, so an
+  agent reads but does not write unless a rule opts a host out. See
+  [`default_methods`](../configuration/network.md#default_methods-apps).
+- **Host-side credential injection** — the API key is read on the host and injected on
+  the wire by the [egress proxy](../secrets/injection.md); it never enters the cage.
+
+## The flagship property
+
+A **globally-declared app keeps its posture even under an untrusted project.** That is
+the whole point: you can point an agent at a repository you do not trust, and the
+agent's command, network allowlist, and credentials are fixed by *your* profile, not
+by the project.
+
+Two integrity gates enforce it: an untrusted project cannot override a trusted app's
+[`cmd`](../configuration/apps.md#layering-and-gating) (which would run attacker code
+under the app's posture), nor flip a trusted app's [`home_scope`](home.md) from
+`"project"` to `"global"` (which would route an untrusted run into a shared home). Its
+`packages` are protected the same way.
+
+## Declaring an app
+
+- **Inline** — a `[app.<name>]` table in a project `.ops.toml` (or the global
+  `ops.toml`, though a *global* app is best kept as a profile file). See
+  [`[app.<name>]`](../configuration/apps.md).
+- **A profile file** — a standalone `apps/<name>.toml`, imported with
+  [`ops app import`](../cli/app.md). This is the portable form. See
+  [Portable profiles](profiles.md).
+
+## Where to go next
+
+- [Per-app isolated `$HOME`](home.md) — persistence and the `home_scope` choice.
+- [Portable profiles](profiles.md) — import, export, and the trust act.
+- [Profile catalog](catalog.md) — the agent profiles shipped in this repository.
+- [Secrets](../secrets/README.md) — how a credential is injected without entering the cage.
