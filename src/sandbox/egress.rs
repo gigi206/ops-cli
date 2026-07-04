@@ -210,7 +210,8 @@ pub(crate) fn start(
     let asks = policy.default_action() == crate::allowlist::DefaultAction::Ask;
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
-        .with_redactions(redactions);
+        .with_redactions(redactions)
+        .with_app(app.map(str::to_string));
 
     // Stand up the control socket the host-side `ops net pending`/`ops net log` reach. It lives under
     // the `0700` egress dir beside `<data>` and is **never** bound into the cage (only the proxy

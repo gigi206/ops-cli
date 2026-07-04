@@ -109,7 +109,7 @@
 //! a legitimate injection-host response would be struck out of it — again entropy- and
 //! minimum-length-mitigated, and confined to the one injection-target host.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
@@ -129,7 +129,7 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 
-use crate::allowlist::{self, Decision, EgressPolicy, L4Decision, Rule, RuleKind};
+use crate::allowlist::{self, Decision, EgressPolicy, L4Decision, RefusalNotice, Rule, RuleKind};
 
 use super::egress_stats::{EgressStats, StatKind};
 
@@ -556,6 +556,13 @@ pub(crate) struct ProxyCtx {
     /// (see [`MAX_CONCURRENT_CONNS`]) — a burst of connections cannot exhaust host threads/fds and
     /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
     conns: AtomicUsize,
+    /// The `host:port` pairs a [`RefusalNotice::Once`] refusal notice has already printed this
+    /// session, so a repeated block of the same destination stays silent. Shared across connection
+    /// threads through the `Arc<ProxyCtx>`; unused under the other cadences.
+    refusal_noticed: Mutex<HashSet<(String, u16)>>,
+    /// The `ops app <name>` this launch runs, if any — used only to scope the refusal notice's
+    /// `ops net allow` suggestion to the app (`--app <name>`). `None` for a bare `ops run`/`shell`.
+    app: Option<String>,
 }
 
 impl ProxyCtx {
@@ -586,7 +593,17 @@ impl ProxyCtx {
             log: None,
             splices: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
+            refusal_noticed: Mutex::new(HashSet::new()),
+            app: None,
         })
+    }
+
+    /// Name the `ops app <name>` this launch runs, so the refusal notice scopes its `ops net allow`
+    /// suggestion to that app. Set once by the launch ([`super::egress::start`]); left unset (a bare
+    /// `ops run`/`shell`) the suggestion targets the project baseline.
+    pub(crate) fn with_app(mut self, app: Option<String>) -> Self {
+        self.app = app;
+        self
     }
 
     /// Attach the session's per-host decision counters, so each request's outcome is recorded.
@@ -629,6 +646,48 @@ impl ProxyCtx {
             StatKind::Blocked => super::control::LogVerdict::Blocked,
         };
         self.push_log(host, port, method, path, verdict, reason)
+    }
+
+    /// Decide whether to print the refusal notice for this `host:port`, per the policy's
+    /// [`RefusalNotice`] cadence: `Off` never, `Each` always, `Once` only the first time a given
+    /// destination is refused this session (recording it so a repeat returns `false`). Pure of I/O
+    /// so the cadence/dedup is unit-testable without capturing stderr.
+    fn should_print_refusal(&self, host: &str, port: u16) -> bool {
+        match self.policy.refusal_notice() {
+            RefusalNotice::Off => false,
+            RefusalNotice::Each => true,
+            RefusalNotice::Once => self
+                .refusal_noticed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((host.to_string(), port)),
+        }
+    }
+
+    /// The copy-paste `ops net allow` command the refusal notice suggests. When the launch is an
+    /// `ops app <name>` (the app hint is set), it names the app — `ops net allow <host> --app
+    /// <name>` writes the allow into that app's config rather than the project baseline, which is
+    /// what the user almost always means when an *app's* egress was blocked. Pure so it is
+    /// unit-testable. The `--app` write defaults to the project scope (least privilege); the user
+    /// adds `-g` to reach a global profile.
+    fn allow_suggestion(&self, host: &str) -> String {
+        match &self.app {
+            Some(name) => format!("ops net allow {host} --app {name}"),
+            None => format!("ops net allow {host}"),
+        }
+    }
+
+    /// Print the stderr refusal notice for a `denied-default` refusal (a host no allow rule
+    /// matched), gated by [`Self::should_print_refusal`]. Called only from the `denied-default`
+    /// path, so the yellow `ops net allow` suggestion is always sound — an explicit deny or a
+    /// security refusal never reaches here.
+    fn refusal_notice(&self, host: &str, port: u16) {
+        if self.should_print_refusal(host, port) {
+            print_egress_notice(
+                &format!("egress refused {host}:{port}"),
+                &[("allow", &self.allow_suggestion(host))],
+            );
+        }
     }
 
     /// Push one event into the live log **without** touching the stat counters — for the outcomes the
@@ -754,6 +813,7 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
         .with_default(user.default_action())
         .with_ask_timeout(user.ask_timeout())
         .with_ask_notice(user.ask_notice())
+        .with_refusal_notice(user.refusal_notice())
 }
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
@@ -1131,6 +1191,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     ),
                 );
             }
+            // Surface the block to an interactive user on stderr (per the policy's cadence) with a
+            // copy-paste `ops net allow` — sound here because nothing allowed the host. The `403`
+            // body still goes to the in-cage client regardless.
+            ctx.refusal_notice(&connect_host, port);
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
@@ -1173,32 +1237,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     |seq| {
                         if ctx.notices {
                             let id = super::control::format_id(std::process::id(), seq);
-                            // Paint the alert when stderr is a terminal (the canonical NO_COLOR / dumb
-                            // / is-tty predicate, borrowed from the shared palette): `ops:` bold red
-                            // (no underline), the rest of the alert red, and the two copy-paste
-                            // commands yellow with a bold-yellow `allow`/`deny` label so the actions
-                            // stand out.
-                            let colored = !crate::style::Palette::for_stream(
-                                std::io::IsTerminal::is_terminal(&std::io::stderr()),
-                            )
-                            .err
-                            .is_empty();
-                            let (ops, red, ylw, bylw, rst) = if colored {
-                                (
-                                    "\x1b[1;31m",
-                                    "\x1b[31m",
-                                    "\x1b[33m",
-                                    "\x1b[1;33m",
-                                    "\x1b[0m",
-                                )
-                            } else {
-                                ("", "", "", "", "")
-                            };
-                            eprintln!(
-                                "{ops}ops:{rst}{red} egress decision needed [{id}] \
-                                 {connect_host}:{port}{itarget}{rst} — {bylw}allow{ylw}: ops net \
-                                 pending allow {id}{rst}  |  {bylw}deny{ylw}: ops net pending deny \
-                                 {id}{rst}"
+                            print_egress_notice(
+                                &format!(
+                                    "egress decision needed [{id}] {connect_host}:{port}{itarget}"
+                                ),
+                                &[
+                                    ("allow", &format!("ops net pending allow {id}")),
+                                    ("deny", &format!("ops net pending deny {id}")),
+                                ],
                             );
                         }
                     },
@@ -1986,6 +2032,36 @@ fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
     }
 }
 
+/// Compose one egress notice line: a bold-red `ops:` tag, the red `head`, then each yellow
+/// `label: command` action (the first joined by ` — `, the rest by `  |  `). Pure over the
+/// palette so it is unit-testable in both the plain and colored forms; [`print_egress_notice`]
+/// wraps it with the stderr auto-detect. This is the single renderer both the `ask`-park alert
+/// and the [`ProxyCtx::refusal_notice`] use, so their styling cannot drift.
+fn egress_notice_line(p: &crate::style::Palette, head: &str, actions: &[(&str, &str)]) -> String {
+    let mut line = format!(
+        "{err}ops:{rst} {err}{head}{rst}",
+        err = p.err,
+        rst = p.reset
+    );
+    for (i, (label, cmd)) in actions.iter().enumerate() {
+        let sep = if i == 0 { " — " } else { "  |  " };
+        line.push_str(&format!(
+            "{sep}{ylw}{label}: {cmd}{rst}",
+            ylw = p.warn,
+            rst = p.reset
+        ));
+    }
+    line
+}
+
+/// Print one egress notice line to stderr. Colour auto-detects on stderr — a terminal with
+/// `NO_COLOR` unset and `TERM` not `dumb` — via the shared [`crate::style::Palette`], so a pipe or
+/// a captured run prints plain text.
+fn print_egress_notice(head: &str, actions: &[(&str, &str)]) {
+    let p = crate::style::Palette::for_stream(std::io::IsTerminal::is_terminal(&std::io::stderr()));
+    eprintln!("{}", egress_notice_line(&p, head, actions));
+}
+
 /// Write an ops-originated refusal: the status line, an `X-Ops-Egress-Reason` header carrying a
 /// stable machine-readable category, and a short `text/plain` body repeating the human detail.
 /// A tool (and the agent it serves) can then tell an explicit policy refusal (`403`, category
@@ -2585,6 +2661,100 @@ mod tests {
         assert!(
             !off.notices,
             "ask_notice = false suppresses the park notice"
+        );
+    }
+
+    /// The shared notice renderer: plain when the palette is plain (a captured/piped run), and
+    /// carrying the ANSI spans when colored — with the `head` red and the actions yellow, joined
+    /// by ` — ` then `  |  `.
+    #[test]
+    fn egress_notice_line_is_plain_or_colored() {
+        let actions = [
+            ("allow", "ops net allow x.test"),
+            ("deny", "ops net deny x.test"),
+        ];
+        let plain = egress_notice_line(
+            &crate::style::Palette::plain(),
+            "egress refused x.test:443",
+            &actions,
+        );
+        assert_eq!(
+            plain,
+            "ops: egress refused x.test:443 — allow: ops net allow x.test  |  \
+             deny: ops net deny x.test"
+        );
+        let colored = egress_notice_line(
+            &crate::style::Palette::colored(),
+            "egress refused x.test:443",
+            &actions[..1],
+        );
+        assert!(
+            colored.contains("\x1b[1;31m"),
+            "the head carries the red span"
+        );
+        assert!(
+            colored.contains("\x1b[33m"),
+            "the action carries the yellow span"
+        );
+        assert!(colored.ends_with("\x1b[0m"), "the line resets its styling");
+    }
+
+    /// The refusal-notice cadence and dedup, pure of I/O: `Off` never prints, `Each` always prints
+    /// (never consulting the seen-set), `Once` prints the first block of a given `host:port` and
+    /// stays silent for a repeat — and the cadence survives the built-in union in `new`.
+    #[test]
+    fn refusal_notice_cadence_off_each_once() {
+        let ctx = |c| {
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&[]).with_refusal_notice(c),
+            )
+            .unwrap()
+        };
+
+        let off = ctx(RefusalNotice::Off);
+        assert!(!off.should_print_refusal("a.test", 443));
+        assert!(off.refusal_noticed.lock().unwrap().is_empty());
+
+        let each = ctx(RefusalNotice::Each);
+        assert!(each.should_print_refusal("a.test", 443));
+        assert!(each.should_print_refusal("a.test", 443));
+        assert!(
+            each.refusal_noticed.lock().unwrap().is_empty(),
+            "Each never records the seen-set"
+        );
+
+        let once = ctx(RefusalNotice::Once);
+        assert!(
+            once.should_print_refusal("a.test", 443),
+            "first block prints"
+        );
+        assert!(
+            !once.should_print_refusal("a.test", 443),
+            "the repeat is silent"
+        );
+        assert!(
+            once.should_print_refusal("a.test", 8443),
+            "a different port is its own key"
+        );
+        assert!(
+            once.should_print_refusal("b.test", 443),
+            "a different host is its own key"
+        );
+    }
+
+    /// The refusal notice's `ops net allow` suggestion names the app when the launch is an
+    /// `ops app <name>` (so the rule is scoped to that app), and stays bare otherwise.
+    #[test]
+    fn allow_suggestion_names_the_app_when_set() {
+        let bare = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[])).unwrap();
+        assert_eq!(bare.allow_suggestion("h.test"), "ops net allow h.test");
+        let app = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
+            .unwrap()
+            .with_app(Some("claude-code".into()));
+        assert_eq!(
+            app.allow_suggestion("h.test"),
+            "ops net allow h.test --app claude-code"
         );
     }
 

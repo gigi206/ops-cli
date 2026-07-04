@@ -54,11 +54,37 @@ for the full semantics.
 | `ask_timeout` | a duration (`"90s"`, `"5m"`) bounding a parked `ask` request; absent = indefinite |
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`ops net stats`](../networking/observability.md)) |
+| `refusal_notice` | how often to print the stderr refusal notice under `deny`: `"off"` / `"once"` (default) / `"each"` (see below) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules.md): a host,
 `*.domain`, `host/path`, an IP, `re:<regex>`, `tcp://host:port`, an optional
 `{GET,POST}` verb prefix, or `@<group>` referencing a [`[net.groups]`](net-groups.md).
+
+## The refusal notice
+
+Under `mode = "deny"`, when a request is refused because **no allow rule matched** the
+host, the proxy prints a one-line alert to the host's stderr — a red `ops: egress refused
+<host>:<port>` plus a yellow copy-paste `ops net allow <host>` — so an interactive user
+sees *what* was blocked and *how* to permit it, in the spirit of `ask` mode:
+
+```toml
+[network]
+mode = "deny"
+allow = ["cache.nixos.org"]
+refusal_notice = "once"   # "off" | "once" (default) | "each"
+```
+
+- `"once"` (default) prints the alert the **first** time a given `host:port` is refused
+  in a session, then stays silent for it — visible without an agent's retries spamming it.
+- `"each"` prints on every refused request; `"off"` prints nothing (only the `403` reaches
+  the in-cage client).
+
+The suggestion is shown **only** for a host nothing allowed. An **explicit** `deny` rule,
+or a security refusal (a leaked credential, an SSRF target), never prints it — blocking
+those is deliberate, and `ops net allow` is not the answer. The colour auto-detects
+(plain when stderr is piped or `NO_COLOR` is set). Meaningful only under `deny` — the only
+mode that produces such a refusal; set elsewhere it is ignored with a warning.
 
 ## Mode inheritance
 
