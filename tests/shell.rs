@@ -259,7 +259,11 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     let mut buf = [0u8; 4096];
     let mut sent_setup = false;
     let mut resized = false;
-    let deadline = Instant::now() + Duration::from_secs(45);
+    // The loop exits the instant both markers appear (~20s idle), so this deadline is only a
+    // ceiling — sized generously so a fully-loaded run (the whole suite in parallel starves the pty
+    // round-trips) cannot time out before the trap's output is captured. A ceiling costs nothing on
+    // success and prevents a load-induced flake.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let mut last_probe = Instant::now();
 
     while Instant::now() < deadline {
