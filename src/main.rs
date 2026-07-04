@@ -3130,24 +3130,44 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let decision = effective.explain(&host, port, &path, &method);
+            // An `http://` URL is a cleartext (L7Clear) question, decided through the same
+            // `explain_clear` the proxy's absolute-form handler uses (so the tester cannot drift from
+            // the wire). Cleartext is strictly opt-in: only an explicit `http://` allow permits it —
+            // the L7 default action above does not open it, so a bare host stays HTTPS-only here too.
+            let clear = url.starts_with("http://");
+            let decision = if clear {
+                effective.explain_clear(&host, port, &path, &method)
+            } else {
+                effective.explain(&host, port, &path, &method)
+            };
             // Tag a request allowed *only* by the built-in set (not the user's own
             // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
             // only allow rules, so an effective `AllowedBy` the user policy does not also allow can
             // only be the built-in set. Discriminate on the user verdict's own variant (definitely
-            // "the user allowed it") rather than a separate predicate.
+            // "the user allowed it") rather than a separate predicate. The `clear` question is
+            // decided through the same `explain_clear`, so the tag matches the wire (the built-in set
+            // is all `https://` hosts, so a cleartext allow is always the user's own).
+            let user_decision = if clear {
+                policy.explain_clear(&host, port, &path, &method)
+            } else {
+                policy.explain(&host, port, &path, &method)
+            };
             let user_allowed = matches!(
-                policy.explain(&host, port, &path, &method),
+                user_decision,
                 allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
             );
             let builtin = matches!(decision, allowlist::Decision::AllowedBy(_)) && !user_allowed;
             print!("{}", render_net_decision(&url, &decision, builtin, &pal));
             // On an allowed request, surface any credential the proxy would inject for this exact
-            // destination — by header and source locator only, never the value, and with no I/O.
-            if matches!(
-                decision,
-                allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
-            ) {
+            // destination — by header and source locator only, never the value, and with no I/O. A
+            // **cleartext** (`http://`) request never receives an injection (a bearer is not sent in
+            // the clear — the proxy skips injection wholesale), so no note is shown for it.
+            if !clear
+                && matches!(
+                    decision,
+                    allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+                )
+            {
                 for secret in &resolved.secrets {
                     if allowlist::rule_matches(&secret.to, &host, port, &path) {
                         print!("{}", render_injection_note(secret, &pal));

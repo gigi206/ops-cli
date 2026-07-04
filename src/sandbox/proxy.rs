@@ -26,6 +26,20 @@
 //! path below). The split is decided pre-decrypt, so the splice and the MITM never both run for one
 //! connection.
 //!
+//! ## L7 cleartext (`http://`)
+//!
+//! An `http://` allow rule permits **inspected cleartext**: a tool with `http_proxy` set sends an
+//! absolute-form request (`GET http://host/path HTTP/1.1`, no CONNECT) for an `http://` URL, and
+//! [`handle_cleartext`] applies the *same* HTTP policy as the MITM path — host / port / path / method
+//! matching, the anti-fronting `Host` check, the outbound-secret tripwire, and the SSRF guard — on a
+//! plaintext connection. There is no TLS to terminate, so nothing is decrypted, no leaf is minted, and
+//! the upstream is reached over plain TCP with no certificate to validate; the request is forwarded in
+//! origin-form and the one response streamed back. It is **strictly opt-in** exactly like the splice
+//! (only an explicit `http://` allow enables it; the default action never opens it), and it forgoes
+//! **credential injection** — a header secret is never sent in the clear (a secret `to` must be an
+//! inspected-over-TLS host). Its one cost versus the default path is transport confidentiality (the
+//! bytes travel unencrypted); the empty netns + allowlist boundary is unchanged.
+//!
 //! This module is the cert machinery and the serve loop; [`super::egress`] wires it into a
 //! launch (binding the socket into the cage, injecting the CA into the cage trust store,
 //! supervising its lifetime under the network-allowlist posture).
@@ -50,7 +64,7 @@
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target |
 //! | `400` | `bad-request`            | the request was malformed or used ambiguous framing |
-//! | `405` | `method-not-allowed`     | a non-CONNECT method (plain-HTTP egress is out of scope) |
+//! | `405` | `method-not-allowed`     | a non-CONNECT request that is not a routable `http://` absolute-form (a bare origin-form or a non-`http` scheme has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
 //! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
@@ -871,10 +885,15 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         );
     };
     if method != "CONNECT" {
-        // Plain-HTTP absolute-form egress (`GET http://host/…`) is out of scope for this slice;
-        // refuse it fail-closed rather than letting it reach a default branch. It has no clean
-        // host:port, but the method + raw target are exactly the "what is the agent trying to do"
+        // A client with `http_proxy` set sends an **absolute-form** request (`GET http://host/… HTTP/1.1`)
+        // for an `http://` URL — no CONNECT. When an `http://` (cleartext L7) rule permits it, this is
+        // the inspected-cleartext path; route it there. Anything else (a bare origin-form with no host
+        // to route, an absolute-form `https://` which should have used CONNECT, or a bad method) is
+        // refused fail-closed — the method + raw target are the "what is the agent trying to do"
         // signal, so log them (host blank, target as the path).
+        if target.starts_with("http://") {
+            return handle_cleartext(client, &parsed, &head, &method, &target, ctx);
+        }
         ctx.push_log(
             "",
             0,
@@ -887,7 +906,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             &mut client,
             "405 Method Not Allowed",
             "method-not-allowed",
-            "only CONNECT (HTTPS tunneling) is supported by this egress proxy",
+            "this egress proxy tunnels HTTPS (CONNECT) and forwards allowed plaintext `http://` \
+             requests; a bare or non-`http://` absolute-form request has no route",
         );
     }
     // 2. The CONNECT authority.
@@ -1630,6 +1650,316 @@ fn splice_copy(client: UnixStream, upstream: TcpStream) -> io::Result<()> {
     Ok(())
 }
 
+/// Handle an **inspected-cleartext** (`http://`) request: the client sent an absolute-form request
+/// (`GET http://host/path HTTP/1.1`) because its `http_proxy` points here, and an `http://` allow
+/// rule may permit it. This is the plaintext sibling of the MITM path — the *same* HTTP policy (host
+/// / port / path / method / the outbound-secret tripwire / the SSRF guard), but on a connection with
+/// **no TLS**: no CONNECT tunnel, no leaf minted, no upstream certificate to validate, and — because
+/// a bearer must never travel in the clear — **no credential injection** (a secret host can only be
+/// an inspected-over-TLS `to`, so [`matching_injections`] is skipped entirely, not merely trusted to
+/// return empty). The request is forwarded to the origin server in **origin-form** with the client's
+/// own `Host`, and the one response is streamed back. Every failure path is fail-closed with the same
+/// [`write_refusal`] reason categories the MITM path uses, so the agent tells a policy refusal from an
+/// unreachable host. `head_bytes` is the raw head (for the byte-exact secret tripwire); `head` is its
+/// parse.
+fn handle_cleartext(
+    mut client: UnixStream,
+    head: &Head,
+    head_bytes: &[u8],
+    method: &str,
+    target: &str,
+    ctx: &ProxyCtx,
+) -> io::Result<()> {
+    // 1. Parse the absolute-form `http://host[:port]/path` target into (host, port=80 default, path).
+    //    The host is canonicalized by the parser; the path is canonicalized inside `explain_clear`.
+    let (host, port, path) = match allowlist::parse_url_target(target) {
+        Ok(t) => t,
+        Err(_) => {
+            ctx.push_log(
+                "",
+                0,
+                Some(method),
+                Some(target),
+                super::control::LogVerdict::Blocked,
+                "bad-request",
+            );
+            return write_refusal(
+                &mut client,
+                "400 Bad Request",
+                "bad-request",
+                "the absolute-form request target is not a valid `http://` URL",
+            );
+        }
+    };
+
+    // 2. Anti request-smuggling, fail-closed — the same guards as the tunneled path: any
+    //    Transfer-Encoding (no chunked framing in this path), or a duplicated Content-Length / Host.
+    if head.header("transfer-encoding").is_some()
+        || head.count("content-length") > 1
+        || head.count("host") > 1
+    {
+        ctx.push_log(
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            super::control::LogVerdict::Blocked,
+            "bad-request",
+        );
+        return write_refusal(
+            &mut client,
+            "400 Bad Request",
+            "bad-request",
+            "the request has ambiguous framing (Transfer-Encoding, or a duplicated \
+             Content-Length or Host)",
+        );
+    }
+    let body_len: u64 = match head.header("content-length") {
+        Some(v) => match v.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                ctx.push_log(
+                    &host,
+                    port,
+                    Some(method),
+                    Some(&path),
+                    super::control::LogVerdict::Blocked,
+                    "bad-request",
+                );
+                return write_refusal(
+                    &mut client,
+                    "400 Bad Request",
+                    "bad-request",
+                    "the Content-Length header is not a valid number",
+                );
+            }
+        },
+        None => 0,
+    };
+
+    // 3. Anti-fronting collapses to one check with no CONNECT/SNI: the absolute-form URL host must
+    //    equal the `Host` header, so a request cannot claim one host in the line and another in the
+    //    header (the destination the policy checks is the URL host).
+    if head
+        .header("host")
+        .map(|h| allowlist::canonical_host(&strip_port(h)) != host)
+        .unwrap_or(true)
+    {
+        ctx.outcome(
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "host-mismatch",
+        );
+        return write_refusal(
+            &mut client,
+            "421 Misdirected Request",
+            "host-mismatch",
+            "the Host header does not match the request-line host",
+        );
+    }
+
+    // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
+    //    configured secret verbatim. It matters more here than on the TLS path: a leaked secret sent
+    //    in the clear is exposed on the wire, not just to the destination.
+    if carries_secret(head_bytes, &ctx.redactions) {
+        ctx.outcome(
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "outbound-secret",
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "outbound-secret",
+            "the request carries a configured secret value (outbound credential leak refused)",
+        );
+    }
+
+    // 5. The verdict — cleartext is strictly opt-in, so only an explicit `http://` allow rule permits
+    //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
+    //    The two denial shapes get distinct reasons, and the `denied-default` suggestion names the
+    //    `http://` scheme (a bare `ops net allow host` would add an https rule that does not open the
+    //    clear).
+    let deciding: Rule = match ctx.policy.explain_clear(&host, port, &path, method) {
+        Decision::AllowedBy(rule) => rule.clone(),
+        Decision::DeniedBy(_) => {
+            ctx.outcome(
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Deny,
+                "denied-by-rule",
+            );
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                "denied-by-rule",
+                "this request matches a deny rule in the network policy",
+            );
+        }
+        // `DeniedDefault` (nothing opened it) — and, defensively, any verdict `explain_clear` does not
+        // return (it never yields an allow-default or ask): all fail closed as a deny-default refusal.
+        _ => {
+            let method_denied = ctx.policy.method_denied_clear(&host, port, &path, method);
+            let reason = if method_denied {
+                "denied-method"
+            } else {
+                "denied-default"
+            };
+            ctx.outcome(
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Deny,
+                reason,
+            );
+            if method_denied {
+                return write_refusal(
+                    &mut client,
+                    "403 Forbidden",
+                    "denied-method",
+                    &format!(
+                        "the `{method}` method is not permitted to `http://{host}:{port}` by the \
+                         network policy"
+                    ),
+                );
+            }
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                "denied-default",
+                &format!(
+                    "cleartext `http://{host}:{port}` is not allowed by the network policy. \
+                     Allow it: {}",
+                    ctx.allow_suggestion(&format!("http://{host}"))
+                ),
+            );
+        }
+    };
+
+    // 6. Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata address
+    //    is refused unless the `http://` rule names this exact host). A resolution failure for an
+    //    allowed host is a clean 502, distinct from a refusal.
+    let ips = match (ctx.resolve)(&host) {
+        Ok(ips) => ips,
+        Err(_) => {
+            ctx.push_log(
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Error,
+                "dns-failure",
+            );
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "dns-failure",
+                &format!("DNS resolution failed for `{host}`"),
+            );
+        }
+    };
+    let Some(ip) = ips
+        .into_iter()
+        .find(|ip| ip_permitted(*ip, &host, Some(&deciding)))
+    else {
+        ctx.outcome(
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "ssrf-blocked",
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "ssrf-blocked",
+            &format!(
+                "`{host}` resolved only to disallowed addresses (a private or metadata range)"
+            ),
+        );
+    };
+
+    // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
+    //    connection is cleartext by definition; the empty netns + the allowlist are the boundary).
+    let mut upstream = match TcpStream::connect((ip, port)) {
+        Ok(s) => {
+            let _ = s.set_read_timeout(Some(ctx.timeout));
+            let _ = s.set_write_timeout(Some(ctx.timeout));
+            s
+        }
+        Err(_) => {
+            ctx.push_log(
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Error,
+                "upstream-unreachable",
+            );
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "upstream-unreachable",
+                &format!("`{host}:{port}` is allowed but could not be reached"),
+            );
+        }
+    };
+
+    // The request is permitted and the upstream is up — record the one `allow` outcome here.
+    let allow_seq = ctx.outcome(
+        &host,
+        port,
+        Some(method),
+        Some(&path),
+        StatKind::Allow,
+        "allowed",
+    );
+
+    // 8. Forward the request in **origin-form** (`GET /path HTTP/1.1`) with the client's `Host` — an
+    //    origin server, unlike a proxy, expects the path, not the absolute-form URL. No credential is
+    //    injected (a header secret never rides a cleartext request). `Connection: close` is forced so
+    //    the upstream closes after the one response (the reserializer strips hop-by-hop headers).
+    let version = head
+        .request_line
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("HTTP/1.1");
+    let origin = Head {
+        request_line: format!("{method} {path} {version}"),
+        headers: head.headers.clone(),
+    };
+    upstream.write_all(&reserialize_request(&origin, &[]))?;
+    if body_len > 0 && head_expects_continue(head) {
+        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = client.flush();
+    }
+    copy_exact(&mut client, &mut upstream, body_len)?;
+    upstream.flush().ok();
+
+    // 9. Peek the status line for the live log (non-consuming — chained back), then stream the whole
+    //    response to the client and close. A cleartext host is never a credential-injection target, so
+    //    it can carry no *reflected* secret to mask — the response is relayed unredacted (there is
+    //    nothing this path could reflect that the tripwire above did not already refuse outbound).
+    let prefix = read_status_prefix(&mut upstream);
+    if let Some(code) = parse_status_code(&prefix) {
+        if code >= 200 {
+            ctx.set_status(allow_seq, code);
+        }
+    }
+    let mut response = io::Cursor::new(prefix).chain(&mut upstream);
+    pump_to_eof(&mut response, &mut client)
+}
+
 /// Why a connection to the validated upstream could not be opened, so the refusal can name a
 /// distinct motif: the TCP connection failed (the host is down/filtered), or the TLS handshake /
 /// certificate validation failed (a forged or otherwise untrusted upstream — never downgraded).
@@ -2262,6 +2592,61 @@ mod tests {
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    /// A one-shot **plaintext** (no TLS) loopback upstream for the `http://` cleartext path: it
+    /// accepts one connection, reports the request head it received over a channel (so a test can
+    /// assert the proxy forwarded origin-form with `Connection: close`), and replies with `response`.
+    fn spawn_plain_upstream(
+        response: &'static [u8],
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = String::new();
+            {
+                let mut br = BufReader::new(&mut sock);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => head.push_str(&line),
+                    }
+                }
+            }
+            let _ = tx.send(head);
+            let _ = sock.write_all(response);
+            let _ = sock.flush();
+        });
+        (addr, rx)
+    }
+
+    /// Drive one **cleartext** (`http://`) absolute-form request through the proxy over a freshly
+    /// bound UDS — no CONNECT, no TLS, exactly what a tool with `http_proxy` set sends. Returns the
+    /// plaintext response the proxy relayed (or its refusal).
+    fn through_cleartext(ctx: Arc<ProxyCtx>, request: &[u8]) -> io::Result<String> {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        sock.write_all(request)?;
+        sock.flush().ok();
+        let mut resp = String::new();
+        match sock.read_to_string(&mut resp) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(e),
+        }
+        Ok(resp)
+    }
+
     #[test]
     fn ca_cert_is_a_pem_certificate_block() {
         let ca = Ca::ephemeral().unwrap();
@@ -2411,6 +2796,118 @@ mod tests {
         assert_eq!(events[0].host, "upstream.test");
         assert_eq!(events[0].method.as_deref(), Some("GET"));
         assert_eq!(events[0].path.as_deref(), Some("/path"));
+    }
+
+    #[test]
+    fn a_cleartext_http_request_is_forwarded_in_origin_form_when_allowed() {
+        // The whole new seam: an absolute-form `http://` request (no CONNECT) that an `http://` allow
+        // rule permits is forwarded to the plaintext upstream in ORIGIN-form and its response relayed.
+        let (addr, up_head) = spawn_plain_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let port = addr.port();
+        let sdir = TmpDir::new();
+        let stats = Arc::new(crate::sandbox::egress_stats::EgressStats::new(
+            sdir.join("stats"),
+            "/t".into(),
+            None,
+        ));
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
+        let rule = format!("http://upstream.test:{port}");
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
+                .unwrap()
+                .with_stats(stats.clone())
+                .with_log(log.clone())
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!(
+            "GET http://upstream.test:{port}/path HTTP/1.1\r\nHost: upstream.test:{port}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(
+            resp.contains("200 OK") && resp.contains("hello"),
+            "cleartext response was not relayed: {resp:?}"
+        );
+        // The origin server must receive ORIGIN-form (`GET /path …`), not the absolute-form the proxy
+        // received, with the client's Host preserved and `Connection: close` forced.
+        let fwd = up_head.recv().unwrap();
+        assert!(
+            fwd.starts_with("GET /path HTTP/1.1"),
+            "upstream did not get an origin-form request line: {fwd:?}"
+        );
+        assert!(
+            !fwd.contains("http://"),
+            "the absolute-form URL leaked to the origin server: {fwd:?}"
+        );
+        assert!(
+            fwd.to_ascii_lowercase().contains("connection: close"),
+            "the forwarded request must force Connection: close: {fwd:?}"
+        );
+        // One `allow` outcome recorded, with the request's method and (origin) path.
+        assert_eq!(stats.snapshot()["upstream.test"].allow, 1);
+        let events = log.snapshot(None, None).events;
+        assert_eq!(events.len(), 1, "one allow event: {events:?}");
+        assert_eq!(events[0].reason, "allowed");
+        assert_eq!(events[0].method.as_deref(), Some("GET"));
+        assert_eq!(events[0].path.as_deref(), Some("/path"));
+    }
+
+    #[test]
+    fn a_cleartext_request_needs_an_explicit_http_rule() {
+        // Cleartext is strictly opt-in: a bare (inspected-over-TLS) allow rule does NOT open the same
+        // host in the clear. So a cleartext request to an https-allowed host is denied-default, and
+        // the suggestion names the `http://` scheme (a bare `ops net allow host` would add an https
+        // rule that still would not open the clear).
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["upstream.test:*"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"GET http://upstream.test/x HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("X-Ops-Egress-Reason: denied-default"),
+            "cleartext must be denied without an http:// rule: {resp:?}"
+        );
+        assert!(
+            resp.contains("ops net allow http://upstream.test"),
+            "the deny-default suggestion must name the http:// scheme: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleartext_request_is_denied_by_a_layer_agnostic_deny() {
+        // Deny wins across layers: an `http://` allow plus a bare (L7) deny on the same host:port →
+        // the cleartext request is denied-by-rule (the same layer-agnostic deny the splice uses).
+        let allow = classify("http://evil.test:80").unwrap();
+        let deny = classify("evil.test:80").unwrap();
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                EgressPolicy::new(vec![allow], vec![deny]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"GET http://evil.test/x HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("denied-by-rule"),
+            "a deny rule must win over an http:// allow: {resp:?}"
+        );
     }
 
     #[test]
@@ -4501,11 +4998,13 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_http_attempt_through_the_proxy_is_refused_and_logged() {
+    fn an_unroutable_non_connect_request_is_refused_and_logged() {
         use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
-        // A malformed-handshake case with no clean host:port — a plain-HTTP absolute-form request
-        // instead of a CONNECT tunnel. It is refused, and logged (host blank, method + raw target)
-        // as the "what is the agent trying to do" signal it is.
+        // A non-CONNECT request that is NOT a routable `http://` absolute-form (here a bare
+        // origin-form `GET /secret`, which carries no host to route) still hits the `method-not-allowed`
+        // branch — an `http://` absolute-form is handled by the cleartext path, but this is neither.
+        // It is refused, and logged (host blank, method + raw target) as the "what is the agent trying
+        // to do" signal it is.
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let ctx = Arc::new(
             ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
@@ -4521,7 +5020,7 @@ mod tests {
         let mut sock = UnixStream::connect(&path).unwrap();
         sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .ok();
-        sock.write_all(b"GET http://host.test/secret HTTP/1.1\r\nHost: host.test\r\n\r\n")
+        sock.write_all(b"GET /secret HTTP/1.1\r\nHost: host.test\r\n\r\n")
             .unwrap();
         sock.flush().unwrap();
         let reply = read_until_blank(&mut sock).unwrap();
@@ -4530,9 +5029,12 @@ mod tests {
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "method-not-allowed");
-        assert_eq!(events[0].host, "", "no clean host for a plain-HTTP attempt");
+        assert_eq!(
+            events[0].host, "",
+            "no clean host for a bare origin-form request"
+        );
         assert_eq!(events[0].method.as_deref(), Some("GET"));
-        assert_eq!(events[0].path.as_deref(), Some("http://host.test/secret"));
+        assert_eq!(events[0].path.as_deref(), Some("/secret"));
     }
 
     #[test]

@@ -28,6 +28,7 @@ which list it is in decides what a match *means*.
 | **exact URL** | `github.com/orgs` | that host and that exact path |
 | **URL subtree** | `github.com/orgs/*` | that path and everything under it |
 | **regex** | `re:^https://api\.github\.com/v3/` | the whole reconstructed URL, unanchored |
+| **cleartext HTTP** | `http://legacy.example.com` | the same inspected policy, on a *plaintext* connection (port 80) |
 | **raw L4 tunnel** | `tcp://ssh.example.com:22` | a byte-spliced (uninspected) stream to host:port |
 | **group reference** | `@ci-hosts` | expands to a named [`[net.groups]`](groups.md) set |
 
@@ -226,11 +227,55 @@ prefix on one is a config error.
 
 ---
 
-## L7 vs L4 (`tcp://`)
+## Layers: inspected-over-TLS (default), cleartext (`http://`), raw (`tcp://`)
 
-By default a rule is **inspected L7**: the proxy man-in-the-middles the TLS and
+A rule's scheme selects the **enforcement path**. There are three:
+
+| Scheme | Layer | Transport | Default port | Controls |
+|---|---|---|---|---|
+| bare / `https://` | inspected over TLS (the default) | encrypted (MITM) | 443 | full host / port / path / method / regex / redaction / anti-fronting |
+| `http://` | inspected cleartext | **plaintext** | 80 | the same HTTP policy, minus credential injection — no TLS to terminate |
+| `tcp://` | raw L4 splice | opaque bytes | none (required) | host:port + the SSRF guard only |
+
+By default a rule is **inspected over TLS**: the proxy man-in-the-middles the TLS and
 enforces the full host / port / path / method / regex / redaction / anti-fronting
 policy. This is the right layer for HTTPS APIs, which is almost everything.
+
+### Cleartext HTTP (`http://`)
+
+Some tools still speak **plain HTTP** to a host that has no HTTPS endpoint. An
+`http://host` rule permits exactly that — the *same* inspected HTTP policy (host,
+port, path, method, the outbound-secret tripwire, the SSRF guard), but on a
+plaintext connection:
+
+```toml
+[network]
+mode  = "deny"
+allow = [
+  "http://legacy.example.com",         # plaintext, port 80
+  "http://mirror.internal:8080/pkgs/*", # a path subtree, cleartext, on 8080
+]
+```
+
+Key properties:
+
+- It is **strictly opt-in**, exactly like a raw splice: only an explicit `http://`
+  allow opens the clear. A bare or `https://` allow rule for the same host does
+  **not** — `allow = ["legacy.example.com"]` permits HTTPS on 443, never HTTP on 80.
+  The default posture (`deny`/`allow`/`ask`) never opens cleartext on its own.
+- It defaults to **port 80** (override with `:port`) and keeps the full HTTP
+  vocabulary — a `{VERB}` method prefix and a `/path` both work, unlike `tcp://`.
+- A credential is **never** injected into a cleartext request (a bearer must not
+  travel in the clear), so a `[secret]` `to` host must be inspected-over-TLS — the
+  secret-target validator rejects an `http://` destination.
+- Its one cost versus the default is **transport confidentiality**: the bytes are
+  unencrypted on the wire. The empty-netns + allowlist boundary is unchanged — only
+  the named host on its named port is reachable.
+
+Prefer `https://` wherever the host offers it; reach for `http://` only for a host
+that genuinely has no TLS.
+
+### Raw L4 splice (`tcp://`)
 
 A `tcp://host:port` rule is a **raw L4 splice**: the proxy copies the TCP byte
 stream verbatim, without terminating TLS or inspecting it, for a non-HTTP protocol
@@ -263,8 +308,14 @@ Because a splice is uninspected, an L7 *path*/method deny on a host that *also*
 carries a `tcp://` allow cannot apply — raw has no HTTP to match. To suppress a
 splice, use a **host-level** deny: `deny evil.com:*` (or a port-agnostic
 `re:^https://evil\.com`) sends the connection to the inspected path instead, where
-it is refused. `http://` and `udp://` are not supported; any other scheme in a rule
-is rejected with a pointer.
+it is refused. `udp://` is not supported; any other scheme in a rule is rejected
+with a pointer.
+
+A **deny wins across layers**: a host-level deny (`deny evil.com:80`,
+`deny http://evil.com`, or a port-agnostic `deny evil.com:*`) suppresses a matching
+`http://` allow, just as it suppresses a `tcp://` splice. As with a splice, a deny
+scoped to the wrong port does not block a host outright — a bare `deny evil.com`
+(port 443) does not stop `http://evil.com` (port 80); name the port or use `:*`.
 
 ---
 

@@ -1207,6 +1207,114 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 }
 
 #[test]
+fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
+    // The `http://` (inspected-cleartext) scheme end to end through the real binary: under a trusted
+    // `network = "deny"` allowlist naming `http://cache.nixos.org`, an in-cage `curl http://…` sends
+    // an ABSOLUTE-form request (no CONNECT) to the forwarder → the host proxy's cleartext handler, and
+    // the allowlist decides it. Teeth: a request the `http://` rule permits passes the filter (no
+    // `denied-*` refusal — the opt-in cleartext rule opened it), while a host with no `http://` rule
+    // is refused with `403 denied-default` *at the proxy*, whose body names the `http://`-scheme
+    // suggestion. This exercises the seam a proxy unit test cannot — the `method != CONNECT`
+    // absolute-form entry point through the real launch. Skips (never fails) when the host cannot
+    // sandbox or the cache is unreachable.
+    let project = TmpDir::new("clear-proj");
+    let data = TmpDir::new("clear-data");
+    let state = TmpDir::new("clear-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"deny\"\nallow = [\"http://cache.nixos.org\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net): a capable host runs `true`; otherwise skip. Also
+    // seeds the project store so a later egress failure is a real fault, not a cold cage.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping cleartext egress e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping cleartext egress e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // trust the project so its allowlist posture (a security field) is honored.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // ALLOWED: the `http://cache.nixos.org` rule opts this cleartext request *through the filter*. curl
+    // sends the absolute-form request to the proxy, which routes it to the cleartext handler and
+    // forwards it over plain TCP:80. What this asserts is precisely the entry-point property this e2e
+    // exists to prove: the `http://` rule permitted the absolute-form request (no `denied-*` refusal),
+    // versus the denied host below. It deliberately does NOT assert the upstream bytes round-tripped —
+    // a `502 upstream-unreachable` would also carry a status line and no `denied-` reason; the
+    // origin-form round-trip is proven conclusively by the `proxy` unit test against a loopback
+    // upstream. Here the load-bearing new seam is `method != CONNECT` → `handle_cleartext` → the
+    // verdict, which only the real binary exercises.
+    let allowed = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "curl",
+            "-sS",
+            "-i",
+            "http://cache.nixos.org/nix-cache-info",
+        ],
+    );
+    let allowed_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(
+        allowed.status.success() && allowed_out.contains("HTTP/"),
+        "an allowed cleartext fetch must get a response, not a dropped connection: {allowed_out}"
+    );
+    assert!(
+        !allowed_out.contains("X-Ops-Egress-Reason: denied"),
+        "the http:// rule must open the cleartext request past the filter (no proxy deny): {allowed_out}"
+    );
+
+    // DENIED (teeth): a host with no `http://` rule is refused at the proxy with `403 denied-default`,
+    // and the suggestion names the http:// scheme (a bare `ops net allow host` adds an https rule that
+    // still would not open the clear). curl exits 0 (it received the proxy's 403 as the response).
+    let denied = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "curl", "-sS", "-i", "http://example.com/"],
+    );
+    let denied_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&denied.stdout),
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        denied_out.contains("403") && denied_out.contains("X-Ops-Egress-Reason: denied-default"),
+        "an unallowed cleartext host must be refused with 403 denied-default at the proxy: {denied_out}"
+    );
+    assert!(
+        denied_out.contains("ops net allow http://example.com"),
+        "the cleartext deny-default body must suggest the http:// scheme: {denied_out}"
+    );
+}
+
+#[test]
 fn ops_net_logs_reads_a_running_sessions_live_egress() {
     // The live egress log end to end through the real binary: a background `ops run` under a
     // trusted allowlist makes one allowed and one denied egress attempt, then sleeps; while it is

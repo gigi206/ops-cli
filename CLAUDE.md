@@ -95,6 +95,58 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Egress `http://` scheme — inspected cleartext (DONE 2026-07-04)** (`src/allowlist.rs` +
+  `src/sandbox/proxy.rs` + `config/mod.rs` + `main.rs` + `help.rs` + `tests/run.rs` +
+  `docs/guide/networking/rules.md` + `configuration/network.md`): the egress grammar closed its one
+  inconsistency — **every posture was expressible except plaintext HTTP**. A tool doing `curl
+  http://host` in the cage got `405 only CONNECT supported`, with **no rule that could ever permit
+  it** (the proxy rejected the absolute-form before any policy lookup, and `split_scheme` rejected an
+  `http://` rule). Now an **`http://host` rule** selects a third enforcement path, `Layer::L7Clear`
+  (**inspected cleartext**): the *same* HTTP policy as the MITM default — host/port/path/method
+  matching, the anti-fronting `Host` check, the outbound-secret tripwire, the SSRF guard — on a
+  **plaintext** connection (no TLS to terminate, so no leaf minted, no upstream cert validated). It is
+  the plaintext sibling of the `tcp://` splice and shares its two invariants: **strictly opt-in** (only
+  an explicit `http://` allow opens it; the default action is **never** consulted — a `deny`/`allow`/
+  `ask` posture never silently opens plaintext, and under `ask` an unmatched cleartext request
+  **denies rather than parks**, since a live prompt cannot convey "unencrypted"), and **deny wins
+  layer-agnostically** (any deny matched by kind suppresses it — a bare `deny evil.com:80` and an
+  `http://` deny both block; a wrong-port deny does not, same consequence the splice documents). Its
+  one loss versus the default is transport confidentiality **and** credential injection — a header
+  secret is **never** sent in the clear, so [`handle_cleartext`] skips `matching_injections` wholesale
+  (not merely trusting the validator), and the secret-target validator now rejects an `http://` `to`
+  alongside `tcp://`. **Grammar** (`allowlist.rs`): `Layer` gained the third variant + `default_port()`
+  (443 TLS / 80 cleartext) + `inspected()` (L7|L7Clear); the scheme's default port threads through
+  `classify → classify_kind → split_host_ports`/`parse_path_rule` via a new `default_port` param (`Ports::single(p)`, the single choke point — not post-processing, which can't tell an explicit `:443`
+  from the default); `render` omits each scheme's default (`:80`/`:443`) so `http://host` round-trips
+  compact. **New `explain_clear`/`method_denied_clear`** decide the cleartext verdict (the L7 `explain`
+  stays MITM-only), and — **the advisor-caught bug the green suite would have hidden** —
+  `apply_default_methods` now rewrites **both** inspected layers (`inspected()`), else an app's
+  `http://` allow silently escaped the read-by-default `{GET,HEAD}` posture to all-verbs.
+  `l4_l7_conflicts` likewise treats a cleartext rule as inspected for the splice-shadow warning.
+  **Proxy** (`proxy.rs`): the `method != "CONNECT"` branch routes a well-formed `http://` absolute-form
+  to a new `handle_cleartext` (a focused sibling of `splice_l4`, **not** a generic refactor of the MITM
+  tail — the advisor's call, keeping regression risk off the encrypted path), reusing the pure helpers
+  (`carries_secret`, `ip_permitted`, `reserialize_request`→origin-form, `pump_to_eof`, `write_refusal`,
+  ctx logging); it forwards in **origin-form** with the client's `Host` and forced `Connection: close`,
+  and streams the one response back (a cleartext host is never an injection target, so no reflection to
+  mask). **`ops test net http://…`** and its built-in/injection-note tags route through the *same*
+  `explain_clear` (no drift from the wire; no injection note ever shown for a cleartext request), and
+  `ops net rules`/help render the third scheme. **The load-bearing proof is a live e2e**
+  (`a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy`, **ran 22s**): a trusted
+  `allow = ["http://cache.nixos.org"]` project runs an in-cage `curl -i http://cache.nixos.org/…`
+  through the empty-netns forwarder → the cleartext handler → real plaintext egress (no `denied-*`),
+  while `http://example.com` (no rule) is refused **`403 denied-default` at the proxy** whose body
+  names `ops net allow http://example.com` — exercising the `method != CONNECT` absolute-form entry a
+  proxy unit test cannot reach. **855+ tests green** (net-new: 6 `allowlist` unit incl. the opt-in +
+  layer-agnostic-deny + method-scope + `apply_default_methods`-rewrites-cleartext + the round-trip;
+  3 `proxy` unit incl. the origin-form forward proof + opt-in + deny-wins; the config secret-target
+  cleartext rejection; the repurposed 405 test for a bare origin-form; the live e2e), fmt/clippy `-D
+  warnings` clean, **std-only** (no new dep — reuses the existing rustls/socket machinery),
+  live-verified (`ops net rules` renders `http://` compact; `test net http://` ALLOWED only via an
+  `http://` rule, a bare/`https` rule does **not** open the clear, deny wins). Advisor-reviewed (plan
+  AND impl). **Honest scope:** cleartext is bytes-on-the-wire unencrypted by nature — the doc steers
+  to `https://` wherever the host offers it; the boundary (empty netns + allowlist + the one host on
+  its one port) is unchanged.
   **One-shot config override — increment 2: typed security flags (DONE 2026-07-04)**
   (`src/config/overrides.rs` + `config/mod.rs` + `config/view.rs` + `main.rs` + `help.rs` +
   `tests/{run,config}.rs`): the ergonomic half of the one-shot override — a **typed flag per field**,

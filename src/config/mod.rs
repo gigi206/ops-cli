@@ -2877,13 +2877,20 @@ fn validate_secret_target(to: &str) -> Result<Rule, String> {
              (a credential is injected for the host on every method)"
         ));
     }
-    // A credential is an HTTP-header injection, which only the inspected L7 (MITM) path can perform —
-    // a `tcp://` (raw L4) destination is spliced byte-for-byte, so there is no request head to inject
-    // into. Reject a `tcp://` `to` fail-closed rather than silently never injecting.
+    // A credential is an HTTP-header injection, which only the inspected-over-TLS (MITM) path can
+    // perform. A `tcp://` (raw L4) destination is spliced byte-for-byte, so there is no request head
+    // to inject into; an `http://` (cleartext L7) destination has a head, but sending a bearer in the
+    // clear would downgrade the credential. Reject either fail-closed rather than silently never
+    // injecting (or injecting over plaintext).
     if rule.layer != Layer::L7 {
+        let scheme = if rule.layer == Layer::L4 {
+            "tcp://"
+        } else {
+            "http://"
+        };
         return Err(format!(
-            "a secret `to` host must be an inspected (L7) destination — remove the `tcp://` from \
-             `{to}` (a header credential cannot be injected into a raw, uninspected stream)"
+            "a secret `to` host must be an inspected-over-TLS destination — remove the `{scheme}` \
+             from `{to}` (a header credential is never injected into a raw or a cleartext stream)"
         ));
     }
     match rule.kind {
@@ -7582,13 +7589,23 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_to_host_rejects_a_tcp_scheme() {
-        // a header credential can only be injected on the inspected (L7) path — a `tcp://` (raw L4)
-        // destination is spliced byte-for-byte, with no request head to inject into. Rejected
-        // fail-closed rather than silently never injecting. The bare/https form still parses.
+    fn a_secret_to_host_rejects_a_raw_or_cleartext_scheme() {
+        // A header credential can only be injected on the inspected-over-TLS path — a `tcp://` (raw
+        // L4) destination is spliced byte-for-byte (no head to inject into), and an `http://`
+        // (cleartext L7) destination has a head but a bearer must never travel in the clear. Both are
+        // rejected fail-closed rather than silently never injecting (or injecting over plaintext). The
+        // bare/https form still parses; each rejection names the exact scheme to remove.
         assert!(validate_secret_target("https://api.example.com").is_ok());
-        let err = validate_secret_target("tcp://api.example.com:443").unwrap_err();
-        assert!(err.contains("inspected (L7) destination"), "{err}");
+        let tcp = validate_secret_target("tcp://api.example.com:443").unwrap_err();
+        assert!(
+            tcp.contains("inspected-over-TLS destination") && tcp.contains("tcp://"),
+            "{tcp}"
+        );
+        let http = validate_secret_target("http://api.example.com").unwrap_err();
+        assert!(
+            http.contains("inspected-over-TLS destination") && http.contains("http://"),
+            "{http}"
+        );
     }
 
     #[test]

@@ -57,8 +57,9 @@ for the full semantics.
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules.md): a host,
-`*.domain`, `host/path`, an IP, `re:<regex>`, `tcp://host:port`, an optional
-`{GET,POST}` verb prefix, or `@<group>` referencing a [`[net.groups]`](net-groups.md).
+`*.domain`, `host/path`, an IP, `re:<regex>`, `http://host` (inspected cleartext),
+`tcp://host:port` (raw), an optional `{GET,POST}` verb prefix, or `@<group>`
+referencing a [`[net.groups]`](net-groups.md).
 
 ## When a host is refused
 

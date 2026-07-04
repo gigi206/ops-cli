@@ -584,9 +584,9 @@ const PAGES: &[Page] = &[
     Page {
         path: &["test", "net"],
         synopsis: "ops test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>",
-        summary: "test a URL (or a tcp:// target) against the resolved network policy",
+        summary: "test a URL (or an http:///tcp:// target) against the resolved network policy",
         options: &[
-            ("<url>", "the URL (or a bare host, completed to https) to test; `tcp://host:port` tests a raw L4 splice instead"),
+            ("<url>", "the URL (or a bare host, completed to https) to test. `http://host` tests the inspected-cleartext path (opt-in — only an `http://` rule opens it); `tcp://host:port` tests a raw L4 splice instead"),
             (
                 "-a, --app <name>",
                 "test against that app's effective policy (baseline + overlay), not the baseline",
@@ -631,8 +631,9 @@ const PAGES: &[Page] = &[
         details:
             "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
             built-in, reflecting the trust gate (an untrusted project's rules are dropped). Every\n\
-            rule names its layer: an inspected L7 rule shows `https://` (a bare host is https on 443),\n\
-            a raw L4 rule shows `tcp://`; a `re:` regex shows neither (its pattern carries its own).\n\
+            rule names its layer: an inspected-over-TLS rule shows `https://` (a bare host is https on\n\
+            443), an inspected-cleartext rule shows `http://` (default port 80), a raw L4 rule shows\n\
+            `tcp://`; a `re:` regex shows neither (its pattern carries its own).\n\
             A rule that came from a `[net.groups]` group shows as a single `@<name>` reference;\n\
             `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
             directly with `ops net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
@@ -697,7 +698,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist an allow rule to a config file",
         options: &[
-            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
+            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
@@ -712,7 +713,7 @@ const PAGES: &[Page] = &[
         synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "persist a deny rule to a config file",
         options: &[
-            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected L7 on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
+            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
