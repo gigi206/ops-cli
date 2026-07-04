@@ -71,39 +71,33 @@ fn main() -> ExitCode {
         "run" => {
             let mut cmd: Vec<OsString> = rest;
             // Leading ops flags before the command: `--detach` to run in the background, a one-shot
-            // override (`--config <toml|@file>`/`--env KEY=VALUE`, repeatable), `--help`/`-h` for
+            // override (the whole-schema `--config <toml|@file>` and the typed `--env`/`--net`/
+            // `--gui`/`--nixpkgs`/`--bind`/`--limit`/`--package`, each repeatable), `--help`/`-h` for
             // this command's page, and an optional `--` separating ops's arguments from the
             // command's. The `--` is consumed before scanning the command, so `ops run -- --detach`
             // (or `-- --help`) runs the literal argument.
             let mut detach = false;
-            let (mut cli_config, mut cli_env) = (Vec::new(), Vec::new());
+            let mut cli = config::CliOverrides::default();
             while let Some(raw) = cmd.first().and_then(|a| a.to_str()) {
                 match flag_name(raw) {
                     "--detach" => {
                         detach = true;
                         cmd.remove(0);
                     }
-                    "--config" => {
-                        if let Err(c) =
-                            take_flag_value(&mut cmd, &mut cli_config, "run", "--config")
-                        {
-                            return c;
-                        }
-                    }
-                    "--env" => {
-                        if let Err(c) = take_flag_value(&mut cmd, &mut cli_env, "run", "--env") {
-                            return c;
-                        }
-                    }
                     "--help" | "-h" => return help::show(&["run"]),
                     "--" => {
                         cmd.remove(0);
                         break;
                     }
-                    _ => break,
+                    // A one-shot override flag, or the start of the command.
+                    _ => match take_override_flag(&mut cmd, &mut cli, "run") {
+                        Some(Ok(())) => {}
+                        Some(Err(c)) => return c,
+                        None => break,
+                    },
                 }
             }
-            let ov = match build_override(cli_config, cli_env) {
+            let ov = match build_override(cli) {
                 Ok(ov) => ov,
                 Err(c) => return c,
             };
@@ -2406,15 +2400,40 @@ fn flag_name(raw: &str) -> &str {
     raw.split_once('=').map(|(f, _)| f).unwrap_or(raw)
 }
 
-/// Build the one-shot override from the collected CLI flag values and the ambient `OPS_CONFIG`/
-/// `OPS_ENV_*` environment, surfacing its notices. Fail-closed: a malformed override (bad TOML, an
-/// unreadable `@file`, a `--env` without `=`) is a usage error (exit 2), never a silent drop that
-/// would launch a different posture than asked.
-fn build_override(
-    cli_config: Vec<String>,
-    cli_env: Vec<String>,
-) -> Result<config::Override, ExitCode> {
-    match config::overrides::collect(&cli_config, &cli_env) {
+/// If the leading token of `head` is a one-shot override flag, consume it and its value into `cli`
+/// and return `Some(result)` (`Ok` on success, `Err(code)` on a missing value); return `None` when
+/// the token is not an override flag, so the caller handles it (a command, the app name, an unknown
+/// flag). Shared by `run`/`shell`/`app`, so the whole `--config`/`--env`/`--net`/`--gui`/`--nixpkgs`/
+/// `--bind`/`--limit`/`--package` set parses identically everywhere. A scalar flag (`--net`/`--gui`/
+/// `--nixpkgs`) may repeat — the merge takes the last; the collection flags take them all.
+fn take_override_flag(
+    head: &mut Vec<OsString>,
+    cli: &mut config::CliOverrides,
+    verb: &str,
+) -> Option<Result<(), ExitCode>> {
+    // Resolve the flag name to an owned string first, ending the borrow of `head` before the value
+    // is taken (which mutates `head`).
+    let name = flag_name(head.first()?.to_str()?).to_string();
+    let sink = match name.as_str() {
+        "--config" => &mut cli.config,
+        "--env" => &mut cli.env,
+        "--net" => &mut cli.net,
+        "--gui" => &mut cli.gui,
+        "--nixpkgs" => &mut cli.nixpkgs,
+        "--bind" => &mut cli.binds,
+        "--limit" => &mut cli.limits,
+        "--package" => &mut cli.packages,
+        _ => return None,
+    };
+    Some(take_flag_value(head, sink, verb, &name))
+}
+
+/// Build the one-shot override from the collected CLI flag values and the ambient `OPS_*`
+/// environment, surfacing its notices. Fail-closed: a malformed override (bad TOML, an unreadable
+/// `@file`, a `--env`/`--limit`/`--package` without `=`, a bad `--net`/`--bind` value) is a usage
+/// error (exit 2), never a silent drop that would launch a different posture than asked.
+fn build_override(cli: config::CliOverrides) -> Result<config::Override, ExitCode> {
+    match config::overrides::collect(&cli) {
         Ok(ov) => {
             for notice in ov.notices() {
                 diag::warn(notice);
@@ -2432,27 +2451,23 @@ fn build_override(
 /// override flags (`--config`/`--env`) and `--help`; any other argument is a usage error (a stray
 /// token would otherwise be silently dropped, since a shell launch has no positional).
 fn shell_cmd(mut args: Vec<OsString>) -> ExitCode {
-    let (mut cli_config, mut cli_env) = (Vec::new(), Vec::new());
+    let mut cli = config::CliOverrides::default();
     while let Some(raw) = args.first().and_then(|a| a.to_str()) {
         match flag_name(raw) {
-            "--config" => {
-                if let Err(c) = take_flag_value(&mut args, &mut cli_config, "shell", "--config") {
-                    return c;
-                }
-            }
-            "--env" => {
-                if let Err(c) = take_flag_value(&mut args, &mut cli_env, "shell", "--env") {
-                    return c;
-                }
-            }
             "--help" | "-h" => return help::show(&["shell"]),
-            other => {
-                eprintln!("ops: shell: unexpected argument `{other}` (it takes no command)");
-                return ExitCode::from(2);
-            }
+            // A one-shot override flag, or a stray argument (a shell takes no command).
+            _ => match take_override_flag(&mut args, &mut cli, "shell") {
+                Some(Ok(())) => {}
+                Some(Err(c)) => return c,
+                None => {
+                    let tok = args.first().and_then(|a| a.to_str()).unwrap_or_default();
+                    eprintln!("ops: shell: unexpected argument `{tok}` (it takes no command)");
+                    return ExitCode::from(2);
+                }
+            },
         }
     }
-    let ov = match build_override(cli_config, cli_env) {
+    let ov = match build_override(cli) {
         Ok(ov) => ov,
         Err(c) => return c,
     };
@@ -2473,8 +2488,8 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         // background as a session `ops ls`/`attach`/`stop` can see. Tokens after a `--` are passed
         // through to the app's command (see `parse_app_launch`).
         _ => match parse_app_launch(&args) {
-            Ok((name, detach, extra, cli_config, cli_env)) => {
-                let ov = match build_override(cli_config, cli_env) {
+            Ok((name, detach, extra, cli)) => {
+                let ov = match build_override(cli) {
                     Ok(ov) => ov,
                     Err(code) => return code,
                 };
@@ -2501,10 +2516,9 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
 /// too, in any order with the name and `--detach`; the collected values are returned for the caller
 /// to build the override (kept out of this pure parser, which reads no environment). The head is
 /// parsed as a mutable queue so a value-taking flag can pull its argument.
-#[allow(clippy::type_complexity)]
 fn parse_app_launch(
     args: &[OsString],
-) -> Result<(String, bool, Vec<OsString>, Vec<String>, Vec<String>), ExitCode> {
+) -> Result<(String, bool, Vec<OsString>, config::CliOverrides), ExitCode> {
     let (mut head, tail): (Vec<OsString>, Vec<OsString>) = match args.iter().position(|a| a == "--")
     {
         Some(i) => (args[..i].to_vec(), args[i + 1..].to_vec()),
@@ -2512,7 +2526,7 @@ fn parse_app_launch(
     };
     let mut detach = false;
     let mut name: Option<String> = None;
-    let (mut cli_config, mut cli_env) = (Vec::new(), Vec::new());
+    let mut cli = config::CliOverrides::default();
     while !head.is_empty() {
         // Decide on the leading token, then act — the match ends the immutable borrow so a
         // value-taking flag can mutate the queue.
@@ -2524,34 +2538,36 @@ fn parse_app_launch(
             return Err(ExitCode::from(2));
         };
         match flag_name(&raw) {
-            "--config" => take_flag_value(&mut head, &mut cli_config, "app", "--config")?,
-            "--env" => take_flag_value(&mut head, &mut cli_env, "app", "--env")?,
             "--detach" => {
                 detach = true;
                 head.remove(0);
             }
-            tok if tok.starts_with('-') => {
-                eprintln!("ops: unknown flag {tok} — usage: {}", help::synopsis("app"));
-                return Err(ExitCode::from(2));
-            }
-            _ => {
-                if name.is_some() {
-                    eprintln!(
-                        "ops: app takes a single name — usage: {}",
-                        help::synopsis("app")
-                    );
-                    return Err(ExitCode::from(2));
+            // A one-shot override flag, an unknown flag, or the app name.
+            _ => match take_override_flag(&mut head, &mut cli, "app") {
+                Some(res) => res?,
+                None => {
+                    if raw.starts_with('-') {
+                        eprintln!("ops: unknown flag {raw} — usage: {}", help::synopsis("app"));
+                        return Err(ExitCode::from(2));
+                    }
+                    if name.is_some() {
+                        eprintln!(
+                            "ops: app takes a single name — usage: {}",
+                            help::synopsis("app")
+                        );
+                        return Err(ExitCode::from(2));
+                    }
+                    name = Some(raw);
+                    head.remove(0);
                 }
-                name = Some(raw);
-                head.remove(0);
-            }
+            },
         }
     }
     let Some(name) = name else {
         eprintln!("ops: usage: {}", help::synopsis("app"));
         return Err(ExitCode::from(2));
     };
-    Ok((name, detach, tail, cli_config, cli_env))
+    Ok((name, detach, tail, cli))
 }
 
 /// The import confirmation: `imported` in green over the app name and destination, the granted
@@ -8196,9 +8212,9 @@ mod tests {
         let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
 
         // A bare name: no detach, no passthrough, no override.
-        let (name, detach, extra, cfg, env) = parse_app_launch(&v(&["claude"])).unwrap();
+        let (name, detach, extra, cli) = parse_app_launch(&v(&["claude"])).unwrap();
         assert_eq!((name.as_str(), detach), ("claude", false));
-        assert!(extra.is_empty() && cfg.is_empty() && env.is_empty());
+        assert!(extra.is_empty() && cli.config.is_empty() && cli.env.is_empty());
 
         // `--detach` before the (absent) `--` sets the flag.
         let (name, detach, extra, ..) = parse_app_launch(&v(&["claude", "--detach"])).unwrap();
@@ -8226,7 +8242,7 @@ mod tests {
 
         // A one-shot override is collected from the head, in any order with the name/`--detach`, and
         // stops at `--` (a later `--config` after `--` is the program's argument, not ops's).
-        let (name, _, extra, cfg, env) = parse_app_launch(&v(&[
+        let (name, _, extra, cli) = parse_app_launch(&v(&[
             "--env",
             "FOO=bar",
             "claude",
@@ -8238,14 +8254,38 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(name, "claude");
-        assert_eq!(cfg, vec!["network=\"none\"".to_string()]);
-        assert_eq!(env, vec!["FOO=bar".to_string()]);
+        assert_eq!(cli.config, vec!["network=\"none\"".to_string()]);
+        assert_eq!(cli.env, vec!["FOO=bar".to_string()]);
         assert_eq!(extra, v(&["--config", "x"]));
         // The `--flag=value` inline form is accepted too.
-        let (_, _, _, cfg, env) =
+        let (_, _, _, cli) =
             parse_app_launch(&v(&["claude", "--config=gui=\"wayland\"", "--env=A=1"])).unwrap();
-        assert_eq!(cfg, vec!["gui=\"wayland\"".to_string()]);
-        assert_eq!(env, vec!["A=1".to_string()]);
+        assert_eq!(cli.config, vec!["gui=\"wayland\"".to_string()]);
+        assert_eq!(cli.env, vec!["A=1".to_string()]);
+        // The typed security flags are collected into their own fields, in any order with the name.
+        let (name, _, _, cli) = parse_app_launch(&v(&[
+            "--net",
+            "none",
+            "claude",
+            "--bind",
+            "/data:rw",
+            "--limit",
+            "tasks_max=4096",
+            "--gui",
+            "wayland",
+            "--nixpkgs",
+            "nixos-23.11",
+            "--package",
+            "hello=nix:hello",
+        ]))
+        .unwrap();
+        assert_eq!(name, "claude");
+        assert_eq!(cli.net, vec!["none".to_string()]);
+        assert_eq!(cli.gui, vec!["wayland".to_string()]);
+        assert_eq!(cli.nixpkgs, vec!["nixos-23.11".to_string()]);
+        assert_eq!(cli.binds, vec!["/data:rw".to_string()]);
+        assert_eq!(cli.limits, vec!["tasks_max=4096".to_string()]);
+        assert_eq!(cli.packages, vec!["hello=nix:hello".to_string()]);
 
         // Errors: a second name, an unknown flag, no name at all, `--` with no name before it, and a
         // value-taking flag with no value.
@@ -8254,6 +8294,7 @@ mod tests {
         assert!(parse_app_launch(&v(&[])).is_err());
         assert!(parse_app_launch(&v(&["--", "-c"])).is_err());
         assert!(parse_app_launch(&v(&["claude", "--config"])).is_err());
+        assert!(parse_app_launch(&v(&["claude", "--net"])).is_err());
     }
 
     #[test]

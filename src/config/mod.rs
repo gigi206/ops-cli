@@ -20,7 +20,7 @@ pub(crate) mod safety;
 mod schema;
 pub(crate) mod view;
 
-pub(crate) use overrides::Override;
+pub(crate) use overrides::{CliOverrides, Override};
 
 use crate::allowlist::{Layer, Methods, Rule, RuleKind};
 use crate::plugins::PluginRegistry;

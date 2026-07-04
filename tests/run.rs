@@ -3472,6 +3472,78 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
     }
 }
 
+/// A typed one-shot `--limit` reaches the cage's scope — no project config, no trust: the override
+/// is trusted by invocation. `ops run --limit tasks_max=8192 -- sleep` with the cage's host-visible
+/// `pids.max` equal to 8192 (not the built-in default) proves the typed flag threads collect →
+/// apply_override → `cgroup::wrap` → the systemd scope, the same seam the `[limits]` config e2e
+/// proves for a file — but through the increment-2 typed-flag surface instead of a TOML blob.
+#[test]
+fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
+    const OVERRIDE_CAP: &str = "8192"; // distinct from the default TASKS_MAX (16384)
+    const DEFAULT_CAP: &str = "16384";
+    let project = TmpDir::new("cgtyped-proj");
+    let data = TmpDir::new("cgtyped-data");
+    let state = TmpDir::new("cgtyped-state");
+
+    // Capability probe (also primes the base userland so the measured launch starts fast). No
+    // project config and no `ops trust` — the one-shot override is trusted by invocation.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping typed-limit e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let mut child = ops()
+        .args(["run", "--limit", "tasks_max=8192", "--"])
+        .args(["sleep", "5"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ops run");
+    let pid = child.id();
+
+    let mut pids_max = String::new();
+    for _ in 0..50 {
+        if let Some(scope) = host_cgroup_path(pid) {
+            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
+                pids_max = v.trim().to_string();
+                if pids_max == OVERRIDE_CAP {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if pids_max != OVERRIDE_CAP {
+        // The default leaking through means the scope applied but the typed flag did not — a real
+        // regression in the flag→collect→cgroup threading, so fail. Any other value (or none) is the
+        // host having no systemd user session that delegates the pids controller — skip.
+        assert_ne!(
+            pids_max, DEFAULT_CAP,
+            "the cage ran under the default task cap, not the typed `--limit tasks_max=8192` — the \
+             typed one-shot flag did not thread through to the scope"
+        );
+        eprintln!(
+            "skipping typed-limit e2e: the cage is not under a task-capped scope \
+             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+        );
+    }
+}
+
 /// The real cgroup v2 path of a process, read from the host (`0::<path>`), or
 /// `None` if the process is gone or its cgroup cannot be read.
 fn host_cgroup_path(pid: u32) -> Option<String> {

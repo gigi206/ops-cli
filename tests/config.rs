@@ -237,6 +237,25 @@ fn config_show_reflects_and_tags_an_ambient_override() {
 }
 
 #[test]
+fn config_show_reflects_an_ambient_typed_override() {
+    // The typed ambient variables (`OPS_NET` here) must reach `ops config show` too — it reads the
+    // same `collect` the launch does, so a stale `OPS_NET` cannot silently change a launch's posture
+    // without the view admitting it. No project config, so the baseline network is `shared`.
+    let fx = Fixture::new();
+    let out = fx
+        .ops(&["config", "show"])
+        .env("OPS_NET", "none")
+        .output()
+        .expect("spawn ops");
+    assert!(out.status.success(), "config show should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("network: none") && stdout.contains("(override)"),
+        "config show must reflect and tag the ambient typed override:\n{stdout}"
+    );
+}
+
+#[test]
 fn config_show_rejects_an_unknown_argument() {
     let fx = Fixture::new();
     let out = fx.run(&["config", "show", "--bogus"]);

@@ -6,31 +6,49 @@
 //! project directory) can reach. So an override is trusted *by invocation*, distinct from the
 //! direnv-style content trust of a project config: it touches no trust marker.
 //!
-//! Precedence, lowest to highest:
+//! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `OPS_CONFIG` — carries
+//! inline TOML shaped exactly like an `ops.toml`, so it can set *any* field the schema has. A
+//! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--limit`/`--package` (and their `--env`
+//! sibling), each with an `OPS_*` environment equivalent — is an ergonomic shorthand for one field.
+//!
+//! Precedence, lowest to highest — four tiers:
 //!
 //! ```text
-//! OPS_CONFIG (env blob) < OPS_ENV_<KEY> (env, per key) < --config (cli blob) < --env (cli)
+//! OPS_CONFIG (env blob) < OPS_* typed (env) < --config (cli blob) < --* typed (cli)
 //! ```
 //!
 //! so any CLI input beats any environment one ("the CLI wins over the environment"), and within a
 //! source the specific typed input beats the whole-schema blob.
 //!
-//! The blob forms (`--config`/`OPS_CONFIG`) carry inline TOML — or `@<file>` — shaped exactly like
-//! an `ops.toml`, so an override can set *any* field the schema has. This module only *collects and
-//! merges* the inputs into one overlay; the authoritative application onto a resolved configuration
-//! is [`super::Resolved::apply_override`] (and [`super::Resolved::apply_override_channel`] for the
-//! nixpkgs channel, which must land before the launch picks its lock).
+//! The merge across the four tiers is uniform: a **scalar** field (`nixpkgs`/`network`/`gui`) is
+//! *replaced* by the highest tier that sets it; a **collection** field (`env`/`packages`/`binds`/
+//! `limits`) is *unioned*, the higher tier winning per key/entry. So `--bind` adds to whatever the
+//! blobs bound, and `--limit tasks_max=…` tunes one limit without dropping a `memory_max` a blob set.
+//!
+//! This module only *collects and merges* the inputs into one overlay; the authoritative application
+//! onto a resolved configuration is [`super::Resolved::apply_override`] (and
+//! [`super::Resolved::apply_override_channel`] for the nixpkgs channel, which must land before the
+//! launch picks its lock). A set-but-invalid *value* (a `--gui bogus`, a `--net nonee`) is caught
+//! there, fail-closed; this module only rejects a *structural* error (a `--limit` with no `=`, a
+//! `--bind` with an empty path).
 //!
 //! Fail-closed: unlike [`super::load`], which is infallible (a bad config warns and is dropped), a
 //! malformed override is an explicit request the user got wrong — [`collect`] returns `Err`, so the
 //! launch aborts rather than silently dropping the field and running a different posture than asked.
 
-use super::schema::{self, RawConfig};
-use std::collections::BTreeMap;
+use super::schema::{
+    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawLimit, RawLimits,
+};
 
 /// The environment-variable prefix that sets one cage environment variable per key:
 /// `OPS_ENV_FOO=bar` contributes `FOO=bar` to the cage environment.
 const OPS_ENV_PREFIX: &str = "OPS_ENV_";
+/// The environment-variable prefix that tunes one cgroup limit: `OPS_LIMIT_TASKS_MAX=8192`
+/// contributes `tasks_max = 8192` (the suffix, lowercased, is the limit field).
+const OPS_LIMIT_PREFIX: &str = "OPS_LIMIT_";
+/// The environment-variable prefix that declares one package: `OPS_PACKAGE_hello=nix:hello`
+/// contributes the `hello` package (the suffix is the package name, the value its backend locator).
+const OPS_PACKAGE_PREFIX: &str = "OPS_PACKAGE_";
 /// The whole-schema environment blob: inline TOML (or `@<file>`) shaped like an `ops.toml`.
 const OPS_CONFIG: &str = "OPS_CONFIG";
 
@@ -75,186 +93,474 @@ impl Override {
     }
 }
 
-/// Collect a one-shot override from the CLI `--config`/`--env` values (already stripped from argv by
-/// the caller) and the `OPS_CONFIG`/`OPS_ENV_<KEY>` environment. Fail-closed: a malformed blob, an
-/// unreadable `@file`, or a bad `--env KEY=VALUE` is an `Err(message)`.
-pub(crate) fn collect(cli_config: &[String], cli_env: &[String]) -> Result<Override, String> {
-    let ops_config = std::env::var(OPS_CONFIG).ok().filter(|s| !s.is_empty());
-    let mut ops_env = BTreeMap::new();
+/// The command-line override inputs, already stripped from argv by the caller. Every field is a
+/// repeatable list of raw flag values; a *scalar* flag (`--net`/`--gui`/`--nixpkgs`) takes the last
+/// occurrence, a *collection* flag (`--bind`/`--limit`/`--package`/`--env`) takes them all.
+#[derive(Debug, Default)]
+pub(crate) struct CliOverrides {
+    /// `--config <toml|@file>` — whole-schema blobs, merged in order (the uniform rule).
+    pub(crate) config: Vec<String>,
+    /// `--env KEY=VALUE` — one cage environment variable each.
+    pub(crate) env: Vec<String>,
+    /// `--net <posture|allow=…|deny=…>` — the network posture (last wins).
+    pub(crate) net: Vec<String>,
+    /// `--gui <none|wayland>` — the display posture (last wins).
+    pub(crate) gui: Vec<String>,
+    /// `--nixpkgs <ref>` — the nixpkgs channel/revision (last wins).
+    pub(crate) nixpkgs: Vec<String>,
+    /// `--bind <path[:ro|:rw]>` — one host bind each.
+    pub(crate) binds: Vec<String>,
+    /// `--limit <key>=<value>` — one cgroup limit each.
+    pub(crate) limits: Vec<String>,
+    /// `--package <name>=<backend:locator>` — one package each.
+    pub(crate) packages: Vec<String>,
+}
+
+/// The ambient (`OPS_*`) override inputs, scanned from the environment. Passed to [`collect_from`]
+/// rather than read there, so the whole merge and its precedence are unit-testable without touching
+/// the process environment. The typed fields mirror [`CliOverrides`]; the maps carry the per-key
+/// forms (`OPS_ENV_<KEY>`, `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`).
+#[derive(Debug, Default)]
+struct AmbientOverrides {
+    /// `OPS_CONFIG` — the whole-schema blob.
+    config: Option<String>,
+    /// `OPS_ENV_<KEY>` — one cage environment variable each.
+    env: Vec<(String, String)>,
+    /// `OPS_NET` — the network posture.
+    net: Option<String>,
+    /// `OPS_GUI` — the display posture.
+    gui: Option<String>,
+    /// `OPS_NIXPKGS` — the nixpkgs channel/revision.
+    nixpkgs: Option<String>,
+    /// `OPS_BIND` — one host bind (a list is a blob concern).
+    binds: Vec<String>,
+    /// `OPS_LIMIT_<key>` — one cgroup limit each (key lowercased).
+    limits: Vec<(String, String)>,
+    /// `OPS_PACKAGE_<name>` — one package each.
+    packages: Vec<(String, String)>,
+}
+
+/// The flag names a typed fragment reports in its structural-error messages, so a `--bind` error
+/// and an `OPS_BIND` error each name their own source. `gui`/`nixpkgs` are passthrough (their value
+/// is validated downstream, never here), so they carry no label.
+struct TypedLabels {
+    net: &'static str,
+    bind: &'static str,
+    limit: &'static str,
+    package: &'static str,
+}
+
+const CLI_LABELS: TypedLabels = TypedLabels {
+    net: "--net",
+    bind: "--bind",
+    limit: "--limit",
+    package: "--package",
+};
+
+const ENV_LABELS: TypedLabels = TypedLabels {
+    net: "OPS_NET",
+    bind: "OPS_BIND",
+    limit: "OPS_LIMIT_*",
+    package: "OPS_PACKAGE_*",
+};
+
+/// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
+/// the ambient `OPS_*` environment. Fail-closed: a malformed blob, an unreadable `@file`, or a
+/// structurally-bad typed value (a `--limit` with no `=`, a `--bind` with an empty path) is an
+/// `Err(message)`.
+pub(crate) fn collect(cli: &CliOverrides) -> Result<Override, String> {
+    collect_from(cli, scan_ambient())
+}
+
+/// Read the ambient `OPS_*` override variables from the environment. Exact names first, then the
+/// per-key prefixes; the two never collide (`OPS_NET` is not an `OPS_ENV_*`).
+fn scan_ambient() -> AmbientOverrides {
+    let mut a = AmbientOverrides {
+        config: env_nonempty(OPS_CONFIG),
+        net: env_nonempty("OPS_NET"),
+        gui: env_nonempty("OPS_GUI"),
+        nixpkgs: env_nonempty("OPS_NIXPKGS"),
+        ..AmbientOverrides::default()
+    };
+    if let Some(v) = env_nonempty("OPS_BIND") {
+        a.binds.push(v);
+    }
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix(OPS_ENV_PREFIX) {
             if !name.is_empty() {
-                ops_env.insert(name.to_string(), v);
+                a.env.push((name.to_string(), v));
+            }
+        } else if let Some(key) = k.strip_prefix(OPS_LIMIT_PREFIX) {
+            if !key.is_empty() {
+                a.limits.push((key.to_lowercase(), v));
+            }
+        } else if let Some(name) = k.strip_prefix(OPS_PACKAGE_PREFIX) {
+            if !name.is_empty() {
+                a.packages.push((name.to_string(), v));
             }
         }
     }
-    collect_from(cli_config, cli_env, ops_config, ops_env)
+    a
 }
 
-/// The pure core of [`collect`]: the environment is passed in (the `OPS_CONFIG` blob and the
-/// `OPS_ENV_<KEY>` map) rather than read, so the whole merge and its precedence are unit-testable
-/// without touching the process environment.
-fn collect_from(
-    cli_config: &[String],
-    cli_env: &[String],
-    ops_config: Option<String>,
-    ops_env: BTreeMap<String, String>,
-) -> Result<Override, String> {
-    // Parse the two blob sources (fail-closed). The CLI blob merges every `--config` occurrence in
-    // order, a later one winning per field, so repeated flags compose predictably.
-    let env_blob = match ops_config {
-        Some(s) => Some(parse_blob(&s).map_err(|e| format!("{OPS_CONFIG}: {e}"))?),
-        None => None,
+/// The value of an environment variable, or `None` if unset or empty.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// The pure core of [`collect`]: the ambient environment is passed in. Builds the four precedence
+/// tiers (`OPS_CONFIG` blob, `OPS_*` typed, `--config` blob, `--*` typed), folds each into one
+/// overlay per the uniform merge rule, and records the one-time notices.
+fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Override, String> {
+    // Tier 0 — the environment blob.
+    let t0 = match &ambient.config {
+        Some(s) => parse_blob(s).map_err(|e| format!("{OPS_CONFIG}: {e}"))?,
+        None => RawConfig::default(),
     };
-    let mut cli_blob: Option<RawConfig> = None;
-    for (i, c) in cli_config.iter().enumerate() {
+    // Tier 1 — the environment's typed fragments.
+    let t1 = build_typed_fragment(
+        ambient.net.as_deref(),
+        ambient.gui.as_deref(),
+        ambient.nixpkgs.as_deref(),
+        &ambient.binds,
+        &ambient.limits,
+        &ambient.packages,
+        &ambient.env,
+        &ENV_LABELS,
+    )?;
+    // Tier 2 — the CLI blobs, merged in order (a later one winning per the uniform rule).
+    let mut t2 = RawConfig::default();
+    for (i, c) in cli.config.iter().enumerate() {
         let parsed = parse_blob(c).map_err(|e| format!("--config (#{}): {e}", i + 1))?;
-        cli_blob = Some(match cli_blob {
-            None => parsed,
-            Some(base) => merge_raw(base, parsed),
-        });
+        t2 = overlay_into(t2, parsed);
     }
-    let cli_typed_env = parse_env_pairs(cli_env)?;
+    // Tier 3 — the CLI's typed fragments.
+    let cli_limits = split_kv(&cli.limits, "--limit")?;
+    let cli_packages = split_kv(&cli.packages, "--package")?;
+    let cli_env = split_kv(&cli.env, "--env")?;
+    let t3 = build_typed_fragment(
+        cli.net.last().map(String::as_str),
+        cli.gui.last().map(String::as_str),
+        cli.nixpkgs.last().map(String::as_str),
+        &cli.binds,
+        &cli_limits,
+        &cli_packages,
+        &cli_env,
+        &CLI_LABELS,
+    )?;
 
-    let mut merged = RawConfig::default();
+    // Fold each source into its side, then merge the sides. Keeping the two sides distinct lets the
+    // notice logic tell an environment-sourced field from a CLI-sourced one.
+    let env_side = overlay_into(t0, t1);
+    let cli_side = overlay_into(t2, t3);
+
     let mut notices = Vec::new();
+    push_ignored_field_notices(&env_side, &cli_side, &mut notices);
+    push_env_source_notices(&env_side, &cli_side, &mut notices);
 
-    // Ignored fields — flagged once, before the blobs are consumed for their launch fields. These
-    // are not one-shot launch concepts: egress groups are a global-config affordance, and an
-    // override shapes *the* launch rather than defining apps.
-    let field_present = |has: fn(&RawConfig) -> bool| {
-        cli_blob.as_ref().is_some_and(has) || env_blob.as_ref().is_some_and(has)
-    };
-    for (label, has) in [
-        (
-            "`[net.groups]`",
-            (|c: &RawConfig| !c.net.groups.is_empty()) as fn(&RawConfig) -> bool,
-        ),
-        ("`[app.*]`", |c: &RawConfig| !c.app.is_empty()),
-    ] {
-        if field_present(has) {
-            notices.push(format!(
-                "ignoring {label} in the override — it is not a one-shot launch field"
-            ));
-        }
-    }
-
-    // The cage environment merges across sources in precedence order, a later one winning per key.
-    if let Some(b) = &env_blob {
-        merged.env.extend(b.env.clone());
-    }
-    merged.env.extend(ops_env);
-    if let Some(b) = &cli_blob {
-        merged.env.extend(b.env.clone());
-    }
-    for (k, v) in cli_typed_env {
-        merged.env.insert(k, v);
-    }
-
-    // The security and other launch-shaping fields: the CLI blob wins over the environment blob per
-    // field. A field that ends up sourced from the environment is noted, so a stale ambient variable
-    // cannot silently widen (or narrow) a launch's posture without a word.
-    fold_launch_fields(&mut merged, env_blob, cli_blob, &mut notices);
-
+    let merged = overlay_into(env_side, cli_side);
     Ok(Override {
         raw: merged,
         notices,
     })
 }
 
-/// The security/launch fields an override can carry, for the environment-source notice. `env` is a
-/// *free* field (folded separately, no notice), so it is not here.
-const SECURITY_FIELDS: &[&str] = &[
-    "binds", "packages", "nixpkgs", "network", "gui", "limits", "secret",
-];
-
-/// Fold the launch-shaping fields of the two blobs into `merged` with the CLI winning over the
-/// environment per field, and push a notice for each security field whose winning value came from
-/// the environment. Consumes both blobs (their fields move into `merged`).
-fn fold_launch_fields(
-    merged: &mut RawConfig,
-    env_blob: Option<RawConfig>,
-    cli_blob: Option<RawConfig>,
+/// Note the fields an override carries that are not one-shot launch concepts: egress groups are a
+/// global-config affordance, and an override shapes *the* launch rather than defining apps. They are
+/// dropped (ignored downstream), so the notice is the only signal.
+fn push_ignored_field_notices(
+    env_side: &RawConfig,
+    cli_side: &RawConfig,
     notices: &mut Vec<String>,
 ) {
-    let e = env_blob.unwrap_or_default();
-    let c = cli_blob.unwrap_or_default();
-
-    // For each field: the CLI value wins when it set one; otherwise the environment's. A field
-    // taken from the environment is recorded by name for the notice below.
-    let mut from_env: Vec<&'static str> = Vec::new();
-
-    if !c.binds.is_empty() {
-        merged.binds = c.binds;
-    } else if !e.binds.is_empty() {
-        merged.binds = e.binds;
-        from_env.push("binds");
+    if !env_side.net.groups.is_empty() || !cli_side.net.groups.is_empty() {
+        notices.push(
+            "ignoring `[net.groups]` in the override — it is not a one-shot launch field"
+                .to_string(),
+        );
     }
-    if !c.packages.is_empty() {
-        merged.packages = c.packages;
-    } else if !e.packages.is_empty() {
-        merged.packages = e.packages;
-        from_env.push("packages");
+    if !env_side.app.is_empty() || !cli_side.app.is_empty() {
+        notices.push(
+            "ignoring `[app.*]` in the override — it is not a one-shot launch field".to_string(),
+        );
     }
-    merged.nixpkgs = pick(c.nixpkgs, e.nixpkgs, "nixpkgs", &mut from_env);
-    merged.network = pick(c.network, e.network, "network", &mut from_env);
-    merged.gui = pick(c.gui, e.gui, "gui", &mut from_env);
-    merged.limits = pick(c.limits, e.limits, "limits", &mut from_env);
-    merged.secret = pick(c.secret, e.secret, "secret", &mut from_env);
+}
 
-    for field in SECURITY_FIELDS {
-        if from_env.contains(field) {
-            notices.push(format!(
-                "security field `{field}` set from the environment ({OPS_CONFIG}) — an ambient \
-                 variable changes every launch; use `--config` on the command line for a true \
-                 one-shot"
-            ));
+/// Push a notice for each **security** field whose value the environment (either the `OPS_CONFIG`
+/// blob or an `OPS_*` typed variable) contributed — so a stale ambient variable cannot silently
+/// change a launch's posture without a word. `env` is a *free* field (folded without a notice).
+///
+/// A replaced (scalar) field is environment-sourced when the CLI did not set it but the environment
+/// did; a unioned (collection) field is noted whenever the environment contributed any entry, since
+/// its value then carries an ambient contribution even if the CLI added more.
+fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: &mut Vec<String>) {
+    let mut note = |field: &str| {
+        notices.push(format!(
+            "security field `{field}` set from the environment — an ambient OPS_* variable changes \
+             every launch; set it on the command line for a true one-shot"
+        ));
+    };
+    // Replaced scalars: noted when only the environment set them.
+    for (field, env_has, cli_has) in [
+        (
+            "nixpkgs",
+            env_side.nixpkgs.is_some(),
+            cli_side.nixpkgs.is_some(),
+        ),
+        (
+            "network",
+            env_side.network.is_some(),
+            cli_side.network.is_some(),
+        ),
+        ("gui", env_side.gui.is_some(), cli_side.gui.is_some()),
+        (
+            "secret",
+            env_side.secret.is_some(),
+            cli_side.secret.is_some(),
+        ),
+    ] {
+        if env_has && !cli_has {
+            note(field);
+        }
+    }
+    // Unioned collections: noted whenever the environment contributed.
+    for (field, env_has) in [
+        ("binds", !env_side.binds.is_empty()),
+        ("packages", !env_side.packages.is_empty()),
+        ("limits", env_side.limits.is_some()),
+    ] {
+        if env_has {
+            note(field);
         }
     }
 }
 
-/// Pick the CLI value if set, else the environment's; record the field name when the environment's
-/// is chosen (a security-field-via-environment notice is emitted for it).
-fn pick<T>(
-    cli: Option<T>,
-    env: Option<T>,
-    field: &'static str,
-    from_env: &mut Vec<&'static str>,
-) -> Option<T> {
-    match cli {
-        Some(v) => Some(v),
-        None => {
-            if env.is_some() {
-                from_env.push(field);
-            }
-            env
-        }
+/// Merge `higher` onto `base` per the uniform rule: a scalar field is replaced when `higher` sets
+/// it; a collection field is unioned, `higher` winning per key/entry. This is the one merge — used
+/// for repeated `--config` blobs, for folding a typed fragment onto a blob, and for merging the two
+/// precedence sides. `[net.groups]`/`[app.*]` ride along (ignored downstream but noticed).
+fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
+    base.env.extend(higher.env);
+    base.packages.extend(higher.packages);
+    base.binds = union_binds(base.binds, higher.binds);
+    base.limits = union_limits(base.limits, higher.limits);
+    if higher.nixpkgs.is_some() {
+        base.nixpkgs = higher.nixpkgs;
     }
-}
-
-/// Merge two parsed override blobs, `over` winning over `base` for any field it sets — the rule for
-/// repeated `--config` flags. Maps extend (a later key wins); a set collection or option replaces.
-fn merge_raw(mut base: RawConfig, over: RawConfig) -> RawConfig {
-    base.env.extend(over.env);
-    if !over.binds.is_empty() {
-        base.binds = over.binds;
+    if higher.network.is_some() {
+        base.network = higher.network;
     }
-    base.packages.extend(over.packages);
-    if over.nixpkgs.is_some() {
-        base.nixpkgs = over.nixpkgs;
+    if higher.gui.is_some() {
+        base.gui = higher.gui;
     }
-    if over.network.is_some() {
-        base.network = over.network;
+    if higher.secret.is_some() {
+        base.secret = higher.secret;
     }
-    if over.gui.is_some() {
-        base.gui = over.gui;
-    }
-    if over.secret.is_some() {
-        base.secret = over.secret;
-    }
-    base.net.groups.extend(over.net.groups);
-    base.app.extend(over.app);
+    base.net.groups.extend(higher.net.groups);
+    base.app.extend(higher.app);
     base
+}
+
+/// The destination path a bind is keyed by (the same path it is bound at in the cage). A detailed
+/// table missing its `path` is malformed — it has no key, so it only ever appends.
+fn bind_path(b: &RawBind) -> Option<&str> {
+    match b {
+        RawBind::Path(p) => Some(p),
+        RawBind::Detailed(t) => t.path.as_deref(),
+    }
+}
+
+/// Union two bind lists, a higher-tier entry replacing a lower-tier one that binds the same path, so
+/// `--bind /data:rw` overrides an `OPS_BIND=/data:ro`. Order is preserved; a keyless (malformed)
+/// entry appends.
+fn union_binds(mut base: Vec<RawBind>, higher: Vec<RawBind>) -> Vec<RawBind> {
+    for h in higher {
+        match bind_path(&h).map(str::to_string) {
+            Some(p) => match base.iter_mut().find(|b| bind_path(b) == Some(p.as_str())) {
+                Some(existing) => *existing = h,
+                None => base.push(h),
+            },
+            None => base.push(h),
+        }
+    }
+    base
+}
+
+/// Union two limit tables per field, a higher-tier field winning. So `--limit tasks_max=…` tunes one
+/// limit over a blob's `memory_max` rather than replacing the whole table (dropping it).
+fn union_limits(base: Option<RawLimits>, higher: Option<RawLimits>) -> Option<RawLimits> {
+    match (base, higher) {
+        (b, None) => b,
+        (None, h) => h,
+        (Some(mut b), Some(h)) => {
+            if h.memory_high.is_some() {
+                b.memory_high = h.memory_high;
+            }
+            if h.memory_max.is_some() {
+                b.memory_max = h.memory_max;
+            }
+            if h.tasks_max.is_some() {
+                b.tasks_max = h.tasks_max;
+            }
+            Some(b)
+        }
+    }
+}
+
+/// Build a `RawConfig` fragment from a source's typed inputs. A *structural* error (a bad `--net`
+/// posture keyword, an empty `--bind` path, an unknown `--limit` key, an empty `--package` name) is
+/// fail-closed; a set-but-invalid *value* passes through to the downstream validation.
+#[allow(clippy::too_many_arguments)]
+fn build_typed_fragment(
+    net: Option<&str>,
+    gui: Option<&str>,
+    nixpkgs: Option<&str>,
+    binds: &[String],
+    limits: &[(String, String)],
+    packages: &[(String, String)],
+    env: &[(String, String)],
+    lbl: &TypedLabels,
+) -> Result<RawConfig, String> {
+    let mut raw = RawConfig::default();
+    if let Some(v) = net {
+        raw.network = Some(parse_net(v, lbl.net)?);
+    }
+    if let Some(v) = gui {
+        raw.gui = Some(v.to_string());
+    }
+    if let Some(v) = nixpkgs {
+        raw.nixpkgs = Some(v.to_string());
+    }
+    for spec in binds {
+        raw.binds.push(parse_bind(spec, lbl.bind)?);
+    }
+    for (key, value) in limits {
+        set_limit(&mut raw.limits, key, value, lbl.limit)?;
+    }
+    for (name, locator) in packages {
+        if name.is_empty() {
+            return Err(format!("{}: empty package name", lbl.package));
+        }
+        raw.packages.insert(name.clone(), locator.clone());
+    }
+    for (key, value) in env {
+        raw.env.insert(key.clone(), value.clone());
+    }
+    Ok(raw)
+}
+
+/// Parse a `--net` value into a `network` field. The postures `none`/`shared`/`ask` pass through
+/// verbatim (validated downstream); `allow=h1,h2` becomes a default-deny allowlist and `deny=h1,h2`
+/// a default-allow denylist — the common one-shot egress shapes. A bare `allow`/`deny` is refused as
+/// ambiguous (it reads like the list forms but means the opposite, a wide-open posture); an unknown
+/// keyword passes through and is caught by the downstream posture validation.
+fn parse_net(value: &str, label: &str) -> Result<NetworkField, String> {
+    if let Some(hosts) = value.strip_prefix("allow=") {
+        return Ok(net_table(
+            "deny",
+            split_hosts(hosts, label, "allow")?,
+            Vec::new(),
+        ));
+    }
+    if let Some(hosts) = value.strip_prefix("deny=") {
+        return Ok(net_table(
+            "allow",
+            Vec::new(),
+            split_hosts(hosts, label, "deny")?,
+        ));
+    }
+    if value == "allow" || value == "deny" {
+        return Err(format!(
+            "{label}: bare `{value}` is ambiguous — use `{label} allow=host,…` to restrict egress \
+             to those hosts, or `--config` for a raw posture"
+        ));
+    }
+    Ok(NetworkField::Posture(value.to_string()))
+}
+
+/// Split a comma-separated host list, trimming each and rejecting an empty result (a `--net allow=`
+/// with no hosts is a structural error, not a silent all-deny).
+fn split_hosts(hosts: &str, label: &str, kind: &str) -> Result<Vec<String>, String> {
+    let list: Vec<String> = hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    if list.is_empty() {
+        return Err(format!("{label}: `{kind}=` needs at least one host"));
+    }
+    Ok(list)
+}
+
+/// A `network` table with a mode and carve-out lists, the other fields left to inherit.
+fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField {
+    NetworkField::Table(NetworkTable {
+        mode: Some(mode.to_string()),
+        allow,
+        deny,
+        ask_timeout: None,
+        ask_notice: None,
+        stats: None,
+        default_methods: None,
+    })
+}
+
+/// Parse a `--bind` spec `path[:ro|:rw]` — the mode is the suffix after the **last** colon, and only
+/// when it is exactly `ro` or `rw`, so a path that itself contains a colon (`/my:dir`) is not
+/// mis-parsed. Read-only (the default) yields the bare-path form; read-write the detailed table. An
+/// empty path is a structural error.
+fn parse_bind(spec: &str, label: &str) -> Result<RawBind, String> {
+    let (path, rw) = match spec.rsplit_once(':') {
+        Some((p, "rw")) => (p, true),
+        Some((p, "ro")) => (p, false),
+        _ => (spec, false),
+    };
+    if path.is_empty() {
+        return Err(format!("{label}: empty bind path in `{spec}`"));
+    }
+    Ok(if rw {
+        RawBind::Detailed(RawBindTable {
+            path: Some(path.to_string()),
+            mode: Some("rw".to_string()),
+        })
+    } else {
+        RawBind::Path(path.to_string())
+    })
+}
+
+/// Set one cgroup limit on the fragment's `[limits]` table. The key must name a limit field; the
+/// value parses to a bare number (`RawLimit::Number`) or a string form (`RawLimit::Text`) — exactly
+/// the two TOML shapes — so the downstream systemd-grammar and bare-byte-floor checks apply
+/// unchanged.
+fn set_limit(
+    limits: &mut Option<RawLimits>,
+    key: &str,
+    value: &str,
+    label: &str,
+) -> Result<(), String> {
+    let table = limits.get_or_insert_with(RawLimits::default);
+    let parsed = parse_raw_limit(value);
+    match key {
+        "memory_high" => table.memory_high = Some(parsed),
+        "memory_max" => table.memory_max = Some(parsed),
+        "tasks_max" => table.tasks_max = Some(parsed),
+        other => {
+            return Err(format!(
+                "{label}: unknown limit `{other}` (memory_high | memory_max | tasks_max)"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// One limit value as declared: a bare number is a `Number` (a byte count for memory, a task count),
+/// anything else a `Text` (`"80%"`, `"16G"`, `"infinity"`) validated downstream.
+fn parse_raw_limit(value: &str) -> RawLimit {
+    match value.parse::<u64>() {
+        Ok(n) => RawLimit::Number(n),
+        Err(_) => RawLimit::Text(value.to_string()),
+    }
 }
 
 /// Parse one blob value: `@<path>` reads the file, anything else is inline TOML. The bytes are then
@@ -269,16 +575,16 @@ fn parse_blob(value: &str) -> Result<RawConfig, String> {
     schema::parse(&bytes)
 }
 
-/// Parse the `--env KEY=VALUE` values into pairs, requiring the `=` (the key is validated
-/// downstream by the env applier). An entry without `=` is a hard error — fail-closed, since a
-/// silently dropped `--env FOO` would launch without the variable the user asked for.
-fn parse_env_pairs(cli_env: &[String]) -> Result<Vec<(String, String)>, String> {
-    cli_env
+/// Split `KEY=VALUE` items into pairs on the first `=`, so a value may itself contain `=`. An item
+/// without `=` is a hard error — fail-closed, since a silently dropped `--env FOO` (or `--limit
+/// tasks_max`) would launch differently than asked.
+fn split_kv(items: &[String], label: &str) -> Result<Vec<(String, String)>, String> {
+    items
         .iter()
         .map(|e| {
             e.split_once('=')
                 .map(|(k, v)| (k.to_string(), v.to_string()))
-                .ok_or_else(|| format!("--env `{e}`: expected KEY=VALUE"))
+                .ok_or_else(|| format!("{label} `{e}`: expected KEY=VALUE"))
         })
         .collect()
 }
@@ -287,44 +593,82 @@ fn parse_env_pairs(cli_env: &[String]) -> Result<Vec<(String, String)>, String> 
 mod tests {
     use super::*;
 
-    fn collect_test(
-        cli_config: &[&str],
-        cli_env: &[&str],
-        ops_config: Option<&str>,
-        ops_env: &[(&str, &str)],
-    ) -> Result<Override, String> {
-        collect_from(
-            &cli_config.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            &cli_env.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            ops_config.map(str::to_string),
-            ops_env
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        )
+    /// Build a `CliOverrides` from borrowed slices, for terse test call sites.
+    #[derive(Default)]
+    struct Cli<'a> {
+        config: &'a [&'a str],
+        env: &'a [&'a str],
+        net: &'a [&'a str],
+        gui: &'a [&'a str],
+        nixpkgs: &'a [&'a str],
+        binds: &'a [&'a str],
+        limits: &'a [&'a str],
+        packages: &'a [&'a str],
+    }
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn collect_cli(cli: Cli) -> Result<Override, String> {
+        let overrides = CliOverrides {
+            config: owned(cli.config),
+            env: owned(cli.env),
+            net: owned(cli.net),
+            gui: owned(cli.gui),
+            nixpkgs: owned(cli.nixpkgs),
+            binds: owned(cli.binds),
+            limits: owned(cli.limits),
+            packages: owned(cli.packages),
+        };
+        collect_from(&overrides, AmbientOverrides::default())
+    }
+
+    fn ambient(a: AmbientOverrides) -> Result<Override, String> {
+        collect_from(&CliOverrides::default(), a)
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn posture(name: &str) -> NetworkField {
+        NetworkField::Posture(name.to_string())
     }
 
     #[test]
     fn an_empty_override_is_a_no_op() {
-        let ov = collect_test(&[], &[], None, &[]).unwrap();
-        assert!(ov.raw.env.is_empty());
-        assert!(ov.raw.network.is_none());
-        assert!(ov.notices().is_empty());
+        let ov = collect_cli(Cli::default()).unwrap();
+        assert!(ov.is_empty());
     }
 
     #[test]
     fn a_cli_config_blob_parses_every_field() {
-        let ov = collect_test(&["network = \"none\"\ngui = \"wayland\""], &[], None, &[]).unwrap();
-        assert!(ov.raw.network.is_some());
+        let ov = collect_cli(Cli {
+            config: &["network = \"none\"\ngui = \"wayland\""],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.network, Some(posture("none")));
         assert_eq!(ov.raw.gui.as_deref(), Some("wayland"));
     }
 
     #[test]
     fn a_malformed_blob_is_a_hard_error_not_a_silent_drop() {
-        let err = collect_test(&["network = = nope"], &[], None, &[]).unwrap_err();
+        let err = collect_cli(Cli {
+            config: &["network = = nope"],
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(err.starts_with("--config (#1):"), "{err}");
-        // and the same for the environment blob
-        let err = collect_test(&[], &[], Some("not = = toml"), &[]).unwrap_err();
+        let err = ambient(AmbientOverrides {
+            config: Some("not = = toml".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(err.starts_with("OPS_CONFIG:"), "{err}");
     }
 
@@ -332,31 +676,29 @@ mod tests {
     fn the_cli_beats_the_environment_per_field() {
         // OPS_CONFIG says shared, --config says none: the CLI wins, and because the winning value is
         // from the CLI, no security-via-env notice fires.
-        let ov = collect_test(
-            &["network = \"none\""],
-            &[],
-            Some("network = \"shared\""),
-            &[],
+        let ov = collect_from(
+            &CliOverrides {
+                config: owned(&["network = \"none\""]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                config: Some("network = \"shared\"".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert_eq!(
-            ov.raw.network,
-            Some(super::schema::NetworkField::Posture("none".into()))
-        );
-        assert!(
-            ov.notices().is_empty(),
-            "a CLI-won security field must not notice: {:?}",
-            ov.notices()
-        );
+        assert_eq!(ov.raw.network, Some(posture("none")));
+        assert!(ov.notices().is_empty(), "{:?}", ov.notices());
     }
 
     #[test]
     fn a_security_field_only_in_the_environment_is_noticed() {
-        let ov = collect_test(&[], &[], Some("network = \"none\""), &[]).unwrap();
-        assert_eq!(
-            ov.raw.network,
-            Some(super::schema::NetworkField::Posture("none".into()))
-        );
+        let ov = ambient(AmbientOverrides {
+            config: Some("network = \"none\"".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.network, Some(posture("none")));
         assert_eq!(ov.notices().len(), 1);
         assert!(
             ov.notices()[0].contains("security field `network`"),
@@ -367,12 +709,18 @@ mod tests {
 
     #[test]
     fn env_precedence_is_ops_config_then_ops_env_then_config_then_env() {
-        // K set in all four sources: --env wins. A key only in OPS_CONFIG survives untouched.
-        let ov = collect_test(
-            &["[env]\nK = \"from-config\"\nONLY_CFG = \"c\""],
-            &["K=from-cli-env"],
-            Some("[env]\nK = \"from-ops-config\"\nONLY_OPS = \"o\""),
-            &[("K", "from-ops-env")],
+        // K set in all four sources: --env wins. Keys unique to a source survive untouched.
+        let ov = collect_from(
+            &CliOverrides {
+                config: owned(&["[env]\nK = \"from-config\"\nONLY_CFG = \"c\""]),
+                env: owned(&["K=from-cli-env"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                config: Some("[env]\nK = \"from-ops-config\"\nONLY_OPS = \"o\"".into()),
+                env: pairs(&[("K", "from-ops-env")]),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(
@@ -381,50 +729,59 @@ mod tests {
         );
         assert_eq!(ov.raw.env.get("ONLY_OPS").map(String::as_str), Some("o"));
         assert_eq!(ov.raw.env.get("ONLY_CFG").map(String::as_str), Some("c"));
-        // env is a free field — no security notice.
-        assert!(ov.notices().is_empty());
+        assert!(ov.notices().is_empty(), "env is free — no notice");
     }
 
     #[test]
     fn ops_env_per_key_variables_become_cage_env() {
-        let ov = collect_test(&[], &[], None, &[("FOO", "bar"), ("BAZ", "qux")]).unwrap();
+        let ov = ambient(AmbientOverrides {
+            env: pairs(&[("FOO", "bar"), ("BAZ", "qux")]),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(ov.raw.env.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(ov.raw.env.get("BAZ").map(String::as_str), Some("qux"));
     }
 
     #[test]
     fn a_bad_env_pair_is_a_hard_error() {
-        let err = collect_test(&[], &["NOEQUALS"], None, &[]).unwrap_err();
+        let err = collect_cli(Cli {
+            env: &["NOEQUALS"],
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(err.contains("expected KEY=VALUE"), "{err}");
     }
 
     #[test]
-    fn a_repeated_config_flag_merges_later_winning() {
-        let ov = collect_test(
-            &[
-                "network = \"none\"\ngui = \"wayland\"",
-                "network = \"shared\"",
+    fn a_repeated_config_flag_merges_later_winning_scalars_and_unioning_collections() {
+        let ov = collect_cli(Cli {
+            config: &[
+                "network = \"none\"\ngui = \"wayland\"\nbinds = [\"/a\"]",
+                "network = \"shared\"\nbinds = [\"/b\"]",
             ],
-            &[],
-            None,
-            &[],
-        )
+            ..Default::default()
+        })
         .unwrap();
-        // the second --config's network wins; the first's gui survives (unset in the second)
-        assert_eq!(
-            ov.raw.network,
-            Some(super::schema::NetworkField::Posture("shared".into()))
-        );
+        // the scalar network is replaced (later wins); gui survives (unset in the second)
+        assert_eq!(ov.raw.network, Some(posture("shared")));
         assert_eq!(ov.raw.gui.as_deref(), Some("wayland"));
+        // the collection binds unions across the two blobs
+        assert_eq!(
+            ov.raw.binds.len(),
+            2,
+            "binds should union: {:?}",
+            ov.raw.binds
+        );
     }
 
     #[test]
     fn every_launch_field_survives_the_merge_into_the_overlay() {
-        // Regression guard: the fold must copy *every* launch field from the blob into the merged
-        // overlay — a field dropped here (as `limits` once was) silently defeats its validation and
-        // application downstream. One blob sets one of each; the merged overlay must carry them all.
-        let ov = collect_test(
-            &[r#"
+        // Regression guard: the fold must copy *every* launch field into the merged overlay — a
+        // field dropped here (as `limits` once was, in the fold and in the repeated-blob merge)
+        // silently defeats its validation and application downstream.
+        let ov = collect_cli(Cli {
+            config: &[r#"
                 nixpkgs = "nixos-23.11"
                 network = "none"
                 gui = "wayland"
@@ -440,10 +797,8 @@ mod tests {
                 header = "X"
                 type = "raw"
             "#],
-            &[],
-            None,
-            &[],
-        )
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ov.raw.nixpkgs.as_deref(), Some("nixos-23.11"));
         assert!(ov.raw.network.is_some(), "network dropped in merge");
@@ -459,17 +814,35 @@ mod tests {
     }
 
     #[test]
-    fn net_groups_and_apps_in_an_override_are_ignored_with_a_notice() {
-        let ov = collect_test(
-            &["[net.groups]\nx = [\"a.example.com\"]\n[app.demo]\ncmd = \"demo\""],
-            &[],
-            None,
-            &[],
-        )
+    fn a_repeated_limits_blob_unions_per_field() {
+        // The repeated-blob merge must union `[limits]` per field, not replace it — `merge_raw` once
+        // omitted `limits` entirely, so the second blob's table silently vanished.
+        let ov = collect_cli(Cli {
+            config: &[
+                "[limits]\nmemory_max = \"80%\"",
+                "[limits]\ntasks_max = 4096",
+            ],
+            ..Default::default()
+        })
         .unwrap();
+        let limits = ov.raw.limits.expect("limits present");
         assert!(
-            ov.raw.net.groups.is_empty() || ov.notices().iter().any(|n| n.contains("net.groups"))
+            limits.memory_max.is_some(),
+            "memory_max from the first blob dropped"
         );
+        assert!(
+            limits.tasks_max.is_some(),
+            "tasks_max from the second blob dropped"
+        );
+    }
+
+    #[test]
+    fn net_groups_and_apps_in_an_override_are_ignored_with_a_notice() {
+        let ov = collect_cli(Cli {
+            config: &["[net.groups]\nx = [\"a.example.com\"]\n[app.demo]\ncmd = \"demo\""],
+            ..Default::default()
+        })
+        .unwrap();
         let text = ov.notices().join("\n");
         assert!(text.contains("[net.groups]"), "{text}");
         assert!(text.contains("[app.*]"), "{text}");
@@ -482,17 +855,330 @@ mod tests {
         let file = dir.join("ov.toml");
         std::fs::write(&file, b"network = \"none\"\n").unwrap();
         let arg = format!("@{}", file.display());
-        let ov = collect_test(&[&arg], &[], None, &[]).unwrap();
-        assert_eq!(
-            ov.raw.network,
-            Some(super::schema::NetworkField::Posture("none".into()))
-        );
+        let ov = collect_cli(Cli {
+            config: &[&arg],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.network, Some(posture("none")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_missing_config_file_is_a_hard_error() {
-        let err = collect_test(&["@/no/such/ops-override.toml"], &[], None, &[]).unwrap_err();
+        let err = collect_cli(Cli {
+            config: &["@/no/such/ops-override.toml"],
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(err.contains("cannot read override file"), "{err}");
+    }
+
+    // --- typed flags (increment 2) ---
+
+    #[test]
+    fn a_typed_net_posture_and_the_allow_deny_dsl_parse() {
+        assert_eq!(
+            collect_cli(Cli {
+                net: &["none"],
+                ..Default::default()
+            })
+            .unwrap()
+            .raw
+            .network,
+            Some(posture("none"))
+        );
+        // allow=… is a default-deny allowlist
+        let ov = collect_cli(Cli {
+            net: &["allow=a.example.com,b.example.com"],
+            ..Default::default()
+        })
+        .unwrap();
+        match ov.raw.network {
+            Some(NetworkField::Table(t)) => {
+                assert_eq!(t.mode.as_deref(), Some("deny"));
+                assert_eq!(t.allow, vec!["a.example.com", "b.example.com"]);
+                assert!(t.deny.is_empty());
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+        // deny=… is a default-allow denylist
+        let ov = collect_cli(Cli {
+            net: &["deny=x.example.com"],
+            ..Default::default()
+        })
+        .unwrap();
+        match ov.raw.network {
+            Some(NetworkField::Table(t)) => {
+                assert_eq!(t.mode.as_deref(), Some("allow"));
+                assert_eq!(t.deny, vec!["x.example.com"]);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_net_allow_or_deny_is_refused_as_ambiguous() {
+        let err = collect_cli(Cli {
+            net: &["allow"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        let err = collect_cli(Cli {
+            net: &["deny"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        // an empty host list is structural too
+        let err = collect_cli(Cli {
+            net: &["allow="],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("at least one host"), "{err}");
+    }
+
+    #[test]
+    fn typed_gui_and_nixpkgs_pass_through() {
+        let ov = collect_cli(Cli {
+            gui: &["wayland"],
+            nixpkgs: &["nixos-23.11"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.gui.as_deref(), Some("wayland"));
+        assert_eq!(ov.raw.nixpkgs.as_deref(), Some("nixos-23.11"));
+    }
+
+    #[test]
+    fn a_typed_bind_parses_the_mode_off_the_last_colon() {
+        // read-only default -> bare path
+        let ov = collect_cli(Cli {
+            binds: &["/data"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.binds, vec![RawBind::Path("/data".into())]);
+        // :rw -> detailed table
+        let ov = collect_cli(Cli {
+            binds: &["/data:rw"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ov.raw.binds,
+            vec![RawBind::Detailed(RawBindTable {
+                path: Some("/data".into()),
+                mode: Some("rw".into())
+            })]
+        );
+        // :ro -> bare path (explicit read-only)
+        let ov = collect_cli(Cli {
+            binds: &["/data:ro"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.binds, vec![RawBind::Path("/data".into())]);
+        // a colon in the path (not a mode) stays part of the path
+        let ov = collect_cli(Cli {
+            binds: &["/my:dir"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.binds, vec![RawBind::Path("/my:dir".into())]);
+    }
+
+    #[test]
+    fn a_typed_bind_with_an_empty_path_is_a_hard_error() {
+        let err = collect_cli(Cli {
+            binds: &[":rw"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("empty bind path"), "{err}");
+    }
+
+    #[test]
+    fn a_typed_limit_parses_numbers_and_strings_and_rejects_unknown_keys() {
+        let ov = collect_cli(Cli {
+            limits: &["tasks_max=8192", "memory_max=80%"],
+            ..Default::default()
+        })
+        .unwrap();
+        let limits = ov.raw.limits.expect("limits present");
+        assert_eq!(limits.tasks_max, Some(RawLimit::Number(8192)));
+        assert_eq!(limits.memory_max, Some(RawLimit::Text("80%".into())));
+        // unknown key -> structural error
+        let err = collect_cli(Cli {
+            limits: &["cpu=1"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("unknown limit"), "{err}");
+        // no '=' -> structural error
+        let err = collect_cli(Cli {
+            limits: &["tasks_max"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("expected KEY=VALUE"), "{err}");
+    }
+
+    #[test]
+    fn a_typed_package_parses_name_and_locator() {
+        let ov = collect_cli(Cli {
+            packages: &["hello=nix:hello"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ov.raw.packages.get("hello").map(String::as_str),
+            Some("nix:hello")
+        );
+        // no '=' -> structural error
+        let err = collect_cli(Cli {
+            packages: &["hello"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("expected KEY=VALUE"), "{err}");
+        // empty name -> structural error
+        let err = collect_cli(Cli {
+            packages: &["=nix:hello"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("empty package name"), "{err}");
+    }
+
+    #[test]
+    fn a_typed_flag_beats_a_blob_on_the_same_field() {
+        // --net (cli typed) beats --config network (cli blob)
+        let ov = collect_cli(Cli {
+            config: &["network = \"shared\""],
+            net: &["none"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.network, Some(posture("none")));
+    }
+
+    #[test]
+    fn the_four_tiers_layer_env_typed_below_cli_blob_below_cli_typed() {
+        // OPS_NET (env typed) is beaten by --config (cli blob), which is beaten by --net (cli typed).
+        let ov = collect_from(
+            &CliOverrides {
+                config: owned(&["network = \"none\""]),
+                net: owned(&["ask"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                net: Some("shared".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ov.raw.network, Some(posture("ask")));
+
+        // Drop the cli typed: the cli blob wins over the env typed.
+        let ov = collect_from(
+            &CliOverrides {
+                config: owned(&["network = \"none\""]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                net: Some("shared".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ov.raw.network, Some(posture("none")));
+    }
+
+    #[test]
+    fn typed_collections_union_across_the_env_and_cli_tiers() {
+        // OPS_BIND + --bind -> both binds; OPS_LIMIT_* + --limit on different keys -> both limits.
+        let ov = collect_from(
+            &CliOverrides {
+                binds: owned(&["/b"]),
+                limits: owned(&["tasks_max=4096"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                binds: owned(&["/a"]),
+                limits: pairs(&[("memory_max", "80%")]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ov.raw.binds.len(),
+            2,
+            "binds should union: {:?}",
+            ov.raw.binds
+        );
+        let limits = ov.raw.limits.expect("limits present");
+        assert!(limits.tasks_max.is_some() && limits.memory_max.is_some());
+    }
+
+    #[test]
+    fn a_higher_tier_bind_replaces_a_lower_tier_bind_on_the_same_path() {
+        // OPS_BIND=/data:ro then --bind /data:rw -> one entry, read-write (the CLI wins the path).
+        let ov = collect_from(
+            &CliOverrides {
+                binds: owned(&["/data:rw"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                binds: owned(&["/data:ro"]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ov.raw.binds,
+            vec![RawBind::Detailed(RawBindTable {
+                path: Some("/data".into()),
+                mode: Some("rw".into())
+            })]
+        );
+    }
+
+    #[test]
+    fn an_ambient_typed_security_field_is_noticed() {
+        // OPS_NET alone (a scalar the CLI did not set) is noticed.
+        let ov = ambient(AmbientOverrides {
+            net: Some("none".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            ov.notices().iter().any(|n| n.contains("`network`")),
+            "{:?}",
+            ov.notices()
+        );
+        // OPS_BIND alone (a collection the environment contributed to) is noticed.
+        let ov = ambient(AmbientOverrides {
+            binds: owned(&["/a"]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            ov.notices().iter().any(|n| n.contains("`binds`")),
+            "{:?}",
+            ov.notices()
+        );
+    }
+
+    #[test]
+    fn an_ambient_typed_structural_error_is_a_hard_error() {
+        let err = ambient(AmbientOverrides {
+            limits: pairs(&[("bogus", "1")]),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("unknown limit"), "{err}");
     }
 }

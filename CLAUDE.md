@@ -95,6 +95,56 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **One-shot config override — increment 2: typed security flags (DONE 2026-07-04)**
+  (`src/config/overrides.rs` + `config/mod.rs` + `config/view.rs` + `main.rs` + `help.rs` +
+  `tests/{run,config}.rs`): the ergonomic half of the one-shot override — a **typed flag per field**,
+  each with an `OPS_*` environment equivalent, so a launch can change a single security field without
+  writing TOML. `--net <none|shared|ask|allow=h1,h2|deny=h1,h2>` (the `allow=`/`deny=` DSL builds a
+  default-deny **allowlist** / default-allow **denylist** — the common one-shot egress shapes; a bare
+  `allow`/`deny` is **refused as ambiguous**, since it reads like the list forms but means the opposite
+  wide-open posture — advisor's call), `--gui <none|wayland>`, `--nixpkgs <ref>`,
+  `--bind <path[:ro|:rw]>` (the mode is the suffix after the **last** `:`, and only when exactly
+  `ro`/`rw`, so `/my:dir` is not mis-parsed), `--limit <key>=<value>` (key ∈
+  `memory_high`/`memory_max`/`tasks_max`; the value parses to a `RawLimit` number-or-text so the
+  downstream systemd-grammar **and** bare-byte-floor guards still fire), `--package
+  <name>=<backend:locator>`. Env forms: scalar `OPS_NET`/`OPS_GUI`/`OPS_NIXPKGS` + single `OPS_BIND` +
+  per-key `OPS_LIMIT_<key>`/`OPS_PACKAGE_<name>` (mirroring `OPS_ENV_<KEY>`). **Precedence is now four
+  tiers** — `OPS_CONFIG < OPS_* typed < --config < --* typed` — the CLI still beats the environment and
+  a typed flag beats the blob. **The merge is one uniform rule across all four tiers** (advisor's #1):
+  a **scalar** (`nixpkgs`/`network`/`gui`) is *replaced* by the highest tier that sets it; a
+  **collection** (`env`/`packages`/`binds`/`limits`) is *unioned*, the higher tier winning per
+  key/entry — so `--bind` adds to whatever the blobs bound and `--limit tasks_max=…` tunes one limit
+  without dropping a blob's `memory_max`. `merge_raw` became `overlay_into` (the single merge), which
+  **also fixed a latent increment-1 bug the rewrite surfaced**: `merge_raw` had dropped `limits`
+  entirely, so a second `--config` blob's `[limits]` silently vanished (a repeated-blob-unions-limits
+  guard now pins it). **The impl seam is clean:** a typed flag only builds the same `RawConfig` fields
+  a blob does, so `apply_override`/`validate_override` need **zero** change — the set-but-invalid *value*
+  fail-closed (a `--gui bogus`, a `--net nonee` → exit 2, no launch) is the increment-1 machinery
+  unchanged; `collect` adds only *structural* hard errors (a `--limit` with no `=`, a `--bind` with an
+  empty path, a bad `--net` keyword, an unknown limit key). `collect`'s signature became
+  `collect(&CliOverrides)`; `main.rs` grew one `take_override_flag` that dispatches all eight flags,
+  shared by `run`/`shell`/`parse_app_launch`. **`ops config show` reflects the ambient `OPS_*` typed
+  vars** through the same `collect(&CliOverrides::default())` it already used, so it never lies about a
+  launch in this environment. **Residual (unchanged from increment 1, now documented in `ops help
+  app`):** overriding an app's `network` drops the app's read-by-default `default_methods` → all-verbs
+  (an override posture is Mode-A-like; `{VERB}` prefixes in a `--config` `[network]` restrict it — the
+  user's "no preference" call). Non-blocking wrinkle: `--net allow=host` renders as `network: deny
+  (override)` in `config show` (the raw mode name of a default-deny allowlist, consistent with a
+  `[network] mode = "deny"` — the `allow …` entries disambiguate). **Full `cargo test` green** (unit
+  835 + config 80 + **run 39** [net-new `a_typed_one_shot_limit_flag_lands_in_the_cage_scope` — a
+  trusted-by-invocation `--limit tasks_max=8192` measured as the cage's host-visible `pids.max`, teeth
+  on the flag→collect→`cgroup::wrap`→scope thread; the three increment-1 override e2es re-ran and
+  **passed**, confirming the merge rewrite did not regress the collect path] + the rest; net-new: ~13
+  `overrides` unit incl. the four-tier layering, the `allow=`/`deny=` DSL, the last-colon bind parse,
+  the union-across-tiers + same-path-replace, the repeated-limits-union guard, and the ambient
+  structural-error case; a `config show` ambient-typed-override integration case; the `parse_app_launch`
+  typed-flag parse). fmt/clippy `-D warnings` clean, **std-only** (no new dep). Advisor-reviewed (plan
+  AND impl — the plan review set the uniform-merge rule and the `--net` DSL/bare-refusal and the
+  last-colon `--bind` and the `RawLimit`-preserving `--limit`; the impl review confirmed the two-level
+  fold keeps the env-source notice computable and required the fmt gate + the increment-1-e2e
+  non-regression confirmation). Live-verified (six fail-closed paths → exit 2 with exact messages; the
+  `allow=` DSL + `OPS_PACKAGE_`/`OPS_BIND` ambient scan through the real binary). **This is a single
+  commit** (the pty-deadline bump already shipped separately with increment 1).
   **One-shot config override — increment 1: the `--config`/`--env` + `OPS_*` overlay (DONE
   2026-07-04)** (`src/config/overrides.rs` [new] + `config/mod.rs` + `config/schema.rs` +
   `config/view.rs` + `sandbox/launch.rs` + `main.rs` + `help.rs` + `tests/{run,config}.rs`): a

@@ -522,14 +522,14 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
 pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     let mut resolved = super::load_scoped(cwd, source);
 
-    // Reflect an ambient one-shot override (`OPS_CONFIG`/`OPS_ENV_*`) in the full view, so
-    // `ops config show` does not lie about what a launch in this environment would do — its values
-    // then carry the `override` provenance tag. Only the full (`All`) view: the single-source
-    // `--global/--local/--default` views show what one config *file* contributes, which an override
-    // is not. Per-invocation CLI `--config`/`--env` are not previewed here (run the launch to see
-    // them); only the ambient environment is read.
+    // Reflect an ambient one-shot override (`OPS_CONFIG`/`OPS_ENV_*` and the `OPS_*` typed
+    // variables) in the full view, so `ops config show` does not lie about what a launch in this
+    // environment would do — its values then carry the `override` provenance tag. Only the full
+    // (`All`) view: the single-source `--global/--local/--default` views show what one config *file*
+    // contributes, which an override is not. Per-invocation CLI flags are not previewed here (run the
+    // launch to see them); passing default (empty) CLI overrides reads only the ambient environment.
     if matches!(source, super::Source::All) {
-        if let Ok(ov) = super::overrides::collect(&[], &[]) {
+        if let Ok(ov) = super::overrides::collect(&super::CliOverrides::default()) {
             if !ov.is_empty() {
                 // A set-but-invalid override value would abort a real launch; here (a read-only view)
                 // surface the error as a note and show the untouched baseline, so `ops config show`
