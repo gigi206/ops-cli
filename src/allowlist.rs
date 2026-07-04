@@ -582,36 +582,6 @@ pub(crate) enum DefaultAction {
     Ask,
 }
 
-/// How often the proxy prints the stderr refusal notice — a red alert plus a yellow copy-paste
-/// `ops net allow <host>` — when a request is refused because **no allow rule matched** it (the
-/// `denied-default` category, reachable only under [`DefaultAction::Deny`]). It never fires for an
-/// explicit deny rule or a security refusal: the suggestion to allow the host is sound only when
-/// the host was simply never listed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum RefusalNotice {
-    /// Never print the notice; only the `403` body reaches the in-cage client.
-    Off,
-    /// Print the notice the **first** time a given `host:port` is refused this session, then stay
-    /// silent for it — visible but not spammed by an agent retrying one blocked host.
-    #[default]
-    Once,
-    /// Print the notice on **every** refused request.
-    Each,
-}
-
-impl RefusalNotice {
-    /// Parse the `[network] refusal_notice` config value. `None` for an unrecognized string, so the
-    /// caller can warn and fall back to the default rather than failing the config.
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s.trim() {
-            "off" => Some(Self::Off),
-            "once" => Some(Self::Once),
-            "each" => Some(Self::Each),
-            _ => None,
-        }
-    }
-}
-
 /// A classified egress policy: an allow list, a deny list, and a default action for a request
 /// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
 /// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
@@ -628,9 +598,6 @@ pub(crate) struct EgressPolicy {
     /// Stored inverted so the derived `Default` (and [`Self::new`]) both mean "notice shown".
     /// Read via [`Self::ask_notice`].
     suppress_ask_notice: bool,
-    /// The cadence of the stderr refusal notice under [`DefaultAction::Deny`]. Read via
-    /// [`Self::refusal_notice`]; defaults to [`RefusalNotice::Once`].
-    refusal_notice: RefusalNotice,
 }
 
 impl EgressPolicy {
@@ -643,7 +610,6 @@ impl EgressPolicy {
             default_action: DefaultAction::Deny,
             ask_timeout: None,
             suppress_ask_notice: false,
-            refusal_notice: RefusalNotice::default(),
         }
     }
 
@@ -683,19 +649,6 @@ impl EgressPolicy {
     /// indefinitely. The proxy reads this only under [`DefaultAction::Ask`].
     pub(crate) fn ask_timeout(&self) -> Option<std::time::Duration> {
         self.ask_timeout
-    }
-
-    /// Set the cadence of the stderr refusal notice (builder style). Inert unless the default
-    /// action is [`DefaultAction::Deny`] (the only mode that yields a `denied-default` refusal).
-    pub(crate) fn with_refusal_notice(mut self, cadence: RefusalNotice) -> Self {
-        self.refusal_notice = cadence;
-        self
-    }
-
-    /// The cadence of the stderr refusal notice — [`RefusalNotice::Once`] by default. The proxy
-    /// reads this only when it refuses a request with the `denied-default` category.
-    pub(crate) fn refusal_notice(&self) -> RefusalNotice {
-        self.refusal_notice
     }
 
     pub(crate) fn allow_rules(&self) -> &[Rule] {
@@ -2241,34 +2194,6 @@ mod tests {
             .with_ask_notice(false)
             .with_ask_notice(true)
             .ask_notice());
-    }
-
-    #[test]
-    fn refusal_notice_parses_and_defaults_to_once() {
-        // The cadence parses from the three config spellings; anything else is `None` so the loader
-        // can warn and fall back.
-        assert_eq!(RefusalNotice::parse("off"), Some(RefusalNotice::Off));
-        assert_eq!(RefusalNotice::parse(" once "), Some(RefusalNotice::Once));
-        assert_eq!(RefusalNotice::parse("each"), Some(RefusalNotice::Each));
-        assert_eq!(RefusalNotice::parse("ONCE"), None);
-        assert_eq!(RefusalNotice::parse(""), None);
-        // The default (from `new`, the derived `Default`, and the enum default) is `Once`.
-        assert_eq!(RefusalNotice::default(), RefusalNotice::Once);
-        assert_eq!(
-            EgressPolicy::new(vec![], vec![]).refusal_notice(),
-            RefusalNotice::Once
-        );
-        assert_eq!(
-            EgressPolicy::default().refusal_notice(),
-            RefusalNotice::Once
-        );
-        // The builder round-trips.
-        assert_eq!(
-            EgressPolicy::default()
-                .with_refusal_notice(RefusalNotice::Off)
-                .refusal_notice(),
-            RefusalNotice::Off
-        );
     }
 
     #[test]

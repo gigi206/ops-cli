@@ -2312,24 +2312,6 @@ fn validate_network_table(
             ));
         }
     }
-    // The refusal notice is meaningful only under deny-by-default — the sole mode that produces a
-    // `denied-default` refusal (an unmatched host). Parse + apply there; a value set under another
-    // mode, or an unrecognized one, is warned and dropped (falling back to the built-in default).
-    if let Some(raw) = &table.refusal_notice {
-        match crate::allowlist::RefusalNotice::parse(raw) {
-            Some(cadence) if action == DefaultAction::Deny => {
-                policy = policy.with_refusal_notice(cadence);
-            }
-            Some(_) => warnings.push(format!(
-                "{source_label}: `refusal_notice` is only meaningful under `mode = \"deny\"` \
-                 (the deny-by-default allowlist) — ignored"
-            )),
-            None => warnings.push(format!(
-                "{source_label}: ignoring invalid `refusal_notice` `{raw}` \
-                 (expected \"off\", \"once\", or \"each\")"
-            )),
-        }
-    }
     Some(NetworkPolicy::Allowlist(policy))
 }
 
@@ -3969,7 +3951,6 @@ mod tests {
             ask_timeout: None,
             ask_notice: None,
             stats: None,
-            refusal_notice: None,
             default_methods: None,
         })
     }
@@ -4324,7 +4305,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })),
             ..RawConfig::default()
@@ -4493,7 +4473,6 @@ mod tests {
             ask_timeout: None,
             ask_notice: None,
             stats: None,
-            refusal_notice: None,
             default_methods: Some(vec!["*".into()]),
         });
         let project = raw_with_app("probe", raw_app(&["id"], &[], &[], &[], Some(net)));
@@ -4634,7 +4613,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })
         };
@@ -4707,7 +4685,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })
         };
@@ -4767,7 +4744,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })),
             ..RawConfig::default()
@@ -4801,7 +4777,6 @@ mod tests {
                     ask_timeout: None,
                     ask_notice: None,
                     stats: None,
-                    refusal_notice: None,
                     default_methods: None,
                 })),
                 ..RawApp::default()
@@ -4832,7 +4807,6 @@ mod tests {
                 ask_timeout: timeout.map(|s| s.to_string()),
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })
         };
@@ -4869,7 +4843,6 @@ mod tests {
             ask_timeout: Some("90s".into()),
             ask_notice: None,
             stats: None,
-            refusal_notice: None,
             default_methods: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
@@ -4890,7 +4863,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: notice,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })
         };
@@ -4919,79 +4891,12 @@ mod tests {
             ask_timeout: None,
             ask_notice: Some(false),
             stats: None,
-            refusal_notice: None,
             default_methods: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
             w.iter().any(|m| m.contains("ask_notice")),
             "a moot ask_notice must warn: {w:?}"
-        );
-    }
-
-    #[test]
-    fn refusal_notice_resolves_under_deny_and_is_moot_elsewhere() {
-        use crate::allowlist::{DefaultAction, RefusalNotice};
-        let deny = |rn: Option<&str>| {
-            NetworkField::Table(NetworkTable {
-                mode: Some("deny".into()),
-                allow: vec![],
-                deny: vec![],
-                ask_timeout: None,
-                ask_notice: None,
-                stats: None,
-                refusal_notice: rn.map(str::to_string),
-                default_methods: None,
-            })
-        };
-        let mut w = Vec::new();
-
-        // Absent → the built-in default `Once`.
-        let def = validate_network(&mut w, GLOBAL_CONFIG, deny(None)).unwrap();
-        assert!(matches!(&def, NetworkPolicy::Allowlist(p)
-            if p.default_action() == DefaultAction::Deny
-                && p.refusal_notice() == RefusalNotice::Once));
-
-        // `each` / `off` apply under `deny`, no warning.
-        let each = validate_network(&mut w, GLOBAL_CONFIG, deny(Some("each"))).unwrap();
-        assert!(matches!(&each, NetworkPolicy::Allowlist(p)
-            if p.refusal_notice() == RefusalNotice::Each));
-        let off = validate_network(&mut w, GLOBAL_CONFIG, deny(Some("off"))).unwrap();
-        assert!(matches!(&off, NetworkPolicy::Allowlist(p)
-            if p.refusal_notice() == RefusalNotice::Off));
-        assert!(
-            w.is_empty(),
-            "valid refusal_notice configs warn nothing: {w:?}"
-        );
-
-        // An invalid value warns and falls back to the default `Once`.
-        let bad = validate_network(&mut w, GLOBAL_CONFIG, deny(Some("sometimes"))).unwrap();
-        assert!(matches!(&bad, NetworkPolicy::Allowlist(p)
-            if p.refusal_notice() == RefusalNotice::Once));
-        assert!(
-            w.iter().any(|m| m.contains("invalid `refusal_notice`")),
-            "an invalid refusal_notice warns: {w:?}"
-        );
-        w.clear();
-
-        // Under a non-`deny` mode (`allow`) it is moot — warned and ignored (the default stands).
-        let moot = NetworkField::Table(NetworkTable {
-            mode: Some("allow".into()),
-            allow: vec![],
-            deny: vec![],
-            ask_timeout: None,
-            ask_notice: None,
-            stats: None,
-            refusal_notice: Some("each".into()),
-            default_methods: None,
-        });
-        let m = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
-        assert!(matches!(&m, NetworkPolicy::Allowlist(p)
-            if p.refusal_notice() == RefusalNotice::Once));
-        assert!(
-            w.iter()
-                .any(|m| m.contains("refusal_notice") && m.contains("deny")),
-            "a moot refusal_notice must warn: {w:?}"
         );
     }
 
@@ -5887,7 +5792,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: Some(vec!["GET".into()]),
             })),
             ..RawConfig::default()
@@ -7121,7 +7025,6 @@ mod tests {
                     ask_timeout: None,
                     ask_notice: None,
                     stats: None,
-                    refusal_notice: None,
                     default_methods: None,
                 })),
                 ..RawConfig::default()
@@ -7223,7 +7126,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             })),
             secret: Some(raw_secret_section(secrets)),
@@ -7470,7 +7372,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats,
-                refusal_notice: None,
                 default_methods: None,
             })),
             ..RawConfig::default()
@@ -7526,7 +7427,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: Some(false),
-                refusal_notice: None,
                 default_methods: None,
             })),
         );
@@ -7600,7 +7500,6 @@ mod tests {
             ask_timeout: None,
             ask_notice: None,
             stats: None,
-            refusal_notice: None,
             default_methods: None,
         }))
     }

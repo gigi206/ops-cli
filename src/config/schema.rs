@@ -401,14 +401,6 @@ pub(crate) struct NetworkTable {
     /// means "inherit" — a layer that does not mention it does not change the inherited value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stats: Option<bool>,
-    /// How often to print the stderr refusal notice (a red alert plus a yellow copy-paste
-    /// `ops net allow <host>`) when a request is refused because no allow rule matched it:
-    /// `"off"` | `"once"` (the first refusal of a given host per session) | `"each"`. Defaults to
-    /// `"once"`. Only meaningful under `mode = "deny"` (the deny-by-default allowlist) — the only
-    /// mode that yields such a refusal; inert (and warned) elsewhere. Never fires for an explicit
-    /// deny rule or a security refusal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) refusal_notice: Option<String>,
     /// The HTTP verbs an **app's** unscoped (`{...}`-less) allow rules default to — its read-by-default
     /// posture. Only meaningful on an `[app.<name>.network]` (or an imported profile's `[network]`):
     /// every Mode-B app defaults to `["GET","HEAD"]` so an agent reads but does not write unless a
@@ -861,7 +853,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             }))
         );
@@ -879,7 +870,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             }))
         );
@@ -899,7 +889,6 @@ mod tests {
                 ask_timeout: None,
                 ask_notice: None,
                 stats: None,
-                refusal_notice: None,
                 default_methods: None,
             }))
         );

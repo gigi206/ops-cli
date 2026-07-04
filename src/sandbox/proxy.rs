@@ -109,7 +109,7 @@
 //! a legitimate injection-host response would be struck out of it — again entropy- and
 //! minimum-length-mitigated, and confined to the one injection-target host.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
@@ -129,7 +129,7 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 
-use crate::allowlist::{self, Decision, EgressPolicy, L4Decision, RefusalNotice, Rule, RuleKind};
+use crate::allowlist::{self, Decision, EgressPolicy, L4Decision, Rule, RuleKind};
 
 use super::egress_stats::{EgressStats, StatKind};
 
@@ -556,12 +556,9 @@ pub(crate) struct ProxyCtx {
     /// (see [`MAX_CONCURRENT_CONNS`]) — a burst of connections cannot exhaust host threads/fds and
     /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
     conns: AtomicUsize,
-    /// The `host:port` pairs a [`RefusalNotice::Once`] refusal notice has already printed this
-    /// session, so a repeated block of the same destination stays silent. Shared across connection
-    /// threads through the `Arc<ProxyCtx>`; unused under the other cadences.
-    refusal_noticed: Mutex<HashSet<(String, u16)>>,
-    /// The `ops app <name>` this launch runs, if any — used only to scope the refusal notice's
-    /// `ops net allow` suggestion to the app (`--app <name>`). `None` for a bare `ops run`/`shell`.
+    /// The `ops app <name>` this launch runs, if any — used only to scope the `ops net allow`
+    /// suggestion in a `denied-default` refusal body to the app (`--app <name>`). `None` for a bare
+    /// `ops run`/`shell`.
     app: Option<String>,
 }
 
@@ -593,7 +590,6 @@ impl ProxyCtx {
             log: None,
             splices: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
-            refusal_noticed: Mutex::new(HashSet::new()),
             app: None,
         })
     }
@@ -648,45 +644,16 @@ impl ProxyCtx {
         self.push_log(host, port, method, path, verdict, reason)
     }
 
-    /// Decide whether to print the refusal notice for this `host:port`, per the policy's
-    /// [`RefusalNotice`] cadence: `Off` never, `Each` always, `Once` only the first time a given
-    /// destination is refused this session (recording it so a repeat returns `false`). Pure of I/O
-    /// so the cadence/dedup is unit-testable without capturing stderr.
-    fn should_print_refusal(&self, host: &str, port: u16) -> bool {
-        match self.policy.refusal_notice() {
-            RefusalNotice::Off => false,
-            RefusalNotice::Each => true,
-            RefusalNotice::Once => self
-                .refusal_noticed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((host.to_string(), port)),
-        }
-    }
-
-    /// The copy-paste `ops net allow` command the refusal notice suggests. When the launch is an
-    /// `ops app <name>` (the app hint is set), it names the app — `ops net allow <host> --app
-    /// <name>` writes the allow into that app's config rather than the project baseline, which is
-    /// what the user almost always means when an *app's* egress was blocked. Pure so it is
-    /// unit-testable. The `--app` write defaults to the project scope (least privilege); the user
-    /// adds `-g` to reach a global profile.
+    /// The copy-paste `ops net allow` command a `denied-default` refusal body suggests. When the
+    /// launch is an `ops app <name>` (the app hint is set), it names the app — `ops net allow
+    /// <host> --app <name>` writes the allow into that app's config rather than the project
+    /// baseline, which is what the user almost always means when an *app's* egress was blocked.
+    /// Pure so it is unit-testable. The `--app` write defaults to the project scope (least
+    /// privilege); the user adds `-g` to reach a global profile.
     fn allow_suggestion(&self, host: &str) -> String {
         match &self.app {
             Some(name) => format!("ops net allow {host} --app {name}"),
             None => format!("ops net allow {host}"),
-        }
-    }
-
-    /// Print the stderr refusal notice for a `denied-default` refusal (a host no allow rule
-    /// matched), gated by [`Self::should_print_refusal`]. Called only from the `denied-default`
-    /// path, so the yellow `ops net allow` suggestion is always sound — an explicit deny or a
-    /// security refusal never reaches here.
-    fn refusal_notice(&self, host: &str, port: u16) {
-        if self.should_print_refusal(host, port) {
-            print_egress_notice(
-                &format!("egress refused {host}:{port}"),
-                &[("allow", &self.allow_suggestion(host))],
-            );
         }
     }
 
@@ -813,7 +780,6 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
         .with_default(user.default_action())
         .with_ask_timeout(user.ask_timeout())
         .with_ask_notice(user.ask_notice())
-        .with_refusal_notice(user.refusal_notice())
 }
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
@@ -1191,15 +1157,19 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     ),
                 );
             }
-            // Surface the block to an interactive user on stderr (per the policy's cadence) with a
-            // copy-paste `ops net allow` — sound here because nothing allowed the host. The `403`
-            // body still goes to the in-cage client regardless.
-            ctx.refusal_notice(&connect_host, port);
+            // The refusal body carries a copy-paste `ops net allow` — sound here because nothing
+            // allowed the host (never for an explicit deny or a security refusal). It rides the
+            // response the client already shows, so there is no second, host-side message to
+            // duplicate it or interleave with it. Scoped to the app when this is an `ops app` launch.
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
                 "denied-default",
-                &format!("`{connect_host}:{port}` is not allowed by the network policy"),
+                &format!(
+                    "`{connect_host}:{port}` is not allowed by the network policy. \
+                     Allow it: {}",
+                    ctx.allow_suggestion(&connect_host)
+                ),
             );
         }
         // Ask-by-default: no config rule decided. First consult the live manual overlay (decisions
@@ -2035,8 +2005,9 @@ fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
 /// Compose one egress notice line: a bold-red `ops:` tag, the red `head`, then each yellow
 /// `label: command` action (the first joined by ` — `, the rest by `  |  `). Pure over the
 /// palette so it is unit-testable in both the plain and colored forms; [`print_egress_notice`]
-/// wraps it with the stderr auto-detect. This is the single renderer both the `ask`-park alert
-/// and the [`ProxyCtx::refusal_notice`] use, so their styling cannot drift.
+/// wraps it with the stderr auto-detect. Used by the `ask`-mode park alert (the interactive
+/// posture where a decision is needed live); a `deny`-mode refusal instead carries its hint in
+/// the `403` body, which the client already shows.
 fn egress_notice_line(p: &crate::style::Palette, head: &str, actions: &[(&str, &str)]) -> String {
     let mut line = format!(
         "{err}ops:{rst} {err}{head}{rst}",
@@ -2699,51 +2670,7 @@ mod tests {
         assert!(colored.ends_with("\x1b[0m"), "the line resets its styling");
     }
 
-    /// The refusal-notice cadence and dedup, pure of I/O: `Off` never prints, `Each` always prints
-    /// (never consulting the seen-set), `Once` prints the first block of a given `host:port` and
-    /// stays silent for a repeat — and the cadence survives the built-in union in `new`.
-    #[test]
-    fn refusal_notice_cadence_off_each_once() {
-        let ctx = |c| {
-            ProxyCtx::new(
-                Arc::new(Ca::ephemeral().unwrap()),
-                policy(&[]).with_refusal_notice(c),
-            )
-            .unwrap()
-        };
-
-        let off = ctx(RefusalNotice::Off);
-        assert!(!off.should_print_refusal("a.test", 443));
-        assert!(off.refusal_noticed.lock().unwrap().is_empty());
-
-        let each = ctx(RefusalNotice::Each);
-        assert!(each.should_print_refusal("a.test", 443));
-        assert!(each.should_print_refusal("a.test", 443));
-        assert!(
-            each.refusal_noticed.lock().unwrap().is_empty(),
-            "Each never records the seen-set"
-        );
-
-        let once = ctx(RefusalNotice::Once);
-        assert!(
-            once.should_print_refusal("a.test", 443),
-            "first block prints"
-        );
-        assert!(
-            !once.should_print_refusal("a.test", 443),
-            "the repeat is silent"
-        );
-        assert!(
-            once.should_print_refusal("a.test", 8443),
-            "a different port is its own key"
-        );
-        assert!(
-            once.should_print_refusal("b.test", 443),
-            "a different host is its own key"
-        );
-    }
-
-    /// The refusal notice's `ops net allow` suggestion names the app when the launch is an
+    /// The refusal body's `ops net allow` suggestion names the app when the launch is an
     /// `ops app <name>` (so the rule is scoped to that app), and stays bare otherwise.
     #[test]
     fn allow_suggestion_names_the_app_when_set() {
@@ -2787,6 +2714,12 @@ mod tests {
         assert!(
             resp.contains("denied-default"),
             "the refusal must name the motif (no allow rule matched): {resp:?}"
+        );
+        // The body carries the actionable hint (no app here → the bare form), so the human who
+        // reads the response also sees how to permit it — no separate host-side message needed.
+        assert!(
+            resp.contains("Allow it: ops net allow denied.test"),
+            "the denied-default body must suggest `ops net allow`: {resp:?}"
         );
     }
 

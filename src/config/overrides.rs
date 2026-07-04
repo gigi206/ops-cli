@@ -502,7 +502,6 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
         ask_timeout: None,
         ask_notice: None,
         stats: None,
-        refusal_notice: None,
         default_methods: None,
     })
 }

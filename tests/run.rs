@@ -1168,16 +1168,6 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
         "denied egress must be refused with a 403 at the proxy: {}",
         String::from_utf8_lossy(&denied.stderr)
     );
-    // The refusal notice fires on the host `ops` stderr with the default `once` cadence: a red
-    // (plain here, stderr is captured) alert plus a copy-paste `ops net allow`. Its presence proves
-    // the `denied-default` path reaches `refusal_notice` end to end; it is scoped to the unmatched
-    // host, so the suggestion names `example.com` (the allowed `cache.nixos.org` never triggers it).
-    let dstderr = String::from_utf8_lossy(&denied.stderr);
-    assert!(
-        dstderr.contains("egress refused example.com:443")
-            && dstderr.contains("ops net allow example.com"),
-        "denied egress must print the refusal notice with an allow suggestion: {dstderr}"
-    );
 
     // STATS — the write↔read key agreement, end to end. The proxy recorded one outcome per request
     // into a session file keyed by the project's canonical path; `ops net stats` run from the same
