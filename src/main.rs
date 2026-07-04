@@ -1870,24 +1870,15 @@ fn config_get(args: &[OsString]) -> ExitCode {
     if positionals.len() != 1 {
         return config_usage("get");
     }
-    if let Some(code) = reject_app_global("get", &app, &scope) {
-        return code;
-    }
-    let key = match effective_key("get", &positionals[0], &app) {
-        Ok(k) => k,
-        Err(code) => return code,
-    };
     let cwd = match config_cwd() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let path = match config::manage::scope_path(&scope, &cwd) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ops: config: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (path, key, _gated) =
+        match resolve_key_target("get", &scope, app.as_deref(), &positionals[0], &cwd) {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
     match config::manage::get(&path, &key) {
         Ok(Some(v)) => {
             println!("{v}");
@@ -1916,38 +1907,57 @@ fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
     }
 }
 
-/// Refuse `--app <name>` together with `--global` on a key-taking verb. A global app lives only as a
-/// profile file (`apps/<name>.toml`) with top-level keys, so the `app.<name>.<key>` rewrite `--app`
-/// performs would write the wrong table shape into the global config (where `[app.*]` is forbidden).
-/// Edit the profile directly, or use `ops net allow -a <name> --save -g` for network rules. Full
-/// routing of `--app -g` to the profile is deferred. Returns the usage exit code when both flags are
-/// present, else `None`.
-fn reject_app_global(
+/// Resolve the file a key-taking verb (`get`/`set`/`unset`) targets and the dotted key within it,
+/// applying the `--app <name>` routing and reporting whether the target is trust-gated.
+///
+/// The routing mirrors `ops net … -a <name>`: a **global** app lives in its own profile file
+/// `apps/<name>.toml` with **top-level** keys, so the key is used as-is; an app declared **inline**
+/// (a project `.ops.toml` or a `-c` file) is addressed under its `app.<name>.` table. The name
+/// asymmetry is deliberate, not a bug: a `.`-containing app name is addressable at `-g` (it keys the
+/// profile *filename*) but rejected inline (the dotted-key splitter does not handle a quoted segment).
+///
+/// The returned `gated` flag drives the trust note: the global config and the app profiles under
+/// `apps/` are trusted **by location**, so a write to either is never gated (and never re-arms a trust
+/// marker); a project (or explicit `-c`) file is. Any resolution error is already reported to stderr,
+/// so the caller just returns the carried exit code.
+fn resolve_key_target(
     verb: &str,
-    app: &Option<String>,
     scope: &config::manage::Scope,
-) -> Option<ExitCode> {
-    if app.is_some() && matches!(scope, config::manage::Scope::Global) {
-        eprintln!(
-            "ops: config {verb}: `--app <name> --global` is not supported — a global app is a \
-             profile file under `apps/<name>.toml`; edit it directly, or use `ops net allow -a \
-             <name> --save -g` for network rules"
-        );
-        Some(config_usage(verb))
-    } else {
-        None
-    }
-}
-
-/// Resolve the dotted key a key-taking verb (`get`/`set`/`unset`) operates on, applying the
-/// `--app <name>` rewrite when present. Returns the verb's usage exit code on an invalid app name.
-fn effective_key(verb: &str, raw_key: &str, app: &Option<String>) -> Result<String, ExitCode> {
-    match app {
-        Some(name) => app_prefixed_key(name, raw_key).map_err(|e| {
-            eprintln!("ops: config {verb}: {e}");
-            config_usage(verb)
-        }),
-        None => Ok(raw_key.to_string()),
+    app: Option<&str>,
+    raw_key: &str,
+    cwd: &Path,
+) -> Result<(PathBuf, String, bool), ExitCode> {
+    use config::manage::{self, Scope};
+    let gated = !matches!(scope, Scope::Global);
+    let scope_path = |scope: &Scope| {
+        manage::scope_path(scope, cwd).map_err(|e| {
+            eprintln!("ops: config: {e}");
+            ExitCode::FAILURE
+        })
+    };
+    match (app, scope) {
+        (None, _) => Ok((scope_path(scope)?, raw_key.to_string(), gated)),
+        (Some(name), Scope::Global) => {
+            // A global app is its own profile file with top-level keys. The name keys that
+            // filename, so validate it (anti-traversal) the way `ops net … -a <name> -g` does.
+            if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+                eprintln!("ops: config {verb}: invalid app name `{name}`");
+                return Err(config_usage(verb));
+            }
+            let path = manage::scope_app_path(scope, cwd, name).map_err(|e| {
+                eprintln!("ops: config: {e}");
+                ExitCode::FAILURE
+            })?;
+            Ok((path, raw_key.to_string(), false))
+        }
+        (Some(name), _) => {
+            // An inline app (project `.ops.toml` or a `-c` file) is addressed under `app.<name>.`.
+            let key = app_prefixed_key(name, raw_key).map_err(|e| {
+                eprintln!("ops: config {verb}: {e}");
+                config_usage(verb)
+            })?;
+            Ok((scope_path(scope)?, key, gated))
+        }
     }
 }
 
@@ -2003,38 +2013,31 @@ fn config_set(args: &[OsString]) -> ExitCode {
     if positionals.len() != 2 {
         return config_usage("set");
     }
-    if let Some(code) = reject_app_global("set", &app, &scope) {
-        return code;
-    }
-    let key = match effective_key("set", &positionals[0], &app) {
-        Ok(k) => k,
-        Err(code) => return code,
-    };
     let val = &positionals[1];
     let cwd = match config_cwd() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let path = match config::manage::scope_path(&scope, &cwd) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ops: config: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (path, key, gated) =
+        match resolve_key_target("set", &scope, app.as_deref(), &positionals[0], &cwd) {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
     // Capture the trust state before the write — the write itself changes the file and so its
-    // verdict, so "was it trusted" must be read first.
+    // verdict, so "was it trusted" must be read first. A non-gated target (the global config or an
+    // app profile, both trusted by location) carries no marker, so the read is skipped.
     let store_dir = trust::default_store_dir();
-    let was_trusted = store_dir
-        .as_deref()
-        .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+    let was_trusted = gated
+        && store_dir
+            .as_deref()
+            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
 
     match config::manage::set(&path, &key, val) {
         Ok(created) => {
             let verb = if created { "set" } else { "updated" };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write(verb, &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref());
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -2064,34 +2067,26 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     if positionals.len() != 1 {
         return config_usage("unset");
     }
-    if let Some(code) = reject_app_global("unset", &app, &scope) {
-        return code;
-    }
-    let key = match effective_key("unset", &positionals[0], &app) {
-        Ok(k) => k,
-        Err(code) => return code,
-    };
     let cwd = match config_cwd() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let path = match config::manage::scope_path(&scope, &cwd) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ops: config: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (path, key, gated) =
+        match resolve_key_target("unset", &scope, app.as_deref(), &positionals[0], &cwd) {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
     let store_dir = trust::default_store_dir();
-    let was_trusted = store_dir
-        .as_deref()
-        .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+    let was_trusted = gated
+        && store_dir
+            .as_deref()
+            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
 
     match config::manage::unset(&path, &key) {
         Ok(true) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write("unset", &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref());
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
             ExitCode::SUCCESS
         }
         Ok(false) => {
@@ -2299,7 +2294,21 @@ fn report_write_trust(
     was_trusted: bool,
     trust_flag: bool,
     store_dir: Option<&Path>,
+    gated: bool,
 ) {
+    // The global config and the app profiles under `apps/` are trusted **by location** — they carry
+    // no per-file trust marker, so a write never re-arms a gate and needs no `ops trust`. Reporting
+    // one would be a false positive (the field applies as soon as the file is read), so say nothing —
+    // beyond noting that an explicit `--trust` is unnecessary here.
+    if !gated {
+        if trust_flag {
+            diag::note(&format!(
+                "{} is trusted by location; `--trust` is not needed",
+                path.display()
+            ));
+        }
+        return;
+    }
     if trust_flag {
         match store_dir {
             Some(dir) => match trust::trust(dir, path) {
@@ -7968,6 +7977,63 @@ mod tests {
         assert_eq!(path, explicit);
         assert_eq!(key, None);
         assert_eq!(target, "/etc/ops.toml");
+    }
+
+    #[test]
+    fn resolve_key_target_routes_by_scope_and_app() {
+        // The routing behind `config get/set/unset`. Env-independent arms are asserted here; the
+        // `--app <name> --global` profile arm resolves the config home, so it is covered by the
+        // `config show --app` / profile integration tests instead (same convention as
+        // `egress_write_target` above).
+        use config::manage::Scope;
+        let cwd = std::path::Path::new("/some/cwd");
+        let proj = cwd.join(config::PROJECT_CONFIG);
+
+        // No app: the raw key, the scope's file, and gated for a project write.
+        let (path, key, gated) =
+            resolve_key_target("set", &Scope::Local, None, "network", cwd).unwrap();
+        assert_eq!((path, key.as_str(), gated), (proj.clone(), "network", true));
+
+        // An inline app (project scope) addresses `app.<name>.<key>` and stays gated.
+        let (path, key, gated) =
+            resolve_key_target("set", &Scope::Local, Some("demo"), "network", cwd).unwrap();
+        assert_eq!(
+            (path, key.as_str(), gated),
+            (proj, "app.demo.network", true)
+        );
+
+        // A `-c` file with an app: the file itself, the prefixed key, still gated (not trusted by
+        // location).
+        let explicit = std::path::PathBuf::from("/etc/ops.toml");
+        let (path, key, gated) = resolve_key_target(
+            "set",
+            &Scope::File(explicit.clone()),
+            Some("demo"),
+            "cmd",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(
+            (path, key.as_str(), gated),
+            (explicit, "app.demo.cmd", true)
+        );
+
+        // An app name with a `.` cannot be addressed inline (the dotted-key splitter is naive).
+        assert!(
+            resolve_key_target("set", &Scope::Local, Some("a.b"), "network", cwd).is_err(),
+            "a dotted app name is rejected inline"
+        );
+
+        // A reserved verb / an invalid charset can never key a profile filename (validated before
+        // the config home is even resolved, so this arm stays env-independent).
+        assert!(
+            resolve_key_target("set", &Scope::Global, Some("import"), "network", cwd).is_err(),
+            "a reserved app verb cannot name a global-app profile"
+        );
+        assert!(
+            resolve_key_target("set", &Scope::Global, Some("bad/name"), "network", cwd).is_err(),
+            "an invalid app name cannot name a global-app profile"
+        );
     }
 
     #[test]

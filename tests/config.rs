@@ -2204,9 +2204,9 @@ fn config_short_flags_alias_their_long_forms() {
         "-d must alias --default:\n{stdout}"
     );
 
-    // `-a` on the write verbs is `--app`: `set -a` writes under the app's table. A global app is a
-    // profile file (an inline `[app.<name>]` in `ops.toml` is forbidden and `--app --global` is
-    // refused), so the project file is the write target here.
+    // `-a` on the write verbs is `--app`: with `-l` (here) `set -a` writes under the project's
+    // `[app.<name>]` overlay table; with `-g` it targets the app's profile file instead (an inline
+    // `[app.<name>]` in the global `ops.toml` is forbidden), covered by its own test below.
     let out = fx.run(&["config", "set", "-a", "demo", "-l", "cmd", "mytool"]);
     assert!(out.status.success(), "set -a -l must succeed");
     let project = fx.proj.path().join(".ops.toml");
@@ -2228,6 +2228,201 @@ fn config_short_flags_alias_their_long_forms() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("mytool"),
         "show -a must render the app's effective cmd"
+    );
+}
+
+#[test]
+fn config_set_get_unset_on_a_global_app_route_to_its_profile_file() {
+    // `config set/get/unset --app <name> -g` targets the app's profile file `apps/<name>.toml`
+    // with top-level keys (a global app is a profile, never an inline `[app.*]`). This is the one
+    // routing that unlocks every network posture on a global app via the CLI; assert it end-to-end
+    // (the value RESOLVES through `config show --app`, not merely that the file holds the string).
+    let fx = Fixture::new();
+    // A global baseline posture, so an inherited app mode has something concrete to resolve to.
+    fx.write_global("network = \"ask\"\n");
+
+    let profile = fx
+        .config_home
+        .path()
+        .join("ops")
+        .join("apps")
+        .join("demo.toml");
+
+    // Each of the five bare postures is settable on the global app and resolves.
+    for (posture, shown) in [
+        ("none", "network: none"),
+        ("shared", "network: shared"),
+        ("deny", "network: deny"),
+        ("allow", "network: allow"),
+        ("ask", "network: ask"),
+    ] {
+        std::fs::remove_file(&profile).ok();
+        // The write must first create the app so `cmd` makes it a launchable profile (an app with
+        // no cmd is not shown); set the posture; then confirm both the file and the resolved view.
+        assert!(fx
+            .run(&["config", "set", "cmd", "agent", "--app", "demo", "-g"])
+            .status
+            .success());
+        let out = fx.run(&["config", "set", "network", posture, "--app", "demo", "-g"]);
+        assert!(
+            out.status.success(),
+            "set network {posture} --app demo -g must succeed"
+        );
+        // No false-positive trust note: a profile is trusted by location, so `ops trust` is never
+        // mentioned on a `-g` write.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.to_lowercase().contains("ops trust"),
+            "a profile write must not print a trust note:\n{stderr}"
+        );
+        // The write landed in the profile file, top-level (not under an `[app.demo]` table).
+        let body = std::fs::read_to_string(&profile).unwrap();
+        assert!(
+            body.contains(&format!("network = \"{posture}\"")) && !body.contains("[app."),
+            "the posture is a top-level key in the profile:\n{body}"
+        );
+        // And it RESOLVES through the app view.
+        let show = fx.run(&["config", "show", "--app", "demo"]);
+        assert!(show.status.success());
+        assert!(
+            String::from_utf8_lossy(&show.stdout).contains(shown),
+            "`{posture}` must resolve for the global app:\n{}",
+            String::from_utf8_lossy(&show.stdout)
+        );
+    }
+
+    // `get` reads a scalar leaf back from the profile.
+    assert!(fx
+        .run(&["config", "set", "network", "deny", "--app", "demo", "-g"])
+        .status
+        .success());
+    let got = fx.run(&["config", "get", "network", "--app", "demo", "-g"]);
+    assert!(got.status.success());
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "deny");
+}
+
+#[test]
+fn unset_network_mode_on_a_global_app_yields_an_inheriting_table() {
+    // The mode-less (inherit) table — the shape the `[network] mode` optional feature added — is now
+    // reachable on a global app via the CLI: bootstrap a rule (which sets an explicit `mode = "deny"`),
+    // then drop the mode. The app then inherits the parent layer's mode while keeping its own rules.
+    let fx = Fixture::new();
+    fx.write_global("network = \"ask\"\n"); // the mode the app will inherit
+    fx.write_profile("demo", "cmd = \"agent\"\n");
+
+    // `ops net allow` bootstraps a `deny`-mode table in the profile...
+    assert!(fx
+        .run(&["net", "allow", "api.example.com", "--app", "demo", "-g"])
+        .status
+        .success());
+    // ...then `unset network.mode` leaves the rules but no mode.
+    assert!(fx
+        .run(&["config", "unset", "network.mode", "--app", "demo", "-g"])
+        .status
+        .success());
+    let profile = fx.config_home.path().join("ops/apps/demo.toml");
+    let body = std::fs::read_to_string(&profile).unwrap();
+    assert!(
+        !body.contains("mode =") && body.contains("api.example.com"),
+        "the table keeps its rule but drops the mode:\n{body}"
+    );
+
+    // The app resolves to the inherited `ask` mode, not the bootstrapped `deny`. The provenance tag
+    // is `app:global` — network provenance is field-level (the app declared the `[network]` table via
+    // its rules), so the tag names the declaration site even though only the *mode* is inherited. This
+    // is consistent with the project-overlay path (a trusted overlay with a mode-less table tags
+    // `app:project` the same way) and is not a routing artifact; per-sub-field network-mode provenance
+    // is a possible follow-up, deliberately deferred. Pinned here so a future change is caught.
+    let show = fx.run(&["config", "show", "--app", "demo"]);
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("network: ask") && stdout.contains("(app:global)"),
+        "a mode-less profile table inherits the global `ask`, tagged by its declaration site:\n{stdout}"
+    );
+}
+
+#[test]
+fn config_set_on_a_full_profile_survives_validation_and_resolves() {
+    // The `-g` profile write validates the whole file (as a config layer), so a *full* profile —
+    // cmd + [packages] + [secret] + [network], the shape the shipped profiles carry — must survive
+    // a `config set` untouched and still resolve. A minimal network-only profile would hide a
+    // validation mismatch on the real-world fields.
+    let fx = Fixture::new();
+    fx.write_profile(
+        "agent",
+        "cmd = \"agent\"\n\
+         \n[packages]\n\
+         tool = \"mise:aqua:vendor/tool\"\n\
+         \n[network]\n\
+         mode = \"deny\"\n\
+         allow = [\"{*} https://api.example.com:443\"]\n\
+         \n[secret.\"api.example.com\"]\n\
+         from = \"env://DEMO_API_KEY\"\n\
+         header = \"x-api-key\"\n\
+         type = \"raw\"\n",
+    );
+
+    // Tune the ask timeout on the table AND flip the mode — both write into the existing profile.
+    assert!(fx
+        .run(&[
+            "config",
+            "set",
+            "network.mode",
+            "ask",
+            "--app",
+            "agent",
+            "-g"
+        ])
+        .status
+        .success());
+    let out = fx.run(&[
+        "config",
+        "set",
+        "network.ask_timeout",
+        "45",
+        "--app",
+        "agent",
+        "-g",
+    ]);
+    assert!(
+        out.status.success(),
+        "a set on a full profile must not fail validation:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The other sections are intact and the profile still resolves through the app view.
+    let profile = fx.config_home.path().join("ops/apps/agent.toml");
+    let body = std::fs::read_to_string(&profile).unwrap();
+    assert!(
+        body.contains("cmd = \"agent\"")
+            && body.contains("[packages]")
+            && body.contains("[secret."),
+        "cmd/packages/secret must survive the write:\n{body}"
+    );
+    let show = fx.run(&["config", "show", "--app", "agent"]);
+    assert!(show.status.success(), "the tuned profile must resolve");
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("network: ask") && stdout.contains("45"),
+        "the tuned mode + timeout resolve:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_local_write_still_warns_when_it_re_arms_a_trusted_project() {
+    // The trust note is scope-aware: suppressed for the global config / profiles (trusted by
+    // location), but a project write that re-arms a trusted `.ops.toml` MUST still warn — the guard
+    // that the note-suppression above did not silence the case that matters.
+    let fx = Fixture::new();
+    fx.write_project("network = \"deny\"\n");
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+
+    let out = fx.run(&["config", "set", "network", "ask"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("re-armed the trust gate") && stderr.contains("ops trust"),
+        "a local write to a trusted file must still warn:\n{stderr}"
     );
 }
 

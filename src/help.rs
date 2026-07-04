@@ -234,7 +234,7 @@ const PAGES: &[Page] = &[
             ("-c <file>", "an explicit config file"),
             (
                 "-a, --app <name>",
-                "address the key under that app's table (app.<name>.<key>)",
+                "address the key under that app (app.<name>.<key> inline, or -g reads its profile)",
             ),
         ],
         details:
@@ -243,9 +243,10 @@ const PAGES: &[Page] = &[
             show` (or `ops config show --json`). An unset key exits 1; an array or table value is\n\
             edited with `ops config edit`, not read as a single value.\n\
             \n\
-            --app <name> rewrites the key under that app's table, so `get --app demo cmd` reads\n\
-            app.demo.cmd — sugar for the dotted key. An app name containing a `.` is edited with\n\
-            `ops config edit` instead.",
+            --app <name> addresses an app's config: inline (a project .ops.toml) it reads\n\
+            app.<name>.<key>; with -g it reads the top-level key from the app's profile file\n\
+            (apps/<name>.toml). An app name containing a `.` is edited with `ops config edit`\n\
+            instead.",
     },
     Page {
         path: &["config", "set"],
@@ -259,7 +260,7 @@ const PAGES: &[Page] = &[
             ("-c <file>", "an explicit config file"),
             (
                 "-a, --app <name>",
-                "address the key under that app's table (app.<name>.<key>)",
+                "address the key under that app (app.<name>.<key> inline, or -g writes its profile)",
             ),
             (
                 "--trust",
@@ -270,15 +271,18 @@ const PAGES: &[Page] = &[
             "Writes a string value at a dotted key, preserving the file's other keys, comments,\n\
             and formatting. Creates the file and intermediate tables as needed.\n\
             \n\
-            --app <name> rewrites the key under that app's table, so `set --app demo network\n\
-            shared` writes app.demo.network — sugar for the dotted key. An app name containing a\n\
-            `.` is edited with `ops config edit` instead.\n\
+            --app <name> addresses an app's config: inline (a project .ops.toml) it writes\n\
+            app.<name>.<key>; with -g it writes the top-level key into the app's profile file\n\
+            (apps/<name>.toml, created if absent). So `set network ask --app demo -g` sets a\n\
+            global app's posture, and `set network.mode ask --app demo -g` tunes its table. An\n\
+            app name containing a `.` is edited with `ops config edit` instead.\n\
             \n\
-            The trust gate hashes the whole file, so any edit re-arms it: after writing a file\n\
-            you had trusted, its security fields stop applying until you run `ops trust`. Pass\n\
-            --trust to re-trust in one step (this blesses the whole current file). A free env\n\
-            value needs no trust. Array and table fields (binds, an allowlist, secrets, apps) are\n\
-            edited with `ops config edit`.",
+            The trust gate hashes the whole file, so any edit re-arms it: after writing a project\n\
+            file you had trusted, its security fields stop applying until you run `ops trust`. Pass\n\
+            --trust to re-trust in one step (this blesses the whole current file). The global config\n\
+            and app profiles are trusted by location, so a write to either needs no trust. A free\n\
+            env value needs no trust. Array and table fields (binds, an allowlist, secrets, apps)\n\
+            are edited with `ops config edit`.",
     },
     Page {
         path: &["config", "unset"],
@@ -291,18 +295,21 @@ const PAGES: &[Page] = &[
             ("-c <file>", "an explicit config file"),
             (
                 "-a, --app <name>",
-                "address the key under that app's table (app.<name>.<key>)",
+                "address the key under that app (app.<name>.<key> inline, or -g edits its profile)",
             ),
             ("--trust", "re-trust the file after writing"),
         ],
         details:
             "Removes a dotted key from one layer file. Removing a key that is not set changes\n\
-            nothing (and so never re-arms trust). A removal that does change a trusted file\n\
-            re-arms its trust gate, the same as `set`.\n\
+            nothing (and so never re-arms trust). A removal that does change a trusted project\n\
+            file re-arms its trust gate, the same as `set` (the global config and app profiles\n\
+            are trusted by location, so a removal there needs no re-trust).\n\
             \n\
-            --app <name> rewrites the key under that app's table, so `unset --app demo network`\n\
-            removes app.demo.network. An app name containing a `.` is edited with `ops config\n\
-            edit` instead.",
+            --app <name> addresses an app's config: inline (a project .ops.toml) it removes\n\
+            app.<name>.<key>; with -g it removes the top-level key from the app's profile file\n\
+            (apps/<name>.toml). So `unset network.mode --app demo -g` drops a global app's mode,\n\
+            leaving a table that inherits it from the parent layer. An app name containing a `.`\n\
+            is edited with `ops config edit` instead.",
     },
     Page {
         path: &["config", "path"],
