@@ -50,14 +50,31 @@ scope flag). See [Egress groups](../networking/groups.md).
 ## ops net allow and deny
 
 ```
-ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]
-ops net deny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
+ops net deny  <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
 ```
 
 Validates the rule, then persists it to a config file. `allow` on a fresh config
 **bootstraps a deny-by-default allowlist**; `deny` needs an existing filtering posture
 (it will not open one). Writing the project config re-trusts it; the global config and
 `-a <name>` app profile are trusted by location. See the [rule grammar](../networking/rules.md).
+
+`--session` instead loads the rule into the **live overlay** of the running session(s),
+which the proxy folds into its effective policy — so it takes effect **immediately**, on an
+allowlist or denylist session as well as [`ask`](../networking/ask.md): a `--session allow`
+opens an otherwise-denied host, a `--session deny` cuts an allowed one (deny wins). It is the
+proactive sibling of [`ops net pending allow <id> --session`](../networking/ask.md), which
+decides a request that already parked. It writes no file (so it never re-trusts the project)
+and dies with the session. By default it scopes to the current project's session(s); `-a
+<app>` narrows to one app, `--all` widens to every reachable session. The config-scope flags
+(`-l`/`-g`/`-c`) do not apply with `--session`; only a filtering posture runs the proxy, so a
+`shared`/`none` session has nothing to load into.
+
+```sh
+ops net allow api.example.com --session          # for this project's live ask session(s)
+ops net allow api.example.com --session -a bot   # only app `bot`'s session(s)
+ops net deny  ads.example.com --session --all    # every reachable session, this run only
+```
 
 ## `ops net pending`
 

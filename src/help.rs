@@ -638,9 +638,10 @@ const PAGES: &[Page] = &[
             `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
             directly with `ops net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
             <name>` shows what `ops app <name>` would launch with — the same effective policy `ops\n\
-            test net --app` tests a URL against. `--source session` instead queries this project's live\n\
-            ask sessions for the rules they remembered from `--session` answers (it does not combine\n\
-            with `--app`). No launch, no nix.",
+            test net --app` tests a URL against. `--source session` instead queries the live sessions\n\
+            for the rules loaded into their overlay with `ops net allow|deny --session` (or a `net\n\
+            pending … --session` answer) — this project's sessions by default, or `-a <app>`'s\n\
+            session(s). No launch, no nix.",
     },
     Page {
         path: &["net", "groups"],
@@ -695,33 +696,53 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "allow"],
-        synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
-        summary: "persist an allow rule to a config file",
+        synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        summary: "persist an allow rule to a config file (or load it live with --session)",
         options: &[
             ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
-            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
+            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)"),
+            ("--session", "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default"),
+            ("--all", "with `--session`, widen the live load to every reachable session (all projects), not just the current one"),
         ],
         details:
             "Validates the rule, then adds it. With no filtering posture yet, `allow` bootstraps a\n\
             deny-by-default allowlist. Writing the project config re-trusts it (it must be absent or\n\
-            already trusted first); the global config is trusted by location.",
+            already trusted first); the global config is trusted by location.\n\
+            \n\
+            `--session` instead loads the rule into the **live overlay** of the running session(s), which\n\
+            the proxy folds into its effective policy — so it takes effect immediately, on an allowlist\n\
+            or denylist session as well as `ask` (a `--session allow` opens an otherwise-denied host, a\n\
+            `--session deny` cuts an allowed one; deny wins). It is the proactive sibling of `ops net\n\
+            pending allow <id> --session`, which decides a request that already parked. It writes no\n\
+            file — so, unlike a config write, it never re-trusts the project — and dies with the session.\n\
+            The config-scope flags (`-l`/`-g`/`-c`) do not apply with `--session`; scope the sessions\n\
+            with `-a <app>`/`--all`. Only a filtering posture runs the proxy, so a `shared`/`none`\n\
+            session has nothing to load into.",
     },
     Page {
         path: &["net", "deny"],
-        synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
-        summary: "persist a deny rule to a config file",
+        synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        summary: "persist a deny rule to a config file (or load it live with --session)",
         options: &[
             ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
             ("-l, --local", "write the project .ops.toml (the default)"),
             ("-g, --global", "write the global ops.toml"),
-            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`"),
+            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)"),
+            ("--session", "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default"),
+            ("--all", "with `--session`, widen the live load to every reachable session (all projects), not just the current one"),
         ],
         details:
             "Validates the rule, then adds it (deny always wins over allow). A deny needs an existing\n\
             filtering posture — it will not open one — so set the posture first on a fresh config.\n\
-            Writing the project config re-trusts it; the global config is trusted by location.",
+            Writing the project config re-trusts it; the global config is trusted by location.\n\
+            \n\
+            `--session` instead loads the rule into the **live overlay** of the running session(s), which\n\
+            the proxy folds into its effective policy — so a `--session deny` cuts a host immediately on\n\
+            an allowlist or denylist session as well as `ask` (deny wins over any allow). It writes no\n\
+            file and dies with the session. The config-scope flags (`-l`/`-g`/`-c`) do not apply with\n\
+            `--session`; scope the sessions with `-a <app>`/`--all`.",
     },
     Page {
         path: &["net", "pending"],

@@ -103,6 +103,27 @@ The persisted rules a session remembered from `--session` answers are visible wi
 
 ---
 
+## Deciding a host *before* it parks (and outside `ask`)
+
+`ops net pending allow|deny <id> --session` reacts to a request that **already** parked.
+To pre-decide a host you know is coming — without editing your config — load a rule into
+the live session's overlay ahead of time:
+
+```bash
+ops net allow api.example.com --session          # this project's live session(s)
+ops net allow api.example.com --session -a bot   # only app `bot`'s session(s)
+ops net deny  ads.example.com --session --all    # every reachable session, this run only
+```
+
+The proxy folds the overlay into its effective policy, so this works on **any** filtering
+posture — not just `ask`. On an **allowlist** agent (the common case for a running
+[`ops app`](../cli/app.md)), `ops net allow <host> --session` opens a host the allowlist
+omits, and `ops net deny <host> --session` cuts one it permits (deny wins), all without
+relaunching. It writes no file and dies with the session. See
+[`ops net allow`/`deny`](../cli/net.md#ops-net-allow-and-deny).
+
+---
+
 ## Draining in bulk
 
 `--all` answers every parked request at once instead of one id:

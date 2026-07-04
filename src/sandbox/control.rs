@@ -204,11 +204,14 @@ impl PendingState {
     }
 }
 
-/// The live, per-session manual egress rules a user adds while answering with `--session`: a runtime
-/// overlay distinct from the (immutable) config policy. Shared via `Arc` between the proxy serve
-/// threads (which consult it on the `ask` branch, before parking) and the control thread (which
-/// appends to it). Each rule is an exact `host:port` — the answered request — so remembering a
-/// decision suppresses the re-ask of *that* request without widening to the host's other ports.
+/// The live, per-session manual egress rules a user adds at runtime — either by answering an `ask`
+/// with `--session` (an exact `host:port` for the answered request) or by loading a rule ahead of
+/// time with `ops net allow|deny <rule> --session` (any egress rule). A runtime overlay distinct
+/// from the (immutable) config policy, shared via `Arc` between the proxy serve threads and the
+/// control thread (which appends to it). The proxy consults it by **folding these rules into the
+/// effective policy** it evaluates per request — so an overlay allow/deny is enforced through the
+/// same allow/deny/path/method/deny-wins machinery as a config rule, in every filtering posture
+/// (allowlist, denylist, and `ask`), not only when a request would otherwise park.
 #[derive(Default)]
 pub(crate) struct ManualRules {
     inner: RwLock<ManualInner>,
@@ -228,7 +231,13 @@ impl ManualRules {
     /// Remember an answered `host:port` as a manual allow or deny, so re-running that exact request
     /// is decided without re-asking. Deduped — re-answering the same `host:port` does not stack.
     pub(crate) fn remember(&self, verdict: Verdict, host: &str, port: u16) {
-        let rule = crate::allowlist::host_port_rule(host, port);
+        self.remember_rule(verdict, crate::allowlist::host_port_rule(host, port));
+    }
+
+    /// Add an arbitrary egress `rule` to the overlay as a manual allow or deny — the proactive
+    /// `ops net allow|deny <rule> --session` path. Deduped, so re-loading the same rule does not
+    /// stack. A deny takes precedence over an allow at decision time (deny wins in the policy).
+    pub(crate) fn remember_rule(&self, verdict: Verdict, rule: Rule) {
         let mut inner = self.inner.write().unwrap();
         let list = match verdict {
             Verdict::Allow => &mut inner.allow,
@@ -239,30 +248,15 @@ impl ManualRules {
         }
     }
 
-    /// The manual overlay's verdict for a request: `Some(true)` a remembered allow, `Some(false)` a
-    /// remembered deny (deny wins), `None` if no manual rule matches (the request still parks). The
-    /// read lock is held only for the check — nothing I/O-bound runs under it.
-    pub(crate) fn decide(&self, host: &str, port: u16, path: &str) -> Option<bool> {
+    /// Whether the overlay is empty — the common case, letting the proxy skip building an effective
+    /// policy and evaluate its immutable config policy directly (no per-request allocation).
+    pub(crate) fn is_empty(&self) -> bool {
         let inner = self.inner.read().unwrap();
-        if inner
-            .deny
-            .iter()
-            .any(|r| crate::allowlist::rule_matches(r, host, port, path))
-        {
-            return Some(false);
-        }
-        if inner
-            .allow
-            .iter()
-            .any(|r| crate::allowlist::rule_matches(r, host, port, path))
-        {
-            return Some(true);
-        }
-        None
+        inner.allow.is_empty() && inner.deny.is_empty()
     }
 
-    /// A snapshot of the manual rules `(allow, deny)` for listing — cloned out so the read lock is
-    /// not held across formatting or I/O.
+    /// A snapshot of the manual rules `(allow, deny)` — cloned out so the read lock is not held
+    /// across the fold into the effective policy, listing, or I/O.
     pub(crate) fn snapshot(&self) -> (Vec<Rule>, Vec<Rule>) {
         let inner = self.inner.read().unwrap();
         (inner.allow.clone(), inner.deny.clone())
@@ -516,9 +510,11 @@ pub(crate) fn serve(
     Ok(())
 }
 
-/// The largest control command accepted — commands are short (`ALLOW <seq>`), so anything larger is
-/// malformed; bounding the read keeps a confused or hostile peer from making us buffer unboundedly.
-const CMD_MAX: u64 = 256;
+/// The largest control command accepted. Most commands are short (`ALLOW <seq>`), but `REMEMBER
+/// ALLOW|DENY <rule>` carries a full egress rule (a long regex or URL rule), so the bound matches the
+/// reply bound rather than the terse-command size — still bounded so a confused or hostile peer
+/// cannot make us buffer unboundedly. The peer is the owner-only, host-side control client.
+const CMD_MAX: u64 = 8 * 1024;
 
 /// The largest control *reply* accepted. Unlike a command, a reply carries the destination the agent
 /// reached (`ok host=<h> …`), which for a URL rule can be far longer than `CMD_MAX` — bounding it at
@@ -551,7 +547,9 @@ fn handle(
 /// remembers it as a manual rule), replying `ok host=<host> count=<n>` or `err not-found`;
 /// `ALLOW *`/`DENY *`
 /// drain *every* parked request, replying one `answered host=<host>` line each then `ok` (the
-/// `session` token remembers each); `RULES` returns the session's manual rules
+/// `session` token remembers each); `REMEMBER ALLOW|DENY <rule>` loads a proactive `--session` rule
+/// into the overlay (`ok`, or `err bad-request` for an unclassifiable/absent rule), which the proxy
+/// folds into its effective policy; `RULES` returns the session's manual rules
 /// (`manual allow|deny <rule>` lines) then `ok`. `LOG` returns the recent egress events (a `dropped=`
 /// line when a `--follow` cursor fell behind the ring, a `head=` cursor, then one `event …` line
 /// each) then `ok`; `LOG after=<seq>` returns only events past that cursor. `path` is emitted last on
@@ -609,11 +607,32 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
                 None => "err not-found\n".to_string(),
             }
         }
+        Some("REMEMBER") => {
+            // `REMEMBER ALLOW|DENY <rule>` loads a proactive `--session` rule. The rule is the
+            // remainder of the line taken **verbatim** (not whitespace-split): an egress rule can be a
+            // `re:` regex carrying spaces. Re-validated here through the same classifier the config
+            // resolver uses, so a malformed rule the CLI somehow let through cannot enter the overlay.
+            let body = cmd["REMEMBER".len()..].trim_start();
+            let (verdict, rule_text) = if let Some(r) = body.strip_prefix("ALLOW ") {
+                (Verdict::Allow, r.trim())
+            } else if let Some(r) = body.strip_prefix("DENY ") {
+                (Verdict::Deny, r.trim())
+            } else {
+                return "err bad-request\n".to_string();
+            };
+            match crate::allowlist::classify(rule_text) {
+                Ok(rule) => {
+                    manual.remember_rule(verdict, rule);
+                    "ok\n".to_string()
+                }
+                Err(_) => "err bad-request\n".to_string(),
+            }
+        }
         Some("RULES") => {
             let (allow, deny) = manual.snapshot();
             let mut out = String::new();
-            // A manual rule is always an exact `host:port`, so its display carries no whitespace —
-            // the client takes everything after `manual allow `/`manual deny ` as the rule text.
+            // The rule text is emitted after the `manual allow `/`manual deny ` prefix; the reader
+            // takes the whole remainder, so a rule carrying whitespace (a `re:` regex) round-trips.
             for rule in allow {
                 out.push_str(&format!("manual allow {rule}\n"));
             }
@@ -1050,6 +1069,42 @@ pub(crate) struct ManualRuleRow {
     pub(crate) rule: String,
 }
 
+/// The outcome of loading a proactive `--session` rule into one session's overlay.
+pub(crate) enum InjectOutcome {
+    /// The rule was loaded into the live overlay — the proxy folds it into its effective policy, so
+    /// it decides the matching request from now on.
+    Loaded,
+    /// The server refused it (a rule it could not classify, or a control server too old to know
+    /// `REMEMBER`) — reported so the caller does not present it as loaded.
+    Refused,
+}
+
+/// Load a proactive egress `rule` into one session's live manual overlay (`REMEMBER ALLOW|DENY
+/// <rule>`) — the `ops net allow|deny <rule> --session` path. A connect error (the session is gone,
+/// or a stale socket) propagates so the caller skips that session.
+pub(crate) fn inject_rule(
+    data_dir: &Path,
+    pid: u32,
+    verdict: Verdict,
+    rule: &str,
+) -> io::Result<InjectOutcome> {
+    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let verb = match verdict {
+        Verdict::Allow => "ALLOW",
+        Verdict::Deny => "DENY",
+    };
+    (&stream).write_all(format!("REMEMBER {verb} {rule}\n").as_bytes())?;
+    (&stream).flush()?;
+    let mut response = String::new();
+    BufReader::new((&stream).take(REPLY_MAX)).read_line(&mut response)?;
+    Ok(match response.trim() {
+        "ok" => InjectOutcome::Loaded,
+        _ => InjectOutcome::Refused,
+    })
+}
+
 /// Query a session's live manual rules (`RULES`) — the runtime rules added by `--session` answers.
 /// A connect error (the session is gone) propagates so the caller can skip it.
 pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRuleRow>> {
@@ -1064,8 +1119,8 @@ pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRu
         if line == "ok" {
             break;
         }
-        // The rule text is everything after the kind prefix — it carries no whitespace (an exact
-        // `host:port`), but taking the remainder is robust regardless.
+        // The rule text is everything after the kind prefix — taken as the whole remainder, so a
+        // rule carrying whitespace (a `re:` regex loaded with `--session`) round-trips intact.
         if let Some(rule) = line.strip_prefix("manual allow ") {
             rules.push(ManualRuleRow {
                 is_allow: true,
@@ -1214,29 +1269,42 @@ mod tests {
     }
 
     #[test]
-    fn manual_rules_remember_decide_and_dedup_by_host_port() {
+    fn manual_rules_store_remembered_and_proactive_rules_deduped() {
+        // The overlay is a rule store; the proxy folds `snapshot()` into its effective policy, so the
+        // *decision* semantics (deny-wins, allow-opens, SSRF breadth) are proven there. Here we pin
+        // only the store contract: an ask answer records an exact host:port, a `--session` load
+        // records an arbitrary rule, each in the right list, deduped, and `is_empty` tracks it.
         let m = ManualRules::new();
-        // Nothing remembered → no decision (the request still parks).
-        assert_eq!(m.decide("api.test", 443, "/"), None);
+        assert!(m.is_empty());
 
-        // Remember an allow for a non-standard port (the very reason the request asked).
+        // An ask answer records the exact host:port on the right list.
         m.remember(Verdict::Allow, "api.test", 8080);
-        // The exact `host:port` is decided allow...
-        assert_eq!(m.decide("api.test", 8080, "/x"), Some(true));
-        // ...but a DIFFERENT port to the same host is not — no widening (the `classify` trap the
-        // advisor flagged: a host-only remember would re-ask `:8080`, or over-trust `:443`).
-        assert_eq!(m.decide("api.test", 443, "/x"), None);
+        assert!(!m.is_empty());
+        assert_eq!(
+            m.snapshot().0,
+            vec![crate::allowlist::host_port_rule("api.test", 8080)]
+        );
 
-        // A deny is remembered and wins for its own host:port.
-        m.remember(Verdict::Deny, "evil.test", 443);
-        assert_eq!(m.decide("evil.test", 443, "/"), Some(false));
+        // A proactive `--session` load records an arbitrary (wildcard) rule.
+        let wildcard = crate::allowlist::classify("*.internal.test").unwrap();
+        m.remember_rule(Verdict::Allow, wildcard.clone());
+        let (allow, deny) = m.snapshot();
+        assert!(allow.contains(&wildcard) && deny.is_empty());
 
-        // Dedup: re-answering the same host:port does not stack duplicates.
+        // A deny goes on the deny list.
+        m.remember_rule(
+            Verdict::Deny,
+            crate::allowlist::classify("bad.internal.test").unwrap(),
+        );
+        assert_eq!(m.snapshot().1.len(), 1);
+
+        // Dedup: re-loading the same rule does not stack.
         m.remember(Verdict::Allow, "api.test", 8080);
+        m.remember_rule(Verdict::Allow, wildcard);
         assert_eq!(
             m.snapshot().0.len(),
-            1,
-            "a re-answered host:port is not duplicated"
+            2,
+            "a re-loaded rule is not duplicated"
         );
     }
 
@@ -1271,6 +1339,65 @@ mod tests {
         assert!(
             dispatch("RULES", &state, &manual, &log).contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
+        );
+    }
+
+    #[test]
+    fn dispatch_remember_loads_a_rule_into_the_overlay() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+
+        // `REMEMBER ALLOW <rule>` loads an arbitrary (here wildcard) rule into the overlay and
+        // `RULES` reports it — the proactive `--session` path. It is accepted in any posture (the
+        // proxy folds the overlay into its effective policy for every filtering posture).
+        assert_eq!(
+            dispatch("REMEMBER ALLOW *.foo.test", &state, &manual, &log),
+            "ok\n"
+        );
+        assert!(
+            dispatch("RULES", &state, &manual, &log).contains("manual allow https://*.foo.test"),
+            "REMEMBER must load the rule"
+        );
+
+        // A malformed rule (a `*` catch-all) and a missing kind/rule are `err bad-request`.
+        assert_eq!(
+            dispatch("REMEMBER ALLOW *", &state, &manual, &log),
+            "err bad-request\n"
+        );
+        assert_eq!(
+            dispatch("REMEMBER ALLOW", &state, &manual, &log),
+            "err bad-request\n"
+        );
+    }
+
+    #[test]
+    fn inject_rule_round_trips_over_the_control_socket() {
+        // The proactive-`--session` integration seam: `inject_rule` (client) against a real `serve`
+        // (server) over a bound socket, so the `REMEMBER` wire format is exercised end to end.
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 24680u32;
+        let sock = control_socket(data.path(), pid);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let served_manual = manual.clone();
+        thread::spawn(move || {
+            let _ = serve(listener, pending, served_manual, log);
+        });
+
+        // A loaded rule reports `Loaded` and lands in the overlay the proxy folds into its policy.
+        assert!(matches!(
+            inject_rule(data.path(), pid, Verdict::Allow, "*.svc.test").unwrap(),
+            InjectOutcome::Loaded
+        ));
+        let (allow, _) = manual.snapshot();
+        assert_eq!(
+            allow,
+            vec![crate::allowlist::classify("*.svc.test").unwrap()]
         );
     }
 

@@ -204,31 +204,28 @@ pub(crate) fn start(
         None
     };
 
-    // Read the posture before the policy moves into the proxy context: only `ask` needs the pending
-    // queue wired into the proxy (to park), but every proxy posture stands the control socket up now
-    // — it also serves the live egress log (`ops net log`), which filtering-posture sessions want too.
-    let asks = policy.default_action() == crate::allowlist::DefaultAction::Ask;
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
         .with_redactions(redactions)
         .with_app(app.map(str::to_string));
 
-    // Stand up the control socket the host-side `ops net pending`/`ops net log` reach. It lives under
-    // the `0700` egress dir beside `<data>` and is **never** bound into the cage (only the proxy
-    // socket and the CA cross in) — in Mode B the in-cage agent must not answer its own asks or read
-    // its own log. One pending queue + manual-rule overlay + event ring are shared between the proxy
-    // and the control thread: the proxy parks into the queue / pushes into the ring, the control
-    // thread answers and reads them. The pending queue is wired into the proxy only under `ask` (no
-    // other posture parks); the ring is always wired, so every proxy session has a live log.
+    // Stand up the control socket the host-side `ops net pending`/`ops net log`/`ops net allow
+    // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
+    // into the cage (only the proxy socket and the CA cross in) — in Mode B the in-cage agent must not
+    // answer its own asks, read its own log, or load its own rules. One pending queue + manual-rule
+    // overlay + event ring are shared between the proxy and the control thread. The overlay is wired
+    // into the proxy for **every** filtering posture (not only `ask`): the proxy folds it into its
+    // effective policy per request, so `ops net allow|deny --session` takes effect on an allowlist or
+    // denylist session too, not just `ask`. Only `ask` ever parks into the pending queue, but wiring
+    // it unconditionally is harmless (a non-ask posture never parks), and the ring is always wired so
+    // every proxy session has a live log.
     let control_uds = {
         let control_uds = dir.join(format!("control-{pid}.sock"));
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
         let log = Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP));
-        if asks {
-            ctx = ctx.with_control(pending.clone(), manual.clone());
-        }
+        ctx = ctx.with_control(pending.clone(), manual.clone());
         ctx = ctx.with_log(log.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `ops net pending`/`ops net log`.

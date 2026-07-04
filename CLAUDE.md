@@ -95,6 +95,42 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Proactive `ops net allow|deny <rule> --session` + the effective-policy pivot (DONE 2026-07-05)**
+  (`src/sandbox/{control.rs,proxy.rs,egress.rs}` + `src/{main,help}.rs` + `docs/guide/networking/
+  {ask,rules}.md` + `cli/net.md` + `tests/net.rs`): a `--session` egress rule can now be **loaded into
+  a running session's live overlay** proactively — `ops net allow http://host --session [-a <app>]
+  [--all]` — the forward sibling of `ops net pending allow <id> --session` (which decides a request that
+  *already* parked). The load-bearing fix is a **design pivot**: the manual overlay is **folded into the
+  proxy's effective policy per request** (`proxy::effective_policy` = config `allow/deny` ∪ overlay
+  `allow/deny`, carrying `default_action`/`ask_timeout`/`ask_notice`, borrowing `ctx.policy` when the
+  overlay is empty), consulted at **all three enforcement sites** (`explain` CONNECT · `explain_clear`
+  `http://` cleartext · `l4_decision` `tcp://` splice) — so a `--session` rule takes effect in **every**
+  filtering posture (allowlist `deny`, denylist `allow`, and `ask`), not only `ask`. This closes the real
+  gap the user hit: their agents run **allowlist**, where the old ask-only overlay did nothing. Precedence
+  is **deny-wins, free from `explain`**: a `--session deny` cuts a config-allowed host, while a config
+  **explicit** deny stays authoritative over a `--session allow` (a live allow only opens a *default*-
+  denied host — the exact `http://google.fr`-not-in-allowlist case). SSRF is auto-correct: the deciding
+  rule is the actually-matched effective rule, so a broad `--session allow *.dom` does **not** unlock a
+  private IP (wildcard ≠ exact host) while an exact host:port does (the deliberate "approve an internal
+  target"). The pivot **removes** the old separate-overlay path (`ManualVerdict`/`ManualRules::decide`
+  gone; `remember`/`remember_rule`/`snapshot`/`is_empty` stay as storage). Control gains a `REMEMBER
+  ALLOW|DENY <rule>` verb (rule verbatim via `splitn`, re-`classify`d server-side; `CMD_MAX`→8K) + client
+  `inject_rule`; `--session` writes **no config** (so no re-trust — the reason it is overlay-only, never
+  additive to a config write) and is scoped current-project / `-a <app>` / `--all` (mirrors `pending
+  --all`). `egress.rs` now wires the overlay for **every** filtering posture (`with_control` unconditional;
+  `notices` stays inert off-`ask` — it is read only in the park closure). **`ops net rules --source session
+  -a <app>`** now filters the live listing to that app's sessions (was refused — closing the load-vs-list
+  asymmetry). **Reason-shift to know:** a remembered/`--session` **deny** now surfaces `denied-by-rule`
+  (a deny rule in the effective policy), not `asked-denied`; `asked-denied` is kept for the ask
+  park-**timeout** path. **LIVE-PROVEN (the definitive proof, the user's exact scenario):** a running
+  allowlist cage looping `curl http://example.com` flipped **403 → 200** the instant `ops net allow
+  http://example.com --session` was injected — no relaunch, no config write — and the same on a real `ops
+  app` session with `-a`. ~860 unit + config 80 + **net 54** + help 14 + the 3 egress launch e2e green,
+  fmt/clippy `-D warnings` clean, **std-only** (reuses `Cow`/`RwLock`). Advisor-reviewed (plan AND impl —
+  the impl review's five gotchas all closed: `Methods::Unspecified` admits every verb so an unscoped
+  overlay allow opens GET **and** POST; `effective_policy` carries the ask fields; the park path + its
+  exact-host deciding rule preserved; all three sites **and** the splice SSRF threaded; the reason-shift
+  with the two tests updated).
   **Egress `http://` scheme — inspected cleartext (DONE 2026-07-04)** (`src/allowlist.rs` +
   `src/sandbox/proxy.rs` + `config/mod.rs` + `main.rs` + `help.rs` + `tests/run.rs` +
   `docs/guide/networking/rules.md` + `configuration/network.md`): the egress grammar closed its one

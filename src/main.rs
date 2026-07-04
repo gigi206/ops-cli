@@ -4838,17 +4838,6 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         }
     }
 
-    // `--app` folds a declared config overlay; `--source session` lists live session rules that no
-    // config produces — orthogonal, so the combination is refused rather than silently ignored
-    // (mirroring how `ops config show` rejects `--app` alongside a source flag).
-    if app.is_some() && source == Some(RuleSourceView::Manual) {
-        eprintln!(
-            "ops: net rules: `--app` does not combine with `--source session` \
-             (session rules are live runtime state, not a config overlay)"
-        );
-        return ExitCode::from(2);
-    }
-
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -4856,10 +4845,13 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // `--source session` is live runtime state, not config: query this project's ask sessions for
-    // the rules they remembered from `--session` answers, rather than reading the static config policy.
-    if source == Some(config::view::RuleSourceView::Manual) {
-        return net_rules_manual(&cwd, filter.as_deref(), json);
+    // `--source session` is live runtime state, not config: query the running sessions for the rules
+    // loaded into their live overlay, rather than reading the static config policy. Scoped to this
+    // project by default, or — with `-a <app>` — to that app's session(s), mirroring how
+    // `ops net allow --session -a <app>` scopes the load (`--app` here filters *which sessions* to
+    // query, it does not fold a config overlay the way it does for the config/builtin sources).
+    if source == Some(RuleSourceView::Manual) {
+        return net_rules_manual(&cwd, app.as_deref(), filter.as_deref(), json);
     }
 
     let mut resolved = config::load(&cwd);
@@ -5302,12 +5294,14 @@ fn render_net_groups(
     o
 }
 
-/// `ops net rules --source session`: the live session rules this project's ask sessions remembered
-/// from `--session` answers. These live in the sessions' memory (not config) and are gone when the
-/// sessions end. Cross-references the registry to find the sessions for this project (by the
+/// `ops net rules --source session`: the live overlay rules this project's running sessions carry —
+/// loaded with `ops net allow|deny --session` or remembered from a `ops net pending … --session`
+/// answer. These live in the sessions' memory (not config) and are gone when the sessions end. The
+/// proxy folds them into its effective policy, so they apply in any filtering posture, not only
+/// `ask`. Cross-references the registry to find the sessions for this project (by the
 /// canonical project root the registry keys on), queries each one's control socket, and lists the
 /// merged, deduped rules. No config read, no launch, no nix.
-fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
+fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: bool) -> ExitCode {
     use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
@@ -5316,14 +5310,27 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The sessions are keyed by the canonical project root (the registry stores canonical paths);
-    // fall back to the cwd as-is if it cannot be canonicalized.
-    let project = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let pids: Vec<u32> = pending_session_context(&data_dir)
-        .into_iter()
-        .filter(|(_, proj, _)| *proj == project)
-        .map(|(pid, _, _)| pid)
-        .collect();
+    // Which sessions to query: `-a <app>` selects that app's session(s) (from the registry, across
+    // projects — an app's live rules are the same wherever it runs); otherwise this project's
+    // sessions, keyed by the canonical project root (the registry stores canonical paths; fall back
+    // to the cwd as-is if it cannot be canonicalized).
+    let (pids, scope): (Vec<u32>, String) = match app {
+        Some(name) => (
+            session_pids_for_app(&data_dir, name).into_iter().collect(),
+            format!(" (app: {name})"),
+        ),
+        None => {
+            let project = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            (
+                pending_session_context(&data_dir)
+                    .into_iter()
+                    .filter(|(_, proj, _)| *proj == project)
+                    .map(|(pid, _, _)| pid)
+                    .collect(),
+                String::new(),
+            )
+        }
+    };
 
     // Merge + dedup the manual rules across this project's sessions.
     let mut rules: Vec<NetRuleView> = Vec::new();
@@ -5367,7 +5374,10 @@ fn net_rules_manual(cwd: &Path, filter: Option<&str>, json: bool) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_net_rules("session", "", &shown, total, &pal));
+    print!(
+        "{}",
+        render_net_rules("session", &scope, &shown, total, &pal)
+    );
     ExitCode::SUCCESS
 }
 
@@ -5419,10 +5429,16 @@ fn render_net_rules(
         // The live session-rule listing (`--source session`): runtime rules from `--session`
         // answers, not config — framed as such so they are not mistaken for the static policy.
         "session" => {
+            // `scope` is ` (app: <name>)` when `-a` narrowed the query, else empty (this project).
+            let where_ = if scope.is_empty() {
+                "this project's running sessions".to_string()
+            } else {
+                format!("that app's running sessions{scope}")
+            };
             let _ = writeln!(
                 o,
-                "{h}session egress rules{r} {dim}— live, from `ops net pending … --session` answers \
-                 in this project's ask sessions (gone when they end){r}"
+                "{h}session egress rules{r} {dim}— live, loaded with `ops net allow|deny --session` \
+                 (or a `ops net pending … --session` answer) into {where_} (gone when they end){r}"
             );
         }
         _ => {
@@ -5481,7 +5497,17 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         manage::EgressList::Deny => "deny",
     };
 
-    let parsed = match split_scope(args) {
+    // `--session` (load the rule into the live overlay of the running session(s) instead of a config
+    // file) and its `--all` scope widener are extracted before `split_scope`, which rejects any flag
+    // it does not know; the config-scope flags (`--local`/`--global`/`-c`) and `-a` ride it.
+    let session = args.iter().any(|a| a.to_str() == Some("--session"));
+    let all = args.iter().any(|a| a.to_str() == Some("--all"));
+    let rest: Vec<OsString> = args
+        .iter()
+        .filter(|a| !matches!(a.to_str(), Some("--session") | Some("--all")))
+        .cloned()
+        .collect();
+    let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("ops: {e}");
@@ -5505,13 +5531,15 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             return ExitCode::from(2);
         }
     }
-    // Validate the rule before touching any file (fail-closed). A `@<name>` group reference is an
-    // alias for a `[net.groups]` group, expanded at load time — not itself a classifiable rule — so
-    // it is validated as a group name rather than through `classify` (which would reject the `@`). An
-    // undefined reference is not a write-time error (the group may be defined later); it warns loudly
-    // on the next load. Any other entry is classified: a `*` catch-all, a scheme, or an uncompilable
-    // regex is refused, the same classification the config resolver applies.
-    if let Some(group) = rule.trim().strip_prefix('@') {
+    // Validate the rule before touching any file or session (fail-closed). A `@<name>` group reference
+    // is an alias for a `[net.groups]` group, expanded at load time — not itself a classifiable rule —
+    // so it is validated as a group name rather than through `classify` (which would reject the `@`).
+    // An undefined reference is not a write-time error (the group may be defined later); it warns
+    // loudly on the next load. Any other entry is classified: a `*` catch-all, a scheme, or an
+    // uncompilable regex is refused, the same classification the config resolver applies.
+    let is_group = rule.trim().starts_with('@');
+    if is_group {
+        let group = rule.trim().strip_prefix('@').unwrap_or_default();
         if !config::is_valid_group_name(group) {
             eprintln!(
                 "ops: invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
@@ -5520,6 +5548,44 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         }
     } else if let Err(e) = allowlist::classify(&rule) {
         eprintln!("ops: invalid rule {rule:?}: {e}");
+        return ExitCode::from(2);
+    }
+
+    if session {
+        // `--session` writes no config file, so the file-scope flags do not apply — point at the
+        // session-scope flags instead of silently ignoring a `--global` the user expected to matter.
+        if parsed.scope_explicit {
+            eprintln!(
+                "ops: --session loads a live rule and writes no file, so --local/--global/-c do not \
+                 apply — use -a <app> or --all to scope the session(s)"
+            );
+            return ExitCode::from(2);
+        }
+        // A `@group` is expanded from the config at launch; the live overlay has no group vocabulary,
+        // so it cannot carry one. Point at the two ways to use a group.
+        if is_group {
+            eprintln!(
+                "ops: --session cannot load a @group (a group is expanded from the config at launch) \
+                 — pass the concrete rules, or add the group to the config without --session"
+            );
+            return ExitCode::from(2);
+        }
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ops: cannot read the current directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return net_inject_session(list, &rule, all, parsed.app.as_deref(), &cwd);
+    }
+
+    // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
+    if all {
+        eprintln!(
+            "ops: --all only applies with --session (it widens a live rule to every session); a config \
+             write targets one file — drop --all"
+        );
         return ExitCode::from(2);
     }
 
@@ -5542,6 +5608,152 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             ExitCode::from(code)
         }
     }
+}
+
+/// `ops net allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
+/// the running session(s) instead of a config file — the proactive sibling of `ops net pending
+/// allow|deny <id> --session`, which remembers a decision for a request that already parked. It writes
+/// no file (so it never re-trusts a project the way a config write does) and the rule dies with the
+/// session. Scope: by default the **current project's** sessions; `-a <app>` narrows to that app's;
+/// `--all` widens to every reachable session. Only an `ask`-posture session consults the overlay, so a
+/// filtering-posture session reports the load as skipped (`err not-ask`) rather than a silent no-op.
+fn net_inject_session(
+    list: config::manage::EgressList,
+    rule: &str,
+    all: bool,
+    app: Option<&str>,
+    cwd: &Path,
+) -> ExitCode {
+    use config::manage::EgressList;
+    let (verdict, verb) = match list {
+        EgressList::Allow => (sandbox::control::Verdict::Allow, "allow"),
+        EgressList::Deny => (sandbox::control::Verdict::Deny, "deny"),
+    };
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Two composing pid filters: the project (unless `--all` widens machine-wide) and the app (`-a`).
+    // A session must pass every active filter to receive the rule.
+    let project_pids = if all {
+        None
+    } else {
+        let canonical = match sandbox::project_identity(cwd) {
+            Ok((_, c)) => c,
+            Err(e) => {
+                eprintln!("ops: cannot resolve the current project directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        Some(session_pids_for_project(&data_dir, &canonical))
+    };
+    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
+
+    let context = pending_session_context(&data_dir);
+    let mut loaded: Vec<u32> = Vec::new();
+    let mut refused: Vec<u32> = Vec::new();
+    for pid in sandbox::control::session_pids(&data_dir) {
+        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        match sandbox::control::inject_rule(&data_dir, pid, verdict, rule) {
+            Ok(sandbox::control::InjectOutcome::Loaded) => loaded.push(pid),
+            Ok(sandbox::control::InjectOutcome::Refused) => refused.push(pid),
+            // A dead/stale socket (the session went away) — skip it.
+            Err(_) => {}
+        }
+    }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!(
+        "{}",
+        render_inject(verb, rule, all, app, &loaded, &refused, &context, &pal)
+    );
+    ExitCode::SUCCESS
+}
+
+/// Render a `--session` rule load: which live sessions took the rule (with their agent/project
+/// context, so a cross-agent reach is visible) and which an older server refused. When no session in
+/// scope took it, it says so and points at the config write as the persistent alternative. A pure
+/// presenter — its palette comes from the caller.
+#[allow(clippy::too_many_arguments)]
+fn render_inject(
+    verb: &str,
+    rule: &str,
+    all: bool,
+    app: Option<&str>,
+    loaded: &[u32],
+    refused: &[u32],
+    context: &[(u32, PathBuf, String)],
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (h, dim, warn, r) = (pal.head, pal.dim, pal.warn, pal.reset);
+    let mut o = String::new();
+    if !loaded.is_empty() {
+        let _ = writeln!(
+            o,
+            "{h}loaded {verb} rule `{rule}` into {} live session(s):{r}",
+            loaded.len()
+        );
+        for pid in loaded {
+            match context.iter().find(|(p, _, _)| p == pid) {
+                Some((_, project, label)) => {
+                    let _ = writeln!(o, "  {dim}session {pid} [{label}] {}{r}", project.display());
+                }
+                None => {
+                    let _ = writeln!(o, "  {dim}session {pid} (unregistered){r}");
+                }
+            }
+        }
+        // The rule is live-only, never written to config — so plain `ops net rules` (the config
+        // policy) will not show it. Point at where it *is* visible.
+        let _ = writeln!(
+            o,
+            "  {dim}see it with `ops net rules --source session` (it is not in the config){r}"
+        );
+    }
+    if !refused.is_empty() {
+        let pids = refused
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            o,
+            "{warn}session(s) {pids} refused the rule (an older ops without --session rule \
+             support).{r}"
+        );
+    }
+    // Nothing took the rule: no session with egress filtering is running in scope. Point at the
+    // persistent path (which pre-decides the host for the next launch), carrying the `--app <name>`
+    // scope when one was given so the hint is copy-pasteable.
+    if loaded.is_empty() {
+        if refused.is_empty() {
+            let scope = match (app, all) {
+                (Some(a), _) => format!("app `{a}`"),
+                (None, true) => "any session".to_string(),
+                (None, false) => "this project".to_string(),
+            };
+            let _ = writeln!(
+                o,
+                "{dim}no reachable session with egress filtering for {scope} — nothing to load the \
+                 rule into.{r}"
+            );
+        }
+        let app_flag = app.map(|a| format!(" --app {a}")).unwrap_or_default();
+        let _ = writeln!(
+            o,
+            "  {dim}to pre-decide it for the next launch, persist it: ops net {verb} \
+             {rule}{app_flag}{r}"
+        );
+    }
+    o
 }
 
 /// Pre-flight the trust gate for a `--local` save at `cwd`, *before* any irreversible action (a bulk

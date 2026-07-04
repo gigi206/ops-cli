@@ -1980,12 +1980,14 @@ fn net_rules_targets_an_app_effective_policy() {
         "an unknown app must error"
     );
 
-    // `--app` does not combine with `--source session` (session rules are live runtime, not config).
-    let clash = fx.run(&["net", "rules", "--app", "demo", "--source", "session"]);
-    assert_eq!(clash.status.code(), Some(2));
+    // `--app` combines with `--source session`: it filters the live query to that app's session(s)
+    // (not a config overlay). With no running sessions it is a clean, empty, app-scoped listing.
+    let scoped = fx.run(&["net", "rules", "--app", "demo", "--source", "session"]);
+    assert!(scoped.status.success(), "--app + --source session is valid");
     assert!(
-        String::from_utf8_lossy(&clash.stderr).contains("does not combine"),
-        "--app + --source session must be refused"
+        String::from_utf8_lossy(&scoped.stdout).contains("app: demo"),
+        "the session listing must name the app scope: {}",
+        String::from_utf8_lossy(&scoped.stdout)
     );
 }
 
@@ -2204,5 +2206,55 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
     assert!(
         String::from_utf8_lossy(&write_post.stdout).contains("ALLOWED"),
         "POST to the {{*}} write host is allowed"
+    );
+}
+
+// `--session` loads a rule into a running session's live overlay instead of a config file. These
+// exercise the host-side argument handling and the no-session path (no live cage needed); the
+// overlay decision itself is proven by the proxy/control unit tests. All fail-closed cases stay
+// exit 2 with a pointed message; the no-session case is a clean exit 0 with a persist hint.
+#[test]
+fn net_allow_session_validates_flags_and_reports_when_no_session_is_reachable() {
+    let fx = Fixture::new();
+
+    // A config-scope flag has no meaning with `--session` (it writes no file) → refused, pointing at
+    // the session-scope flags.
+    let out = fx.run(&["net", "allow", "github.com", "--session", "--global"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--session") && err.contains("--local/--global/-c do not apply"),
+        "a config scope with --session must be refused: {err}"
+    );
+
+    // A `@group` is a config-load concept; the live overlay has no group vocabulary → refused.
+    let out = fx.run(&["net", "allow", "@ci", "--session"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot load a @group"),
+        "a @group with --session must be refused"
+    );
+
+    // `--all` widens the session scope, so it is meaningless for a config write → refused.
+    let out = fx.run(&["net", "allow", "github.com", "--all"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only applies with --session"),
+        "--all without --session must be refused"
+    );
+
+    // With no live ask-mode session, a `--session` load is a clean no-op (exit 0) that says so for
+    // the scope and points at the persistent alternative — it must NOT write the config.
+    let out = fx.run(&["net", "allow", "github.com", "--session"]);
+    assert!(out.status.success(), "a no-session load is a clean success");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no reachable session with egress filtering for this project")
+            && stdout.contains("ops net allow github.com"),
+        "the no-session load must explain and point at the config write: {stdout}"
+    );
+    assert!(
+        !fx.proj.path().join(".ops.toml").exists(),
+        "a --session load must not write the project config"
     );
 }

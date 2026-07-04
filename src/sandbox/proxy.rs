@@ -796,6 +796,33 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
         .with_ask_notice(user.ask_notice())
 }
 
+/// The policy the proxy evaluates for a request: the immutable config policy, or — when a live
+/// `--session` overlay is present — that policy with the overlay's allow/deny rules folded in. The
+/// fold reuses the full policy machinery (deny-wins, layer partitioning, path/method matching), so a
+/// `--session` rule is enforced identically to a config rule, in **every** filtering posture
+/// (allowlist, denylist, `ask`) and at every enforcement layer (inspected TLS, inspected cleartext,
+/// raw splice) — not only when a request would otherwise park. The common case (an empty overlay)
+/// borrows the config policy with no allocation.
+fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
+    if ctx.manual.is_empty() {
+        return std::borrow::Cow::Borrowed(&ctx.policy);
+    }
+    let (overlay_allow, overlay_deny) = ctx.manual.snapshot();
+    let mut allow = ctx.policy.allow_rules().to_vec();
+    allow.extend(overlay_allow);
+    let mut deny = ctx.policy.deny_rules().to_vec();
+    deny.extend(overlay_deny);
+    // Carry default_action + ask_timeout + ask_notice through unchanged — a pure allow/deny merge
+    // would silently flip the posture (lose the timeout, or demote deny↔ask), the same contract
+    // `union_with_builtin` keeps.
+    std::borrow::Cow::Owned(
+        EgressPolicy::new(allow, deny)
+            .with_default(ctx.policy.default_action())
+            .with_ask_timeout(ctx.policy.ask_timeout())
+            .with_ask_notice(ctx.policy.ask_notice()),
+    )
+}
+
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
 /// connection. Each accepted stream gets the per-socket timeouts before it is handled, so a slow
 /// or hung peer cannot pin a thread forever.
@@ -934,8 +961,11 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     allow rule splices the connection raw — no TLS termination, no inspection — so this is
     //     decided before the IP-literal refusal (a raw splice needs no SNI, so an IP-literal target
     //     is fine for it). Anything else (the common case) falls through to the inspected L7 path.
-    if let L4Decision::Splice(rule) = ctx.policy.l4_decision(&connect_host, port) {
-        return splice_l4(client, &connect_host, port, rule, ctx);
+    {
+        let policy = effective_policy(ctx);
+        if let L4Decision::Splice(rule) = policy.l4_decision(&connect_host, port) {
+            return splice_l4(client, &connect_host, port, rule, ctx);
+        }
     }
 
     // An IP-literal target carries no SNI to bind the minted leaf to, so the inspected L7 path
@@ -1121,9 +1151,12 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     }
 
     // 5. The verdict — built through the SAME canonicalizer `ops test net` uses, so enforcement
-    //    cannot drift from the tester's prediction. The two denial shapes get distinct reasons so
-    //    the agent can tell "no rule allowed this" from "a deny rule blocked it".
-    let deciding: Option<Rule> = match ctx.policy.explain(&connect_host, port, &itarget, &imethod) {
+    //    cannot drift from the tester's prediction. Evaluated against the effective policy (config +
+    //    any live `--session` overlay), so a `--session allow` opens an otherwise-default-denied host
+    //    and a `--session deny` blocks a config-allowed one (deny wins). The two denial shapes get
+    //    distinct reasons so the agent can tell "no rule allowed this" from "a deny rule blocked it".
+    let policy = effective_policy(ctx);
+    let deciding: Option<Rule> = match policy.explain(&connect_host, port, &itarget, &imethod) {
         Decision::AllowedBy(rule) => Some(rule.clone()),
         // Allow-by-default (denylist mode): no rule named this host, so there is no deciding
         // rule. The SSRF guard below then treats it as unnamed (private addresses refused).
@@ -1150,9 +1183,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             // the request's verb, say so, so the agent can tell a method-scoped deny apart. The
             // reason is decided *before* the outcome is recorded, so the log carries the precise
             // category (`denied-method`/`denied-default`), not a coarse one.
-            let method_denied = ctx
-                .policy
-                .method_denied(&connect_host, port, &itarget, &imethod);
+            let method_denied = policy.method_denied(&connect_host, port, &itarget, &imethod);
             let reason = if method_denied {
                 "denied-method"
             } else {
@@ -1192,77 +1223,55 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 ),
             );
         }
-        // Ask-by-default: no config rule decided. First consult the live manual overlay (decisions
-        // a prior `--session` answer remembered) — a remembered allow/deny short-circuits the park,
-        // so the same request is not asked twice. Only if nothing is remembered does the request
-        // park and block until a host-side `ops net pending` answers it or the timeout elapses (deny
-        // — fail-closed). An allow (remembered or fresh) names this exact host:port as the deciding
-        // rule so the SSRF guard permits a deliberately-approved internal target.
-        Decision::Ask => match ctx.manual.decide(&connect_host, port, &itarget) {
-            Some(true) => Some(allowlist::host_port_rule(&connect_host, port)),
-            Some(false) => {
-                ctx.outcome(
-                    &connect_host,
-                    port,
-                    Some(&imethod),
-                    Some(&itarget),
-                    StatKind::Deny,
-                    "asked-denied",
-                );
-                return respond_refusal_tls(
-                    &mut br,
-                    "403 Forbidden",
-                    "asked-denied",
-                    "this host:port was denied by a live `ops net pending deny --session` \
-                         decision",
-                );
-            }
-            None => {
-                let verdict = ctx.pending.park(
-                    &connect_host,
-                    port,
-                    &itarget,
-                    ctx.policy.ask_timeout(),
-                    ASK_PENDING_CAP,
-                    |seq| {
-                        if ctx.notices {
-                            let id = super::control::format_id(std::process::id(), seq);
-                            print_egress_notice(
-                                &format!(
-                                    "egress decision needed [{id}] {connect_host}:{port}{itarget}"
-                                ),
-                                &[
-                                    ("allow", &format!("ops net pending allow {id}")),
-                                    ("deny", &format!("ops net pending deny {id}")),
-                                ],
-                            );
-                        }
-                    },
-                );
-                match verdict {
-                    super::control::Verdict::Allow => {
-                        Some(allowlist::host_port_rule(&connect_host, port))
-                    }
-                    super::control::Verdict::Deny => {
-                        ctx.outcome(
-                            &connect_host,
-                            port,
-                            Some(&imethod),
-                            Some(&itarget),
-                            StatKind::Deny,
-                            "asked-denied",
-                        );
-                        return respond_refusal_tls(
-                            &mut br,
-                            "403 Forbidden",
-                            "asked-denied",
-                            "this request was denied by a live decision or the ask timeout \
-                                 elapsed",
+        // Ask-by-default: no rule in the effective policy decided (a `--session` overlay rule would
+        // have folded into it and returned Allowed/Denied above, so reaching here means the host is
+        // genuinely undecided). Park and block until a host-side `ops net pending` answers it or the
+        // timeout elapses (deny — fail-closed). A fresh allow names this exact host:port as the
+        // deciding rule so the SSRF guard permits a deliberately-approved internal target.
+        Decision::Ask => {
+            let verdict = ctx.pending.park(
+                &connect_host,
+                port,
+                &itarget,
+                policy.ask_timeout(),
+                ASK_PENDING_CAP,
+                |seq| {
+                    if ctx.notices {
+                        let id = super::control::format_id(std::process::id(), seq);
+                        print_egress_notice(
+                            &format!(
+                                "egress decision needed [{id}] {connect_host}:{port}{itarget}"
+                            ),
+                            &[
+                                ("allow", &format!("ops net pending allow {id}")),
+                                ("deny", &format!("ops net pending deny {id}")),
+                            ],
                         );
                     }
+                },
+            );
+            match verdict {
+                super::control::Verdict::Allow => {
+                    Some(allowlist::host_port_rule(&connect_host, port))
+                }
+                super::control::Verdict::Deny => {
+                    ctx.outcome(
+                        &connect_host,
+                        port,
+                        Some(&imethod),
+                        Some(&itarget),
+                        StatKind::Deny,
+                        "asked-denied",
+                    );
+                    return respond_refusal_tls(
+                        &mut br,
+                        "403 Forbidden",
+                        "asked-denied",
+                        "this request was denied by a live decision or the ask timeout elapsed",
+                    );
                 }
             }
-        },
+        }
     };
 
     // 6. Resolve host-side, then the SSRF guard. A resolution failure for an allowed host is a
@@ -1783,10 +1792,12 @@ fn handle_cleartext(
 
     // 5. The verdict — cleartext is strictly opt-in, so only an explicit `http://` allow rule permits
     //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
-    //    The two denial shapes get distinct reasons, and the `denied-default` suggestion names the
-    //    `http://` scheme (a bare `ops net allow host` would add an https rule that does not open the
-    //    clear).
-    let deciding: Rule = match ctx.policy.explain_clear(&host, port, &path, method) {
+    //    Evaluated against the effective policy, so an `http://` rule loaded live with `ops net allow
+    //    http://host --session` opens it too. The two denial shapes get distinct reasons, and the
+    //    `denied-default` suggestion names the `http://` scheme (a bare `ops net allow host` would add
+    //    an https rule that does not open the clear).
+    let policy = effective_policy(ctx);
+    let deciding: Rule = match policy.explain_clear(&host, port, &path, method) {
         Decision::AllowedBy(rule) => rule.clone(),
         Decision::DeniedBy(_) => {
             ctx.outcome(
@@ -1807,7 +1818,7 @@ fn handle_cleartext(
         // `DeniedDefault` (nothing opened it) — and, defensively, any verdict `explain_clear` does not
         // return (it never yields an allow-default or ask): all fail closed as a deny-default refusal.
         _ => {
-            let method_denied = ctx.policy.method_denied_clear(&host, port, &path, method);
+            let method_denied = policy.method_denied_clear(&host, port, &path, method);
             let reason = if method_denied {
                 "denied-method"
             } else {
@@ -2857,6 +2868,78 @@ mod tests {
     }
 
     #[test]
+    fn a_session_http_overlay_opens_a_cleartext_host_for_an_allowlist_agent() {
+        // The user's exact case: a session in **allowlist** mode (deny-by-default, NOT `ask`) whose
+        // config does not list the host. A live `ops net allow http://host --session` folds an
+        // `http://` allow into the effective policy, so a cleartext request to that host now proceeds
+        // — the whole point of `--session` working outside `ask`. An unscoped overlay allow admits
+        // every verb (it is a deliberate live grant), so a POST proceeds too, not just the GET a
+        // `curl` would send (the method-scope gotcha a GET-only test would hide).
+        use crate::sandbox::control::{ManualRules, Verdict};
+        for method in ["GET", "POST"] {
+            let (addr, _up_head) = spawn_plain_upstream(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+            let port = addr.port();
+            let manual = Arc::new(ManualRules::new());
+            manual.remember_rule(
+                Verdict::Allow,
+                classify(&format!("http://target.test:{port}")).unwrap(),
+            );
+            // An allowlist session (deny-by-default) that allows only an unrelated host — the target
+            // is NOT config-permitted, so without the overlay a cleartext request is denied-default.
+            let ctx = Arc::new(
+                ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["other.test"]))
+                    .unwrap()
+                    .with_manual(manual)
+                    .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+            );
+            let request = format!(
+                "{method} http://target.test:{port}/x HTTP/1.1\r\nHost: target.test:{port}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+            assert!(
+                resp.contains("200 OK"),
+                "a --session http:// allow must open the cleartext host for a {method}: {resp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_deny_blocks_a_config_allowed_host() {
+        // The reverse override: a live `ops net deny host --session` cuts a host the config allows.
+        // Deny wins in the effective policy, so the request is refused (denied-by-rule) even though the
+        // allowlist permits it. The resolver panics if reached — a deny refuses before resolving.
+        use crate::sandbox::control::{ManualRules, Verdict};
+        let manual = Arc::new(ManualRules::new());
+        manual.remember_rule(Verdict::Deny, classify("api.test").unwrap());
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["api.test:*"]))
+                .unwrap()
+                .with_manual(manual)
+                .with_resolver(Box::new(|_| {
+                    panic!("a session-denied host must not resolve")
+                })),
+        );
+        let resp = through_proxy(
+            ctx,
+            der,
+            "api.test",
+            "api.test",
+            443,
+            b"GET / HTTP/1.1\r\nHost: api.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("denied-by-rule"),
+            "a --session deny must block a config-allowed host: {resp:?}"
+        );
+    }
+
+    #[test]
     fn a_cleartext_request_needs_an_explicit_http_rule() {
         // Cleartext is strictly opt-in: a bare (inspected-over-TLS) allow rule does NOT open the same
         // host in the clear. So a cleartext request to an https-allowed host is denied-default, and
@@ -3463,8 +3546,202 @@ mod tests {
         )
         .unwrap();
         assert!(
-            resp.contains("403") && resp.contains("asked-denied"),
-            "a remembered deny must 403 without parking: {resp:?}"
+            resp.contains("403") && resp.contains("denied-by-rule"),
+            "a remembered deny must 403 without parking (it is now a deny rule in the effective \
+             policy): {resp:?}"
+        );
+    }
+
+    /// A `--session` allow lives in the overlay, which the proxy consults **only** when the config
+    /// policy returns Ask. A config *deny* returns DeniedBy first (before the overlay), so loading an
+    /// overlay allow for a config-denied host must not let it through — the load-bearing security
+    /// property of the proactive-`--session` path. The resolver panics if reached (a deny refuses
+    /// before resolving), so a regression that consulted the overlay first would blow up rather than
+    /// silently pass.
+    #[test]
+    fn a_config_deny_is_not_overridable_by_a_session_overlay_allow() {
+        use crate::sandbox::control::{ManualRules, Verdict};
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let manual = Arc::new(ManualRules::new());
+        manual.remember_rule(Verdict::Allow, classify("blocked.test").unwrap());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                ca,
+                EgressPolicy::new(vec![], vec![classify("blocked.test").unwrap()])
+                    .with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_manual(manual)
+            .with_resolver(Box::new(|_| {
+                panic!("a config-denied host must refuse before resolving")
+            })),
+        );
+        let resp = through_proxy(
+            ctx,
+            der,
+            "blocked.test",
+            "blocked.test",
+            443,
+            b"GET / HTTP/1.1\r\nHost: blocked.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("denied-by-rule"),
+            "a config deny must win over a session overlay allow: {resp:?}"
+        );
+    }
+
+    /// The security delta of proactive `--session` rules: an overlay allow carries the rule that
+    /// *matched* to the SSRF guard, so a **broad** rule does not silently unlock a private address the
+    /// way an exact-host approval deliberately does. Both resolve to the same loopback IP — the
+    /// wildcard `*.internal.test` is `ssrf-blocked`, while the exact host is permitted and reaches a
+    /// real loopback upstream (200). The contrast is the proof the guard treated them differently.
+    #[test]
+    fn a_broad_session_overlay_allow_does_not_unlock_a_private_ip() {
+        use crate::sandbox::control::{ManualRules, Verdict};
+
+        // A wildcard overlay allow (`:*` so it matches the upstream's random port) → the deciding rule
+        // is a subdomain wildcard → the SSRF guard refuses the loopback address.
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let manual = Arc::new(ManualRules::new());
+        manual.remember_rule(Verdict::Allow, classify("*.internal.test:*").unwrap());
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, EgressPolicy::default().with_default(DefaultAction::Ask))
+                .unwrap()
+                .with_manual(manual)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(
+            ctx,
+            der,
+            "sub.internal.test",
+            "sub.internal.test",
+            8443,
+            b"GET / HTTP/1.1\r\nHost: sub.internal.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("ssrf-blocked"),
+            "a wildcard overlay allow must not unlock a private IP: {resp:?}"
+        );
+
+        // An exact-host overlay allow for the same private address IS permitted (the deliberate
+        // "approve an internal target" behavior): it passes the SSRF guard and reaches a real upstream.
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "exact.internal.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let manual = Arc::new(ManualRules::new());
+        manual.remember(Verdict::Allow, "exact.internal.test", addr.port());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_manual(manual),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "exact.internal.test",
+            "exact.internal.test",
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: exact.internal.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(
+            resp.contains("200 OK"),
+            "an exact-host overlay allow must reach the approved internal target: {resp:?}"
+        );
+    }
+
+    /// The full proactive-`--session` wire path, cage-free: `inject_rule` (the client `ops net allow
+    /// --session` drives) loads a rule over a real control `serve` into the overlay the proxy shares,
+    /// so an otherwise-undecided ask request proceeds to the upstream **without parking**. There is no
+    /// answerer thread and the default ask wait is indefinite, so a request that (wrongly) parked would
+    /// hang and time the test out — the 200 is the proof the injected rule decided it.
+    #[test]
+    fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
+        use crate::sandbox::control::{
+            self, LogRing, ManualRules, PendingState, Verdict, LOG_RING_CAP,
+        };
+        use crate::testutil::TmpDir;
+        use std::os::unix::net::UnixListener;
+
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "ask.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+
+        // Stand up a real control socket sharing the overlay with the proxy below.
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control::control_dir(data.path())).unwrap();
+        let pid = std::process::id();
+        let listener = UnixListener::bind(control::control_socket(data.path(), pid)).unwrap();
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        {
+            let (pending, served_manual, log) = (pending.clone(), manual.clone(), log.clone());
+            std::thread::spawn(move || {
+                let _ = control::serve(listener, pending, served_manual, log);
+            });
+        }
+
+        // Load an allow for the upstream's exact host:port over the socket, exactly as the CLI does.
+        let rule = format!("ask.test:{}", addr.port());
+        assert!(matches!(
+            control::inject_rule(data.path(), pid, Verdict::Allow, &rule).unwrap(),
+            control::InjectOutcome::Loaded
+        ));
+
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_manual(manual),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "ask.test",
+            "ask.test",
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: ask.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(
+            resp.contains("200 OK") && resp.contains("hello"),
+            "a session-injected allow must let the request proceed without parking: {resp:?}"
         );
     }
 
@@ -4262,7 +4539,7 @@ mod tests {
     #[test]
     fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         use crate::allowlist::DefaultAction;
-        use crate::sandbox::control::{LogRing, LogVerdict, ManualRules, Verdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
         use crate::sandbox::egress_stats::{Counts, EgressStats};
 
         let dir = TmpDir::new();
@@ -4354,22 +4631,27 @@ mod tests {
             );
         }
 
-        // asked-denied (a remembered manual deny) → deny.
+        // asked-denied (an `ask` park that times out with no answer) → deny. A short timeout and no
+        // answerer thread makes the park deny by timeout — the still-reachable `asked-denied` path (a
+        // remembered/`--session` deny now folds into the effective policy and surfaces as
+        // `denied-by-rule`, tested above).
         {
             let s = fresh();
             let ca = Arc::new(Ca::ephemeral().unwrap());
             let der = ca.ca_cert_der();
-            let manual = Arc::new(ManualRules::new());
-            manual.remember(Verdict::Deny, "blocked.test", 443);
             let ctx = Arc::new(
-                ProxyCtx::new(ca, EgressPolicy::default().with_default(DefaultAction::Ask))
-                    .unwrap()
-                    .with_stats(s.clone())
-                    .with_log(log.clone())
-                    .with_manual(manual)
-                    .with_resolver(Box::new(|_| {
-                        panic!("resolve must not run for a manual deny")
-                    })),
+                ProxyCtx::new(
+                    ca,
+                    EgressPolicy::default()
+                        .with_default(DefaultAction::Ask)
+                        .with_ask_timeout(Some(std::time::Duration::from_millis(50))),
+                )
+                .unwrap()
+                .with_stats(s.clone())
+                .with_log(log.clone())
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a timed-out ask")
+                })),
             );
             let resp = through_proxy(
                 ctx,
