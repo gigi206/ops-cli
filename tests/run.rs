@@ -18,6 +18,11 @@ fn ops() -> Command {
     let _ = std::fs::create_dir_all(&cfg);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
     cmd.env("XDG_CONFIG_HOME", cfg);
+    // Pin a deterministic UTF-8 locale: the cage now honors the host locale, so a provisioned
+    // tool's output (e.g. GNU `hello`) would otherwise be translated on a non-English developer
+    // machine and break an assertion on its English text. `C.UTF-8` keeps messages English while
+    // staying UTF-8-clean, independent of the runner's own `LANG`.
+    cmd.env("LC_ALL", "C.UTF-8").env_remove("LANG");
     cmd
 }
 
@@ -1259,7 +1264,7 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
             "-c",
             "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
              nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
-             sleep 30",
+             sleep 60",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -1277,7 +1282,11 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
         rows.iter()
             .any(|r| r["host"] == host && r["verdict"] == verdict)
     };
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // Generous: a fresh test store provisions the whole base cold, including the one-time
+    // locale-archive build, before the session makes its egress requests; the deadline covers
+    // that cold start plus the fetches (production reuses the cached base, so this is a
+    // fresh-store test cost, not a launch cost).
+    let deadline = Instant::now() + Duration::from_secs(60);
     // Deferred init: the loop assigns `last` on its first iteration, before either break — so it is
     // always set by the post-loop read, with no dead initial store.
     let mut last;
@@ -1397,7 +1406,7 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
             "-c",
             "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
              nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
-             sleep 30",
+             sleep 60",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -1447,7 +1456,11 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
     };
     // Poll the accumulating stream until both decisions appear, or a generous deadline — stopping as
     // soon as they do keeps the test fast without a fragile fixed sleep.
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // Generous: a fresh test store provisions the whole base cold, including the one-time
+    // locale-archive build, before the session makes its egress requests; the deadline covers
+    // that cold start plus the fetches (production reuses the cached base, so this is a
+    // fresh-store test cost, not a launch cost).
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         {
             let buf = captured.lock().unwrap();

@@ -1052,6 +1052,54 @@ pub(crate) fn provision(
     select_marked_output(layout, &stdout, attr, marker)
 }
 
+/// Provision a package built from a Nix *expression* into the user-owned store, gcrooted at
+/// `gcroot`. The same store setup, gcroot, sandboxed build, and marked-output selection as
+/// [`provision`], only the build target differs: `--expr <expr>` instead of `<flake_ref>#<attr>`.
+/// It is for a package that cannot be named by a flake attribute path — an `.override { … }`,
+/// notably — so the expression must reference nixpkgs itself; a `builtins.getFlake` on a
+/// rev-pinned `github:NixOS/nixpkgs/<rev>` reference is a *locked* flake, so it evaluates purely
+/// (no `--impure`). `label` names the build in an error and drives the marked-output selection.
+pub(crate) fn provision_expr(
+    nix: &Path,
+    layout: &Layout,
+    gcroot: &Path,
+    expr: &str,
+    label: &str,
+    marker: &str,
+) -> io::Result<PathBuf> {
+    ensure(layout)?;
+    if let Some(parent) = gcroot.parent() {
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+
+    let mut cmd = nix_command(nix, layout);
+    cmd.args(["--extra-experimental-features", "nix-command flakes"])
+        .arg("build")
+        .args(["--option", "sandbox", "true"])
+        .arg("--out-link")
+        .arg(gcroot)
+        .arg("--print-out-paths")
+        .arg("--expr")
+        .arg(expr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let out = cmd.spawn()?.wait_with_output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "nix build --expr ({label}) failed"
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    select_marked_output(layout, &stdout, label, marker)
+}
+
 /// Pick, among the logical store paths a build printed (`--print-out-paths` may list several —
 /// e.g. a `-man` beside the binary), the one whose tree carries `marker`.
 ///

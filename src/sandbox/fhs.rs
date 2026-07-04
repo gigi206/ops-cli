@@ -45,6 +45,109 @@ const BASE_TOOLS: &[(&str, &str, &str)] = &[
     ("which", "bin/which", "which"),
 ];
 
+/// The locale always compiled into the cage's archive: a known-good UTF-8 anchor (English) so
+/// there is always at least one real named locale and English tooling messages render, on top of
+/// glibc's always-available compiled `C.UTF-8`.
+const ANCHOR_LOCALE: &str = "en_US.UTF-8";
+
+/// Normalize a host locale env value (e.g. from `LANG`) to the glibc UTF-8 locale name the cage's
+/// archive is built for (e.g. `fr_FR.utf8` → `fr_FR.UTF-8`), or `None` if it is not a UTF-8 locale
+/// ops should build. Only an explicit UTF-8 codeset is accepted: a bare `fr_FR`, a non-UTF-8
+/// codeset (`fr_FR.ISO-8859-1`), or the built-in `C`/`POSIX`/`C.UTF-8` all yield `None` (the last
+/// needs no archive — glibc has it compiled in). A final safe-charset gate (letters, digits, and
+/// `_ . - @`) rejects anything that could not be a locale name, so a hostile `LANG` cannot inject
+/// into the Nix build expression the name is interpolated into.
+fn normalize_utf8_locale(raw: &str) -> Option<String> {
+    let (head, modifier) = match raw.trim().split_once('@') {
+        Some((h, m)) => (h, Some(m)),
+        None => (raw.trim(), None),
+    };
+    let (name, codeset) = head.split_once('.')?;
+    if !codeset.eq_ignore_ascii_case("UTF-8") && !codeset.eq_ignore_ascii_case("utf8") {
+        return None;
+    }
+    if name.is_empty() || name.eq_ignore_ascii_case("C") || name.eq_ignore_ascii_case("POSIX") {
+        return None;
+    }
+    let normalized = match modifier {
+        Some(m) => format!("{name}.UTF-8@{m}"),
+        None => format!("{name}.UTF-8"),
+    };
+    normalized
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@'))
+        .then_some(normalized)
+}
+
+/// The UTF-8 locales to compile into the cage's archive, derived from the host's own locale
+/// (`LC_ALL` then `LANG` — the general selectors the cage inherits through the passthrough) so
+/// each machine's cage renders that machine's language, plus the [`ANCHOR_LOCALE`] English
+/// fallback. A host locale ops cannot recognize is simply omitted (the cage falls back to the
+/// compiled-in `C.UTF-8`, still UTF-8-clean); `C.UTF-8` stays the structural `LANG` default
+/// regardless.
+fn host_locales() -> Vec<String> {
+    locale_set(
+        ["LC_ALL", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok()),
+    )
+}
+
+/// Pure core of [`host_locales`]: normalize the raw locale values, add the anchor, and dedup +
+/// sort for a stable build expression (so an unchanged host locale re-uses the built archive).
+/// Separated from the environment read so the derivation is unit-testable.
+fn locale_set(raw: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut set: Vec<String> = raw
+        .into_iter()
+        .filter_map(|v| normalize_utf8_locale(&v))
+        .collect();
+    set.push(ANCHOR_LOCALE.to_string());
+    set.sort();
+    set.dedup();
+    set
+}
+
+/// Provision a UTF-8 locale archive carrying exactly `locales` into ops's store, gcrooted under
+/// `roots`. Built with `glibcLocales.override` (a curated set, ~3 MB) rather than the stock
+/// `glibcLocales` (every locale, ~230 MB) — and *not* the stock `glibcLocalesUtf8`, whose archive
+/// lists locales but does not actually load them. Built against the base's own `nixpkgs`
+/// reference, so the archive and the base glibc stay version-locked (glibc ignores an archive
+/// built for another version). Every interpolated value is ops-controlled or charset-validated
+/// (the resolved reference, the detected system, and the normalized locale names), so the
+/// expression carries nothing to escape.
+///
+/// The gcroot is the fixed name `locales` (not keyed by the locale set): `provision_expr` always
+/// runs `nix build`, which rebuilds and repoints the out-link when the set changes, so no stale
+/// archive is ever used. Two concurrent launches with *different* host locales race to repoint
+/// that shared out-link; the loser's archive simply loses its root and becomes GC-able in the
+/// shared store — each project's own seeded copy is unaffected, so no launch fails.
+fn provision_locale_archive(
+    nix: &Path,
+    layout: &Layout,
+    roots: &Path,
+    nixpkgs: &str,
+    system: &str,
+    locales: &[String],
+) -> io::Result<PathBuf> {
+    let locale_list = locales
+        .iter()
+        .map(|l| format!("\"{l}/UTF-8\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expr = format!(
+        "(builtins.getFlake \"{nixpkgs}\").legacyPackages.{system}.glibcLocales.override \
+         {{ allLocales = false; locales = [ {locale_list} ]; }}"
+    );
+    crate::store::provision_expr(
+        nix,
+        layout,
+        &roots.join("locales"),
+        &expr,
+        "glibcLocales",
+        "lib/locale/locale-archive",
+    )
+}
+
 /// Provision the base hermetic userland into ops's store and report its paths.
 /// The launcher resolves the userland before assembling a spec; on a project's
 /// first launch this fetches the base closure from the binary cache. `nixpkgs` is
@@ -131,6 +234,33 @@ pub(crate) fn resolve_userland(
     // per-session CA over the same variables, so that leaf still wins; for every other posture
     // this is the trust anchor.
     let cacert = realise("cacert", "etc/ssl/certs/ca-bundle.crt", "cacert")?;
+    // A compiled UTF-8 locale archive, so the cage's glibc can fully load a UTF-8 `LANG`
+    // (e.g. `fr_FR.UTF-8`) — rendering accented text and filenames correctly and giving
+    // locale-aware collation and messages. A hermetic cage has no host `/usr/lib/locale`, so
+    // without an archive glibc silently falls back to the C locale and byte-escapes non-ASCII
+    // (an accented filename then shows as `$'\303\251'` under `ls` on a terminal). Like `cacert`
+    // it ships only a data file (the archive), no binary, so it is off PATH; the assembler names
+    // it in `LOCALE_ARCHIVE`. The locale set is derived from the host's own locale
+    // ([`host_locales`]), so each machine's cage renders that machine's language. Best-effort: a
+    // host locale glibc cannot build would fail the whole set, so on failure it retries with just
+    // the known-good anchor — the host locale then falls back to the compiled-in `C.UTF-8`
+    // (still UTF-8-clean) rather than bricking the launch.
+    let system = super::current_system();
+    let locales = provision_locale_archive(nix, layout, &roots, nixpkgs, &system, &host_locales())
+        .or_else(|e| {
+            eprintln!(
+                "ops: warning: could not build the host locale archive ({e}); \
+                 falling back to {ANCHOR_LOCALE}"
+            );
+            provision_locale_archive(
+                nix,
+                layout,
+                &roots,
+                nixpkgs,
+                &system,
+                &[ANCHOR_LOCALE.to_string()],
+            )
+        })?;
 
     // Curated base CLI tools: a small, broadly-useful set every project gets without
     // per-project provisioning — an HTTP client, version control, a pager, the text-processing
@@ -157,6 +287,7 @@ pub(crate) fn resolve_userland(
         mise.clone(),
         socat.clone(),
         cacert.clone(),
+        locales.clone(),
     ];
     base_roots.extend(tools.iter().cloned());
 
@@ -201,7 +332,81 @@ pub(crate) fn resolve_userland(
         // nix is on the base PATH too, but the `flake:` build wrapper invokes it by absolute
         // path for the same reason — a persisted shim must not shadow the build.
         nix_bin: nix_pkg.join("bin/nix"),
+        // The UTF-8 locale archive, named in `LOCALE_ARCHIVE` so the cage's glibc loads a
+        // UTF-8 `LANG`. An in-sandbox logical path (it resolves through the store at `/nix`).
+        locale_archive: locales.join("lib/locale/locale-archive"),
     })
+}
+
+/// The host-locale derivation is pure (no nix, no store), so it is unit-tested directly.
+#[cfg(test)]
+mod locale_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_utf8_locales_and_rejects_the_rest() {
+        // a UTF-8 locale normalizes to glibc's canonical spelling
+        assert_eq!(
+            normalize_utf8_locale("fr_FR.UTF-8").as_deref(),
+            Some("fr_FR.UTF-8")
+        );
+        assert_eq!(
+            normalize_utf8_locale("fr_FR.utf8").as_deref(),
+            Some("fr_FR.UTF-8")
+        );
+        assert_eq!(
+            normalize_utf8_locale("de_DE.UTF-8").as_deref(),
+            Some("de_DE.UTF-8")
+        );
+        assert_eq!(
+            normalize_utf8_locale("ja_JP.UTF-8").as_deref(),
+            Some("ja_JP.UTF-8")
+        );
+        // a @modifier is preserved after the normalized codeset
+        assert_eq!(
+            normalize_utf8_locale("sr_RS.UTF-8@latin").as_deref(),
+            Some("sr_RS.UTF-8@latin")
+        );
+        // the built-in C.UTF-8 needs no archive entry; C/POSIX and a bare or non-UTF-8 locale
+        // are not UTF-8 archive locales
+        assert_eq!(normalize_utf8_locale("C.UTF-8"), None);
+        assert_eq!(normalize_utf8_locale("C"), None);
+        assert_eq!(normalize_utf8_locale("POSIX"), None);
+        assert_eq!(normalize_utf8_locale("en_US"), None);
+        assert_eq!(normalize_utf8_locale("fr_FR.ISO-8859-1"), None);
+    }
+
+    #[test]
+    fn a_hostile_locale_value_cannot_inject_into_the_build_expression() {
+        // a value carrying quote/space/shell metacharacters fails the safe-charset gate, so it
+        // never reaches the Nix `--expr` string
+        assert_eq!(
+            normalize_utf8_locale("fr_FR.UTF-8\" ]; evil = 1; x = [ \"y"),
+            None
+        );
+        assert_eq!(normalize_utf8_locale("a b.UTF-8"), None);
+        assert_eq!(normalize_utf8_locale("$(touch pwned).UTF-8"), None);
+    }
+
+    #[test]
+    fn the_locale_set_adds_the_anchor_dedups_and_sorts() {
+        // the host's own locale is kept, C is dropped, the anchor is always present, sorted+deduped
+        assert_eq!(
+            locale_set(["fr_FR.UTF-8".into(), "C".into(), "de_DE.utf8".into()]),
+            vec![
+                "de_DE.UTF-8".to_string(),
+                "en_US.UTF-8".to_string(),
+                "fr_FR.UTF-8".to_string(),
+            ]
+        );
+        // no host locale → just the anchor
+        assert_eq!(locale_set([]), vec!["en_US.UTF-8".to_string()]);
+        // a host locale equal to the anchor does not duplicate it
+        assert_eq!(
+            locale_set(["en_US.UTF-8".into()]),
+            vec!["en_US.UTF-8".to_string()]
+        );
+    }
 }
 
 /// Provisioning the userland needs a real nix and store, so this is an
@@ -238,11 +443,11 @@ mod resolve_tests {
         // the base roots are logical store paths, each backed by ops's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure
         // roots the per-project store is seeded from. The expected base set is present:
-        // the nine core provisions plus one root per curated CLI tool.
+        // the ten core provisions plus one root per curated CLI tool.
         assert_eq!(
             u.base_roots.len(),
-            9 + BASE_TOOLS.len(),
-            "glibc, gcc, bash, coreutils, nix-ld, nix, mise, socat, cacert + the curated tools"
+            10 + BASE_TOOLS.len(),
+            "glibc, gcc, bash, coreutils, nix-ld, nix, mise, socat, cacert, locales + the curated tools"
         );
         // every curated tool is reachable by name: its marker binary physically exists in
         // one of the base PATH directories (so it is both realised and on PATH).

@@ -99,6 +99,10 @@ pub(crate) struct Userland {
     /// it), but invoked by *absolute* path from the `flake:` build wrapper so a persisted shim
     /// cannot shadow it.
     pub(crate) nix_bin: PathBuf,
+    /// ops's own compiled UTF-8 locale archive, as an in-sandbox logical path. Named in
+    /// `LOCALE_ARCHIVE` so the cage's glibc can load a UTF-8 `LANG` without a host
+    /// `/usr/lib/locale`; ships no binary, so it is off `PATH`.
+    pub(crate) locale_archive: PathBuf,
 }
 
 /// One explicit bind injected by the launcher after the structural mounts (so it is
@@ -394,6 +398,20 @@ fn assemble(
             "OPS_EGRESS_CONTRACT".to_string(),
             super::contract::EGRESS_CONTRACT_INCAGE.to_string(),
         ),
+        // Locale. `LOCALE_ARCHIVE` names ops's own UTF-8 locale archive so the cage's glibc
+        // can load a UTF-8 `LANG` — a hermetic cage has no host `/usr/lib/locale`, so without
+        // it glibc falls back to the C locale and byte-escapes accented text and filenames.
+        // `LANG` defaults to the always-available compiled `C.UTF-8` so a cage with no host
+        // locale is still UTF-8-clean; the host's `LANG` passes through the overlay and
+        // upserts over this floor, loading fully from the archive when it is a locale the
+        // archive carries. Both are structural (lowest precedence): a trusted `[env]` may
+        // override them, which only mis-sets the project's own cage locale (self-sabotage,
+        // the same class as `FONTCONFIG_FILE`), so neither needs a denylist entry.
+        (
+            "LOCALE_ARCHIVE".to_string(),
+            userland.locale_archive.to_string_lossy().into_owned(),
+        ),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
     ];
     env.extend(mise_env());
     for (key, val) in overlay.env {
@@ -914,6 +932,7 @@ mod tests {
             socat_bin: PathBuf::from("/store/socat/bin/socat"),
             mise_bin: PathBuf::from("/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/store/nix/bin/nix"),
+            locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
         }
     }
 
@@ -1497,6 +1516,8 @@ mod tests {
                 "NIX_LD_LIBRARY_PATH",
                 "OPS_SANDBOX",
                 "OPS_EGRESS_CONTRACT",
+                "LOCALE_ARCHIVE",
+                "LANG",
                 "MISE_DATA_DIR",
                 "MISE_EXPERIMENTAL",
                 "MISE_YES",

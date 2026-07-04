@@ -2699,11 +2699,29 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
 }
 
 /// Host variables worth carrying through the cleared environment for a usable
-/// session. Secrets are never passed this way.
+/// session. Secrets are never passed this way. `LANG`/`LC_ALL` carry the host's locale so the
+/// cage renders text in the user's language; the base userland builds a matching locale archive
+/// (see `fhs::host_locales`), and both upsert over the structural `LANG=C.UTF-8` floor.
 fn passthrough_env() -> Vec<(String, String)> {
-    ["TERM", "LANG"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
+    keep_passthrough(
+        ["TERM", "LANG", "LC_ALL"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v))),
+    )
+}
+
+/// Drop a `LANG`/`LC_ALL` whose value is the non-UTF-8 `C`/`POSIX` builtin, so a host that
+/// selects it (a developer forcing deterministic tooling on the host) cannot override the cage's
+/// structural `LANG=C.UTF-8` floor and byte-escape accented text — almost never the intent inside
+/// an agent cage, and a config `[env]` remains the explicit escape hatch. Every other value — a
+/// real locale, or `C.UTF-8` itself — is kept and upserts over the floor; `TERM` and any
+/// non-locale key pass unconditionally. Pure, so the rule is unit-tested without the environment.
+fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter(|(k, v)| {
+            !matches!(k.as_str(), "LANG" | "LC_ALL")
+                || (!v.eq_ignore_ascii_case("C") && !v.eq_ignore_ascii_case("POSIX"))
+        })
         .collect()
 }
 
@@ -3089,6 +3107,28 @@ mod tests {
     }
 
     #[test]
+    fn keep_passthrough_drops_bare_c_locale_but_keeps_real_ones() {
+        let out = keep_passthrough([
+            ("TERM".to_string(), "xterm".to_string()),
+            ("LANG".to_string(), "C".to_string()),
+            ("LC_ALL".to_string(), "fr_FR.UTF-8".to_string()),
+        ]);
+        // TERM always passes; a bare `C` LANG is dropped so it cannot break the UTF-8 floor;
+        // a real locale is kept
+        assert!(out.iter().any(|(k, v)| k == "TERM" && v == "xterm"));
+        assert!(!out.iter().any(|(k, _)| k == "LANG"));
+        assert!(out.iter().any(|(k, v)| k == "LC_ALL" && v == "fr_FR.UTF-8"));
+
+        // `POSIX` is dropped too (case-insensitive), while `C.UTF-8` — a real UTF-8 locale — passes
+        let out = keep_passthrough([
+            ("LC_ALL".to_string(), "posix".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ]);
+        assert!(!out.iter().any(|(k, _)| k == "LC_ALL"));
+        assert!(out.iter().any(|(k, v)| k == "LANG" && v == "C.UTF-8"));
+    }
+
+    #[test]
     fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
         // The seed's completeness rides on this collection: every provisioner's roots
         // must reach it. The order is base, then packages, then tools, then fonts.
@@ -3108,6 +3148,7 @@ mod tests {
             socat_bin: PathBuf::from("/nix/store/socat/bin/socat"),
             mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),
+            locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
         };
         let pkg_roots = [PathBuf::from("/nix/store/jq")];
         let tool_roots = [PathBuf::from("/nix/store/nodejs")];

@@ -152,7 +152,12 @@ impl Fixture {
             .current_dir(self.proj.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("XDG_STATE_HOME", self.state_home.path())
-            .env("XDG_DATA_HOME", self.data_home.path());
+            .env("XDG_DATA_HOME", self.data_home.path())
+            // Pin a deterministic UTF-8 locale so an assertion on a provisioned tool's output
+            // (e.g. GNU `hello`) does not depend on the developer's own `LANG` — the cage now
+            // honors the host locale, so a French host would otherwise see a translated message.
+            .env("LC_ALL", "C.UTF-8")
+            .env_remove("LANG");
         cmd
     }
 
