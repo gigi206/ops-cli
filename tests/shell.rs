@@ -259,11 +259,16 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     let mut buf = [0u8; 4096];
     let mut sent_setup = false;
     let mut resized = false;
-    // The loop exits the instant both markers appear (~20s idle), so this deadline is only a
-    // ceiling — sized generously so a fully-loaded run (the whole suite in parallel starves the pty
-    // round-trips) cannot time out before the trap's output is captured. A ceiling costs nothing on
-    // success and prevents a load-induced flake.
-    let deadline = Instant::now() + Duration::from_secs(180);
+    // Alternates the resized row so each re-issue is a genuine size *change* (see the post-resize
+    // block): a single resize sends one SIGWINCH, which — under job control — a transient foreground
+    // `stty` process group can absorb before the shell ever sees it, and the size then never changes
+    // again, so the shell's trap would never fire. Re-issuing keeps delivering fresh signals until
+    // one lands while the shell idles at its prompt.
+    let mut toggle = false;
+    // The loop exits the instant both markers appear — the re-issued resize makes that reliable
+    // rather than luck-of-the-timing, so this deadline is just a generous backstop (the test
+    // completes in well under a minute even with the whole suite in parallel).
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_probe = Instant::now();
 
     while Instant::now() < deadline {
@@ -301,13 +306,27 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
             last_probe = Instant::now();
         }
 
-        // After the resize, poll the inner size until it reflects 50x200 and the trap has fired.
+        // After the resize, confirm the inner size reflects 50x200, then keep the trap fed until it
+        // fires. First probe once for the propagated size (a foreground `stty size`). Once 50x200 is
+        // seen, stop probing and instead re-issue the resize as a real change (toggle a row) every
+        // cycle: this both delivers a fresh SIGWINCH the idle shell can catch — a single one can be
+        // absorbed by a transient foreground process group — and, by not spawning more `stty`
+        // children, leaves the shell idle at its prompt to receive it. 50x200 stays satisfied (it was
+        // captured on the first probe).
         if resized {
             if text.contains("50 200") && text.contains("WINCH=FIRED") {
                 break;
             }
-            if last_probe.elapsed() >= Duration::from_millis(400) {
-                unsafe { libc::write(master, b"stty size\n".as_ptr().cast(), 10) };
+            if last_probe.elapsed() >= Duration::from_millis(300) {
+                if text.contains("50 200") {
+                    toggle = !toggle;
+                    let mut sz: libc::winsize = unsafe { std::mem::zeroed() };
+                    sz.ws_row = if toggle { 51 } else { 50 };
+                    sz.ws_col = 200;
+                    unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &sz) };
+                } else {
+                    unsafe { libc::write(master, b"stty size\n".as_ptr().cast(), 10) };
+                }
                 last_probe = Instant::now();
             }
         }
