@@ -2564,7 +2564,9 @@ fn parse_app_launch(
         }
     }
     let Some(name) = name else {
-        eprintln!("ops: usage: {}", help::synopsis("app"));
+        // No app name and no subcommand (bare `ops app`, or only flags): print the full page so
+        // its Subcommands list and launch synopsis guide, like bare `ops net`/`ops config`.
+        eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
         return Err(ExitCode::from(2));
     };
     Ok((name, detach, tail, cli))
@@ -2959,12 +2961,13 @@ fn search_cmd(args: Vec<OsString>) -> ExitCode {
 fn test_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("net") => net_test(&args[1..]),
-        Some(other) => {
-            eprintln!("ops: unknown test kind '{other}' (known: net)");
-            ExitCode::from(2)
-        }
-        None => {
-            eprintln!("ops: usage: {}", help::synopsis("test"));
+        // Unknown or no kind: name the mistake (if any), then print the full page so its
+        // Subcommands list guides, like bare `ops net`/`ops config`.
+        other => {
+            if let Some(tok) = other {
+                eprintln!("ops: test: unknown kind {tok:?}");
+            }
+            eprint!("{}", help::page_usage(&["test"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }
@@ -3285,15 +3288,14 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("stats") => net_stats(&args[1..]),
         // `log` is an accepted alias for `logs` so a typo does not error.
         Some("logs") | Some("log") => net_logs(&args[1..]),
-        Some(other) => {
-            eprintln!(
-                "ops: unknown `net` subcommand '{other}' (known: rules, groups, allow, deny, \
-                 pending, stats, logs)"
-            );
-            ExitCode::from(2)
-        }
-        None => {
-            eprintln!("ops: usage: {}", help::synopsis("net"));
+        // Unknown or no subcommand: name the mistake (if any), then print the full page — its
+        // Subcommands list reveals rules/allow/deny/pending/… instead of a bare one-line synopsis,
+        // the way `ops config` and bare `ops` guide.
+        other => {
+            if let Some(tok) = other {
+                eprintln!("ops: net: unknown subcommand {tok:?}");
+            }
+            eprint!("{}", help::page_usage(&["net"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }
@@ -5899,14 +5901,13 @@ fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
         Some("install") => plugins_install(args.get(1)),
         Some("rm") => plugins_remove(args.get(1).and_then(|a| a.to_str())),
         Some("store") => plugins_store(&args[1..]),
-        Some(other) => {
-            eprintln!(
-                "ops: unknown plugins subcommand '{other}' (known: list, info, install, rm, store)"
-            );
-            ExitCode::from(2)
-        }
-        None => {
-            eprintln!("ops: usage: {}", help::synopsis("plugins"));
+        // Unknown or no subcommand: name the mistake (if any), then print the full page so its
+        // Subcommands list guides, like bare `ops net`/`ops config`.
+        other => {
+            if let Some(tok) = other {
+                eprintln!("ops: plugins: unknown subcommand {tok:?}");
+            }
+            eprint!("{}", help::page_usage(&["plugins"]).unwrap_or_default());
             ExitCode::from(2)
         }
     }
@@ -6173,15 +6174,16 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
         Some("install") => plugins_store_install(&args[1..]),
         Some("info") => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
         Some("rm") => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
-        Some(other) => {
-            eprintln!(
-                "ops: unknown plugins store subcommand '{other}' \
-                 (known: list, add, publish, update, install, info, rm)"
+        // Unknown or no subcommand: name the mistake (if any), then print the full page so its
+        // Subcommands list guides, like bare `ops net`/`ops config`.
+        other => {
+            if let Some(tok) = other {
+                eprintln!("ops: plugins store: unknown subcommand {tok:?}");
+            }
+            eprint!(
+                "{}",
+                help::page_usage(&["plugins", "store"]).unwrap_or_default()
             );
-            ExitCode::from(2)
-        }
-        None => {
-            eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "store"]));
             ExitCode::from(2)
         }
     }
