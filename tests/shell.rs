@@ -10,6 +10,7 @@
 //! the load-bearing concern for putting the cage inside a transient scope.
 
 use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,8 +27,14 @@ impl TmpDir {
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
-        d.push(format!("ops-shell-it-{tag}-{}-{n}", std::process::id()));
+        // On the repo's disk, not the system tmpfs: provisioning a nix store copies a large file
+        // count, which exhausts a tmpfs's inode budget (making the launch fail and the test skip).
+        // Disk has inodes to spare, and it matches production (the store lives on disk). A short
+        // prefix keeps any bound socket path under `sun_path`'s 108-byte cap. `cargo clean`
+        // reclaims it.
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("target/test-tmp");
+        d.push(format!("sh-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -164,4 +171,164 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
         "bash reported no job control:\n{text}"
     );
     assert!(text.contains("MARKER"), "project not visible:\n{text}");
+}
+
+#[test]
+fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
+    // The reported bug: `ops app <name>` launched interactively "stays small" when the terminal
+    // goes fullscreen. An interactive app now runs under the pty supervisor, so it must (1) get a
+    // private controlling terminal and (2) see a resize propagate live. The faithful proxy for a
+    // caching TUI (like claude-code) is not "stty reports the new size" but "the inner process is
+    // *notified*" — so the inner shell arms `trap ... WINCH` and we assert the trap fires.
+    //
+    // Terminal-echo trap: the inner pty (cooked mode) echoes typed commands back, so a marker that
+    // appears verbatim in a command (`CTTY=OK`, `GOTWINCH`) would show up from the echo alone and
+    // give a false pass on broken code. The markers are therefore assembled at *runtime* from
+    // shell variables (`$Y`, `$W`): the echoed command carries `CTTY=$Y` / `WINCH=$W`, while only
+    // the executed branch prints the expanded `CTTY=YES` / `WINCH=FIRED`. So the assertions have
+    // teeth — they fail on a launch with no controlling terminal or no resize delivery.
+    let project = TmpDir::new("appterm-proj");
+    let data = TmpDir::new("appterm-data");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[app.term]\ncmd = [\"bash\", \"--norc\", \"-i\"]\n",
+    )
+    .unwrap();
+
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping ops app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        return;
+    }
+
+    // An outer pty sized 24x80. ops runs on the slave; the test drives the master.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    ws.ws_row = 24;
+    ws.ws_col = 80;
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+
+    // Make ops itself own the *outer* pty as its controlling terminal, faithfully reproducing
+    // production: in a real run ops holds the launching terminal (Warp's), so resizing that
+    // terminal delivers SIGWINCH to ops *naturally* — no explicit signal. A `pre_exec` runs in the
+    // forked ops (after its stdio is set to the slave, before exec): `setsid` starts a fresh
+    // session, then `ioctl(TIOCSCTTY)` claims fd 0's terminal as ops's ctty. The cage's inner child
+    // later gets its own private ctty via `login_tty`, leaving ops the outer pty's foreground group.
+    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    let mut command = ops();
+    command
+        .arg("app")
+        .arg("term")
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) });
+    // SAFETY: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe; fd 0 is the inherited slave.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn ops app term");
+    unsafe { libc::close(slave) };
+
+    // Arm the resize trap, confirm the controlling terminal, and print the initial size. The
+    // markers `$Y`/`$W` expand only when the branch runs (see the echo note above).
+    let setup = b"Y=YES; W=FIRED\n\
+                  trap 'echo WINCH=$W' WINCH\n\
+                  ( : < /dev/tty ) 2>/dev/null && echo CTTY=$Y || echo CTTY=no\n\
+                  stty size\n";
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut sent_setup = false;
+    let mut resized = false;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_probe = Instant::now();
+
+    while Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 300) } > 0 {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break; // EIO/EOF: session over
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        let text = String::from_utf8_lossy(&out);
+
+        // Once the shell prompt appears, send the setup block.
+        if !sent_setup && text.contains('$') {
+            unsafe { libc::write(master, setup.as_ptr().cast(), setup.len()) };
+            sent_setup = true;
+            continue;
+        }
+
+        // After the controlling terminal is confirmed and the initial 24x80 is seen, resize the
+        // *outer* pty. Because ops holds it as its ctty (the pre_exec above), the kernel delivers
+        // SIGWINCH to ops naturally — the exact production trigger of dragging Warp to fullscreen,
+        // not a simulated signal. No explicit `kill`.
+        if sent_setup && !resized && text.contains("CTTY=YES") && text.contains("24 80") {
+            let mut big: libc::winsize = unsafe { std::mem::zeroed() };
+            big.ws_row = 50;
+            big.ws_col = 200;
+            unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &big) };
+            resized = true;
+            last_probe = Instant::now();
+        }
+
+        // After the resize, poll the inner size until it reflects 50x200 and the trap has fired.
+        if resized {
+            if text.contains("50 200") && text.contains("WINCH=FIRED") {
+                break;
+            }
+            if last_probe.elapsed() >= Duration::from_millis(400) {
+                unsafe { libc::write(master, b"stty size\n".as_ptr().cast(), 10) };
+                last_probe = Instant::now();
+            }
+        }
+    }
+
+    unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) };
+    unsafe { libc::close(master) };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("CTTY=YES"),
+        "the interactive app has no controlling terminal:\n{text}"
+    );
+    assert!(
+        text.contains("24 80"),
+        "the initial 24x80 window size was not observed:\n{text}"
+    );
+    assert!(
+        text.contains("50 200"),
+        "the resize did not propagate to the cage pty:\n{text}"
+    );
+    assert!(
+        text.contains("WINCH=FIRED"),
+        "the inner process was not notified of the resize (SIGWINCH not delivered to the cage):\n{text}"
+    );
 }

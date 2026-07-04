@@ -12,11 +12,14 @@
 //!   omits `--new-session` — bubblewrap's `setsid` would `setsid` away from that
 //!   private terminal.
 //!
+//! The supervisor also relays terminal resizes: it catches `SIGWINCH` on the real
+//! terminal and pushes the new window size onto the pty master, so the kernel
+//! delivers `SIGWINCH` to the cage's foreground process group and an interactive
+//! TUI reflows live. Interactive `ops app` launches ride this same supervisor.
+//!
 //! Known gaps in the supervisor (named, not silent):
 //! - terminal-state restore is a RAII guard, so it covers normal/error/panic
 //!   exits but not a `SIGTERM`/`SIGHUP` kill;
-//! - the window size is set once at startup — dynamic `SIGWINCH` propagation is a
-//!   follow-up;
 //! - the relay is single-threaded with a blocking `write_all` to the master, so a
 //!   pathological simultaneous flood (the inner shell not draining its input while
 //!   also flooding output) could stall it. Humans don't trigger it and `script(1)`
@@ -37,6 +40,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
@@ -433,7 +437,17 @@ pub(crate) fn app(name: &str, detach: bool, extra: Vec<OsString>) -> ExitCode {
     eprintln!("ops: launching app `{name}`");
     prep.cfg.merge_app(app);
 
-    launch(prep, runtime, Kind::Run, cmd, detach, name)
+    // An interactive foreground launch (a real terminal on stdin) runs under the pty supervisor:
+    // the agent's TUI gets a private controlling terminal and live terminal-resize propagation
+    // (the same isolation `ops shell` uses — the real terminal stays unreachable). A detached
+    // agent has no terminal, and a piped/non-tty invocation must not be handed one, so both keep
+    // the exec-replace / supervised `NewSession` path.
+    // SAFETY: `isatty` only inspects fd 0.
+    if !detach && unsafe { libc::isatty(0) } == 1 {
+        launch_pty_supervised(&prep, runtime, Kind::Run, cmd)
+    } else {
+        launch(prep, runtime, Kind::Run, cmd, detach, name)
+    }
 }
 
 /// A suffix for the "no such app" error: " (available: a, b)" listing the configured app
@@ -1079,17 +1093,31 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
         OsString::from("--rcfile"),
         OsString::from(binds::SHELL_RC_INCAGE),
     ];
+    launch_pty_supervised(prep, runtime, Kind::Shell, cmd)
+}
+
+/// Launch `cmd` under the pty supervisor: the cage gets a *private* controlling terminal (so job
+/// control and terminal-resize propagation work inside), while the real launching terminal stays
+/// unreachable — ops holds the pty master and never execs. Shared by `ops shell`, `ops attach`,
+/// and interactive `ops app`.
+///
+/// The session is registered and its record held by a [`RecordGuard`] that unlinks it when the
+/// session ends (ops stays alive as the supervisor, so the record is cleaned promptly rather than
+/// left for liveness pruning). The egress guard is held for the whole session too: under a network
+/// allowlist the host filtering proxy runs on a thread alongside the supervisor, and the guard
+/// unlinks its socket and CA on exit.
+fn launch_pty_supervised(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+    kind: Kind,
+    cmd: Vec<OsString>,
+) -> ExitCode {
     let (spec, egress) = match build(prep, runtime, cmd) {
         Ok((s, e)) => (s.with_private_tty(), e),
         Err(code) => return code,
     };
 
-    // Register the session and hold the guard for the whole supervised session;
-    // it unlinks the record when the shell exits (dropped as this scope ends).
-    let _record =
-        register(prep.layout.data_dir(), &spec, Kind::Shell, runtime).map(RecordGuard::new);
-    // Hold the egress guard for the session too (under an allowlist): the host proxy thread
-    // runs alongside the pty supervisor, and the guard unlinks the socket and CA on exit.
+    let _record = register(prep.layout.data_dir(), &spec, kind, runtime).map(RecordGuard::new);
     let _egress = egress;
 
     match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
@@ -2353,14 +2381,28 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -
     // Parent: keep the master, drop the slave, go raw, relay.
     unsafe { libc::close(slave) };
     let _raw = RawMode::enable(0)?;
-    let status = pump(master, child);
+    // Install the resize relay *after* the fork so the child never inherits the handler. ops keeps
+    // the real controlling terminal (only the child `setsid`'d, via `login_tty`), so it receives
+    // `SIGWINCH` from the launching terminal naturally; the handler wakes `pump` to copy the new
+    // size onto the pty master. Best effort: if it cannot be installed the session still runs, only
+    // without dynamic resize (the startup size is already set by `openpty`).
+    let winch = WinchRelay::install().ok();
+    if winch.is_some() {
+        // Close a resize that raced startup (between `openpty` and now).
+        copy_winsize(0, master);
+    }
+    let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
+    let status = pump(master, child, winch_fd);
+    drop(winch);
     unsafe { libc::close(master) };
     status
 }
 
 /// Relay bytes between the real terminal and the pty master until the session
-/// ends, then reap the child and return its exit status code.
-fn pump(master: libc::c_int, child: libc::pid_t) -> io::Result<i32> {
+/// ends, then reap the child and return its exit status code. `winch_fd` is the read
+/// end of the resize relay's self-pipe (or `-1` when it could not be installed — `poll`
+/// ignores a negative fd), readable when a `SIGWINCH` has arrived.
+fn pump(master: libc::c_int, child: libc::pid_t, winch_fd: libc::c_int) -> io::Result<i32> {
     let mut fds = [
         libc::pollfd {
             fd: 0,
@@ -2369,6 +2411,11 @@ fn pump(master: libc::c_int, child: libc::pid_t) -> io::Result<i32> {
         },
         libc::pollfd {
             fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: winch_fd,
             events: libc::POLLIN,
             revents: 0,
         },
@@ -2384,6 +2431,13 @@ fn pump(master: libc::c_int, child: libc::pid_t) -> io::Result<i32> {
                 continue;
             }
             return Err(e);
+        }
+
+        // A resize arrived: drain the self-pipe and copy the real terminal's window size
+        // onto the pty. Handled before stdin so a resize delivered alongside input takes
+        // effect before that input reaches the inner program.
+        if fds[2].revents != 0 {
+            drain_and_resize(winch_fd, master);
         }
 
         // master -> stdout. Quit when the master closes (the child exited), which
@@ -2449,6 +2503,107 @@ fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
         buf = &buf[n as usize..];
     }
     Ok(())
+}
+
+/// The write end of the resize relay's self-pipe, read by the `SIGWINCH` handler. A process-wide
+/// atomic because a signal handler cannot capture state; `-1` when no relay is installed. Only one
+/// pty supervisor runs per process, so there is a single writer.
+static WINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// `SIGWINCH` handler: nudge the supervisor by writing one byte to the self-pipe. Async-signal-safe
+/// — it does nothing but a single `write` of a constant byte to a non-blocking fd read from an
+/// atomic (no allocation, no locks). A full pipe (`EAGAIN`) or absent relay is ignored: the
+/// supervisor coalesces, so a dropped nudge only means an already-pending resize is still pending.
+extern "C" fn winch_handler(_sig: libc::c_int) {
+    let fd = WINCH_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+    }
+}
+
+/// Relays terminal resizes onto the pty master for the life of a supervised session. Installs a
+/// `SIGWINCH` self-pipe handler on construction and restores the previous disposition (and closes
+/// the pipe) on drop, so the handler is live only while the supervisor is pumping.
+struct WinchRelay {
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+    previous: libc::sigaction,
+}
+
+impl WinchRelay {
+    /// Create the self-pipe and install the `SIGWINCH` handler, saving the previous disposition to
+    /// restore on drop. Both ends are `O_CLOEXEC` (never inherited by bwrap); the read end is
+    /// `O_NONBLOCK` so draining it in the poll loop cannot block.
+    fn install() -> io::Result<Self> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` fills the two-element array.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        WINCH_WRITE_FD.store(write_fd, Ordering::Relaxed);
+
+        // SAFETY: `act` is zeroed then fully initialized before use; `previous` receives the old
+        // disposition. The handler is async-signal-safe (see `winch_handler`).
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        act.sa_sigaction = winch_handler as *const () as libc::sighandler_t;
+        unsafe { libc::sigemptyset(&mut act.sa_mask) };
+        // No `SA_RESTART`: a resize should interrupt the blocking `poll` (the self-pipe is the
+        // primary wakeup; the `EINTR` is a harmless second one the loop already handles).
+        act.sa_flags = 0;
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGWINCH, &act, &mut previous) } != 0 {
+            let e = io::Error::last_os_error();
+            WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err(e);
+        }
+        Ok(WinchRelay {
+            read_fd,
+            write_fd,
+            previous,
+        })
+    }
+
+    fn read_fd(&self) -> libc::c_int {
+        self.read_fd
+    }
+}
+
+impl Drop for WinchRelay {
+    fn drop(&mut self) {
+        // Restore the previous handler *first*, so `winch_handler` can no longer run, before
+        // clearing the fd it reads and closing the pipe — no signal can then touch a closed fd.
+        unsafe { libc::sigaction(libc::SIGWINCH, &self.previous, std::ptr::null_mut()) };
+        WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+        unsafe {
+            libc::close(self.read_fd);
+            libc::close(self.write_fd);
+        }
+    }
+}
+
+/// Drain the resize self-pipe (coalescing however many `SIGWINCH`s queued) and copy the real
+/// terminal's window size onto the pty master. Setting the master's size makes the kernel deliver
+/// `SIGWINCH` to the pty's foreground process group — the cage's interactive program.
+fn drain_and_resize(pipe_fd: libc::c_int, master: libc::c_int) {
+    let mut sink = [0u8; 64];
+    // The read end is non-blocking, so this stops at `EAGAIN`.
+    while unsafe { libc::read(pipe_fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+    copy_winsize(0, master);
+}
+
+/// Copy `src`'s window size onto `dst` (`TIOCGWINSZ` → `TIOCSWINSZ`). Best effort: if `src` has no
+/// size (not a terminal), `dst` is left unchanged.
+fn copy_winsize(src: libc::c_int, dst: libc::c_int) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(src, libc::TIOCGWINSZ, &mut ws) } == 0 {
+        unsafe { libc::ioctl(dst, libc::TIOCSWINSZ, &ws) };
+    }
 }
 
 /// Put a terminal into raw mode, restoring the original settings on drop (covers
