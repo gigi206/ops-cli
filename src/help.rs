@@ -93,7 +93,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app"],
-        synopsis: "ops app <name> [--detach]",
+        synopsis: "ops app <name> [--detach] [-- <args>...]",
         summary: "launch or manage named application profiles",
         options: &[(
             "--detach",
@@ -103,7 +103,12 @@ const PAGES: &[Page] = &[
             "`ops app <name>` launches a named application profile (a project [app.<name>] overlay,\n\
             or an imported apps/<name>.toml profile — a global app lives as a profile file, not\n\
             inline in ops.toml) inside the project sandbox, each with its own persistent isolated\n\
-            home.",
+            home.\n\n\
+            Arguments after a `--` are appended to the app's declared command, so you can pass a\n\
+            flag to the launched program without editing the profile — e.g. `ops app claude-code\n\
+            -- -c` runs the profile's `claude` command with `-c` (resume the previous session).\n\
+            They are ordinary launch-time arguments; the app's posture (network, binds, secrets,\n\
+            home) is fixed by the profile and unchanged.",
     },
     Page {
         path: &["search"],
@@ -1124,9 +1129,14 @@ fn resolve_path<'a>(cmd: &'a str, rest: &'a [OsString]) -> Vec<&'a str> {
 /// they name and return its exit code; otherwise `None`, so the command runs normally. The
 /// caller restricts this to known commands (an unknown command keeps its own diagnosis) and
 /// excludes `run`/`mise`, which handle a leading help flag themselves.
+///
+/// A `--` ends ops's own options: anything after it belongs to a launched command (e.g.
+/// `ops app <name> -- --help` passes `--help` through to that command), so the help scan stops
+/// at the first `--` — the same rule the `run` arm applies to its command.
 pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
     let asks_help = rest
         .iter()
+        .take_while(|a| a.to_str() != Some("--"))
         .any(|a| matches!(a.to_str(), Some("--help" | "-h")));
     asks_help.then(|| show(&resolve_path(cmd, rest)))
 }
@@ -1199,6 +1209,26 @@ mod tests {
         let page = find(&["app"]).expect("app page");
         assert!(!render(page, &Palette::plain()).contains('\x1b'));
         assert!(!top_level(&Palette::plain()).contains('\x1b'));
+    }
+
+    #[test]
+    fn maybe_help_stops_at_a_double_dash() {
+        use std::ffi::OsString;
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+
+        // A leading help flag — or one after a subcommand, or after a non-`--` flag — is ops's.
+        assert!(maybe_help("app", &v(&["--help"])).is_some());
+        assert!(maybe_help("app", &v(&["-h"])).is_some());
+        assert!(maybe_help("app", &v(&["import", "--help"])).is_some());
+        assert!(maybe_help("stop", &v(&["--all", "--help"])).is_some());
+
+        // A help flag *after* a `--` belongs to the launched command — `ops app <name> -- --help`
+        // passes `--help` through, so ops does not intercept it.
+        assert!(maybe_help("app", &v(&["claude", "--", "--help"])).is_none());
+        assert!(maybe_help("app", &v(&["claude", "--", "-h"])).is_none());
+        // No help flag at all runs the command.
+        assert!(maybe_help("app", &v(&["claude", "--", "-c"])).is_none());
+        assert!(maybe_help("app", &v(&["claude"])).is_none());
     }
 
     #[test]

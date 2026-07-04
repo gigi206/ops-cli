@@ -2359,45 +2359,64 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
         Some("list") => app_list(),
         // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
-        // background as a session `ops ls`/`attach`/`stop` can see. An unknown flag or a second
-        // token is a usage error, so a typo cannot silently launch a different posture (e.g. a
-        // mistyped `--detach` running attached, or extra tokens dropped without a word).
-        _ => {
-            let mut detach = false;
-            let mut name: Option<&str> = None;
-            for a in &args {
-                match a.to_str() {
-                    Some("--detach") => detach = true,
-                    Some(tok) if tok.starts_with('-') => {
-                        eprintln!("ops: unknown flag {tok} — usage: {}", help::synopsis("app"));
-                        return ExitCode::from(2);
-                    }
-                    Some(tok) => {
-                        if name.is_some() {
-                            eprintln!(
-                                "ops: app takes a single name — usage: {}",
-                                help::synopsis("app")
-                            );
-                            return ExitCode::from(2);
-                        }
-                        name = Some(tok);
-                    }
-                    None => {
-                        eprintln!(
-                            "ops: app name must be valid text — usage: {}",
-                            help::synopsis("app")
-                        );
-                        return ExitCode::from(2);
-                    }
-                }
+        // background as a session `ops ls`/`attach`/`stop` can see. Tokens after a `--` are passed
+        // through to the app's command (see `parse_app_launch`).
+        _ => match parse_app_launch(&args) {
+            Ok((name, detach, extra)) => sandbox::app(&name, detach, extra),
+            Err(code) => code,
+        },
+    }
+}
+
+/// Parse the launch form of `ops app`: split ops's own arguments from the app command's trailing
+/// arguments at the first `--`, then read the app name and `--detach` from the head. Tokens after
+/// `--` are appended verbatim to the app's declared `cmd` (e.g. `ops app claude -- -c` passes `-c`
+/// to the launched command, so an agent can resume a session or tweak a flag without editing the
+/// profile). An unknown flag or a second name in the head is a usage error, so a typo cannot
+/// silently launch a different posture (a mistyped `--detach` running attached, or extra tokens
+/// dropped without a word). The passthrough arguments are host-user input at invocation time, so
+/// they carry no config trust — an untrusted project cannot inject them, and the `cmd` integrity
+/// gate (which blocks a config-supplied `cmd` override) is a separate, intact vector. A pure
+/// parser so the split and the head rules are unit-tested without launching a cage; the caller
+/// maps `Err(code)` to an exit.
+fn parse_app_launch(args: &[OsString]) -> Result<(String, bool, Vec<OsString>), ExitCode> {
+    let (head, tail): (&[OsString], Vec<OsString>) = match args.iter().position(|a| a == "--") {
+        Some(i) => (&args[..i], args[i + 1..].to_vec()),
+        None => (args, Vec::new()),
+    };
+    let mut detach = false;
+    let mut name: Option<&str> = None;
+    for a in head {
+        match a.to_str() {
+            Some("--detach") => detach = true,
+            Some(tok) if tok.starts_with('-') => {
+                eprintln!("ops: unknown flag {tok} — usage: {}", help::synopsis("app"));
+                return Err(ExitCode::from(2));
             }
-            let Some(name) = name else {
-                eprintln!("ops: usage: {}", help::synopsis("app"));
-                return ExitCode::from(2);
-            };
-            sandbox::app(name, detach)
+            Some(tok) => {
+                if name.is_some() {
+                    eprintln!(
+                        "ops: app takes a single name — usage: {}",
+                        help::synopsis("app")
+                    );
+                    return Err(ExitCode::from(2));
+                }
+                name = Some(tok);
+            }
+            None => {
+                eprintln!(
+                    "ops: app name must be valid text — usage: {}",
+                    help::synopsis("app")
+                );
+                return Err(ExitCode::from(2));
+            }
         }
     }
+    let Some(name) = name else {
+        eprintln!("ops: usage: {}", help::synopsis("app"));
+        return Err(ExitCode::from(2));
+    };
+    Ok((name.to_string(), detach, tail))
 }
 
 /// The import confirmation: `imported` in green over the app name and destination, the granted
@@ -8034,6 +8053,47 @@ mod tests {
             resolve_key_target("set", &Scope::Global, Some("bad/name"), "network", cwd).is_err(),
             "an invalid app name cannot name a global-app profile"
         );
+    }
+
+    #[test]
+    fn parse_app_launch_splits_the_name_flags_and_passthrough_args() {
+        use std::ffi::OsString;
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+
+        // A bare name: no detach, no passthrough.
+        let (name, detach, extra) = parse_app_launch(&v(&["claude"])).unwrap();
+        assert_eq!((name.as_str(), detach), ("claude", false));
+        assert!(extra.is_empty());
+
+        // `--detach` before the (absent) `--` sets the flag.
+        let (name, detach, extra) = parse_app_launch(&v(&["claude", "--detach"])).unwrap();
+        assert_eq!((name.as_str(), detach), ("claude", true));
+        assert!(extra.is_empty());
+
+        // `--` separates ops's args from the passthrough tail, appended verbatim.
+        let (name, detach, extra) = parse_app_launch(&v(&["claude", "--", "-c"])).unwrap();
+        assert_eq!((name.as_str(), detach), ("claude", false));
+        assert_eq!(extra, v(&["-c"]));
+
+        // A flag before `--` is ops's; the same token after `--` is the program's (passthrough).
+        let (name, detach, extra) =
+            parse_app_launch(&v(&["claude", "--detach", "--", "-c", "--foo"])).unwrap();
+        assert_eq!((name.as_str(), detach), ("claude", true));
+        assert_eq!(extra, v(&["-c", "--foo"]));
+        let (_, detach, extra) = parse_app_launch(&v(&["claude", "--", "--detach"])).unwrap();
+        assert!(!detach, "`--detach` after `--` is the program's, not ops's");
+        assert_eq!(extra, v(&["--detach"]));
+
+        // A trailing `--` with nothing after it is an empty tail, not an error.
+        let (name, _, extra) = parse_app_launch(&v(&["claude", "--"])).unwrap();
+        assert_eq!(name, "claude");
+        assert!(extra.is_empty());
+
+        // Errors: a second name, an unknown flag, no name at all, and `--` with no name before it.
+        assert!(parse_app_launch(&v(&["claude", "extra"])).is_err());
+        assert!(parse_app_launch(&v(&["claude", "--unknown"])).is_err());
+        assert!(parse_app_launch(&v(&[])).is_err());
+        assert!(parse_app_launch(&v(&["--", "-c"])).is_err());
     }
 
     #[test]

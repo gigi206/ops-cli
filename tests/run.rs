@@ -97,6 +97,20 @@ fn app_in(project: &Path, data: &Path, name: &str) -> Output {
         .expect("spawn ops app")
 }
 
+/// `ops app <name> -- <extra...>`: the passthrough form, where `extra` is appended to the app's
+/// declared command.
+fn app_in_args(project: &Path, data: &Path, name: &str, extra: &[&str]) -> Output {
+    ops()
+        .arg("app")
+        .arg(name)
+        .arg("--")
+        .args(extra)
+        .current_dir(project)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("spawn ops app")
+}
+
 /// `ops <args>` from `project` with both the data dir and the trust-store dir
 /// redirected, so a test can trust a project and launch it without touching the
 /// real `$HOME` or the user's trust store.
@@ -439,7 +453,9 @@ fn ops_app_launches_the_apps_command_with_its_overlay() {
           [app.greet]\n\
           cmd = [\"printenv\", \"APPVAR\"]\n\
           [app.greet.env]\n\
-          APPVAR = \"from-app\"\n",
+          APPVAR = \"from-app\"\n\n\
+          [app.echoer]\n\
+          cmd = [\"echo\", \"BASE\"]\n",
     )
     .unwrap();
 
@@ -468,6 +484,21 @@ fn ops_app_launches_the_apps_command_with_its_overlay() {
         String::from_utf8_lossy(&greet.stdout).contains("from-app"),
         "the app env overlay did not reach the cage: {}",
         String::from_utf8_lossy(&greet.stdout)
+    );
+
+    // Arguments after `--` are appended to the app's declared command. `echoer` runs `echo BASE`;
+    // launched as `ops app echoer -- EXTRA-ARG` it prints `BASE EXTRA-ARG`, so the tail reached the
+    // program's argv (echo never emits EXTRA-ARG on its own) while the profile's own argv (BASE) is
+    // preserved. This proves the append on the unwrapped launch path; the wrapped path (packages /
+    // network) forwards the command positionally, so the multi-element `printenv APPVAR` above
+    // already shows wrapping preserves every element.
+    let echoed = app_in_args(project.path(), data.path(), "echoer", &["EXTRA-ARG"]);
+    let echoed_out = String::from_utf8_lossy(&echoed.stdout);
+    assert!(
+        echoed_out.contains("BASE") && echoed_out.contains("EXTRA-ARG"),
+        "extra args after `--` did not reach the app command: stdout={:?} stderr={:?}",
+        echoed_out,
+        String::from_utf8_lossy(&echoed.stderr)
     );
 
     // An unknown app name is a clean usage error, not a launch.

@@ -404,7 +404,7 @@ fn redirect_to_log(log: &File) {
 /// locked-down posture as `ops run`; the overlay's security fields took effect only if their
 /// source was trusted (the global config or a trusted project), so launching an app on
 /// untrusted code is as safe as `ops run` there.
-pub(crate) fn app(name: &str, detach: bool) -> ExitCode {
+pub(crate) fn app(name: &str, detach: bool, extra: Vec<OsString>) -> ExitCode {
     let mut prep = match prepare() {
         Ok(p) => p,
         Err(code) => return code,
@@ -421,8 +421,11 @@ pub(crate) fn app(name: &str, detach: bool) -> ExitCode {
     }
     // The argv and the home scope are owned by the app; read them before the overlay is folded
     // in (which moves the app but does not touch them). The scope keys this app's persistent
-    // home: one shared across projects (`Global`) or one per project (`Project`).
-    let cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
+    // home: one shared across projects (`Global`) or one per project (`Project`). Any trailing
+    // `ops app <name> -- <args>` are appended to the declared `cmd`, so the caller can pass a flag
+    // to the launched program (e.g. `-c` to resume) without editing the profile.
+    let mut cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
+    cmd.extend(extra);
     let runtime = match app.home_scope {
         crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
         crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
