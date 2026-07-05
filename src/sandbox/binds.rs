@@ -561,14 +561,17 @@ pub(crate) fn flake_out_link_rev(name: &str, rev: &str) -> PathBuf {
 /// mount.
 pub(crate) const SHELL_RC_INCAGE: &str = "/opt/ops/bashrc";
 
-/// The synthetic interactive-shell rc: show the egress contract once (to stderr, so a
-/// captured stdout stays clean), source the home's own `.bashrc` if the agent has written
-/// one, then activate mise so its activated tools manage PATH/env. Static (no per-project
-/// data, so the same bytes back every cage), bound read-only from outside every writable
-/// mount, so the agent cannot rewrite what its own shell sources. The contract `cat` is
-/// guarded on the variable being set and readable, so it is a no-op where the handle is
-/// absent.
+/// The synthetic interactive-shell rc: set a default prompt that names the cage, show the
+/// egress contract once (to stderr, so a captured stdout stays clean), source the home's own
+/// `.bashrc` if the agent has written one, then activate mise so its activated tools manage
+/// PATH/env. Static (no per-project data, so the same bytes back every cage), bound read-only
+/// from outside every writable mount, so the agent cannot rewrite what its own shell sources.
+/// The prompt uses `\h`, which resolves to the cage's `ops-<slug>` hostname, so `ops shell`
+/// reads `(ops-<slug>) <cwd>$` instead of the bare `bash-<v>$` default — set *before* the
+/// `.bashrc` source so a home's own `PS1` still wins. The contract `cat` is guarded on the
+/// variable being set and readable, so it is a no-op where the handle is absent.
 const SHELL_RC_CONTENTS: &str = "\
+PS1='(\\h) \\w\\$ '\n\
 [ -r \"$OPS_EGRESS_CONTRACT\" ] && cat \"$OPS_EGRESS_CONTRACT\" >&2\n\
 [ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
 command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
@@ -873,12 +876,22 @@ pub(crate) fn build_spec(
         shell_rc_src: &shell_rc,
         contract_src: &contract,
     };
-    assemble(&paths, userland, nix, overlay, extra_binds, net, cmd).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid sandbox spec: {e:?}"),
-        )
-    })
+    // The cage's readable name: the app name for `ops app <name>`, else the project's own
+    // directory name. Carried on the spec so the scope, hostname, and session listing all
+    // read the same slug.
+    let app = match runtime {
+        Runtime::ProjectDefault => None,
+        Runtime::GlobalApp(name) | Runtime::ProjectApp(name) => Some(name),
+    };
+    let slug = super::naming::cage_slug(app, &project);
+    assemble(&paths, userland, nix, overlay, extra_binds, net, cmd)
+        .map(|spec| spec.with_cage_slug(slug))
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid sandbox spec: {e:?}"),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -904,6 +917,23 @@ mod tests {
             "a pinned out-link differs from the floating one"
         );
         assert!(a.ends_with(format!("flake-tool-{rev_a}")));
+    }
+
+    #[test]
+    fn the_shell_rc_sets_a_cage_naming_prompt_before_sourcing_bashrc() {
+        // The interactive prompt names the cage via `\h` (the `ops-<slug>` hostname), and is
+        // set *before* the home's own `.bashrc` is sourced, so a user's own `PS1` still wins.
+        let rc = SHELL_RC_CONTENTS;
+        let ps1 = rc.find("PS1=").expect("the rc sets a default PS1");
+        let source = rc.find(".bashrc").expect("the rc sources the home .bashrc");
+        assert!(
+            ps1 < source,
+            "PS1 is a default set before .bashrc can override it"
+        );
+        assert!(
+            rc.contains("\\h"),
+            "the prompt names the cage via its hostname"
+        );
     }
 
     fn userland() -> Userland {

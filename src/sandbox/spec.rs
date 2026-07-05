@@ -118,6 +118,11 @@ pub(crate) struct SandboxSpec {
     pub(super) terminal: TerminalPolicy,
     /// The program and its arguments; `cmd[0]` is the executable.
     pub(super) cmd: Vec<OsString>,
+    /// The cage's readable name slug (the app or project the launch is for), shown on
+    /// every face a cage surfaces through — the systemd scope, the in-cage hostname, the
+    /// session listing. [`SandboxSpec::new`] defaults it to `cage`; the real launch path
+    /// sets it via [`SandboxSpec::with_cage_slug`].
+    pub(super) cage_slug: String,
 }
 
 impl SandboxSpec {
@@ -147,7 +152,15 @@ impl SandboxSpec {
             net,
             terminal: TerminalPolicy::NewSession,
             cmd,
+            cage_slug: "cage".to_string(),
         })
+    }
+
+    /// Set the cage's readable name slug (see [`SandboxSpec::cage_slug`]). The launch path
+    /// derives it from the app or project via [`super::naming::cage_slug`].
+    pub(crate) fn with_cage_slug(mut self, slug: String) -> Self {
+        self.cage_slug = slug;
+        self
     }
 
     /// Switch to a private-pty terminal (see [`TerminalPolicy::PrivateTty`]).

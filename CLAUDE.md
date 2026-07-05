@@ -95,6 +95,44 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Cage naming — one `ops-<slug>` name across the scope, hostname, and `ops ls` (DONE 2026-07-05)**
+  (`src/sandbox/naming.rs` [new] + `cgroup.rs` + `argv.rs` + `binds.rs` + `spec.rs` + `mod.rs` +
+  `src/main.rs`): a cage had three opaque/undifferentiated names — the systemd scope was
+  `run-p<pid>-i<pid>.scope`, the in-cage hostname was a fixed `sandbox` for **every** cage, and
+  `ops ls` showed only `[run]`/`app:<name>`. They now all read **one** readable name, `ops-<slug>`,
+  derived once from the launch's **own** identity (the app name for `ops app <name>`, else the
+  project's directory name — never an untrusted field, so naming grants no new host influence;
+  security-neutral, since the project is already bind-mounted at its real path in-cage). A new pure
+  `naming` module owns the shared derivation: `cage_slug` sanitizes to the charset common to a
+  systemd unit name **and** a DNS hostname label (lowercase `[a-z0-9-]`, common accented Latin
+  transliterated — `café`→`cafe`, `Zürich`→`zurich` — every other non-alnum→`-`, collapse/trim,
+  bounded to 50, empty→`cage`); `cage_hostname`/`scope_unit`/`cage_name` compose the three faces. The slug is carried on `SandboxSpec.cage_slug` (default `cage`, builder `with_cage_slug`),
+  computed once in `binds::build_spec`. **Face 1 — systemd scope** (`cgroup::wrap`/`scope_wrapper`):
+  `--unit=ops-<slug>-<pid>.scope`, so `systemctl --user`/`ps`/`systemd-cgls` read it. Uniqueness is
+  **load-bearing** — `systemd-run` fails a launch on a live unit-name collision, so `--collect` (frees
+  a finished name) + the launcher pid (two cages of one project share a slug) is required; the one
+  multi-cage-per-process path (`ops upgrade`) is sequential. Probed live that `--unit=X.scope` yields
+  exactly `X.scope`. **Face 2 — hostname** (`argv.rs`): `--hostname ops-<slug>` (was the fixed
+  `sandbox`); still never reveals the *host's* hostname (the unshared UTS ns's point); affects
+  `$HOSTNAME`/`uname -n`. **Face 3 — shell prompt** (`binds.rs` `SHELL_RC_CONTENTS`): a
+  `PS1='(\h) \w\$ '` set **before** the home's `.bashrc` source (an overridable default), so `\h`
+  resolves to the `ops-<slug>` hostname and `ops shell` reads `(ops-<slug>) <cwd>$` instead of the
+  bare `bash-<v>$`. **Face 4 — `ops ls` NAME column** (`main.rs::list_sessions`): computed **at render
+  time** via `sandbox::cage_name(s.app(), &s.project)` from the session record, so it **cannot drift**
+  from the scope/hostname (the single-slug design's whole point). **Golden-rule live verifications that
+  shaped the design:** the `hostname` *command* is not in the cage (base toolset), and the prompt did
+  **not** show the hostname (the synthetic bashrc set no `PS1` → bash's compiled `bash-<v>$` default) —
+  so a hostname change alone doesn't touch the prompt (the PS1 was added deliberately, user-chosen via
+  AskUserQuestion); and `/etc/hosts` was **dropped** as a non-problem (nothing binds it, `sandbox`/
+  `localhost` already don't resolve with zero complaints, and the tools that warn `unable to resolve
+  host` — `sudo`/`getent`/`hostname` — aren't in the cage, so it would only widen the mount surface).
+  All three faces **live-proven to show the same name** for one cage (`ops-lsname` scope+hostname+ls;
+  `ops-hostv2` env/uname; `(ops-ptyprompt) …$` real pty prompt). Increment-1 non-regression closed per
+  the advisor: exec path (live `ops run`) + pty path (`shell.rs` 2/2) + limits still land with `--unit`
+  present (`run.rs` cgroup e2e). **867 unit** (net-new: 9 naming + 2 argv hostname + 1 cgroup `--unit`
+  [ran with teeth on this host] + 1 binds PS1-order) green, fmt/clippy `-D warnings` clean, **std-only**
+  (no new dep). Shipped incrementally (scope → hostname+prompt → ls), advisor-reviewed (direction + the
+  incr-1 gap-close + the verify-first discipline on the two hostname premises).
   **Proactive `ops net allow|deny <rule> --session` + the effective-policy pivot (DONE 2026-07-05)**
   (`src/sandbox/{control.rs,proxy.rs,egress.rs}` + `src/{main,help}.rs` + `docs/guide/networking/
   {ask,rules}.md` + `cli/net.md` + `tests/net.rs`): a `--session` egress rule can now be **loaded into

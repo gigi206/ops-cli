@@ -463,7 +463,15 @@ fn list_sessions() -> ExitCode {
     let (h, n, r) = (pal.head, pal.name, pal.reset);
     // The header is padded first, then wrapped, so the color spans never count toward the
     // column widths and the alignment is identical with or without color.
-    let header = format!("{:<14}  {:>8}  {:>8}  PROJECT", "KIND", "PID", "AGE");
+    // The NAME column is the cage's own name — `ops-<slug>`, the *same* name shown by its
+    // systemd scope (`systemctl --user`) and its in-cage hostname — so a session here can be
+    // cross-referenced with the host tooling and the shell inside it. It is computed from the
+    // record's app/project via the one `cage_name` helper the scope and hostname also use, so
+    // the three can never drift.
+    let header = format!(
+        "{:<20}  {:<14}  {:>8}  {:>8}  PROJECT",
+        "NAME", "KIND", "PID", "AGE"
+    );
     println!("{h}{header}{r}");
     let uptime = uptime_seconds();
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
@@ -475,12 +483,13 @@ fn list_sessions() -> ExitCode {
             }
             _ => "?".to_string(),
         };
-        // An app session shows its app name (`app:<name>`), so the user can tell which sessions are
-        // agents — and that `ops attach`/`ops stop` act on that app's isolated environment. The
-        // label is padded before coloring so the spans do not disturb the column width.
+        // An app session's KIND shows its app name (`app:<name>`), so the user can tell which
+        // sessions are agents — and that `ops attach`/`ops stop` act on that app's isolated
+        // environment. NAME/KIND are padded before coloring so the spans do not disturb the widths.
+        let name = format!("{:<20}", sandbox::cage_name(s.app(), &s.project));
         let label = format!("{:<14}", s.label());
         println!(
-            "{n}{label}{r}  {:>8}  {:>8}  {}",
+            "{n}{name}{r}  {label}  {:>8}  {:>8}  {}",
             s.pid,
             age,
             s.project.display()

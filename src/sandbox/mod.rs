@@ -20,6 +20,7 @@ mod gc;
 mod launch;
 mod mise;
 mod miseplugin;
+mod naming;
 mod nixhub;
 mod packages;
 mod projectstore;
@@ -39,6 +40,7 @@ pub(crate) use flake::{
 pub(crate) use launch::{
     app, attach, effective_lock_target, gc, run, run_mise, shell, stop, upgrade_mise_packages,
 };
+pub(crate) use naming::cage_name;
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 pub(crate) use proxy::{builtin_allow_rules, union_with_builtin};
 pub(crate) use search::run as search;

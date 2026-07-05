@@ -261,7 +261,7 @@ fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
 /// The `systemd-run` launcher and the argv prefix (ending with `--`) that wraps a
 /// command in a transient scope carrying the enforceable limits, or `None` when no
 /// limit can be applied on this host (graceful degradation).
-fn scope_wrapper(limits: &Limits) -> Option<(PathBuf, Vec<OsString>)> {
+fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
     let (systemd_run, props) = limiter(limits)?;
     let mut prefix = vec![
         OsString::from("--user"),
@@ -270,6 +270,17 @@ fn scope_wrapper(limits: &Limits) -> Option<(PathBuf, Vec<OsString>)> {
         // even if it fails, so repeated launches never accumulate dead units.
         OsString::from("-q"),
         OsString::from("--collect"),
+        // Name the scope after the cage so it reads legibly in `systemctl --user`,
+        // `ps`, and `systemd-cgls` instead of the opaque `run-p<pid>-i<pid>.scope`
+        // systemd would auto-assign. `systemd-run` fails a launch outright on a live
+        // unit-name collision, so uniqueness is load-bearing, not cosmetic: the launcher
+        // pid distinguishes two cages of one project (which share a slug), and `--collect`
+        // frees a finished cage's name so it never blocks the next. The one multi-cage
+        // path in a single process (`ops upgrade`) runs its cages sequentially.
+        OsString::from(format!(
+            "--unit={}",
+            super::naming::scope_unit(cage_slug, std::process::id())
+        )),
     ];
     for p in props {
         prefix.push(OsString::from("-p"));
@@ -287,8 +298,9 @@ pub(crate) fn wrap(
     bwrap: &Path,
     bwrap_argv: Vec<OsString>,
     limits: &Limits,
+    cage_slug: &str,
 ) -> (PathBuf, Vec<OsString>) {
-    compose(scope_wrapper(limits), bwrap, bwrap_argv)
+    compose(scope_wrapper(limits, cage_slug), bwrap, bwrap_argv)
 }
 
 /// Pure composition of a launch from an optional scope wrapper: with `Some` the
@@ -582,6 +594,37 @@ mod tests {
         let marker = full.iter().position(|a| a == "--").expect("a -- marker");
         assert_eq!(full[marker + 1], bwrap.as_os_str());
         assert_eq!(&full[marker + 2..], &argv[..]);
+    }
+
+    #[test]
+    fn a_scope_wrapper_names_the_unit_after_the_cage() {
+        // The scope carries a legible unit name built from the cage slug, so a running
+        // cage is identifiable in `systemctl --user`/`ps`/`systemd-cgls` rather than
+        // systemd's opaque `run-p<pid>-i<pid>.scope`. Skips where no user session can
+        // create a scope (as the landing test does), so it is silent in a headless CI.
+        if crate::pathfind::find_on_path("systemd-run").is_none()
+            || std::env::var_os("XDG_RUNTIME_DIR").is_none()
+        {
+            eprintln!("skipping scope-unit test: no systemd user session");
+            return;
+        }
+        let Some((_launcher, prefix)) = scope_wrapper(&Limits::default(), "demo-app") else {
+            eprintln!("skipping scope-unit test: no delegated controller");
+            return;
+        };
+        let unit = prefix
+            .iter()
+            .find_map(|a| a.to_str()?.strip_prefix("--unit="))
+            .expect("a --unit= argument is present");
+        assert!(
+            unit.starts_with("ops-demo-app-") && unit.ends_with(".scope"),
+            "the unit is named after the cage slug: {unit}"
+        );
+        // The pid segment is the launcher's, keeping concurrent same-slug scopes distinct.
+        assert!(
+            unit.contains(&std::process::id().to_string()),
+            "the unit carries the launcher pid: {unit}"
+        );
     }
 
     /// The profile properties must produce the intended kernel limits, not merely

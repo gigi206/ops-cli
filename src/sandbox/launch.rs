@@ -2301,7 +2301,7 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
             return 1;
         }
     };
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits);
+    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, &spec.cage_slug);
     match Command::new(prog).args(args).status() {
         Ok(status) => status_code(status),
         Err(e) => {
@@ -2349,7 +2349,7 @@ fn exec(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io:
     };
     // `_seccomp` stays alive until the exec replaces this process (or, on failure,
     // until this returns), so bwrap can read the inherited filter descriptors.
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits);
+    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, &spec.cage_slug);
     Command::new(prog).args(args).exec()
 }
 
@@ -2369,7 +2369,7 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -
     // between fork and exec may allocate.
     let mut bwrap_argv = super::seccomp::argv_prefix(&seccomp);
     bwrap_argv.extend(super::argv::to_argv(spec));
-    let (program, full_argv) = super::cgroup::wrap(bwrap, bwrap_argv, limits);
+    let (program, full_argv) = super::cgroup::wrap(bwrap, bwrap_argv, limits, &spec.cage_slug);
     let program_c = cstring(program.as_os_str().as_bytes())?;
     let mut argv_owned = vec![program_c.clone()];
     for arg in &full_argv {
