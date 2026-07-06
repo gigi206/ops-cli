@@ -221,9 +221,17 @@ pub(crate) enum Methods {
 
 impl Methods {
     /// Whether this set applies to `method` (already uppercased by the caller). `Unspecified` and
-    /// `Any` both admit every verb (the difference between them is only whether `default_methods`
+    /// `Any` both admit every HTTP verb (the difference between them is only whether `default_methods`
     /// may rewrite them, resolved before matching); `Only` admits exactly the listed ones.
+    ///
+    /// `WS` (the WebSocket-upgrade pseudo-verb the proxy checks for an `Upgrade: websocket` handshake)
+    /// is special: it is a distinct, unredactable bidirectional capability, not just another HTTP
+    /// method, so an unrestricted allowance does NOT grant it — only a rule that names `WS` explicitly
+    /// (`{WS}` or `{…,WS}`) admits it. Neither a bare/`Unspecified` rule nor `{*}` opens a WebSocket.
     fn admits(&self, method: &str) -> bool {
+        if method == "WS" {
+            return matches!(self, Methods::Only(ms) if ms.iter().any(|m| m == "WS"));
+        }
         match self {
             Methods::Unspecified | Methods::Any => true,
             Methods::Only(ms) => ms.iter().any(|m| m == method),
@@ -1709,6 +1717,67 @@ mod tests {
         assert!(matches!(
             clear.explain_clear("example.com", 8080, "/", "GET"),
             Decision::DeniedDefault
+        ));
+    }
+
+    #[test]
+    fn a_websocket_pseudo_verb_needs_an_explicit_ws_grant() {
+        // WS is a distinct capability: neither an unrestricted `{*}` nor a bare rule grants it — only
+        // a rule that names `WS`. A method-restricted HTTP rule never opens a WebSocket either.
+        let any = allow(&["{*} example.com"]);
+        assert!(matches!(
+            any.explain("example.com", 443, "/", "GET"),
+            Decision::AllowedBy(_)
+        ));
+        assert!(
+            matches!(
+                any.explain("example.com", 443, "/", "WS"),
+                Decision::DeniedDefault
+            ),
+            "`{{*}}` must not grant WS"
+        );
+
+        let bare = allow(&["example.com"]);
+        assert!(
+            matches!(
+                bare.explain("example.com", 443, "/", "WS"),
+                Decision::DeniedDefault
+            ),
+            "a bare rule must not grant WS"
+        );
+
+        let get = allow(&["{GET} example.com"]);
+        assert!(
+            matches!(
+                get.explain("example.com", 443, "/", "WS"),
+                Decision::DeniedDefault
+            ),
+            "`{{GET}}` must not grant WS"
+        );
+
+        // An explicit `{WS}` grants the upgrade — but not an HTTP GET (a different capability).
+        let ws = allow(&["{WS} example.com"]);
+        assert!(matches!(
+            ws.explain("example.com", 443, "/", "WS"),
+            Decision::AllowedBy(_)
+        ));
+        assert!(
+            matches!(
+                ws.explain("example.com", 443, "/", "GET"),
+                Decision::DeniedDefault
+            ),
+            "`{{WS}}` alone does not grant an HTTP GET"
+        );
+
+        // `{GET,WS}` grants both explicitly.
+        let both = allow(&["{GET,WS} example.com"]);
+        assert!(matches!(
+            both.explain("example.com", 443, "/", "GET"),
+            Decision::AllowedBy(_)
+        ));
+        assert!(matches!(
+            both.explain("example.com", 443, "/", "WS"),
+            Decision::AllowedBy(_)
         ));
     }
 

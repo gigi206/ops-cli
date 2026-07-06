@@ -51,6 +51,9 @@ allow = [
   #"{*} https://ab.chatgpt.com",
   "{GET} https://auth.openai.com",
   "{POST} https://github.com/openai/plugins.git/git-upload-pack",
+  # codex streams over `wss://chatgpt.com`. A WebSocket is a distinct capability that a plain `{*}`
+  # does NOT grant (it is a bidirectional, uninspected channel) — it must be named explicitly.
+  "{WS} https://chatgpt.com",
 ]
 
 # API-key path: the real key is read on the HOST and injected by the egress proxy — never in

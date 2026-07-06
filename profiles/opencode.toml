@@ -22,14 +22,23 @@ opencode = "mise:opencode"
 mode = "deny"
 # api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
 # and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
-allow = ["{*} https://api.anthropic.com", "{GET,HEAD} https://models.dev"]
+allow = [
+  "{GET} https://models.dev",
+  "{GET} https://registry.npmjs.org",
+  "{*} https://opencode.ai",
+  # opencode opens a WebSocket to its service. A WebSocket is a distinct capability a plain `{*}`
+  # does NOT grant (a bidirectional, uninspected channel) — it must be named explicitly. If opencode
+  # still logs "Falling back from WebSockets to HTTPS", `ops net logs -a opencode` shows the refused
+  # WS host (flagged `ws`, reason `denied-method`); move this `{WS}` grant to that host.
+  "{WS} https://opencode.ai",
+]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the
 # cage. Provide it on the host as $ANTHROPIC_API_KEY (or a resolver).
 [env]
-ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 
-[secret."api.anthropic.com"]
-from = "env://ANTHROPIC_API_KEY"
-header = "x-api-key"
-type = "raw"
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
