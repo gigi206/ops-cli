@@ -761,6 +761,13 @@ impl ProxyCtx {
         self
     }
 
+    /// Shrink the per-socket timeout, so a test can provoke an idle-timeout window in milliseconds
+    /// instead of the production 30 s.
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Replace the upstream-validation config, so a test can trust a loopback upstream's own CA.
     fn with_upstream(mut self, upstream: Arc<ClientConfig>) -> Self {
         self.upstream = upstream;
@@ -1401,6 +1408,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     copy_exact(&mut br, &mut upstream, body_len)?;
     upstream.flush().ok();
 
+    // The request is permitted and fully forwarded; the response may now idle between bursts (a
+    // streamed completion), so lift the upstream read timeout for the relay below.
+    begin_response_stream(&upstream.sock);
+
     // 9b. Peek the response status line for the live log, best-effort. The bytes read here are NOT
     //     consumed — they are chained back ahead of the rest of the response, so the relay (and its
     //     redaction) still sees the whole stream unaltered. `set_status` amends the `allow` event
@@ -1432,6 +1443,9 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     } else {
         pump_to_eof(&mut response, br.get_mut())?;
     }
+    // The response is fully relayed — close the intercepted TLS cleanly so the client sees a proper
+    // end-of-stream, not a bare socket drop (the reported `without sending TLS close_notify`).
+    finish_tls(br.get_mut());
     Ok(())
 }
 
@@ -1957,6 +1971,10 @@ fn handle_cleartext(
     copy_exact(&mut client, &mut upstream, body_len)?;
     upstream.flush().ok();
 
+    // The request is permitted and fully forwarded; the response may now idle between bursts, so
+    // lift the upstream read timeout for the relay below (same rationale as the tunneled path).
+    begin_response_stream(&upstream);
+
     // 9. Peek the status line for the live log (non-consuming — chained back), then stream the whole
     //    response to the client and close. A cleartext host is never a credential-injection target, so
     //    it can carry no *reflected* secret to mask — the response is relayed unredacted (there is
@@ -2256,6 +2274,43 @@ fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result
     Ok(())
 }
 
+/// Enter the response-streaming phase of an inspected (L7) request: lift the per-read timeout on
+/// the validated upstream socket so a long-lived or bursty response — server-sent events, a slow
+/// completion that idles between tokens — is not aborted mid-flight. The timeout the serve loop set
+/// bounds a slowloris on the *request head*; by here the request is permitted and forwarded, so an
+/// idle upstream is a legitimate stream, not an attack (the raw L4 splice clears its timeouts for
+/// the same reason). Leaving it in place instead abruptly drops the connection at the timeout, which
+/// the in-cage client sees as a truncated stream (`peer closed connection without sending TLS
+/// close_notify`) — the failure mode that cut streaming agents mid-completion.
+///
+/// The client *write* timeout is deliberately left untouched, so a stalled in-cage reader still
+/// cannot pin a proxy thread indefinitely, and the forced `Connection: close` means a finished
+/// upstream closes and ends the relay with a clean EOF. Residual (bounded by `MAX_CONCURRENT_CONNS`,
+/// same-tenant): an upstream that neither sends nor closes while its client has gone away can hold a
+/// thread until it does — the accepted cost of not killing a genuinely idle stream, as for the L4
+/// splice.
+fn begin_response_stream(upstream: &TcpStream) {
+    let _ = upstream.set_read_timeout(None);
+}
+
+/// Cleanly shut down the interception TLS after a response is fully relayed: queue a `close_notify`
+/// and flush the connection's pending TLS records to the client socket. The sending half-close is
+/// the correct TLS teardown; without it the client sees a bare socket close after the last byte,
+/// which a streaming client surfaces as `peer closed connection without sending TLS close_notify`
+/// even though the whole body arrived — the same error shape as an idle cut, but at end-of-stream.
+/// It matters most for a close-delimited response (no `Content-Length`), where the client relies on
+/// the shutdown to know the body ended. Best-effort: a client that already went away just makes the
+/// writes fail, which ends the loop.
+fn finish_tls(stream: &mut StreamOwned<ServerConnection, UnixStream>) {
+    stream.conn.send_close_notify();
+    while stream.conn.wants_write() {
+        if stream.conn.write_tls(&mut stream.sock).is_err() {
+            break;
+        }
+    }
+    let _ = stream.sock.flush();
+}
+
 /// Stream `r` to `w` until end of input. A peer that drops the TLS connection without a
 /// `close_notify` surfaces as an unexpected EOF, which ends the stream normally rather than erroring.
 fn pump_to_eof<R: Read, W: Write>(r: &mut R, w: &mut W) -> io::Result<()> {
@@ -2487,6 +2542,53 @@ mod tests {
         (addr, ca_der, handle)
     }
 
+    /// Like [`spawn_upstream`] but streams its reply in two parts with an idle gap between them — a
+    /// stand-in for a streaming completion / server-sent-events response that pauses between bursts.
+    /// It sends `head_and_first`, sleeps `idle`, sends `rest`, then closes (EOF ends the relay).
+    fn spawn_upstream_idle(
+        head_and_first: &'static [u8],
+        idle: Duration,
+        rest: &'static [u8],
+    ) -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            // drain the request head so the reply is not pipelined ahead of it
+            {
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let _ = tls.write_all(head_and_first);
+            let _ = tls.flush();
+            thread::sleep(idle);
+            let _ = tls.write_all(rest);
+            let _ = tls.flush();
+        });
+        (addr, ca_der, handle)
+    }
+
     /// Like [`spawn_upstream`] but reports the request head it received over a channel, so a test
     /// can assert what the proxy actually forwarded (e.g. a forced `Connection: close`).
     fn spawn_upstream_capturing(
@@ -2584,6 +2686,52 @@ mod tests {
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
             Err(e) => return Err(e),
         }
+        Ok(resp)
+    }
+
+    /// Like [`through_proxy`] but does NOT tolerate a missing TLS `close_notify`: the final read must
+    /// terminate cleanly (`Ok`), so a test can assert the proxy shuts the intercepted TLS down
+    /// properly instead of dropping the socket — the exact defect a streaming client reports as
+    /// `peer closed connection without sending TLS close_notify`.
+    fn through_proxy_clean_close(
+        ctx: Arc<ProxyCtx>,
+        proxy_ca: CertificateDer<'static>,
+        connect_host: &str,
+        connect_port: u16,
+        request: &[u8],
+    ) -> io::Result<String> {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        write!(
+            sock,
+            "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+        )
+        .unwrap();
+        sock.flush().unwrap();
+        let established = read_until_blank(&mut sock)?;
+        assert!(
+            established.contains("200 Connection established"),
+            "CONNECT not accepted: {established:?}"
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(proxy_ca).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(connect_host.to_string()).unwrap();
+        let conn =
+            ClientConnection::new(Arc::new(client_config), name).map_err(io::Error::other)?;
+        let mut tls = StreamOwned::new(conn, sock);
+        tls.write_all(request)?;
+        tls.flush().ok();
+        let mut resp = String::new();
+        // Propagate a missing close_notify (UnexpectedEof) instead of swallowing it — the whole point.
+        tls.read_to_string(&mut resp)?;
         Ok(resp)
     }
 
@@ -2807,6 +2955,97 @@ mod tests {
         assert_eq!(events[0].host, "upstream.test");
         assert_eq!(events[0].method.as_deref(), Some("GET"));
         assert_eq!(events[0].path.as_deref(), Some("/path"));
+    }
+
+    /// A streamed response that idles longer than the per-read timeout must not be cut: the failure
+    /// that truncated streaming agents (codex/opencode) mid-completion with a rustls "peer closed
+    /// connection without sending TLS close_notify". The timeout is shrunk to 200 ms and the upstream
+    /// pauses 500 ms mid-response; the whole body must still arrive. Teeth: without
+    /// `begin_response_stream` lifting the upstream read timeout, the pause aborts the relay and the
+    /// second half is lost — the assertion on `second` fails.
+    #[test]
+    fn a_streaming_response_that_idles_past_the_timeout_is_not_cut() {
+        let (addr, upstream_ca, up) = spawn_upstream_idle(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfirst-",
+            Duration::from_millis(500),
+            b"second",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_timeout(Duration::from_millis(200))
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /path HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(resp.contains("200 OK"), "status line missing: {resp:?}");
+        assert!(
+            resp.contains("first-") && resp.contains("second"),
+            "the streamed body was truncated at the idle gap: {resp:?}"
+        );
+    }
+
+    /// A completed response closes the intercepted TLS with a proper `close_notify`, so a streaming
+    /// client does not see the reported `peer closed connection without sending TLS close_notify` at
+    /// end-of-stream — even for a close-delimited reply (no `Content-Length`), which `Connection:
+    /// close` can push an upstream toward. Teeth: without `finish_tls` on the completion path, the
+    /// client's read ends in `UnexpectedEof` and `through_proxy_clean_close` returns that error, so
+    /// the `unwrap` panics.
+    #[test]
+    fn a_completed_response_ends_with_a_clean_tls_close_notify() {
+        // A close-delimited reply: no Content-Length, the body is ended by the upstream closing.
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstreamed-body",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+
+        let resp = through_proxy_clean_close(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            b"GET /path HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(
+            resp.contains("streamed-body"),
+            "the body was not fully relayed: {resp:?}"
+        );
     }
 
     #[test]
