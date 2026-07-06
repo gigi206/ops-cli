@@ -52,7 +52,7 @@ const PROFILES_DIR: &str = "apps";
 /// between the subcommand and launching an app literally named `import`, and such an app could be
 /// neither launched nor managed. Reserving them removes the ambiguity at the source — they are
 /// rejected as app names wherever one is resolved.
-pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list"];
+pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list", "ls"];
 
 /// Whether `name` is a reserved `ops app` subcommand verb, and so may not be an app name.
 pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
@@ -515,6 +515,15 @@ pub(crate) struct Resolved {
     pub(crate) gui: GuiPolicy,
     /// Which layer supplied the winning `gui` posture (`Default` when neither config set it).
     pub(crate) gui_origin: Provenance,
+    /// Host loopback TCP ports forwarded into the cage (see [`RawConfig::forward`]). A security
+    /// field, gated like `network`/`gui`; the merged set is the union of the global and a trusted
+    /// project's ports (an untrusted project's ports are dropped, never added), so a trusted
+    /// layer's ports survive an untrusted overlay. Empty when no layer declared any.
+    pub(crate) forward: Vec<u16>,
+    /// Which layer supplied the winning `forward` set. The union means a value here is the
+    /// *highest-trust* layer that contributed any port (`Default` when none did). A display
+    /// affordance for `ops config`; the launcher ignores it.
+    pub(crate) forward_origin: Provenance,
     /// The resolved cgroup resource limits (anti-DoS): the built-in defaults, with any field a
     /// trusted `[limits]` table (global or project) overrode. A security field, gated like
     /// `network`/`gui` — an untrusted project may not loosen a limit. Each of the three fields is
@@ -588,6 +597,11 @@ pub(crate) struct ResolvedApp {
     /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
     /// means the app tunes nothing and inherits the baseline limits.
     pub(crate) limits: crate::sandbox::cgroup::Limits,
+    /// The app's own host loopback forward ports, set only from a trusted source (an untrusted
+    /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
+    /// baseline's at [`merge_app`]; an empty vec means the app adds none and inherits the baseline
+    /// set. A security field, gated like the baseline `forward`.
+    pub(crate) forward: Vec<u16>,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
     /// The verbs this app's unscoped (`{...}`-less) allow rules default to — its read-by-default
@@ -605,6 +619,10 @@ pub(crate) struct ResolvedApp {
     pub(crate) network_origin: Provenance,
     pub(crate) gui_origin: Provenance,
     pub(crate) limits_origin: LimitsOrigin,
+    /// Which app layer (`Global`/`Project`) supplied the app's own `forward` ports, or `Default`
+    /// when the app declared none. The merged effective set is the app's own ∪ the baseline's;
+    /// a port the app did not contribute is shown as inherited from the baseline.
+    pub(crate) forward_origin: Provenance,
     pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `ops run`.
@@ -650,6 +668,10 @@ impl Resolved {
         if let Some(gui) = app.gui {
             self.gui = gui;
         }
+        // The app's ports union onto the baseline's — an app adds ports, never removes or
+        // overrides the trusted baseline set (the flagship "agent on untrusted code" property,
+        // which holds because the untrusted contribution was dropped at resolve time).
+        union_forward(&mut self.forward, app.forward);
         overlay_limits(&mut self.limits, app.limits);
         // Drop the baseline secret-posture warning: it judged the *baseline* network, but the app's
         // posture re-decides injection just below — keeping it would let `ops app <name>` both inject
@@ -731,6 +753,7 @@ impl Resolved {
             gui,
             limits,
             secret,
+            forward,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time.
             nixpkgs: _,
@@ -819,6 +842,19 @@ impl Resolved {
         if let Some(over) = new_limits {
             mark_limit_origins(&mut self.limits_origin, &over, Provenance::Override);
             overlay_limits(&mut self.limits, over);
+        }
+
+        // `forward` — trusted by invocation; the ports add to the effective set (a collection, so a
+        // bad port — only `0` is possible after parse — is warned and skipped, not fatal). The
+        // override is the final word and additive: its ports union onto the resolved set, and the
+        // origin stamps `Override` when it contributes any (it cannot remove a baseline's ports,
+        // matching the additive model of `--bind`/`--package`).
+        if let Some(raw) = forward {
+            let validated = validate_forward(&mut self.warnings, OVERRIDE_SOURCE, &raw);
+            if !validated.is_empty() {
+                self.forward_origin = Provenance::Override;
+            }
+            union_forward(&mut self.forward, validated);
         }
 
         // `[secret]` — trusted by invocation; the credentials add to the effective set, resolved
@@ -1064,6 +1100,18 @@ fn resolve(
         }
         None => GuiPolicy::default(),
     };
+    // `forward` ports are trusted by location at the global layer; each invalid port is dropped
+    // (warned) and the rest kept. The merged set is a union (a project adds ports, never
+    // replaces), so the origin is `Global` only when this layer contributed any port.
+    let mut forward_origin = Provenance::Default;
+    let mut forward = global
+        .forward
+        .as_deref()
+        .map(|r| validate_forward(&mut warnings, GLOBAL_CONFIG, r))
+        .unwrap_or_default();
+    if !forward.is_empty() {
+        forward_origin = Provenance::Global;
+    }
     // Resource limits are trusted by location at the global layer; each invalid field is dropped
     // (warned) and the built-in default kept. The origin is recorded per field that the layer set.
     let mut limits = validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits);
@@ -1185,6 +1233,24 @@ fn resolve(
                 ));
             }
         }
+        // `forward` is a security field — a trusted project may add host loopback forward ports;
+        // an untrusted or changed one may not (opening a host port is a deliberate inbound hole).
+        // The ports union onto the global set: a project adds, never replaces (the flagship
+        // property holds because the untrusted contribution is dropped here, before the union).
+        if let Some(raw) = proj.forward {
+            if trusted {
+                let project_forward = validate_forward(&mut warnings, PROJECT_CONFIG, &raw);
+                if !project_forward.is_empty() {
+                    forward_origin = Provenance::Project;
+                }
+                union_forward(&mut forward, project_forward);
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `forward` ports ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `[limits]` is a security field — a trusted project may tune the cgroup limits; an
         // untrusted or changed one may not (loosening them weakens the anti-DoS control). The
         // three fields layer independently: a project's set field overrides the global one, an
@@ -1267,6 +1333,8 @@ fn resolve(
         egress_stats,
         gui,
         gui_origin,
+        forward,
+        forward_origin,
         limits,
         limits_origin,
         secrets,
@@ -1389,6 +1457,39 @@ fn overlay_limits(base: &mut crate::sandbox::cgroup::Limits, over: crate::sandbo
     if over.tasks_max.is_some() {
         base.tasks_max = over.tasks_max;
     }
+}
+
+/// Union `extra` ports into `base`, deduped and sorted. The `forward` model — a layer adds
+/// ports, never replaces — shared by the baseline project-over-global merge and the app overlay
+/// onto the baseline. A port already present is kept (idempotent); the result is sorted so two
+/// equivalent layers produce one canonical set.
+fn union_forward(base: &mut Vec<u16>, extra: Vec<u16>) {
+    for port in extra {
+        if !base.contains(&port) {
+            base.push(port);
+        }
+    }
+    base.sort_unstable();
+}
+
+/// Validate one `forward` port list: drop a port of `0` (not a real port; the range ceiling is
+/// already enforced by the `u16` type) with a per-port warning, keeping the rest. A collection —
+/// the drop-bad-entry, keep-the-rest shape (like a malformed `binds` entry), not the all-or-nothing
+/// of a scalar posture — so one bad port does not void the valid ones.
+fn validate_forward(warnings: &mut Vec<String>, source: &str, raw: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(raw.len());
+    for &port in raw {
+        if port == 0 {
+            warnings.push(format!(
+                "{source}: ignoring `forward` port `0` (not a real port)"
+            ));
+        } else {
+            out.push(port);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Record `layer` as the provenance of each limit field that `limits` actually sets (a `Some`
@@ -1626,6 +1727,11 @@ fn resolve_app(
     let mut cmd_origin = Provenance::Default;
     let mut network_origin = Provenance::Default;
     let mut gui_origin = Provenance::Default;
+    // The app's own loopback forward ports — a security field, gated like `network`/`gui`. The
+    // merged effective set (app ∪ baseline) is computed at `merge_app`; this holds only the app's
+    // own contribution, with its origin for the per-app view.
+    let mut forward: Vec<u16> = Vec::new();
+    let mut forward_origin = Provenance::Default;
     let mut limits_origin = LimitsOrigin::default();
     let mut home_scope_origin: Option<Provenance> = None;
 
@@ -1663,6 +1769,16 @@ fn resolve_app(
                 gui = Some(policy);
                 gui_origin = Provenance::Global;
             }
+        }
+        // `forward` is trusted by location at the global app layer; invalid ports are dropped
+        // (warned). The app's own set is kept separate here — it unions onto the baseline at
+        // `merge_app` — so the origin records only that this layer contributed.
+        if let Some(raw) = app.forward.as_deref() {
+            let validated = validate_forward(&mut warnings, &source, raw);
+            if !validated.is_empty() {
+                forward_origin = Provenance::Global;
+            }
+            union_forward(&mut forward, validated);
         }
         let global_limits = validate_limits(&mut warnings, &source, app.limits);
         mark_limit_origins(&mut limits_origin, &global_limits, Provenance::Global);
@@ -1767,6 +1883,23 @@ fn resolve_app(
                 ));
             }
         }
+        // `forward` mirrors `network`/`gui`: a trusted project may add forward ports to its own
+        // app or a trusted one; an untrusted project may not (opening a host port is an inbound
+        // hole). The ports union onto the app's own set, so the project adds, never replaces.
+        if let Some(raw) = app.forward {
+            if trusted {
+                let project_forward = validate_forward(&mut warnings, &source, &raw);
+                if !project_forward.is_empty() {
+                    forward_origin = Provenance::Project;
+                }
+                union_forward(&mut forward, project_forward);
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `forward` ports ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         if let Some(section) = app.secret {
             if trusted {
                 // A project-local app resolves its secrets against the project-effective defaults
@@ -1829,11 +1962,13 @@ fn resolve_app(
         network,
         gui,
         limits,
+        forward,
         secrets,
         default_methods,
         cmd_origin,
         network_origin,
         gui_origin,
+        forward_origin,
         limits_origin,
         home_scope_origin,
         warnings,
@@ -3942,6 +4077,7 @@ mod tests {
             nixpkgs: None,
             network: None,
             gui: None,
+            forward: None,
             secret: None,
             app: BTreeMap::new(),
             limits: None,
@@ -4331,6 +4467,14 @@ mod tests {
         }
     }
 
+    /// A `RawConfig` declaring `forward` ports.
+    fn raw_forward(ports: &[u16]) -> RawConfig {
+        RawConfig {
+            forward: Some(ports.to_vec()),
+            ..RawConfig::default()
+        }
+    }
+
     /// A `RawConfig` declaring a `[limits]` table from optional string tokens (each `None` leaves
     /// that field unset, falling back to the default).
     fn raw_limits(
@@ -4376,6 +4520,7 @@ mod tests {
                 .collect(),
             network,
             gui: None,
+            forward: None,
             secret: None,
             limits: None,
             home_scope: None,
@@ -4988,6 +5133,66 @@ mod tests {
         let app = &r.apps["mine"];
         assert_eq!(app.gui, None, "an untrusted project may not open a display");
         assert!(app.warnings.iter().any(|w| w.contains("gui")));
+    }
+
+    #[test]
+    fn a_global_apps_forward_survives_an_untrusted_projects_override_attempt() {
+        // The flagship property for the inbound hole: a globally-declared app keeps its forward
+        // ports even under an untrusted project, which may neither remove them nor open its own.
+        let global = raw_with_app(
+            "codex",
+            RawApp {
+                forward: Some(vec![1455]),
+                ..raw_app(&["codex"], &[], &[], &[], None)
+            },
+        );
+        // An untrusted project tries to add a port to the trusted app — dropped.
+        let project = raw_with_app(
+            "codex",
+            RawApp {
+                forward: Some(vec![31337]),
+                ..raw_app(&[], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["codex"];
+        assert_eq!(
+            app.forward,
+            vec![1455],
+            "an untrusted project may not add a forward port to a trusted app"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("forward")));
+
+        // The reverse: an untrusted project cannot open an inbound hole on its own app either.
+        let project = raw_with_app(
+            "mine",
+            RawApp {
+                forward: Some(vec![8080]),
+                ..raw_app(&["tool"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        let app = &r.apps["mine"];
+        assert!(
+            app.forward.is_empty(),
+            "an untrusted project may not open an inbound port"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("forward")));
+    }
+
+    #[test]
+    fn a_trusted_app_forward_is_honored() {
+        // A trusted (global-declared) app's forward ports are honored and carried on the overlay.
+        let global = raw_with_app(
+            "codex",
+            RawApp {
+                forward: Some(vec![1455]),
+                ..raw_app(&["codex"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.apps["codex"].forward, vec![1455]);
+        assert_eq!(r.apps["codex"].forward_origin, Provenance::Global);
     }
 
     /// Build a `RawLimits` from optional tokens, for the per-app overlay tests.
@@ -5631,6 +5836,8 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -5677,6 +5884,8 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -5708,6 +5917,8 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -5735,6 +5946,8 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -5853,6 +6066,8 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -5892,6 +6107,8 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -6903,6 +7120,58 @@ mod tests {
         assert_eq!(r.gui, GuiPolicy::None);
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("unknown gui posture `x11`"));
+    }
+
+    #[test]
+    fn the_default_forward_is_empty() {
+        // No declared ports means no inbound hole — the cage exposes no forwarded port.
+        assert!(resolve_no_plugins(RawConfig::default(), None)
+            .forward
+            .is_empty());
+    }
+
+    #[test]
+    fn a_trusted_project_forward_unions_onto_the_global_set() {
+        // global is trusted by location; a trusted project *adds* ports (the union model), it does
+        // not replace — and the merged set is sorted+deduped.
+        let r = resolve_no_plugins(
+            raw_forward(&[1455]),
+            Some((raw_forward(&[8080, 1455]), TrustState::Trusted)),
+        );
+        assert_eq!(
+            r.forward,
+            vec![1455, 8080],
+            "the project adds, never replaces"
+        );
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.forward_origin, Provenance::Project);
+    }
+
+    #[test]
+    fn an_untrusted_project_forward_is_dropped_but_the_global_survives() {
+        // The flagship property: an untrusted project may not open a host port. Its `forward` is
+        // dropped with a warning, and a globally-declared port survives intact (an agent runs *on*
+        // untrusted code without that code opening an inbound hole).
+        for state in [TrustState::Untrusted, TrustState::Changed] {
+            let r = resolve_no_plugins(raw_forward(&[1455]), Some((raw_forward(&[9090]), state)));
+            assert_eq!(
+                r.forward,
+                vec![1455],
+                "the trusted global port survives an untrusted overlay"
+            );
+            assert!(
+                r.warnings.iter().any(|w| w.contains("forward")),
+                "the dropped untrusted forward must warn"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_forward_port_is_dropped_with_a_warning() {
+        // Port 0 is not a real port — dropped (warned), the rest kept.
+        let r = resolve_no_plugins(raw_forward(&[0, 1455]), None);
+        assert_eq!(r.forward, vec![1455]);
+        assert!(r.warnings.iter().any(|w| w.contains("forward")));
     }
 
     #[test]

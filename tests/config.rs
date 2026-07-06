@@ -2792,6 +2792,13 @@ fn the_shipped_profiles_import_and_resolve() {
     // Every profile under the repo's `profiles/` directory must import cleanly (parse, have a
     // command, a usable name) and resolve as a launchable app — so a shipped profile is never
     // subtly broken, and the import path is re-exercised on real artifacts.
+    //
+    // Beyond "it imports", each profile's declared *security* fields must survive resolution to
+    // their intended values. A field written into the wrong TOML place — e.g. `forward` under a
+    // `[network]` table instead of at the top level — parses as an unknown key and is silently
+    // dropped (the schema is deliberately additive for forward-compatibility, so this is not an
+    // error). The value checks below therefore anchor on *intent*, read from the raw file text —
+    // never from the parse, which is exactly what would have swallowed the field.
     let fx = Fixture::new();
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
     let mut imported = Vec::new();
@@ -2807,6 +2814,61 @@ fn the_shipped_profiles_import_and_resolve() {
             "shipped profile `{name}` failed to import: {}",
             String::from_utf8_lossy(&imp.stderr)
         );
+
+        // The resolved app, as the machine-readable model — the effective (merged) view.
+        let out = fx.run(&["config", "show", "--app", &name, "--json"]);
+        assert!(
+            out.status.success(),
+            "config show --app {name} --json must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("profile `{name}` --app --json is not valid JSON: {e}"));
+
+        // What the file *intends*, read from its raw text so a misplaced key cannot hide it: a
+        // top-level key line (`forward = …`), or an uncommented `[secret]`/`[[secret."h"]]` table.
+        let text = std::fs::read_to_string(&path).expect("read the profile file");
+        let declares = |head: &str| {
+            text.lines().map(str::trim_start).any(|l| {
+                !l.starts_with('#')
+                    && l.starts_with(head)
+                    && (head.starts_with('[') || l[head.len()..].trim_start().starts_with('='))
+            })
+        };
+
+        // Every shipped profile filters egress (each declares `[network] mode = "deny"`). A silently
+        // dropped `[network]` would revert to the baseline default `shared` — a fail-OPEN on the
+        // security field that matters most. Require the resolved posture to be the allowlist.
+        assert!(
+            doc["network"].get("Allowlist").is_some(),
+            "profile `{name}` must resolve to a filtering allowlist, not `{}` — a non-allowlist \
+             here means its `[network]` was silently dropped (fail-open):\n{doc:#}",
+            doc["network"]
+        );
+
+        // A `forward` the file declares must resolve to a non-empty port set. This is the class of
+        // regression that motivated the check: a `forward` nested under `[network]` parses as
+        // `network.forward`, an ignored key, so the port never reached the launch.
+        if declares("forward") {
+            let ports = doc["forward"].as_array().map(Vec::len).unwrap_or(0);
+            assert!(
+                ports >= 1,
+                "profile `{name}` declares `forward` in its file but it resolved to none — the key \
+                 must be a TOP-LEVEL app field, not nested under a `[table]` like `[network]`:\n{doc:#}"
+            );
+        }
+
+        // A credential the file declares must resolve — a dropped `[secret]` would leave the app
+        // unauthenticated with no error.
+        if declares("[secret") {
+            let own = doc["secrets"].as_array().map(Vec::len).unwrap_or(0);
+            assert!(
+                own >= 1,
+                "profile `{name}` declares a `[secret]` but resolved none — a credential the launch \
+                 would inject was silently dropped:\n{doc:#}"
+            );
+        }
+
         imported.push(name);
     }
     assert!(

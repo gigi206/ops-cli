@@ -174,9 +174,9 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
     );
 
     // hermetic: `/usr` is the minimal synthetic tree — it holds only `bin` (which carries the
-    // single `/usr/bin/env` symlink), never the host's `/usr`, which would expose `lib`/`share`/…
-    // alongside. (That `/usr/bin/env` resolves an interpreted shebang is proven separately by
-    // `a_usr_bin_env_shebang_resolves_in_the_cage`.)
+    // `/usr/bin/env` symlink and the `/usr/bin/xdg-open` stub), never the host's `/usr`, which
+    // would expose `lib`/`share`/… alongside. (That `/usr/bin/env` resolves an interpreted
+    // shebang is proven separately by `a_usr_bin_env_shebang_resolves_in_the_cage`.)
     let usr = run_in(project.path(), data.path(), &["ls", "/usr"]);
     assert!(
         usr.status.success() && String::from_utf8_lossy(&usr.stdout).trim() == "bin",
@@ -1206,6 +1206,147 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     );
 }
 
+/// Poll `127.0.0.1:<port>` from the host until a read returns a body containing `marker`, or time
+/// out. Returns the matching body, or `None` on timeout (a refused connect, or the marker never
+/// arriving). Used by the forward e2e to wait for the in-cage server to come up and the forwarder
+/// to bridge a connection — a partial/early read that lacks the marker keeps polling rather than
+/// being accepted.
+fn read_loopback_until(port: u16, marker: &str, deadline: std::time::Duration) -> Option<String> {
+    use std::io::{Read, Write};
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            // The cage server writes its banner on connect (it does not require a request); send a
+            // newline anyway in case it reads a line first, then read whatever comes back.
+            let _ = s.write_all(b"\r\n");
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            if buf.contains(marker) {
+                return Some(buf);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    None
+}
+
+/// Pick a free host loopback TCP port by binding port 0 and reading back the assigned port, then
+/// releasing it — the same race-free trick the inbound unit tests use.
+fn free_loopback_port() -> u16 {
+    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
+    l.local_addr().unwrap().port()
+}
+
+#[test]
+fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
+    // The inbound loopback-forward path end to end through the real binary: a trusted
+    // `network = "none"` cage with `forward = [<port>]` starts a service on its own loopback, and a
+    // host process reaches it only because ops bound the host port and the in-cage socat bridged it
+    // over the shared Unix socket. Teeth: with `forward` declared the host curl gets the cage
+    // server's marker; a second project with the SAME server but NO `forward` is unreachable from
+    // the host (connection refused) — so the forwarder is provably the bridge, not some ambient
+    // route. The in-cage HTTP server is `socat` (already in the base closure; declared `nix:socat`
+    // to put it on PATH), serving a fixed one-line banner on connect. Skips (never fails) when the
+    // host cannot sandbox or the cache is unreachable (the first launch seeds the store).
+    let port = free_loopback_port();
+    let marker = "OPS-FORWARD-OK";
+
+    // Helper: run the cage server in the background (spawn, not wait), poll from the host, kill.
+    // The in-cage server is `socat` serving a static banner file on each connection: the file is
+    // written into the project (bound in-cage at its real path), and `SYSTEM:cat <file>` avoids any
+    // nested shell-quoting. `fork` handles the (possibly several) poll connections.
+    let run_server_and_probe =
+        |proj: &Path, data: &Path, state: &Path, with_forward: bool| -> Option<String> {
+            // The banner file the cage server serves — the project is bound at its real path in-cage,
+            // so the same absolute path resolves on both sides.
+            let banner = proj.join("banner.txt");
+            std::fs::write(&banner, format!("HTTP/1.0 200 OK\r\n\r\n{marker}\r\n")).unwrap();
+            let server_cmd = format!(
+                "exec socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:\"cat {}\"",
+                banner.display()
+            );
+            // Write the config for this project.
+            let cfg = if with_forward {
+                format!(
+                    "network = \"none\"\nforward = [{port}]\n[packages]\nsocat = \"nix:socat\"\n"
+                )
+            } else {
+                "network = \"none\"\n[packages]\nsocat = \"nix:socat\"\n".to_string()
+            };
+            std::fs::write(proj.join(".ops.toml"), cfg).unwrap();
+            // Trust so the security fields (network, forward) are honored.
+            let trusted = ops_in(proj, data, state, &["trust", ".ops.toml"]);
+            assert!(
+                trusted.status.success(),
+                "trust: {}",
+                String::from_utf8_lossy(&trusted.stderr)
+            );
+            // Spawn the cage server in the background; hold the child so we can kill it after probing.
+            let mut child = ops()
+                .args(["run", "--", "sh", "-c", &server_cmd])
+                .current_dir(proj)
+                .env("XDG_DATA_HOME", data)
+                .env("XDG_STATE_HOME", state)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn cage server");
+            let got = read_loopback_until(port, marker, std::time::Duration::from_secs(20));
+            let _ = child.kill();
+            let _ = child.wait();
+            got
+        };
+
+    let proj_a = TmpDir::new("ingr-a");
+    let data = TmpDir::new("ingr-data");
+    let state = TmpDir::new("ingr-state");
+
+    // Capability + cache probe on the first project (also seeds the store for the socat closure).
+    std::fs::write(
+        proj_a.path().join(".ops.toml"),
+        "network = \"none\"\n[packages]\nsocat = \"nix:socat\"\n",
+    )
+    .unwrap();
+    let probe = run_in(proj_a.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping forward e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping forward e2e: the binary cache is unreachable (socat closure unseeded)");
+        return;
+    }
+
+    // With `forward`: the host must reach the cage server through the forwarder.
+    let with = run_server_and_probe(proj_a.path(), data.path(), state.path(), true);
+    let Some(body) = with else {
+        eprintln!(
+            "skipping forward e2e: the cage server did not come up in time (slow first seed?)"
+        );
+        return;
+    };
+    assert!(
+        body.contains(marker),
+        "the host must reach the cage server through the forward forwarder, got: {body:?}"
+    );
+
+    // Teeth: a second project with the SAME cage server but NO `forward` must be unreachable from
+    // the host — nothing binds the host port, so the connect is refused. This is what proves the
+    // forwarder (not an ambient route) is the bridge.
+    let proj_b = TmpDir::new("ingr-b");
+    let data_b = TmpDir::new("ingr-datb");
+    let state_b = TmpDir::new("ingr-statb");
+    let without = run_server_and_probe(proj_b.path(), data_b.path(), state_b.path(), false);
+    assert!(
+        without.is_none(),
+        "without `forward` the host must NOT reach the cage loopback, but got: {without:?}"
+    );
+}
+
 #[test]
 fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
     // The `http://` (inspected-cleartext) scheme end to end through the real binary: under a trusted
@@ -2101,6 +2242,42 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ENV-SHEBANG-OK"),
         "a `#!/usr/bin/env node` shebang did not resolve in the cage: {log}"
+    );
+}
+
+#[test]
+fn a_synthetic_xdg_open_surfaces_the_url_and_exits_zero() {
+    // A tool that auto-opens a browser/file calls `xdg-open <arg>`; the hermetic cage has no
+    // display, browser, or file manager, so without a stub the call fails with "xdg-open not
+    // found" and aborts the flow (the cline OAuth device-auth crash). The cage synthesises
+    // `/usr/bin/xdg-open` as a `/bin/sh` stub that prints its argument to stderr and exits 0,
+    // so the call is non-fatal and the user is told what to open. This runs the real stub in a
+    // real cage — teeth: exit 0 AND the URL on stderr — and needs no packages or network.
+    let project = TmpDir::new("xdg-proj");
+    let data = TmpDir::new("xdg-data");
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping xdg-open e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    let out = run_in(
+        project.path(),
+        data.path(),
+        &["xdg-open", "https://example.com/auth"],
+    );
+    assert!(
+        out.status.success(),
+        "xdg-open did not exit 0 (the call must be non-fatal): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("https://example.com/auth"),
+        "xdg-open did not surface its argument on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

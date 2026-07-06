@@ -114,19 +114,35 @@ pub(crate) struct Wiring {
 /// non-UTF-8 argv preserved); only ops-owned ASCII store paths and the fixed port/socket
 /// go into the script string.
 pub(crate) fn wrap_command(socat: &Path, bash: &Path, cmd: Vec<OsString>) -> Vec<OsString> {
-    let script = format!(
+    let preamble = format!(
         "{socat} TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{uds} \
-         </dev/null >/dev/null 2>&1 & exec \"$@\"",
+         </dev/null >/dev/null 2>&1 & ",
         socat = socat.to_string_lossy(),
         port = CAGE_PROXY_PORT,
         uds = CAGE_UDS,
     );
+    wrap_background(bash, &preamble, "ops-egress-forward", cmd)
+}
+
+/// Assemble the `bash -c '<preamble> exec "$@"'` forwarder wrapper shared by the egress and
+/// the host→cage forward ([`super::forward`]) socat bridges: `preamble` backgrounds the socat(s) (it must end
+/// with a trailing `& `), `label` is the `$0`, and `cmd` rides `"$@"` **positionally** so nothing
+/// the agent controls is ever interpolated into the script (no shell injection, non-UTF-8 argv
+/// preserved). `exec` keeps the inner command the cage's main process, leaving `ops shell`'s pty
+/// job control unchanged.
+pub(super) fn wrap_background(
+    bash: &Path,
+    preamble: &str,
+    label: &str,
+    cmd: Vec<OsString>,
+) -> Vec<OsString> {
+    let script = format!("{preamble}exec \"$@\"");
     let mut out = vec![
         bash.as_os_str().to_os_string(),
         OsString::from("-c"),
         OsString::from(script),
         // `$0` — a label, not the command; the command is `$@` (the args after it).
-        OsString::from("ops-egress-forward"),
+        OsString::from(label),
     ];
     out.extend(cmd);
     out

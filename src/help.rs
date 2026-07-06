@@ -64,7 +64,7 @@ const PAGES: &[Page] = &[
                  ops.toml; repeatable, later wins",
             ),
             (
-                "--env / --net / --gui / --nixpkgs / --bind / --limit / --package",
+                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package",
                 "typed one-shot overrides for a single field each; see `ops help run`",
             ),
         ],
@@ -105,6 +105,11 @@ const PAGES: &[Page] = &[
                 "one-shot host bind (read-only by default); repeatable",
             ),
             (
+                "--forward <port[,port…]>",
+                "one-shot host loopback forward port(s) into the cage (e.g. 1455 for an OAuth \
+                 callback, or 1455,8080); repeatable, unions with the config",
+            ),
+            (
                 "--limit <key>=<value>",
                 "one-shot cgroup limit: memory_high | memory_max | tasks_max; repeatable",
             ),
@@ -121,14 +126,14 @@ const PAGES: &[Page] = &[
             One-shot overrides let you change any configuration field for a single launch without\n\
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
             exactly like an `ops.toml`, so it can set any field; the typed flags\n\
-            `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--limit`/`--package` are ergonomic\n\
+            `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package` are ergonomic\n\
             shorthands for one field each. Every flag has an environment equivalent — `OPS_CONFIG`,\n\
-            `OPS_ENV_<KEY>`, `OPS_NET`, `OPS_GUI`, `OPS_NIXPKGS`, `OPS_BIND`, `OPS_LIMIT_<key>`,\n\
-            `OPS_PACKAGE_<name>`. Precedence, lowest to highest:\n\
+            `OPS_ENV_<KEY>`, `OPS_NET`, `OPS_GUI`, `OPS_NIXPKGS`, `OPS_BIND`, `OPS_FORWARD`,\n\
+            `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`. Precedence, lowest to highest:\n\
             `OPS_CONFIG < OPS_* typed < --config < --* typed` — the command line always beats the\n\
             environment, and a typed flag beats the blob. Scalars (`net`/`gui`/`nixpkgs`) replace;\n\
-            collections (`env`/`bind`/`limit`/`package`) union. An override is the final word: it\n\
-            beats a trusted project config and an app's own posture. A malformed override is a hard\n\
+            collections (`env`/`bind`/`forward`/`limit`/`package`) union. An override is the final word:\n\
+            it beats a trusted project config and an app's own posture. A malformed override is a hard\n\
             error (it never silently launches a different posture); a security field set from the\n\
             environment prints a notice.",
     },
@@ -158,7 +163,7 @@ const PAGES: &[Page] = &[
                  repeatable (see `ops help run`)",
             ),
             (
-                "--env / --net / --gui / --nixpkgs / --bind / --limit / --package",
+                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package",
                 "typed one-shot overrides for a single field each, beating the app's posture; \
                  see `ops help run`",
             ),
@@ -510,7 +515,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["gc"],
-        synopsis: "ops gc [--all] [--prune]",
+        synopsis: "ops gc [--all] [--prune] [--unidentified] [--id <id>]",
         summary: "reclaim ops's per-project store space",
         options: &[
             (
@@ -521,10 +526,52 @@ const PAGES: &[Page] = &[
                 "--prune",
                 "actually reclaim (default is a dry run that touches nothing)",
             ),
+            (
+                "--unidentified",
+                "with --all --prune, also reap markerless legacy trees (no deadness proof)",
+            ),
+            (
+                "--id <id>",
+                "reap (with --prune) or measure one named project tree; the id is the directory\n\
+                 name `ops path` lists under projects/. No deadness proof — naming it is consent.\n\
+                 A tree a live session holds is refused; run `ops stop` first.",
+            ),
         ],
         details:
             "By default it sweeps the current project's store. Reclamation is irreversible, so\n\
-            the destructive form is opt-in.",
+            the destructive form is opt-in.\n\
+            \n\
+            A project tree is reaped only when ops can prove it is dead: it carries a `project`\n\
+            marker, that path is gone (its parent still present), and no live session holds it.\n\
+            Markerless trees predate marker-recording, so their project path is unknown and\n\
+            deadness cannot be verified — they are listed for a manual removal by default.\n\
+            `--unidentified` opts into reaping them anyway (it requires `--all`). It is a\n\
+            fail-closed escape hatch, not the default: a markerless tree of a project still in\n\
+            use would be lost, so ops leaves the decision to you unless you ask explicitly.\n\
+            \n\
+            `--id <id>` targets one tree you name — the focused counterpart of the broad reaps.\n\
+            It needs no marker and no deadness proof (you named it, so it is not an accident),\n\
+            works on markerless trees, and refuses only a tree a live session holds. Use `ops\n\
+            path` to find the id (the directory name under projects/, with the recorded project\n\
+            path beside it), then `ops gc --id <id> --prune` to remove it.",
+    },
+    Page {
+        path: &["path"],
+        synopsis: "ops path [--json]",
+        summary: "show every directory ops uses on disk, grouped by XDG base",
+        options: &[
+            ("--json", "emit the layout as a JSON document for scripting"),
+        ],
+        details:
+            "Lists the on-disk locations ops owns — the data, config, and state trees — and\n\
+            marks which exist, so it is clear where ops puts things even before any file is\n\
+            created. Under `projects/` it enumerates each project's runtime tree and annotates it\n\
+            with a liveness state — `live` (a running session holds it), `idle` (the project\n\
+            directory still exists, just not active), `dead` (the project is gone — reclaimable\n\
+            by `ops gc --all`), or `markerless` (a legacy tree pre-dating marker recording) — plus\n\
+            the last-used date. Under `apps/` it lists each global app home, and under the config\n\
+            `apps/` each imported profile. Read-only: no trust gate, no network. For the config\n\
+            files in resolution order, see `ops config path`.",
     },
     // ---- app subcommands ----------------------------------------------------------
     Page {
@@ -573,12 +620,13 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "list"],
-        synopsis: "ops app list",
+        synopsis: "ops app list  (alias: ops app ls)",
         summary: "list the imported profiles",
         options: &[],
         details:
-            "The imported profiles `import`/`rm` manage, by name. The full resolved app set —\n\
-            inline, project, and profile apps with their gating — is `ops config show`.",
+            "The imported profiles `import`/`rm` manage, by name. `ops app ls` is the same\n\
+            command — a shorter alias. The full resolved app set — inline, project, and\n\
+            profile apps with their gating — is `ops config show`.",
     },
     // ---- test subcommands ---------------------------------------------------------
     Page {

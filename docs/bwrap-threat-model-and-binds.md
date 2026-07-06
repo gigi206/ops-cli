@@ -144,6 +144,7 @@ project config.
 | **ssh-agent** (`$SSH_AUTH_SOCK`) | **off** (hands over ALL your keys for their lifetime) | scoped opt-in |
 | **Secret injection** | least-privilege, declared in **trusted** config only | same |
 | **A tool's credential persistence** (e.g. claude-code's own creds) | a **dedicated, persistent, isolated** creds dir, mounted **for that tool alone** — never all of `~/.config` | same |
+| **Inbound loopback forward** (`forward`) | **off** by default; opt-in via `forward = [port,…]` (trusted/global/per-app). A declared port is bound on the host's `127.0.0.1` only and bridged, through a bound Unix socket the in-cage `socat` listens on, to the cage's own loopback at the same port — so a host process (an OAuth `localhost:<port>` callback, or a dev server) reaches a service the agent started inside the empty-netns cage. **Loopback-only**, never an external interface; a port already in use fails the launch closed (the redirect URL is fixed, no ephemeral substitute). Orthogonal to egress — the empty netns and the allowlist are unchanged. | opt-in, same |
 
 ### 5a. The GUI / Wayland hole (BUILT — `gui = "wayland"`)
 

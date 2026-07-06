@@ -56,6 +56,17 @@ pub(crate) struct RawConfig {
     /// X client can snoop and drive every other window, which Wayland's per-client isolation
     /// prevents on a well-behaved compositor.
     pub(crate) gui: Option<String>,
+    /// Host loopback TCP ports to forward from the host into the cage — a list of port
+    /// numbers (`forward = [1455]`). Each port is bound on the host's `127.0.0.1` and
+    /// bridged, through a bound Unix socket, to the cage's own loopback at the same port,
+    /// so a host process (a browser chasing an OAuth `localhost:<port>` callback, or a
+    /// dev opening a cage-run dev server) can reach a service the agent started inside the
+    /// empty-netns cage. A security field — honored from the global config or a trusted
+    /// project, ignored from an untrusted one: opening a host port is a deliberate inbound
+    /// hole, a choice an untrusted project may not make. A port already in use on the host
+    /// fails the launch closed (the redirect URL is baked in for OAuth, so ops does not
+    /// pick an ephemeral substitute). Loopback-only — never the host's external interfaces.
+    pub(crate) forward: Option<Vec<u16>>,
     /// Credentials the egress proxy injects into matching outbound requests, declared
     /// as the `[secret]` section — a table keyed by destination host. A security field:
     /// honored from the global config or a trusted project, ignored from an untrusted one,
@@ -202,6 +213,11 @@ pub(crate) struct RawApp {
     /// baseline `gui`. An unset `Option` is omitted by TOML on export, so an app with no GUI
     /// need carries no `gui` line.
     pub(crate) gui: Option<String>,
+    /// Host loopback ports forwarded into this app's cage (see `RawConfig.forward`). A
+    /// security field, gated like the baseline `forward`: an app's ports **union** onto
+    /// the baseline's, so an untrusted project can only add its own, never remove or
+    /// override a trusted layer's set. An unset `Option` is omitted on export.
+    pub(crate) forward: Option<Vec<u16>>,
     /// Credentials the egress proxy injects for this app. A security field, effective only
     /// under a network allowlist, like the baseline `[secret]` section.
     pub(crate) secret: Option<RawSecretSection>,

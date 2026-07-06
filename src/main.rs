@@ -12,6 +12,7 @@ mod config;
 mod diag;
 mod help;
 mod pathfind;
+mod paths;
 mod plugin_store;
 mod plugins;
 mod sandbox;
@@ -68,6 +69,7 @@ fn main() -> ExitCode {
         "config" => config_cmd(rest),
         "upgrade" => upgrade_cmd(rest),
         "gc" => gc_cmd(rest),
+        "path" => path_cmd(&rest),
         "run" => {
             let mut cmd: Vec<OsString> = rest;
             // Leading ops flags before the command: `--detach` to run in the background, a one-shot
@@ -1264,6 +1266,23 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // Inbound loopback forward ports — shown only when a layer declared any, so a default-profile
+    // config stays uncluttered. Each port is bound on the host's `127.0.0.1` and bridged into the
+    // cage at the same port (an OAuth `localhost:<port>` callback, or a cage-run dev server).
+    if !view.forward.is_empty() {
+        let ports = view
+            .forward
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            o,
+            "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{}",
+            provenance_tag(view.forward_origin, pal)
+        );
+    }
+
     // Resource limits — shown only when a config `[limits]` override customizes one, so a
     // default-profile config stays uncluttered (the effective defaults are in `ops doctor`). When
     // shown, each of the three fields carries its own provenance: the overridden ones name their
@@ -1477,6 +1496,17 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
                 let _ = writeln!(o, "      {dim}limits:{r} {}", parts.join(", "));
             }
+            // The host loopback ports this overlay adds (its own, not the baseline-merged set). A
+            // compact list under the app's roster entry; the effective set is in `config show --app`.
+            if !app.forward.is_empty() {
+                let ports = app
+                    .forward
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
+            }
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
             // under `--details` to each by destination and source, the same metadata the baseline
@@ -1639,6 +1669,24 @@ fn render_app_detail(
         cell("MemoryMax", &l.memory_max),
         cell("TasksMax", &l.tasks_max),
     );
+
+    // Effective inbound loopback forward ports — the app's own ∪ the baseline's. Shown even when
+    // empty so the inherited story is visible (a non-empty baseline set shows as `inherited`).
+    let forward_tag = app_provenance_tag(view.forward_origin, pal);
+    if view.forward.is_empty() {
+        let _ = writeln!(o, "  {h}forward:{r} (none){forward_tag}");
+    } else {
+        let ports = view
+            .forward
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            o,
+            "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{forward_tag}"
+        );
+    }
 
     // Collections: the overlay's own additions and how many baseline entries it inherits. The own
     // entry lists expand under `--details`; the inherited baseline entries are not re-listed (they
@@ -2131,6 +2179,48 @@ fn config_unset(args: &[OsString]) -> ExitCode {
 /// need not exist). With an explicit scope (`-l`/`-g`/`-c`), print the single bare path that scope
 /// targets — the file `set`/`unset`/`edit` would touch, for scripting and for finding the global
 /// config.
+/// `ops path [--json]`: show every on-disk location ops uses, grouped by XDG base
+/// (data, config, state), marking which exist and enumerating the per-project /
+/// per-app / per-profile entries actually on disk. Read-only, no trust gate, no
+/// network — the layout map that answers "where on disk does ops put things?".
+/// The counterpart of `ops config path` (the config files in resolution order)
+/// for the rest of the filesystem.
+fn path_cmd(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    for a in args {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some(other) => {
+                eprintln!("ops: path: unknown argument `{other}`");
+                eprintln!("       run `ops help path` for usage.");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("ops: path: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let layout = store::Layout::from_env();
+    let view = paths::view(layout.as_ref());
+    if json {
+        match serde_json::to_string_pretty(&view) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("ops: path: failed to serialize: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+        print!("{}", paths::render(&view, &pal));
+        ExitCode::SUCCESS
+    }
+}
+
 fn config_path_cmd(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
@@ -2430,6 +2520,7 @@ fn take_override_flag(
         "--gui" => &mut cli.gui,
         "--nixpkgs" => &mut cli.nixpkgs,
         "--bind" => &mut cli.binds,
+        "--forward" => &mut cli.forward,
         "--limit" => &mut cli.limits,
         "--package" => &mut cli.packages,
         _ => return None,
@@ -2492,7 +2583,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("import") => app_import(&args[1..]),
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
-        Some("list") => app_list(),
+        Some("list" | "ls") => app_list(),
         // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
         // background as a session `ops ls`/`attach`/`stop` can see. Tokens after a `--` are passed
         // through to the app's command (see `parse_app_launch`).
@@ -7065,18 +7156,55 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
 fn gc_cmd(args: Vec<OsString>) -> ExitCode {
     let mut prune = false;
     let mut all = false;
-    for arg in &args {
-        match arg.to_str() {
+    let mut unidentified = false;
+    let mut id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].to_str() {
             Some("--prune") => prune = true,
             Some("--all") => all = true,
-            _ => {
+            Some("--unidentified") => unidentified = true,
+            Some("--id") => {
+                i += 1;
+                let Some(val) = args.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("ops: `--id` needs a project id (run `ops path` to list them).");
+                    return ExitCode::from(2);
+                };
+                id = Some(val.to_string());
+            }
+            Some(_) => {
                 eprintln!("ops: usage: {}", help::synopsis("gc"));
                 return ExitCode::from(2);
             }
+            None => {
+                eprintln!("ops: gc: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
         }
+        i += 1;
+    }
+    // `--unidentified` reaps markerless trees without a deadness proof — a cross-project tree
+    // operation, so it needs `--all`. It is meaningless without the tree reap, and the dry-run
+    // already lists them by default, so the only new effect is the reaping, which is destructive.
+    if unidentified && !all {
+        eprintln!(
+            "ops: `--unidentified` reaps markerless project trees and requires `--all` — \
+             run `ops gc --all --unidentified --prune`."
+        );
+        return ExitCode::from(2);
+    }
+    // `--id` targets one named tree. It is incompatible with `--unidentified` (which is a broad
+    // reap, not a targeted one) and needs neither `--all` nor a deadness proof — the user naming
+    // the id IS the proof. It runs the focused reap and returns, skipping the broad sweep.
+    if unidentified && id.is_some() {
+        eprintln!("ops: `--unidentified` cannot be combined with `--id` — pick one.");
+        return ExitCode::from(2);
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    sandbox::gc(prune, all, &pal)
+    if let Some(id) = id {
+        return sandbox::gc_one_tree(&id, prune, &pal);
+    }
+    sandbox::gc(prune, all, unidentified, &pal)
 }
 
 /// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else
@@ -8522,6 +8650,8 @@ mod tests {
             "claude",
             "--bind",
             "/data:rw",
+            "--forward",
+            "1455",
             "--limit",
             "tasks_max=4096",
             "--gui",
@@ -8537,6 +8667,7 @@ mod tests {
         assert_eq!(cli.gui, vec!["wayland".to_string()]);
         assert_eq!(cli.nixpkgs, vec!["nixos-23.11".to_string()]);
         assert_eq!(cli.binds, vec!["/data:rw".to_string()]);
+        assert_eq!(cli.forward, vec!["1455".to_string()]);
         assert_eq!(cli.limits, vec!["tasks_max=4096".to_string()]);
         assert_eq!(cli.packages, vec!["hello=nix:hello".to_string()]);
 
@@ -8874,6 +9005,8 @@ mod tests {
             egress_stats: true,
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
@@ -9308,6 +9441,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![],
@@ -9483,6 +9618,8 @@ mod tests {
             network_origin: ProvenanceView::Global,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
+            forward: vec![],
+            forward_origin: ProvenanceView::Inherited,
             limits: LimitsView {
                 memory_high: LimitView {
                     value: "70%".into(),
@@ -9656,6 +9793,7 @@ mod tests {
             packages: vec![],
             network: None,
             gui: None,
+            forward: vec![],
             limits,
             secrets: vec![],
             notes: vec![],
@@ -9738,6 +9876,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -9757,6 +9897,7 @@ mod tests {
                 }],
                 network: None,
                 gui: None,
+                forward: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -9813,6 +9954,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -9831,6 +9974,7 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
+                forward: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -9890,6 +10034,7 @@ mod tests {
             packages: vec![],
             network,
             gui,
+            forward: vec![],
             limits: None,
             secrets: vec![],
             notes: vec![],
@@ -9916,6 +10061,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![
@@ -9972,6 +10119,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -9983,6 +10132,7 @@ mod tests {
                 packages: vec![],
                 network: None,
                 gui: None,
+                forward: vec![],
                 limits: None,
                 secrets: vec![
                     SecretView {
@@ -10058,6 +10208,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10082,6 +10234,7 @@ mod tests {
                 packages: vec![],
                 network: None,
                 gui: None,
+                forward: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10144,6 +10297,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            forward: vec![],
+            forward_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10183,6 +10338,7 @@ mod tests {
                 ],
                 network: None,
                 gui: None,
+                forward: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],

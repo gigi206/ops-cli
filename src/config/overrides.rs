@@ -110,6 +110,9 @@ pub(crate) struct CliOverrides {
     pub(crate) nixpkgs: Vec<String>,
     /// `--bind <path[:ro|:rw]>` — one host bind each.
     pub(crate) binds: Vec<String>,
+    /// `--forward <port[,port…]>` — host loopback TCP ports forwarded into the cage (repeatable;
+    /// each value may carry a comma-list). A collection — unioned across the tiers.
+    pub(crate) forward: Vec<String>,
     /// `--limit <key>=<value>` — one cgroup limit each.
     pub(crate) limits: Vec<String>,
     /// `--package <name>=<backend:locator>` — one package each.
@@ -134,6 +137,8 @@ struct AmbientOverrides {
     nixpkgs: Option<String>,
     /// `OPS_BIND` — one host bind (a list is a blob concern).
     binds: Vec<String>,
+    /// `OPS_FORWARD` — host loopback forward ports, a comma-list (e.g. `1455,8080`).
+    forward: Vec<String>,
     /// `OPS_LIMIT_<key>` — one cgroup limit each (key lowercased).
     limits: Vec<(String, String)>,
     /// `OPS_PACKAGE_<name>` — one package each.
@@ -148,6 +153,7 @@ struct TypedLabels {
     bind: &'static str,
     limit: &'static str,
     package: &'static str,
+    forward: &'static str,
 }
 
 const CLI_LABELS: TypedLabels = TypedLabels {
@@ -155,6 +161,7 @@ const CLI_LABELS: TypedLabels = TypedLabels {
     bind: "--bind",
     limit: "--limit",
     package: "--package",
+    forward: "--forward",
 };
 
 const ENV_LABELS: TypedLabels = TypedLabels {
@@ -162,6 +169,7 @@ const ENV_LABELS: TypedLabels = TypedLabels {
     bind: "OPS_BIND",
     limit: "OPS_LIMIT_*",
     package: "OPS_PACKAGE_*",
+    forward: "OPS_FORWARD",
 };
 
 /// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
@@ -184,6 +192,9 @@ fn scan_ambient() -> AmbientOverrides {
     };
     if let Some(v) = env_nonempty("OPS_BIND") {
         a.binds.push(v);
+    }
+    if let Some(v) = env_nonempty("OPS_FORWARD") {
+        a.forward.push(v);
     }
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix(OPS_ENV_PREFIX) {
@@ -223,6 +234,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         ambient.gui.as_deref(),
         ambient.nixpkgs.as_deref(),
         &ambient.binds,
+        &ambient.forward,
         &ambient.limits,
         &ambient.packages,
         &ambient.env,
@@ -243,6 +255,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         cli.gui.last().map(String::as_str),
         cli.nixpkgs.last().map(String::as_str),
         &cli.binds,
+        &cli.forward,
         &cli_limits,
         &cli_packages,
         &cli_env,
@@ -328,6 +341,7 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ("binds", !env_side.binds.is_empty()),
         ("packages", !env_side.packages.is_empty()),
         ("limits", env_side.limits.is_some()),
+        ("forward", env_side.forward.is_some()),
     ] {
         if env_has {
             note(field);
@@ -356,6 +370,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     if higher.secret.is_some() {
         base.secret = higher.secret;
     }
+    base.forward = union_forward_opt(base.forward, higher.forward);
     base.net.groups.extend(higher.net.groups);
     base.app.extend(higher.app);
     base
@@ -407,6 +422,41 @@ fn union_limits(base: Option<RawLimits>, higher: Option<RawLimits>) -> Option<Ra
     }
 }
 
+/// Union two optional forward port lists, deduped and sorted. `None` means "this tier set none"; a
+/// higher tier's ports add to a lower's, never replace — the collection-union rule, so `--forward`
+/// over `OPS_FORWARD` accumulates rather than clobbers.
+fn union_forward_opt(base: Option<Vec<u16>>, higher: Option<Vec<u16>>) -> Option<Vec<u16>> {
+    match (base, higher) {
+        (b, None) => b,
+        (None, h) => h,
+        (Some(mut b), Some(h)) => {
+            // Reuse the resolver's port-union (dedup + sort) so the two paths cannot drift.
+            super::union_forward(&mut b, h);
+            Some(b)
+        }
+    }
+}
+
+/// Parse one `--forward` value — a single port or a comma-list of ports — into `Vec<u16>`. A
+/// structural error (an empty value, or a token that is not a port number) is fail-closed, since it
+/// is an explicit request the user mistyped. A port of `0` parses here and is dropped downstream
+/// by the resolver's validator (a value-range concern, not a structural one — the additive model).
+fn parse_forward(spec: &str, label: &str) -> Result<Vec<u16>, String> {
+    let ports: Vec<u16> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|t| {
+            t.parse::<u16>()
+                .map_err(|_| format!("{label}: `{t}` is not a valid port (expected 0–65535)"))
+        })
+        .collect::<Result<_, _>>()?;
+    if ports.is_empty() {
+        return Err(format!("{label}: no ports given"));
+    }
+    Ok(ports)
+}
+
 /// Build a `RawConfig` fragment from a source's typed inputs. A *structural* error (a bad `--net`
 /// posture keyword, an empty `--bind` path, an unknown `--limit` key, an empty `--package` name) is
 /// fail-closed; a set-but-invalid *value* passes through to the downstream validation.
@@ -416,6 +466,7 @@ fn build_typed_fragment(
     gui: Option<&str>,
     nixpkgs: Option<&str>,
     binds: &[String],
+    forward: &[String],
     limits: &[(String, String)],
     packages: &[(String, String)],
     env: &[(String, String)],
@@ -433,6 +484,13 @@ fn build_typed_fragment(
     }
     for spec in binds {
         raw.binds.push(parse_bind(spec, lbl.bind)?);
+    }
+    let mut ports: Vec<u16> = Vec::new();
+    for spec in forward {
+        ports.extend(parse_forward(spec, lbl.forward)?);
+    }
+    if !ports.is_empty() {
+        raw.forward = Some(ports);
     }
     for (key, value) in limits {
         set_limit(&mut raw.limits, key, value, lbl.limit)?;
@@ -602,6 +660,7 @@ mod tests {
         gui: &'a [&'a str],
         nixpkgs: &'a [&'a str],
         binds: &'a [&'a str],
+        forward: &'a [&'a str],
         limits: &'a [&'a str],
         packages: &'a [&'a str],
     }
@@ -618,6 +677,7 @@ mod tests {
             gui: owned(cli.gui),
             nixpkgs: owned(cli.nixpkgs),
             binds: owned(cli.binds),
+            forward: owned(cli.forward),
             limits: owned(cli.limits),
             packages: owned(cli.packages),
         };
@@ -654,6 +714,42 @@ mod tests {
         .unwrap();
         assert_eq!(ov.raw.network, Some(posture("none")));
         assert_eq!(ov.raw.gui.as_deref(), Some("wayland"));
+    }
+
+    #[test]
+    fn the_forward_flag_parses_a_comma_list_and_unions_across_tiers() {
+        // A single `--forward` value may carry a comma-list; repeated flags accumulate; and the
+        // env tier (`OPS_FORWARD`) unions with the CLI tier rather than being replaced.
+        let ov = collect_from(
+            &CliOverrides {
+                forward: owned(&["1455", "8080,9090"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                forward: vec!["3000".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ov.raw.forward, Some(vec![1455, 3000, 8080, 9090]));
+        // The env contributed a security-relevant collection, so a source notice fires.
+        assert!(ov
+            .notices()
+            .iter()
+            .any(|n| n.contains("forward") && n.contains("environment")));
+    }
+
+    #[test]
+    fn a_non_numeric_forward_value_is_a_hard_error() {
+        let err = collect_cli(Cli {
+            forward: &["1455,notaport"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--forward") && err.contains("notaport"),
+            "a bad port must be a structural error naming the flag: {err}"
+        );
     }
 
     #[test]
@@ -785,6 +881,7 @@ mod tests {
                 nixpkgs = "nixos-23.11"
                 network = "none"
                 gui = "wayland"
+                forward = [1455]
                 binds = ["/opt/data"]
                 [env]
                 E = "1"
@@ -803,6 +900,11 @@ mod tests {
         assert_eq!(ov.raw.nixpkgs.as_deref(), Some("nixos-23.11"));
         assert!(ov.raw.network.is_some(), "network dropped in merge");
         assert_eq!(ov.raw.gui.as_deref(), Some("wayland"));
+        assert_eq!(
+            ov.raw.forward.as_deref(),
+            Some(&[1455][..]),
+            "forward dropped in merge"
+        );
         assert!(!ov.raw.binds.is_empty(), "binds dropped in merge");
         assert_eq!(ov.raw.env.get("E").map(String::as_str), Some("1"));
         assert!(

@@ -27,6 +27,7 @@
 
 use super::binds::{self, Userland};
 use super::egress;
+use super::forward;
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use crate::session::{self, Kind, RecordGuard, Session};
 use crate::store::Layout;
@@ -163,14 +164,14 @@ fn launch_foreground(
     kind: Kind,
     cmd: Vec<OsString>,
 ) -> ExitCode {
-    let (spec, egress) = match build(&prep, runtime, cmd) {
+    let (spec, guard) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };
 
     register(prep.layout.data_dir(), &spec, kind, runtime);
 
-    match egress {
+    match guard {
         // The default postures: exec-replace, so the command's exit status becomes ops's.
         // The pid and its start time survive the exec, so the registry record keeps matching
         // the sandbox and is reclaimed by liveness pruning once it exits.
@@ -180,10 +181,10 @@ fn launch_foreground(
             eprintln!("ops: failed to launch the sandbox: {err}");
             ExitCode::FAILURE
         }
-        // A network allowlist: ops cannot exec-replace, because the host filtering proxy
-        // runs on a thread that must outlive the cage. Supervise instead — fork bwrap, wait,
-        // propagate the exit status — keeping the proxy alive and the guard (which unlinks
-        // the socket and CA) held for the whole session.
+        // A network allowlist or an forward forwarder: ops cannot exec-replace, because a host
+        // thread (the filtering proxy and/or the forward accept pumps) must outlive the cage.
+        // Supervise instead — fork bwrap, wait, propagate the exit status — keeping the thread(s)
+        // alive and the guard (which unlinks the sockets and CA) held for the whole session.
         Some(guard) => {
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(guard);
@@ -275,7 +276,7 @@ fn detached_child(
     // terminal through build/register so provisioning progress and any error are seen live.
     redirect_stdin_to_null();
 
-    let (spec, egress) = match build(&prep, runtime, cmd) {
+    let (spec, guard) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
         // `build` already printed the cause to the terminal; close the pipe (no readiness byte)
         // so the parent reports failure.
@@ -304,7 +305,7 @@ fn detached_child(
     // The log fd is now duplicated onto 1/2; the owning handle is no longer needed.
     drop(log);
 
-    match egress {
+    match guard {
         None => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
@@ -312,10 +313,10 @@ fn detached_child(
             std::process::exit(1);
         }
         Some(guard) => {
-            // Supervise: this daemon is the long-lived parent the proxy thread and bwrap
-            // (`--die-with-parent`) hang from. Drop the guard explicitly before exiting — a bare
-            // `process::exit` runs no destructors, so the socket and CA would otherwise leak even
-            // on a clean exit.
+            // Supervise: this daemon is the long-lived parent the proxy/forwarder threads and
+            // bwrap (`--die-with-parent`) hang from. Drop the guard explicitly before exiting — a
+            // bare `process::exit` runs no destructors, so the sockets and CA would otherwise leak
+            // even on a clean exit.
             let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(guard);
             std::process::exit(code);
@@ -692,17 +693,18 @@ pub(crate) fn upgrade_mise_packages(
         ];
         cmd.extend(tokens.iter().map(OsString::from));
 
-        let (spec, egress) = match build(&prep, runtime, cmd) {
+        let (spec, guard) = match build(&prep, runtime, cmd) {
             Ok(v) => v,
             Err(_) => {
                 ok = false;
                 continue;
             }
         };
-        // Fork-and-wait (never exec-replace) so the next group can run; the egress guard, if any,
-        // is held across the wait so the proxy serves the fetch, then unlinked as the group ends.
+        // Fork-and-wait (never exec-replace) so the next group can run; the guard, if any, is
+        // held across the wait so the proxy/forwarder serves the fetch, then dropped as the group
+        // ends (unlinks the sockets and CA).
         let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
-        drop(egress);
+        drop(guard);
         if code != 0 {
             crate::diag::warn(&format!("`{label}`: mise upgrade exited {code}"));
             ok = false;
@@ -721,12 +723,17 @@ pub(crate) fn upgrade_mise_packages(
 /// current-project sweep needs — so `ops gc --all` reclaims even from a directory that is not a
 /// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
 /// the destructive form.
-pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCode {
+pub(crate) fn gc(
+    prune: bool,
+    all: bool,
+    prune_unidentified: bool,
+    pal: &crate::style::Palette,
+) -> ExitCode {
     if all {
         match crate::store::Layout::from_env() {
             Some(layout) => {
                 let live_ids = session_housekeeping(&layout, pal);
-                reap_dead_trees(&layout, &live_ids, prune, pal);
+                reap_dead_trees(&layout, &live_ids, prune, prune_unidentified, pal);
                 shared_store_gc(&layout, prune, pal);
             }
             None => eprintln!(
@@ -786,18 +793,23 @@ fn session_housekeeping(
 /// directory is gone, plus surface any markerless legacy trees. A tree is reclaimed only when it
 /// carries a `project` marker, that path is absent while its parent directory still exists (a cheap
 /// guard, not a reliable unmount check — the dry-run default is the backstop there), and no live
-/// session holds it. Markerless trees (their project path unknown) are listed for a manual decision,
-/// never reclaimed. Pure host-side filesystem work — no sandbox, no nix.
+/// session holds it. Markerless trees (their project path unknown) are listed for a manual decision
+/// by default; `prune_unidentified` opts into reaping them without a deadness proof (the
+/// `--unidentified` escape hatch). Pure host-side filesystem work — no sandbox, no nix.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
     prune: bool,
+    prune_unidentified: bool,
     pal: &crate::style::Palette,
 ) {
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
-    let report = super::gc::reap_dead_projects(&projects_dir, live_ids, prune);
-    if report.dead.is_empty() && report.unidentified.is_empty() {
+    let report = super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified);
+    if report.dead.is_empty()
+        && report.unidentified.is_empty()
+        && report.reaped_unidentified.is_empty()
+    {
         println!("{h}ops gc --all:{r} {dim}no dead project trees to reclaim.{r}");
         return;
     }
@@ -833,14 +845,107 @@ fn reap_dead_trees(
             );
         }
     }
-    // Markerless trees predate marker-recording: their project path is unknown, so deadness cannot
-    // be verified and they are never auto-reclaimed — only surfaced for a manual decision.
-    for tree in &report.unidentified {
+
+    // Markerless trees reaped under the `--unidentified` opt-in. Their deadness was NOT verified
+    // (the marker is absent, so the project path is unknown) — the caller accepted that risk. They
+    // are gone now, so report them as reclaimed rather than as candidates.
+    let mut ufreed = 0u64;
+    for tree in &report.reaped_unidentified {
+        ufreed += tree.bytes;
         println!(
-            "  {warn}unidentified{r} (no marker, project path unknown): {n}{}{r} ({}) — remove by hand if unwanted",
+            "  {ok}reclaimed{r} {warn}(no marker, deadness unverified){r}: {n}{}{r} ({})",
             tree.dir.display(),
             super::gc::human_bytes(tree.bytes)
         );
+    }
+    if !report.reaped_unidentified.is_empty() {
+        println!(
+            "{h}ops gc --all --unidentified:{r} reclaimed {} markerless tree(s), freed up to {}.",
+            report.reaped_unidentified.len(),
+            super::gc::human_bytes(ufreed)
+        );
+    }
+
+    // Markerless trees not reaped (no opt-in, or a dry run): surfaced for a manual decision. The
+    // hint adapts to whether the user is using the `--unidentified` hatch — a dry run of it points
+    // at the prune form, the default still points at a by-hand removal (the fail-closed stance).
+    for tree in &report.unidentified {
+        let hint = if prune_unidentified {
+            "run `ops gc --all --unidentified --prune` to reclaim (no deadness proof)"
+        } else {
+            "remove by hand if unwanted"
+        };
+        println!(
+            "  {warn}unidentified{r} (no marker, project path unknown): {n}{}{r} ({}) — {hint}",
+            tree.dir.display(),
+            super::gc::human_bytes(tree.bytes)
+        );
+    }
+}
+
+/// Reap — or, in a dry run, measure — one named project tree (`ops gc --id <id>`). The caller
+/// supplies the id, so this needs no deadness proof and no marker: it works on markerless trees
+/// too, and on trees a marker would call idle. The live-session guard still holds — a tree a
+/// running session holds is refused, with a pointer at `ops stop`. Pure host-side filesystem
+/// work — no sandbox, no nix — so it runs even where the broad reap cannot.
+pub(crate) fn gc_one_tree(id: &str, prune: bool, pal: &crate::style::Palette) -> ExitCode {
+    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    // Reject a traversal/absolute id before any work: it is joined onto `projects/` and reaches a
+    // recursive delete, so only a single path component is allowed (a real id is a 16-hex hash the
+    // `ops path` listing shows). `reap_one` re-checks at the sink; this gives the clearer message.
+    if !super::gc::is_safe_tree_id(id) {
+        eprintln!(
+            "ops gc: invalid project id `{id}` — expected a single tree name \
+             (the directory name `ops path` lists under projects/), not a path."
+        );
+        return ExitCode::from(2);
+    }
+    let Some(layout) = crate::store::Layout::from_env() else {
+        eprintln!("ops gc: cannot locate ops's data directory; cannot reap a project tree.");
+        return ExitCode::FAILURE;
+    };
+    let live_ids = session_housekeeping(&layout, pal);
+    let projects_dir = layout.data_dir().join("projects");
+    match super::gc::reap_one(&projects_dir, id, &live_ids, prune) {
+        super::gc::ReapOneOutcome::NotFound => {
+            eprintln!(
+                "ops gc: no project tree for id `{id}` under {}.",
+                projects_dir.display()
+            );
+            ExitCode::FAILURE
+        }
+        super::gc::ReapOneOutcome::Live => {
+            eprintln!(
+                "ops gc: project tree {n}{id}{r} is held by a live session — \
+                 stop it first with {n}ops stop{r} (then `ops gc --id {id} --prune`)."
+            );
+            ExitCode::FAILURE
+        }
+        super::gc::ReapOneOutcome::Tree { dir, bytes } => {
+            let verb = if prune {
+                format!("{ok}reclaimed{r}")
+            } else {
+                format!("{dim}reclaimable{r}")
+            };
+            println!(
+                "  {verb}: {n}{}{r} ({})",
+                dir.display(),
+                super::gc::human_bytes(bytes)
+            );
+            if prune {
+                println!(
+                    "{h}ops gc --id:{r} reclaimed project tree {n}{id}{r}, freed up to {}.",
+                    super::gc::human_bytes(bytes)
+                );
+            } else {
+                println!(
+                    "{h}ops gc --id:{r} {n}{id}{r} reclaimable ({}) — \
+                     run `ops gc --id {id} --prune` to reclaim.",
+                    super::gc::human_bytes(bytes)
+                );
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -1147,13 +1252,14 @@ fn launch_pty_supervised(
     kind: Kind,
     cmd: Vec<OsString>,
 ) -> ExitCode {
-    let (spec, egress) = match build(prep, runtime, cmd) {
-        Ok((s, e)) => (s.with_private_tty(), e),
+    let (spec, guard) = match build(prep, runtime, cmd) {
+        Ok((s, g)) => (s.with_private_tty(), g),
         Err(code) => return code,
     };
 
     let _record = register(prep.layout.data_dir(), &spec, kind, runtime).map(RecordGuard::new);
-    let _egress = egress;
+    // Hold the guard (egress proxy / forward forwarder threads) for the whole pty session.
+    let _guard = guard;
 
     match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
         Ok(code) => ExitCode::from(code as u8),
@@ -1548,11 +1654,36 @@ fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<
         .collect()
 }
 
+/// The host-side resources a launch must keep alive for the whole session — a filtering egress
+/// proxy, an forward loopback forwarder, or both — returned by [`build`] and held by the
+/// supervisor paths ([`run_supervised`], the `--detach` child) so the proxy/forwarder threads
+/// outlive the cage. `None` means no such resource: the launcher exec-replaces (the command's
+/// exit status becomes ops's). Dropping the guard drops both, unlinking the on-disk artifacts and
+/// closing the listeners; the threads are detached and exit when their listener closes.
+pub(crate) struct LaunchGuard {
+    pub(crate) egress: Option<egress::Egress>,
+    pub(crate) forward: Option<forward::Forwarder>,
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        // The inner guards' Drops unlink the proxy/forwarder artifacts and close the listeners.
+        // Taking them here runs those Drops explicitly (and reads the fields, so the RAII holds
+        // are not flagged as unused — their whole purpose is to stay alive until this drop).
+        if let Some(egress) = self.egress.take() {
+            drop(egress);
+        }
+        if let Some(forward) = self.forward.take() {
+            drop(forward);
+        }
+    }
+}
+
 fn build(
     prep: &Prepared,
     runtime: binds::Runtime,
     cmd: Vec<OsString>,
-) -> Result<(SandboxSpec, Option<egress::Egress>), ExitCode> {
+) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
     for warning in &prep.cfg.warnings {
         crate::diag::warn(warning);
     }
@@ -1768,6 +1899,46 @@ fn build(
     let mut egress_guard = None;
     let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut egress_env: Vec<(String, String)> = Vec::new();
+
+    // Forwarder loopback forward ports: a declared `forward` opens a host loopback port and
+    // bridges it into the cage, so a host process (an OAuth `localhost:<port>` callback, or a
+    // dev server) can reach a service the agent started inside the empty-netns cage. Applied
+    // *before* the egress wrap below, so under an allowlist both forwarders are up before the
+    // command runs (the egress wrap is the outermost, backgrounds its socat, execs the inner
+    // which backgrounds the forward socats, execs the real command). Skipped under
+    // `network = "shared"`: the cage shares the host netns, so a cage loopback service is already
+    // on host loopback and the forwarder is a redundant no-op (noted, not wired). A port already
+    // in use fails the launch closed inside `forward::start`.
+    let mut forward_guard = None;
+    let mut forward_binds: Vec<binds::ExtraBind> = Vec::new();
+    if !prep.cfg.forward.is_empty() {
+        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Shared) {
+            crate::diag::warn(&format!(
+                "forward ports {} declared but `network = \"shared\"` already exposes the \
+                 cage loopback to the host — no forwarder needed",
+                prep.cfg
+                    .forward
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        } else {
+            let (guard, wiring) =
+                forward::start(&prep.layout, prep.cfg.forward.clone()).map_err(|e| {
+                    eprintln!("ops: {e}");
+                    ExitCode::FAILURE
+                })?;
+            cmd = forward::wrap_command(
+                &prep.userland.socat_bin,
+                &prep.userland.shell_bin,
+                &wiring.forwards,
+                cmd,
+            );
+            forward_binds = wiring.binds;
+            forward_guard = Some(guard);
+        }
+    }
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
         // An `ops app <name>` launch tags its egress stats with the app, so `ops net stats --app`
         // can scope to it; a plain `run`/`shell` records under the project with no app tag.
@@ -1862,6 +2033,7 @@ fn build(
     // (socket + CA) and the GUI socket. Their destinations are ops's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
+    extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
 
     // Pin ops's own control plane in place whenever a read-write bind contains it: each root's host
@@ -1930,7 +2102,15 @@ fn build(
         eprintln!("ops: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
-    Ok((spec, egress_guard))
+    let guard = if egress_guard.is_some() || forward_guard.is_some() {
+        Some(LaunchGuard {
+            egress: egress_guard,
+            forward: forward_guard,
+        })
+    } else {
+        None
+    };
+    Ok((spec, guard))
 }
 
 /// Translate the resolved configuration's network posture into the cage's net
@@ -2921,6 +3101,8 @@ mod tests {
             egress_stats: true,
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
@@ -2964,11 +3146,13 @@ mod tests {
             network: None,
             gui: None,
             limits: Default::default(),
+            forward: vec![],
             secrets: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],

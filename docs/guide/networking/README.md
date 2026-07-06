@@ -72,6 +72,9 @@ pasta NAT) are in [architecture](architecture.md) and the
   `ops net rules`, `ops net stats`, `ops net logs`, and `ops test net`.
 - **[Architecture](architecture.md)** — how Model B works under the hood, and why
   it was chosen over the alternatives.
+- **[Inbound forwarding (`forward`)](forward.md)** — the reverse direction: forward a host
+  loopback port *into* the cage so an OAuth `localhost:<port>` callback or a cage-run dev
+  server is reachable from the host. Loopback-only, trusted-only, orthogonal to egress.
 
 Credential injection into an allowed request (and the secret-redaction tripwires
 that ride the same proxy) are a separate subsystem — see

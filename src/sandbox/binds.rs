@@ -44,6 +44,26 @@ const SANDBOX_BASH: &str = "/bin/bash";
 /// rather than working around it.
 const SANDBOX_ENV: &str = "/usr/bin/env";
 
+/// The in-sandbox `/usr/bin/xdg-open`, synthesised as a tiny shell script. A
+/// hermetic cage has no host display, no browser, and no file manager, so a tool
+/// that calls `xdg-open <file|url>` (an OAuth device-auth flow that auto-opens the
+/// verification URL, a "open the docs" link, an image viewer) would otherwise fail
+/// with `Executable not found in $PATH: "xdg-open"` and abort the flow. The stub
+/// surfaces the argument on stderr so the user can act on it (open the URL in their
+/// host browser, view the file), and exits 0 so the caller treats the open as
+/// non-fatal and continues — a device-auth flow then proceeds while the user
+/// completes auth. Like the other synthetic FHS affordances it adds no exposure:
+/// it owns no data, opens nothing.
+const XDG_OPEN_INCAGE: &str = "/usr/bin/xdg-open";
+
+/// The synthetic `xdg-open` body. POSIX `sh` (the cage's `/bin/sh`), prints every
+/// argument (the common call is a single file or URL) to stderr with an `ops:`
+/// prefix, then exits 0. Robust to any argv a tool passes: it never inspects or
+/// forks — `xdg-open` may be asked to open anything, not only a URL.
+const XDG_OPEN_CONTENTS: &str = "#!/bin/sh\n\
+echo \"ops: open on the host:\" \"$@\" >&2\n\
+exit 0\n";
+
 /// The resolved hermetic userland (provided by the nix resolver). A nix binary
 /// finds its own libraries by absolute RPATH, so a read-only `/nix` suffices for
 /// it and it is never steered by the sandbox's library search. *Foreign* binaries
@@ -188,6 +208,8 @@ struct SandboxPaths<'a> {
     shell_rc_src: &'a Path,
     /// Generated egress contract; bound read-only at [`super::contract::EGRESS_CONTRACT_INCAGE`].
     contract_src: &'a Path,
+    /// Synthetic `xdg-open` script; bound read-only at [`XDG_OPEN_INCAGE`].
+    xdg_open_src: &'a Path,
 }
 
 /// Assemble a [`SandboxSpec`] from already-resolved host paths. Pure: no I/O, no
@@ -263,6 +285,19 @@ fn assemble(
         Mount::Symlink {
             target: userland.env_bin.clone(),
             dest: PathBuf::from(SANDBOX_ENV),
+        },
+        // Zone 1 — the synthetic `/usr/bin/xdg-open`: a stub that prints its
+        // argument and exits 0. A tool that auto-opens a browser or file (an OAuth
+        // device-auth flow, a docs link) calls `xdg-open <file|url>`; the hermetic
+        // cage has no display, browser, or file manager, so without this stub the
+        // call fails with "xdg-open not found" and aborts the flow. The stub surfaces
+        // the argument for the user to act on (open the URL in their host browser,
+        // view the file) and signals success, so the flow continues. bwrap
+        // auto-creates the `/usr/bin` parent (already created for `/usr/bin/env`
+        // above); like it, this adds only the name a tool assumes.
+        Mount::RoBind {
+            src: paths.xdg_open_src.to_path_buf(),
+            dest: PathBuf::from(XDG_OPEN_INCAGE),
         },
         // Zone 1 — the embedded mise "nix" backend plugin, read-only: an agent's
         // in-cage mise resolves it (via a symlink in the writable mise data dir) to
@@ -366,6 +401,11 @@ fn assemble(
     let mut path_dirs = overlay.bin_paths.to_vec();
     path_dirs.push(PathBuf::from(format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}")));
     path_dirs.extend(userland.bin_paths.iter().cloned());
+    // The synthetic `/usr/bin` (only `env` and `xdg-open`, both ops-owned — no host
+    // leak) is on PATH last, so a tool that calls `xdg-open` by name resolves the
+    // stub. Last so declared tools, mise shims, and the base userland all win on a
+    // name collision; `/usr/bin/env` is the same coreutils `env` already on PATH.
+    path_dirs.push(PathBuf::from("/usr/bin"));
 
     // Structural environment first, then the extra (passthrough + config) entries
     // upserted over it: a trusted config's override wins, while an untrusted one —
@@ -444,6 +484,7 @@ const STRUCTURAL_DESTS: &[&str] = &[
     SANDBOX_SHELL,
     SANDBOX_BASH,
     SANDBOX_ENV,
+    XDG_OPEN_INCAGE,
     CAGE_CA_BUNDLE,
     SHELL_RC_INCAGE,
     super::miseplugin::INCAGE_DIR,
@@ -835,7 +876,7 @@ pub(crate) fn build_spec(
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let project = canonicalize_project(cwd)?;
     let rt = project_runtime(data_dir, &project, runtime);
@@ -860,6 +901,13 @@ pub(crate) fn build_spec(
     let contract = rt.etc_dir.join("egress-contract.md");
     write_atomic(&contract, egress_contract.as_bytes())?;
 
+    // Materialize the synthetic `xdg-open` stub beside the other synthetic files
+    // (outside every writable mount, so it has no writable alias the agent could
+    // rewrite), then make it executable so a tool calling `xdg-open` runs it.
+    let xdg_open = rt.etc_dir.join("xdg-open");
+    write_atomic(&xdg_open, XDG_OPEN_CONTENTS.as_bytes())?;
+    std::fs::set_permissions(&xdg_open, std::fs::Permissions::from_mode(0o755))?;
+
     // Materialize the embedded mise `nix:` backend plugin (read-only, content-keyed,
     // shared across projects) and register it for this cage's mise: a symlink in the
     // writable mise data dir pointing at the read-only in-cage plugin. Both run on
@@ -875,6 +923,7 @@ pub(crate) fn build_spec(
         mise_plugin_src: &mise_plugin,
         shell_rc_src: &shell_rc,
         contract_src: &contract,
+        xdg_open_src: &xdg_open,
     };
     // The cage's readable name: the app name for `ops app <name>`, else the project's own
     // directory name. Carried on the spec so the scope, hostname, and session listing all
@@ -985,6 +1034,7 @@ mod tests {
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
+            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -1173,10 +1223,11 @@ mod tests {
 
         let path_i = joined.iter().position(|s| s == "PATH").unwrap();
         // mise's shims dir sits between the (here empty) declared tools and the base
-        // userland, so an agent-activated tool surfaces ahead of base on a name clash.
+        // userland, so an agent-activated tool surfaces ahead of base on a name clash; the
+        // synthetic `/usr/bin` (env + xdg-open) trails so `xdg-open` resolves by name.
         assert_eq!(
             joined[path_i + 1],
-            "/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin"
+            "/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin"
         );
         // foreign binaries reach the base glibc through the nix-ld shim, never the
         // global LD_LIBRARY_PATH (which would skew a differently-pinned nix tool)
@@ -1251,6 +1302,7 @@ mod tests {
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
+            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1321,6 +1373,7 @@ mod tests {
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
+            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
         };
         let overlay = Overlay {
             env: extra_env,
@@ -1376,10 +1429,11 @@ mod tests {
         );
         let argv = argv_strings(&spec);
         let path_i = argv.iter().position(|s| s == "PATH").unwrap();
-        // declared tools first, then mise's shims, then the base userland
+        // declared tools first, then mise's shims, then the base userland, then the
+        // synthetic `/usr/bin` (env + xdg-open, ops-owned) so `xdg-open` resolves by name.
         assert_eq!(
             argv[path_i + 1],
-            "/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin"
+            "/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin"
         );
     }
 
@@ -1399,6 +1453,49 @@ mod tests {
             "/usr/bin/env links to coreutils' env"
         );
         assert_eq!(argv[env - 2], "--symlink", "/usr/bin/env is a symlink");
+    }
+
+    #[test]
+    fn usr_bin_xdg_open_is_a_read_only_bind_of_the_stub() {
+        // A tool that auto-opens a browser/file (an OAuth device-auth flow) calls
+        // `xdg-open`; the hermetic cage has none, so the cage synthesises a stub at
+        // `/usr/bin/xdg-open`. It is a read-only bind (not a symlink) of the staged
+        // executable script, so a tool probing `$PATH` finds it and a call exits 0
+        // instead of aborting the flow with "xdg-open not found".
+        let argv = argv_strings(&assembled());
+        let xdg = argv
+            .iter()
+            .position(|s| s == "/usr/bin/xdg-open")
+            .expect("/usr/bin/xdg-open is synthesised");
+        assert_eq!(
+            argv[xdg - 1],
+            "/data/ops/projects/abc/etc/xdg-open",
+            "/usr/bin/xdg-open binds the staged stub"
+        );
+        assert_eq!(
+            argv[xdg - 2],
+            "--ro-bind",
+            "/usr/bin/xdg-open is a read-only bind"
+        );
+    }
+
+    #[test]
+    fn xdg_open_contents_is_a_posix_sh_script_that_exits_zero() {
+        // The stub must be a valid `#!/bin/sh` script (the cage synthesises that
+        // path) that exits 0 — the whole point is a tool calling `xdg-open` does not
+        // see a failure — and surface its argument so the user can act on it.
+        assert!(
+            XDG_OPEN_CONTENTS.starts_with("#!/bin/sh\n"),
+            "the stub is a /bin/sh script"
+        );
+        assert!(
+            XDG_OPEN_CONTENTS.contains("exit 0"),
+            "the stub exits 0 so the caller treats the open as non-fatal"
+        );
+        assert!(
+            XDG_OPEN_CONTENTS.contains("\"$@\""),
+            "the stub surfaces the argument the tool passed"
+        );
     }
 
     #[test]
@@ -1569,6 +1666,7 @@ mod tests {
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
+            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
         };
         let nix = NixMount {
             src: PathBuf::from("/data/ops/projects/abc/store/nix"),
@@ -1838,7 +1936,7 @@ mod smoke {
             "synthetic identity not resolved:\n{stdout}"
         );
         // hermetic: `/usr` is the minimal synthetic tree — only `bin` (which holds the
-        // single `env` symlink), never the host's `/usr` (which would carry `lib`/`share`/…
+        // `env` symlink and the `xdg-open` stub), never the host's `/usr` (which would carry `lib`/`share`/…
         // alongside). The cage synthesises `/usr/bin/env` and nothing else under `/usr`.
         assert!(
             stdout.contains("USR=bin,"),

@@ -308,7 +308,20 @@ mod tests {
     fn the_egress_and_toolchain_carve_outs_stay_allowed() {
         let eperm = eperm_rules();
         let enosys = enosys_rules();
-        for nr in [libc::SYS_socket, libc::SYS_socketpair, libc::SYS_recvfrom] {
+        // The egress forwarder (socat TCP-LISTEN→UNIX-CONNECT) needs socket/socketpair/recvfrom.
+        // The inbound forwarder (socat UNIX-LISTEN→TCP-CONNECT) additionally needs the server
+        // socket primitives — bind/listen/accept/connect/sendto — which were never denied, but
+        // pinning them here guards against a future denylist that would silently break inbound.
+        for nr in [
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            libc::SYS_recvfrom,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_accept,
+            libc::SYS_connect,
+            libc::SYS_sendto,
+        ] {
             assert!(!eperm.contains_key(&nr), "carve-out {nr} must stay allowed");
             assert!(
                 !enosys.contains_key(&nr),

@@ -3,15 +3,33 @@
 #   ops app import profiles/codex.toml
 #   ops app codex
 #
-# The tool is equipped fresh from upstream (mise's `aqua` backend pulls OpenAI's
-# codex release binary) — no nixpkgs lag. It is equipped at the latest upstream
-# version on the first launch in a project; advancing an already-installed version
-# is not yet automated by `ops upgrade`.
+# The tool is equipped fresh from upstream (mise's `aqua` backend pulls OpenAI's codex
+# release binary) — no nixpkgs lag. It is equipped at the latest upstream version on the
+# first launch in a project; advancing an already-installed version is not yet automated
+# by `ops upgrade`.
 #
-# This profile uses the API-key path (api.openai.com). Codex's ChatGPT login flow
-# is an OAuth/device flow, which does not fit the header-injection model below —
-# use the API key if you want the sandboxed credential boundary.
+# Two authentication paths are supported:
+#
+#  - **API key** (header-injected): set `$OPENAI_API_KEY` on the host and uncomment the
+#    `[secret."api.openai.com"]` block below. The egress proxy injects the key on the wire
+#    to api.openai.com; the plaintext never enters the cage.
+#  - **ChatGPT login (OAuth)**: run `ops app codex`, then `codex login` inside the cage.
+#    Codex opens the OAuth URL in your host browser; the provider redirects to
+#    http://localhost:1455/auth/callback, and `forward = [1455]` forwards that host
+#    loopback port into the cage so codex (listening on its own loopback) receives the
+#    code. The resulting token persists in the app's isolated `$HOME`, so login is a
+#    one-time step. The allowlist below opens the OAuth/runtime hosts.
+#
+# Both paths ride the same Model-B allowlist; the OAuth runtime hosts the CLI talks to are
+# confirmed at first login — a host the flow reaches that is not listed returns a 403 whose
+# body names `ops net allow <host>`, so add any missing host the proxy surfaces.
 cmd = "codex"
+
+# Forward the host's localhost:1455 into the cage so the OAuth callback reaches codex.
+# A port already in use on the host fails the launch closed (the redirect URL is fixed).
+# Must stay a top-level key: written after a `[table]` header, TOML would fold it into that
+# table (e.g. `network.forward`) and it would be silently ignored.
+forward = [1455]
 
 [packages]
 codex = "mise:aqua:openai/codex"
@@ -19,15 +37,21 @@ codex = "mise:aqua:openai/codex"
 # An app is read-by-default ({GET,HEAD}); the API host the agent POSTs to is opened with `{*}`.
 [network]
 mode = "deny"
-allow = ["{*} https://api.openai.com"]
+allow = [
+  "{*} https://api.openai.com",
+  "{GET} https://chatgpt.com",
+  "{*} https://ab.chatgpt.com",
+  "{GET} https://auth.openai.com",
+  "{POST} https://github.com/openai/plugins.git/git-upload-pack",
+]
 
-# The real key is read on the HOST and injected by the egress proxy — never in the
-# cage. Provide it on the host as $OPENAI_API_KEY (or a resolver). The placeholder
-# lets the CLI start; the proxy substitutes the real key on the wire.
+# API-key path: the real key is read on the HOST and injected by the egress proxy — never in
+# the cage. Provide it on the host as $OPENAI_API_KEY (or a resolver) and uncomment to use the
+# API-key path instead of the OAuth login.
 [env]
-OPENAI_API_KEY = "sk-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-ops-placeholder-replaced-by-the-egress-proxy"
 
-[secret."api.openai.com"]
-from = "env://OPENAI_API_KEY"
-header = "Authorization"
-type = "bearer"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

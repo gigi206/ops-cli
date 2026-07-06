@@ -55,6 +55,11 @@ pub(crate) struct ConfigView {
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
     pub(crate) gui_origin: ProvenanceView,
+    /// Host loopback TCP ports forwarded into the cage (`forward`), each a port number. Empty when
+    /// no layer declared any.
+    pub(crate) forward: Vec<u16>,
+    /// Which layer supplied the `forward` set (`Default` when neither config set it).
+    pub(crate) forward_origin: ProvenanceView,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -445,6 +450,10 @@ pub(crate) struct AppView {
     /// The app's own GUI posture, when it set one — the same [`GuiView`] the baseline `gui` field
     /// carries, so the overlay and the baseline render and serialize a display identically.
     pub(crate) gui: Option<GuiView>,
+    /// The host loopback ports this overlay adds over the baseline — a security field, gated like
+    /// the baseline `forward`. The overlay's own ports, not the baseline-merged set; the merge
+    /// unions them only for the launch itself.
+    pub(crate) forward: Vec<u16>,
     /// The cgroup limits this overlay overrides, when it tunes any — its *own* fields, not the
     /// baseline-merged set, so an app that changes nothing shows nothing.
     pub(crate) limits: Option<AppLimitsView>,
@@ -485,6 +494,10 @@ pub(crate) struct AppDetailView {
     /// The effective GUI posture (the app's own, else the baseline's).
     pub(crate) gui: GuiView,
     pub(crate) gui_origin: ProvenanceView,
+    /// The effective host loopback forward ports — the app's own ∪ the baseline's. The origin is
+    /// `Inherited` when the app added none of its own.
+    pub(crate) forward: Vec<u16>,
+    pub(crate) forward_origin: ProvenanceView,
     /// The effective cgroup limits — the app's overrides folded onto the baseline — each field
     /// carrying its provenance (`Inherited` when the app left it to the baseline).
     pub(crate) limits: LimitsView,
@@ -637,6 +650,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         egress_stats: resolved.egress_stats,
         gui,
         gui_origin: resolved.gui_origin.into(),
+        forward: resolved.forward.clone(),
+        forward_origin: resolved.forward_origin.into(),
         limits,
         secrets,
         apps,
@@ -882,6 +897,7 @@ fn app_view(
             super::GuiPolicy::Wayland => GuiView::Wayland,
             super::GuiPolicy::None => GuiView::None,
         }),
+        forward: app.forward.clone(),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
             app.secrets
@@ -954,6 +970,12 @@ fn app_detail_view(
     };
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
 
+    // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
+    // performs — with the origin `Inherited` when the app added none of its own.
+    let mut eff_forward = baseline.forward.clone();
+    super::union_forward(&mut eff_forward, app.forward.clone());
+    let forward_origin = origin_or_inherited(!app.forward.is_empty(), app.forward_origin);
+
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
     // app's when it set the field, else inherited from the baseline.
     let mut eff_limits = baseline.limits.clone();
@@ -1025,6 +1047,8 @@ fn app_detail_view(
         network_origin,
         gui,
         gui_origin,
+        forward: eff_forward,
+        forward_origin,
         limits,
         env: app
             .env
@@ -1249,6 +1273,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
+            forward: vec![1455],
+            forward_origin: ProvenanceView::Global,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -1282,6 +1308,7 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
+                forward: vec![1455],
                 limits: Some(AppLimitsView {
                     memory_high: None,
                     memory_max: Some("8G".into()),
@@ -1320,6 +1347,11 @@ mod tests {
         // (default/global/project) travels with it.
         assert_eq!(json["network_origin"], "Project");
         assert_eq!(json["gui_origin"], "Global");
+        // The forward port list + its origin travel with the view, so a front-end can render
+        // the host-loopback forward ports and where they came from.
+        assert_eq!(json["forward"][0], 1455);
+        assert_eq!(json["forward_origin"], "Global");
+        assert_eq!(json["apps"][0]["forward"][0], 1455);
         // An app overlay's allowlist serializes its rules and the built-in set in full, so the
         // JSON form carries what `ops app <name>` can reach without a `--details` equivalent.
         let app_net = &json["apps"][0]["network"]["Allowlist"];
@@ -1401,11 +1433,13 @@ mod tests {
             network: None,
             gui: None,
             limits: Default::default(),
+            forward: vec![],
             secrets: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            forward_origin: Default::default(),
             limits_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
@@ -1466,6 +1500,8 @@ mod tests {
             egress_stats: true,
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
+            forward: vec![9090],
+            forward_origin: Provenance::Global,
             limits: sandbox::cgroup::Limits {
                 memory_high: Some("50%".into()),
                 memory_max: None,
@@ -1501,11 +1537,14 @@ mod tests {
                 memory_max: None,
                 tasks_max: Some("99".into()),
             },
+            // The app adds its own port; the baseline's 9090 must survive the union.
+            forward: vec![1455],
             secrets: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Provenance::Global,
             network_origin: Provenance::Global,
             gui_origin: Provenance::Default,
+            forward_origin: Provenance::Global,
             limits_origin: crate::config::LimitsOrigin {
                 memory_high: Provenance::Default,
                 memory_max: Provenance::Default,
@@ -1544,6 +1583,18 @@ mod tests {
         );
         assert_eq!(detail.limits.memory_max.value, merged.limits.memory_max().0);
         assert_eq!(detail.limits.tasks_max.value, merged.limits.tasks_max().0);
+
+        // Effective forward must equal merge_app's union — the app's own 1455 plus the inherited
+        // baseline 9090, sorted — so the detail view never misreports the forwarded ports.
+        assert_eq!(
+            detail.forward, merged.forward,
+            "effective forward must match merge_app"
+        );
+        assert_eq!(
+            merged.forward,
+            vec![1455, 9090],
+            "the union keeps both ports"
+        );
 
         // Credentials must agree with merge_app too: the app narrowed the network to `none`, so
         // merge_app's posture check clears the inherited secret — and the detail view, mirroring it,

@@ -16,6 +16,7 @@ pub(crate) mod egress_stats;
 mod fhs;
 mod flake;
 mod fonts;
+mod forward;
 mod gc;
 mod launch;
 mod mise;
@@ -31,17 +32,21 @@ mod seccomp;
 mod smoke;
 mod spec;
 
-pub(crate) use binds::{project_identity, structural_nesting_warning};
+pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use flake::{
     pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
     withheld as withheld_flake_packages, FlakeUpgrade,
 };
+pub(crate) use gc::classify_tree;
 pub(crate) use launch::{
-    app, attach, effective_lock_target, gc, run, run_mise, shell, stop, upgrade_mise_packages,
+    app, attach, effective_lock_target, gc, gc_one_tree, run, run_mise, shell, stop,
+    upgrade_mise_packages,
 };
 pub(crate) use naming::cage_name;
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
+#[cfg(test)]
+pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use proxy::{builtin_allow_rules, union_with_builtin};
 pub(crate) use search::run as search;
 pub(crate) use smoke::run as smoke;
