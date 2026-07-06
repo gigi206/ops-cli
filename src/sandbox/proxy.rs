@@ -127,6 +127,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1390,6 +1391,28 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    re-runs this match, so the secret cannot ride along to an unintended host.
     let injected = matching_injections(ctx, &connect_host, port, &itarget);
 
+    // 8b. A WebSocket upgrade cannot ride the one-shot request/response path below (which forces
+    //     `Connection: close` and relays a single direction). The handshake was inspected by the same
+    //     verdict as any request — host, path, method, anti-fronting, SSRF, upstream-cert — and the
+    //     outbound-secret tripwire already ran on it above, so the allowlist governs which host/path
+    //     may open a WebSocket. Hand it to the upgrade relay, which forwards it with its
+    //     `Upgrade`/`Connection` headers preserved and, on a `101`, relays both TLS streams verbatim.
+    //
+    //     Two known properties of an opened WebSocket, deliberate and bounded to a low-volume agent
+    //     stream (documented, not silent):
+    //       - Posture: an upgrade is a `GET`, so it rides a `GET`/`{*}` allow. A read-only `{GET}` rule
+    //         therefore permits opening a *bidirectional* channel to that host/path. This is accepted
+    //         (the handshake is a legitimate GET and the host/path is still gated); a dedicated
+    //         `ws://` opt-in scheme, if a read-only-should-forbid-WS case ever arises, is a future
+    //         refinement, not a gap here.
+    //       - Once opened, the framed bytes are opaque and relayed verbatim: they are NOT scanned by
+    //         the response-side redaction ([`pump_redacting`]). The boundary stays the empty netns +
+    //         the allowlist + the inspected handshake; frame-level redaction is out of scope (masked,
+    //         framed binary that a byte scan cannot meaningfully cover).
+    if is_websocket_upgrade(&inner) {
+        return relay_upgrade(br, upstream, &inner, &injected, ctx, allow_seq);
+    }
+
     // 9. Forward this one request and stream the response back, then close — a pipelined second
     //    request is never forwarded, so it cannot skip the per-request check. The head is
     //    reserialized with `Connection: close` forced so a keep-alive upstream closes after the
@@ -2174,6 +2197,199 @@ fn reserialize_request(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Whether a decrypted request head is a WebSocket upgrade: `Upgrade: websocket` together with a
+/// `Connection` header listing the `upgrade` token (both case-insensitive; `Connection` is a
+/// comma-separated token list). Both are required — an `Upgrade` header without `Connection:
+/// upgrade` is not an upgrade a client will complete, so it stays on the normal request path.
+fn is_websocket_upgrade(head: &Head) -> bool {
+    let names_token = |header: &str, token: &str| {
+        head.header(header)
+            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+            .unwrap_or(false)
+    };
+    names_token("upgrade", "websocket") && names_token("connection", "upgrade")
+}
+
+/// Reserialize a WebSocket upgrade handshake for forwarding upstream. Like [`reserialize_request`]
+/// it injects any matching credential and strips the client's copy of an injected header, but it
+/// PRESERVES the hop-by-hop `Connection`/`Upgrade` headers (and the `Sec-WebSocket-*` set) so the
+/// upstream actually performs the upgrade — the opposite of the normal path, which forces
+/// `Connection: close`. `Proxy-Connection` and `Expect` are still stripped (proxy-local hop headers).
+fn reserialize_upgrade(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = String::with_capacity(head.request_line.len() + 64);
+    out.push_str(&head.request_line);
+    out.push_str("\r\n");
+    for (k, v) in &head.headers {
+        if k.eq_ignore_ascii_case("proxy-connection") || k.eq_ignore_ascii_case("expect") {
+            continue;
+        }
+        if injections.iter().any(|(name, _)| header_name_eq(k, name)) {
+            continue;
+        }
+        out.push_str(k);
+        out.push_str(": ");
+        out.push_str(v);
+        out.push_str("\r\n");
+    }
+    for (name, value) in injections {
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    out.into_bytes()
+}
+
+/// Forward an allowed WebSocket upgrade and, on a `101`, relay the two TLS streams bidirectionally.
+/// The handshake was already inspected by the same verdict as any request (host / path / method /
+/// anti-fronting / SSRF / upstream-cert), so the allowlist still governs which host and path may open
+/// a WebSocket; from the `101` on, the framed bytes are opaque and relayed verbatim. If the upstream
+/// declines the upgrade (any non-`101`), its response is relayed as a normal one and the tunnel closes.
+///
+/// Takes `br` and `upstream` by value: the response phase owns both streams, and on the `101` path the
+/// buffered bytes each `BufReader` read past its head are handed to [`relay_websocket`] to flush first.
+fn relay_upgrade(
+    mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
+    mut upstream: StreamOwned<ClientConnection, TcpStream>,
+    inner: &Head,
+    injected: &[(&str, &str)],
+    ctx: &ProxyCtx,
+    allow_seq: Option<u64>,
+) -> io::Result<()> {
+    // Forward the handshake with its upgrade headers preserved (a handshake carries no body).
+    upstream.write_all(&reserialize_upgrade(inner, injected))?;
+    upstream.flush().ok();
+
+    // Read the upstream's response head. A BufReader may read past it into the server's first frames;
+    // those buffered bytes are drained below so none is lost.
+    let mut up_br = BufReader::new(upstream);
+    let resp_head = read_head_buffered(&mut up_br, HEAD_MAX)?;
+
+    if parse_status_code(&resp_head) != Some(101) {
+        // The upstream declined the upgrade — relay its response as a normal one, then close. The
+        // upstream keeps the read timeout it was given (the handshake did not force `Connection:
+        // close`), so a keep-alive response without an EOF is bounded by that timeout, not hung.
+        if let Some(code) = parse_status_code(&resp_head) {
+            if code >= 200 {
+                ctx.set_status(allow_seq, code);
+            }
+        }
+        br.get_mut().write_all(&resp_head)?;
+        pump_to_eof(&mut up_br, br.get_mut())?;
+        finish_tls(br.get_mut());
+        return Ok(());
+    }
+
+    ctx.set_status(allow_seq, 101);
+    // Relay the `101` to the client so it completes the WebSocket handshake.
+    br.get_mut().write_all(&resp_head)?;
+    br.get_mut().flush()?;
+    // Drain what each BufReader already read past its head, then relay the raw TLS streams.
+    let upstream_pending = up_br.buffer().to_vec();
+    let upstream = up_br.into_inner();
+    let client_pending = br.buffer().to_vec();
+    let client = br.into_inner();
+    relay_websocket(client, &client_pending, upstream, &upstream_pending)
+}
+
+/// Relay an established bidirectional connection (a WebSocket) between the cage `client` and the
+/// `upstream`, both TLS-terminated, until either side closes. The handshake was inspected and allowed;
+/// from here every byte is opaque (masked frames), relayed verbatim both ways. Single-threaded with
+/// `poll`: the two rustls `Connection`s cannot be read and written from two threads without aliasing
+/// UB, so one thread multiplexes both directions — poll for readability, then a blocking read on the
+/// ready side and a blocking write to the other. Idle time is spent parked in `poll` (not in a read),
+/// so a live-but-idle channel is never cut; a generous socket timeout is the only safety valve against
+/// a stalled partial-record read or a backpressured write. `*_pending` are the bytes each side already
+/// read past its head — they MUST be flushed to the peer first, or the first frames are lost.
+///
+/// Bounded by design for a low-volume agent stream: one thread reads one side then does a *blocking*
+/// write to the other, so a peer that stops reading couples head-of-line onto the other direction
+/// until the `valve` timeout fires. A high-throughput full-duplex peer could thus stall one direction;
+/// the fix, if that ever matters, is per-direction non-blocking writes with a bounded buffer — not
+/// needed for a chat/completion WebSocket, where each frame is small and consumed promptly.
+fn relay_websocket(
+    mut client: StreamOwned<ServerConnection, UnixStream>,
+    client_pending: &[u8],
+    mut upstream: StreamOwned<ClientConnection, TcpStream>,
+    upstream_pending: &[u8],
+) -> io::Result<()> {
+    if !client_pending.is_empty() {
+        upstream.write_all(client_pending)?;
+        upstream.flush()?;
+    }
+    if !upstream_pending.is_empty() {
+        client.write_all(upstream_pending)?;
+        client.flush()?;
+    }
+
+    // No idle read timeout (poll waits for data), but keep a generous safety valve so a stalled
+    // partial-record read or a backpressured write cannot pin the thread indefinitely.
+    let valve = Some(Duration::from_secs(60));
+    let _ = client.sock.set_read_timeout(valve);
+    let _ = client.sock.set_write_timeout(valve);
+    let _ = upstream.sock.set_read_timeout(valve);
+    let _ = upstream.sock.set_write_timeout(valve);
+
+    let cfd = client.sock.as_raw_fd();
+    let ufd = upstream.sock.as_raw_fd();
+    let interest = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: cfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: ufd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // Indefinite: an idle live channel parks here, not in a read, so it is never cut; a dead peer
+        // that neither sends nor closes is bounded by the connection cap, as for the L4 splice.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if fds[0].revents & interest != 0 {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => {
+                    upstream.write_all(&buf[..k])?;
+                    upstream.flush()?;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if fds[1].revents & interest != 0 {
+            match upstream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => {
+                    client.write_all(&buf[..k])?;
+                    client.flush()?;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    // Clean TLS shutdown both ways.
+    client.conn.send_close_notify();
+    let _ = client.flush();
+    upstream.conn.send_close_notify();
+    let _ = upstream.flush();
+    Ok(())
+}
+
 /// Whether the request head carries `Expect: 100-continue` (case-insensitive) — the client will
 /// withhold its body until it sees a `100 Continue`, so the proxy answers one on the upstream's behalf.
 fn head_expects_continue(head: &Head) -> bool {
@@ -2735,6 +2951,132 @@ mod tests {
         Ok(resp)
     }
 
+    /// A one-shot loopback TLS "upstream" that speaks a WebSocket: it reads the upgrade head, replies
+    /// `101 Switching Protocols`, immediately pushes an unsolicited `S-FIRST;` (server→client, so a
+    /// test proves that direction and that the bytes buffered past the `101` are not lost), then reads
+    /// the client's frame and echoes it back as `ECHO:<frame>` (client→upstream→client), then closes.
+    fn spawn_ws_upstream() -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            {
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let _ = tls.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\nS-FIRST;",
+            );
+            let _ = tls.flush();
+            let mut buf = [0u8; 64];
+            if let Ok(n) = tls.read(&mut buf) {
+                let mut echo = b"ECHO:".to_vec();
+                echo.extend_from_slice(&buf[..n]);
+                let _ = tls.write_all(&echo);
+                let _ = tls.flush();
+            }
+        });
+        (addr, ca_der, handle)
+    }
+
+    /// Read a TLS (or any) stream up to the `\r\n\r\n` blank-line terminator, leaving anything after it
+    /// unread (so post-`101` frames stay in the stream).
+    fn read_head_until_blank<R: Read>(r: &mut R) -> io::Result<String> {
+        let mut buf = Vec::new();
+        let mut one = [0u8; 1];
+        loop {
+            if r.read(&mut one)? == 0 {
+                break;
+            }
+            buf.push(one[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Drive one WebSocket upgrade through the proxy: CONNECT + TLS, send the upgrade, read the `101`,
+    /// send a client frame, then read everything the server sent until close. Returns the whole
+    /// decrypted transcript (the `101` head + every relayed byte both the server pushed and echoed).
+    fn through_proxy_websocket(
+        ctx: Arc<ProxyCtx>,
+        proxy_ca: CertificateDer<'static>,
+        connect_host: &str,
+        connect_port: u16,
+    ) -> io::Result<String> {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        write!(
+            sock,
+            "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+        )
+        .unwrap();
+        sock.flush().unwrap();
+        let established = read_until_blank(&mut sock)?;
+        assert!(
+            established.contains("200 Connection established"),
+            "CONNECT not accepted: {established:?}"
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(proxy_ca).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(connect_host.to_string()).unwrap();
+        let conn =
+            ClientConnection::new(Arc::new(client_config), name).map_err(io::Error::other)?;
+        let mut tls = StreamOwned::new(conn, sock);
+        let upgrade = format!(
+            "GET /chat HTTP/1.1\r\nHost: {connect_host}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        // Everything after the CONNECT is best-effort: on a refusal the proxy writes its status over
+        // the tunnel and closes, so any of these can hit a closed connection — that is the denied
+        // case, where the transcript is simply the refusal the proxy sent.
+        let _ = tls.write_all(upgrade.as_bytes());
+        let _ = tls.flush();
+        let head = read_head_until_blank(&mut tls).unwrap_or_default();
+        // Only send a client frame on an established WebSocket. On a non-`101` (a refusal, or an
+        // upstream that declined the upgrade) the tunnel is closing, so writing would RST the socket
+        // and discard the buffered response body before `read_to_string` can relay it.
+        if head.contains("101 Switching Protocols") {
+            let _ = tls.write_all(b"client-frame");
+            let _ = tls.flush();
+        }
+        let mut rest = String::new();
+        let _ = tls.read_to_string(&mut rest);
+        Ok(format!("{head}{rest}"))
+    }
+
     /// Read bytes until the `\r\n\r\n` blank-line terminator (cleartext CONNECT reply).
     fn read_until_blank(sock: &mut UnixStream) -> io::Result<String> {
         let mut buf = Vec::new();
@@ -3045,6 +3387,119 @@ mod tests {
         assert!(
             resp.contains("streamed-body"),
             "the body was not fully relayed: {resp:?}"
+        );
+    }
+
+    /// An allowed WebSocket upgrade is relayed bidirectionally: the client gets the `101`, the server's
+    /// unsolicited push (`S-FIRST;`, proving upstream→client AND that bytes buffered past the `101` are
+    /// not lost — the buffer-drain), and the echo of its own frame (`ECHO:client-frame`, proving
+    /// client→upstream→client). Teeth: without the upgrade relay, the one-shot path forces
+    /// `Connection: close` and never carries the frames, so the echo never comes back.
+    #[test]
+    fn a_websocket_upgrade_is_relayed_bidirectionally() {
+        let (addr, upstream_ca, up) = spawn_ws_upstream();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+
+        let transcript =
+            through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+        up.join().unwrap();
+        assert!(
+            transcript.contains("101 Switching Protocols"),
+            "the upgrade was not completed: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("S-FIRST;"),
+            "the server push (upstream→client, buffered past the 101) was lost: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("ECHO:client-frame"),
+            "the client frame did not round-trip (client→upstream→client): {transcript:?}"
+        );
+    }
+
+    /// A WebSocket upgrade does not bypass the verdict: an upgrade to a host no rule allows is refused
+    /// (`403`) at the same gate as any request, and no tunnel is opened. So the allowlist governs which
+    /// host may open a WebSocket, exactly as for a normal request.
+    #[test]
+    fn a_websocket_upgrade_to_a_denied_host_is_refused() {
+        let (addr, upstream_ca, _up) = spawn_ws_upstream();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        // The policy allows only `allowed.test`, but the upgrade targets `denied.test`.
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let transcript =
+            through_proxy_websocket(ctx, proxy_ca_der, "denied.test", addr.port()).unwrap();
+        assert!(
+            transcript.contains("403"),
+            "a denied-host upgrade must be refused, not tunneled: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("101"),
+            "no tunnel may be established to a denied host: {transcript:?}"
+        );
+    }
+
+    /// When the upstream declines the upgrade (any non-`101`), its response is relayed as a normal one
+    /// and the tunnel closes — it does not hang waiting for a bidirectional channel that will never
+    /// open. Here the upstream answers a WebSocket upgrade with a `401` and closes; the client must
+    /// receive that `401` (body and all) and reach EOF.
+    #[test]
+    fn a_websocket_upgrade_the_upstream_declines_is_relayed_as_a_normal_response() {
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 14\r\n\r\nnot-upgradable",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let transcript =
+            through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+        up.join().unwrap();
+        assert!(
+            transcript.contains("401") && transcript.contains("not-upgradable"),
+            "the declined-upgrade response was not relayed: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("101"),
+            "no upgrade was completed: {transcript:?}"
         );
     }
 
