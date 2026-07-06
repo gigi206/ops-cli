@@ -23,7 +23,14 @@
 # Both paths ride the same Model-B allowlist; the OAuth runtime hosts the CLI talks to are
 # confirmed at first login — a host the flow reaches that is not listed returns a 403 whose
 # body names `ops net allow <host>`, so add any missing host the proxy surfaces.
-cmd = "codex"
+# ops IS the sandbox (bwrap + seccomp + empty netns + egress allowlist), so codex's own nested
+# bubblewrap sandbox is redundant here — and unreachable anyway: the cage's seccomp filter blocks
+# the mount/namespace family a nested bwrap needs (unshare/mount/pivot_root), so it cannot start
+# (that is the "could not find bubblewrap on PATH" warning, and the bundled fallback fails too).
+# `--sandbox danger-full-access` turns codex's own sandbox off — OpenAI recommends exactly this when
+# Codex runs inside a pre-existing containment environment. It drops only codex's *internal*
+# restrictions; the real filesystem and network boundary stays ops's cage and its egress allowlist.
+cmd = ["codex", "--sandbox", "danger-full-access"]
 
 # Forward the host's localhost:1455 into the cage so the OAuth callback reaches codex.
 # A port already in use on the host fails the launch closed (the redirect URL is fixed).
@@ -39,8 +46,9 @@ codex = "mise:aqua:openai/codex"
 mode = "deny"
 allow = [
   "{*} https://api.openai.com",
-  "{GET} https://chatgpt.com",
-  "{*} https://ab.chatgpt.com",
+  "{*} https://auth.openai.com",
+  "{*} https://chatgpt.com",
+  #"{*} https://ab.chatgpt.com",
   "{GET} https://auth.openai.com",
   "{POST} https://github.com/openai/plugins.git/git-upload-pack",
 ]
