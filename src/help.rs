@@ -944,6 +944,10 @@ const PAGES: &[Page] = &[
             `tail` cannot un-print a line, so the status arrives as a follow-up); the one-shot\n\
             listing shows each event's status directly.\n\
             \n\
+            A WebSocket is flagged `ws` on its line (it opens with a `101` status, which only an\n\
+            upgrade produces) — shown even without `--with-status`, since a long-lived bidirectional\n\
+            tunnel reads differently from a one-shot request.\n\
+            \n\
             The URL query is dropped from the shown path by default (a token can ride in a query);\n\
             `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\
             values before an event enters the log.\n\

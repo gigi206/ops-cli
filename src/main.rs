@@ -4833,6 +4833,14 @@ fn render_log_line(
     } else {
         format!("  {dim}({}){r}", e.reason)
     };
+    // A WebSocket shows a `101` status (set only by the upgrade relay; the normal path never records
+    // a 1xx), so flag it explicitly — a long-lived bidirectional tunnel reads differently from a
+    // one-shot request, and the marker shows even without `--with-status`.
+    let ws = if e.status == Some(101) {
+        format!("  {n}ws{r}")
+    } else {
+        String::new()
+    };
     // The upstream status, only under `--with-status`: the code (colored by class) for a completed
     // L7 request, or `-` where none was captured (an L4 splice, a refusal, or a not-yet-returned
     // response) so the column is legible rather than mysteriously blank.
@@ -4845,7 +4853,7 @@ fn render_log_line(
         String::new()
     };
     format!(
-        "    {dim}{pid}{r}  {dim}{time}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{status}",
+        "    {dim}{pid}{r}  {dim}{time}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{ws}{status}",
         e.verdict.as_str()
     )
 }
@@ -8211,6 +8219,40 @@ mod tests {
             j_raw["status"],
             serde_json::Value::Null,
             "null when none captured"
+        );
+    }
+
+    #[test]
+    fn a_websocket_event_is_flagged_ws_even_without_with_status() {
+        use sandbox::control::LogVerdict::Allow;
+        let p = style::Palette::plain();
+        // A WebSocket carries a 101 (set only by the upgrade relay); a normal request never does.
+        let mut ws = log_event(1, "chat.test", Some("GET"), Some("/rt"), Allow, "allowed");
+        ws.status = Some(101);
+        let normal = {
+            let mut e = log_event(2, "api.test", Some("GET"), Some("/p"), Allow, "allowed");
+            e.status = Some(200);
+            e
+        };
+        let off = LogView::default();
+        // The `ws` marker shows even without `--with-status`, and only for a 101.
+        assert!(
+            render_log_line(&ws, 7, &off, &p).contains("ws"),
+            "a 101 event is flagged ws in the default view"
+        );
+        assert!(
+            !render_log_line(&normal, 7, &off, &p).contains(" ws"),
+            "a normal request is not flagged ws"
+        );
+        // Under --with-status the explicit 101 code is still shown alongside the ws marker.
+        let on = LogView {
+            with_status: true,
+            ..LogView::default()
+        };
+        let line = render_log_line(&ws, 7, &on, &p);
+        assert!(
+            line.contains("ws") && line.contains("101"),
+            "with --with-status a WebSocket shows both `ws` and `101`: {line}"
         );
     }
 
