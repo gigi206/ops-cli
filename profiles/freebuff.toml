@@ -44,6 +44,7 @@ mode = "deny"
 allow = [
   "{GET} https://registry.npmjs.org",
   "{GET} https://www.codebuff.com",
+  "{GET} https://codebuff.com",
   "{*} https://www.codebuff.com/api/*",
   "{GET} https://freebuff.com",
   "{POST} https://freebuff.com/api/auth/cli/code",
