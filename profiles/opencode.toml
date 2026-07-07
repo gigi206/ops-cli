@@ -15,6 +15,15 @@
 # the host it refused — add it to `allow` (or check with `ops test net <url>`).
 cmd = "opencode"
 
+# Your host opencode config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `opencode` read and write these host files. Uncomment to share your host opencode
+# setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/opencode", mode = "rw" },       # config
+#    { path = "~/.local/share/opencode", mode = "rw" },  # auth + sessions (SQLite)
+#]
+
 [packages]
 opencode = "mise:opencode"
 

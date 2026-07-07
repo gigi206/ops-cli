@@ -31,6 +31,14 @@
 # `ops test net <url>`).
 cmd = "hermes"
 
+# Your host Hermes config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `hermes` read and write these host files (login, settings, sessions). Uncomment to
+# share your host Hermes setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.hermes", mode = "rw" },
+#]
+
 [packages]
 # uv (the installer) and a supported Python, both from nixpkgs and on PATH before the in-cage
 # equip; then Hermes itself via mise's pipx backend, which uses uv to install the wheel. All

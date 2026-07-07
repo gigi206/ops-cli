@@ -24,6 +24,14 @@
 # refused — add it to `allow` (or check ahead with `ops test net <url>`).
 cmd = "kilo"
 
+# Your host Kilo Code config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `kilo` read and write these host files (login, settings). Uncomment to share your host Kilo
+# Code setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/kilo", mode = "rw" },
+#]
+
 [packages]
 kilo = "mise:github:Kilo-Org/kilocode"
 
@@ -31,14 +39,19 @@ kilo = "mise:github:Kilo-Org/kilocode"
 mode = "deny"
 # api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
 # and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
-allow = ["{*} https://api.anthropic.com", "{GET,HEAD} https://models.dev"]
+allow = [
+  "{GET} https://models.dev",
+  "{*} https://api.kilo.ai",
+  #"{*} https://supermassive-black-hole.kiloapps.io",
+  #"{*} https://us.i.posthog.com",
+]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage.
 # Provide it on the host as $ANTHROPIC_API_KEY (or point `from` at a resolver).
 [env]
-ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
 
-[secret."api.anthropic.com"]
-from = "env://ANTHROPIC_API_KEY"
-header = "x-api-key"
-type = "raw"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"

@@ -26,6 +26,14 @@
 # (or check ahead with `ops test net <url>`).
 cmd = "freebuff"
 
+# Your host Freebuff config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `freebuff` read and write these host files (Codebuff login token, settings). Uncomment
+# to share your host Freebuff setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/manicode", mode = "rw" },
+#]
+
 [packages]
 # A node runtime (the launcher and the npm install need it), then freebuff itself via
 # mise's npm backend. Both are trusted-only [packages]; this profile is trusted by

@@ -18,6 +18,14 @@
 # `ops test net <url>`).
 cmd = "pi"
 
+# Your host Pi config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `pi` read and write these host files (auth, API keys, sessions). Uncomment to share your host Pi
+# setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.pi/agent", mode = "rw" },
+#]
+
 [packages]
 pi = "mise:aqua:earendil-works/pi"
 

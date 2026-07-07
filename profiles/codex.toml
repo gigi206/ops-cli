@@ -38,6 +38,14 @@ cmd = ["codex", "--sandbox", "danger-full-access"]
 # table (e.g. `network.forward`) and it would be silently ignored.
 forward = [1455]
 
+# Your host Codex config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `codex` read and write these host files (auth.json, config.toml, sessions). Uncomment
+# to share your host Codex setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.codex", mode = "rw" },
+#]
+
 [packages]
 codex = "mise:aqua:openai/codex"
 

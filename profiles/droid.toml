@@ -37,6 +37,14 @@
 # ahead with `ops test net <url>`).
 cmd = "droid"
 
+# Your host Droid config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `droid` read and write these host files (Factory login, settings.json). Uncomment to
+# share your host Droid setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.factory", mode = "rw" },
+#]
+
 [packages]
 # A node runtime (the npm install needs it), then Droid itself via mise's npm backend. The
 # executed `droid` is a native binary (resolved via the package's optional dependency), so
