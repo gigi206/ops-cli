@@ -41,7 +41,13 @@ forward = [1455]
 [packages]
 codex = "mise:aqua:openai/codex"
 
-# An app is read-by-default ({GET,HEAD}); the API host the agent POSTs to is opened with `{*}`.
+# Egress is denied by construction except OpenAI's hosts: the API the CLI POSTs completions to
+# (api.openai.com), the OAuth login/authorization host (auth.openai.com — the ChatGPT-login flow
+# described above), and the ChatGPT backend codex streams through (chatgpt.com). The github.com
+# entry serves OpenAI's plugins repo over git smart-HTTP fetch (git-upload-pack). An app is
+# read-by-default ({GET,HEAD}); the API/auth/backend hosts the agent POSTs to are opened to every
+# verb with `{*}`. The WebSocket stream to chatgpt.com is a distinct capability and keeps its own
+# explicit {WS} grant (below).
 [network]
 mode = "deny"
 allow = [
@@ -49,7 +55,6 @@ allow = [
   "{*} https://auth.openai.com",
   "{*} https://chatgpt.com",
   #"{*} https://ab.chatgpt.com",
-  "{GET} https://auth.openai.com",
   "{POST} https://github.com/openai/plugins.git/git-upload-pack",
   # codex streams over `wss://chatgpt.com`. A WebSocket is a distinct capability that a plain `{*}`
   # does NOT grant (it is a bidirectional, uninspected channel) — it must be named explicitly.
