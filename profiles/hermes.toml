@@ -3,53 +3,66 @@
 #   ops app import profiles/hermes.toml
 #   ops app hermes
 #
-# Hermes ships ONLY as a nix flake (a uv2nix Python project — no single release binary,
-# no nixpkgs attribute), so it is equipped via the `flake:` backend: ops builds it IN the
-# cage with `nix build`, into the project's own writable store. The FIRST launch in a
-# project builds it (this needs network + several minutes — the allowlist below opens the
-# build's fetch hosts); later launches reuse the warm build and run offline.
+# Hermes is a Python agent published to PyPI as a pure `py3-none-any` wheel, so ops installs
+# it with uv instead of building it from source. `nix:uv` puts the uv installer on PATH (a
+# `nix:` package is provisioned host-side and on PATH BEFORE the in-cage equip runs); mise's
+# pipx backend then runs `uv tool install hermes-agent`, fetching the wheel and its
+# dependencies from PyPI. `nix:python312` supplies the interpreter (Hermes requires Python
+# >=3.11,<3.14). The first launch resolves ~60 wheels in a few tens of MiB and seconds; later
+# launches reuse the warm install from the app's own home. The install lays down the `hermes`,
+# `hermes-acp`, and `hermes-agent` CLIs; `cmd` launches `hermes`.
 #
-# Hermes is BYOK and multi-provider. This template keys it to OpenRouter (Hermes' own
-# default provider — one key, hundreds of models, OpenAI-compatible bearer auth). The real
-# key is read on the HOST and injected by the egress proxy on the wire to openrouter.ai —
-# never in the cage. Provide it on the host as $OPENROUTER_API_KEY (or point `from` at a
-# resolver, e.g. sops://secrets.yaml#openrouter). To use a different provider, change the
-# allowlist host + the [secret] block + the env var — e.g. Anthropic (api.anthropic.com,
-# ANTHROPIC_API_KEY, header "x-api-key", type "raw") or OpenAI (api.openai.com,
-# OPENAI_API_KEY, header "Authorization", type "bearer"). If a request is blocked, the proxy
-# reports the host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
+# (Hermes also ships as a nix flake — `flake:github:NousResearch/hermes-agent#default` — which
+# ADDITIONALLY bundles the node-based TUI/web front-ends, at the cost of a multi-minute, ~2 GiB
+# in-cage `nix build` on the first launch. This profile favours the fast PyPI install and the
+# `hermes` CLI, including its built-in `--tui`/`--cli` modes; swap the [packages] block for a
+# single `hermes = "flake:github:NousResearch/hermes-agent#default"` if you need the node
+# front-ends, and add `registry.npmjs.org` to the allowlist for that build.)
+#
+# Hermes is BYOK and multi-provider. This template keys it to OpenRouter (Hermes' default
+# provider — one key, hundreds of models, OpenAI-compatible bearer auth). BYOK is commented
+# out below, so this profile ships with no baked-in credential. Uncomment the [env] placeholder
+# and the [secret] block, and provide $OPENROUTER_API_KEY on the host, to have the egress proxy
+# inject the key on the wire to openrouter.ai — the plaintext never enters the cage. To use a
+# different provider, change the allowlist host + the [secret] block + the env var — e.g.
+# Anthropic (api.anthropic.com, ANTHROPIC_API_KEY, header "x-api-key", type "raw") or OpenAI
+# (api.openai.com, OPENAI_API_KEY, header "Authorization", type "bearer"). If a request is
+# blocked, the proxy reports the host it refused — add it to `allow` (or check ahead with
+# `ops test net <url>`).
 cmd = "hermes"
 
 [packages]
-# The `default` flake output = the `hermes` agent. It bundles the node TUI/web front-ends,
-# so the in-cage build fetches Python wheels from PyPI AND JS deps from npm (both hosts are
-# in the allowlist below). This build is **proven to run in-cage** under this allowlist —
-# the launch's first run compiles it (several minutes). The flake reference floats at HEAD —
-# pinning a flake revision (and rolling it via `ops upgrade`) is not yet automated.
-hermes = "flake:github:NousResearch/hermes-agent#default"
+# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the in-cage
+# equip; then Hermes itself via mise's pipx backend, which uses uv to install the wheel. All
+# three are trusted-only [packages]; this profile is trusted by location once imported.
+uv     = "nix:uv"
+python = "nix:python312"
+hermes = "mise:pipx:hermes-agent"
 
-# An app is read-by-default ({GET,HEAD}); these are write/build hosts (API POSTs, and the
-# package-manager fetches the in-cage build needs), so each is opened to all verbs with `{*}`.
 [network]
 mode = "deny"
 allow = [
-    # Runtime: the LLM provider — OpenRouter, Hermes' default BYOK endpoint.
+    # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter;
+    # with the NousResearch account login instead (no BYOK key set — the shipped default), the
+    # model traffic goes to the account's own API: portal is the OAuth token endpoint, and
+    # inference-api serves the models (GET /v1/models, POST /v1/chat/completions).
     "{*} https://openrouter.ai",
-    # Runtime: the model catalog (TTL-cached on disk, fail-soft if this is blocked).
+    "{*} https://portal.nousresearch.com",
+    "{*} https://inference-api.nousresearch.com",
+    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
-    # Build-time (the in-cage `nix build`): uv2nix fetches Python wheels/sdists from PyPI,
-    # and the bundled node front-ends (tui/web) fetch their JS dependencies from npm.
-    "{*} https://files.pythonhosted.org",
-    "{*} https://pypi.org",
-    "{*} https://registry.npmjs.org",
-    # (cache.nixos.org + github.com — the nix binary cache, the flake inputs, and Hermes'
-    # fail-soft startup update check — are already in ops's built-in nix-cache allow-set,
-    # so they need no entry here.)
+    "{GET} https://models.dev",
+    # Install-time (`uv tool install`): the Python wheels and the package index, read-only.
+    "{GET} https://files.pythonhosted.org",
+    "{GET} https://pypi.org",
+    # (cache.nixos.org + github.com — the nix binary cache for uv and Python — are already in
+    # ops's built-in nix-cache allow-set, so they need no entry here.)
 ]
 
-# The real API key is read on the HOST and injected by the egress proxy — never in the
-# cage. The in-cage placeholder lets Hermes start and issue the request; the proxy strips
-# it and substitutes the real key on the wire to openrouter.ai.
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage.
+# Uncomment both blocks and provide $OPENROUTER_API_KEY on the host to enable BYOK; the in-cage
+# placeholder lets Hermes start and issue the request, and the proxy substitutes the real key
+# on the wire to openrouter.ai.
 [env]
 #OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 

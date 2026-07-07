@@ -23,7 +23,7 @@ with `ops app export <name>`.
 | `codex`           | `mise:aqua:openai/codex`             | `api.openai.com`        |
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
-| `hermes`          | `flake:github:NousResearch/hermes-agent#default` | `openrouter.ai` (BYOK)  |
+| `hermes`          | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | `openrouter.ai` (BYOK)  |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
 | `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
@@ -70,11 +70,10 @@ can only reach the provider you listed.
 > persists in the isolated home). Both are the flagship validation, still to be proven with a
 > real key/account.
 >
-> The **flake-backed** profile `hermes` carries an extra first-launch step — the in-cage
-> `nix build` that compiles it (uv2nix Python + its bundled node front-ends) — and that build
-> is **proven to run live in-cage** under the profile's own allowlist (`hermes` lands on PATH;
-> only the live-auth above is still pending). The `flake:` backend itself is also proven on a
-> reference flake.
+> `hermes` installs its published PyPI wheel with **uv** (mise's `pipx` backend over a `nix:uv`
+> installer and `nix:python312`) — proven live in-cage under the profile's own allowlist
+> (`hermes --version` → v0.18.0, ~60 wheels resolved in seconds; only the live-auth above is
+> still pending). The `flake:` backend itself is proven separately on a reference flake.
 
 ## Tool freshness
 
@@ -86,14 +85,15 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `codex`       | `mise:aqua:openai/codex`                      | OpenAI's GitHub release        |
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
-| `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix Python) |
+| `hermes`      | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | NousResearch PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
-(mise's `aqua`/`github`/registry backends pull the real release binary), so the version is the
+(mise's `aqua`/`github`/registry backends pull the real release binary, its `pipx` backend a
+PyPI wheel via uv), so the version is the
 **latest upstream** — not whatever nixpkgs has packaged. This sidesteps both the nixpkgs
 lag and, for `claude-code`, the nixpkgs **unfree** gate (the standalone binary carries no
 such restriction). The tool is equipped at the latest upstream version on the **first
@@ -105,11 +105,10 @@ A nixpkgs attribute is still available as `nix:<attr>` (provisioned host-side, s
 offline-reusable) — use it for stable substrate tools where freshness does not matter.
 
 A third backend, **`flake:<ref>`**, packages a tool that ships **only as a nix flake** — no
-single release binary and no nixpkgs attribute (e.g. a uv2nix Python agent like `hermes`). ops
+single release binary and no nixpkgs attribute (e.g. a uv2nix Python agent). ops
 builds the flake **in-cage** with `nix build` into the project's own store; the first launch
-builds it (network + minutes — the build's own fetch hosts must be in `allow`, e.g.
-`files.pythonhosted.org`/`pypi.org` and `registry.npmjs.org` for `hermes`), and later launches
-reuse the warm build **offline**. Like `mise:`, the flake reference **floats** at HEAD for now —
+builds it (network + minutes — the build's own fetch hosts must be in `allow`), and later launches
+reuse the warm build **offline**. Like `mise:`, the flake reference **floats** for now —
 a `flake:` pin and an `ops upgrade` roll-forward are planned, not yet built. Note a flake build
 runs under the cage's egress posture: a build step that fetches with its **own** client (e.g.
 `bun install`) rather than through nix's fetcher may not honour the proxy / MITM CA under an
