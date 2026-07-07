@@ -96,6 +96,44 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **One-shot `--seccomp` / `--device` flags — closing the two fail-closed override residuals (DONE
+  2026-07-07)** (`src/config/overrides.rs` + `config/mod.rs` + `src/{main,help}.rs` + `docs/guide/
+  configuration/{seccomp,devices,overrides}.md` + `tests/{config,run}.rs`): the two typed one-shot
+  overrides named-but-deferred by the `[seccomp] allow` and `[devices]` increments. Until now
+  `apply_override` **ignored** an override's `[seccomp]`/`[devices]` (`seccomp: _, devices: _`) — the
+  fail-closed direction. Now `--seccomp <token[,token…]>` (repeatable, `OPS_SECCOMP` comma-list) and
+  `--device <path>` (repeatable, `OPS_DEVICE` single, one path per flag — **not** comma-split, mirroring
+  `OPS_BIND`) relax the mandatory syscall denylist / grant a host device for a **single launch**. **The
+  security basis is parity with the trusted config, NOT the `--net`/`--bind` axis** (the advisor's
+  load-bearing catch — an earlier "no wider than `--net shared`/`--bind :rw`" framing was a **category
+  error**: `--net`/`--bind` widen host reach, but `--seccomp` re-permits a syscall whose *only*
+  containment was the filter → widens the in-cage **kernel attack surface**). The sound justification,
+  now in all four doc/comment sites: a config file gates `[seccomp]`/`[devices]` **trusted-only**, and
+  the override is **trusted by invocation** — the invoker strictly outranks any config layer, so it may
+  declare exactly the relaxation/grant a *trusted config already can*. Both are **additive collections**
+  (union, fail-closed: a bad token/path is warned+skipped by the same `apply_seccomp`/`apply_devices`/
+  `union_devices`/`SeccompPolicy::union` helpers the config path uses, stamped `Provenance::Override`,
+  never fatal — `validate_override` unchanged, only scalar postures are fatal-up-front). **Fold bug
+  fixed en passant:** `overlay_into` did **not** copy `seccomp`/`devices`, so even a `--config` blob's
+  `[seccomp]` was silently dropped before apply — a new generic `union_allow_opt` unions both across the
+  four tiers (regression-guarded). `scan_ambient` reads `OPS_SECCOMP`/`OPS_DEVICE`; both are
+  **security-field env-source-noticed** (anti stale `OPS_SECCOMP` — carries more weight than `OPS_NET`
+  given the kernel-surface axis). `main.rs` two dispatch arms; `ops config show` reflects the ambient
+  `OPS_*` tagged `(override)` (live-verified). **Tests: net-new 8 unit** (collect/merge/notice/apply
+  incl. union-onto-trusted-baseline, malformed-fail-closed, and the **blob-survives-the-fold** regression
+  guard), **1 config integration** (`config show` reflects `OPS_SECCOMP`/`OPS_DEVICE` tagged override),
+  **1 run.rs e2e** `a_typed_one_shot_security_override_reaches_the_cage` (**ran live ~22s**): `--device`
+  = measurable teeth (device ABSENT without the flag, PRESENT with it, **no `ops trust`** → trusted-by-
+  invocation + the flag→collect→apply_override→build_spec→`--dev-bind-try` thread); `--seccomp ptrace`
+  rides the same launch = **threading coverage** for the seccomp arm (an override-sourced `SeccompPolicy`
+  through the real `build_spec`→`with_seccomp`→`memfds`→`--add-seccomp-fd` path — a union/apply bug
+  corrupting the policy would fail here). **Honest scope (advisor-noted):** the seccomp arm is *threading*,
+  not kernel *enforcement* — no base tool triggers a denied syscall distinguishably, so enforcement teeth
+  stay in `seccomp.rs` real-cage tests on a byte-identical policy. 951→ green unit + 89 config + the e2e,
+  fmt/clippy `-D warnings` clean, **std-only** (no new dep). Advisor-reviewed (**APPROVE** — the two
+  non-blocking asks both applied: the parity-not-blast-radius correction, and the seccomp-arm threading
+  coverage folded into the e2e). **Residual:** none material — the override path now covers every
+  security field.
   **`[devices]` — a trusted grant of host device nodes into the cage (DONE 2026-07-07)**
   (`src/config/{schema,mod,view}.rs` + `src/sandbox/{spec,argv,binds,launch}.rs` + `src/{main,help}.rs`
   + `docs/guide/configuration/devices.md` [new] + `docs/guide/{README,configuration/README,concepts/

@@ -89,6 +89,14 @@ The paths render sorted, the same set the cage binds.
 
 ## Scope
 
-`[devices]` is a config-file field (global, project, or an app overlay). There is no
-one-shot `--devices` flag: a one-shot override does **not** grant a device (the fail-closed
-direction — a device grant only ever comes from a trusted config file).
+`[devices]` is a config-file field (global, project, or an app overlay). It is also a
+one-shot [override](overrides.md): `--device <path>` (repeatable) and `OPS_DEVICE` grant a
+host device for a single launch. An override is **trusted by invocation** — the person
+running `ops` outranks any config layer — so it may grant exactly the device a *trusted*
+config already can, even though an untrusted project's `[devices]` is dropped (parity with
+the trusted config). `--device` takes **one path per flag** (repeatable); it is not
+comma-split, so `--device /dev/a,/dev/b` is a single, non-existent path (silently skipped),
+not two grants. A malformed path is warned and skipped (no device, fail-closed), never
+fatal. (Granting the *node* is not the same as being able to *use* it — see the note above;
+in particular a device that needs a Linux capability, such as a VPN tun, is not made usable
+by exposing it, in a config file or a one-shot flag.)

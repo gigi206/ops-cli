@@ -3935,6 +3935,88 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
     );
 }
 
+/// The one-shot `--device` / `--seccomp` security overrides reach the cage — the CLI
+/// flag→collect→`apply_override`→build_spec→bwrap thread a config-file e2e cannot reach. Two arms,
+/// which build_spec consumes differently:
+///   - `--device`: measurable teeth. The SAME project (no trusted `[devices]`) leaves the device
+///     ABSENT without the flag and PRESENT with it → the grant threads to a real `--dev-bind-try`,
+///     and applies with NO `ops trust` (trusted **by invocation**).
+///   - `--seccomp`: threading coverage. The grant launch also carries `--seccomp ptrace`, so an
+///     override-sourced `SeccompPolicy` threads through the real launch path
+///     (`apply_override` → `cfg.seccomp` → `build_spec` → `with_seccomp` → `memfds` →
+///     `--add-seccomp-fd`); a malformed policy from the union/apply would fail here. Kernel
+///     *enforcement* of the relaxation is proven separately in `seccomp.rs` real-cage tests on a
+///     byte-identical policy — no base tool triggers a denied syscall distinguishably, so this arm is
+///     threading, not enforcement.
+///
+/// Skips if the host cannot sandbox or no candidate device exists.
+#[test]
+fn a_typed_one_shot_security_override_reaches_the_cage() {
+    let Some(device) = ["/dev/net/tun", "/dev/fuse", "/dev/kvm", "/dev/dri"]
+        .into_iter()
+        .find(|d| std::path::Path::new(d).exists())
+    else {
+        eprintln!("skipping one-shot override e2e: no candidate host device present");
+        return;
+    };
+
+    let project = TmpDir::new("ovr1-proj");
+    let data = TmpDir::new("ovr1-data");
+    let state = TmpDir::new("ovr1-state");
+    let check = format!("test -e {device} && echo DEV-PRESENT || echo DEV-ABSENT");
+
+    // Baseline (also seeds the base userland): no flag, no config → the device is ABSENT from the
+    // minimal /dev. A failed launch means the host cannot sandbox → skip.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check.as_str()],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping one-shot override e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains("DEV-ABSENT"),
+        "without the flag the device must be absent from the minimal /dev:\n{}",
+        String::from_utf8_lossy(&probe.stdout)
+    );
+
+    // The one-shot grants — trusted by invocation, so they apply with NO `ops trust`. `--seccomp
+    // ptrace` rides the same launch: its success proves the override's seccomp policy threaded to a
+    // valid filter (a union/apply bug corrupting the policy would fail `memfds`/`--add-seccomp-fd`).
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--device",
+            device,
+            "--seccomp",
+            "ptrace",
+            "--",
+            "sh",
+            "-c",
+            check.as_str(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "a one-shot --device/--seccomp override must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("DEV-PRESENT"),
+        "the one-shot --device flag must bind {device} into the cage:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// A trusted app's `[limits]` overlay reaches the cage's scope at `ops app` dispatch — the seam a
 /// `merge_app` unit test cannot cover: that the real dispatch merges the overlay *before* it
 /// consumes the limits. An inline `[app.cap]` caps tasks below the default; after trust, `ops app

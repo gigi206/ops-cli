@@ -770,7 +770,13 @@ impl Resolved {
     /// by [`Resolved::apply_override_channel`] (the lock is already chosen by now), so it is skipped.
     ///
     /// Trusted **by invocation**: every field is honored, since the invoker owns the process argv
-    /// and environment (no lower-trust context can reach them). Each field it sets is stamped
+    /// and environment (no lower-trust context can reach them). This includes the two fields a config
+    /// file gates trusted-only — `[seccomp]` (relax the syscall denylist) and `[devices]` (grant a
+    /// host device): the justification is **parity with the trusted config** — the invoker strictly
+    /// outranks any config layer, so it may declare exactly the relaxation/grant a *trusted* config
+    /// already can. (Not the `network`/`binds` axis: relaxing the denylist re-permits a syscall whose
+    /// only containment was the filter, widening the in-cage kernel attack surface.) Each field it
+    /// sets is stamped
     /// [`Provenance::Override`] for `ops config show`; its binds are canonicalized and its secret
     /// posture re-checked exactly as the layered fields are, so this is a faithful final layer, not
     /// a raw assignment. `[net.groups]`/`[app.*]` in an override are ignored (noticed at collection
@@ -779,8 +785,9 @@ impl Resolved {
     /// A set-but-invalid **scalar security posture** (`network`/`gui`/`[limits]`) is a **hard error**
     /// (`Err`, the launch aborts): there is no safe fallback — silently keeping the baseline could
     /// leave a *wider* posture than the user's explicit (mistyped) intent, the exact fail-open this
-    /// feature must not have. The additive fields (`env`/`binds`/`packages`) instead fail *closed* by
-    /// dropping a bad entry (a missing bind or unbuilt tool is less capability, never a wider
+    /// feature must not have. The additive fields (`env`/`binds`/`packages`/`seccomp`/`devices`)
+    /// instead fail *closed* by dropping a bad entry (a missing bind, an unbuilt tool, an unknown
+    /// syscall token, or a malformed device path is *less* capability/relaxation, never a wider
     /// posture), so they warn and skip rather than abort. On a hard error nothing is applied (the
     /// scalars are validated up front, before any mutation), so a caller that surfaces the error can
     /// still show the untouched baseline.
@@ -795,16 +802,13 @@ impl Resolved {
             limits,
             secret,
             forward,
+            seccomp,
+            devices,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
-            // launch-shaping and were noticed and dropped at collection time. A one-shot override
-            // does not relax the seccomp denylist nor grant a device — an override's
-            // `[seccomp]`/`[devices]` is ignored (the fail-closed direction: a relaxation or a
-            // device grant only ever comes from a trusted config file).
+            // launch-shaping and were noticed and dropped at collection time.
             nixpkgs: _,
             net: _,
             app: _,
-            seccomp: _,
-            devices: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -901,6 +905,26 @@ impl Resolved {
                 self.forward_origin = Provenance::Override;
             }
             union_forward(&mut self.forward, validated);
+        }
+
+        // `[seccomp]` / `[devices]` — trusted by invocation, so the override may relax the mandatory
+        // syscall denylist and grant a host device for this launch. Both are additive collections
+        // (union onto the resolved policy/set; a bad token/path is warned and skipped by
+        // `apply_seccomp`/`apply_devices`, never fatal — the invoker can only *add* here). The origin
+        // stamps `Override` when the override contributed any, for `ops config show`.
+        if seccomp.is_some() {
+            let over = apply_seccomp(&mut self.warnings, OVERRIDE_SOURCE, seccomp);
+            if !over.is_empty() {
+                self.seccomp.union(&over);
+                self.seccomp_origin = Provenance::Override;
+            }
+        }
+        if devices.is_some() {
+            let over = apply_devices(&mut self.warnings, OVERRIDE_SOURCE, devices);
+            if !over.is_empty() {
+                union_devices(&mut self.devices, over);
+                self.devices_origin = Provenance::Override;
+            }
         }
 
         // `[secret]` — trusted by invocation; the credentials add to the effective set, resolved
@@ -4766,6 +4790,15 @@ mod tests {
         }
     }
 
+    fn raw_seccomp(tokens: &[&str]) -> RawConfig {
+        RawConfig {
+            seccomp: Some(schema::RawSeccomp {
+                allow: tokens.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..RawConfig::default()
+        }
+    }
+
     /// A `RawConfig` declaring a `[limits]` table from optional string tokens (each `None` leaves
     /// that field unset, falling back to the default).
     fn raw_limits(
@@ -8089,6 +8122,90 @@ mod tests {
         assert_eq!(r.gui_origin, Provenance::Override);
         assert_eq!(r.limits.tasks_max.as_deref(), Some("4096"));
         assert_eq!(r.limits_origin.tasks_max, Provenance::Override);
+    }
+
+    #[test]
+    fn an_override_relaxes_seccomp_and_grants_a_device_stamped_override() {
+        // Trusted by invocation: a one-shot override may relax the denylist and grant a device that a
+        // config file gates trusted-only. Both land, stamped `Override`.
+        let resolved = resolve_no_plugins(RawConfig::default(), None);
+        assert!(resolved.seccomp.is_empty() && resolved.devices.is_empty());
+        let r = with_override(
+            resolved,
+            RawConfig {
+                seccomp: raw_seccomp(&["ptrace"]).seccomp,
+                devices: raw_devices(&["/dev/kvm"]).devices,
+                ..RawConfig::default()
+            },
+        );
+        assert!(
+            r.seccomp.tokens().iter().any(|t| t == "ptrace"),
+            "the override relaxes the denylist: {:?}",
+            r.seccomp.tokens()
+        );
+        assert_eq!(r.seccomp_origin, Provenance::Override);
+        assert_eq!(r.devices, vec![PathBuf::from("/dev/kvm")]);
+        assert_eq!(r.devices_origin, Provenance::Override);
+    }
+
+    #[test]
+    fn an_override_seccomp_and_devices_union_onto_a_trusted_baseline() {
+        // The override *adds* to what a trusted global already granted (the additive/union model),
+        // never dropping the baseline's relaxation or device.
+        let resolved = resolve_no_plugins(
+            RawConfig::default(),
+            Some((
+                RawConfig {
+                    seccomp: raw_seccomp(&["unshare"]).seccomp,
+                    devices: raw_devices(&["/dev/dri"]).devices,
+                    ..RawConfig::default()
+                },
+                TrustState::Trusted,
+            )),
+        );
+        let r = with_override(
+            resolved,
+            RawConfig {
+                seccomp: raw_seccomp(&["ptrace"]).seccomp,
+                devices: raw_devices(&["/dev/kvm"]).devices,
+                ..RawConfig::default()
+            },
+        );
+        let toks = r.seccomp.tokens();
+        assert!(
+            toks.iter().any(|t| t == "unshare") && toks.iter().any(|t| t == "ptrace"),
+            "both the baseline and override relaxations survive: {toks:?}"
+        );
+        assert_eq!(
+            r.devices,
+            vec![PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")],
+            "the override device unions onto the baseline's, sorted"
+        );
+    }
+
+    #[test]
+    fn an_override_with_a_malformed_seccomp_or_device_fails_closed() {
+        // Additive fields: a bad token/path is warned and skipped (Ok), less relaxation not more —
+        // never a hard error like a scalar posture.
+        let resolved = resolve_no_plugins(RawConfig::default(), None);
+        let r = with_override(
+            resolved,
+            RawConfig {
+                seccomp: raw_seccomp(&["not_a_syscall"]).seccomp,
+                devices: raw_devices(&["/etc/shadow"]).devices,
+                ..RawConfig::default()
+            },
+        );
+        assert!(
+            r.seccomp.is_empty(),
+            "an unknown token grants no relaxation"
+        );
+        assert!(r.devices.is_empty(), "a non-/dev path grants no device");
+        assert!(
+            r.warnings.iter().filter(|w| w.contains("override")).count() >= 2,
+            "both bad entries warn: {:?}",
+            r.warnings
+        );
     }
 
     #[test]

@@ -64,7 +64,8 @@ const PAGES: &[Page] = &[
                  ops.toml; repeatable, later wins",
             ),
             (
-                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package",
+                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
+                 --seccomp / --device",
                 "typed one-shot overrides for a single field each; see `ops help run`",
             ),
         ],
@@ -117,6 +118,14 @@ const PAGES: &[Page] = &[
                 "--package <name>=<backend:locator>",
                 "one-shot package (e.g. hello=nix:hello); repeatable",
             ),
+            (
+                "--seccomp <token[,token…]>",
+                "one-shot relaxation of the syscall denylist (e.g. ptrace, clone:newuser); repeatable",
+            ),
+            (
+                "--device <path>",
+                "one-shot host device grant, one path per flag (e.g. /dev/kvm); repeatable",
+            ),
             ("--", "end ops's own flags; everything after runs literally"),
         ],
         details:
@@ -126,16 +135,21 @@ const PAGES: &[Page] = &[
             One-shot overrides let you change any configuration field for a single launch without\n\
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
             exactly like an `ops.toml`, so it can set any field; the typed flags\n\
-            `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package` are ergonomic\n\
-            shorthands for one field each. Every flag has an environment equivalent — `OPS_CONFIG`,\n\
-            `OPS_ENV_<KEY>`, `OPS_NET`, `OPS_GUI`, `OPS_NIXPKGS`, `OPS_BIND`, `OPS_FORWARD`,\n\
-            `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`. Precedence, lowest to highest:\n\
+            `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/`--seccomp`/\n\
+            `--device` are ergonomic shorthands for one field each. Every flag has an environment\n\
+            equivalent — `OPS_CONFIG`, `OPS_ENV_<KEY>`, `OPS_NET`, `OPS_GUI`, `OPS_NIXPKGS`, `OPS_BIND`,\n\
+            `OPS_FORWARD`, `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`, `OPS_SECCOMP`, `OPS_DEVICE`.\n\
+            Precedence, lowest to highest:\n\
             `OPS_CONFIG < OPS_* typed < --config < --* typed` — the command line always beats the\n\
             environment, and a typed flag beats the blob. Scalars (`net`/`gui`/`nixpkgs`) replace;\n\
-            collections (`env`/`bind`/`forward`/`limit`/`package`) union. An override is the final word:\n\
-            it beats a trusted project config and an app's own posture. A malformed override is a hard\n\
-            error (it never silently launches a different posture); a security field set from the\n\
-            environment prints a notice.",
+            collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`) union. An override\n\
+            is the final word: it beats a trusted project config and an app's own posture — including\n\
+            `--seccomp`/`--device`, which relax the denylist and grant a device a config file gates\n\
+            trusted-only (the invoker outranks any config layer, so it may set exactly what a trusted\n\
+            config already can — note `--seccomp` widens the in-cage kernel attack surface, so an\n\
+            ambient `OPS_SECCOMP` is worth checking). A malformed override is a hard error (it never\n\
+            silently launches a different posture); a security field set from the environment prints a\n\
+            notice.",
     },
     Page {
         path: &["mise"],
@@ -178,7 +192,8 @@ const PAGES: &[Page] = &[
                  repeatable (see `ops help run`)",
             ),
             (
-                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package",
+                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
+                 --seccomp / --device",
                 "typed one-shot overrides for a single field each, beating the app's posture; \
                  see `ops help run`",
             ),

@@ -261,6 +261,31 @@ fn config_show_reflects_an_ambient_typed_override() {
 }
 
 #[test]
+fn config_show_reflects_an_ambient_seccomp_and_device_override() {
+    // `--seccomp`/`--device` relax the cage; their ambient `OPS_*` forms must reach `ops config show`
+    // (via the same `collect` a launch uses) and be tagged `(override)` — so a stale variable cannot
+    // silently widen a launch without the view admitting it. No project config → the baseline is the
+    // full mandatory denylist and a minimal /dev, so both lines appear only because of the override.
+    let fx = Fixture::new();
+    let out = fx
+        .ops(&["config", "show"])
+        .env("OPS_SECCOMP", "ptrace,unshare")
+        .env("OPS_DEVICE", "/dev/kvm")
+        .output()
+        .expect("spawn ops");
+    assert!(out.status.success(), "config show should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("seccomp allow: ptrace, unshare") && stdout.contains("(override)"),
+        "config show must reflect and tag the ambient seccomp relaxation:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("devices: /dev/kvm") && stdout.contains("(override)"),
+        "config show must reflect and tag the ambient device grant:\n{stdout}"
+    );
+}
+
+#[test]
 fn config_show_rejects_an_unknown_argument() {
     let fx = Fixture::new();
     let out = fx.run(&["config", "show", "--bogus"]);

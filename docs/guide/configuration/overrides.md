@@ -40,14 +40,35 @@ Ergonomic shorthands for a single field, each with an `OPS_*` environment equiva
 | `--gui <none\|wayland>` | `OPS_GUI` | the display posture |
 | `--nixpkgs <ref>` | `OPS_NIXPKGS` | the nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | `OPS_BIND` | a host bind (read-only by default); repeatable |
+| `--forward <port[,port…]>` | `OPS_FORWARD` | host loopback TCP port(s) into the cage; repeatable |
 | `--limit <key>=<value>` | `OPS_LIMIT_<key>` | a cgroup limit (`memory_high`/`memory_max`/`tasks_max`) |
 | `--package <name>=<backend:locator>` | `OPS_PACKAGE_<name>` | a package |
+| `--seccomp <token[,token…]>` | `OPS_SECCOMP` | relax the syscall denylist ([`[seccomp]`](seccomp.md) grammar); repeatable |
+| `--device <path>` | `OPS_DEVICE` | grant a host device node ([`[devices]`](devices.md)); repeatable |
 
 ```sh
 ops run --net none --limit tasks_max=8192 -- ./build.sh
 ops app claude-code --net none            # cut the app's network for one run
+ops run --seccomp ptrace -- gdb ./a.out   # relax the denylist for one debug session
+ops run --device /dev/kvm -- ./vm.sh      # grant a device for one run
 OPS_NET=none OPS_BIND=/opt/data:ro ops shell
 ```
+
+#### `--seccomp` / `--device` — relaxing the cage for one launch
+
+A config file gates [`[seccomp]`](seccomp.md) and [`[devices]`](devices.md)
+**trusted-only** (an untrusted project's is dropped). A one-shot override is **trusted by
+invocation** — the person running `ops` already commands the host process's argv and
+environment, and so **outranks any config layer**. So `--seccomp`/`--device` *may* relax the
+denylist and grant a device: exactly the relaxation/grant a *trusted config* can already
+declare, extended to the more-trusted invoker (parity with the trusted config — not the
+`--net`/`--bind` axis). Note relaxing the denylist re-permits a syscall whose only
+containment was the filter, widening the **in-cage kernel attack surface** — so a stale
+`OPS_SECCOMP` matters more than a stale `OPS_NET` (both print an ambient-source notice).
+`--device` takes one path per flag (not comma-split). A bad token or a non-`/dev/` path is
+warned and skipped (less relaxation/no device — fail-closed), never fatal. Granting a device
+node exposes it; it does not confer a Linux capability, so a device that needs one (a VPN
+tun) is not made *usable* this way.
 
 #### The `--net` posture
 
@@ -82,9 +103,10 @@ One uniform rule across all four tiers:
 
 - **Scalars** (`nixpkgs`, `network`, `gui`) are **replaced** by the highest tier that
   sets them.
-- **Collections** (`env`, `packages`, `binds`, `limits`) are **unioned**, the higher
-  tier winning per key/entry — so `--bind` *adds* to whatever the blobs bound, and
-  `--limit tasks_max=…` tunes one limit without dropping a blob's `memory_max`.
+- **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
+  `devices`) are **unioned**, the higher tier winning per key/entry — so `--bind` *adds*
+  to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
+  a blob's `memory_max`.
 
 ## Fail-closed on an invalid value
 
@@ -96,8 +118,9 @@ posture:
   keeping the baseline could leave a *wider* posture than the mistyped intent.
 - A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, a bad
   `--net` keyword, an unknown limit key) is likewise a hard error.
-- The **additive** fields (`env`/`binds`/`packages`) fail *closed* by dropping a bad
-  entry (a missing bind or tool is less capability, never a wider posture), so they
+- The **additive** fields (`env`/`binds`/`packages`/`forward`/`seccomp`/`devices`) fail
+  *closed* by dropping a bad entry (a missing bind or tool, an unknown syscall token, a
+  malformed device path — less capability/relaxation, never a wider posture), so they
   warn and skip.
 
 ## Environment footgun notice

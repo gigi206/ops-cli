@@ -122,6 +122,13 @@ cage enforces.
 
 ## Scope
 
-`[seccomp]` is a config-file field (global, project, or an app overlay). There is no
-one-shot `--seccomp` flag: a one-shot override does **not** relax the denylist (the
-fail-closed direction — a relaxation only ever comes from a trusted config file).
+`[seccomp]` is a config-file field (global, project, or an app overlay). It is
+also a one-shot [override](overrides.md): `--seccomp <token[,token…]>` (repeatable) and
+`OPS_SECCOMP` relax the denylist for a single launch, following the same `allow` grammar.
+An override is **trusted by invocation** — the person running `ops` outranks any config
+layer — so it may declare exactly the relaxation a *trusted* config already can, even though
+an untrusted project's `[seccomp]` is dropped (parity with the trusted config, not a new
+axis). Note a relaxation re-permits a syscall whose only containment was the filter, widening
+the in-cage kernel attack surface — so a stale `OPS_SECCOMP` is worth checking (its ambient
+use prints a notice). A bad token is warned and skipped (less relaxation, fail-closed), never
+fatal.

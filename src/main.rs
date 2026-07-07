@@ -2581,6 +2581,8 @@ fn take_override_flag(
         "--forward" => &mut cli.forward,
         "--limit" => &mut cli.limits,
         "--package" => &mut cli.packages,
+        "--seccomp" => &mut cli.seccomp,
+        "--device" => &mut cli.devices,
         _ => return None,
     };
     Some(take_flag_value(head, sink, verb, &name))

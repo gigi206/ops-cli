@@ -8,8 +8,18 @@
 //!
 //! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `OPS_CONFIG` — carries
 //! inline TOML shaped exactly like an `ops.toml`, so it can set *any* field the schema has. A
-//! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--limit`/`--package` (and their `--env`
-//! sibling), each with an `OPS_*` environment equivalent — is an ergonomic shorthand for one field.
+//! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
+//! `--seccomp`/`--device` (and their `--env` sibling), each with an `OPS_*` environment equivalent —
+//! is an ergonomic shorthand for one field.
+//!
+//! Because an override is trusted by invocation, its `--seccomp`/`--device` (and a blob's
+//! `[seccomp]`/`[devices]`) relax the mandatory syscall denylist and grant a host device for the
+//! one launch. The justification is **parity with the trusted config**: those two fields are
+//! trusted-*only* in a config file (an untrusted project's is dropped), and the invoker strictly
+//! outranks any config layer — so the override may declare exactly the relaxation/grant a trusted
+//! config already can. (This is *not* the same axis as `--net`/`--bind`, which widen host reach:
+//! `--seccomp` re-permits a syscall whose only containment was the filter, widening the kernel
+//! attack surface reachable from in-cage code — so the ambient-env notice below matters more here.)
 //!
 //! Precedence, lowest to highest — four tiers:
 //!
@@ -37,7 +47,8 @@
 //! launch aborts rather than silently dropping the field and running a different posture than asked.
 
 use super::schema::{
-    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawLimit, RawLimits,
+    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawDevices, RawLimit,
+    RawLimits, RawSeccomp,
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
@@ -117,6 +128,12 @@ pub(crate) struct CliOverrides {
     pub(crate) limits: Vec<String>,
     /// `--package <name>=<backend:locator>` — one package each.
     pub(crate) packages: Vec<String>,
+    /// `--seccomp <token[,token…]>` — relax the mandatory syscall denylist for this launch. Each
+    /// value follows the `[seccomp] allow` grammar (a bare name, a `clone`/`ioctl` `:selector`, or a
+    /// comma-list). A collection — unioned across the tiers.
+    pub(crate) seccomp: Vec<String>,
+    /// `--device <path>` — grant one host device node (a `/dev/…` path) into the cage. A collection.
+    pub(crate) devices: Vec<String>,
 }
 
 /// The ambient (`OPS_*`) override inputs, scanned from the environment. Passed to [`collect_from`]
@@ -143,6 +160,10 @@ struct AmbientOverrides {
     limits: Vec<(String, String)>,
     /// `OPS_PACKAGE_<name>` — one package each.
     packages: Vec<(String, String)>,
+    /// `OPS_SECCOMP` — a seccomp relaxation, a comma-list of allow tokens (e.g. `ptrace,unshare`).
+    seccomp: Vec<String>,
+    /// `OPS_DEVICE` — one host device path (a list is a blob concern, like `OPS_BIND`).
+    devices: Vec<String>,
 }
 
 /// The flag names a typed fragment reports in its structural-error messages, so a `--bind` error
@@ -196,6 +217,12 @@ fn scan_ambient() -> AmbientOverrides {
     if let Some(v) = env_nonempty("OPS_FORWARD") {
         a.forward.push(v);
     }
+    if let Some(v) = env_nonempty("OPS_SECCOMP") {
+        a.seccomp.push(v);
+    }
+    if let Some(v) = env_nonempty("OPS_DEVICE") {
+        a.devices.push(v);
+    }
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix(OPS_ENV_PREFIX) {
             if !name.is_empty() {
@@ -238,6 +265,8 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         &ambient.limits,
         &ambient.packages,
         &ambient.env,
+        &ambient.seccomp,
+        &ambient.devices,
         &ENV_LABELS,
     )?;
     // Tier 2 — the CLI blobs, merged in order (a later one winning per the uniform rule).
@@ -259,6 +288,8 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         &cli_limits,
         &cli_packages,
         &cli_env,
+        &cli.seccomp,
+        &cli.devices,
         &CLI_LABELS,
     )?;
 
@@ -342,6 +373,8 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ("packages", !env_side.packages.is_empty()),
         ("limits", env_side.limits.is_some()),
         ("forward", env_side.forward.is_some()),
+        ("seccomp", env_side.seccomp.is_some()),
+        ("devices", env_side.devices.is_some()),
     ] {
         if env_has {
             note(field);
@@ -371,9 +404,31 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         base.secret = higher.secret;
     }
     base.forward = union_forward_opt(base.forward, higher.forward);
+    base.seccomp = union_allow_opt(base.seccomp, higher.seccomp, |s| &mut s.allow);
+    base.devices = union_allow_opt(base.devices, higher.devices, |d| &mut d.allow);
     base.net.groups.extend(higher.net.groups);
     base.app.extend(higher.app);
     base
+}
+
+/// Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]`), a higher tier's
+/// entries appended onto a lower's — the collection-union rule, so `--seccomp`/`--device` accumulate
+/// across the tiers rather than clobbering a blob's list. `None` means "this tier set none". The
+/// downstream `apply_*` dedups (devices) or is idempotent (seccomp), so a plain append is enough.
+fn union_allow_opt<T>(
+    base: Option<T>,
+    higher: Option<T>,
+    allow: impl Fn(&mut T) -> &mut Vec<String>,
+) -> Option<T> {
+    match (base, higher) {
+        (b, None) => b,
+        (None, h) => h,
+        (Some(mut b), Some(mut h)) => {
+            let extra = std::mem::take(allow(&mut h));
+            allow(&mut b).extend(extra);
+            Some(b)
+        }
+    }
 }
 
 /// The destination path a bind is keyed by (the same path it is bound at in the cage). A detailed
@@ -470,6 +525,8 @@ fn build_typed_fragment(
     limits: &[(String, String)],
     packages: &[(String, String)],
     env: &[(String, String)],
+    seccomp: &[String],
+    devices: &[String],
     lbl: &TypedLabels,
 ) -> Result<RawConfig, String> {
     let mut raw = RawConfig::default();
@@ -503,6 +560,21 @@ fn build_typed_fragment(
     }
     for (key, value) in env {
         raw.env.insert(key.clone(), value.clone());
+    }
+    // `--seccomp` / `--device` carry their entries verbatim into the `[seccomp]` / `[devices]`
+    // `allow` lists — the exact config-file grammar, so `apply_seccomp`/`apply_devices` validate
+    // them downstream (a bad token/path is warned and skipped, an additive collection like `binds`,
+    // never a structural error here). A seccomp value is comma-splittable there; a device value is
+    // one path (the field does not comma-split a device).
+    if !seccomp.is_empty() {
+        raw.seccomp = Some(RawSeccomp {
+            allow: seccomp.to_vec(),
+        });
+    }
+    if !devices.is_empty() {
+        raw.devices = Some(RawDevices {
+            allow: devices.to_vec(),
+        });
     }
     Ok(raw)
 }
@@ -663,6 +735,8 @@ mod tests {
         forward: &'a [&'a str],
         limits: &'a [&'a str],
         packages: &'a [&'a str],
+        seccomp: &'a [&'a str],
+        devices: &'a [&'a str],
     }
 
     fn owned(items: &[&str]) -> Vec<String> {
@@ -680,6 +754,8 @@ mod tests {
             forward: owned(cli.forward),
             limits: owned(cli.limits),
             packages: owned(cli.packages),
+            seccomp: owned(cli.seccomp),
+            devices: owned(cli.devices),
         };
         collect_from(&overrides, AmbientOverrides::default())
     }
@@ -1282,5 +1358,106 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("unknown limit"), "{err}");
+    }
+
+    // --- typed --seccomp / --device flags ---
+
+    #[test]
+    fn typed_seccomp_and_device_land_verbatim_in_the_allow_lists() {
+        // A seccomp value may carry a comma-list (split downstream by apply_seccomp); a device value
+        // is one path per flag. The collection carries the raw entries so the field grammar applies.
+        let ov = collect_cli(Cli {
+            seccomp: &["ptrace,unshare", "clone:newuser"],
+            devices: &["/dev/kvm", "/dev/dri"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ov.raw.seccomp.as_ref().map(|s| s.allow.as_slice()),
+            Some(&["ptrace,unshare".to_string(), "clone:newuser".to_string()][..])
+        );
+        assert_eq!(
+            ov.raw.devices.as_ref().map(|d| d.allow.as_slice()),
+            Some(&["/dev/kvm".to_string(), "/dev/dri".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn seccomp_and_device_union_across_the_env_and_cli_tiers() {
+        // OPS_SECCOMP + --seccomp accumulate; OPS_DEVICE + --device accumulate — the collection-union
+        // rule, so the CLI adds to the environment's list rather than replacing it.
+        let ov = collect_from(
+            &CliOverrides {
+                seccomp: owned(&["unshare"]),
+                devices: owned(&["/dev/dri"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                seccomp: owned(&["ptrace"]),
+                devices: owned(&["/dev/kvm"]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let allow = &ov.raw.seccomp.expect("seccomp present").allow;
+        assert!(allow.contains(&"ptrace".to_string()) && allow.contains(&"unshare".to_string()));
+        let devs = &ov.raw.devices.expect("devices present").allow;
+        assert!(
+            devs.contains(&"/dev/kvm".to_string()) && devs.contains(&"/dev/dri".to_string()),
+            "{devs:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_blob_seccomp_and_devices_survive_the_fold() {
+        // Regression guard: overlay_into must copy the [seccomp]/[devices] tables (they were once
+        // dropped in the fold, so a --config blob's relaxation silently vanished before apply).
+        let ov = collect_cli(Cli {
+            config: &["[seccomp]\nallow = [\"ptrace\"]\n[devices]\nallow = [\"/dev/kvm\"]"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ov.raw.seccomp.as_ref().map(|s| s.allow.as_slice()),
+            Some(&["ptrace".to_string()][..])
+        );
+        assert_eq!(
+            ov.raw.devices.as_ref().map(|d| d.allow.as_slice()),
+            Some(&["/dev/kvm".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn ambient_seccomp_and_device_are_noticed_as_security_fields() {
+        // OPS_SECCOMP / OPS_DEVICE relax the cage, so a stale ambient variable must not change a
+        // launch silently — each fires a security-via-environment notice.
+        let ov = ambient(AmbientOverrides {
+            seccomp: owned(&["ptrace"]),
+            devices: owned(&["/dev/kvm"]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            ov.notices().iter().any(|n| n.contains("`seccomp`")),
+            "{:?}",
+            ov.notices()
+        );
+        assert!(
+            ov.notices().iter().any(|n| n.contains("`devices`")),
+            "{:?}",
+            ov.notices()
+        );
+    }
+
+    #[test]
+    fn a_cli_seccomp_or_device_fires_no_env_notice() {
+        // On the command line these are explicit per-invocation — no stale-ambient risk, no notice.
+        let ov = collect_cli(Cli {
+            seccomp: &["ptrace"],
+            devices: &["/dev/kvm"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(ov.notices().is_empty(), "{:?}", ov.notices());
     }
 }
