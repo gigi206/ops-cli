@@ -873,6 +873,7 @@ pub(crate) fn build_spec(
     extra_binds: &[ExtraBind],
     net: NetPolicy,
     egress_contract: &str,
+    seccomp: super::seccomp::SeccompPolicy,
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
@@ -934,7 +935,7 @@ pub(crate) fn build_spec(
     };
     let slug = super::naming::cage_slug(app, &project);
     assemble(&paths, userland, nix, overlay, extra_binds, net, cmd)
-        .map(|spec| spec.with_cage_slug(slug))
+        .map(|spec| spec.with_cage_slug(slug).with_seccomp(seccomp))
         .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1916,6 +1917,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
             cmd,
         )
         .expect("build spec");
@@ -2076,6 +2078,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
             vec![foreign.clone().into_os_string()],
         )
         .expect("build foreign spec");
@@ -2118,6 +2121,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
             vec![OsString::from("hello")],
         )
         .expect("build cross spec");
@@ -2256,6 +2260,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
             cmd,
         )
         .expect("build spec");
@@ -2424,6 +2429,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
             cmd,
         )
         .expect("build spec");
@@ -2590,6 +2596,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
             cmd,
         )
         .expect("build spec");
@@ -2716,6 +2723,7 @@ mod smoke {
                 &[],
                 NetPolicy::Shared,
                 "",
+                crate::sandbox::seccomp::SeccompPolicy::default(),
                 cmd,
             )
             .expect("build spec");

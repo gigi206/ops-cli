@@ -3785,6 +3785,75 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
     }
 }
 
+/// A trusted `[seccomp] allow` relaxation threads through the real launch path — the
+/// config → spec → `memfds(&policy)` → bwrap `--add-seccomp-fd` chain a `build_spec` unit test
+/// cannot cover (it never invokes bwrap with the compiled filters). The kernel *enforcement* of a
+/// fine-grained lift is proven in `src/sandbox/seccomp.rs`'s real-cage tests; this proves the
+/// relaxed filters still compile, load, and launch a working cage through `ops run` — a
+/// non-regression that a `[seccomp]` config never breaks a launch.
+#[test]
+fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
+    let project = TmpDir::new("sec-proj");
+    let data = TmpDir::new("sec-data");
+    let state = TmpDir::new("sec-state");
+
+    // A relaxation mixing a whole-syscall lift (comma-separated in one string) and a fine-grained
+    // selector — the union of both must thread through. `[seccomp]` is a security field, so it
+    // applies only after `ops trust`.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"[seccomp]\nallow = [\"ptrace,perf_event_open\", \"clone:newns\"]\n",
+    )
+    .unwrap();
+
+    // Capability probe (also seeds the base userland); skip if the host cannot sandbox.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping seccomp-relaxation e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // Trust the project so its `[seccomp]` relaxation applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The relaxed cage launches and runs `id` to success — the policy threaded to the real bwrap
+    // invocation, the modified filters loaded, and the synthetic identity resolves (hermetic).
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "id"],
+    );
+    assert!(
+        out.status.success(),
+        "a trusted seccomp relaxation must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(sandbox)"),
+        "the relaxed cage must run hermetically as the synthetic identity:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// A trusted app's `[limits]` overlay reaches the cage's scope at `ops app` dispatch — the seam a
 /// `merge_app` unit test cannot cover: that the real dispatch merges the overlay *before* it
 /// consumes the limits. An inline `[app.cap]` caps tasks below the default; after trust, `ops app

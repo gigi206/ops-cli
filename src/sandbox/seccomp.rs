@@ -41,12 +41,27 @@
 //!
 //! Carve-outs kept *allowed* on purpose: `AF_UNIX` sockets (the egress forwarder's
 //! bridge), `socketpair`, and `recvfrom` (toolchain subprocess plumbing).
+//!
+//! ## Relaxing the denylist — `[seccomp] allow`
+//!
+//! The denylist is mandatory by default, but a **trusted** config (global or a trusted
+//! project) can re-permit a specific denied syscall so a tool that genuinely needs it — a
+//! debugger (`ptrace`), a profiler (`perf_event_open`), a runtime using `userfaultfd`, or
+//! nested-container tooling (`unshare`/`mount`) — can run in the cage. The grammar is
+//! **uniform**: a bare syscall name (`ptrace`, `unshare`, `mount`) lifts the whole syscall,
+//! while `clone`/`ioctl` — the two *argument-filtered* entries — additionally accept a
+//! `:selector` (`clone:newns`, `ioctl:tioclinux`) that lifts only one sub-rule and leaves the
+//! rest denied. An empty or absent `allow` list reproduces the mandatory baseline exactly.
+//! Loosening is trusted-only (an untrusted project's `[seccomp]` is dropped), and each token
+//! that reopens a real escape surface (`clone`→userns, `ioctl`→terminal injection,
+//! `umount2`→a mount teardown that can defeat a control-plane pin) is surfaced with a
+//! [`Caution`] the resolver turns into a warning.
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -95,88 +110,150 @@ fn arg1_is(request: u64) -> SeccompRule {
     .expect("a single-condition rule is valid")
 }
 
-/// The syscalls denied outright with EPERM — no namespace/mount semantics, so an
-/// unconditional refusal is safe.
-fn eperm_unconditional() -> Vec<i64> {
+/// The syscalls denied outright with EPERM (no namespace/mount semantics, so an unconditional
+/// refusal is safe), as `(name, number)` pairs. This is the **single source** for both the
+/// compiled filter and the `[seccomp] allow` name lookup, so the set a trusted config can
+/// re-permit can never drift from the set the filter denies. Names are the canonical Linux
+/// syscall names — the exact tokens `[seccomp] allow` accepts.
+fn eperm_unconditional_named() -> Vec<(&'static str, i64)> {
     let mut v = vec![
         // process inspection/patching of siblings
-        libc::SYS_ptrace,
-        libc::SYS_process_vm_readv,
-        libc::SYS_process_vm_writev,
+        ("ptrace", libc::SYS_ptrace),
+        ("process_vm_readv", libc::SYS_process_vm_readv),
+        ("process_vm_writev", libc::SYS_process_vm_writev),
         // kernel module loading
-        libc::SYS_init_module,
-        libc::SYS_finit_module,
-        libc::SYS_delete_module,
+        ("init_module", libc::SYS_init_module),
+        ("finit_module", libc::SYS_finit_module),
+        ("delete_module", libc::SYS_delete_module),
         // kexec / reboot
-        libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
-        libc::SYS_reboot,
+        ("kexec_load", libc::SYS_kexec_load),
+        ("kexec_file_load", libc::SYS_kexec_file_load),
+        ("reboot", libc::SYS_reboot),
         // introspection / perf / async-IO that hides syscalls from a filter
-        libc::SYS_bpf,
-        libc::SYS_perf_event_open,
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-        libc::SYS_userfaultfd,
+        ("bpf", libc::SYS_bpf),
+        ("perf_event_open", libc::SYS_perf_event_open),
+        ("io_uring_setup", libc::SYS_io_uring_setup),
+        ("io_uring_enter", libc::SYS_io_uring_enter),
+        ("io_uring_register", libc::SYS_io_uring_register),
+        ("userfaultfd", libc::SYS_userfaultfd),
         // kernel keyring
-        libc::SYS_keyctl,
-        libc::SYS_add_key,
-        libc::SYS_request_key,
+        ("keyctl", libc::SYS_keyctl),
+        ("add_key", libc::SYS_add_key),
+        ("request_key", libc::SYS_request_key),
         // misc privileged
-        libc::SYS_swapon,
-        libc::SYS_swapoff,
-        libc::SYS_acct,
-        libc::SYS_syslog,
-        libc::SYS_sethostname,
-        libc::SYS_setdomainname,
-        libc::SYS_personality,
+        ("swapon", libc::SYS_swapon),
+        ("swapoff", libc::SYS_swapoff),
+        ("acct", libc::SYS_acct),
+        ("syslog", libc::SYS_syslog),
+        ("sethostname", libc::SYS_sethostname),
+        ("setdomainname", libc::SYS_setdomainname),
+        ("personality", libc::SYS_personality),
         // mount / namespace family (the container-escape surface)
-        libc::SYS_unshare,
-        libc::SYS_setns,
-        libc::SYS_mount,
-        libc::SYS_umount2,
-        libc::SYS_pivot_root,
-        libc::SYS_chroot,
+        ("unshare", libc::SYS_unshare),
+        ("setns", libc::SYS_setns),
+        ("mount", libc::SYS_mount),
+        ("umount2", libc::SYS_umount2),
+        ("pivot_root", libc::SYS_pivot_root),
+        ("chroot", libc::SYS_chroot),
     ];
     // I/O-port access exists only on x86.
     #[cfg(target_arch = "x86_64")]
-    v.extend_from_slice(&[libc::SYS_ioperm, libc::SYS_iopl]);
+    v.extend_from_slice(&[("ioperm", libc::SYS_ioperm), ("iopl", libc::SYS_iopl)]);
     v
 }
 
-/// The EPERM filter's rules: the unconditional set, plus `clone` filtered on its
-/// namespace flags and `ioctl` filtered on the terminal-injection requests.
-fn eperm_rules() -> Rules {
-    let mut m = Rules::new();
-    for nr in eperm_unconditional() {
-        m.insert(nr, vec![]); // empty rule vec = match unconditionally
+/// The ENOSYS-denied syscalls as `(name, number)` pairs: `clone3` and the new mount API, so a
+/// caller falls back to the (filtered) old syscalls instead of bypassing the EPERM denylist.
+/// Like [`eperm_unconditional_named`], this is the single source for both the filter and the
+/// allow-token lookup.
+fn enosys_named() -> Vec<(&'static str, i64)> {
+    vec![
+        ("clone3", libc::SYS_clone3),
+        ("open_tree", libc::SYS_open_tree),
+        ("move_mount", libc::SYS_move_mount),
+        ("fsopen", libc::SYS_fsopen),
+        ("fsconfig", libc::SYS_fsconfig),
+        ("fsmount", libc::SYS_fsmount),
+        ("fspick", libc::SYS_fspick),
+        ("mount_setattr", libc::SYS_mount_setattr),
+    ]
+}
+
+/// The number of a denied syscall by name — searching both the EPERM and ENOSYS unconditional
+/// sets (not `clone`/`ioctl`, which are argument-filtered and handled by name in [`resolve_allow`]).
+/// `None` for a name ops does not deny, so an `allow` entry for it is refused (loosening nothing).
+fn denied_number(name: &str) -> Option<i64> {
+    eperm_unconditional_named()
+        .into_iter()
+        .chain(enosys_named())
+        .find(|(n, _)| *n == name)
+        .map(|(_, nr)| nr)
+}
+
+/// The canonical name of a denied syscall by number, for rendering a policy back to tokens
+/// (`ops config`). `clone`/`ioctl` are recognized explicitly; every other number is looked up in
+/// the two named sets. `None` for a number that is not denied (never happens for a policy built by
+/// [`resolve_allow`], whose whole-syscall lifts are all drawn from these sets).
+fn denied_name(nr: i64) -> Option<&'static str> {
+    if nr == libc::SYS_clone {
+        return Some("clone");
     }
-    // clone is also ordinary fork/thread creation; deny only when it asks for a
-    // new user or mount namespace.
-    m.insert(
-        libc::SYS_clone,
-        vec![arg0_has_flag(CLONE_NEWUSER), arg0_has_flag(CLONE_NEWNS)],
-    );
-    // ioctl is ubiquitous; deny only the terminal-injection requests.
-    m.insert(libc::SYS_ioctl, vec![arg1_is(TIOCSTI), arg1_is(TIOCLINUX)]);
+    if nr == libc::SYS_ioctl {
+        return Some("ioctl");
+    }
+    eperm_unconditional_named()
+        .into_iter()
+        .chain(enosys_named())
+        .find(|(_, n)| *n == nr)
+        .map(|(n, _)| n)
+}
+
+/// The EPERM filter's rules for a given relaxation policy: the unconditional set (minus any
+/// syscall the policy lifts wholesale), plus `clone` filtered on the namespace flags the policy has
+/// not lifted and `ioctl` filtered on the terminal-injection requests the policy has not lifted. A
+/// default (empty) policy reproduces the full mandatory denylist.
+fn eperm_rules(policy: &SeccompPolicy) -> Rules {
+    let mut m = Rules::new();
+    for (_, nr) in eperm_unconditional_named() {
+        if !policy.whole.contains(&nr) {
+            m.insert(nr, vec![]); // empty rule vec = match unconditionally
+        }
+    }
+    // clone is also ordinary fork/thread creation; deny only when it asks for a new user or mount
+    // namespace — and only for a flag the policy has not lifted. If the whole syscall is lifted, or
+    // every namespace flag is, clone is left entirely allowed (no entry).
+    if !policy.whole.contains(&libc::SYS_clone) {
+        let clone_rules: Vec<SeccompRule> = [CLONE_NEWUSER, CLONE_NEWNS]
+            .into_iter()
+            .filter(|f| !policy.clone_flags.contains(f))
+            .map(arg0_has_flag)
+            .collect();
+        if !clone_rules.is_empty() {
+            m.insert(libc::SYS_clone, clone_rules);
+        }
+    }
+    // ioctl is ubiquitous; deny only the terminal-injection requests the policy has not lifted.
+    if !policy.whole.contains(&libc::SYS_ioctl) {
+        let ioctl_rules: Vec<SeccompRule> = [TIOCSTI, TIOCLINUX]
+            .into_iter()
+            .filter(|r| !policy.ioctl_reqs.contains(r))
+            .map(arg1_is)
+            .collect();
+        if !ioctl_rules.is_empty() {
+            m.insert(libc::SYS_ioctl, ioctl_rules);
+        }
+    }
     m
 }
 
-/// The ENOSYS filter's rules: `clone3` and the new mount API, so a caller falls
-/// back to the (filtered) old syscalls instead of bypassing the EPERM denylist.
-fn enosys_rules() -> Rules {
+/// The ENOSYS filter's rules for a given relaxation policy: `clone3` and the new mount API, minus
+/// any the policy lifts wholesale. A default (empty) policy reproduces the full set.
+fn enosys_rules(policy: &SeccompPolicy) -> Rules {
     let mut m = Rules::new();
-    for nr in [
-        libc::SYS_clone3,
-        libc::SYS_open_tree,
-        libc::SYS_move_mount,
-        libc::SYS_fsopen,
-        libc::SYS_fsconfig,
-        libc::SYS_fsmount,
-        libc::SYS_fspick,
-        libc::SYS_mount_setattr,
-    ] {
-        m.insert(nr, vec![]);
+    for (_, nr) in enosys_named() {
+        if !policy.whole.contains(&nr) {
+            m.insert(nr, vec![]);
+        }
     }
     m
 }
@@ -202,13 +279,22 @@ fn serialize(program: &BpfProgram) -> Vec<u8> {
     bytes
 }
 
-/// The two compiled filters in load order: the EPERM denylist, then the ENOSYS
-/// denylist. Pure.
-fn programs() -> [Vec<u8>; 2] {
-    [
-        compile(eperm_rules(), SeccompAction::Errno(libc::EPERM as u32)),
-        compile(enosys_rules(), SeccompAction::Errno(libc::ENOSYS as u32)),
-    ]
+/// The compiled filters in load order for a given relaxation policy: the EPERM denylist, then the
+/// ENOSYS denylist. Pure. A filter whose rule set the policy has fully emptied is **omitted** —
+/// seccompiler rejects an empty filter, and an empty denylist is a no-op anyway — so the result has
+/// two entries for the default (mandatory) policy and fewer only if a trusted config lifts an entire
+/// filter's worth of syscalls.
+fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(2);
+    let eperm = eperm_rules(policy);
+    if !eperm.is_empty() {
+        out.push(compile(eperm, SeccompAction::Errno(libc::EPERM as u32)));
+    }
+    let enosys = enosys_rules(policy);
+    if !enosys.is_empty() {
+        out.push(compile(enosys, SeccompAction::Errno(libc::ENOSYS as u32)));
+    }
+    out
 }
 
 /// Write each compiled filter into an anonymous in-memory file, ready to hand to
@@ -216,8 +302,8 @@ fn programs() -> [Vec<u8>; 2] {
 /// close-on-exec so bwrap inherits them across the launch; the caller must keep
 /// the returned files alive until bwrap has read them. (No `memfd` seal is applied
 /// or needed — the file is written, rewound, and read once by bwrap.)
-pub(crate) fn memfds() -> io::Result<Vec<File>> {
-    programs().into_iter().map(write_to_memfd).collect()
+pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
+    programs(policy).into_iter().map(write_to_memfd).collect()
 }
 
 fn write_to_memfd(bytes: Vec<u8>) -> io::Result<File> {
@@ -245,6 +331,178 @@ pub(crate) fn argv_prefix(memfds: &[File]) -> Vec<OsString> {
     a
 }
 
+/// A resolved relaxation of the mandatory denylist: which denied syscalls (or argument-filtered
+/// sub-rules) a trusted `[seccomp] allow` re-permits. The **default is empty** — the full
+/// mandatory denylist, byte-identical to a cage with no `[seccomp]` config. Only a trusted config
+/// (global or a trusted project) contributes to it; the layering is a **union** (a security field
+/// that only ever subtracts from the denied set, like `forward` only ever adds ports).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SeccompPolicy {
+    /// Denied syscalls (by number) lifted wholesale — a bare token like `ptrace`, or a bare
+    /// `clone`/`ioctl` (which drops all of that syscall's argument-filtered rules).
+    whole: BTreeSet<i64>,
+    /// `clone` namespace flags lifted individually (a `clone:newns` token), effective only while
+    /// `clone` is not lifted wholesale.
+    clone_flags: BTreeSet<u64>,
+    /// `ioctl` requests lifted individually (an `ioctl:tiocsti` token), effective only while
+    /// `ioctl` is not lifted wholesale.
+    ioctl_reqs: BTreeSet<u64>,
+}
+
+/// What one resolved `[seccomp] allow` token lifts, against the denylist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Allow {
+    /// Lift a whole denied syscall (a bare name, including a bare `clone`/`ioctl`).
+    Whole(i64),
+    /// Lift one `clone` namespace flag (`clone:newns`/`clone:newuser`).
+    CloneFlag(u64),
+    /// Lift one `ioctl` request (`ioctl:tiocsti`/`ioctl:tioclinux`).
+    IoctlReq(u64),
+}
+
+/// The escape surface a token reopens — surfaced by the resolver as a graduated warning so a
+/// trusted operator sees exactly what they are opening. Tokens that only reduce defense-in-depth
+/// (e.g. `ptrace`, `perf_event_open`) carry no caution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caution {
+    /// Reopens unprivileged user-namespace creation (bare `clone`, `clone:newuser`, `clone3`).
+    Userns,
+    /// Reopens injecting input into the controlling terminal (bare `ioctl`, `ioctl:tiocsti`,
+    /// `ioctl:tioclinux`).
+    TerminalInjection,
+    /// Reopens tearing down a mount, which can defeat a control-plane pin ops relies on (`umount2`).
+    ControlPlane,
+}
+
+impl Caution {
+    /// A short phrase naming what the token reopens, for the resolver's warning.
+    pub(crate) fn reopens(self) -> &'static str {
+        match self {
+            Caution::Userns => "unprivileged user-namespace creation",
+            Caution::TerminalInjection => "terminal input injection",
+            Caution::ControlPlane => {
+                "tearing down a mount (can defeat a control-plane pin when ops's control plane is \
+                 bound read-write)"
+            }
+        }
+    }
+}
+
+/// Resolve one `[seccomp] allow` token against the denylist. A bare syscall name lifts the whole
+/// syscall; `clone`/`ioctl` additionally accept a `:selector` (`clone:newns`, `ioctl:tioclinux`)
+/// that lifts only that sub-rule. Returns the lift plus any [`Caution`] the caller should surface.
+/// `Err` names why the token is unusable (unknown syscall, bad or superfluous selector) so the
+/// caller drops it with a warning — an unrecognized token must loosen nothing (fail-closed). The
+/// token is trimmed here; comma-splitting a single string into several tokens is the caller's job.
+pub(crate) fn resolve_allow(token: &str) -> Result<(Allow, Option<Caution>), String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("empty entry".to_string());
+    }
+    if let Some((name, selector)) = token.split_once(':') {
+        return match name {
+            "clone" => match selector {
+                "newuser" => Ok((Allow::CloneFlag(CLONE_NEWUSER), Some(Caution::Userns))),
+                "newns" => Ok((Allow::CloneFlag(CLONE_NEWNS), None)),
+                other => Err(format!(
+                    "unknown clone flag `{other}` (expected `newuser` or `newns`)"
+                )),
+            },
+            "ioctl" => match selector {
+                "tiocsti" => Ok((Allow::IoctlReq(TIOCSTI), Some(Caution::TerminalInjection))),
+                "tioclinux" => Ok((Allow::IoctlReq(TIOCLINUX), Some(Caution::TerminalInjection))),
+                other => Err(format!(
+                    "unknown ioctl request `{other}` (expected `tiocsti` or `tioclinux`)"
+                )),
+            },
+            other => Err(format!(
+                "`{other}` takes no `:selector` (only `clone` and `ioctl` are argument-filtered)"
+            )),
+        };
+    }
+    match token {
+        // The two argument-filtered syscalls, lifted wholesale (every flag/request). The caution
+        // names what the coarse form reopens; the `:selector` form above is the narrow alternative.
+        "clone" => Ok((Allow::Whole(libc::SYS_clone), Some(Caution::Userns))),
+        "ioctl" => Ok((
+            Allow::Whole(libc::SYS_ioctl),
+            Some(Caution::TerminalInjection),
+        )),
+        name => match denied_number(name) {
+            Some(nr) => {
+                let caution = match name {
+                    "umount2" => Some(Caution::ControlPlane),
+                    // clone3 cannot be argument-filtered (its flags live behind a struct pointer a
+                    // cBPF cannot read), so lifting it reopens unfiltered namespace creation.
+                    "clone3" => Some(Caution::Userns),
+                    _ => None,
+                };
+                Ok((Allow::Whole(nr), caution))
+            }
+            None => Err(format!("`{name}` is not in ops's seccomp denylist")),
+        },
+    }
+}
+
+impl SeccompPolicy {
+    /// Record one resolved allowance.
+    pub(crate) fn allow(&mut self, a: Allow) {
+        match a {
+            Allow::Whole(nr) => {
+                self.whole.insert(nr);
+            }
+            Allow::CloneFlag(f) => {
+                self.clone_flags.insert(f);
+            }
+            Allow::IoctlReq(r) => {
+                self.ioctl_reqs.insert(r);
+            }
+        }
+    }
+
+    /// Whether this policy relaxes nothing — the mandatory baseline. When true, [`programs`]
+    /// yields exactly the two mandatory filters, identical to a cage with no `[seccomp]` config.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.whole.is_empty() && self.clone_flags.is_empty() && self.ioctl_reqs.is_empty()
+    }
+
+    /// Union another policy's allowances into this one — the merge used for both the
+    /// project-over-global baseline and an app overlay onto the baseline. Additive by nature
+    /// (a lifted syscall stays lifted), so a trusted layer's relaxation survives an overlay.
+    pub(crate) fn union(&mut self, other: &SeccompPolicy) {
+        self.whole.extend(&other.whole);
+        self.clone_flags.extend(&other.clone_flags);
+        self.ioctl_reqs.extend(&other.ioctl_reqs);
+    }
+
+    /// The canonical, sorted token strings this policy allows — for `ops config` display. Derived
+    /// from the same name tables the parse used, so what is shown can never drift from what the
+    /// cage enforces. A `clone`/`ioctl` lifted wholesale renders as the bare name; a lifted flag or
+    /// request renders in its `:selector` form.
+    pub(crate) fn tokens(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for nr in &self.whole {
+            out.push(denied_name(*nr).unwrap_or("unknown").to_string());
+        }
+        for f in &self.clone_flags {
+            if *f == CLONE_NEWUSER {
+                out.push("clone:newuser".to_string());
+            } else if *f == CLONE_NEWNS {
+                out.push("clone:newns".to_string());
+            }
+        }
+        for r in &self.ioctl_reqs {
+            if *r == TIOCSTI {
+                out.push("ioctl:tiocsti".to_string());
+            } else if *r == TIOCLINUX {
+                out.push("ioctl:tioclinux".to_string());
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,8 +510,8 @@ mod tests {
 
     #[test]
     fn the_two_denylists_are_disjoint() {
-        let eperm = eperm_rules();
-        let enosys = enosys_rules();
+        let eperm = eperm_rules(&SeccompPolicy::default());
+        let enosys = enosys_rules(&SeccompPolicy::default());
         for nr in enosys.keys() {
             assert!(
                 !eperm.contains_key(nr),
@@ -264,7 +522,7 @@ mod tests {
 
     #[test]
     fn the_eperm_set_covers_the_surface_and_the_mount_ns_family() {
-        let m = eperm_rules();
+        let m = eperm_rules(&SeccompPolicy::default());
         for nr in [
             libc::SYS_ptrace,
             libc::SYS_bpf,
@@ -291,7 +549,7 @@ mod tests {
 
     #[test]
     fn the_enosys_set_is_clone3_and_the_new_mount_api() {
-        let m = enosys_rules();
+        let m = enosys_rules(&SeccompPolicy::default());
         for nr in [
             libc::SYS_clone3,
             libc::SYS_fsopen,
@@ -306,8 +564,8 @@ mod tests {
 
     #[test]
     fn the_egress_and_toolchain_carve_outs_stay_allowed() {
-        let eperm = eperm_rules();
-        let enosys = enosys_rules();
+        let eperm = eperm_rules(&SeccompPolicy::default());
+        let enosys = enosys_rules(&SeccompPolicy::default());
         // The egress forwarder (socat TCP-LISTEN→UNIX-CONNECT) needs socket/socketpair/recvfrom.
         // The inbound forwarder (socat UNIX-LISTEN→TCP-CONNECT) additionally needs the server
         // socket primitives — bind/listen/accept/connect/sendto — which were never denied, but
@@ -332,9 +590,169 @@ mod tests {
 
     #[test]
     fn both_filters_compile_to_non_empty_programs() {
-        let [eperm, enosys] = programs();
-        assert!(!eperm.is_empty() && eperm.len() % 8 == 0);
-        assert!(!enosys.is_empty() && enosys.len() % 8 == 0);
+        let progs = programs(&SeccompPolicy::default());
+        assert_eq!(
+            progs.len(),
+            2,
+            "the default policy yields both mandatory filters"
+        );
+        for prog in &progs {
+            assert!(!prog.is_empty() && prog.len() % 8 == 0);
+        }
+    }
+
+    #[test]
+    fn resolve_allow_parses_bare_names_selectors_and_rejects_unknowns() {
+        // A bare unconditional name lifts the whole syscall, no caution.
+        assert!(
+            matches!(resolve_allow("ptrace"), Ok((Allow::Whole(nr), None)) if nr == libc::SYS_ptrace)
+        );
+        // A bare argument-filtered name lifts the whole syscall, with its caution.
+        assert!(
+            matches!(resolve_allow("clone"), Ok((Allow::Whole(nr), Some(Caution::Userns))) if nr == libc::SYS_clone)
+        );
+        assert!(matches!(
+            resolve_allow("ioctl"),
+            Ok((Allow::Whole(_), Some(Caution::TerminalInjection)))
+        ));
+        // The two syscalls with a specific, non-default caution.
+        assert!(matches!(
+            resolve_allow("umount2"),
+            Ok((Allow::Whole(_), Some(Caution::ControlPlane)))
+        ));
+        assert!(matches!(
+            resolve_allow("clone3"),
+            Ok((Allow::Whole(_), Some(Caution::Userns)))
+        ));
+        // Selectors lift only the named sub-rule; `newns` reopens nothing worth a caution,
+        // `newuser` and the ioctl requests do.
+        assert!(
+            matches!(resolve_allow("clone:newns"), Ok((Allow::CloneFlag(f), None)) if f == CLONE_NEWNS)
+        );
+        assert!(matches!(
+            resolve_allow("clone:newuser"),
+            Ok((Allow::CloneFlag(_), Some(Caution::Userns)))
+        ));
+        assert!(
+            matches!(resolve_allow("ioctl:tioclinux"), Ok((Allow::IoctlReq(r), Some(Caution::TerminalInjection))) if r == TIOCLINUX)
+        );
+        // Each token is trimmed (the caller splits a string on commas, this trims the pieces).
+        assert!(resolve_allow("  ptrace  ").is_ok());
+        // Unknown syscall, unknown selector, a `:selector` on a non-filtered syscall, and empty
+        // all fail — a token that resolves nothing must loosen nothing.
+        assert!(resolve_allow("read").is_err());
+        assert!(resolve_allow("clone:newnet").is_err());
+        assert!(resolve_allow("ptrace:foo").is_err());
+        assert!(resolve_allow("").is_err());
+    }
+
+    #[test]
+    fn a_default_policy_denies_the_whole_list_and_a_lift_is_surgical() {
+        let default = SeccompPolicy::default();
+        assert!(default.is_empty());
+        assert!(eperm_rules(&default).contains_key(&libc::SYS_ptrace));
+
+        // Lifting a whole syscall removes exactly it, nothing else.
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("ptrace").unwrap().0);
+        let rules = eperm_rules(&p);
+        assert!(
+            !rules.contains_key(&libc::SYS_ptrace),
+            "ptrace should be lifted"
+        );
+        assert!(
+            rules.contains_key(&libc::SYS_keyctl),
+            "an unrelated denial must stay"
+        );
+
+        // A clone flag lifts only that flag: the clone entry keeps the OTHER flag's rule (one rule
+        // left, not two) — the fine grammar's whole point.
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("clone:newns").unwrap().0);
+        assert_eq!(
+            eperm_rules(&p).get(&libc::SYS_clone).map(Vec::len),
+            Some(1),
+            "clone:newns must leave clone(CLONE_NEWUSER) denied"
+        );
+
+        // Lifting BOTH clone flags drops the clone entry entirely (equivalent to bare `clone`).
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("clone:newns").unwrap().0);
+        p.allow(resolve_allow("clone:newuser").unwrap().0);
+        assert!(!eperm_rules(&p).contains_key(&libc::SYS_clone));
+
+        // A BARE `clone`/`ioctl` lifts the WHOLE syscall through the `whole` branch — distinct from
+        // lifting every sub-rule above (that path builds an empty rule vec; this one short-circuits
+        // on `whole.contains`). Both drop the entry, but a bare token must exercise its own branch,
+        // and must NOT disturb the *other* arg-filtered syscall's rules.
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("clone").unwrap().0);
+        let rules = eperm_rules(&p);
+        assert!(
+            !rules.contains_key(&libc::SYS_clone),
+            "bare `clone` must drop the whole clone entry"
+        );
+        assert_eq!(
+            rules.get(&libc::SYS_ioctl).map(Vec::len),
+            Some(2),
+            "lifting `clone` must leave ioctl's two rules intact"
+        );
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("ioctl").unwrap().0);
+        let rules = eperm_rules(&p);
+        assert!(
+            !rules.contains_key(&libc::SYS_ioctl),
+            "bare `ioctl` must drop the whole ioctl entry"
+        );
+        assert_eq!(
+            rules.get(&libc::SYS_clone).map(Vec::len),
+            Some(2),
+            "lifting `ioctl` must leave clone's two rules intact"
+        );
+
+        // An ENOSYS lift removes it from the ENOSYS filter.
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("clone3").unwrap().0);
+        assert!(!enosys_rules(&p).contains_key(&libc::SYS_clone3));
+    }
+
+    #[test]
+    fn tokens_round_trip_the_policy_for_display() {
+        let mut p = SeccompPolicy::default();
+        for t in [
+            "ptrace",
+            "unshare",
+            "clone:newns",
+            "ioctl:tioclinux",
+            "clone3",
+        ] {
+            p.allow(resolve_allow(t).unwrap().0);
+        }
+        assert_eq!(
+            p.tokens(),
+            vec![
+                "clone3",
+                "clone:newns",
+                "ioctl:tioclinux",
+                "ptrace",
+                "unshare"
+            ]
+        );
+        // A wholesale clone/ioctl renders as the bare name.
+        let mut p = SeccompPolicy::default();
+        p.allow(resolve_allow("clone").unwrap().0);
+        p.allow(resolve_allow("ioctl").unwrap().0);
+        assert_eq!(p.tokens(), vec!["clone", "ioctl"]);
+    }
+
+    #[test]
+    fn union_is_additive() {
+        let mut base = SeccompPolicy::default();
+        base.allow(resolve_allow("ptrace").unwrap().0);
+        let mut over = SeccompPolicy::default();
+        over.allow(resolve_allow("clone:newns").unwrap().0);
+        base.union(&over);
+        assert_eq!(base.tokens(), vec!["clone:newns", "ptrace"]);
     }
 
     #[test]
@@ -345,7 +763,10 @@ mod tests {
         // filter is built in the parent and installed in a forked child that runs ONLY
         // async-signal-safe calls (prctl + syscall + _exit), so there is no fork-in-threaded hazard
         // and no test-harness recursion.
-        let prog = compile(eperm_rules(), SeccompAction::Errno(libc::EPERM as u32));
+        let prog = compile(
+            eperm_rules(&SeccompPolicy::default()),
+            SeccompAction::Errno(libc::EPERM as u32),
+        );
         // SAFETY: the child touches only async-signal-safe libc calls before `_exit`; `prog` is
         // read-only memory shared copy-on-write from the parent (the child allocates nothing).
         let pid = unsafe { libc::fork() };
@@ -391,8 +812,8 @@ mod tests {
 
     #[test]
     fn each_memfd_holds_its_compiled_filter() {
-        let files = memfds().expect("memfds");
-        let expected = programs();
+        let files = memfds(&SeccompPolicy::default()).expect("memfds");
+        let expected = programs(&SeccompPolicy::default());
         assert_eq!(files.len(), 2);
         for (mut f, want) in files.into_iter().zip(expected) {
             let mut got = Vec::new();
@@ -403,7 +824,7 @@ mod tests {
 
     #[test]
     fn argv_prefix_emits_one_add_flag_per_filter() {
-        let files = memfds().expect("memfds");
+        let files = memfds(&SeccompPolicy::default()).expect("memfds");
         let argv = argv_prefix(&files);
         assert_eq!(argv.len(), 4);
         assert_eq!(argv[0], "--add-seccomp-fd");
@@ -419,47 +840,13 @@ mod tests {
         matches!(crate::probe_userns(), crate::Userns::Ok).then_some(bwrap)
     }
 
-    /// End-to-end teeth: load the real compiled filters into a real cage and
-    /// confirm the kernel enforces them — a denied core syscall returns EPERM, a
-    /// bypass route (`clone3`) returns ENOSYS, and the `AF_UNIX` carve-out works.
-    /// x86_64-only because it triggers syscalls by raw number.
+    /// The mount set + a `/usr/bin/python3 -c <probe>` spec for the real-cage seccomp tests: host
+    /// `/usr` bound read-only so python runs, plus `/proc`/`/dev`/tmpfs on shared net. x86_64-only
+    /// (the probes trigger raw syscalls by number).
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn the_real_cage_enforces_the_denylist() {
+    fn probe_spec(probe: &str) -> super::super::spec::SandboxSpec {
         use super::super::spec::{Mount, NetPolicy, SandboxSpec};
         use std::path::PathBuf;
-        use std::process::Command;
-
-        let Some(bwrap) = sandbox_prereq() else {
-            eprintln!("skipping seccomp cage test: no bwrap or no capability-bearing userns");
-            return;
-        };
-        if !PathBuf::from("/usr/bin/python3").exists() {
-            eprintln!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
-            return;
-        }
-
-        // x86_64 syscall numbers: keyctl=250, clone3=435, unshare=272, clone=56,
-        // ioctl=16. `clone(CLONE_NEWUSER|SIGCHLD)` and `ioctl(TIOCSTI)` exercise the
-        // *argument-filtered* rules (a different BPF codegen than the unconditional
-        // entries); a regression in either reopens the mount/namespace escape surface the
-        // denylist closes.
-        // The EPERM action fires before the syscall runs, so the clone probe spawns
-        // no child. `fork()` (clone without namespace flags) must still succeed.
-        let probe = "import ctypes,os,socket\n\
-             l=ctypes.CDLL(None,use_errno=True)\n\
-             def e(nr,*a):\n \
-              ctypes.set_errno(0); l.syscall(nr,*[ctypes.c_long(x) for x in a]); return ctypes.get_errno()\n\
-             print('keyctl',e(250,0,-3,0))\n\
-             print('clone3',e(435,0,0))\n\
-             print('unshare',e(272,0x10000000))\n\
-             print('clone_newuser',e(56,0x10000000|17,0,0,0,0))\n\
-             print('ioctl_tiocsti',e(16,0,0x5412,0))\n\
-             pid=os.fork()\n\
-             if pid==0: os._exit(0)\n\
-             os.waitpid(pid,0); print('fork','ok')\n\
-             s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); print('afunix','ok'); s.close()\n";
-
         let mounts = vec![
             Mount::RoBind {
                 src: PathBuf::from("/usr"),
@@ -487,7 +874,7 @@ mod tests {
                 dest: PathBuf::from("/tmp"),
             },
         ];
-        let spec = SandboxSpec::new(
+        SandboxSpec::new(
             PathBuf::from("/tmp"),
             mounts,
             vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
@@ -498,24 +885,67 @@ mod tests {
                 OsString::from(probe),
             ],
         )
-        .expect("probe spec");
+        .expect("probe spec")
+    }
 
-        let memfds = memfds().expect("memfds");
+    /// Run `probe` under `policy`'s compiled filters in a real cage, returning its stdout — or
+    /// `None` to skip (no bwrap / no capability-bearing userns / no python3). A non-zero bwrap exit
+    /// is a test failure (the probe must actually run), not a skip.
+    #[cfg(target_arch = "x86_64")]
+    fn run_probe(policy: &SeccompPolicy, probe: &str) -> Option<String> {
+        use std::path::PathBuf;
+        use std::process::Command;
+        let bwrap = sandbox_prereq()?;
+        if !PathBuf::from("/usr/bin/python3").exists() {
+            eprintln!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
+            return None;
+        }
+        let spec = probe_spec(probe);
+        let memfds = memfds(policy).expect("memfds");
         let mut argv = argv_prefix(&memfds);
         argv.extend(super::super::argv::to_argv(&spec));
         let out = Command::new(&bwrap)
             .args(argv)
             .output()
             .expect("launch bwrap");
-        // memfds stay alive until here.
-        drop(memfds);
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        drop(memfds); // kept alive until bwrap has read the inherited descriptors
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
             out.status.success(),
             "probe did not run; stdout=\n{stdout}\nstderr=\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        Some(stdout)
+    }
+
+    /// End-to-end teeth: load the DEFAULT (mandatory) filters into a real cage and confirm the
+    /// kernel enforces them — a denied core syscall returns EPERM, a bypass route (`clone3`) returns
+    /// ENOSYS, the arg-filtered `clone(CLONE_NEWUSER)`/`ioctl(TIOCSTI)` are refused, and `fork` plus
+    /// the `AF_UNIX` carve-out still work. x86_64-only (raw syscall numbers).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_real_cage_enforces_the_denylist() {
+        // keyctl=250, clone3=435, unshare=272, clone=56, ioctl=16. `clone(CLONE_NEWUSER|SIGCHLD)`
+        // and `ioctl(TIOCSTI)` exercise the *argument-filtered* rules; the EPERM action fires
+        // before the syscall runs, so the clone probe spawns no child, and `fork()` (clone without
+        // namespace flags) must still succeed.
+        let probe = "import ctypes,os,socket\n\
+             l=ctypes.CDLL(None,use_errno=True)\n\
+             def e(nr,*a):\n \
+              ctypes.set_errno(0); l.syscall(nr,*[ctypes.c_long(x) for x in a]); return ctypes.get_errno()\n\
+             print('keyctl',e(250,0,-3,0))\n\
+             print('clone3',e(435,0,0))\n\
+             print('unshare',e(272,0x10000000))\n\
+             print('clone_newuser',e(56,0x10000000|17,0,0,0,0))\n\
+             print('ioctl_tiocsti',e(16,0,0x5412,0))\n\
+             pid=os.fork()\n\
+             if pid==0: os._exit(0)\n\
+             os.waitpid(pid,0); print('fork','ok')\n\
+             s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); print('afunix','ok'); s.close()\n";
+
+        let Some(stdout) = run_probe(&SeccompPolicy::default(), probe) else {
+            return;
+        };
         assert!(stdout.contains("keyctl 1"), "keyctl not EPERM: {stdout}");
         assert!(stdout.contains("clone3 38"), "clone3 not ENOSYS: {stdout}");
         assert!(stdout.contains("unshare 1"), "unshare not EPERM: {stdout}");
@@ -534,6 +964,72 @@ mod tests {
         assert!(
             stdout.contains("afunix ok"),
             "AF_UNIX carve-out broke: {stdout}"
+        );
+    }
+
+    /// End-to-end teeth for a **bare** `allow` token (`xxx` — the whole-syscall form): a trusted
+    /// `allow = ["ptrace"]` lifts the entire syscall, so in a real kernel `ptrace(PTRACE_TRACEME)`
+    /// returns 0 (it is EPERM while denied), while an unrelated denial (`keyctl`) stays EPERM — the
+    /// lift is surgical. x86_64-only (raw syscall numbers).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_bare_seccomp_allow_lifts_a_whole_syscall_in_a_real_cage() {
+        // ptrace=101 (PTRACE_TRACEME=0 → returns 0 on success), keyctl=250. `syscall` returns the
+        // raw result; the probe prints the errno so the assertion tells a lift from a block.
+        let probe = "import ctypes\n\
+             l=ctypes.CDLL(None,use_errno=True)\n\
+             def r(nr,*a):\n \
+              ctypes.set_errno(0); rv=l.syscall(nr,*[ctypes.c_long(x) for x in a]); return (rv,ctypes.get_errno())\n\
+             rv,er=r(101,0,0,0,0); print('ptrace_traceme',rv,er)\n\
+             _,er=r(250,0,-3,0); print('keyctl',er)\n";
+
+        let mut policy = SeccompPolicy::default();
+        policy.allow(resolve_allow("ptrace").unwrap().0);
+        let Some(stdout) = run_probe(&policy, probe) else {
+            return;
+        };
+        // ptrace lifted wholesale → PTRACE_TRACEME succeeds (return 0, errno 0).
+        assert!(
+            stdout.contains("ptrace_traceme 0 0"),
+            "ptrace not lifted (expected TRACEME to succeed): {stdout}"
+        );
+        // An unrelated denial stays: the lift is surgical, not a blanket relaxation.
+        assert!(
+            stdout.contains("keyctl 1"),
+            "keyctl wrongly lifted — a bare `ptrace` must not touch it: {stdout}"
+        );
+    }
+
+    /// End-to-end teeth for a **selector** `allow` token (`xxx:yyy` — the fine grammar): a trusted
+    /// `allow = ["ioctl:tioclinux"]` lifts *only* that request, so in a real kernel
+    /// `ioctl(TIOCLINUX)` reaches the kernel (errno **not** EPERM — EFAULT/ENOTTY) while
+    /// `ioctl(TIOCSTI)` — the *other* request of the *same* syscall, not lifted — stays EPERM. This
+    /// is the crux: the selector lifts one sub-rule, not the whole syscall. x86_64-only.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_seccomp_selector_lifts_only_the_named_sub_rule_in_a_real_cage() {
+        // ioctl=16, TIOCLINUX=0x541C, TIOCSTI=0x5412. The probe prints each errno (0 on success).
+        let probe = "import ctypes\n\
+             l=ctypes.CDLL(None,use_errno=True)\n\
+             def r(nr,*a):\n \
+              ctypes.set_errno(0); l.syscall(nr,*[ctypes.c_long(x) for x in a]); return ctypes.get_errno()\n\
+             print('ioctl_tioclinux',r(16,0,0x541C,0))\n\
+             print('ioctl_tiocsti',r(16,0,0x5412,0))\n";
+
+        let mut policy = SeccompPolicy::default();
+        policy.allow(resolve_allow("ioctl:tioclinux").unwrap().0);
+        let Some(stdout) = run_probe(&policy, probe) else {
+            return;
+        };
+        // ioctl:tioclinux lifted → the request reaches the kernel, so its errno is NOT EPERM.
+        assert!(
+            stdout.contains("ioctl_tioclinux ") && !stdout.contains("ioctl_tioclinux 1"),
+            "ioctl(TIOCLINUX) still blocked by seccomp — the selector did not lift it: {stdout}"
+        );
+        // ioctl:tiocsti NOT lifted → the OTHER request of the same syscall stays EPERM.
+        assert!(
+            stdout.contains("ioctl_tiocsti 1"),
+            "ioctl(TIOCSTI) not EPERM — the selector lifted more than the named request: {stdout}"
         );
     }
 }

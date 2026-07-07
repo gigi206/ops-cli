@@ -29,7 +29,7 @@ mod projectstore;
 mod proxy;
 mod resolver;
 mod search;
-mod seccomp;
+pub(crate) mod seccomp;
 mod smoke;
 mod spec;
 

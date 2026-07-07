@@ -123,6 +123,12 @@ pub(crate) struct SandboxSpec {
     /// session listing. [`SandboxSpec::new`] defaults it to `cage`; the real launch path
     /// sets it via [`SandboxSpec::with_cage_slug`].
     pub(super) cage_slug: String,
+    /// The relaxation of the mandatory seccomp denylist, from a trusted `[seccomp] allow`.
+    /// [`SandboxSpec::new`] defaults it to empty — the full mandatory denylist, identical to a
+    /// cage with no `[seccomp]` config; the launch path sets a non-empty one via
+    /// [`SandboxSpec::with_seccomp`]. Consumed when the seccomp filters are compiled, not by
+    /// [`super::argv::to_argv`] (the filters are prepended as `--add-seccomp-fd` descriptors).
+    pub(super) seccomp: super::seccomp::SeccompPolicy,
 }
 
 impl SandboxSpec {
@@ -153,6 +159,7 @@ impl SandboxSpec {
             terminal: TerminalPolicy::NewSession,
             cmd,
             cage_slug: "cage".to_string(),
+            seccomp: super::seccomp::SeccompPolicy::default(),
         })
     }
 
@@ -160,6 +167,13 @@ impl SandboxSpec {
     /// derives it from the app or project via [`super::naming::cage_slug`].
     pub(crate) fn with_cage_slug(mut self, slug: String) -> Self {
         self.cage_slug = slug;
+        self
+    }
+
+    /// Set the trusted seccomp relaxation (see [`SandboxSpec::seccomp`]). The launch path derives
+    /// it from the resolved `[seccomp] allow`; a default (empty) policy is the mandatory denylist.
+    pub(crate) fn with_seccomp(mut self, seccomp: super::seccomp::SeccompPolicy) -> Self {
+        self.seccomp = seccomp;
         self
     }
 

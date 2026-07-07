@@ -392,6 +392,8 @@ mod tests {
             gui_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         }
@@ -420,6 +422,8 @@ mod tests {
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             declared_secrets: vec![],
             apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
             warnings: vec![],

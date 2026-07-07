@@ -70,7 +70,7 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     // Load the mandatory seccomp filters too, so `doctor` proves the real launch
     // path — hardening *and* filter — works on this host, not just the namespaces.
     // The memfds stay alive until `output` returns (bwrap reads them at startup).
-    let seccomp = super::seccomp::memfds()?;
+    let seccomp = super::seccomp::memfds(&spec.seccomp)?;
     let mut argv = super::seccomp::argv_prefix(&seccomp);
     argv.extend(to_argv(&spec));
     let out = Command::new(bwrap).args(argv).output()?;

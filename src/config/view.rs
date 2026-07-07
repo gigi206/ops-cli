@@ -60,6 +60,11 @@ pub(crate) struct ConfigView {
     pub(crate) forward: Vec<u16>,
     /// Which layer supplied the `forward` set (`Default` when neither config set it).
     pub(crate) forward_origin: ProvenanceView,
+    /// The seccomp denylist relaxation, as the canonical `[seccomp] allow` tokens a trusted config
+    /// re-permitted. Empty when the mandatory denylist stands (no `[seccomp]` config).
+    pub(crate) seccomp: Vec<String>,
+    /// Which layer supplied the seccomp relaxation (`Default` when neither config did).
+    pub(crate) seccomp_origin: ProvenanceView,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -454,6 +459,10 @@ pub(crate) struct AppView {
     /// the baseline `forward`. The overlay's own ports, not the baseline-merged set; the merge
     /// unions them only for the launch itself.
     pub(crate) forward: Vec<u16>,
+    /// The seccomp relaxation this overlay adds over the baseline — its *own* allow tokens, not the
+    /// baseline-merged set. Empty when it relaxes nothing; the merge unions it with the baseline
+    /// only for the launch itself.
+    pub(crate) seccomp: Vec<String>,
     /// The cgroup limits this overlay overrides, when it tunes any — its *own* fields, not the
     /// baseline-merged set, so an app that changes nothing shows nothing.
     pub(crate) limits: Option<AppLimitsView>,
@@ -498,6 +507,10 @@ pub(crate) struct AppDetailView {
     /// `Inherited` when the app added none of its own.
     pub(crate) forward: Vec<u16>,
     pub(crate) forward_origin: ProvenanceView,
+    /// The effective seccomp relaxation — the app's own ∪ the baseline's, as tokens. The origin is
+    /// `Inherited` when the app added none of its own (it takes the baseline's relaxation).
+    pub(crate) seccomp: Vec<String>,
+    pub(crate) seccomp_origin: ProvenanceView,
     /// The effective cgroup limits — the app's overrides folded onto the baseline — each field
     /// carrying its provenance (`Inherited` when the app left it to the baseline).
     pub(crate) limits: LimitsView,
@@ -652,6 +665,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         gui_origin: resolved.gui_origin.into(),
         forward: resolved.forward.clone(),
         forward_origin: resolved.forward_origin.into(),
+        seccomp: resolved.seccomp.tokens(),
+        seccomp_origin: resolved.seccomp_origin.into(),
         limits,
         secrets,
         apps,
@@ -898,6 +913,7 @@ fn app_view(
             super::GuiPolicy::None => GuiView::None,
         }),
         forward: app.forward.clone(),
+        seccomp: app.seccomp.tokens(),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
             app.secrets
@@ -976,6 +992,12 @@ fn app_detail_view(
     super::union_forward(&mut eff_forward, app.forward.clone());
     let forward_origin = origin_or_inherited(!app.forward.is_empty(), app.forward_origin);
 
+    // Effective seccomp: the app's own relaxation ∪ the baseline's — the same union `merge_app`
+    // performs — with the origin `Inherited` when the app added none of its own.
+    let mut eff_seccomp = baseline.seccomp.clone();
+    eff_seccomp.union(&app.seccomp);
+    let seccomp_origin = origin_or_inherited(!app.seccomp.is_empty(), app.seccomp_origin);
+
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
     // app's when it set the field, else inherited from the baseline.
     let mut eff_limits = baseline.limits.clone();
@@ -1049,6 +1071,8 @@ fn app_detail_view(
         gui_origin,
         forward: eff_forward,
         forward_origin,
+        seccomp: eff_seccomp.tokens(),
+        seccomp_origin,
         limits,
         env: app
             .env
@@ -1275,6 +1299,8 @@ mod tests {
             gui_origin: ProvenanceView::Global,
             forward: vec![1455],
             forward_origin: ProvenanceView::Global,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -1309,6 +1335,7 @@ mod tests {
                 }),
                 gui: None,
                 forward: vec![1455],
+                seccomp: vec![],
                 limits: Some(AppLimitsView {
                     memory_high: None,
                     memory_max: Some("8G".into()),
@@ -1441,6 +1468,8 @@ mod tests {
             gui_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -1509,6 +1538,8 @@ mod tests {
             },
             limits_origin: Default::default(),
             secrets: vec![a_header_secret()],
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             declared_secrets: vec![a_header_secret()],
             apps: Default::default(),
             warnings: vec![],
@@ -1550,6 +1581,8 @@ mod tests {
                 memory_max: Provenance::Default,
                 tasks_max: Provenance::Global,
             },
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };

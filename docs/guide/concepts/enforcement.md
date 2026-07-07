@@ -112,6 +112,17 @@ untrusted-only environment denylist). The cage — not nix's inner build sandbox
 the boundary, and the agent already runs arbitrary code in it, so this is within the
 Mode-B threat model.
 
+### Relaxing the denylist (trusted-only)
+
+The denylist is mandatory by default, but a **trusted** config can re-permit a
+specific denied syscall with [`[seccomp] allow`](../configuration/seccomp.md) — so a
+debugger (`ptrace`), profiler (`perf_event_open`), or nested-container tool can run in
+the cage. The grammar is uniform (a bare name lifts the whole syscall; `clone`/`ioctl`
+also accept a `:selector` that lifts one sub-rule); loosening is trusted-only (an
+untrusted project's relaxation is dropped), and each token that reopens a real escape
+surface is surfaced with a caution. This reduces the surface reduction above — never the
+namespace/capability boundary itself — and does **not** re-enable nix's inner sandbox.
+
 ### Carve-outs kept allowed
 
 `socket(AF_UNIX)`, `socketpair`, and `recvfrom` are **deliberately permitted**. The

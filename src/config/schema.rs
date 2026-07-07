@@ -86,6 +86,12 @@ pub(crate) struct RawConfig {
     /// memory ceiling) reduces the anti-DoS protection, a choice an untrusted project may not
     /// make. Each field is independent and falls back to the default when unset.
     pub(crate) limits: Option<RawLimits>,
+    /// A trusted relaxation of the cage's mandatory seccomp syscall denylist, declared as the
+    /// `[seccomp]` table. A security field — honored from the global config or a trusted project,
+    /// ignored from an untrusted one: re-permitting a denied syscall reduces the kernel-attack-
+    /// surface control, a choice an untrusted project may not make. Empty or absent leaves the full
+    /// mandatory denylist.
+    pub(crate) seccomp: Option<RawSeccomp>,
     /// Network-scoped config that is not itself a posture — currently the reusable egress
     /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
     /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
@@ -183,6 +189,19 @@ impl RawLimit {
     }
 }
 
+/// The `[seccomp]` table: a trusted relaxation of the cage's mandatory syscall denylist. `allow`
+/// lists syscalls (or argument-filtered sub-rules) to re-permit — a bare name lifts the whole
+/// syscall (`ptrace`, `unshare`, `mount`), while `clone`/`ioctl` (the two argument-filtered
+/// entries) also accept a `:selector` (`clone:newns`, `ioctl:tioclinux`) that lifts only that
+/// sub-rule. Each string may itself be a comma-separated list (`"ptrace,unshare"`), split downstream.
+/// A malformed or unknown entry is dropped with a warning (fail-closed); an entry that reopens a
+/// real escape surface is accepted with a caution. Empty or absent leaves the full mandatory denylist.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawSeccomp {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+}
+
 /// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
 /// baseline. The overlay fields reuse the baseline shapes and gate identically — an
 /// untrusted project's app may add `env`/`packages` and choose the command, but its
@@ -226,6 +245,11 @@ pub(crate) struct RawApp {
     /// untrusted project's app `[limits]` is dropped whole. An unset `Option` is omitted on
     /// export, so an app that tunes nothing carries no `[limits]` table.
     pub(crate) limits: Option<RawLimits>,
+    /// The app's seccomp denylist relaxation, unioned onto the baseline's. A security field, gated
+    /// like the baseline `[seccomp]` (loosening the denylist weakens the kernel-attack-surface
+    /// control), so an untrusted project's app `[seccomp]` is dropped. An unset `Option` is omitted
+    /// on export, so an app that relaxes nothing carries no `[seccomp]` table.
+    pub(crate) seccomp: Option<RawSeccomp>,
     /// Where this app's persistent `$HOME` (its config, login state, history) lives:
     /// `"global"` (the default) — one home per app, shared across every project, so the app
     /// keeps a single identity wherever it runs; or `"project"` — a home per (project, app),

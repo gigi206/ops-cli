@@ -77,8 +77,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   M3.5** — the per-project writable store + the Mode-B `/nix` read-write inversion, nix-in-cage
   self-equip, `ops mise` passthrough + tool activation, `ops upgrade [nix|mise|flake]`, hermetic
   TLS + a curated base toolset, and `ops search`. **Enforcement (M4) complete** — seccomp denylist
-  (Posture A) + cgroup v2 resource limits (Landlock-FS is a deferred defense-in-depth option, not a
-  gap). **Housekeeping (M5) complete** — `ops gc [--all] [--prune]` (session + per-project +
+  (Posture A, now trusted-relaxable via `[seccomp] allow`) + cgroup v2 resource limits (Landlock-FS
+  is a deferred defense-in-depth option, not a gap). **Housekeeping (M5) complete** — `ops gc [--all] [--prune]` (session + per-project +
   shared-store collection, including the stale rev-keyed flake out-link residual), `ops attach
   <id>`, `ops stop <id>… | --all`, and a `--detach` background-agent path; the **one open M5 parity
   hole is ssh-agent forwarding** (`$SSH_AUTH_SOCK`, a scoped trusted-only opt-in, deferred — the
@@ -95,6 +95,69 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`[seccomp] allow` — a trusted relaxation of the mandatory syscall denylist (DONE 2026-07-07)**
+  (`src/sandbox/seccomp.rs` + `spec.rs` + `binds.rs` + `launch.rs` + `smoke.rs` + `config/{schema,mod,
+  view}.rs` + `main.rs` + `help.rs` + `docs/guide/configuration/seccomp.md` [new] + `tests/{config,
+  run}.rs`): the M4.1 denylist was **unconditional** — no tool needing a denied syscall (`gdb`/`strace`
+  → `ptrace`, `perf` → `perf_event_open`, CRIU → `userfaultfd`, nested containers → `unshare`/`mount`)
+  could run in a cage, even in a fully-trusted project. A new **`[seccomp] allow = [...]`** field lets a
+  **trusted** config (global or a trusted project) re-permit specific denied syscalls. **Grammar is
+  uniform (the user's explicit call, over an initial refuse-the-dangerous design):** a **bare syscall
+  name lifts the whole syscall** (`ptrace`, `unshare`, `mount`), and `clone`/`ioctl` — the only two
+  *argument-filtered* denylist entries — additionally accept a **`:selector`** (`clone:newns`,
+  `ioctl:tioclinux`) that lifts one sub-rule and leaves its siblings denied. **No refusals** — every
+  token that reopens a real escape surface is applied but flagged with a graduated **`Caution`**
+  (`clone`/`clone:newuser`/`clone3` → userns creation; `ioctl`/`ioctl:tiocsti`/`ioctl:tioclinux` →
+  terminal injection; `umount2` → a mount teardown that can defeat a control-plane pin). Each string
+  is also **comma-splittable** (`"ptrace,unshare"` ≡ two entries), and an unknown/malformed token is
+  **dropped + warned** (fail-closed — loosens nothing). **`allow = []` ≡ the current mandatory
+  denylist, byte-identical** (the field can only subtract). **Engine** (`seccomp.rs`): the denied set
+  is refactored to **single-source `(name, number)` tables** (`eperm_unconditional_named`/`enosys_named`
+  → both the compiled filter *and* the allow-token lookup, so the allowable set cannot drift from the
+  denied set); a `SeccompPolicy { whole, clone_flags, ioctl_reqs }` (default empty) drives
+  `eperm_rules(&policy)`/`enosys_rules(&policy)` (skip a lifted whole syscall; keep only the
+  non-lifted clone flags / ioctl requests; drop the clone/ioctl entry entirely when every sub-rule is
+  lifted); `resolve_allow(token) -> Result<(Allow, Option<Caution>), String>` is the parser
+  (bare=whole, `:selector`=subset, `:selector` on a non-filtered syscall rejected); `programs(&policy)`
+  **skips an emptied filter** (seccompiler rejects an empty rule set) so a fully-relaxed filter is
+  omitted rather than a panic; `tokens()` reverse-maps for display (same tables → shown ≡ enforced).
+  **Threading:** the policy rides on `SandboxSpec.seccomp` (default empty, `with_seccomp` builder),
+  set in `binds::build_spec` from `prep.cfg.seccomp` (post-`merge_app`, so an app's union is in effect
+  for `ops app`, like limits), consumed by `seccomp_argv`/`supervise`/`smoke` via
+  `memfds(&spec.seccomp)`. **Config** (`config/`): `RawSeccomp{allow}` on `RawConfig`+`RawApp`;
+  `Resolved`/`ResolvedApp` gain `seccomp: SeccompPolicy` + `seccomp_origin`; modelled on **`forward`**
+  (a set that **unions**, single origin) not `limits` (per-field) — gated trusted/global-only in
+  `resolve`/`resolve_app` (untrusted layer's `[seccomp]` dropped + warned), `merge_app` does
+  `self.seccomp.union(&app.seccomp)`. **The flagship holds** (a global app's relaxation survives an
+  untrusted project's widening, because the untrusted contribution is dropped before the union — its
+  own integration test). A one-shot **override does not relax** the denylist (`apply_override`
+  ignores an override's `[seccomp]` — the fail-closed direction; the deferred residual). **`ops config
+  show`** renders a `seccomp allow:` line (baseline, provenance-tagged) + the per-app compact roster +
+  the `--app` effective (union) view with `inherited`/`app:*` provenance; `--json` carries the token
+  array. **Tests:** net-new **15 unit** (`seccomp.rs`: token parse incl. rejections, surgical
+  filtering [bare `clone`/`ioctl` drop the whole entry without touching the sibling arg-filtered
+  syscall; `clone:newns` leaves one clone rule], `tokens()` round-trip, union, and **two dedicated
+  real-cage teeth via a shared `run_probe` helper** — `a_bare_seccomp_allow_lifts_a_whole_syscall_in_a_real_cage`
+  (`allow=["ptrace"]` → live `ptrace(TRACEME)`→0 [lifted], `keyctl`→EPERM [surgical]) and
+  `a_seccomp_selector_lifts_only_the_named_sub_rule_in_a_real_cage` (`allow=["ioctl:tioclinux"]` →
+  `ioctl(TIOCLINUX)`→non-EPERM [selector lifted] while `ioctl(TIOCSTI)`→EPERM [sibling still denied]),
+  **both ran not skipped**; plus the unchanged default-denylist real-cage test. Note: a bare `clone`
+  / `clone:xxx` lift is proven at parse + filter-construction level but **not** kernel-probed —
+  clone(NEWUSER) *succeeds* and forks a child [messy probe], clone(NEWNS) is CAP_SYS_ADMIN-gated
+  [EPERM indistinguishable from seccomp] — so the selector *mechanism*'s kernel teeth ride on the
+  identical arg-filter codegen exercised by `ioctl:tioclinux`), **4 config integration** (untrusted-dropped/trusted-applies + canonical tokens +
+  comma-split; caution + unknown-dropped; the flagship untrusted-widen; `--json`), **1 run.rs e2e**
+  (`a_trusted_seccomp_relaxation_launches_a_working_cage` — the config→spec→`memfds(&policy)`→bwrap
+  thread a `build_spec` unit test cannot reach; **ran live 21s**). **933→ green unit + 4 config + the
+  e2e**, fmt/clippy `-D warnings` clean, **std-only** (no new dep — reuses `seccompiler`).
+  **Honest scope:** kernel *enforcement* teeth live in `seccomp.rs`'s real-cage tests (no base-tool
+  triggers a denied syscall distinguishably, so the run.rs e2e proves *threading + non-regression*,
+  not enforcement — named). Re-permitting mount/ns is **surface-reduction undone, not a boundary
+  breach** (cap-drop + single-uid userns still neuter a nested userns) and does **not** re-enable
+  nix's inner sandbox. Docs: new `configuration/seccomp.md` (grammar, cautions, per-app, why-not-a-
+  boundary) + `configuration/README.md` + top guide index + a relaxation note in
+  `concepts/enforcement.md`. **Deferred:** a typed one-shot `--seccomp` flag (the override path
+  currently ignores `[seccomp]`, fail-closed).
   **Cage naming — one `ops-<slug>` name across the scope, hostname, and `ops ls` (DONE 2026-07-05)**
   (`src/sandbox/naming.rs` [new] + `cgroup.rs` + `argv.rs` + `binds.rs` + `spec.rs` + `mod.rs` +
   `src/main.rs`): a cage had three opaque/undifferentiated names — the systemd scope was

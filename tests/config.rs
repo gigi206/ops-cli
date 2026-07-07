@@ -3095,3 +3095,114 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn an_untrusted_seccomp_relaxation_is_dropped_but_trusting_applies_it() {
+    // `[seccomp] allow` re-permits denied syscalls in the cage — a security field, so an untrusted
+    // project's relaxation is dropped (loosening the kernel-attack-surface control), and applied
+    // only once the project is trusted. Also exercises the input ergonomics: a comma-separated
+    // string, a separate entry, and a fine-grained `clone:newns` selector all resolve.
+    let fx = Fixture::new();
+    fx.write_project("[seccomp]\nallow = [\"ptrace,unshare\", \"clone:newns\"]\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("seccomp allow"),
+        "an untrusted seccomp relaxation must not be applied:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("ignoring `[seccomp]`"),
+        "a dropped seccomp table must be explained:\n{stderr}"
+    );
+
+    // Trust it → the relaxation applies, rendered as canonical, sorted tokens (the comma-split and
+    // the fine-grained selector both resolved) and tagged with the project layer.
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("seccomp allow: clone:newns, ptrace, unshare"),
+        "trusted seccomp tokens must render canonically:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(project)"),
+        "the seccomp origin must be tagged with its layer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_dangerous_seccomp_token_carries_a_caution_and_an_unknown_one_is_dropped() {
+    // The global config is trusted by location, so its `[seccomp]` applies with no trust step.
+    // `umount2` and a bare `clone` each reopen a real escape surface — accepted, but flagged with a
+    // caution; an unknown syscall name is dropped (fail-closed — it loosens nothing).
+    let fx = Fixture::new();
+    fx.write_global("[seccomp]\nallow = [\"umount2\", \"clone\", \"bogus_syscall\"]\n");
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("seccomp allow: clone, umount2"),
+        "the valid tokens must apply, the unknown one dropped:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("reopens") && stderr.contains("umount2"),
+        "a dangerous token must carry a caution:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("bogus_syscall") && stderr.contains("ignoring"),
+        "an unknown token must be dropped with a reason:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_global_apps_seccomp_relaxation_survives_an_untrusted_projects_widening() {
+    // The flagship property, for seccomp: a globally-declared app (a profile, trusted by location)
+    // keeps its relaxation, and an untrusted project cannot add a dangerous lift to it — so an
+    // agent can run *on* untrusted code without that code widening the app's syscall surface.
+    let fx = Fixture::new();
+    fx.write_profile("dbg", "cmd = \"dbg\"\n[seccomp]\nallow = [\"ptrace\"]\n");
+    // The untrusted project tries to widen the SAME app with `unshare`.
+    fx.write_project("[app.dbg.seccomp]\nallow = [\"unshare\"]\n");
+
+    let out = fx.run(&["config", "show", "--app", "dbg"]);
+    assert!(
+        out.status.success(),
+        "config show --app failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ptrace"),
+        "the trusted app relaxation must stand:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("unshare"),
+        "an untrusted project must not widen a trusted app's syscall surface:\n{stdout}"
+    );
+}
+
+#[test]
+fn config_json_carries_the_seccomp_relaxation() {
+    // The machine-readable model carries the resolved relaxation, like every other field.
+    let fx = Fixture::new();
+    fx.write_global("[seccomp]\nallow = [\"ptrace\", \"clone:newns\"]\n");
+    let out = fx.run(&["config", "show", "--json"]);
+    assert!(out.status.success(), "config --json should exit 0");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
+    let tokens: Vec<String> = doc["seccomp"]
+        .as_array()
+        .expect("seccomp is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tokens, vec!["clone:newns", "ptrace"], "{doc}");
+}

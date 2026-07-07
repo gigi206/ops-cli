@@ -2219,6 +2219,9 @@ fn build(
         &extra_binds,
         net_policy(&prep.cfg.network),
         &egress_contract,
+        // The trusted seccomp relaxation from the resolved (post-`merge_app`) config, so an app's
+        // `[seccomp] allow` union is in effect for `ops app`, exactly like its limits.
+        prep.cfg.seccomp.clone(),
         cmd,
     )
     .map_err(|e| {
@@ -2620,7 +2623,7 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
 /// bwrap is told to read. Seccomp is loaded on every launch path the same way the
 /// namespace hardening is emitted unconditionally by `to_argv`.
 fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
-    let memfds = super::seccomp::memfds()?;
+    let memfds = super::seccomp::memfds(&spec.seccomp)?;
     let mut argv = super::seccomp::argv_prefix(&memfds);
     argv.extend(super::argv::to_argv(spec));
     Ok((argv, memfds))
@@ -2664,7 +2667,7 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -
     // The seccomp filters are loaded into anonymous files *before* the fork so the
     // child inherits their descriptors; the parent holds `seccomp` alive through
     // `pump` so the descriptors stay open until bwrap has read them.
-    let seccomp = super::seccomp::memfds()?;
+    let seccomp = super::seccomp::memfds(&spec.seccomp)?;
 
     // Build the bwrap argv (seccomp prefix + the hardened spec), then wrap it in
     // the resource-limit scope: the program may become `systemd-run` with bwrap
@@ -3229,6 +3232,8 @@ mod tests {
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -3277,6 +3282,8 @@ mod tests {
             gui_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         }

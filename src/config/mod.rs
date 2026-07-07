@@ -532,6 +532,15 @@ pub(crate) struct Resolved {
     /// The per-field provenance of `limits`: which layer set each of the three, or `Default` for a
     /// field no config overrode. A display affordance for `ops config`.
     pub(crate) limits_origin: LimitsOrigin,
+    /// The trusted relaxation of the cage's mandatory seccomp denylist (the built-in denylist plus
+    /// any syscall a trusted `[seccomp] allow` re-permits). A security field, gated like
+    /// `network`/`limits` — an untrusted project may not relax it. The default (empty) is the full
+    /// mandatory denylist. The layering unions (a project adds to the global set), like `forward`.
+    pub(crate) seccomp: crate::sandbox::seccomp::SeccompPolicy,
+    /// Which layer supplied the seccomp relaxation — the highest-trust layer that lifted anything
+    /// (`Default` when neither config did), like `forward_origin`. A display affordance for
+    /// `ops config`; the launcher ignores it.
+    pub(crate) seccomp_origin: Provenance,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -597,6 +606,11 @@ pub(crate) struct ResolvedApp {
     /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
     /// means the app tunes nothing and inherits the baseline limits.
     pub(crate) limits: crate::sandbox::cgroup::Limits,
+    /// The app's own seccomp relaxation, set only from a trusted source (an untrusted project's app
+    /// `[seccomp]` is dropped, like its `network`/`limits`). Unions onto the baseline at
+    /// [`merge_app`]; empty means the app relaxes nothing and inherits the baseline relaxation. A
+    /// security field, gated like the baseline `[seccomp]`.
+    pub(crate) seccomp: crate::sandbox::seccomp::SeccompPolicy,
     /// The app's own host loopback forward ports, set only from a trusted source (an untrusted
     /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
     /// baseline's at [`merge_app`]; an empty vec means the app adds none and inherits the baseline
@@ -623,6 +637,9 @@ pub(crate) struct ResolvedApp {
     /// when the app declared none. The merged effective set is the app's own ∪ the baseline's;
     /// a port the app did not contribute is shown as inherited from the baseline.
     pub(crate) forward_origin: Provenance,
+    /// Which app layer (`Global`/`Project`) supplied the app's own seccomp relaxation, or `Default`
+    /// when the app declared none. The merged effective relaxation is the app's own ∪ the baseline's.
+    pub(crate) seccomp_origin: Provenance,
     pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `ops run`.
@@ -673,6 +690,10 @@ impl Resolved {
         // which holds because the untrusted contribution was dropped at resolve time).
         union_forward(&mut self.forward, app.forward);
         overlay_limits(&mut self.limits, app.limits);
+        // The app's seccomp relaxation unions onto the baseline's — an app adds lifts, never
+        // removes the trusted baseline's (the flagship "agent on untrusted code" property, which
+        // holds because the untrusted contribution was dropped at resolve time).
+        self.seccomp.union(&app.seccomp);
         // Drop the baseline secret-posture warning: it judged the *baseline* network, but the app's
         // posture re-decides injection just below — keeping it would let `ops app <name>` both inject
         // a credential and print "ignoring N HTTP-header secret(s)". The re-check re-emits it only if
@@ -755,10 +776,13 @@ impl Resolved {
             secret,
             forward,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
-            // launch-shaping and were noticed and dropped at collection time.
+            // launch-shaping and were noticed and dropped at collection time. A one-shot override
+            // does not relax the seccomp denylist — an override's `[seccomp]` is ignored (the
+            // fail-closed direction: a relaxation only ever comes from a trusted config file).
             nixpkgs: _,
             net: _,
             app: _,
+            seccomp: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -1117,6 +1141,15 @@ fn resolve(
     let mut limits = validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits);
     let mut limits_origin = LimitsOrigin::default();
     mark_limit_origins(&mut limits_origin, &limits, Provenance::Global);
+    // The seccomp relaxation is trusted by location at the global layer; a bad `allow` entry is
+    // dropped (warned) and the rest kept. A project's unions onto this, so the origin records
+    // `Global` only when this layer actually lifted something.
+    let mut seccomp = apply_seccomp(&mut warnings, GLOBAL_CONFIG, global.seccomp);
+    let mut seccomp_origin = if seccomp.is_empty() {
+        Provenance::Default
+    } else {
+        Provenance::Global
+    };
     // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
     // captured for the global hosts and as the base a trusted project may extend.
     let mut secret_defaults = SecretDefaults::default();
@@ -1268,6 +1301,24 @@ fn resolve(
                 ));
             }
         }
+        // `[seccomp]` is a security field — a trusted project may relax the denylist; an untrusted
+        // or changed one may not (loosening the kernel-attack-surface control). The relaxation
+        // unions onto the global set: a project adds lifts, never removes (the flagship property
+        // holds because the untrusted contribution is dropped here, before the union).
+        if let Some(raw) = proj.seccomp {
+            if trusted {
+                let project_seccomp = apply_seccomp(&mut warnings, PROJECT_CONFIG, Some(raw));
+                if !project_seccomp.is_empty() {
+                    seccomp_origin = Provenance::Project;
+                }
+                seccomp.union(&project_seccomp);
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `[seccomp]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // The `[secret]` section is a security field — a trusted project may inject
         // credentials (and extend the resolver defaults); an untrusted or changed one may
         // not (it would aim the user's secrets at a host of its choosing). The whole
@@ -1337,6 +1388,8 @@ fn resolve(
         forward_origin,
         limits,
         limits_origin,
+        seccomp,
+        seccomp_origin,
         secrets,
         declared_secrets,
         apps,
@@ -1457,6 +1510,46 @@ fn overlay_limits(base: &mut crate::sandbox::cgroup::Limits, over: crate::sandbo
     if over.tasks_max.is_some() {
         base.tasks_max = over.tasks_max;
     }
+}
+
+/// Resolve a `[seccomp] allow` table into a [`SeccompPolicy`]: split each string on commas, trim,
+/// and resolve each token against the mandatory denylist. A malformed or unknown entry is dropped
+/// with a warning (fail-closed — an unrecognized token loosens nothing); an entry that reopens a
+/// real escape surface is accepted but flagged with a caution. A collection field — drop-bad-entry,
+/// keep-the-rest — like `forward`/`binds`, not an all-or-nothing scalar. Called only from a layer
+/// already gated as trusted, so a bad entry warns for a relaxation that *is* being applied.
+fn apply_seccomp(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: Option<schema::RawSeccomp>,
+) -> crate::sandbox::seccomp::SeccompPolicy {
+    let mut policy = crate::sandbox::seccomp::SeccompPolicy::default();
+    let Some(raw) = raw else {
+        return policy;
+    };
+    for entry in &raw.allow {
+        for token in entry.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            match crate::sandbox::seccomp::resolve_allow(token) {
+                Ok((allow, caution)) => {
+                    policy.allow(allow);
+                    if let Some(c) = caution {
+                        warnings.push(format!(
+                            "{source}: `[seccomp] allow` includes `{token}`, which reopens {}",
+                            c.reopens()
+                        ));
+                    }
+                }
+                Err(reason) => warnings.push(format!(
+                    "{source}: ignoring `[seccomp] allow` entry `{token}` ({reason})"
+                )),
+            }
+        }
+    }
+    policy
 }
 
 /// Union `extra` ports into `base`, deduped and sorted. The `forward` model — a layer adds
@@ -1708,6 +1801,10 @@ fn resolve_app(
     // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
     // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
     let mut limits = crate::sandbox::cgroup::Limits::default();
+    // The app's own seccomp relaxation, accumulated like the limits: global by location, a trusted
+    // project unions, an untrusted one dropped. Empty means the app inherits the baseline's.
+    let mut seccomp = crate::sandbox::seccomp::SeccompPolicy::default();
+    let mut seccomp_origin = Provenance::Default;
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
@@ -1783,6 +1880,11 @@ fn resolve_app(
         let global_limits = validate_limits(&mut warnings, &source, app.limits);
         mark_limit_origins(&mut limits_origin, &global_limits, Provenance::Global);
         overlay_limits(&mut limits, global_limits);
+        let global_seccomp = apply_seccomp(&mut warnings, &source, app.seccomp);
+        if !global_seccomp.is_empty() {
+            seccomp_origin = Provenance::Global;
+        }
+        seccomp.union(&global_seccomp);
         if let Some(section) = app.secret {
             apply_app_secret(
                 &mut secrets,
@@ -1883,6 +1985,24 @@ fn resolve_app(
                 ));
             }
         }
+        // `[seccomp]` mirrors `[limits]`: a trusted project may relax the denylist for its own app
+        // or a trusted one; an untrusted project may not (loosening the kernel-attack-surface
+        // control). Dropping the untrusted layer here — before the union — is what keeps a global
+        // app's relaxation from being widened by an untrusted project.
+        if let Some(raw) = app.seccomp {
+            if trusted {
+                let project_seccomp = apply_seccomp(&mut warnings, &source, Some(raw));
+                if !project_seccomp.is_empty() {
+                    seccomp_origin = Provenance::Project;
+                }
+                seccomp.union(&project_seccomp);
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `[seccomp]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `forward` mirrors `network`/`gui`: a trusted project may add forward ports to its own
         // app or a trusted one; an untrusted project may not (opening a host port is an inbound
         // hole). The ports union onto the app's own set, so the project adds, never replaces.
@@ -1962,6 +2082,7 @@ fn resolve_app(
         network,
         gui,
         limits,
+        seccomp,
         forward,
         secrets,
         default_methods,
@@ -1969,6 +2090,7 @@ fn resolve_app(
         network_origin,
         gui_origin,
         forward_origin,
+        seccomp_origin,
         limits_origin,
         home_scope_origin,
         warnings,
@@ -4081,6 +4203,7 @@ mod tests {
             secret: None,
             app: BTreeMap::new(),
             limits: None,
+            seccomp: None,
             net: Default::default(),
         }
     }
@@ -4523,6 +4646,7 @@ mod tests {
             forward: None,
             secret: None,
             limits: None,
+            seccomp: None,
             home_scope: None,
         }
     }
@@ -5839,6 +5963,8 @@ mod tests {
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -5887,6 +6013,8 @@ mod tests {
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -5920,6 +6048,8 @@ mod tests {
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -5949,6 +6079,8 @@ mod tests {
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6069,6 +6201,8 @@ mod tests {
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6110,6 +6244,8 @@ mod tests {
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };

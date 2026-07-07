@@ -1303,6 +1303,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // Seccomp denylist relaxation — shown only when a trusted `[seccomp] allow` re-permits a
+    // syscall, so the default (full mandatory denylist) stays uncluttered. The tokens read as the
+    // canonical `allow` entries; the provenance names which layer relaxed the denylist.
+    if !view.seccomp.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}seccomp allow:{r} {} {dim}(syscalls re-permitted in the cage){r}{}",
+            view.seccomp.join(", "),
+            provenance_tag(view.seccomp_origin, pal)
+        );
+    }
+
     // Credentials the egress proxy injects — by destination and source locator, never the value.
     if !view.secrets.is_empty() {
         let _ = writeln!(
@@ -1507,6 +1519,10 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     .join(", ");
                 let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
             }
+            // The seccomp relaxation this overlay adds (its own allow tokens, not the merged set).
+            if !app.seccomp.is_empty() {
+                let _ = writeln!(o, "      {dim}seccomp allow:{r} {}", app.seccomp.join(", "));
+            }
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
             // under `--details` to each by destination and source, the same metadata the baseline
@@ -1685,6 +1701,19 @@ fn render_app_detail(
         let _ = writeln!(
             o,
             "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{forward_tag}"
+        );
+    }
+
+    // Effective seccomp relaxation — the app's own ∪ the baseline's. Shown even when empty so the
+    // inherited story is visible (a relaxation the app takes from the baseline reads as `inherited`).
+    let seccomp_tag = app_provenance_tag(view.seccomp_origin, pal);
+    if view.seccomp.is_empty() {
+        let _ = writeln!(o, "  {h}seccomp:{r} (mandatory denylist){seccomp_tag}");
+    } else {
+        let _ = writeln!(
+            o,
+            "  {h}seccomp:{r} allow {} {dim}(syscalls re-permitted){r}{seccomp_tag}",
+            view.seccomp.join(", ")
         );
     }
 
@@ -9219,6 +9248,8 @@ mod tests {
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -9652,6 +9683,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![],
@@ -9829,6 +9862,8 @@ mod tests {
             gui_origin: ProvenanceView::Inherited,
             forward: vec![],
             forward_origin: ProvenanceView::Inherited,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Inherited,
             limits: LimitsView {
                 memory_high: LimitView {
                     value: "70%".into(),
@@ -10003,6 +10038,7 @@ mod tests {
             network: None,
             gui: None,
             forward: vec![],
+            seccomp: vec![],
             limits,
             secrets: vec![],
             notes: vec![],
@@ -10087,6 +10123,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10107,6 +10145,7 @@ mod tests {
                 network: None,
                 gui: None,
                 forward: vec![],
+                seccomp: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10165,6 +10204,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10184,6 +10225,7 @@ mod tests {
                 }),
                 gui: None,
                 forward: vec![],
+                seccomp: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10244,6 +10286,7 @@ mod tests {
             network,
             gui,
             forward: vec![],
+            seccomp: vec![],
             limits: None,
             secrets: vec![],
             notes: vec![],
@@ -10272,6 +10315,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![
@@ -10330,6 +10375,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10342,6 +10389,7 @@ mod tests {
                 network: None,
                 gui: None,
                 forward: vec![],
+                seccomp: vec![],
                 limits: None,
                 secrets: vec![
                     SecretView {
@@ -10419,6 +10467,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10444,6 +10494,7 @@ mod tests {
                 network: None,
                 gui: None,
                 forward: vec![],
+                seccomp: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10508,6 +10559,8 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
+            seccomp: vec![],
+            seccomp_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10548,6 +10601,7 @@ mod tests {
                 network: None,
                 gui: None,
                 forward: vec![],
+                seccomp: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
