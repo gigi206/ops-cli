@@ -18,7 +18,7 @@ min_version = "2024.12.0"
 # required. Build with:
 #   mise exec -- cargo zigbuild --release --target x86_64-unknown-linux-musl
 zig                             = "latest"
-"ubi:rust-cross/cargo-zigbuild" = "latest"
+"github:rust-cross/cargo-zigbuild" = "latest"
 
 # ============================================================================
 # Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you
