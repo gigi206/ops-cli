@@ -112,38 +112,65 @@ fn print_dead(nix_store: &Path, store_dir: &Path) -> io::Result<Vec<String>> {
 }
 
 /// The summed size (bytes) of `paths` in `store_dir`'s store. Empty input is zero without
-/// invoking nix. `--query --size` prints one size per path; any unparsable line is ignored so a
-/// single odd line never derails the total.
+/// invoking nix.
+///
+/// `--query --size` prints one size per path in argv order and aborts at the *first* path it
+/// rejects as invalid — an interrupted build leaves residue in the store dir (a `<store-path>.lock`
+/// build lock, a `.chroot` build root) that `--gc --print-dead` reports yet which is not a
+/// registered store object, so it trips this. One such entry must not derail the whole collection,
+/// so a failing batch is not fatal: the sizes printed before the abort are summed, the single
+/// rejected path is skipped, and sizing resumes after it. The figure is only a report — `sweep`
+/// still deletes every dead entry regardless.
 fn total_size(nix_store: &Path, store_dir: &Path, paths: &[String]) -> io::Result<u64> {
-    if paths.is_empty() {
-        return Ok(0);
-    }
-    // Query in bounded batches: passing every dead path as one argv overflows the kernel's argv
+    // Query in bounded windows: passing every dead path as one argv overflows the kernel's argv
     // limit (E2BIG) on a large store, which would abort the whole GC (including `--prune`). Store
     // paths are ~100 bytes each, so a few thousand per call stays well under any ARG_MAX.
     const BATCH: usize = 2048;
     let mut total = 0u64;
-    for chunk in paths.chunks(BATCH) {
+    let mut i = 0;
+    while i < paths.len() {
+        let end = (i + BATCH).min(paths.len());
         let out = Command::new(nix_store)
             .env("NIX_REMOTE", "")
             .arg("--store")
             .arg(store_dir)
             .arg("--query")
             .arg("--size")
-            .args(chunk)
+            .args(&paths[i..end])
             .output()?;
-        if !out.status.success() {
-            return Err(io::Error::other(format!(
-                "nix-store --query --size failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+        let (bytes, consumed) = parse_size_batch(&String::from_utf8_lossy(&out.stdout));
+        total += bytes;
+        if out.status.success() {
+            i = end;
+        } else {
+            // nix sized the `consumed` leading paths, then rejected the next one. Skip that path
+            // (its size is unknowable and it is residue, not a real store object) and resume; the
+            // step is always at least one, so the loop terminates.
+            i += consumed + 1;
         }
-        total += String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.trim().parse::<u64>().ok())
-            .sum::<u64>();
     }
     Ok(total)
+}
+
+/// Fold one `--query --size` batch: sum the byte sizes it printed and count how many paths nix
+/// processed. `--query --size` prints one integer per path in argv order and stops at the first
+/// invalid path, so the line count is exactly the number of leading paths consumed — which locates
+/// the rejected path (the next one) when the batch failed. A non-integer line still counts as a
+/// consumed path but contributes no bytes, so a stray line never skews the resume offset.
+fn parse_size_batch(stdout: &str) -> (u64, usize) {
+    let mut bytes = 0u64;
+    let mut consumed = 0usize;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        consumed += 1;
+        if let Ok(size) = trimmed.parse::<u64>() {
+            bytes += size;
+        }
+    }
+    (bytes, consumed)
 }
 
 /// Delete every dead path in `store_dir`'s store.
@@ -581,6 +608,21 @@ mod tests {
         assert!(gcroots.join("ops-flake-hello").symlink_metadata().is_ok());
         assert!(gcroots.join("abcd-coreutils").symlink_metadata().is_ok());
         assert!(gcroots.join("auto").is_dir());
+    }
+
+    #[test]
+    fn parse_size_batch_sums_valid_and_locates_the_reject() {
+        // a fully-valid batch: every size summed, every path counted
+        assert_eq!(parse_size_batch("10\n20\n30\n"), (60, 3));
+        // nix aborted after one valid path (the leftover-lock case): the one size is summed and one
+        // path counted, so `total_size` skips the path right after it and resumes
+        assert_eq!(parse_size_batch("2208\n"), (2208, 1));
+        // an abort on the very first path prints nothing: zero summed, zero consumed → skip index 0
+        assert_eq!(parse_size_batch(""), (0, 0));
+        // a blank line is ignored entirely; a non-integer line still marks a consumed path but adds
+        // no bytes, keeping the skip offset aligned with nix's argv position
+        assert_eq!(parse_size_batch("5\n\n7\n"), (12, 2));
+        assert_eq!(parse_size_batch("5\ngarbage\n7\n"), (12, 3));
     }
 
     #[test]
