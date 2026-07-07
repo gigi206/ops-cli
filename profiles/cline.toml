@@ -67,6 +67,8 @@ allow = [
     #"{*} https://otel.cline.bot",
     # WorkOS device-authorization endpoint — Cline's account login flow.
     "{*} https://api.workos.com",
+    # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
+    #"{*} https://openrouter.ai",
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.

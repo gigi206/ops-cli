@@ -53,10 +53,17 @@ allow = [
   # an established one is flagged `ws` (that marker shows only on a successful `101` upgrade). Then
   # uncomment the line below and set it to that host.
   #"{WS} https://api.openai.com",
+  # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
+  #"{*} https://openrouter.ai",
 ]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the
-# cage. Provide it on the host as $ANTHROPIC_API_KEY (or a resolver).
+# cage. Provide it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver,
+# e.g. sops://secrets.yaml#openrouter). The in-cage placeholder lets the CLI start and
+# issue the request; the proxy strips it and substitutes the real key on the wire to
+# openrouter.ai. (For a direct provider add its host to `allow` above — e.g. a commented
+# `{*} https://openrouter.ai` — and keep this block; for Anthropic/OpenAI change the host,
+# header, and env var instead.)
 [env]
 #OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 

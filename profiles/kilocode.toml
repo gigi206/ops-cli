@@ -44,14 +44,18 @@ allow = [
   "{*} https://api.kilo.ai",
   #"{*} https://supermassive-black-hole.kiloapps.io",
   #"{*} https://us.i.posthog.com",
+  # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
+  #"{*} https://openrouter.ai",
 ]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage.
-# Provide it on the host as $ANTHROPIC_API_KEY (or point `from` at a resolver).
+# Provide it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.
+# sops://secrets.yaml#openrouter). The in-cage placeholder lets the CLI start and issue the
+# request; the proxy strips it and substitutes the real key on the wire to openrouter.ai.
 [env]
-#ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 
-#[secret."api.anthropic.com"]
-#from = "env://ANTHROPIC_API_KEY"
-#header = "x-api-key"
-#type = "raw"
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

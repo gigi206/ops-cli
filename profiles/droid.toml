@@ -70,4 +70,20 @@ allow = [
     "{GET,HEAD} https://docs.factory.ai",
     "{POST} https://github.com/Factory-AI/factory-plugins.git/git-upload-pack",
     #"{POST} telemetry.factory.ai",
+    # Uncomment for the direct-OpenRouter BYOK path below.
+    #"{*} https://openrouter.ai",
 ]
+
+# OPTIONAL direct-OpenRouter BYOK (commented). Droid's default is the Factory account above,
+# NOT a header-injected provider key — so this block does nothing on its own. It applies only
+# if you point Droid at OpenRouter directly via a `customModels` entry in ~/.factory/settings.json
+# (apiKey `${OPENROUTER_API_KEY}`) AND uncomment `openrouter.ai` in `allow`. Then the real key is
+# read on the HOST and injected by the egress proxy on the wire to openrouter.ai — never in the
+# cage; the in-cage placeholder just lets the request go out.
+[env]
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

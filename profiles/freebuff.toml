@@ -57,4 +57,21 @@ allow = [
   "{GET} https://freebuff.com",
   "{POST} https://freebuff.com/api/auth/cli/code",
   #"{POST} https://us.i.posthog.com/batch/"
+  # Uncomment only if you route freebuff to a direct OpenRouter endpoint (see the note below).
+  #"{*} https://openrouter.ai",
 ]
+
+# OPTIONAL direct-OpenRouter BYOK (commented). By default freebuff authenticates to a CODEBUFF
+# account and routes ALL model traffic through Codebuff's backend server-side — there is no
+# provider key to inject, so this block does nothing on its own and is NOT the shipped path.
+# It is here only for parity with the BYOK profiles: it takes effect solely if a freebuff
+# release lets you point it at OpenRouter directly (uncomment `openrouter.ai` in `allow` too).
+# The real key is then read on the HOST and injected by the egress proxy on the wire — never in
+# the cage.
+[env]
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
