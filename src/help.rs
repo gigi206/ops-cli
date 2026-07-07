@@ -150,12 +150,27 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app"],
-        synopsis: "ops app <name> [--detach] [override flags] [-- <args>...]",
+        synopsis: "ops app <name> [--detach] [--net-learn[=level] [-g|--local] [--dry-run]] \
+                   [override flags] [-- <args>...]",
         summary: "launch or manage named application profiles",
         options: &[
             (
                 "--detach",
                 "launch the app in the background as a session `ops ls`/`attach`/`stop` can see",
+            ),
+            (
+                "--net-learn[=domain|path|exact]",
+                "run under the app's real posture, then add the egress rules it was refused for \
+                 lack of one to the app's profile (default level `domain`)",
+            ),
+            (
+                "-g, --global / -l, --local",
+                "with --net-learn, write the learned rules to the global app profile / the project \
+                 config (default local)",
+            ),
+            (
+                "--dry-run",
+                "with --net-learn, print the rules that would be added without writing them",
             ),
             (
                 "--config <toml|@file>",
@@ -183,7 +198,22 @@ const PAGES: &[Page] = &[
             `ops app claude-code --net none` cuts the app's network for one run. Note that\n\
             overriding an app's network drops its read-by-default verb filter (an override posture is\n\
             all-verbs, like a Mode-A launch); scope it with `{GET,HEAD}` rules in a `--config`\n\
-            `[network]` if you need to keep it. See `ops help run` for the full precedence rules.",
+            `[network]` if you need to keep it. See `ops help run` for the full precedence rules.\n\n\
+            `--net-learn` discovers an app's egress needs: it runs the app under its own (unchanged)\n\
+            posture — nothing is opened, so a request the allowlist refuses stays refused — and turns\n\
+            each such refusal into the allow rule that would have admitted it, writing them to the\n\
+            app's profile (or, with `--dry-run`, only printing them). It needs a filtering posture\n\
+            (mode allow/deny/ask); a `shared`/`none` app logs no egress to learn from. Only a\n\
+            plain \"not allowed yet\" refusal is learned — a deliberate `deny` rule and a security\n\
+            block (SSRF, host-mismatch, an outbound secret) are never turned into a rule. Run it\n\
+            again after adding rules to catch a host only reachable once an earlier one is allowed.\n\
+            The level sets how wide each rule is: `domain` opens the whole host (`{*} https://host`),\n\
+            `path` its first path section (`{*} https://host/v1/*`), `exact` the one endpoint\n\
+            (`{POST} https://host/v1/chat`). It is foreground-only (not with `--detach`).\n\n\
+            The rules land in the project config by default (`--local`), or in the app's global\n\
+            profile with `-g` — which, for an app defined only inline in a project ops.toml, writes a\n\
+            partial apps/<name>.toml the inline table then shadows on load; prefer `-g` for an app\n\
+            that is already an imported profile.",
     },
     Page {
         path: &["search"],

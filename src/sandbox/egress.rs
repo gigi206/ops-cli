@@ -82,6 +82,19 @@ pub(crate) struct Egress {
     /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
     /// persists for `ops net stats` to aggregate after the session ends (cleared by `--reset`).
     stats: Option<Arc<super::egress_stats::EgressStats>>,
+    /// The live egress event ring, shared with the proxy and control threads. Held here so a
+    /// supervised launch can snapshot the run's decisions after the cage exits — the source
+    /// `ops app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
+    /// read handle.
+    log: Arc<super::control::LogRing>,
+}
+
+impl Egress {
+    /// A snapshot of every egress decision this session logged, newest last. Taken after the cage
+    /// exits (no more requests can arrive), it is the run's full record for `--net-learn`.
+    pub(crate) fn observed_events(&self) -> Vec<super::control::LogEvent> {
+        self.log.snapshot(None, None).events
+    }
 }
 
 impl Drop for Egress {
@@ -235,19 +248,23 @@ pub(crate) fn start(
     // denylist session too, not just `ask`. Only `ask` ever parks into the pending queue, but wiring
     // it unconditionally is harmless (a non-ask posture never parks), and the ring is always wired so
     // every proxy session has a live log.
+    // The event ring is created here, before the control block, so a clone can be kept on the guard
+    // for `--net-learn` to snapshot after the run — the control thread and the proxy get their own
+    // clones of the same `Arc`.
+    let log = Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP));
     let control_uds = {
         let control_uds = dir.join(format!("control-{pid}.sock"));
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
-        let log = Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP));
         ctx = ctx.with_control(pending.clone(), manual.clone());
         ctx = ctx.with_log(log.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `ops net pending`/`ops net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
+        let control_log = log.clone();
         std::thread::spawn(move || {
-            let _ = super::control::serve(control_listener, pending, manual, log);
+            let _ = super::control::serve(control_listener, pending, manual, control_log);
         });
         Some(control_uds)
     };
@@ -320,6 +337,7 @@ pub(crate) fn start(
             ca_file,
             control_uds,
             stats,
+            log,
         },
         Wiring { binds, env },
     ))

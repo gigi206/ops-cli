@@ -438,7 +438,7 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
 /// segment-prefix matching compares, so an encoded or dot-laden path cannot slip past a
 /// rule. (Single-level decoding — a double-encoded `%252f` stays literal, matching a
 /// server that decodes once.)
-fn canonical_segments(target: &str) -> Vec<String> {
+pub(crate) fn canonical_segments(target: &str) -> Vec<String> {
     let path = target.split('?').next().unwrap_or("");
     let decoded = percent_decode(path);
     let mut out: Vec<String> = Vec::new();

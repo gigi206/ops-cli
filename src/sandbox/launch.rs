@@ -430,25 +430,44 @@ fn redirect_to_log(log: &File) {
 /// locked-down posture as `ops run`; the overlay's security fields took effect only if their
 /// source was trusted (the global config or a trusted project), so launching an app on
 /// untrusted code is as safe as `ops run` there.
+/// The result of an `ops app <name>` launch: the exit code, plus — for a `--net-learn` run — the
+/// rules synthesized from the egress the run was refused. The caller (`app_cmd`) writes them to the
+/// chosen profile (or prints them under `--dry-run`); keeping the write in `main` keeps the trust
+/// gating and re-trust out of the sandbox module.
+pub(crate) struct AppOutcome {
+    pub(crate) code: ExitCode,
+    pub(crate) learned: Option<super::Synthesis>,
+}
+
+impl AppOutcome {
+    fn plain(code: ExitCode) -> Self {
+        AppOutcome {
+            code,
+            learned: None,
+        }
+    }
+}
+
 pub(crate) fn app(
     name: &str,
     detach: bool,
     extra: Vec<OsString>,
     ov: crate::config::Override,
-) -> ExitCode {
+    net_learn: Option<super::Granularity>,
+) -> AppOutcome {
     let mut prep = match prepare_with(&ov) {
         Ok(p) => p,
-        Err(code) => return code,
+        Err(code) => return AppOutcome::plain(code),
     };
     let Some(app) = prep.cfg.apps.remove(name) else {
         eprintln!("ops: no app named `{name}`.{}", available_apps(&prep.cfg));
-        return ExitCode::from(2);
+        return AppOutcome::plain(ExitCode::from(2));
     };
     if app.cmd.is_empty() {
         eprintln!(
             "ops: app `{name}` declares no command — add a `cmd` to its `[app.{name}]` table."
         );
-        return ExitCode::FAILURE;
+        return AppOutcome::plain(ExitCode::FAILURE);
     }
     // The argv and the home scope are owned by the app; read them before the overlay is folded
     // in (which moves the app but does not touch them). The scope keys this app's persistent
@@ -466,7 +485,45 @@ pub(crate) fn app(
     // The override is the authoritative final word — applied *after* the app overlay so a one-shot
     // `ops app <name> --config …`/`OPS_*` beats the app's own posture, not the other way round.
     if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
-        return code;
+        return AppOutcome::plain(code);
+    }
+
+    // SAFETY: `isatty` only inspects fd 0.
+    let interactive = !detach && unsafe { libc::isatty(0) } == 1;
+
+    // `--net-learn`: run the app under its real (unchanged) posture, capture the egress it was
+    // refused for lack of a rule, and hand the synthesized rules back for the caller to write. It is
+    // foreground-only (the parser refuses `--detach`) and needs a filtering posture — a `shared` or
+    // `none` app has no proxy logging egress, so there is nothing to learn.
+    if let Some(gran) = net_learn {
+        let policy = match &prep.cfg.network {
+            crate::config::NetworkPolicy::Allowlist(p) => p.clone(),
+            other => {
+                eprintln!(
+                    "ops: --net-learn needs a filtering network posture (mode allow/deny/ask); \
+                     app `{name}` has `{}` — nothing logs egress to learn from.",
+                    network_posture_name(other)
+                );
+                return AppOutcome::plain(ExitCode::from(2));
+            }
+        };
+        // A build failure (a provisioning error, a host that cannot sandbox) must NOT be reported as
+        // "nothing to learn": return it as a plain failure so its code propagates and the caller
+        // never enters the write path. Only a cage that actually ran yields events to learn from —
+        // an empty log from a real run (the app was refused nothing) is a genuine "no new rules".
+        let (code, events) =
+            match launch_foreground_learning(&prep, runtime, Kind::Run, cmd, interactive) {
+                Ok(v) => v,
+                Err(code) => return AppOutcome::plain(code),
+            };
+        // Subsume against the SAME effective policy the proxy enforced — the config allowlist unioned
+        // with the always-on built-in allow-set — so a built-in-allowed host is never re-proposed.
+        let effective = super::union_with_builtin(policy);
+        let learned = super::netlearn::synthesize(&events, &effective, gran);
+        return AppOutcome {
+            code,
+            learned: Some(learned),
+        };
     }
 
     // An interactive foreground launch (a real terminal on stdin) runs under the pty supervisor:
@@ -474,12 +531,66 @@ pub(crate) fn app(
     // (the same isolation `ops shell` uses — the real terminal stays unreachable). A detached
     // agent has no terminal, and a piped/non-tty invocation must not be handed one, so both keep
     // the exec-replace / supervised `NewSession` path.
-    // SAFETY: `isatty` only inspects fd 0.
-    if !detach && unsafe { libc::isatty(0) } == 1 {
+    let code = if interactive {
         launch_pty_supervised(&prep, runtime, Kind::Run, cmd)
     } else {
         launch(prep, runtime, Kind::Run, cmd, detach, name)
+    };
+    AppOutcome::plain(code)
+}
+
+/// The posture name for a `--net-learn` refusal message — the config vocabulary, not the internal
+/// `NetworkPolicy` variant.
+fn network_posture_name(network: &crate::config::NetworkPolicy) -> &'static str {
+    match network {
+        crate::config::NetworkPolicy::Shared => "shared",
+        crate::config::NetworkPolicy::Isolated => "none",
+        crate::config::NetworkPolicy::Allowlist(_) => "allowlist",
     }
+}
+
+/// Run an `ops app` launch in the foreground and return the egress it logged, for `--net-learn`.
+/// Interactive launches use the pty supervisor (a private controlling terminal, like `ops shell`);
+/// a non-tty one supervises directly. Either way the egress guard is held for the whole run, then
+/// its log is snapshotted before the guard is dropped — so the returned events are the run's full
+/// record. A `build()` failure is `Err(code)`, distinct from a clean run with no denials (`Ok` with
+/// an empty log): the caller must not treat a failed build as "nothing to learn".
+fn launch_foreground_learning(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+    kind: Kind,
+    cmd: Vec<OsString>,
+    interactive: bool,
+) -> Result<(ExitCode, Vec<super::control::LogEvent>), ExitCode> {
+    let (spec, guard) = match build(prep, runtime, cmd) {
+        Ok((s, g)) if interactive => (s.with_private_tty(), g),
+        Ok((s, g)) => (s, g),
+        Err(code) => return Err(code),
+    };
+
+    // A pty session unlinks its record on exit (RecordGuard); a supervised one persists it
+    // (liveness-pruned), matching `launch_pty_supervised` and `launch_foreground` respectively.
+    let record = register(prep.layout.data_dir(), &spec, kind, runtime);
+    let _record = interactive.then(|| record.map(RecordGuard::new));
+
+    let code = if interactive {
+        match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
+            Ok(c) => ExitCode::from(c as u8),
+            Err(e) => {
+                eprintln!("ops: sandbox session failed: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        run_supervised(&prep.bwrap, &spec, &prep.cfg.limits)
+    };
+
+    let events = guard
+        .as_ref()
+        .map(LaunchGuard::observed_events)
+        .unwrap_or_default();
+    drop(guard);
+    Ok((code, events))
 }
 
 /// A suffix for the "no such app" error: " (available: a, b)" listing the configured app
@@ -1663,6 +1774,18 @@ fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<
 pub(crate) struct LaunchGuard {
     pub(crate) egress: Option<egress::Egress>,
     pub(crate) forward: Option<forward::Forwarder>,
+}
+
+impl LaunchGuard {
+    /// The egress decisions this launch logged, or empty when there is no filtering proxy (a
+    /// `shared`/`none` posture, or a forward-only guard). Snapshotted after the run for
+    /// `--net-learn`.
+    fn observed_events(&self) -> Vec<super::control::LogEvent> {
+        self.egress
+            .as_ref()
+            .map(|e| e.observed_events())
+            .unwrap_or_default()
+    }
 }
 
 impl Drop for LaunchGuard {

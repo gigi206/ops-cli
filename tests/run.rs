@@ -1206,6 +1206,112 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     );
 }
 
+#[test]
+fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
+    // `ops app <name> --net-learn` end to end through the real binary: an app under a `deny`
+    // allowlist runs a command that reaches a host it has no rule for; the proxy refuses it
+    // (`denied-default`) and logs it; net-learn snapshots that log after the run, synthesizes the
+    // allow rule that would admit the host, and (a) prints it under `--dry-run` and (b) writes it to
+    // the project config on a real run — which the trust re-gate then re-trusts. Teeth: the refused
+    // host (`example.com`) must appear as a `{*} https://…` rule the run never had, proving the whole
+    // chain (empty-netns forwarder → MITM proxy → verdict logged → teardown snapshot → synthesis).
+    // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("netlearn-proj");
+    let data = TmpDir::new("netlearn-data");
+    let state = TmpDir::new("netlearn-state");
+    // Baseline `deny` allowlist (allow only the cache, so provisioning works); an inline app whose
+    // command reaches a host the allowlist does not cover. `curl` is in the base toolset.
+    let original_config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
+         [app.probe]\ncmd = [\"curl\", \"-sS\", \"-m\", \"20\", \"-o\", \"/dev/null\", \
+         \"https://example.com\"]\n";
+    std::fs::write(project.path().join(".ops.toml"), original_config).unwrap();
+
+    // capability probe (also seeds the project store, so a later egress failure is a real fault
+    // rather than a cold cage).
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping net-learn e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping net-learn e2e: the binary cache is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // DRY RUN: the refused host is synthesized into a domain rule and only printed — nothing written.
+    let dry = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "probe", "--net-learn=domain", "--dry-run"],
+    );
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        dry.status.success(),
+        "net-learn --dry-run should succeed regardless of the agent's exit: {dry_out}"
+    );
+    assert!(
+        dry_out.contains("{*} https://example.com"),
+        "net-learn --dry-run must synthesize the refused host's rule: {dry_out}"
+    );
+    // A dry run writes nothing: the config is byte-identical to what we wrote (the app's `cmd`
+    // already names the host, so a substring check would be a false positive — compare the whole).
+    let cfg_after_dry = std::fs::read_to_string(project.path().join(".ops.toml")).unwrap();
+    assert_eq!(
+        cfg_after_dry, original_config,
+        "a dry run must not modify the config"
+    );
+
+    // REAL WRITE (local scope): the same rule is persisted to the project config for app `probe` and
+    // the project is re-trusted. The write path is `ops net allow`'s, so this proves net-learn wires
+    // into it correctly (the file gains the rule under the app's table).
+    let write = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "probe", "--net-learn=domain", "--local"],
+    );
+    let write_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&write.stdout),
+        String::from_utf8_lossy(&write.stderr)
+    );
+    assert!(
+        write.status.success(),
+        "net-learn write should succeed: {write_out}"
+    );
+    let cfg_after = std::fs::read_to_string(project.path().join(".ops.toml")).unwrap();
+    assert_ne!(
+        cfg_after, original_config,
+        "the write must change the config: {cfg_after}"
+    );
+    // The rule lands in the app's network allow list — an `allow`/rule line naming the host, beyond
+    // the app's `cmd` that already mentioned it.
+    assert!(
+        cfg_after.matches("example.com").count() >= 2,
+        "the learned allow rule must be written alongside the app's cmd: {cfg_after}"
+    );
+}
+
 /// Poll `127.0.0.1:<port>` from the host until a read returns a body containing `marker`, or time
 /// out. Returns the matching body, or `None` on timeout (a refused connect, or the marker never
 /// arriving). Used by the forward e2e to wait for the in-cage server to come up and the forwarder

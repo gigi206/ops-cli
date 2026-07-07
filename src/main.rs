@@ -2588,15 +2588,85 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         // background as a session `ops ls`/`attach`/`stop` can see. Tokens after a `--` are passed
         // through to the app's command (see `parse_app_launch`).
         _ => match parse_app_launch(&args) {
-            Ok((name, detach, extra, cli)) => {
-                let ov = match build_override(cli) {
+            Ok(launch) => {
+                let ov = match build_override(launch.cli) {
                     Ok(ov) => ov,
                     Err(code) => return code,
                 };
-                sandbox::app(&name, detach, extra, ov)
+                let outcome = sandbox::app(
+                    &launch.name,
+                    launch.detach,
+                    launch.tail,
+                    ov,
+                    launch.net_learn.as_ref().map(|nl| nl.gran),
+                );
+                match (outcome.learned, launch.net_learn) {
+                    (Some(synth), Some(nl)) => finish_net_learn(&launch.name, synth, &nl),
+                    _ => outcome.code,
+                }
             }
             Err(code) => code,
         },
+    }
+}
+
+/// Apply the rules `ops app <name> --net-learn` synthesized from the run: surface the notes (nothing
+/// is dropped silently), then either preview the diff (`--dry-run`) or write each rule to the chosen
+/// profile. The exit code reflects the *learning* outcome, not the agent's exit — a `--net-learn` run
+/// is expected to fail hosts it lacks rules for, so its non-zero exit is not this command's failure;
+/// only a write error is.
+fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> ExitCode {
+    use config::manage::EgressList;
+    for note in &synth.notes {
+        diag::warn(note);
+    }
+    if synth.rules.is_empty() {
+        println!(
+            "ops net-learn: no new egress rules — app `{name}` was refused nothing it lacked a rule for."
+        );
+        return ExitCode::SUCCESS;
+    }
+    let cwd = match config_cwd() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    // Resolve the human target once (the file the rules land in), shared by the preview and the write
+    // messages so they cannot disagree about where the rules go.
+    let target = match egress_write_target(&nl.scope, Some(name), &cwd) {
+        Ok((_, _, target)) => target,
+        Err((code, msg)) => {
+            eprintln!("ops net-learn: {msg}");
+            return ExitCode::from(code);
+        }
+    };
+    if nl.dry_run {
+        println!(
+            "ops net-learn ({}): {} rule(s) would be added to {target} (dry run — nothing written):",
+            nl.gran.as_str(),
+            synth.rules.len()
+        );
+        for rule in &synth.rules {
+            println!("  allow {rule}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    // Write each rule through the shared persister, so a project write is trust-gated and re-trusted
+    // exactly like `ops net allow`. One rule per call (each re-trusts a gated project write); a batch
+    // writer is a future refinement.
+    let mut failed = false;
+    for rule in &synth.rules {
+        match persist_egress_rule(EgressList::Allow, rule, &nl.scope, Some(name), &cwd) {
+            Ok(msg) => println!("{msg}"),
+            Err((_, msg)) => {
+                eprintln!("ops net-learn: {msg}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -2616,9 +2686,8 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
 /// too, in any order with the name and `--detach`; the collected values are returned for the caller
 /// to build the override (kept out of this pure parser, which reads no environment). The head is
 /// parsed as a mutable queue so a value-taking flag can pull its argument.
-fn parse_app_launch(
-    args: &[OsString],
-) -> Result<(String, bool, Vec<OsString>, config::CliOverrides), ExitCode> {
+fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
+    use config::manage::Scope;
     let (mut head, tail): (Vec<OsString>, Vec<OsString>) = match args.iter().position(|a| a == "--")
     {
         Some(i) => (args[..i].to_vec(), args[i + 1..].to_vec()),
@@ -2627,6 +2696,12 @@ fn parse_app_launch(
     let mut detach = false;
     let mut name: Option<String> = None;
     let mut cli = config::CliOverrides::default();
+    // `--net-learn` state: the granularity (once seen), the write scope, and whether to only preview.
+    // The scope/`--dry-run` flags are meaningful only with `--net-learn`, enforced after the loop.
+    let mut learn_gran: Option<sandbox::Granularity> = None;
+    let mut scope = Scope::Local;
+    let mut scope_seen = false;
+    let mut dry_run = false;
     while !head.is_empty() {
         // Decide on the leading token, then act — the match ends the immutable borrow so a
         // value-taking flag can mutate the queue.
@@ -2640,6 +2715,36 @@ fn parse_app_launch(
         match flag_name(&raw) {
             "--detach" => {
                 detach = true;
+                head.remove(0);
+            }
+            // `--net-learn[=domain|path|exact]`: the value after `=` picks the granularity; a bare
+            // flag is the widest, `domain`.
+            "--net-learn" => {
+                let gran = match raw.split_once('=') {
+                    Some((_, value)) => match sandbox::Granularity::parse(value) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("ops: {e}");
+                            return Err(ExitCode::from(2));
+                        }
+                    },
+                    None => sandbox::Granularity::default(),
+                };
+                learn_gran = Some(gran);
+                head.remove(0);
+            }
+            "--dry-run" => {
+                dry_run = true;
+                head.remove(0);
+            }
+            "--global" | "-g" => {
+                scope = Scope::Global;
+                scope_seen = true;
+                head.remove(0);
+            }
+            "--local" | "-l" => {
+                scope = Scope::Local;
+                scope_seen = true;
                 head.remove(0);
             }
             // A one-shot override flag, an unknown flag, or the app name.
@@ -2669,7 +2774,49 @@ fn parse_app_launch(
         eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
         return Err(ExitCode::from(2));
     };
-    Ok((name, detach, tail, cli))
+    // `--net-learn` reviews and writes rules in the foreground; `--detach` has no session to observe.
+    if learn_gran.is_some() && detach {
+        eprintln!(
+            "ops: --net-learn cannot be combined with --detach (it observes a foreground run)."
+        );
+        return Err(ExitCode::from(2));
+    }
+    // The write scope and `--dry-run` only shape where `--net-learn` puts its rules; refuse them on a
+    // plain launch rather than silently ignoring a flag the user expected to matter.
+    if learn_gran.is_none() && (scope_seen || dry_run) {
+        eprintln!("ops: --global/--local/--dry-run apply only with --net-learn.");
+        return Err(ExitCode::from(2));
+    }
+    let net_learn = learn_gran.map(|gran| NetLearn {
+        gran,
+        scope,
+        dry_run,
+    });
+    Ok(AppLaunch {
+        name,
+        detach,
+        tail,
+        cli,
+        net_learn,
+    })
+}
+
+/// The parsed launch form of `ops app`: the app name, `--detach`, the passthrough args after `--`,
+/// the one-shot overrides, and the optional `--net-learn` intent.
+struct AppLaunch {
+    name: String,
+    detach: bool,
+    tail: Vec<OsString>,
+    cli: config::CliOverrides,
+    net_learn: Option<NetLearn>,
+}
+
+/// The `--net-learn` intent: how wide to synthesize rules, which profile to write them to, and
+/// whether to only preview the diff.
+struct NetLearn {
+    gran: sandbox::Granularity,
+    scope: config::manage::Scope,
+    dry_run: bool,
 }
 
 /// The import confirmation: `imported` in green over the app name and destination, the granted
@@ -8634,38 +8781,41 @@ mod tests {
         use std::ffi::OsString;
         let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
 
-        // A bare name: no detach, no passthrough, no override.
-        let (name, detach, extra, cli) = parse_app_launch(&v(&["claude"])).unwrap();
-        assert_eq!((name.as_str(), detach), ("claude", false));
-        assert!(extra.is_empty() && cli.config.is_empty() && cli.env.is_empty());
+        // A bare name: no detach, no passthrough, no override, no net-learn.
+        let a = parse_app_launch(&v(&["claude"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("claude", false));
+        assert!(a.tail.is_empty() && a.cli.config.is_empty() && a.cli.env.is_empty());
+        assert!(a.net_learn.is_none());
 
         // `--detach` before the (absent) `--` sets the flag.
-        let (name, detach, extra, ..) = parse_app_launch(&v(&["claude", "--detach"])).unwrap();
-        assert_eq!((name.as_str(), detach), ("claude", true));
-        assert!(extra.is_empty());
+        let a = parse_app_launch(&v(&["claude", "--detach"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("claude", true));
+        assert!(a.tail.is_empty());
 
         // `--` separates ops's args from the passthrough tail, appended verbatim.
-        let (name, detach, extra, ..) = parse_app_launch(&v(&["claude", "--", "-c"])).unwrap();
-        assert_eq!((name.as_str(), detach), ("claude", false));
-        assert_eq!(extra, v(&["-c"]));
+        let a = parse_app_launch(&v(&["claude", "--", "-c"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("claude", false));
+        assert_eq!(a.tail, v(&["-c"]));
 
         // A flag before `--` is ops's; the same token after `--` is the program's (passthrough).
-        let (name, detach, extra, ..) =
-            parse_app_launch(&v(&["claude", "--detach", "--", "-c", "--foo"])).unwrap();
-        assert_eq!((name.as_str(), detach), ("claude", true));
-        assert_eq!(extra, v(&["-c", "--foo"]));
-        let (_, detach, extra, ..) = parse_app_launch(&v(&["claude", "--", "--detach"])).unwrap();
-        assert!(!detach, "`--detach` after `--` is the program's, not ops's");
-        assert_eq!(extra, v(&["--detach"]));
+        let a = parse_app_launch(&v(&["claude", "--detach", "--", "-c", "--foo"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("claude", true));
+        assert_eq!(a.tail, v(&["-c", "--foo"]));
+        let a = parse_app_launch(&v(&["claude", "--", "--detach"])).unwrap();
+        assert!(
+            !a.detach,
+            "`--detach` after `--` is the program's, not ops's"
+        );
+        assert_eq!(a.tail, v(&["--detach"]));
 
         // A trailing `--` with nothing after it is an empty tail, not an error.
-        let (name, _, extra, ..) = parse_app_launch(&v(&["claude", "--"])).unwrap();
-        assert_eq!(name, "claude");
-        assert!(extra.is_empty());
+        let a = parse_app_launch(&v(&["claude", "--"])).unwrap();
+        assert_eq!(a.name, "claude");
+        assert!(a.tail.is_empty());
 
         // A one-shot override is collected from the head, in any order with the name/`--detach`, and
         // stops at `--` (a later `--config` after `--` is the program's argument, not ops's).
-        let (name, _, extra, cli) = parse_app_launch(&v(&[
+        let a = parse_app_launch(&v(&[
             "--env",
             "FOO=bar",
             "claude",
@@ -8676,17 +8826,34 @@ mod tests {
             "x",
         ]))
         .unwrap();
-        assert_eq!(name, "claude");
-        assert_eq!(cli.config, vec!["network=\"none\"".to_string()]);
-        assert_eq!(cli.env, vec!["FOO=bar".to_string()]);
-        assert_eq!(extra, v(&["--config", "x"]));
+        assert_eq!(a.name, "claude");
+        assert_eq!(a.cli.config, vec!["network=\"none\"".to_string()]);
+        assert_eq!(a.cli.env, vec!["FOO=bar".to_string()]);
+        assert_eq!(a.tail, v(&["--config", "x"]));
         // The `--flag=value` inline form is accepted too.
-        let (_, _, _, cli) =
-            parse_app_launch(&v(&["claude", "--config=gui=\"wayland\"", "--env=A=1"])).unwrap();
-        assert_eq!(cli.config, vec!["gui=\"wayland\"".to_string()]);
-        assert_eq!(cli.env, vec!["A=1".to_string()]);
+        let a = parse_app_launch(&v(&["claude", "--config=gui=\"wayland\"", "--env=A=1"])).unwrap();
+        assert_eq!(a.cli.config, vec!["gui=\"wayland\"".to_string()]);
+        assert_eq!(a.cli.env, vec!["A=1".to_string()]);
+
+        // `--net-learn`: bare is `domain` (the default), the local scope, no dry-run.
+        let a = parse_app_launch(&v(&["claude", "--net-learn"])).unwrap();
+        let nl = a.net_learn.expect("net-learn set");
+        assert_eq!(nl.gran, sandbox::Granularity::Domain);
+        assert!(matches!(nl.scope, config::manage::Scope::Local) && !nl.dry_run);
+        // `=level`, `--dry-run`, and `-g` compose, in any order with the name.
+        let a = parse_app_launch(&v(&["--net-learn=path", "claude", "--dry-run", "-g"])).unwrap();
+        let nl = a.net_learn.expect("net-learn set");
+        assert_eq!(nl.gran, sandbox::Granularity::Path);
+        assert!(matches!(nl.scope, config::manage::Scope::Global) && nl.dry_run);
+        // A bad granularity, `--net-learn` with `--detach`, and a scope/`--dry-run` without
+        // `--net-learn` are each usage errors (never a silently-ignored flag).
+        assert!(parse_app_launch(&v(&["claude", "--net-learn=subtree"])).is_err());
+        assert!(parse_app_launch(&v(&["claude", "--net-learn", "--detach"])).is_err());
+        assert!(parse_app_launch(&v(&["claude", "--dry-run"])).is_err());
+        assert!(parse_app_launch(&v(&["claude", "-g"])).is_err());
+
         // The typed security flags are collected into their own fields, in any order with the name.
-        let (name, _, _, cli) = parse_app_launch(&v(&[
+        let a = parse_app_launch(&v(&[
             "--net",
             "none",
             "claude",
@@ -8704,14 +8871,14 @@ mod tests {
             "hello=nix:hello",
         ]))
         .unwrap();
-        assert_eq!(name, "claude");
-        assert_eq!(cli.net, vec!["none".to_string()]);
-        assert_eq!(cli.gui, vec!["wayland".to_string()]);
-        assert_eq!(cli.nixpkgs, vec!["nixos-23.11".to_string()]);
-        assert_eq!(cli.binds, vec!["/data:rw".to_string()]);
-        assert_eq!(cli.forward, vec!["1455".to_string()]);
-        assert_eq!(cli.limits, vec!["tasks_max=4096".to_string()]);
-        assert_eq!(cli.packages, vec!["hello=nix:hello".to_string()]);
+        assert_eq!(a.name, "claude");
+        assert_eq!(a.cli.net, vec!["none".to_string()]);
+        assert_eq!(a.cli.gui, vec!["wayland".to_string()]);
+        assert_eq!(a.cli.nixpkgs, vec!["nixos-23.11".to_string()]);
+        assert_eq!(a.cli.binds, vec!["/data:rw".to_string()]);
+        assert_eq!(a.cli.forward, vec!["1455".to_string()]);
+        assert_eq!(a.cli.limits, vec!["tasks_max=4096".to_string()]);
+        assert_eq!(a.cli.packages, vec!["hello=nix:hello".to_string()]);
 
         // Errors: a second name, an unknown flag, no name at all, `--` with no name before it, and a
         // value-taking flag with no value.
