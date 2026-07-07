@@ -20,17 +20,30 @@ opencode = "mise:opencode"
 
 [network]
 mode = "deny"
-# api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
-# and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
+# opencode.ai: the opencode gateway ("Zen", e.g. `opencode.ai/zen/v1/chat/completions`) plus auth and
+# the config/theme schemas — opened to every verb with `{*}` (an app is read-by-default, and the CLI
+# POSTs completions through the gateway). For a DIRECT provider instead of the gateway, add its host
+# here (`{*} https://api.anthropic.com` for Anthropic, `{*} https://api.openai.com` for OpenAI) and
+# fill the [secret] block below. models.dev: the model catalogue, a read-only fetch. registry.npmjs.org:
+# equipping opencode via mise.
 allow = [
   "{GET} https://models.dev",
   "{GET} https://registry.npmjs.org",
   "{*} https://opencode.ai",
-  # opencode opens a WebSocket to its service. A WebSocket is a distinct capability a plain `{*}`
-  # does NOT grant (a bidirectional, uninspected channel) — it must be named explicitly. If opencode
-  # still logs "Falling back from WebSockets to HTTPS", `ops net logs -a opencode` shows the refused
-  # WS host (flagged `ws`, reason `denied-method`); move this `{WS}` grant to that host.
-  "{WS} https://opencode.ai",
+  # /share syncs a session to opencode's servers on demand (the `/share` command), by HTTPS POST — not
+  # a WebSocket. Uncomment to allow sharing.
+  #"{*} https://opncd.ai",
+  # opencode streams completions over HTTPS (SSE), NOT a WebSocket, so the default posture
+  # (Anthropic, or a model routed through the opencode gateway) needs no `{WS}` grant — and it
+  # never opens a WebSocket to `opencode.ai`. A WebSocket is opened only by the OpenAI "Responses"
+  # transport, and it targets the OpenAI provider's OWN base host: `api.openai.com` for a direct
+  # key, or your gateway host if you route OpenAI through one. A WebSocket is a distinct capability
+  # a plain `{*}` does NOT grant (a bidirectional, uninspected channel), so it must be named with
+  # `{WS}`. To pin the exact host: run `ops net logs -a opencode` while opencode runs and look for a
+  # `WS` row — a refused one reads `deny … WS … (denied-default|denied-method)` with NO `ws` marker;
+  # an established one is flagged `ws` (that marker shows only on a successful `101` upgrade). Then
+  # uncomment the line below and set it to that host.
+  #"{WS} https://api.openai.com",
 ]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the
