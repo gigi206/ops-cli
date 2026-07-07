@@ -15,10 +15,10 @@ cmd = "claude"
 # security field, honored only because this profile lives in your trusted config dir;
 # `mode = "rw"` lets the caged claude write back to these host files (login refresh,
 # history, project state).
-binds = [
-    { path = "~/.claude", mode = "rw" },
-    { path = "~/.claude.json", mode = "rw" },
-]
+#binds = [
+#    { path = "~/.claude", mode = "rw" },
+#    { path = "~/.claude.json", mode = "rw" },
+#]
 
 [packages]
 claude-code = "mise:aqua:anthropics/claude-code"
@@ -50,12 +50,12 @@ mode = "deny"
 #     "*.datadoghq.com:*",  # Datadog telemetry / operational logs
 # ]
 allow = [
-    "{*} https://api.anthropic.com:443",
-    "{*} https://platform.claude.com:443",
-    "{GET,HEAD} https://downloads.claude.ai:443",
-    "{*} https://mcp-proxy.anthropic.com:443",
-    "{*} console.anthropic.com:443",
-    "{GET,HEAD} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
+    "{*} https://api.anthropic.com",
+    "{*} https://platform.claude.com",
+    "{GET} https://downloads.claude.ai",
+    "{*} https://mcp-proxy.anthropic.com",
+    "{*} https://console.anthropic.com",
+    "{GET} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
 # BYOK (API-key auth) is commented out below, so this profile ships with no baked-in credential —

@@ -41,4 +41,11 @@ mode = "deny"
 # further runtime host the proxy reports on first real use.
 # An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/REST POSTs),
 # so each is opened to all verbs with `{*}`.
-allow = ["{*} https://registry.npmjs.org", "{*} https://codebuff.com", "{*} https://www.codebuff.com"]
+allow = [
+  "{GET} https://registry.npmjs.org",
+  "{GET} https://www.codebuff.com",
+  "{*} https://www.codebuff.com/api/*",
+  "{GET} https://freebuff.com",
+  "{POST} https://freebuff.com/api/auth/cli/code",
+  #"{POST} https://us.i.posthog.com/batch/"
+]

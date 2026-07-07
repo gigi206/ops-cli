@@ -21,10 +21,9 @@
 # type "bearer"). Cline reads ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY directly.
 #
 # Cline stores its config + credentials under ~/.cline in the app's persistent isolated home.
-# (A benign `hostname: command not found` may print — Cline probes the host name, which the
-# hermetic cage does not carry; it is harmless and the agent runs regardless.) If a request is
-# blocked, the proxy reports the host it refused — add it to `allow` (or check ahead with
-# `ops test net <url>`).
+# (Cline probes the host name at startup; `hostname` is declared in `[packages]` below since the
+# hermetic cage ships none.) If a request is blocked, the proxy reports the host it refused —
+# add it to `allow` (or check ahead with `ops test net <url>`).
 cmd = "cline"
 
 [packages]
@@ -34,6 +33,9 @@ cmd = "cline"
 # by location once imported.
 nodejs = "nix:nodejs"
 cline = "mise:npm:cline"
+# Cline probes the host name at startup; the hermetic cage ships no `hostname`,
+# so provide it to avoid the `hostname: command not found` noise.
+hostname = "nix:hostname"
 
 # An app is read-by-default ({GET,HEAD}); these are write hosts (install POSTs, API POSTs), so
 # each is opened to all verbs with `{*}`.
@@ -41,24 +43,28 @@ cline = "mise:npm:cline"
 mode = "deny"
 allow = [
     # Install: the npm package, its dependencies, and the platform binary (an optional dep).
-    "{*} https://registry.npmjs.org",
-    # Runtime: the LLM provider — OpenRouter, this template's BYOK endpoint.
-    "{*} https://openrouter.ai",
+    "{GET} https://registry.npmjs.org/cline/latest",
     # Runtime: Cline's backend/account control plane and its telemetry endpoint. Telemetry can
     # be turned off in Cline's settings; keep `data.cline.bot` here (or deny it explicitly) to
     # avoid silent drops. Cline publishes no exhaustive host list — if a real run is refused a
     # host, the proxy names it; add it here.
     "{*} https://api.cline.bot",
     "{*} https://data.cline.bot",
+    # A third-party model catalogue Cline fetches to suggest models, and Cline's
+    # OpenTelemetry telemetry sink — both observed on a live run.
+    "{GET} https://models.dev",
+    #"{*} https://otel.cline.bot",
+    # WorkOS device-authorization endpoint — Cline's account login flow.
+    "{*} https://api.workos.com",
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.
 # The in-cage placeholder lets Cline start and issue the request; the proxy strips it and
 # substitutes the real key on the wire to openrouter.ai.
 [env]
-OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 
-[secret."openrouter.ai"]
-from = "env://OPENROUTER_API_KEY"
-header = "Authorization"
-type = "bearer"
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
