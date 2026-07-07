@@ -42,8 +42,11 @@ hostname = "nix:hostname"
 [network]
 mode = "deny"
 allow = [
-    # Install: the npm package, its dependencies, and the platform binary (an optional dep).
-    "{GET} https://registry.npmjs.org/cline/latest",
+    # Install: the packument (`npm view`/version resolution hits `/cline`, as does `ops upgrade`),
+    # the tarball (`/cline/-/…`), and the platform binary (an optional dependency published at its
+    # own top-level path) — npm spreads these across sibling paths, so the registry host is opened
+    # read-only as a whole (like the other npm-backed profiles), not path-scoped.
+    "{GET} https://registry.npmjs.org",
     # Runtime: Cline's backend/account control plane and its telemetry endpoint. Telemetry can
     # be turned off in Cline's settings; keep `data.cline.bot` here (or deny it explicitly) to
     # avoid silent drops. Cline publishes no exhaustive host list — if a real run is refused a
