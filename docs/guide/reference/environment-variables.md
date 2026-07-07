@@ -71,6 +71,20 @@ trust the egress proxy's per-session CA. These are managed by `ops`; a trusted
 [`env`](../configuration/env.md) can override a cage variable, but the loader-control and
 proxy-control keys are on the [untrusted-only denylist](../configuration/env.md#the-reserved-key-denylist-untrusted-only).
 
+## Tool-behavior variables (in-cage, via `env`)
+
+A trusted [`env`](../configuration/env.md) entry can also tune a tool `ops` runs in the
+cage. The one worth knowing:
+
+| Variable | Effect |
+|---|---|
+| `MISE_MINIMUM_RELEASE_AGE` | overrides mise's built-in 24 h fresh-release hold; `"0"` installs the newest upstream release immediately. See [Upgrading toolchains](../housekeeping/upgrade.md#installing-the-newest-release-immediately). |
+
+Set it in the **global** config to apply to every app — edit `ops/ops.toml` or run
+`ops config set --global env.MISE_MINIMUM_RELEASE_AGE 0` (`--local` for one project). A
+host `export` does **not** reach the cage, and `ops upgrade` takes no override flags — a
+config `env` entry is the only channel.
+
 ## Credential variables (host, user-defined)
 
 An app [profile](../apps/catalog.md) references a provider key by

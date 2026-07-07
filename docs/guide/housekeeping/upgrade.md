@@ -60,6 +60,54 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
 - **`flake:`** — re-pins each declared flake ref (`nix flake metadata`) and rewrites
   `flake-packages.lock`; a re-pin builds the newly-locked ref at the next launch.
 
+## The fresh-release hold (`mise:` packages)
+
+mise applies a built-in **`minimum_release_age`** (24 hours by default): it will not
+install an upstream release until it has been public for a day, so a release that is
+compromised or broken and then yanked within hours is never picked up. This is mise's own
+supply-chain safety default — `ops` does not set it, and it is in none of your configs.
+
+So `ops upgrade mise` can report a newer version yet leave the tool where it is:
+
+```text
+mise WARN  newer npm:cline release 3.0.38 … ignored by minimum_release_age (24h); latest eligible release is 3.0.37
+mise All tools are up to date
+```
+
+This is not an error. The tool is up to date **relative to eligible (≥ 24 h old)
+releases**, and a held version installs on the next `ops upgrade` once it crosses the
+delay — the warning even prints the exact eligibility time.
+
+### Installing the newest release immediately
+
+A cage does **not** inherit your host environment, and `ops upgrade` takes no override
+flags, so exporting `MISE_MINIMUM_RELEASE_AGE` on the host has no effect. The only channel
+that reaches the in-cage mise is a trusted [`env`](../configuration/env.md) entry. Set it
+in your **global** config (`ops/ops.toml`) to lift the hold for every app:
+
+```toml
+[env]
+MISE_MINIMUM_RELEASE_AGE = "0"
+```
+
+The same entry can be written from the CLI (see [`ops config`](../cli/config.md)) — pass
+the bare `0`, since an `env` value is always stored as a string:
+
+```sh
+ops config set --global env.MISE_MINIMUM_RELEASE_AGE 0   # every app
+ops config set --local  env.MISE_MINIMUM_RELEASE_AGE 0   # this project only
+```
+
+Read it back with `ops config get --global env.MISE_MINIMUM_RELEASE_AGE`, or remove it
+with `ops config unset --global env.MISE_MINIMUM_RELEASE_AGE`.
+
+Use a shorter duration (`"6h"`, `"1h"`) to soften the delay rather than remove it; delete
+the line to restore mise's default. The variable also applies to normal launches, but
+there `mise use -g` is a warm no-op, so the effect is concentrated on `ops upgrade`.
+
+> **Trade-off:** lifting the hold removes mise's supply-chain delay — a freshly published
+> release is installed without the window that lets a bad one be caught first.
+
 ## Locks are written atomically
 
 A lock is rewritten atomically (temp + rename), so a concurrent reader sees old-or-new,
