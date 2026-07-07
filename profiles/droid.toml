@@ -51,7 +51,7 @@ droid = "mise:npm:droid"
 mode = "deny"
 allow = [
     # Install: the npm package and its platform binary (an optional dep).
-    "{GET,HEAD} https://registry.npmjs.org",
+    "{GET} https://registry.npmjs.org",
     # Runtime: Factory's account/login and API gateway. Model traffic flows through Factory's
     # gateway by default (so no separate provider host is needed unless you switch to BYOK).
     "{*} https://app.factory.ai",
