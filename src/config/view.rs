@@ -65,6 +65,11 @@ pub(crate) struct ConfigView {
     pub(crate) seccomp: Vec<String>,
     /// Which layer supplied the seccomp relaxation (`Default` when neither config did).
     pub(crate) seccomp_origin: ProvenanceView,
+    /// The host device nodes granted into the cage (`[devices] allow`), each an absolute `/dev/`
+    /// path. Empty when the cage's minimal, hostless `/dev` stands (no `[devices]` config).
+    pub(crate) devices: Vec<String>,
+    /// Which layer supplied the device grant (`Default` when neither config did).
+    pub(crate) devices_origin: ProvenanceView,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -463,6 +468,10 @@ pub(crate) struct AppView {
     /// baseline-merged set. Empty when it relaxes nothing; the merge unions it with the baseline
     /// only for the launch itself.
     pub(crate) seccomp: Vec<String>,
+    /// The host device nodes this overlay grants over the baseline — its *own* `/dev/` paths, not the
+    /// baseline-merged set. Empty when it grants none; the merge unions it with the baseline only for
+    /// the launch itself.
+    pub(crate) devices: Vec<String>,
     /// The cgroup limits this overlay overrides, when it tunes any — its *own* fields, not the
     /// baseline-merged set, so an app that changes nothing shows nothing.
     pub(crate) limits: Option<AppLimitsView>,
@@ -511,6 +520,10 @@ pub(crate) struct AppDetailView {
     /// `Inherited` when the app added none of its own (it takes the baseline's relaxation).
     pub(crate) seccomp: Vec<String>,
     pub(crate) seccomp_origin: ProvenanceView,
+    /// The effective host device grant — the app's own ∪ the baseline's, as `/dev/` paths. The origin
+    /// is `Inherited` when the app added none of its own (it takes the baseline's grant).
+    pub(crate) devices: Vec<String>,
+    pub(crate) devices_origin: ProvenanceView,
     /// The effective cgroup limits — the app's overrides folded onto the baseline — each field
     /// carrying its provenance (`Inherited` when the app left it to the baseline).
     pub(crate) limits: LimitsView,
@@ -667,11 +680,19 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         forward_origin: resolved.forward_origin.into(),
         seccomp: resolved.seccomp.tokens(),
         seccomp_origin: resolved.seccomp_origin.into(),
+        devices: device_paths(&resolved.devices),
+        devices_origin: resolved.devices_origin.into(),
         limits,
         secrets,
         apps,
         warnings: resolved.warnings.clone(),
     }
+}
+
+/// The device grant as display strings, in the resolved (sorted) order. A tiny shared conversion so
+/// the baseline, per-app, and `--app` effective views render a device path identically.
+fn device_paths(devices: &[std::path::PathBuf]) -> Vec<String> {
+    devices.iter().map(|p| p.display().to_string()).collect()
 }
 
 /// Project one declared package, recording its backend, how it is realised, the trust verdict,
@@ -914,6 +935,7 @@ fn app_view(
         }),
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
+        devices: device_paths(&app.devices),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
             app.secrets
@@ -998,6 +1020,12 @@ fn app_detail_view(
     eff_seccomp.union(&app.seccomp);
     let seccomp_origin = origin_or_inherited(!app.seccomp.is_empty(), app.seccomp_origin);
 
+    // Effective devices: the app's own grant ∪ the baseline's — the same union `merge_app` performs
+    // — with the origin `Inherited` when the app added none of its own.
+    let mut eff_devices = baseline.devices.clone();
+    super::union_devices(&mut eff_devices, app.devices.clone());
+    let devices_origin = origin_or_inherited(!app.devices.is_empty(), app.devices_origin);
+
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
     // app's when it set the field, else inherited from the baseline.
     let mut eff_limits = baseline.limits.clone();
@@ -1073,6 +1101,8 @@ fn app_detail_view(
         forward_origin,
         seccomp: eff_seccomp.tokens(),
         seccomp_origin,
+        devices: device_paths(&eff_devices),
+        devices_origin,
         limits,
         env: app
             .env
@@ -1301,6 +1331,8 @@ mod tests {
             forward_origin: ProvenanceView::Global,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -1336,6 +1368,7 @@ mod tests {
                 gui: None,
                 forward: vec![1455],
                 seccomp: vec![],
+                devices: vec![],
                 limits: Some(AppLimitsView {
                     memory_high: None,
                     memory_max: Some("8G".into()),
@@ -1470,6 +1503,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -1540,6 +1575,8 @@ mod tests {
             secrets: vec![a_header_secret()],
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             declared_secrets: vec![a_header_secret()],
             apps: Default::default(),
             warnings: vec![],
@@ -1583,6 +1620,8 @@ mod tests {
             },
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };

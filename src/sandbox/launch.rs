@@ -2222,6 +2222,9 @@ fn build(
         // The trusted seccomp relaxation from the resolved (post-`merge_app`) config, so an app's
         // `[seccomp] allow` union is in effect for `ops app`, exactly like its limits.
         prep.cfg.seccomp.clone(),
+        // The trusted device grant from the resolved (post-`merge_app`) config, so an app's
+        // `[devices]` union is in effect for `ops app`, exactly like its seccomp relaxation.
+        &prep.cfg.devices,
         cmd,
     )
     .map_err(|e| {
@@ -3234,6 +3237,8 @@ mod tests {
             secrets: vec![],
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -3284,6 +3289,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         }

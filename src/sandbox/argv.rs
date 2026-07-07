@@ -104,6 +104,13 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
                 a.push(lit("--dev"));
                 a.push(path(dest));
             }
+            Mount::DevBind { src, dest } => {
+                // `-try` so a device absent on this host is skipped rather than aborting the
+                // launch — a portable profile may grant a device (a GPU, kvm) some hosts lack.
+                a.push(lit("--dev-bind-try"));
+                a.push(path(src));
+                a.push(path(dest));
+            }
             Mount::Tmpfs { dest } => {
                 a.push(lit("--tmpfs"));
                 a.push(path(dest));
@@ -278,6 +285,20 @@ mod tests {
 
         let start = index_of(&argv, "--ro-bind").expect("mounts present");
         assert_eq!(&argv[start..start + expected.len()], expected.as_slice());
+    }
+
+    #[test]
+    fn dev_bind_maps_to_the_dev_bind_try_variant() {
+        // A `[devices]` grant is a `--dev-bind-try` (skips a device absent on this host) binding the
+        // host device at its own path with device access.
+        let mounts = vec![Mount::DevBind {
+            src: PathBuf::from("/dev/dri"),
+            dest: PathBuf::from("/dev/dri"),
+        }];
+        let argv = to_argv(&spec(mounts, vec![], NetPolicy::Shared));
+        let i = index_of(&argv, "--dev-bind-try").expect("--dev-bind-try present");
+        assert_eq!(argv[i + 1], OsString::from("/dev/dri"));
+        assert_eq!(argv[i + 2], OsString::from("/dev/dri"));
     }
 
     #[test]

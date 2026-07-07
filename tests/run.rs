@@ -3854,6 +3854,87 @@ fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
     );
 }
 
+/// A trusted `[devices]` grant binds a real host device into the cage — the
+/// config→resolve→build_spec→`Mount::DevBind`→bwrap `--dev-bind-try` thread a unit test cannot reach.
+/// Teeth: the device is ABSENT from the default minimal `/dev` (the untrusted probe launch, whose
+/// grant is dropped), and PRESENT only after the project is trusted so the grant applies — so the
+/// device appears solely because of the grant. Skips if the host cannot sandbox, or if none of the
+/// candidate devices exists on this host.
+#[test]
+fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
+    // A device present on this host but absent from bwrap's minimal /dev (null/zero/tty…).
+    let Some(device) = ["/dev/net/tun", "/dev/fuse", "/dev/kvm", "/dev/dri"]
+        .into_iter()
+        .find(|d| std::path::Path::new(d).exists())
+    else {
+        eprintln!("skipping devices e2e: no candidate host device present");
+        return;
+    };
+
+    let project = TmpDir::new("dev-proj");
+    let data = TmpDir::new("dev-data");
+    let state = TmpDir::new("dev-state");
+
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        format!("[devices]\nallow = [\"{device}\"]\n").as_bytes(),
+    )
+    .unwrap();
+    let check = format!("test -e {device} && echo DEV-PRESENT || echo DEV-ABSENT");
+
+    // Untrusted probe (also seeds the base userland): the grant is dropped, so the device is ABSENT
+    // in the minimal /dev. A failed launch means the host cannot sandbox → skip.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check.as_str()],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping devices e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains("DEV-ABSENT"),
+        "the untrusted (dropped) grant must leave the device out of the minimal /dev:\n{}",
+        String::from_utf8_lossy(&probe.stdout)
+    );
+
+    // Trust the project so its `[devices]` grant applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The device is now bound into the cage — the whole thread landed at a real `--dev-bind-try`.
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check.as_str()],
+    );
+    assert!(
+        out.status.success(),
+        "a trusted devices grant must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("DEV-PRESENT"),
+        "the trusted `[devices]` grant must bind {device} into the cage:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// A trusted app's `[limits]` overlay reaches the cage's scope at `ops app` dispatch — the seam a
 /// `merge_app` unit test cannot cover: that the real dispatch merges the overlay *before* it
 /// consumes the limits. An inline `[app.cap]` caps tasks below the default; after trust, `ops app

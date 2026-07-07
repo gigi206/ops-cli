@@ -3206,3 +3206,107 @@ fn config_json_carries_the_seccomp_relaxation() {
         .collect();
     assert_eq!(tokens, vec!["clone:newns", "ptrace"], "{doc}");
 }
+
+#[test]
+fn an_untrusted_devices_grant_is_dropped_but_trusting_applies_it() {
+    // `[devices] allow` exposes host device nodes in the cage — a security field, so an untrusted
+    // project's grant is dropped (a device widens the kernel attack surface) and applied only once
+    // the project is trusted. The resolved grant is sorted.
+    let fx = Fixture::new();
+    fx.write_project("[devices]\nallow = [\"/dev/net/tun\", \"/dev/dri\"]\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("devices:"),
+        "an untrusted device grant must not be applied:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("ignoring `[devices]`"),
+        "a dropped devices table must be explained:\n{stderr}"
+    );
+
+    // Trust it → the grant applies, rendered as sorted paths tagged with the project layer.
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("devices: /dev/dri, /dev/net/tun"),
+        "trusted device paths must render sorted:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(project)"),
+        "the devices origin must be tagged with its layer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_malformed_device_entry_is_dropped_and_the_valid_one_kept() {
+    // The global config is trusted by location, so its `[devices]` applies with no trust step. A
+    // path outside `/dev/` is dropped (fail-closed), the valid device kept.
+    let fx = Fixture::new();
+    fx.write_global("[devices]\nallow = [\"/etc/shadow\", \"/dev/kvm\"]\n");
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("devices: /dev/kvm"),
+        "the valid device must apply, the bad path dropped:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("ignoring `[devices] allow`") && stderr.contains("/etc/shadow"),
+        "a malformed device entry must be dropped with a reason:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_global_apps_devices_grant_survives_an_untrusted_projects_widening() {
+    // The flagship property, for devices: a globally-declared app (a profile, trusted by location)
+    // keeps its device grant, and an untrusted project cannot add a device to it — so an agent can
+    // run *on* untrusted code without that code widening the app's kernel attack surface.
+    let fx = Fixture::new();
+    fx.write_profile("gpu", "cmd = \"gpu\"\n[devices]\nallow = [\"/dev/dri\"]\n");
+    // The untrusted project tries to widen the SAME app with /dev/kvm.
+    fx.write_project("[app.gpu.devices]\nallow = [\"/dev/kvm\"]\n");
+
+    let out = fx.run(&["config", "show", "--app", "gpu"]);
+    assert!(
+        out.status.success(),
+        "config show --app failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("/dev/dri"),
+        "the trusted app device grant must stand:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("/dev/kvm"),
+        "an untrusted project must not widen a trusted app's device grant:\n{stdout}"
+    );
+}
+
+#[test]
+fn config_json_carries_the_devices_grant() {
+    // The machine-readable model carries the resolved grant, sorted, like every other field.
+    let fx = Fixture::new();
+    fx.write_global("[devices]\nallow = [\"/dev/kvm\", \"/dev/dri\"]\n");
+    let out = fx.run(&["config", "show", "--json"]);
+    assert!(out.status.success(), "config --json should exit 0");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
+    let paths: Vec<String> = doc["devices"]
+        .as_array()
+        .expect("devices is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(paths, vec!["/dev/dri", "/dev/kvm"], "{doc}");
+}

@@ -32,6 +32,12 @@ pub(crate) enum Mount {
     Proc { dest: PathBuf },
     /// A minimal device tree at `dest` (null/zero/urandom/tty…), never the host's.
     Dev { dest: PathBuf },
+    /// A host device node (or a directory of them) bound at `dest` **with device access** — the
+    /// escape hatch a [`Mount::Dev`] tree deliberately lacks. Emitted only from a trusted
+    /// `[devices] allow`, and only *after* the [`Mount::Dev`] that sets up the minimal `/dev`, so it
+    /// layers a real device (`/dev/dri`, `/dev/kvm`, `/dev/net/tun`) over the hostless default. A
+    /// `-try` mount: a source absent on this host is skipped, so a portable profile still launches.
+    DevBind { src: PathBuf, dest: PathBuf },
     /// A fresh, private tmpfs at `dest`.
     Tmpfs { dest: PathBuf },
 }
@@ -48,6 +54,7 @@ impl Mount {
             | Mount::Symlink { dest, .. }
             | Mount::Proc { dest }
             | Mount::Dev { dest }
+            | Mount::DevBind { dest, .. }
             | Mount::Tmpfs { dest } => dest,
         }
     }

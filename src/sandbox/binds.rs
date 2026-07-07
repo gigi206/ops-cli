@@ -215,12 +215,14 @@ struct SandboxPaths<'a> {
 /// Assemble a [`SandboxSpec`] from already-resolved host paths. Pure: no I/O, no
 /// ambient state — every mount and variable derives from the arguments. This is
 /// the audited core; [`build_spec`] feeds it real paths.
+#[allow(clippy::too_many_arguments)]
 fn assemble(
     paths: &SandboxPaths,
     userland: &Userland,
     nix: &NixMount,
     overlay: &Overlay,
     extra_binds: &[ExtraBind],
+    devices: &[PathBuf],
     net: NetPolicy,
     cmd: Vec<OsString>,
 ) -> Result<SandboxSpec, SpecError> {
@@ -373,6 +375,17 @@ fn assemble(
             dest: paths.project.to_path_buf(),
         },
     ]);
+
+    // Host device nodes from a trusted `[devices]` grant, bound at their own `/dev/*` paths with
+    // device access. Emitted *after* the `Mount::Dev` above (part of the structural block), so each
+    // real device layers over the minimal, hostless `/dev` rather than being shadowed by it. A `-try`
+    // bind (see `Mount::DevBind`) skips a device absent on this host, so a portable profile still
+    // launches everywhere. Their destinations are `/dev/*`, disjoint from the config binds, every
+    // structural mount, and the launcher's extra binds below.
+    mounts.extend(devices.iter().map(|d| Mount::DevBind {
+        src: d.clone(),
+        dest: d.clone(),
+    }));
 
     // Launcher-injected binds, emitted last so they neither shadow a structural mount nor
     // are shadowed by one. Their destinations are ops's (the egress socket under the tmpfs,
@@ -531,11 +544,21 @@ fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
 /// user their bind will not behave as a naive reading suggests.
 pub(crate) fn structural_nesting_warning(dest: &Path, writable: bool) -> Option<String> {
     structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
-        Nesting::Shadowed => format!(
-            "bind `{}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
-             over it, so the bind is shadowed and will not appear inside",
-            dest.display()
-        ),
+        Nesting::Shadowed => {
+            // A `/dev/*` path is the common case worth steering: a plain bind of a device node is
+            // both shadowed here *and* (were it not) `nodev` — visible but unusable. `[devices]` is
+            // the field that actually exposes a host device with device access.
+            let dev_hint = if structural == "/dev" {
+                " — to expose a host device with device access, use `[devices]` instead"
+            } else {
+                ""
+            };
+            format!(
+                "bind `{}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
+                 over it, so the bind is shadowed and will not appear inside{dev_hint}",
+                dest.display()
+            )
+        }
         Nesting::Contains => {
             let write_note = if writable {
                 " — and being read-write, the cage can write through to the host files around it"
@@ -874,6 +897,7 @@ pub(crate) fn build_spec(
     net: NetPolicy,
     egress_contract: &str,
     seccomp: super::seccomp::SeccompPolicy,
+    devices: &[PathBuf],
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
@@ -934,14 +958,23 @@ pub(crate) fn build_spec(
         Runtime::GlobalApp(name) | Runtime::ProjectApp(name) => Some(name),
     };
     let slug = super::naming::cage_slug(app, &project);
-    assemble(&paths, userland, nix, overlay, extra_binds, net, cmd)
-        .map(|spec| spec.with_cage_slug(slug).with_seccomp(seccomp))
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid sandbox spec: {e:?}"),
-            )
-        })
+    assemble(
+        &paths,
+        userland,
+        nix,
+        overlay,
+        extra_binds,
+        devices,
+        net,
+        cmd,
+    )
+    .map(|spec| spec.with_cage_slug(slug).with_seccomp(seccomp))
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid sandbox spec: {e:?}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1049,6 +1082,7 @@ mod tests {
             &nix_mount(),
             &overlay,
             &[],
+            &[],
             NetPolicy::Shared,
             vec![OsString::from("/bin/sh")],
         )
@@ -1084,6 +1118,17 @@ mod tests {
             structural_nesting_warning(Path::new("/tmp/secrets"), false).expect("descendant warns");
         assert!(w.contains("shadowed"), "descendant message: {w}");
         assert!(w.contains("/tmp"));
+        // A non-`/dev` shadowed bind carries no device hint.
+        assert!(!w.contains("[devices]"), "no device hint off /dev: {w}");
+
+        // A `/dev/*` bind is shadowed AND steered to `[devices]` (the field that actually exposes a
+        // device with device access — a plain bind would be visible but `nodev`).
+        let w = structural_nesting_warning(Path::new("/dev/dri"), false).expect("/dev/* warns");
+        assert!(w.contains("shadowed"), "/dev message: {w}");
+        assert!(
+            w.contains("[devices]"),
+            "a /dev/* bind must be steered to [devices]: {w}"
+        );
 
         // An ancestor of structural files over-exposes the directory around them.
         let w = structural_nesting_warning(Path::new("/etc"), false).expect("ancestor warns");
@@ -1161,6 +1206,61 @@ mod tests {
         assert_eq!(text[ssl - 2], "--ro-bind");
         let resolv = text.iter().position(|s| s == "/etc/resolv.conf").unwrap();
         assert_eq!(text[resolv - 1], "--ro-bind-try");
+    }
+
+    #[test]
+    fn assemble_binds_a_device_after_the_minimal_dev() {
+        // A `[devices]` grant becomes a `--dev-bind-try` of the host device at its own path, emitted
+        // *after* the minimal `--dev` so the real device layers over the hostless default rather than
+        // being shadowed by it. Both granted devices must be present, each after the `--dev`.
+        let paths = SandboxPaths {
+            project: Path::new("/home/u/proj"),
+            home_src: Path::new("/data/ops/projects/abc/home"),
+            passwd_src: Path::new("/data/ops/projects/abc/etc/passwd"),
+            group_src: Path::new("/data/ops/projects/abc/etc/group"),
+            mise_plugin_src: Path::new("/store/mise-plugin"),
+            shell_rc_src: Path::new("/store/bashrc"),
+            contract_src: Path::new("/store/egress-contract.md"),
+            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
+        };
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+        };
+        let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
+        let spec = assemble(
+            &paths,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            &devices,
+            NetPolicy::Shared,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("valid spec");
+        let text: Vec<String> = super::super::argv::to_argv(&spec)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dev = text
+            .iter()
+            .position(|s| s == "--dev")
+            .expect("--dev present");
+        for d in ["/dev/dri", "/dev/kvm"] {
+            let src = text
+                .iter()
+                .position(|s| s == d)
+                .unwrap_or_else(|| panic!("{d} not bound"));
+            assert_eq!(text[src - 1], "--dev-bind-try", "{d} is a device bind");
+            assert_eq!(
+                text[src + 1],
+                d,
+                "{d} is bound at its own path (src == dest)"
+            );
+            assert!(src > dev, "{d} must be bound after the minimal --dev");
+        }
     }
 
     #[test]
@@ -1328,6 +1428,7 @@ mod tests {
             &nix_mount(),
             &overlay,
             &extra,
+            &[],
             NetPolicy::Isolated,
             vec![OsString::from("/bin/sh")],
         )
@@ -1386,6 +1487,7 @@ mod tests {
             &userland(),
             &nix_mount(),
             &overlay,
+            &[],
             &[],
             NetPolicy::Shared,
             vec![OsString::from("/bin/sh")],
@@ -1684,6 +1786,7 @@ mod tests {
             &nix,
             &overlay,
             &[],
+            &[],
             NetPolicy::Shared,
             vec![OsString::from("/bin/sh")],
         )
@@ -1918,6 +2021,7 @@ mod smoke {
             NetPolicy::Shared,
             "",
             crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
             cmd,
         )
         .expect("build spec");
@@ -2079,6 +2183,7 @@ mod smoke {
             NetPolicy::Shared,
             "",
             crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
             vec![foreign.clone().into_os_string()],
         )
         .expect("build foreign spec");
@@ -2122,6 +2227,7 @@ mod smoke {
             NetPolicy::Shared,
             "",
             crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
             vec![OsString::from("hello")],
         )
         .expect("build cross spec");
@@ -2261,6 +2367,7 @@ mod smoke {
             NetPolicy::Shared,
             "",
             crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
             cmd,
         )
         .expect("build spec");
@@ -2430,6 +2537,7 @@ mod smoke {
             NetPolicy::Shared,
             "",
             crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
             cmd,
         )
         .expect("build spec");
@@ -2597,6 +2705,7 @@ mod smoke {
             NetPolicy::Shared,
             "",
             crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
             cmd,
         )
         .expect("build spec");
@@ -2724,6 +2833,7 @@ mod smoke {
                 NetPolicy::Shared,
                 "",
                 crate::sandbox::seccomp::SeccompPolicy::default(),
+                &[],
                 cmd,
             )
             .expect("build spec");

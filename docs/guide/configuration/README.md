@@ -42,6 +42,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `nixpkgs` | security | [nixpkgs](nixpkgs.md) |
 | `[limits]` | security | [limits](limits.md) |
 | `[seccomp]` | security | [seccomp](seccomp.md) |
+| `[devices]` | security | [devices](devices.md) |
 | `gui` | security | [gui](gui.md) |
 | `network` | security | [network](network.md) |
 | `[secret]` | security | [secret](secret.md) |

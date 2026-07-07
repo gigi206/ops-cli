@@ -1315,6 +1315,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // Host device grant — shown only when a trusted `[devices] allow` exposes a device, so the
+    // default (minimal, hostless `/dev`) stays uncluttered. The paths read as the `allow` entries;
+    // the provenance names which layer granted them.
+    if !view.devices.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}devices:{r} {} {dim}(host device nodes exposed in the cage){r}{}",
+            view.devices.join(", "),
+            provenance_tag(view.devices_origin, pal)
+        );
+    }
+
     // Credentials the egress proxy injects — by destination and source locator, never the value.
     if !view.secrets.is_empty() {
         let _ = writeln!(
@@ -1523,6 +1535,10 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if !app.seccomp.is_empty() {
                 let _ = writeln!(o, "      {dim}seccomp allow:{r} {}", app.seccomp.join(", "));
             }
+            // The host device grant this overlay adds (its own `/dev/` paths, not the merged set).
+            if !app.devices.is_empty() {
+                let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
+            }
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
             // under `--details` to each by destination and source, the same metadata the baseline
@@ -1714,6 +1730,19 @@ fn render_app_detail(
             o,
             "  {h}seccomp:{r} allow {} {dim}(syscalls re-permitted){r}{seccomp_tag}",
             view.seccomp.join(", ")
+        );
+    }
+
+    // Effective host device grant — the app's own ∪ the baseline's. Shown even when empty so the
+    // inherited story is visible (a device the app takes from the baseline reads as `inherited`).
+    let devices_tag = app_provenance_tag(view.devices_origin, pal);
+    if view.devices.is_empty() {
+        let _ = writeln!(o, "  {h}devices:{r} (none — minimal /dev){devices_tag}");
+    } else {
+        let _ = writeln!(
+            o,
+            "  {h}devices:{r} {} {dim}(host device nodes exposed){r}{devices_tag}",
+            view.devices.join(", ")
         );
     }
 
@@ -9250,6 +9279,8 @@ mod tests {
             secrets: vec![],
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -9685,6 +9716,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![],
@@ -9864,6 +9897,8 @@ mod tests {
             forward_origin: ProvenanceView::Inherited,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Inherited,
+            devices: vec![],
+            devices_origin: ProvenanceView::Inherited,
             limits: LimitsView {
                 memory_high: LimitView {
                     value: "70%".into(),
@@ -10039,6 +10074,7 @@ mod tests {
             gui: None,
             forward: vec![],
             seccomp: vec![],
+            devices: vec![],
             limits,
             secrets: vec![],
             notes: vec![],
@@ -10125,6 +10161,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10146,6 +10184,7 @@ mod tests {
                 gui: None,
                 forward: vec![],
                 seccomp: vec![],
+                devices: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10206,6 +10245,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10226,6 +10267,7 @@ mod tests {
                 gui: None,
                 forward: vec![],
                 seccomp: vec![],
+                devices: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10287,6 +10329,7 @@ mod tests {
             gui,
             forward: vec![],
             seccomp: vec![],
+            devices: vec![],
             limits: None,
             secrets: vec![],
             notes: vec![],
@@ -10317,6 +10360,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![
@@ -10377,6 +10422,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10390,6 +10437,7 @@ mod tests {
                 gui: None,
                 forward: vec![],
                 seccomp: vec![],
+                devices: vec![],
                 limits: None,
                 secrets: vec![
                     SecretView {
@@ -10469,6 +10517,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10495,6 +10545,7 @@ mod tests {
                 gui: None,
                 forward: vec![],
                 seccomp: vec![],
+                devices: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],
@@ -10561,6 +10612,8 @@ mod tests {
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
+            devices: vec![],
+            devices_origin: ProvenanceView::Default,
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -10602,6 +10655,7 @@ mod tests {
                 gui: None,
                 forward: vec![],
                 seccomp: vec![],
+                devices: vec![],
                 limits: None,
                 secrets: vec![],
                 notes: vec![],

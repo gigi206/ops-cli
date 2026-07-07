@@ -493,7 +493,8 @@ const PAGES: &[Page] = &[
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
             project environment, binds, packages, tools, network, GUI, secrets, resource\n\
-            limits, the seccomp relaxation, and app profiles, after the trust gate has dropped\n\
+            limits, the seccomp relaxation, the host device grant, and app profiles, after the\n\
+            trust gate has dropped\n\
             anything an untrusted project may not set. Each value is tagged with where it came\n\
             from — (default), (global), or\n\
             (project), colored by level. Warnings explain what was dropped and why. No launch,\n\

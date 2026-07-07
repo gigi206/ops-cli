@@ -541,6 +541,15 @@ pub(crate) struct Resolved {
     /// (`Default` when neither config did), like `forward_origin`. A display affordance for
     /// `ops config`; the launcher ignores it.
     pub(crate) seccomp_origin: Provenance,
+    /// Host device nodes granted into the cage from a trusted `[devices] allow` (each an absolute
+    /// path under `/dev/`). A security field, gated like `network`/`seccomp` — an untrusted project
+    /// may not expose a host device. The default (empty) leaves the cage's minimal, hostless `/dev`.
+    /// The layering unions (a project adds to the global set), like `forward`; sorted and deduped.
+    pub(crate) devices: Vec<PathBuf>,
+    /// Which layer supplied the device grant — the highest-trust layer that granted anything
+    /// (`Default` when neither config did), like `forward_origin`. A display affordance for
+    /// `ops config`; the launcher ignores it.
+    pub(crate) devices_origin: Provenance,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -611,6 +620,11 @@ pub(crate) struct ResolvedApp {
     /// [`merge_app`]; empty means the app relaxes nothing and inherits the baseline relaxation. A
     /// security field, gated like the baseline `[seccomp]`.
     pub(crate) seccomp: crate::sandbox::seccomp::SeccompPolicy,
+    /// The app's own host device grant, set only from a trusted source (an untrusted project's app
+    /// `[devices]` is dropped, like its `network`/`seccomp`). Unions onto the baseline at
+    /// [`merge_app`]; empty means the app grants no device and inherits the baseline grant. A
+    /// security field, gated like the baseline `[devices]`.
+    pub(crate) devices: Vec<PathBuf>,
     /// The app's own host loopback forward ports, set only from a trusted source (an untrusted
     /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
     /// baseline's at [`merge_app`]; an empty vec means the app adds none and inherits the baseline
@@ -640,6 +654,9 @@ pub(crate) struct ResolvedApp {
     /// Which app layer (`Global`/`Project`) supplied the app's own seccomp relaxation, or `Default`
     /// when the app declared none. The merged effective relaxation is the app's own ∪ the baseline's.
     pub(crate) seccomp_origin: Provenance,
+    /// Which app layer (`Global`/`Project`) supplied the app's own device grant, or `Default` when
+    /// the app declared none. The merged effective grant is the app's own ∪ the baseline's.
+    pub(crate) devices_origin: Provenance,
     pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `ops run`.
@@ -694,6 +711,9 @@ impl Resolved {
         // removes the trusted baseline's (the flagship "agent on untrusted code" property, which
         // holds because the untrusted contribution was dropped at resolve time).
         self.seccomp.union(&app.seccomp);
+        // The app's device grant unions onto the baseline's — an app adds devices, never removes
+        // the trusted baseline's (the same flagship property, holding for the same reason).
+        union_devices(&mut self.devices, app.devices);
         // Drop the baseline secret-posture warning: it judged the *baseline* network, but the app's
         // posture re-decides injection just below — keeping it would let `ops app <name>` both inject
         // a credential and print "ignoring N HTTP-header secret(s)". The re-check re-emits it only if
@@ -777,12 +797,14 @@ impl Resolved {
             forward,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time. A one-shot override
-            // does not relax the seccomp denylist — an override's `[seccomp]` is ignored (the
-            // fail-closed direction: a relaxation only ever comes from a trusted config file).
+            // does not relax the seccomp denylist nor grant a device — an override's
+            // `[seccomp]`/`[devices]` is ignored (the fail-closed direction: a relaxation or a
+            // device grant only ever comes from a trusted config file).
             nixpkgs: _,
             net: _,
             app: _,
             seccomp: _,
+            devices: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -1150,6 +1172,15 @@ fn resolve(
     } else {
         Provenance::Global
     };
+    // The device grant is trusted by location at the global layer; a bad entry is dropped (warned)
+    // and the rest kept. A project's unions onto this, so the origin records `Global` only when this
+    // layer actually granted a device.
+    let mut devices = apply_devices(&mut warnings, GLOBAL_CONFIG, global.devices);
+    let mut devices_origin = if devices.is_empty() {
+        Provenance::Default
+    } else {
+        Provenance::Global
+    };
     // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
     // captured for the global hosts and as the base a trusted project may extend.
     let mut secret_defaults = SecretDefaults::default();
@@ -1319,6 +1350,24 @@ fn resolve(
                 ));
             }
         }
+        // `[devices]` is a security field — a trusted project may grant a host device; an untrusted
+        // or changed one may not (exposing a device widens the kernel attack surface). The grant
+        // unions onto the global set: a project adds devices, never removes (the flagship property
+        // holds because the untrusted contribution is dropped here, before the union).
+        if let Some(raw) = proj.devices {
+            if trusted {
+                let project_devices = apply_devices(&mut warnings, PROJECT_CONFIG, Some(raw));
+                if !project_devices.is_empty() {
+                    devices_origin = Provenance::Project;
+                }
+                union_devices(&mut devices, project_devices);
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `[devices]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // The `[secret]` section is a security field — a trusted project may inject
         // credentials (and extend the resolver defaults); an untrusted or changed one may
         // not (it would aim the user's secrets at a host of its choosing). The whole
@@ -1390,6 +1439,8 @@ fn resolve(
         limits_origin,
         seccomp,
         seccomp_origin,
+        devices,
+        devices_origin,
         secrets,
         declared_secrets,
         apps,
@@ -1552,6 +1603,70 @@ fn apply_seccomp(
     policy
 }
 
+/// Resolve one `[devices] allow` list into the host device paths to grant into the cage. Each entry
+/// must be an **absolute path under `/dev/`** naming a device (or a directory of them). Validation is
+/// purely lexical (no filesystem I/O, so [`resolve`] stays pure): a device absent on this host is
+/// *not* an error here — it is skipped at launch by the `--dev-bind-try` mount, so a portable profile
+/// that lists a device some hosts lack still launches everywhere. A malformed entry (not absolute,
+/// outside `/dev/`, or containing `..`) is dropped with a warning (fail-closed — a bad path never
+/// widens exposure). The result is sorted and deduped so two equivalent layers produce one canonical
+/// set.
+fn apply_devices(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: Option<schema::RawDevices>,
+) -> Vec<PathBuf> {
+    let mut devices: Vec<PathBuf> = Vec::new();
+    let Some(raw) = raw else {
+        return devices;
+    };
+    for entry in &raw.allow {
+        let path = entry.trim();
+        if path.is_empty() {
+            continue;
+        }
+        match validate_device_path(path) {
+            Ok(p) => devices.push(p),
+            Err(reason) => warnings.push(format!(
+                "{source}: ignoring `[devices] allow` entry `{path}` ({reason})"
+            )),
+        }
+    }
+    devices.sort();
+    devices.dedup();
+    devices
+}
+
+/// Validate one `[devices]` entry lexically: an absolute path *strictly under* `/dev/`, with no `..`
+/// component (which could escape `/dev`). Returns the `PathBuf`, or a reason it was rejected. No I/O
+/// — the device need not exist here (a portable profile may list a device some hosts lack; a missing
+/// one is skipped at launch by `--dev-bind-try`). `/dev` itself (and a bare `/dev/`) is refused:
+/// rebinding the whole tree would defeat the cage's minimal, hostless `/dev`.
+///
+/// The check is on the path *spelling*, not the resolved target: the source is deliberately **not**
+/// canonicalized. Canonicalizing would need I/O (breaking this function's — and [`resolve`]'s —
+/// purity) and would require the device to exist, defeating the portable-profile property above. So
+/// a symlink under `/dev` pointing elsewhere (`/dev/foo -> /etc`) would dev-bind its target. Since
+/// `[devices]` is trusted-only, that is **self-harm equivalent to a plain read-write bind of the
+/// target** (a trusted config can already write `binds = [{ path = "/etc", mode = "rw" }]`), not a
+/// new capability — so the lexical check is the proportionate guard.
+fn validate_device_path(path: &str) -> Result<PathBuf, &'static str> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err("must be an absolute path");
+    }
+    if p.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("must not contain a `..` component");
+    }
+    // Strictly under `/dev/`: a `/dev`-prefixed path with a name beyond it. The component count rules
+    // out both a non-`/dev` path and the degenerate `/dev` / `/dev/`, which would rebind the whole
+    // minimal device tree rather than grant one device.
+    if !path.starts_with("/dev/") || p.components().count() <= 2 {
+        return Err("must be a path under `/dev/` (e.g. /dev/dri, /dev/kvm)");
+    }
+    Ok(p.to_path_buf())
+}
+
 /// Union `extra` ports into `base`, deduped and sorted. The `forward` model — a layer adds
 /// ports, never replaces — shared by the baseline project-over-global merge and the app overlay
 /// onto the baseline. A port already present is kept (idempotent); the result is sorted so two
@@ -1563,6 +1678,19 @@ fn union_forward(base: &mut Vec<u16>, extra: Vec<u16>) {
         }
     }
     base.sort_unstable();
+}
+
+/// Union `extra` device paths into `base`, deduped and sorted — the same additive model as
+/// [`union_forward`]: a layer (a trusted project overlay, an app) adds device grants, never removes
+/// another layer's. A path already present is kept (idempotent); the result is sorted so two
+/// equivalent layers produce one canonical set.
+fn union_devices(base: &mut Vec<PathBuf>, extra: Vec<PathBuf>) {
+    for dev in extra {
+        if !base.contains(&dev) {
+            base.push(dev);
+        }
+    }
+    base.sort();
 }
 
 /// Validate one `forward` port list: drop a port of `0` (not a real port; the range ceiling is
@@ -1805,6 +1933,10 @@ fn resolve_app(
     // project unions, an untrusted one dropped. Empty means the app inherits the baseline's.
     let mut seccomp = crate::sandbox::seccomp::SeccompPolicy::default();
     let mut seccomp_origin = Provenance::Default;
+    // The app's own device grant, accumulated like the seccomp relaxation: global by location, a
+    // trusted project unions, an untrusted one dropped. Empty means the app inherits the baseline's.
+    let mut devices: Vec<PathBuf> = Vec::new();
+    let mut devices_origin = Provenance::Default;
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
@@ -1885,6 +2017,11 @@ fn resolve_app(
             seccomp_origin = Provenance::Global;
         }
         seccomp.union(&global_seccomp);
+        let global_devices = apply_devices(&mut warnings, &source, app.devices);
+        if !global_devices.is_empty() {
+            devices_origin = Provenance::Global;
+        }
+        union_devices(&mut devices, global_devices);
         if let Some(section) = app.secret {
             apply_app_secret(
                 &mut secrets,
@@ -2003,6 +2140,24 @@ fn resolve_app(
                 ));
             }
         }
+        // `[devices]` mirrors `[seccomp]`: a trusted project may grant a host device to its own app
+        // or a trusted one; an untrusted project may not (a device widens the kernel attack surface).
+        // Dropping the untrusted layer here — before the union — is what keeps a global app's device
+        // grant from being widened by an untrusted project.
+        if let Some(raw) = app.devices {
+            if trusted {
+                let project_devices = apply_devices(&mut warnings, &source, Some(raw));
+                if !project_devices.is_empty() {
+                    devices_origin = Provenance::Project;
+                }
+                union_devices(&mut devices, project_devices);
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `[devices]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `forward` mirrors `network`/`gui`: a trusted project may add forward ports to its own
         // app or a trusted one; an untrusted project may not (opening a host port is an inbound
         // hole). The ports union onto the app's own set, so the project adds, never replaces.
@@ -2083,6 +2238,7 @@ fn resolve_app(
         gui,
         limits,
         seccomp,
+        devices,
         forward,
         secrets,
         default_methods,
@@ -2091,6 +2247,7 @@ fn resolve_app(
         gui_origin,
         forward_origin,
         seccomp_origin,
+        devices_origin,
         limits_origin,
         home_scope_origin,
         warnings,
@@ -4204,6 +4361,7 @@ mod tests {
             app: BTreeMap::new(),
             limits: None,
             seccomp: None,
+            devices: None,
             net: Default::default(),
         }
     }
@@ -4598,6 +4756,16 @@ mod tests {
         }
     }
 
+    /// A `RawConfig` declaring a `[devices] allow` list from the given paths.
+    fn raw_devices(paths: &[&str]) -> RawConfig {
+        RawConfig {
+            devices: Some(schema::RawDevices {
+                allow: paths.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..RawConfig::default()
+        }
+    }
+
     /// A `RawConfig` declaring a `[limits]` table from optional string tokens (each `None` leaves
     /// that field unset, falling back to the default).
     fn raw_limits(
@@ -4647,6 +4815,7 @@ mod tests {
             secret: None,
             limits: None,
             seccomp: None,
+            devices: None,
             home_scope: None,
         }
     }
@@ -5319,6 +5488,74 @@ mod tests {
         assert_eq!(r.apps["codex"].forward_origin, Provenance::Global);
     }
 
+    #[test]
+    fn a_global_apps_devices_grant_survives_an_untrusted_projects_override_attempt() {
+        // The flagship property for devices: a globally-declared app keeps its device grant even
+        // under an untrusted project, which may neither widen it nor grant its own.
+        let global = raw_with_app(
+            "codex",
+            RawApp {
+                devices: Some(schema::RawDevices {
+                    allow: vec!["/dev/kvm".into()],
+                }),
+                ..raw_app(&["codex"], &[], &[], &[], None)
+            },
+        );
+        // An untrusted project tries to add a device to the trusted app — dropped.
+        let project = raw_with_app(
+            "codex",
+            RawApp {
+                devices: Some(schema::RawDevices {
+                    allow: vec!["/dev/dri".into()],
+                }),
+                ..raw_app(&[], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+        let app = &r.apps["codex"];
+        assert_eq!(
+            app.devices,
+            vec![PathBuf::from("/dev/kvm")],
+            "an untrusted project may not widen a trusted app's device grant"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("[devices]")));
+
+        // The reverse: an untrusted project cannot grant a device on its own app either.
+        let project = raw_with_app(
+            "mine",
+            RawApp {
+                devices: Some(schema::RawDevices {
+                    allow: vec!["/dev/kvm".into()],
+                }),
+                ..raw_app(&["tool"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+        let app = &r.apps["mine"];
+        assert!(
+            app.devices.is_empty(),
+            "an untrusted project may not grant a device"
+        );
+        assert!(app.warnings.iter().any(|w| w.contains("[devices]")));
+    }
+
+    #[test]
+    fn a_trusted_app_devices_grant_is_honored() {
+        // A trusted (global-declared) app's device grant is honored and carried on the overlay.
+        let global = raw_with_app(
+            "codex",
+            RawApp {
+                devices: Some(schema::RawDevices {
+                    allow: vec!["/dev/kvm".into()],
+                }),
+                ..raw_app(&["codex"], &[], &[], &[], None)
+            },
+        );
+        let r = resolve_no_plugins(global, None);
+        assert_eq!(r.apps["codex"].devices, vec![PathBuf::from("/dev/kvm")]);
+        assert_eq!(r.apps["codex"].devices_origin, Provenance::Global);
+    }
+
     /// Build a `RawLimits` from optional tokens, for the per-app overlay tests.
     fn app_raw_limits(
         memory_high: Option<&str>,
@@ -5943,6 +6180,8 @@ mod tests {
             memory_max: Some("16G".into()),
             tasks_max: Some("8192".into()),
         };
+        // Seed a baseline device so the app's grant is observably *unioned*, not replaced.
+        base.devices = vec![PathBuf::from("/dev/dri")];
         let app = ResolvedApp {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
@@ -5965,10 +6204,18 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: vec![PathBuf::from("/dev/kvm")],
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
         base.merge_app(app);
+        // The app's device grant unions onto the baseline's (sorted), never replacing it.
+        assert_eq!(
+            base.devices,
+            vec![PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")],
+            "app devices union onto the baseline"
+        );
         // App env wins on a collision; baseline-only and app-only keys both survive.
         assert!(base.env.iter().any(|(k, v)| k == "A" && v == "app"));
         assert!(base.env.iter().any(|(k, v)| k == "B" && v == "base"));
@@ -6015,6 +6262,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6050,6 +6299,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6081,6 +6332,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6203,6 +6456,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6246,6 +6501,8 @@ mod tests {
             limits_origin: Default::default(),
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -7308,6 +7565,94 @@ mod tests {
         let r = resolve_no_plugins(raw_forward(&[0, 1455]), None);
         assert_eq!(r.forward, vec![1455]);
         assert!(r.warnings.iter().any(|w| w.contains("forward")));
+    }
+
+    #[test]
+    fn validate_device_path_accepts_devs_and_rejects_the_rest() {
+        // A device node and a directory of them under `/dev/` are accepted verbatim.
+        for good in [
+            "/dev/dri",
+            "/dev/kvm",
+            "/dev/net/tun",
+            "/dev/dri/renderD128",
+        ] {
+            assert_eq!(
+                validate_device_path(good),
+                Ok(PathBuf::from(good)),
+                "{good}"
+            );
+        }
+        // Everything outside `/dev/`, the degenerate `/dev`/`/dev/`, a relative path, and any `..`
+        // component (which could escape `/dev`) is rejected — fail-closed.
+        for bad in [
+            "/etc/shadow",    // not under /dev
+            "/devil/x",       // a textual prefix of /dev, not a path under it
+            "/dev",           // the whole tree — would defeat the minimal /dev
+            "/dev/",          // the degenerate bare tree
+            "dev/dri",        // relative
+            "/dev/../etc",    // escapes via ..
+            "/dev/dri/../..", // escapes via ..
+        ] {
+            assert!(validate_device_path(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn the_default_devices_grant_is_empty() {
+        // No `[devices]` means the cage keeps its minimal, hostless `/dev`.
+        assert!(resolve_no_plugins(RawConfig::default(), None)
+            .devices
+            .is_empty());
+    }
+
+    #[test]
+    fn a_trusted_project_devices_grant_unions_onto_the_global_set() {
+        // global is trusted by location; a trusted project *adds* devices (the union model), it does
+        // not replace — and the merged set is sorted+deduped.
+        let r = resolve_no_plugins(
+            raw_devices(&["/dev/dri"]),
+            Some((raw_devices(&["/dev/kvm", "/dev/dri"]), TrustState::Trusted)),
+        );
+        assert_eq!(
+            r.devices,
+            vec![PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")],
+            "the project adds, never replaces; deduped and sorted"
+        );
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.devices_origin, Provenance::Project);
+    }
+
+    #[test]
+    fn an_untrusted_project_devices_grant_is_dropped_but_the_global_survives() {
+        // The flagship property: an untrusted project may not expose a host device. Its `[devices]`
+        // is dropped with a warning, and a globally-granted device survives intact (an agent runs
+        // *on* untrusted code without that code widening the kernel attack surface).
+        for state in [TrustState::Untrusted, TrustState::Changed] {
+            let r = resolve_no_plugins(
+                raw_devices(&["/dev/dri"]),
+                Some((raw_devices(&["/dev/kvm"]), state)),
+            );
+            assert_eq!(
+                r.devices,
+                vec![PathBuf::from("/dev/dri")],
+                "the trusted global device survives an untrusted overlay"
+            );
+            assert!(
+                r.warnings.iter().any(|w| w.contains("[devices]")),
+                "the dropped untrusted device grant must warn"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_device_entry_is_dropped_and_the_rest_kept() {
+        // A bad entry is dropped (warned), the valid ones kept — a collection, not all-or-nothing.
+        let r = resolve_no_plugins(raw_devices(&["/etc/shadow", "/dev/kvm"]), None);
+        assert_eq!(r.devices, vec![PathBuf::from("/dev/kvm")]);
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("[devices] allow") && w.contains("/etc/shadow")));
     }
 
     #[test]

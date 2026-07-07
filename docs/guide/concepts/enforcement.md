@@ -40,6 +40,12 @@ there is no setuid binary to attack. The hardening flags below are emitted
 > terminal for job control: the pty supervisor establishes the session itself and
 > keeps the pty master, so the launching terminal stays unreachable either way.
 
+The cage's `/dev` is also **minimal and hostless** — `null`/`zero`/`urandom`/`tty` and the
+standard descriptor symlinks, never a real host device. A tool that genuinely needs the GPU,
+a VPN tunnel, KVM, or FUSE can bind a specific device node with a trusted
+[`[devices]`](../configuration/devices.md) grant; like the seccomp relaxation below, this is
+trusted-only surface reduction undone, not a change to the namespace/capability boundary.
+
 The absence of a capability-bearing user namespace is a **hard failure**, never a
 silent fallback to a weaker engine. See [`ops doctor`](../getting-started/doctor.md).
 

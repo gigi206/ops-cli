@@ -40,6 +40,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`nixpkgs`](configuration/nixpkgs.md) — pin the channel or revision.
 - [`[limits]`](configuration/limits.md) — cgroup resource limits.
 - [`[seccomp]`](configuration/seccomp.md) — relax the mandatory syscall denylist (trusted-only).
+- [`[devices]`](configuration/devices.md) — expose host device nodes into the cage (trusted-only).
 - [`gui`](configuration/gui.md) — the Wayland display posture.
 - [`network`](configuration/network.md) — the egress posture (links to [Networking](networking/README.md)).
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).

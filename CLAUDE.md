@@ -77,7 +77,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   M3.5** — the per-project writable store + the Mode-B `/nix` read-write inversion, nix-in-cage
   self-equip, `ops mise` passthrough + tool activation, `ops upgrade [nix|mise|flake]`, hermetic
   TLS + a curated base toolset, and `ops search`. **Enforcement (M4) complete** — seccomp denylist
-  (Posture A, now trusted-relaxable via `[seccomp] allow`) + cgroup v2 resource limits (Landlock-FS
+  (Posture A, now trusted-relaxable via `[seccomp] allow`) + cgroup v2 resource limits + a trusted
+  `[devices]` host-device grant into the cage's minimal `/dev` (Landlock-FS
   is a deferred defense-in-depth option, not a gap). **Housekeeping (M5) complete** — `ops gc [--all] [--prune]` (session + per-project +
   shared-store collection, including the stale rev-keyed flake out-link residual), `ops attach
   <id>`, `ops stop <id>… | --all`, and a `--detach` background-agent path; the **one open M5 parity
@@ -95,6 +96,57 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`[devices]` — a trusted grant of host device nodes into the cage (DONE 2026-07-07)**
+  (`src/config/{schema,mod,view}.rs` + `src/sandbox/{spec,argv,binds,launch}.rs` + `src/{main,help}.rs`
+  + `docs/guide/configuration/devices.md` [new] + `docs/guide/{README,configuration/README,concepts/
+  enforcement}.md` + `tests/{config,run}.rs`): the cage's `/dev` is a **minimal, hostless** tree
+  (null/zero/urandom/tty/full/ptmx/pts/shm/std\* — verified live against bwrap's `--dev`), so a tool
+  needing the GPU (`/dev/dri`), a VPN tunnel (`/dev/net/tun`), KVM (`/dev/kvm`), or FUSE (`/dev/fuse`)
+  could not reach one. A new **`[devices] allow = ["/dev/…"]`** field lets a **trusted** config
+  (global or a trusted project) bind a host device node over the minimal `/dev`. **Modelled on
+  `[seccomp]`/`forward`** — a set that **unions** across layers with a single `Provenance` origin,
+  gated **trusted/global-only** (a device widens the kernel attack surface, so an untrusted project's
+  `[devices]` is **dropped + warned**; the flagship holds — a global app's grant survives an untrusted
+  project's widening, its own integration test). **Sandbox side = modelled on `binds`** (devices are
+  filesystem exposure = mounts): a new `Mount::DevBind{src,dest}` → bwrap **`--dev-bind-try`** (a
+  `-try` so a device absent on this host is **skipped, not fatal** — a portable GPU/kvm profile still
+  launches everywhere; the missing-device firm-bind bricks, verified live). Emitted in `assemble`
+  **after** the structural `Mount::Dev` (so the real device layers *over* the hostless `/dev` rather
+  than being shadowed — the mount-order is load-bearing and unit-tested), src==dest (bound at its own
+  `/dev/*` path). **Validation is purely lexical** (`validate_device_path`: absolute, strictly under
+  `/dev/`, no `..` component, refuses the bare `/dev`/`/dev/`) so `resolve` stays **pure** (no I/O,
+  mirrors `apply_seccomp`); a malformed entry is dropped + warned (fail-closed), the rest kept. **No
+  stderr caution** (unlike seccomp's per-dangerous-token cautions) — a device grant is uniform and
+  `warnings` print on *every* launch, so the risk is surfaced in `ops config show` + the docs, not as
+  per-launch noise. **Config** (`config/`): `RawDevices{allow: Vec<String>}` on `RawConfig`+`RawApp`;
+  `Resolved`/`ResolvedApp` gain `devices: Vec<PathBuf>` + `devices_origin`; `apply_devices` +
+  `union_devices` (mirror `apply_seccomp`/`union_forward`); global+project gating in `resolve`,
+  global+project app gating in `resolve_app`, `merge_app` does `union_devices(&mut self.devices,
+  app.devices)` (so an `ops app` launch's grant = baseline ∪ app). Threaded via `Overlay`-sibling
+  param: `build_spec` gains `devices: &[PathBuf]` (`&prep.cfg.devices` post-`merge_app`, like the
+  seccomp policy), `assemble` emits the `DevBind` mounts (`#[allow(clippy::too_many_arguments)]`, same
+  as `build_spec`). A one-shot override **does not grant** a device (`apply_override` ignores
+  `[devices]` — the fail-closed direction, like `[seccomp]`). **`ops config show`** renders a
+  `devices:` line (baseline, provenance-tagged) + the per-app compact roster + the `--app` effective
+  (union) view with `inherited`/`app:*` provenance; `--json` carries the sorted path array. **Tests:**
+  net-new **9 unit** (`validate_device_path` accept/reject incl. `..`-escape + bare-`/dev` + non-`/dev`;
+  resolve default-empty / trusted-union / untrusted-drop-flagship / malformed-drop; `merge_app` union;
+  app-level flagship + trusted-app; argv `DevBind`→`--dev-bind-try`; binds `assemble` emits DevBind
+  after `--dev` with src==dest), **4 config integration** (untrusted-dropped-then-trusting-applies;
+  malformed-dropped; the flagship untrusted-widen via `--app`; `--json`), **1 run.rs e2e**
+  (`a_trusted_devices_grant_binds_a_host_device_into_the_cage` — **ran live 21s**, real teeth: the
+  device is **ABSENT** in the untrusted probe's minimal `/dev` and **PRESENT** only after trust, so it
+  appears *solely* because of the grant; picks the first of `/dev/net/tun|fuse|kvm|dri` present on the
+  host, skips if none). fmt/clippy `-D warnings` clean, **std-only** (no new dep). **Honest scope:** a
+  grant binds the device *node*; actual *use* is still governed by the device's file perms + the host
+  uid (same-uid) — visibility, not new privilege. Some devices need more than the node — **`/dev/fuse`
+  also needs `[seccomp] allow = ["mount"]`** (the mandatory denylist refuses `mount`), **`/dev/net/tun`
+  is most useful under `network = "shared"`** — both documented. Re-exposing a device is
+  surface-reduction undone, not a boundary breach (cap-drop + single-uid userns unchanged). Docs: new
+  `configuration/devices.md` (grammar, when-you-need-it table, the fuse/tun interactions, why
+  trusted-only, per-app) + index links + an `enforcement.md` minimal-`/dev` note. **Deferred:** a
+  one-shot `--device` flag (the override path ignores `[devices]`, fail-closed); devices outside
+  `/dev/` (lexically refused).
   **`[seccomp] allow` — a trusted relaxation of the mandatory syscall denylist (DONE 2026-07-07)**
   (`src/sandbox/seccomp.rs` + `spec.rs` + `binds.rs` + `launch.rs` + `smoke.rs` + `config/{schema,mod,
   view}.rs` + `main.rs` + `help.rs` + `docs/guide/configuration/seccomp.md` [new] + `tests/{config,

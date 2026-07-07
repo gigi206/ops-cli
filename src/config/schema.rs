@@ -92,6 +92,12 @@ pub(crate) struct RawConfig {
     /// surface control, a choice an untrusted project may not make. Empty or absent leaves the full
     /// mandatory denylist.
     pub(crate) seccomp: Option<RawSeccomp>,
+    /// A trusted grant of host device nodes into the cage, declared as the `[devices]` table. A
+    /// security field — honored from the global config or a trusted project, ignored from an
+    /// untrusted one: a real device node widens the kernel attack surface (a device-driver bug
+    /// becomes reachable from the cage), a choice an untrusted project may not make. Empty or absent
+    /// leaves the cage's minimal `/dev` (null/zero/urandom/tty…) with no host devices.
+    pub(crate) devices: Option<RawDevices>,
     /// Network-scoped config that is not itself a posture — currently the reusable egress
     /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
     /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
@@ -202,6 +208,19 @@ pub(crate) struct RawSeccomp {
     pub(crate) allow: Vec<String>,
 }
 
+/// The `[devices]` table: a trusted grant of host device nodes into the cage. Each `allow` entry is
+/// an absolute path under `/dev/` — a single device node (`/dev/kvm`, `/dev/net/tun`, `/dev/fuse`)
+/// or a directory of them (`/dev/dri` for a GPU). The cage's default `/dev` is a minimal, hostless
+/// tree (null/zero/urandom/tty…); an allowed path is bound over it with device access, so the tool
+/// reaches the real host device. A malformed entry (not absolute, not under `/dev/`, or containing a
+/// `..` component) is dropped with a warning (fail-closed); a device absent on the host is skipped at
+/// launch, not fatal. Empty or absent leaves the minimal `/dev`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawDevices {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+}
+
 /// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
 /// baseline. The overlay fields reuse the baseline shapes and gate identically — an
 /// untrusted project's app may add `env`/`packages` and choose the command, but its
@@ -250,6 +269,11 @@ pub(crate) struct RawApp {
     /// control), so an untrusted project's app `[seccomp]` is dropped. An unset `Option` is omitted
     /// on export, so an app that relaxes nothing carries no `[seccomp]` table.
     pub(crate) seccomp: Option<RawSeccomp>,
+    /// The host device nodes this app grants into its cage, unioned onto the baseline's. A security
+    /// field, gated like the baseline `[devices]` (a host device widens the kernel attack surface),
+    /// so an untrusted project's app `[devices]` is dropped. An unset `Option` is omitted on export,
+    /// so an app that needs no device carries no `[devices]` table.
+    pub(crate) devices: Option<RawDevices>,
     /// Where this app's persistent `$HOME` (its config, login state, history) lives:
     /// `"global"` (the default) — one home per app, shared across every project, so the app
     /// keeps a single identity wherever it runs; or `"project"` — a home per (project, app),
