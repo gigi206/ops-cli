@@ -47,7 +47,7 @@ const CAGE_UDS: &str = "/tmp/ops-egress.sock";
 /// Where the proxy's CA certificate appears in the cage, read-only. Under `/opt/ops`
 /// (already a cage directory for the mise plugin and shell rc), so the agent cannot
 /// rewrite the trust anchor.
-const CAGE_CA: &str = "/opt/ops/egress-ca.pem";
+pub(crate) const CAGE_CA: &str = "/opt/ops/egress-ca.pem";
 
 /// The CA-bundle environment variables ops sets so the cage's toolchains trust its
 /// per-session CA, and — being the keys it sets — exactly the keys an untrusted project

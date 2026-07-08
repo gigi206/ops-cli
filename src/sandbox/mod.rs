@@ -8,6 +8,7 @@
 
 mod argv;
 mod binds;
+mod catrust;
 pub(crate) mod cgroup;
 mod contract;
 pub(crate) mod control;

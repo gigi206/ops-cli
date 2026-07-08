@@ -24,15 +24,13 @@
 # reference FLOATS until you run `ops upgrade flake`, which pins it (a floating package is sticky to
 # its first build — it does not advance on its own).
 #
-# WHY `cmd` IS A `bash` WRAPPER (the MITM-CA import). Under the allowlist ops runs a TLS-terminating
-# proxy with a per-session CA, which it injects into the cage via the CA-file env vars
-# (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …). Electron/Chromium **ignores those** — it trusts its
-# own NSS database (`~/.pki/nssdb`), so without help every HTTPS request fails
-# `ERR_CERT_AUTHORITY_INVALID` and the UI cannot load. The wrapper imports ops's CA into that NSS db
-# with `certutil` (from the `nss` package below) and passes `--use-system-ca`, so the app trusts the
-# proxy and egress stays filtered. (`$SSL_CERT_FILE` is ops's CA under a filtering posture; the
-# `/opt/ops/egress-ca.pem` fallback is where ops binds it.) This is a profile-level shim; making ops
-# seed the NSS db for every Chromium app is a cleaner, separate improvement.
+# CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars ops sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
+# `ERR_CERT_AUTHORITY_INVALID` and its UI could not load. For a `gui = "wayland"` cage under a
+# filtering posture, **ops now seeds its MITM CA into the cage's NSS db automatically** (part of
+# the GUI hole, like fonts), so the app trusts the proxy and egress stays filtered — no per-profile
+# shim needed. The app only has to be told to consult that store, hence `--use-system-ca`.
 #
 # DISPLAY. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and provisions
 # fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation is
@@ -45,7 +43,14 @@
 # avoids the small cage `/dev/shm`. The cage has no dbus bus, so desktop notifications, a tray icon,
 # and the system keyring are unavailable — benign for editing/chat; a keyring-backed login would
 # fall back to a file in the app's isolated home.
-cmd = ["bash", "-c", "DB=\"$HOME/.pki/nssdb\"; mkdir -p \"$DB\"; certutil -d \"sql:$DB\" -N --empty-password 2>/dev/null; certutil -d \"sql:$DB\" -A -n ops-mitm -t C,, -i \"${SSL_CERT_FILE:-/opt/ops/egress-ca.pem}\" 2>/dev/null; exec opencode-desktop --no-sandbox --ozone-platform=wayland --disable-gpu --disable-dev-shm-usage --use-system-ca"]
+cmd = [
+    "opencode-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+]
 
 gui = "wayland"
 
@@ -60,10 +65,6 @@ gui = "wayland"
 
 [packages]
 opencode-desktop = "flake:github:tomsch/opencode-desktop-nix#opencode-desktop"
-# certutil (NSS tools) — the cmd wrapper above uses it to import ops's MITM CA into the cage's NSS
-# db so Electron/Chromium trusts the egress proxy under the allowlist. A stable substrate tool, so
-# it is a nixpkgs `nix:` package (seeded, offline-reusable).
-nss = "nix:nss.tools"
 
 [network]
 mode = "deny"

@@ -108,11 +108,12 @@ can only reach the provider you listed.
 > `tomsch/opencode-desktop-nix` flake) so no bun/source build is needed, and displayed through
 > `gui = "wayland"`. Proven live **under the allowlist**: version 1.17.15 built in-cage
 > (`.deb` fetched from GitHub, autoPatchelf'd), the Electron window mapped and rendered on the
-> Wayland compositor, and its HTTPS ran through the egress MITM once ops's CA was imported into the
-> cage's NSS database (the `cmd` wrapper's `certutil` step — Electron ignores the CA-file env vars).
-> `ops net logs` showed the model catalogue / gateway / plugin fetches allowed and the Sentry
-> telemetry denied — egress filtered as intended. The remaining flagship step, as for every
-> profile, is the live credential/auth with your own provider key.
+> Wayland compositor, and its HTTPS ran through the egress MITM because ops seeds its per-session
+> CA into the cage's NSS database automatically for a `gui = "wayland"` cage under a filtering
+> posture (Electron ignores the CA-file env vars other tools honour). `ops net logs` showed the
+> model catalogue / gateway / plugin fetches allowed and the Sentry telemetry denied — egress
+> filtered as intended. The remaining flagship step, as for every profile, is the live
+> credential/auth with your own provider key.
 
 ## Tool freshness
 
@@ -224,8 +225,9 @@ do not guess the values, so each waits on a real fact or on a named feature:
   Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with a flake
   that `autoPatchelfHook`s it (fetch via nix from GitHub — avoids the from-source `bun install`
   wall); (2) **`gui = "wayland"`** plus the Chromium flags (`--no-sandbox --ozone-platform=wayland
-  --disable-gpu`); (3) under the allowlist, **import ops's MITM CA into the app's NSS db** (Chromium
-  ignores the CA-file env vars), as `opencode-desktop`'s `cmd` wrapper does with `certutil`. Still
+  --disable-gpu --use-system-ca`); (3) nothing extra for CA trust — ops **seeds its MITM CA into
+  the cage's NSS db automatically** for a gui cage under a filtering posture (Chromium ignores the
+  CA-file env vars other tools honour). Still
   waiting, each on a real fact: **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that
   drives *other* agents — its targets `codex`/`claude`/`opencode` are already profiled as CLIs), the
   Antigravity *IDE* (distinct from the `agy` CLI, profiled above), and hermes desktop — each needs a

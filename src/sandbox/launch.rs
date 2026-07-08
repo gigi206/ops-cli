@@ -1890,14 +1890,45 @@ fn build(
     };
     let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
 
+    // CA trust for a Chromium/Electron GUI app under a filtering posture: Chromium ignores the
+    // CA-file env vars ops sets and reads its own NSS db, so under the egress MITM it rejects
+    // ops's per-session CA and a graphical app's UI cannot load. When the cage is BOTH `gui =
+    // "wayland"` AND a filtering allowlist, provision `certutil` (part of the GUI hole, like the
+    // fonts) so the command wrap below can import the bound CA into the cage's NSS db. Gated to
+    // exactly those cages — a CLI tool needs nothing (its env-reading TLS already trusts the CA),
+    // and `shared`/`none` has no MITM CA. Best-effort: a provisioning failure warns and the app
+    // runs (and fails its own HTTPS) rather than blocking the launch.
+    let ca_trust = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+        && matches!(prep.cfg.network, crate::config::NetworkPolicy::Allowlist(_))
+    {
+        match super::catrust::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(ct) => Some(ct),
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "`gui = \"wayland\"` under a network allowlist but certutil could not be \
+                     provisioned ({e}) — a Chromium/Electron app may not trust the egress proxy"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The GUI-hole store roots to seed: the fonts plus (when present) certutil, so the cage reads
+    // both through `/nix`.
+    let mut gui_roots: Vec<PathBuf> = font_roots.to_vec();
+    if let Some(ct) = &ca_trust {
+        gui_roots.push(ct.root.clone());
+    }
+
     // Seed the project's own writable store with the closure of everything the cage
     // resolves through `/nix` — the base userland, every provisioned tool, and (under the
-    // GUI hole) the fonts — then back `/nix` with it read-write. The cage reads and writes
-    // only its own store, so an agent that installs a toolchain writes into the project's
+    // GUI hole) the fonts and certutil — then back `/nix` with it read-write. The cage reads and
+    // writes only its own store, so an agent that installs a toolchain writes into the project's
     // copy and the shared store is never in the cage. Which store backs `/nix` is ops's
     // decision, not a configurable field, so an untrusted project cannot keep the shared
     // store mounted or widen its access.
-    let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, font_roots) {
+    let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ops: cannot prepare the project's store: {e}");
@@ -2083,6 +2114,14 @@ fn build(
             ExitCode::FAILURE
         })?;
         cmd = egress::wrap_command(&prep.userland.socat_bin, &prep.userland.shell_bin, cmd);
+        // For a GUI cage, import ops's MITM CA into the cage's NSS db before the app runs, so a
+        // Chromium/Electron app trusts the egress proxy (it ignores the CA-file env vars). This
+        // is the outermost wrap — it runs, then execs the egress-wrapped command. Only present
+        // when `ca_trust` was provisioned (gui = "wayland" under this allowlist).
+        if let Some(ct) = &ca_trust {
+            cmd =
+                super::catrust::wrap(&ct.certutil, &prep.userland.shell_bin, egress::CAGE_CA, cmd);
+        }
         egress_binds = wiring.binds;
         egress_env = wiring.env;
         egress_guard = Some(guard);

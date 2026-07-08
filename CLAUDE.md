@@ -96,6 +96,32 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **GUI CA trust — ops seeds the egress MITM CA into the cage's NSS db for Chromium/Electron apps
+  (DONE 2026-07-08)** (`src/sandbox/catrust.rs` [new] + `mod.rs` + `egress.rs` [`CAGE_CA` →
+  `pub(crate)`] + `launch.rs`): the ops-core generalization of the per-profile CA→NSS shim
+  `opencode-desktop` shipped with. Chromium/Electron **ignores ops's CA-file env vars**
+  (`SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS`) and verifies against its **own NSS db** (`~/.pki/nssdb`),
+  so under the allowlist MITM a graphical app rejects ops's per-session CA
+  (`ERR_CERT_AUTHORITY_INVALID`) and its UI cannot load. When a cage is BOTH `gui = "wayland"` AND a
+  filtering `Allowlist`, ops now provisions `certutil` (`nss.tools`, part of the GUI hole like the
+  fonts — **gated so only GUI+filtering cages pay the closure**, seeded into the project store) and
+  wraps the command (outermost, after the egress wrap) to import the bound CA
+  (`egress::CAGE_CA` = `/opt/ops/egress-ca.pem`) into the cage's NSS db before the app runs. **No new
+  trust:** the cage already trusts the MITM CA via the env vars; this extends the *same* trust to the
+  store Chromium reads. `catrust::wrap` rides the command **positionally** (`exec "$@"`, no config
+  interpolation; only the ops-controlled certutil store path + fixed CA path are interpolated).
+  **Live-caught bug (why live-verify matters):** `certutil -N` on an *existing* db — the persistent
+  per-app home reuses `~/.pki/nssdb` across launches — prompts for confirmation on stdin and HUNG the
+  tty-less launch; fixed by guarding `-N` on `cert9.db` absence AND redirecting every certutil step
+  from `/dev/null` (delete-then-add of a fixed `ops-mitm` nickname handles the per-session CA
+  rotation). **Proven live:** with the *clean* `opencode-desktop` profile (its per-profile `certutil`
+  wrapper + `nss` package removed — ops does it now, cmd back to the bare Electron invocation +
+  `--use-system-ca`), 1.17.15 renders under the allowlist, updater `checking → up-to-date` through the
+  MITM, egress filtered (Sentry denied). **961 unit (+1 `catrust::wrap`) + 90 config green**,
+  fmt/clippy `-D warnings` clean, std-only (reuses `store::provision`). **Residual:** the app still
+  passes `--use-system-ca` (its own Chromium flag to consult the system/NSS store — ops cannot add app
+  argv); a **dbus session bus** for GUI apps is still absent (no notifications/tray/system-keyring —
+  benign for editing/chat; a keyring login falls back to a file in the isolated home).
   **opencode GUI profiles — `opencode-web` + `opencode-desktop` (DONE 2026-07-08)**
   (`profiles/opencode-web.toml` [new] + `profiles/opencode-desktop.toml` [new] + `profiles/
   README.md`; no ops code change): two graphical ways to run opencode under ops, both live-proven.
@@ -125,11 +151,10 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   same name reuses the stale build — remove the out-link (or `ops upgrade flake`, which pins a
   rev-keyed out-link) to rebuild. **Upgrade:** `ops upgrade flake` rolls the app's flake package
   (bounded by what tomsch's flake pins); a floating package is sticky to its first warm build until
-  then. **Named follow-up (not built):** generalize the CA→NSS seeding into ops-core so every
-  Chromium/Electron app trusts the MITM CA under the allowlist automatically (a sandbox increment —
-  tests + advisor), replacing the per-profile `certutil` wrapper; and a dbus session bus for GUI apps
-  (currently absent → no desktop notifications/tray/keyring, benign for editing/chat). `the_shipped_
-  profiles_import_and_resolve` now covers 12 profiles.
+  then. **Follow-up now DONE (see the entry above):** the CA→NSS seeding was generalized into
+  ops-core (`catrust`), so `opencode-desktop`'s per-profile `certutil` wrapper was removed; a dbus
+  session bus for GUI apps remains absent (no desktop notifications/tray/keyring, benign for
+  editing/chat). `the_shipped_profiles_import_and_resolve` now covers 12 profiles.
   **`[network] mute` — SELinux-`dontaudit` egress-log suppression (DONE 2026-07-08)**
   (`src/allowlist.rs` + `config/{schema,mod,view,manage}.rs` + `sandbox/{control,proxy,egress,
   netlearn}.rs` + `{main,help}.rs` + `docs/guide/networking/{observability,rules}.md` +
