@@ -96,6 +96,42 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Synthetic `/etc/hosts` — `localhost` resolves in the cage (DONE 2026-07-08)** (`src/sandbox/
+  binds.rs` + `tests/run.rs` + `profiles/agy.toml` [new] + `profiles/README.md`): bringing up the
+  **Antigravity CLI (`agy`)** profile surfaced a real cage gap. `agy` starts an internal language
+  server that binds `localhost`; the hermetic cage carried **no `/etc/hosts`**, so resolving the
+  *name* `localhost` fell through the file lookup to DNS — which the Model-B empty netns has no
+  resolver for (`resolv.conf` points at the unreachable `127.0.0.53` stub) — and `agy` exited
+  immediately (`CLI failed to start … lookup localhost … connection refused`). The loopback
+  *interface* was already up (the egress `socat` forwarder binds `127.0.0.1`); only the *name*
+  failed. **This falsifies the premise recorded in the cage-naming entry below** that `/etc/hosts`
+  was safe to drop because "the tools that warn `unable to resolve host` aren't in the cage" — `agy`
+  does not warn, it **hard-fails**. Fix: a **synthetic `/etc/hosts`** (`hosts_contents`) mapping
+  `localhost` **and** the cage's own `ops-<slug>` hostname to loopback (v4 + v6), materialized via
+  `write_atomic` beside the synthetic identity (outside every writable mount, so the agent cannot
+  rewrite its own name resolution) and bound **read-only** at `/etc/hosts` in `assemble` — the same
+  pattern as `/etc/passwd`/`group`. **Security-neutral:** it is *synthetic* (never a bind of the
+  host's `/etc/hosts`, which would leak the user's other host entries), contains only loopback
+  mappings, and adds no network reach — the loopback interface was already up; only name resolution
+  is added. Broadly useful beyond `agy` — any tool that binds or reaches an internal `localhost`
+  server (an in-process language server, a dev server, a local MCP) needed it. The hostname line
+  reuses `naming::cage_hostname(&slug)`, the exact value the argv passes to `--hostname`, so the two
+  cannot drift; `build_spec` computes the slug once, before materializing hosts and again at
+  `with_cage_slug`. `/etc/hosts` added to `STRUCTURAL_DESTS` (the bind-nesting guard). **Tests:**
+  2 unit (`hosts_contents` maps localhost + hostname to loopback only; `assemble` emits the ro
+  `/etc/hosts` bind) → 36 `binds` tests green incl. the real-cage smokes; **1 run.rs e2e**
+  `the_cage_resolves_localhost_via_a_synthetic_hosts_file` (**ran live 24.7s**, not skipped): under
+  a trusted `network = "none"` (empty netns — the exact failing condition, where only `/etc/hosts`
+  can answer) `curl -v http://localhost:1` resolves to `127.0.0.1` (a connection error, nothing
+  listening) and never reports "could not resolve host". fmt/clippy `-D warnings` clean, **std-only**
+  (no new dep). **Live-proven for `agy`:** with the fix its language server starts (the `lookup
+  localhost` error is gone from its `cli.log`) and the process reaches the Google Sign-In step
+  (blocks awaiting login) instead of quitting immediately. **The `agy` profile** (account/OAuth
+  class, `mise:aqua:google-antigravity/antigravity-cli`, no `[secret]` — Google does not support a
+  BYOK header key for the CLI) equips fresh (1.0.16) and runs headless (`--version`/`--help`
+  confirmed the `-p`/`--print` mode); the remaining pending items (the OAuth **keyring**-vs-file
+  persistence, and the runtime **model host**) need a real Google account — the standard live-auth
+  step deferred for every profile.
   **One-shot `--seccomp` / `--device` flags — closing the two fail-closed override residuals (DONE
   2026-07-07)** (`src/config/overrides.rs` + `config/mod.rs` + `src/{main,help}.rs` + `docs/guide/
   configuration/{seccomp,devices,overrides}.md` + `tests/{config,run}.rs`): the two typed one-shot

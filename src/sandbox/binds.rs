@@ -210,6 +210,8 @@ struct SandboxPaths<'a> {
     contract_src: &'a Path,
     /// Synthetic `xdg-open` script; bound read-only at [`XDG_OPEN_INCAGE`].
     xdg_open_src: &'a Path,
+    /// Synthetic `/etc/hosts`; bound read-only at `/etc/hosts`.
+    hosts_src: &'a Path,
 }
 
 /// Assemble a [`SandboxSpec`] from already-resolved host paths. Pure: no I/O, no
@@ -333,6 +335,18 @@ fn assemble(
         Mount::RoBind {
             src: paths.group_src.to_path_buf(),
             dest: PathBuf::from("/etc/group"),
+        },
+        // Zone 1 — a synthetic `/etc/hosts` mapping `localhost` (and the cage's own
+        // hostname) to loopback. A hermetic cage carries no `/etc/hosts`, so a tool that
+        // resolves the *name* `localhost` — e.g. to bind an internal server on it — falls
+        // through the file lookup to DNS, which the empty netns has no resolver for, and
+        // fails hard. The loopback interface itself is already up (the egress forwarder binds
+        // `127.0.0.1`); this only adds the name resolution. Synthetic, like the identity files
+        // — it exposes no host data (never the host's own `/etc/hosts`), so it is bound
+        // read-only from outside every writable mount.
+        Mount::RoBind {
+            src: paths.hosts_src.to_path_buf(),
+            dest: PathBuf::from("/etc/hosts"),
         },
         // Zone 1 — TLS: ops's own CA bundle from its store rather than the host, so HTTPS
         // trust is hermetic. Bound at the two standard certificate paths a Linux toolchain
@@ -490,6 +504,7 @@ const STRUCTURAL_DESTS: &[&str] = &[
     "/tmp",
     "/etc/passwd",
     "/etc/group",
+    "/etc/hosts",
     "/etc/resolv.conf",
     "/etc/ssl/certs/ca-certificates.crt",
     "/lib64/ld-linux-x86-64.so.2",
@@ -734,6 +749,18 @@ fn group_contents(id: &Identity) -> String {
     )
 }
 
+/// The synthetic `/etc/hosts`: `localhost` (and the cage's own `ops-<slug>` hostname) mapped to
+/// loopback, so a name lookup of either resolves via the file without reaching DNS — which the
+/// cage's empty netns has no resolver for. Only these loopback mappings appear; no host entry is
+/// leaked. The hostname is placed on the `localhost` lines so a tool that resolves its own
+/// hostname (`gethostname` → `getaddrinfo`) also gets a loopback answer instead of a DNS failure.
+fn hosts_contents(hostname: &str) -> String {
+    format!(
+        "127.0.0.1\tlocalhost {hostname}\n\
+         ::1\tlocalhost ip6-localhost ip6-loopback {hostname}\n"
+    )
+}
+
 /// Which persistent runtime a launch uses — the writable `$HOME` and its sibling synthetic
 /// `/etc`. `ops run`/`ops shell` use the project's shared default; an app gets a dedicated,
 /// persistent home so its config, login state, and history never bleed into the project shell
@@ -940,6 +967,26 @@ pub(crate) fn build_spec(
     let mise_plugin = super::miseplugin::stage(data_dir)?;
     super::miseplugin::register(&rt.home_src.join(MISE_DATA_REL).join("plugins"))?;
 
+    // The cage's readable name: the app name for `ops app <name>`, else the project's own
+    // directory name. Carried on the spec so the scope, hostname, and session listing all
+    // read the same slug. Computed here (not only at the end) because the synthetic
+    // `/etc/hosts` maps the cage hostname derived from it.
+    let app = match runtime {
+        Runtime::ProjectDefault => None,
+        Runtime::GlobalApp(name) | Runtime::ProjectApp(name) => Some(name),
+    };
+    let slug = super::naming::cage_slug(app, &project);
+
+    // Materialize the synthetic `/etc/hosts` beside the other synthetic files (outside every
+    // writable mount, so the agent has no writable alias to rewrite the name resolution it
+    // relies on). It maps `localhost` and the cage's own `ops-<slug>` hostname to loopback;
+    // the hostname matches the `--hostname` the launch sets, both from this same slug.
+    let hosts = rt.etc_dir.join("hosts");
+    write_atomic(
+        &hosts,
+        hosts_contents(&super::naming::cage_hostname(&slug)).as_bytes(),
+    )?;
+
     let paths = SandboxPaths {
         project: &project,
         home_src: &rt.home_src,
@@ -949,15 +996,8 @@ pub(crate) fn build_spec(
         shell_rc_src: &shell_rc,
         contract_src: &contract,
         xdg_open_src: &xdg_open,
+        hosts_src: &hosts,
     };
-    // The cage's readable name: the app name for `ops app <name>`, else the project's own
-    // directory name. Carried on the spec so the scope, hostname, and session listing all
-    // read the same slug.
-    let app = match runtime {
-        Runtime::ProjectDefault => None,
-        Runtime::GlobalApp(name) | Runtime::ProjectApp(name) => Some(name),
-    };
-    let slug = super::naming::cage_slug(app, &project);
     assemble(
         &paths,
         userland,
@@ -1069,6 +1109,7 @@ mod tests {
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -1107,6 +1148,52 @@ mod tests {
                 STRUCTURAL_DESTS.iter().any(|s| Path::new(s) == dest),
                 "structural mount destination {dest:?} is not in STRUCTURAL_DESTS — list it, or \
                  the bind-nesting warning will not catch a config bind that overlaps it"
+            );
+        }
+    }
+
+    #[test]
+    fn assemble_binds_a_read_only_hosts_file() {
+        // A hermetic cage has no `/etc/hosts`; without it a tool resolving the *name* `localhost`
+        // (e.g. to bind an internal server on it) falls through to DNS, which the empty netns has
+        // no resolver for, and fails hard. The bind must be read-only from the synthetic source,
+        // so the agent cannot rewrite the name resolution it depends on.
+        let spec = assembled();
+        let hosts = spec
+            .mounts
+            .iter()
+            .find(|m| m.dest() == Path::new("/etc/hosts"))
+            .expect("a /etc/hosts mount is emitted");
+        match hosts {
+            Mount::RoBind { src, .. } => assert_eq!(
+                src.as_path(),
+                Path::new("/data/ops/projects/abc/etc/hosts"),
+                "bound from the synthetic source"
+            ),
+            other => panic!("/etc/hosts must be a read-only bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_synthetic_hosts_maps_localhost_and_the_cage_hostname() {
+        let h = hosts_contents("ops-agy");
+        assert!(
+            h.contains("127.0.0.1\tlocalhost"),
+            "localhost → IPv4 loopback: {h:?}"
+        );
+        assert!(
+            h.contains("::1\tlocalhost"),
+            "localhost → IPv6 loopback: {h:?}"
+        );
+        assert!(
+            h.contains("ops-agy"),
+            "the cage's own hostname resolves too: {h:?}"
+        );
+        // Every entry maps to loopback — no host address is ever written into the cage.
+        for line in h.lines() {
+            assert!(
+                line.starts_with("127.0.0.1") || line.starts_with("::1"),
+                "every /etc/hosts entry maps to loopback: {line:?}"
             );
         }
     }
@@ -1222,6 +1309,7 @@ mod tests {
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1404,6 +1492,7 @@ mod tests {
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1476,6 +1565,7 @@ mod tests {
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
         };
         let overlay = Overlay {
             env: extra_env,
@@ -1770,6 +1860,7 @@ mod tests {
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
         };
         let nix = NixMount {
             src: PathBuf::from("/data/ops/projects/abc/store/nix"),

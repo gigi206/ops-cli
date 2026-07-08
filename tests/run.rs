@@ -200,6 +200,89 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
 }
 
 #[test]
+fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
+    // A hermetic cage carries no `/etc/hosts`, so the *name* `localhost` would fall through to
+    // DNS — which the empty-netns posture (Model B) has no resolver for. A tool that resolves the
+    // name to bind or reach an internal loopback server (an in-process language server, a dev
+    // server, a local MCP) then fails hard. ops synthesises an `/etc/hosts` mapping localhost →
+    // loopback. Prove resolution with teeth in the exact failing posture (`network = "none"`, an
+    // empty netns where only `/etc/hosts` can answer): `curl -v http://localhost:1` must resolve
+    // to 127.0.0.1 (then a connection error, nothing listening), NOT report "could not resolve
+    // host". `curl` is in the base toolset.
+    let project = TmpDir::new("hosts-proj");
+    let data = TmpDir::new("hosts-data");
+    let state = TmpDir::new("hosts-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"none\"\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → the `none` posture is dropped → shared net): seeds the base
+    // store over the network so the later isolated run is warm. Skip (not fail) if the host cannot
+    // sandbox, or if the cache is unreachable for the seed.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping localhost-resolve e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping localhost-resolve e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // trust the project so `network = "none"` (a security field) is honored → empty netns.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // the synthetic file is present with the localhost → loopback mapping
+    let hosts = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "cat", "/etc/hosts"],
+    );
+    let hosts_out = String::from_utf8_lossy(&hosts.stdout);
+    assert!(
+        hosts_out.contains("127.0.0.1") && hosts_out.contains("localhost"),
+        "the cage's /etc/hosts must map localhost to loopback: {hosts_out}"
+    );
+
+    // teeth: the NAME resolves to loopback in the empty netns (only /etc/hosts can do this here).
+    let curl = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "curl", "-sS", "-v", "http://localhost:1"],
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&curl.stdout),
+        String::from_utf8_lossy(&curl.stderr)
+    );
+    assert!(
+        combined.contains("127.0.0.1"),
+        "localhost must resolve to loopback in the cage (the /etc/hosts fix): {combined}"
+    );
+    assert!(
+        !combined.to_lowercase().contains("could not resolve"),
+        "localhost must not fail name resolution: {combined}"
+    );
+}
+
+#[test]
 fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
     // Fail-closed: a malformed `--config` is a usage error (exit 2) surfaced before any sandbox
     // work — never a silent drop that would launch a different posture than asked. Needs no capable
