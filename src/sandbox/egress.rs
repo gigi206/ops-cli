@@ -93,7 +93,9 @@ impl Egress {
     /// A snapshot of every egress decision this session logged, newest last. Taken after the cage
     /// exits (no more requests can arrive), it is the run's full record for `--net-learn`.
     pub(crate) fn observed_events(&self) -> Vec<super::control::LogEvent> {
-        self.log.snapshot(None, None).events
+        // The run's full record includes muted refusals (`--all`) — a `mute` rule only suppresses a
+        // live log *view*, it never removes a decision from what `--net-learn` observed.
+        self.log.snapshot(None, None, true).events
     }
 }
 

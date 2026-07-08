@@ -48,6 +48,10 @@ pub(crate) enum ManageError {
     /// A `deny` rule was added but there is no filtering posture to carry it (and a `deny` must
     /// not silently create an open denylist) — the user must set a posture first.
     DenyNeedsPosture,
+    /// A `mute` rule was added but there is no filtering posture to carry it — a mute suppresses a
+    /// *denied* request's log line, so with no proxy (a non-filtering posture) there is nothing to
+    /// mute; refuse rather than write an inert rule.
+    MuteNeedsPosture,
     /// The target's network is explicitly `shared`/`none` (a non-filtering posture); adding a rule
     /// would silently flip a deliberate choice, so refuse and let the user change it explicitly.
     NonFilteringPosture(String),
@@ -64,6 +68,9 @@ pub(crate) enum ManageError {
 pub(crate) enum EgressList {
     Allow,
     Deny,
+    /// The `mute` list — a `dontaudit` log filter (a denied request's line is suppressed from the
+    /// default `ops net log`), never a verdict. Same on-disk shape and grammar as `allow`/`deny`.
+    Mute,
 }
 
 impl EgressList {
@@ -71,6 +78,7 @@ impl EgressList {
         match self {
             EgressList::Allow => "allow",
             EgressList::Deny => "deny",
+            EgressList::Mute => "mute",
         }
     }
 }
@@ -109,6 +117,12 @@ impl std::fmt::Display for ManageError {
                 f,
                 "no filtering network posture is set, and a `deny` rule must not open one — set a \
                  posture first: `ops config set network allow` (a denylist) then `ops trust`"
+            ),
+            ManageError::MuteNeedsPosture => write!(
+                f,
+                "no filtering network posture is set, so a `mute` rule would be inert (there is no \
+                 proxy to suppress a refusal from) — set a posture first \
+                 (`ops config set network deny|allow`), then `ops net mute`"
             ),
             ManageError::NonFilteringPosture(p) => write!(
                 f,
@@ -366,10 +380,13 @@ pub(crate) fn add_egress_rule(
 
     let outcome = match case {
         NetCase::Absent => {
-            // A deny rule must not silently create an open denylist; only `allow` bootstraps, into
-            // the most restrictive (deny-by-default) posture.
-            if list == EgressList::Deny {
-                return Err(ManageError::DenyNeedsPosture);
+            // Only `allow` bootstraps a posture (the most restrictive, deny-by-default allowlist). A
+            // `deny` must not silently open a denylist, and a `mute` with no filtering posture is
+            // inert (nothing to suppress) — each needs the user to set a posture first.
+            match list {
+                EgressList::Deny => return Err(ManageError::DenyNeedsPosture),
+                EgressList::Mute => return Err(ManageError::MuteNeedsPosture),
+                EgressList::Allow => {}
             }
             parent.insert(
                 "network",
@@ -424,6 +441,102 @@ pub(crate) fn add_egress_rule(
 
     write_doc(path, &doc)?;
     Ok(outcome)
+}
+
+/// The result of removing an egress rule.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoveOutcome {
+    /// The rule was present and removed.
+    Removed,
+    /// The rule was not present (nothing changed): an idempotent no-op.
+    NotPresent,
+}
+
+/// Remove an egress `rule` from the `list` of the target's `[network]` table — the inverse of
+/// [`add_egress_rule`]. An absent file, an absent `[network]`, a bare-string posture (which carries
+/// no lists), or a rule simply not in the list are all a clean [`RemoveOutcome::NotPresent`], never
+/// an error, so `ops net unmute` of something already gone is idempotent. Unlike the add path it
+/// **never creates** the app/network scaffolding — there is nothing to remove from a table that does
+/// not exist. Preserves comments/formatting and writes atomically only when it actually removed
+/// something.
+pub(crate) fn remove_egress_rule(
+    path: &Path,
+    app: Option<&str>,
+    list: EgressList,
+    rule: &str,
+) -> Result<RemoveOutcome, ManageError> {
+    if !path.exists() {
+        return Ok(RemoveOutcome::NotPresent);
+    }
+    let mut doc = read_or_empty(path)?;
+    // Navigate to the table holding `network` WITHOUT creating anything (the add path creates the
+    // `[app.<name>]` scaffolding; removal must not).
+    let parent = match app {
+        None => Some(doc.as_table_mut()),
+        Some(name) => doc
+            .as_table_mut()
+            .get_mut("app")
+            .and_then(Item::as_table_mut)
+            .and_then(|apps| apps.get_mut(name))
+            .and_then(Item::as_table_mut),
+    };
+    let Some(parent) = parent else {
+        return Ok(RemoveOutcome::NotPresent);
+    };
+    let removed = match parent.get_mut("network") {
+        Some(Item::Table(t)) => {
+            let hit = t
+                .get_mut(list.key())
+                .and_then(Item::as_array_mut)
+                .is_some_and(|arr| remove_from_array(arr, rule));
+            // Drop a now-empty list so no `mute = []` residue is left behind.
+            if hit
+                && t.get(list.key())
+                    .and_then(Item::as_array)
+                    .is_some_and(Array::is_empty)
+            {
+                t.remove(list.key());
+            }
+            hit
+        }
+        Some(Item::Value(v)) if v.is_inline_table() => {
+            let it = v
+                .as_inline_table_mut()
+                .expect("inspected as an inline table");
+            let hit = it
+                .get_mut(list.key())
+                .and_then(Value::as_array_mut)
+                .is_some_and(|arr| remove_from_array(arr, rule));
+            if hit
+                && it
+                    .get(list.key())
+                    .and_then(Value::as_array)
+                    .is_some_and(Array::is_empty)
+            {
+                it.remove(list.key());
+            }
+            hit
+        }
+        // Absent, a bare-string posture (no lists), or a malformed field: nothing to remove.
+        _ => false,
+    };
+    if !removed {
+        return Ok(RemoveOutcome::NotPresent);
+    }
+    write_doc(path, &doc)?;
+    Ok(RemoveOutcome::Removed)
+}
+
+/// Remove the first exact-string match of `rule` from `arr`, reporting whether one was removed.
+fn remove_from_array(arr: &mut Array, rule: &str) -> bool {
+    let idx = arr.iter().position(|v| v.as_str() == Some(rule));
+    match idx {
+        Some(i) => {
+            arr.remove(i);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Validate the `mode` of a `[network]` table/inline-table before appending an allow/deny rule to
@@ -855,6 +968,66 @@ mod tests {
             body.contains("mode = \"deny\"") && body.contains("allow = [\"github.com\"]"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn mute_rule_add_and_remove_round_trip_on_a_table() {
+        let tmp = crate::testutil::TmpDir::new();
+        // A filtering posture already exists (the common `ops net mute -a <app>` case).
+        let p = doc_at(
+            tmp.path(),
+            "[network]\nmode = \"deny\"\nallow = [\"api.test\"]\n",
+        );
+
+        // Add a mute rule → it lands in a `mute` array beside `allow`, the verdict lists untouched.
+        let added = add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap();
+        assert_eq!(added, AddOutcome::Added { created_mode: None });
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("mute = [\"play.googleapis.com\"]"), "{body}");
+        assert!(
+            body.contains("allow = [\"api.test\"]"),
+            "the allow list is untouched:\n{body}"
+        );
+
+        // Adding the same rule again is idempotent.
+        assert_eq!(
+            add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+
+        // Remove it → gone; a second removal is a reported no-op.
+        assert_eq!(
+            remove_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap(),
+            RemoveOutcome::Removed
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !body.contains("play.googleapis.com"),
+            "the mute rule is removed:\n{body}"
+        );
+        assert!(
+            !body.contains("mute"),
+            "removing the last entry drops the key — no empty `mute = []` residue:\n{body}"
+        );
+        // The verdict lists it sat beside are untouched by the mute removal.
+        assert!(body.contains("allow = [\"api.test\"]"), "{body}");
+        assert_eq!(
+            remove_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap(),
+            RemoveOutcome::NotPresent
+        );
+    }
+
+    #[test]
+    fn a_mute_rule_needs_a_filtering_posture() {
+        let tmp = crate::testutil::TmpDir::new();
+        // No `[network]` at all → a mute would be inert, so it is refused (like a posture-less deny),
+        // and nothing is written.
+        let p = tmp.path().join(".ops.toml");
+        assert!(matches!(
+            add_egress_rule(&p, None, EgressList::Mute, "x.test"),
+            Err(ManageError::MuteNeedsPosture)
+        ));
+        assert!(!p.exists(), "a refused mute writes nothing");
     }
 
     #[test]

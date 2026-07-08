@@ -309,6 +309,7 @@ mod tests {
             path: path.map(str::to_string),
             verdict: LogVerdict::Deny,
             reason: reason.to_string(),
+            muted: false,
             status: None,
             amend_seq: None,
         }

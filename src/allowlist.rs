@@ -640,6 +640,11 @@ pub(crate) enum DefaultAction {
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
+    /// Log-suppression rules (SELinux `dontaudit`): a **denied** request matching one of these is
+    /// still refused and still counted in `ops net stats`, but its refusal is kept out of the
+    /// default `ops net log` view (`ops net log --all` shows it). Consulted only at logging time via
+    /// [`Self::muted`], never in [`Self::explain`] — so a mute entry can never change a verdict.
+    mute: Vec<Rule>,
     default_action: DefaultAction,
     ask_timeout: Option<std::time::Duration>,
     /// Stored inverted so the derived `Default` (and [`Self::new`]) both mean "notice shown".
@@ -654,10 +659,19 @@ impl EgressPolicy {
         Self {
             allow,
             deny,
+            mute: Vec::new(),
             default_action: DefaultAction::Deny,
             ask_timeout: None,
             suppress_ask_notice: false,
         }
+    }
+
+    /// Attach the log-suppression (`mute`) rules, returning the policy (builder style). A denied
+    /// request matching one is refused as usual and counted in stats, but kept out of the default
+    /// `ops net log` view. Purely a logging filter — never consulted by [`Self::explain`].
+    pub(crate) fn with_mute(mut self, mute: Vec<Rule>) -> Self {
+        self.mute = mute;
+        self
     }
 
     /// Set the action a request matching no rule gets, returning the policy (builder style).
@@ -704,6 +718,36 @@ impl EgressPolicy {
 
     pub(crate) fn deny_rules(&self) -> &[Rule] {
         &self.deny
+    }
+
+    pub(crate) fn mute_rules(&self) -> &[Rule] {
+        &self.mute
+    }
+
+    /// Whether a **denied** request to `host:port` for `path`/`method` matches a mute rule — a
+    /// LOG-ONLY filter (SELinux `dontaudit`): it never affects the verdict (only [`Self::explain`]
+    /// does), only whether the refusal enters the default `ops net log` view. The proxy consults it
+    /// at logging time, after the verdict, and still counts a muted refusal in `ops net stats`. Only
+    /// [`Layer::L7`] (inspected) rules participate, matched exactly as [`Self::explain`] matches
+    /// (same canonicalized request, same method-set semantics), so a mute entry reads identically to
+    /// an allow/deny entry. A method-less request (an early-CONNECT block) is matched with an empty
+    /// method, so a method-scoped mute rule does not match it — failing toward *showing* the log, the
+    /// safe direction when the verb is unknown.
+    pub(crate) fn muted(
+        &self,
+        host: &str,
+        port: u16,
+        path: Option<&str>,
+        method: Option<&str>,
+    ) -> bool {
+        if self.mute.is_empty() {
+            return false;
+        }
+        let req = Request::new(host, port, path.unwrap_or("/"));
+        let method = method.unwrap_or("").to_ascii_uppercase();
+        self.mute
+            .iter()
+            .any(|r| r.layer == Layer::L7 && r.matches(&req, &method))
     }
 
     /// Whether a request to `host`:`port` for `path` is permitted: it must match some
@@ -2535,6 +2579,49 @@ mod tests {
             EgressPolicy::default().default_action(),
             DefaultAction::Deny
         );
+    }
+
+    #[test]
+    fn mute_is_a_log_filter_that_never_touches_the_verdict() {
+        // A deny-by-default policy that mutes one host. `mute` is a `dontaudit` log filter — it must
+        // change no verdict, only whether the refusal is reported by `muted`.
+        let policy = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("play.googleapis.com")]);
+
+        // The muted host is still DENIED (mute changed the verdict of nothing) ...
+        assert_eq!(
+            policy.explain("play.googleapis.com", 443, "/log", "POST"),
+            Decision::DeniedDefault
+        );
+        // ... and it reports muted, so the proxy keeps its refusal out of the default log.
+        assert!(policy.muted("play.googleapis.com", 443, Some("/log"), Some("POST")));
+
+        // A different denied host is NOT muted — its refusal still logs.
+        assert!(!policy.muted("api.example.com", 443, Some("/x"), Some("GET")));
+        // A policy with no mute rules mutes nothing.
+        assert!(!EgressPolicy::new(vec![], vec![]).muted(
+            "play.googleapis.com",
+            443,
+            Some("/log"),
+            None
+        ));
+        // The mute set is surfaced for `ops net rules` / `ops config show`.
+        assert_eq!(policy.mute_rules().len(), 1);
+    }
+
+    #[test]
+    fn mute_honors_method_and_path_scope_like_a_verdict_rule() {
+        // A method- and path-scoped mute entry: only a matching verb+path is muted, so a mute reads
+        // identically to an allow/deny rule and never over-suppresses.
+        let policy = EgressPolicy::new(vec![], vec![])
+            .with_mute(vec![rule("{POST} play.googleapis.com/log")]);
+        assert!(policy.muted("play.googleapis.com", 443, Some("/log"), Some("POST")));
+        // A different verb to the same path is not muted (its refusal still logs).
+        assert!(!policy.muted("play.googleapis.com", 443, Some("/log"), Some("GET")));
+        // A different path is not muted.
+        assert!(!policy.muted("play.googleapis.com", 443, Some("/other"), Some("POST")));
+        // A method-less request (an early-CONNECT block) does not match a method-scoped mute — the
+        // safe direction (show the log) when the verb is unknown.
+        assert!(!policy.muted("play.googleapis.com", 443, None, None));
     }
 
     #[test]

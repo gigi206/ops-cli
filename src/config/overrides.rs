@@ -626,6 +626,7 @@ fn split_hosts(hosts: &str, label: &str, kind: &str) -> Result<Vec<String>, Stri
 /// A `network` table with a mode and carve-out lists, the other fields left to inherit.
 fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField {
     NetworkField::Table(NetworkTable {
+        mute: vec![],
         mode: Some(mode.to_string()),
         allow,
         deny,

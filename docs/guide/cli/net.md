@@ -16,6 +16,7 @@ See also: [Networking overview](../networking/README.md) · [Rule grammar](../ne
 | [`rules`](#ops-net-rules) | list the effective allow/deny rules by source |
 | [`groups`](#ops-net-groups) | list reusable `[net.groups]`, or resolve one |
 | [`allow`](#ops-net-allow-and-deny) / [`deny`](#ops-net-allow-and-deny) | persist a rule to config |
+| [`mute`](#ops-net-mute-and-unmute) / [`unmute`](#ops-net-mute-and-unmute) | add / remove a log-suppression (`dontaudit`) rule |
 | [`pending`](#ops-net-pending) | list and answer `ask`-mode parked requests |
 | [`stats`](#ops-net-stats) | per-host allow/deny/blocked decision counters |
 | [`logs`](#ops-net-logs) | the live, per-request egress log of a running session |
@@ -76,6 +77,33 @@ ops net allow api.example.com --session -a bot   # only app `bot`'s session(s)
 ops net deny  ads.example.com --session --all    # every reachable session, this run only
 ```
 
+## ops net mute and unmute
+
+```
+ops net mute   <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
+ops net unmute <rule> [-l|--local|-g|--global] [-a|--app <name>]
+```
+
+`mute` adds a [`[network] mute`](../networking/observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit)
+rule (SELinux `dontaudit`): a **denied** request matching it is still refused and still
+counted in [`stats`](#ops-net-stats), but its line is kept out of the default
+[`ops net log`](#ops-net-logs) (see it with `--all`). It is a log filter, never a verdict —
+it cannot open egress. `unmute` removes such a rule (idempotent — removing an absent rule is a
+reported no-op). Same scope vocabulary as `allow`/`deny`: a config write needs an existing
+filtering posture (nothing to suppress under `shared`/`none`) and re-trusts the project
+config; the global config and `-a <name>` app profile are trusted by location.
+
+`--session` instead loads the mute into a **running** session's live overlay — it takes
+effect immediately and dies with the session, exactly like `ops net allow|deny --session`
+(scope with `-a <app>`/`--all`). A live mute is not un-loaded by `unmute` (a log filter has no
+counter-verdict); it ends with the session.
+
+```sh
+ops net mute   play.googleapis.com -a agy             # persist to the profile
+ops net unmute play.googleapis.com -a agy             # undo it
+ops net mute   play.googleapis.com --session -a agy   # quiet a running agy session now
+```
+
 ## `ops net pending`
 
 ```
@@ -106,11 +134,13 @@ recording is on by default (a trusted `[network] stats = false` disables it). Se
 
 ```
 ops net logs [-a <app>] [--host <h>] [--verdict allow|deny|blocked|error] [-n <N>]
-             [--with-query] [--with-status] [-f|--follow] [-i <secs>] [--json]
+             [--all] [--with-query] [--with-status] [-f|--follow] [-i <secs>] [--json]
 ```
 
 A chronological, per-request record of every egress decision a **running** session's
 proxy made. **Live-only** — the log lives in the running session's memory and is
 **never written to disk**; once the session exits, nothing remains. Verdicts are a
 superset of `stats`, adding `error` (allowed but did not complete). `--follow` tails
-it. See [Observability](../networking/observability.md).
+it. `--all` also shows refusals a [`[network] mute`](../networking/observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit)
+rule suppressed (tagged `muted`; still counted in `stats`). See
+[Observability](../networking/observability.md).

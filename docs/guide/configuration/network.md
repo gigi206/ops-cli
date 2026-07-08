@@ -51,6 +51,7 @@ for the full semantics.
 | `mode` | the egress mode; **absent** = inherit a filtering mode from the parent layer |
 | `allow` | egress rules that may reach (under `deny`) / auto-pass (under `ask`) |
 | `deny` | egress rules that may not reach (under `allow`) / auto-fail (under `ask`) |
+| `mute` | egress rules whose **denied** requests are kept out of the default [`ops net log`](../networking/observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit) (SELinux `dontaudit`) — a log filter, never a verdict change; still counted in `stats`, shown by `ops net log --all` |
 | `ask_timeout` | a duration (`"90s"`, `"5m"`) bounding a parked `ask` request; absent = indefinite |
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`ops net stats`](../networking/observability.md)) |

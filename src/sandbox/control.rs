@@ -221,6 +221,11 @@ pub(crate) struct ManualRules {
 struct ManualInner {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
+    /// Live `--session` mute (`dontaudit`) rules — a denied request matching one has its log line
+    /// suppressed for this session, never its verdict. Folded into the effective policy's mute set
+    /// alongside the config mutes; carried separately from allow/deny because it is a log filter,
+    /// not a verdict rule.
+    mute: Vec<Rule>,
 }
 
 impl ManualRules {
@@ -248,18 +253,37 @@ impl ManualRules {
         }
     }
 
-    /// Whether the overlay is empty — the common case, letting the proxy skip building an effective
-    /// policy and evaluate its immutable config policy directly (no per-request allocation).
-    pub(crate) fn is_empty(&self) -> bool {
-        let inner = self.inner.read().unwrap();
-        inner.allow.is_empty() && inner.deny.is_empty()
+    /// Add an egress `rule` to the live **mute** overlay — the `ops net mute <rule> --session` path.
+    /// A `dontaudit` log filter: a denied request matching it is still refused (and still counted),
+    /// only its log line is suppressed for this session. Deduped, so re-loading does not stack. Kept
+    /// off [`Verdict`] deliberately — a mute is not a park answer, so it never touches the
+    /// allow/deny/ask verdict paths.
+    pub(crate) fn remember_mute(&self, rule: Rule) {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.mute.contains(&rule) {
+            inner.mute.push(rule);
+        }
     }
 
-    /// A snapshot of the manual rules `(allow, deny)` — cloned out so the read lock is not held
-    /// across the fold into the effective policy, listing, or I/O.
+    /// Whether the overlay is empty — the common case, letting the proxy skip building an effective
+    /// policy and evaluate its immutable config policy directly (no per-request allocation). Includes
+    /// the mute overlay, so a live `--session` mute is folded in like an allow/deny.
+    pub(crate) fn is_empty(&self) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.allow.is_empty() && inner.deny.is_empty() && inner.mute.is_empty()
+    }
+
+    /// A snapshot of the manual verdict rules `(allow, deny)` — cloned out so the read lock is not
+    /// held across the fold into the effective policy, listing, or I/O.
     pub(crate) fn snapshot(&self) -> (Vec<Rule>, Vec<Rule>) {
         let inner = self.inner.read().unwrap();
         (inner.allow.clone(), inner.deny.clone())
+    }
+
+    /// A snapshot of the manual **mute** rules — cloned out (like [`Self::snapshot`]) so the read
+    /// lock is not held across the fold into the effective policy.
+    pub(crate) fn mute_snapshot(&self) -> Vec<Rule> {
+        self.inner.read().unwrap().mute.clone()
     }
 }
 
@@ -337,6 +361,12 @@ pub(crate) struct LogEvent {
     pub(crate) path: Option<String>,
     pub(crate) verdict: LogVerdict,
     pub(crate) reason: String,
+    /// Whether this refusal was suppressed from the default `ops net log` view by a `mute`
+    /// (SELinux `dontaudit`) rule. A muted event is still counted in `ops net stats` and lives in a
+    /// **separate** ring (so a muted flood never evicts a real event); it appears only under
+    /// `ops net log --all`, tagged. Only ever `true` for a `deny` (mute suppresses refusals, never
+    /// an allow, a security-guard `blocked`, or a downstream `error`).
+    pub(crate) muted: bool,
     /// The upstream HTTP status code (200/404/…), for a **completed L7** request only — filled in by
     /// [`LogRing::set_status`] once the response head returns, after the event was pushed at the
     /// decision point. `None` for an L4 (`tcp://`) splice (no HTTP response to parse), a refusal, an
@@ -378,6 +408,11 @@ struct LogInner {
     /// bumped only when a status is filled in, so a follow reader can pick up retroactive statuses.
     next_amend: u64,
     events: VecDeque<LogEvent>,
+    /// Muted refusals, kept out of the default view. A **separate** ring with the same cap so a
+    /// chatty muted host can never evict a real event from `events`; merged in (by `seq`) only when
+    /// a reader passes `include_muted` (`ops net log --all`). Shares `next_seq` with `events`, so the
+    /// two interleave in one monotonic order.
+    muted: VecDeque<LogEvent>,
 }
 
 impl LogRing {
@@ -387,6 +422,7 @@ impl LogRing {
                 next_seq: 1,
                 next_amend: 1,
                 events: VecDeque::new(),
+                muted: VecDeque::new(),
             }),
             cap: cap.max(1),
         }
@@ -399,6 +435,7 @@ impl LogRing {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &self,
+        muted: bool,
         host: &str,
         port: u16,
         method: Option<&str>,
@@ -413,7 +450,7 @@ impl LogRing {
         let mut g = self.inner.lock().unwrap();
         let seq = g.next_seq;
         g.next_seq += 1;
-        g.events.push_back(LogEvent {
+        let event = LogEvent {
             seq,
             at_epoch_ms,
             host: host.to_string(),
@@ -422,11 +459,16 @@ impl LogRing {
             path: path.map(str::to_string),
             verdict,
             reason: reason.to_string(),
+            muted,
             status: None,
             amend_seq: None,
-        });
-        while g.events.len() > self.cap {
-            g.events.pop_front();
+        };
+        // A muted refusal goes to its own ring so it can never evict a real event from `events`;
+        // both rings share `self.cap` and the monotonic `seq`.
+        let ring = if muted { &mut g.muted } else { &mut g.events };
+        ring.push_back(event);
+        while ring.len() > self.cap {
+            ring.pop_front();
         }
         seq
     }
@@ -458,7 +500,12 @@ impl LogRing {
     /// status that arrives after it passed the event's `seq`. A brand-new event (`seq > after`) is
     /// already included, so it is not re-emitted (no duplicate). `after_amend = None` (a tail read, or
     /// an old reader that does not track the amend cursor) does no retroactive re-emission.
-    pub(crate) fn snapshot(&self, after: Option<u64>, after_amend: Option<u64>) -> LogSnapshot {
+    pub(crate) fn snapshot(
+        &self,
+        after: Option<u64>,
+        after_amend: Option<u64>,
+        include_muted: bool,
+    ) -> LogSnapshot {
         let g = self.inner.lock().unwrap();
         let head = g.next_seq - 1;
         let amend_head = g.next_amend - 1;
@@ -469,6 +516,13 @@ impl LogRing {
             .filter(|e| e.seq > cursor)
             .cloned()
             .collect();
+        // `--all` folds the separate muted ring into the view, re-sorted into one `seq` order. The
+        // default view omits it entirely (muted refusals are suppressed). `dropped`/amend stay keyed
+        // on the main ring — a muted eviction never reports a gap (it is suppressed by design).
+        if include_muted {
+            events.extend(g.muted.iter().filter(|e| e.seq > cursor).cloned());
+            events.sort_by_key(|e| e.seq);
+        }
         if let Some(a) = after_amend {
             for e in g.events.iter() {
                 if e.seq <= cursor && e.amend_seq.is_some_and(|s| s > a) {
@@ -613,16 +667,27 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
             // `re:` regex carrying spaces. Re-validated here through the same classifier the config
             // resolver uses, so a malformed rule the CLI somehow let through cannot enter the overlay.
             let body = cmd["REMEMBER".len()..].trim_start();
-            let (verdict, rule_text) = if let Some(r) = body.strip_prefix("ALLOW ") {
-                (Verdict::Allow, r.trim())
+            // `MUTE` is a log-suppression rule, not a verdict, so it routes to the mute overlay
+            // rather than [`ManualRules::remember_rule`]; `ALLOW`/`DENY` stay verdict rules.
+            enum Kind {
+                Verdict(Verdict),
+                Mute,
+            }
+            let (kind, rule_text) = if let Some(r) = body.strip_prefix("ALLOW ") {
+                (Kind::Verdict(Verdict::Allow), r.trim())
             } else if let Some(r) = body.strip_prefix("DENY ") {
-                (Verdict::Deny, r.trim())
+                (Kind::Verdict(Verdict::Deny), r.trim())
+            } else if let Some(r) = body.strip_prefix("MUTE ") {
+                (Kind::Mute, r.trim())
             } else {
                 return "err bad-request\n".to_string();
             };
             match crate::allowlist::classify(rule_text) {
                 Ok(rule) => {
-                    manual.remember_rule(verdict, rule);
+                    match kind {
+                        Kind::Verdict(v) => manual.remember_rule(v, rule),
+                        Kind::Mute => manual.remember_mute(rule),
+                    }
                     "ok\n".to_string()
                 }
                 Err(_) => "err bad-request\n".to_string(),
@@ -631,13 +696,17 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
         Some("RULES") => {
             let (allow, deny) = manual.snapshot();
             let mut out = String::new();
-            // The rule text is emitted after the `manual allow `/`manual deny ` prefix; the reader
-            // takes the whole remainder, so a rule carrying whitespace (a `re:` regex) round-trips.
+            // The rule text is emitted after the `manual allow `/`manual deny `/`manual mute ` prefix;
+            // the reader takes the whole remainder, so a rule carrying whitespace (a `re:` regex)
+            // round-trips.
             for rule in allow {
                 out.push_str(&format!("manual allow {rule}\n"));
             }
             for rule in deny {
                 out.push_str(&format!("manual deny {rule}\n"));
+            }
+            for rule in manual.mute_snapshot() {
+                out.push_str(&format!("manual mute {rule}\n"));
             }
             out.push_str("ok\n");
             out
@@ -649,14 +718,18 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
             // follow); an old reader that omits it gets today's behavior (no re-emission).
             let mut after = None;
             let mut after_amend = None;
+            let mut include_muted = false;
             for token in parts {
                 if let Some(v) = token.strip_prefix("after=") {
                     after = v.parse().ok();
                 } else if let Some(v) = token.strip_prefix("amended=") {
                     after_amend = v.parse().ok();
+                } else if token == "all" {
+                    // `ops net log --all` — fold the muted (`dontaudit`) ring into the view.
+                    include_muted = true;
                 }
             }
-            let snapshot = log.snapshot(after, after_amend);
+            let snapshot = log.snapshot(after, after_amend, include_muted);
             let mut out = String::new();
             if snapshot.dropped > 0 {
                 out.push_str(&format!("dropped={}\n", snapshot.dropped));
@@ -687,6 +760,11 @@ fn format_event_line(ev: &LogEvent) -> String {
     );
     if let Some(status) = ev.status {
         line.push_str(&format!(" status={status}"));
+    }
+    // Emitted only for a muted event (so a default-view line is byte-unchanged); a reader that
+    // requested `--all` uses it to tag the suppressed refusal.
+    if ev.muted {
+        line.push_str(" muted=1");
     }
     if let Some(method) = &ev.method {
         line.push_str(&format!(" method={method}"));
@@ -835,6 +913,7 @@ pub(crate) fn read_log(
     socket: &Path,
     after: Option<u64>,
     after_amend: Option<u64>,
+    include_muted: bool,
 ) -> io::Result<LogSnapshot> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -846,6 +925,11 @@ pub(crate) fn read_log(
     // Only sent for a `--with-status` follow; an older session ignores the token (no re-emission).
     if let Some(a) = after_amend {
         cmd.push_str(&format!(" amended={a}"));
+    }
+    // `--all` — ask the session to fold its muted (`dontaudit`) ring in; an older session ignores
+    // the token (it has no muted ring) and returns its normal view.
+    if include_muted {
+        cmd.push_str(" all");
     }
     cmd.push('\n');
     (&stream).write_all(cmd.as_bytes())?;
@@ -881,10 +965,10 @@ pub(crate) fn read_log(
 /// filename's pid, and query it (with an optional per-nothing tail read — a shared cursor makes no
 /// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped.
 /// Sessions are returned ordered by pid for stable output.
-pub(crate) fn log_all(data_dir: &Path) -> Vec<SessionLog> {
+pub(crate) fn log_all(data_dir: &Path, include_muted: bool) -> Vec<SessionLog> {
     let mut sessions = Vec::new();
     for pid in session_pids(data_dir) {
-        if let Ok(snapshot) = read_log(&control_socket(data_dir, pid), None, None) {
+        if let Ok(snapshot) = read_log(&control_socket(data_dir, pid), None, None, include_muted) {
             sessions.push(SessionLog { pid, snapshot });
         }
     }
@@ -904,6 +988,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut host = None;
     let mut path = None;
     let mut status = None;
+    let mut muted = false;
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "event" {
         return None;
@@ -920,6 +1005,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
             "host" => host = Some(value.to_string()),
             "path" => path = Some(value.to_string()),
             "status" => status = value.parse().ok(),
+            "muted" => muted = value == "1",
             _ => {}
         }
     }
@@ -932,6 +1018,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         path,
         verdict: verdict?,
         reason: reason?,
+        muted,
         status,
         // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
         amend_seq: None,
@@ -1063,9 +1150,18 @@ pub(crate) fn drain_session(
     Ok(DrainOutcome::Drained(hosts))
 }
 
-/// One manual rule reported by a live session: whether it allows (vs denies) and its display text.
+/// The kind of a manual (`--session`) rule reported by a live session: a verdict rule (allow/deny)
+/// or a mute (`dontaudit`) log-suppression rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualKind {
+    Allow,
+    Deny,
+    Mute,
+}
+
+/// One manual rule reported by a live session: its kind and its display text.
 pub(crate) struct ManualRuleRow {
-    pub(crate) is_allow: bool,
+    pub(crate) kind: ManualKind,
     pub(crate) rule: String,
 }
 
@@ -1088,13 +1184,28 @@ pub(crate) fn inject_rule(
     verdict: Verdict,
     rule: &str,
 ) -> io::Result<InjectOutcome> {
-    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let verb = match verdict {
         Verdict::Allow => "ALLOW",
         Verdict::Deny => "DENY",
     };
+    send_remember(data_dir, pid, verb, rule)
+}
+
+/// Load a proactive **mute** (`dontaudit`) `rule` into one session's live overlay — the
+/// `ops net mute <rule> --session` path. A denied request matching it has its log line suppressed
+/// for this session; the verdict and the `ops net stats` count are untouched. Same wire shape as
+/// [`inject_rule`], with the `MUTE` verb.
+pub(crate) fn inject_mute(data_dir: &Path, pid: u32, rule: &str) -> io::Result<InjectOutcome> {
+    send_remember(data_dir, pid, "MUTE", rule)
+}
+
+/// Send one `REMEMBER <verb> <rule>` to a session's control socket and read its one-line reply.
+/// Shared by [`inject_rule`] (ALLOW/DENY) and [`inject_mute`] (MUTE) so the connection handling and
+/// the reply parsing cannot drift.
+fn send_remember(data_dir: &Path, pid: u32, verb: &str, rule: &str) -> io::Result<InjectOutcome> {
+    let stream = UnixStream::connect(control_socket(data_dir, pid))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     (&stream).write_all(format!("REMEMBER {verb} {rule}\n").as_bytes())?;
     (&stream).flush()?;
     let mut response = String::new();
@@ -1123,12 +1234,17 @@ pub(crate) fn query_manual(data_dir: &Path, pid: u32) -> io::Result<Vec<ManualRu
         // rule carrying whitespace (a `re:` regex loaded with `--session`) round-trips intact.
         if let Some(rule) = line.strip_prefix("manual allow ") {
             rules.push(ManualRuleRow {
-                is_allow: true,
+                kind: ManualKind::Allow,
                 rule: rule.to_string(),
             });
         } else if let Some(rule) = line.strip_prefix("manual deny ") {
             rules.push(ManualRuleRow {
-                is_allow: false,
+                kind: ManualKind::Deny,
+                rule: rule.to_string(),
+            });
+        } else if let Some(rule) = line.strip_prefix("manual mute ") {
+            rules.push(ManualRuleRow {
+                kind: ManualKind::Mute,
                 rule: rule.to_string(),
             });
         }
@@ -1369,6 +1485,37 @@ mod tests {
             dispatch("REMEMBER ALLOW", &state, &manual, &log),
             "err bad-request\n"
         );
+
+        // `REMEMBER MUTE <rule>` loads into the dedicated mute overlay (a log filter, not a verdict),
+        // so it lands in `mute_snapshot`, never the allow/deny verdict lists.
+        assert_eq!(
+            dispatch("REMEMBER MUTE play.googleapis.com", &state, &manual, &log),
+            "ok\n"
+        );
+        let (allow, deny) = manual.snapshot();
+        assert!(
+            allow
+                .iter()
+                .all(|r| r.to_string() != "https://play.googleapis.com")
+                && deny.is_empty(),
+            "a MUTE must not enter the verdict lists"
+        );
+        assert_eq!(
+            manual.mute_snapshot().len(),
+            1,
+            "a MUTE lands in the mute overlay"
+        );
+        assert!(
+            !manual.is_empty(),
+            "a loaded mute makes the overlay non-empty"
+        );
+        // …and `RULES` reports it as a `manual mute` line, so `ops net rules --source session` lists
+        // a live mute (distinct from the allow/deny lines).
+        assert!(
+            dispatch("RULES", &state, &manual, &log)
+                .contains("manual mute https://play.googleapis.com"),
+            "RULES must list a live mute"
+        );
     }
 
     #[test]
@@ -1443,7 +1590,7 @@ mod tests {
         // The remembered rule round-trips back through RULES with its exact host:port.
         let rules = query_manual(data.path(), pid).unwrap();
         assert_eq!(rules.len(), 1);
-        assert!(rules[0].is_allow);
+        assert_eq!(rules[0].kind, ManualKind::Allow);
         assert_eq!(rules[0].rule, "https://api.test:8080");
 
         // The consumed seq is now gone — a second answer is NotFound (not a phantom success).
@@ -1643,7 +1790,7 @@ mod tests {
         // Each answered host:port round-trips back as a remembered manual rule.
         let rules = query_manual(data.path(), pid).unwrap();
         assert_eq!(rules.len(), 2);
-        assert!(rules.iter().all(|r| r.is_allow));
+        assert!(rules.iter().all(|r| r.kind == ManualKind::Allow));
 
         // A drain on the now-empty queue is a clean *empty* Drained — distinct from Unsupported.
         match drain_session(data.path(), pid, Verdict::Allow, false).unwrap() {
@@ -1684,7 +1831,7 @@ mod tests {
     // ── The live egress event log ──────────────────────────────────────────────────────────────
 
     fn push_event(ring: &LogRing, host: &str, verdict: LogVerdict, reason: &str) {
-        ring.push(host, 443, Some("GET"), Some("/x"), verdict, reason);
+        ring.push(false, host, 443, Some("GET"), Some("/x"), verdict, reason);
     }
 
     #[test]
@@ -1693,7 +1840,7 @@ mod tests {
         for i in 0..5 {
             push_event(&ring, &format!("h{i}.test"), LogVerdict::Allow, "allowed");
         }
-        let snap = ring.snapshot(None, None);
+        let snap = ring.snapshot(None, None, false);
         // Cap is 3, so only the newest three survive; seqs are 1..=5 and never repeat.
         assert_eq!(snap.events.len(), 3);
         assert_eq!(snap.head, 5, "head is the newest seq assigned");
@@ -1708,7 +1855,7 @@ mod tests {
         let ring = LogRing::new(LOG_RING_CAP);
         push_event(&ring, "a.test", LogVerdict::Allow, "allowed");
         push_event(&ring, "b.test", LogVerdict::Deny, "denied-default");
-        let snap = ring.snapshot(None, None);
+        let snap = ring.snapshot(None, None, false);
         assert_eq!(snap.events.len(), 2);
         assert_eq!(snap.dropped, 0);
         assert_eq!(snap.head, 2);
@@ -1724,12 +1871,12 @@ mod tests {
             push_event(&ring, &format!("h{i}.test"), LogVerdict::Allow, "allowed");
         }
         // A follower whose cursor is 1 missed seq 2 (evicted, never seen): report the gap.
-        let snap = ring.snapshot(Some(1), None);
+        let snap = ring.snapshot(Some(1), None, false);
         let seqs: Vec<u64> = snap.events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![3, 4]);
         assert_eq!(snap.dropped, 1, "seq 2 fell off the ring between polls");
         // A follower already at the head sees nothing new and no gap.
-        let caught_up = ring.snapshot(Some(snap.head), None);
+        let caught_up = ring.snapshot(Some(snap.head), None, false);
         assert!(caught_up.events.is_empty());
         assert_eq!(caught_up.dropped, 0);
         assert_eq!(caught_up.head, 4);
@@ -1739,6 +1886,7 @@ mod tests {
     fn set_status_amends_a_live_event_and_is_a_noop_once_evicted() {
         let ring = LogRing::new(2);
         let s1 = ring.push(
+            false,
             "a.test",
             443,
             Some("GET"),
@@ -1747,6 +1895,7 @@ mod tests {
             "allowed",
         );
         let s2 = ring.push(
+            false,
             "b.test",
             443,
             Some("GET"),
@@ -1756,7 +1905,7 @@ mod tests {
         );
         // A status amends the matching still-resident event, and only it.
         ring.set_status(s2, 404);
-        let snap = ring.snapshot(None, None);
+        let snap = ring.snapshot(None, None, false);
         assert_eq!(
             snap.events[0].status, None,
             "the untouched event keeps None"
@@ -1770,6 +1919,7 @@ mod tests {
         // Evict s1 and s2 (push two more, cap is 2), then a late status for s1 is a silent no-op —
         // an evicted event is never resurrected.
         ring.push(
+            false,
             "c.test",
             443,
             Some("GET"),
@@ -1778,6 +1928,7 @@ mod tests {
             "allowed",
         );
         ring.push(
+            false,
             "d.test",
             443,
             Some("GET"),
@@ -1786,7 +1937,7 @@ mod tests {
             "allowed",
         );
         ring.set_status(s1, 500);
-        let after = ring.snapshot(None, None);
+        let after = ring.snapshot(None, None, false);
         assert!(
             after.events.iter().all(|e| e.seq != s1),
             "s1 is gone from the ring"
@@ -1801,6 +1952,7 @@ mod tests {
     fn a_follow_reader_gets_a_status_amended_after_it_passed_the_event() {
         let ring = LogRing::new(8);
         let s1 = ring.push(
+            false,
             "a.test",
             443,
             Some("GET"),
@@ -1809,7 +1961,7 @@ mod tests {
             "allowed",
         );
         // A follow reader catches up: it has seen seq s1, with no amendment yet.
-        let seen = ring.snapshot(Some(s1), Some(0));
+        let seen = ring.snapshot(Some(s1), Some(0), false);
         assert!(seen.events.is_empty(), "nothing new past the head");
         let (seq_cursor, amend_cursor) = (seen.head, seen.amend_head);
 
@@ -1817,20 +1969,20 @@ mod tests {
         ring.set_status(s1, 200);
 
         // The next follow poll RE-EMITS the already-seen event, now carrying its status.
-        let after = ring.snapshot(Some(seq_cursor), Some(amend_cursor));
+        let after = ring.snapshot(Some(seq_cursor), Some(amend_cursor), false);
         assert_eq!(after.events.len(), 1, "the amended event resurfaces");
         assert_eq!(after.events[0].seq, s1);
         assert_eq!(after.events[0].status, Some(200));
 
         // A reader that does NOT track the amend cursor gets today's behavior: no re-emission.
-        let no_amend = ring.snapshot(Some(seq_cursor), None);
+        let no_amend = ring.snapshot(Some(seq_cursor), None, false);
         assert!(
             no_amend.events.is_empty(),
             "without the amend cursor there is no retroactive status"
         );
 
         // Once the reader advances its amend cursor, the amendment is not shown a second time.
-        let caught_up = ring.snapshot(Some(after.head), Some(after.amend_head));
+        let caught_up = ring.snapshot(Some(after.head), Some(after.amend_head), false);
         assert!(
             caught_up.events.is_empty(),
             "an amendment resurfaces exactly once"
@@ -1849,6 +2001,7 @@ mod tests {
             path: Some("/v1/x?a=1&b=2".into()),
             verdict: LogVerdict::Allow,
             reason: "allowed".into(),
+            muted: false,
             // A captured upstream status round-trips on the wire alongside the query path.
             status: Some(200),
             amend_seq: None,
@@ -1870,6 +2023,7 @@ mod tests {
             path: None,
             verdict: LogVerdict::Allow,
             reason: "allowed".into(),
+            muted: false,
             status: None,
             amend_seq: None,
         };
@@ -1897,6 +2051,9 @@ mod tests {
                 path: Some("/p".into()),
                 verdict,
                 reason: "dns-failure".into(),
+                // A muted deny exercises the `muted=1` token on the wire (mute only ever applies to
+                // a deny), so its round-trip is covered here alongside every verdict token.
+                muted: verdict == LogVerdict::Deny,
                 status: None,
                 amend_seq: None,
             };
@@ -1923,6 +2080,7 @@ mod tests {
         let manual = Arc::new(ManualRules::new());
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
         log.push(
+            false,
             "a.test",
             443,
             Some("GET"),
@@ -1931,6 +2089,7 @@ mod tests {
             "allowed",
         );
         log.push(
+            false,
             "b.test",
             443,
             Some("POST"),
@@ -1950,7 +2109,7 @@ mod tests {
         }
 
         // A tail read over the socket returns both events, newest last, with the fields intact.
-        let snap = read_log(&socket, None, None).unwrap();
+        let snap = read_log(&socket, None, None, false).unwrap();
         assert_eq!(snap.events.len(), 2);
         assert_eq!(snap.head, 2);
         assert_eq!(snap.events[0].host, "a.test");
@@ -1960,13 +2119,13 @@ mod tests {
         assert_eq!(snap.events[1].path.as_deref(), Some("/two?t=1"));
 
         // A follow read past the first event returns only the second, no gap.
-        let after = read_log(&socket, Some(1), None).unwrap();
+        let after = read_log(&socket, Some(1), None, false).unwrap();
         assert_eq!(after.events.len(), 1);
         assert_eq!(after.events[0].seq, 2);
         assert_eq!(after.dropped, 0);
 
         // Discovery: `log_all` globs the egress dir and finds this session by its socket pid.
-        let sessions = log_all(data.path());
+        let sessions = log_all(data.path(), false);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, pid);
         assert_eq!(sessions[0].snapshot.events.len(), 2);

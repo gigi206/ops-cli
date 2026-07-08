@@ -309,6 +309,92 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
 }
 
 #[test]
+fn net_mute_and_unmute_round_trip_through_config() {
+    let fx = Fixture::new();
+    // A mute needs a filtering posture (nothing to suppress otherwise) — bootstrap one first.
+    assert!(fx
+        .run(&["net", "allow", "api.example.com"])
+        .status
+        .success());
+
+    // Mute a noisy denied host: it persists to `[network] mute` and re-trusts the project.
+    let muted = fx.run(&["net", "mute", "play.googleapis.com"]);
+    assert!(
+        muted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&muted.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&muted.stdout);
+    assert!(
+        stdout.contains("play.googleapis.com") && stdout.contains("re-trusted"),
+        "mute must persist and re-trust:\n{stdout}"
+    );
+
+    // It reloads and `ops net rules` lists it as a config mute rule (tagged `mute`, not allow/deny).
+    let rules = fx.run(&["net", "rules"]);
+    assert!(
+        String::from_utf8_lossy(&rules.stdout)
+            .contains("mute  https://play.googleapis.com  (config)"),
+        "the persisted mute must appear in `ops net rules`:\n{}",
+        String::from_utf8_lossy(&rules.stdout)
+    );
+
+    // `unmute` removes it; a second `unmute` is an idempotent reported no-op.
+    let unmuted = fx.run(&["net", "unmute", "play.googleapis.com"]);
+    assert!(
+        unmuted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unmuted.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unmuted.stdout).contains("removed"),
+        "unmute must report the removal:\n{}",
+        String::from_utf8_lossy(&unmuted.stdout)
+    );
+    let rules = fx.run(&["net", "rules"]);
+    assert!(
+        !String::from_utf8_lossy(&rules.stdout).contains("play.googleapis.com"),
+        "the mute rule is gone after unmute:\n{}",
+        String::from_utf8_lossy(&rules.stdout)
+    );
+    let again = fx.run(&["net", "unmute", "play.googleapis.com"]);
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("no change"),
+        "a redundant unmute is a reported no-op:\n{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+}
+
+#[test]
+fn net_mute_with_no_posture_is_refused() {
+    // A mute on a fresh project (no filtering posture) is inert, so it is refused with guidance —
+    // never a silently-written rule that suppresses nothing.
+    let fx = Fixture::new();
+    let refused = fx.run(&["net", "mute", "play.googleapis.com"]);
+    assert!(
+        !refused.status.success(),
+        "a posture-less mute must not succeed"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("posture"),
+        "the refusal must point at setting a posture:\n{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // `--session` mute is supported (a live log filter): with no running session it is a benign
+    // no-op — it must be accepted (exit 0), not refused, and never touch a config file.
+    let sess = fx.run(&["net", "mute", "x.test", "--session"]);
+    assert!(
+        sess.status.success(),
+        "a --session mute with no live session is a benign no-op, not an error:\n{}",
+        String::from_utf8_lossy(&sess.stderr)
+    );
+    assert!(
+        !fx.proj.path().join(".ops.toml").exists(),
+        "a --session mute must write no config file"
+    );
+}
+
+#[test]
 fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
     let fx = Fixture::new();
     // `net allow tcp://…` is a security-rule write: it must validate, persist, re-trust, and reload

@@ -96,6 +96,52 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`[network] mute` — SELinux-`dontaudit` egress-log suppression (DONE 2026-07-08)**
+  (`src/allowlist.rs` + `config/{schema,mod,view,manage}.rs` + `sandbox/{control,proxy,egress,
+  netlearn}.rs` + `{main,help}.rs` + `docs/guide/networking/{observability,rules}.md` +
+  `configuration/network.md` + `cli/net.md` + `profiles/agy.toml` + `tests/{config,net}.rs`):
+  bringing up the **Antigravity CLI (`agy`)** surfaced the recurring pain that a busy agent hammers
+  hosts a user has **deliberately left denied** (telemetry, feature flags, an optional Playwright
+  CDN), and those refusals drown the *actionable* denials in `ops net log`. A **`mute` list** (the
+  analogue of SELinux `dontaudit`) suppresses a **denied** request's log line **without changing the
+  verdict** — the request is still refused and still counted in `ops net stats`, only its line drops
+  out of the default log (`ops net log --all` shows it, tagged `muted`). The single load-bearing
+  invariant: **`mute` is a log filter, never a verdict** — consulted only at logging time
+  (`EgressPolicy::muted`, `Layer::L7`, same canonicalized request + method-set semantics as
+  `explain`), so a mute can *never* open egress. Shipped in **three increments + a residual pass**,
+  all green (960 unit + 56 net + 90 config + 14 help, fmt/clippy clean, live-smoked). **Increment 1
+  — declarative:** `NetworkTable.mute` (`#[serde(default)]`), classified via the same
+  `classify_entries` as allow/deny (grammar + `@group` expansion), gated **trusted/global-only** for
+  free (it rides the whole-`[network]` trust gate — an untrusted project cannot blind the user).
+  `EgressPolicy` gains `mute: Vec<Rule>` + `with_mute` + `muted()`; the proxy's single decision
+  chokepoint `outcome()` routes a mute-matched **deny** to the log's **separate** ring
+  (`LogInner.muted`, own cap) so a chatty muted host can never evict a real event, and the event
+  carries a `muted` flag on the wire (`muted=1`) that `ops net log --all` folds back in. Rendered
+  (dim `muted` tag) + `--json` `"muted"`, surfaced in `ops net rules` (`NetRuleKind::Mute`) and
+  `ops config show` (`NetworkView::Allowlist.mute`). **A real bug the proxy test caught:**
+  `union_with_builtin` **and** `effective_policy` rebuilt the policy from allow/deny and **dropped the
+  mute set** — fixed (both carry it), else config mutes would be silently ignored. **Increment 2 —
+  config verbs:** `ops net mute <rule>` / `ops net unmute <rule>` (all scopes `--local`/`--global`/
+  `-a <app>`, trust-gate + re-trust, idempotent), `EgressList::Mute` + `manage::remove_egress_rule`
+  (new — the inverse of `add_egress_rule`) + `MuteNeedsPosture` (a mute with no filtering posture is
+  inert → refused, not written). **Increment 3 — live `--session`:** `ops net mute … --session
+  [-a] [--all]` loads into a running session's overlay (a **dedicated** `ManualInner.mute` +
+  `remember_mute` + a `REMEMBER MUTE` control verb + `inject_mute` — deliberately **not** a
+  `Verdict::Mute`, which would pollute the park-answer paths); `effective_policy` folds config-mutes
+  ∪ session-mutes and `outcome` consults the **effective** policy, so a session mute suppresses
+  exactly like a config one. `unmute` stays config-only by construction (a log filter has no
+  counter-verdict — a live mute ends with the session, parity with allow/deny having no live-forget).
+  **Residual pass:** a live mute now lists in `ops net rules --source session` (a 3-state
+  `ManualKind` allow/deny/**mute** replacing the binary `is_allow`; `RULES` emits `manual mute`,
+  `query_manual` parses it, `net_rules_manual` maps it), and `unmute` of the last entry drops the
+  key (no `mute = []` residue, table + inline forms). **Profile:** `profiles/agy.toml` carries a
+  `mute` block (`play.googleapis.com` telemetry, `antigravity-unleash.goog` feature flags, the three
+  `playwright*.azureedge.net` driver mirrors) so `ops net log -a agy` reads clean by default.
+  **Tests (net-new):** allowlist `muted`/method-scope (2), config classify+group (1), proxy
+  config-mute + session-mute routing (2), control `REMEMBER MUTE`/`RULES` + wire round-trip, manage
+  add/remove round-trip + posture-guard (2), config-integration gating+visibility (1), net-integration
+  mute/unmute round-trip + `--session` no-op + posture/refusal (2). **std-only, no new dep.** The
+  `--session` overlay path reuses the proactive `ops net allow|deny --session` machinery.
   **Synthetic `/etc/hosts` — `localhost` resolves in the cage (DONE 2026-07-08)** (`src/sandbox/
   binds.rs` + `tests/run.rs` + `profiles/agy.toml` [new] + `profiles/README.md`): bringing up the
   **Antigravity CLI (`agy`)** profile surfaced a real cage gap. `agy` starts an internal language

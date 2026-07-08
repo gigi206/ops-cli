@@ -245,15 +245,21 @@ pub(crate) enum NetworkView {
         ask_notice: Option<bool>,
         allow: Vec<String>,
         deny: Vec<String>,
+        /// `mute` (`dontaudit`) rules: refusals suppressed from the default `ops net log` view (still
+        /// counted in `ops net stats`, shown by `ops net log --all`). Surfaced so the suppression is
+        /// never silent. Empty for a policy that mutes nothing.
+        mute: Vec<String>,
         builtin: Vec<String>,
     },
 }
 
-/// Whether a listed egress rule allows or denies.
+/// Whether a listed egress rule allows, denies, or mutes (`dontaudit` — suppresses a denied
+/// request's log line without changing the verdict).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetRuleKind {
     Allow,
     Deny,
+    Mute,
 }
 
 /// Where a listed egress rule came from: the resolved config (`.ops.toml`/global, after the trust
@@ -342,6 +348,9 @@ pub(crate) fn net_rules_view(
     let mut rules = Vec::new();
     project_config_rules(policy.allow_rules(), NetRuleKind::Allow, expand, &mut rules);
     project_config_rules(policy.deny_rules(), NetRuleKind::Deny, expand, &mut rules);
+    // Mute (`dontaudit`) rules are policy too — surfaced so `ops net rules` shows what refusals are
+    // suppressed from the default log. They never change a verdict; the renderer tags them.
+    project_config_rules(policy.mute_rules(), NetRuleKind::Mute, expand, &mut rules);
     for r in sandbox::builtin_allow_rules() {
         rules.push(NetRuleView {
             kind: NetRuleKind::Allow,
@@ -815,6 +824,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             ask_notice: ask_notice_view(a),
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
+            mute: a.mute_rules().iter().map(|r| r.to_string()).collect(),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
                 .map(|r| r.to_string())
@@ -1321,6 +1331,7 @@ mod tests {
                 ask_notice: None,
                 allow: vec!["github.com".into()],
                 deny: vec![],
+                mute: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,

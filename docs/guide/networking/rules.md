@@ -14,7 +14,9 @@ This page is the complete reference. The one law that governs everything below:
 > host.
 
 Every rule is written the same way whether it goes in an `allow` or a `deny` list;
-which list it is in decides what a match *means*.
+which list it is in decides what a match *means*. The same grammar also drives a
+third list, [`mute`](observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit) —
+a log filter that hides a *denied* request's line without changing the verdict.
 
 ---
 

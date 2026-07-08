@@ -519,6 +519,43 @@ fn trusting_the_project_applies_its_binds() {
 }
 
 #[test]
+fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
+    // A `[network] mute` (SELinux `dontaudit`) suppresses a denied request's log line. It is a
+    // security-relevant network sub-field, so it rides the whole-`[network]` trust gate, and it must
+    // be *visible* (never a silent suppression) in both read-only views once it applies.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\nmute = [\"play.googleapis.com\"]\n",
+    );
+
+    // Untrusted: the entire `[network]` (mute included) is dropped, so the mute host appears nowhere.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("play.googleapis.com"),
+        "an untrusted project's network (mute included) must be dropped:\n{stdout}"
+    );
+
+    // Trust it → the allowlist applies and the mute rule is surfaced (dimmed) in `config show`.
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mute") && stdout.contains("play.googleapis.com"),
+        "a trusted mute rule must be visible in `config show`:\n{stdout}"
+    );
+
+    // …and it is listed by `ops net rules` too, tagged `mute` (distinct from allow/deny).
+    let rules = fx.run(&["net", "rules"]);
+    let rstdout = String::from_utf8_lossy(&rules.stdout);
+    assert!(
+        rstdout.contains("mute") && rstdout.contains("play.googleapis.com"),
+        "`ops net rules` must list the mute rule:\n{rstdout}"
+    );
+}
+
+#[test]
 fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     // A trusted bind of `/etc` is an ancestor of the cage's synthetic `/etc/passwd`, so the cage
     // layers its own files over part of it — the bind will not behave as a naive reading suggests.

@@ -149,12 +149,58 @@ ops net logs -n 50                   # the most recent 50 (per session)
 ops net logs --follow                # tail -f: keep appending new events until Ctrl-C
 ops net logs --with-status           # also show the upstream HTTP status (200/404/…)
 ops net logs --with-query            # keep the URL query (already secret-redacted)
+ops net logs --all                   # also show refusals a `mute` rule suppressed (tagged)
 ops net logs --json
 ```
 
 Each line carries the session id (the PID `ops ls` shows), the local `hh:mm:ss`
 time, `host:port`, method, path, verdict, and a reason category. `log` is an
 accepted alias.
+
+### Muting noisy refusals — `[network] mute` (SELinux `dontaudit`)
+
+A busy agent often hammers hosts you have **deliberately left denied** — telemetry,
+feature flags, an optional CDN — and those refusals drown the ones worth acting on.
+A `[network] mute` rule (the analogue of SELinux's `dontaudit`) keeps a **denied**
+request's line **out of the default log**, without changing anything else:
+
+```toml
+[network]
+mode  = "deny"
+allow = ["api.example.com"]
+mute  = ["play.googleapis.com", "*.datadoghq.com", "antigravity-unleash.goog"]
+```
+
+- **It never changes the verdict.** A muted host is still denied — `mute` is a log
+  filter, not a third posture. It cannot open egress.
+- **It never hides a count.** A muted refusal is still tallied in
+  [`ops net stats`](#ops-net-stats), so you always know *how many* happened.
+- **It only suppresses refusals** (`deny`) — a security-guard `blocked`, an `error`,
+  and every `allow` are always shown.
+- **`--all` brings them back**, each tagged `muted`. Muted refusals live in a
+  **separate** ring, so a chatty muted host can never push a real event off the log.
+
+`mute` uses the **same grammar** as `allow`/`deny` — a host, `*.domain`, an exact
+`host/path`, a `{VERB}` method prefix, a `re:` regex, ports, and `@group` references
+— and is **trusted/global-only** like the rest of the `[network]` table (an untrusted
+project cannot blind you to what its agent tried to reach). `ops net rules` and
+`ops config show` both list the mute rules, so the suppression is never silent.
+
+You can edit the list from the CLI instead of the TOML, with the same scopes as
+`allow`/`deny` (a project write re-trusts; `-a <app>`/`-g` target a profile or the global
+config):
+
+```bash
+ops net mute   play.googleapis.com -a agy   # add — quiet a profile's telemetry host
+ops net unmute play.googleapis.com -a agy   # remove (idempotent)
+```
+
+A config write needs an existing filtering posture (there is nothing to suppress under
+`shared`/`none`), so set one first. You can also mute a **running** session live —
+`ops net mute <host> --session [-a <app>] [--all]` folds the rule into the session's
+effective policy immediately (writes no file, dies with the session); it is the log-filter
+sibling of `ops net allow|deny --session`. A live mute is not un-loaded by `unmute` (a log
+filter has no counter-verdict) — it simply ends with the session.
 
 ### Live-only — never written to disk
 

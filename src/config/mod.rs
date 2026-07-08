@@ -2718,7 +2718,13 @@ fn validate_network_table(
     };
     let allow = classify_entries(warnings, source_label, "allow", table.allow, groups);
     let deny = classify_entries(warnings, source_label, "deny", table.deny, groups);
-    let mut policy = crate::allowlist::EgressPolicy::new(allow, deny).with_default(action);
+    // `mute` (SELinux `dontaudit`) suppresses a *denied* request's log line — never a verdict — so
+    // it classifies with the same grammar as `allow`/`deny` (including `@group` expansion) and is
+    // carried on the policy for the proxy to consult at logging time.
+    let mute = classify_entries(warnings, source_label, "mute", table.mute, groups);
+    let mut policy = crate::allowlist::EgressPolicy::new(allow, deny)
+        .with_default(action)
+        .with_mute(mute);
     if action == DefaultAction::Ask {
         // A configured `ask_timeout` bounds the parked wait; a malformed value falls back to
         // indefinite (warned), never a hard config failure.
@@ -4393,6 +4399,7 @@ mod tests {
     /// Build a `[network]` field in table form for the egress-group tests.
     fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
         NetworkField::Table(NetworkTable {
+            mute: vec![],
             mode: Some(mode.into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -4451,6 +4458,34 @@ mod tests {
             panic!("expected an allowlist policy");
         };
         assert_eq!(p.deny_rules().len(), 2);
+    }
+
+    #[test]
+    fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
+        // `mute` (`dontaudit`) reuses the allow/deny grammar and `@group` expansion, and lands on the
+        // policy's mute set without touching the verdict lists.
+        let (g, _) = make_groups(&[("telemetry", &["play.googleapis.com", "*.datadoghq.com"])]);
+        let mut w = Vec::new();
+        let field = NetworkField::Table(NetworkTable {
+            mode: Some("deny".into()),
+            allow: vec![],
+            deny: vec![],
+            mute: vec!["@telemetry".into(), "antigravity-unleash.goog".into()],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+        });
+        let policy =
+            super::validate_network(&mut w, GLOBAL_CONFIG, field, &g, &NetworkPolicy::default())
+                .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        // Two group entries + one literal → three mute rules; the verdict lists stay empty.
+        assert_eq!(p.mute_rules().len(), 3);
+        assert!(p.allow_rules().is_empty() && p.deny_rules().is_empty());
+        assert!(w.is_empty(), "a clean mute list warns nothing: {w:?}");
     }
 
     #[test]
@@ -4747,6 +4782,7 @@ mod tests {
     fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".to_string()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -4945,6 +4981,7 @@ mod tests {
         // the app falls to the built-in `{GET,HEAD}`, never all-verbs. (Read-by-default only ever
         // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
         let net = NetworkField::Table(NetworkTable {
+            mute: vec![],
             mode: Some("deny".into()),
             allow: vec!["x.com".into()],
             deny: vec![],
@@ -5085,6 +5122,7 @@ mod tests {
         let mut w = Vec::new();
         let tbl = |mode: &str, allow: &[&str], deny: &[&str]| {
             NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some(mode.into()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -5157,6 +5195,7 @@ mod tests {
         // A `[network]` table that lists a rule but omits `mode`.
         let no_mode = || {
             NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: None,
                 allow: vec!["api.foo.com".to_string()],
                 deny: vec![],
@@ -5216,6 +5255,7 @@ mod tests {
         let global = raw_network("ask");
         let project = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: None,
                 allow: vec!["api.proj.com".to_string()],
                 deny: vec![],
@@ -5249,6 +5289,7 @@ mod tests {
             RawApp {
                 cmd: Some(schema::RawCmd::Line("demo".to_string())),
                 network: Some(NetworkField::Table(NetworkTable {
+                    mute: vec![],
                     mode: None,
                     allow: vec!["api.app.com".to_string()],
                     deny: vec![],
@@ -5279,6 +5320,7 @@ mod tests {
         use crate::allowlist::DefaultAction;
         let ask_table = |timeout: Option<&str>| {
             NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("ask".into()),
                 allow: vec![],
                 deny: vec![],
@@ -5315,6 +5357,7 @@ mod tests {
 
         // An `ask_timeout` under a non-ask mode is moot — warned and ignored.
         let moot = NetworkField::Table(NetworkTable {
+            mute: vec![],
             mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
@@ -5335,6 +5378,7 @@ mod tests {
         use crate::allowlist::DefaultAction;
         let ask = |notice: Option<bool>| {
             NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("ask".into()),
                 allow: vec![],
                 deny: vec![],
@@ -5363,6 +5407,7 @@ mod tests {
 
         // An `ask_notice` under a non-ask mode is moot — warned and ignored.
         let moot = NetworkField::Table(NetworkTable {
+            mute: vec![],
             mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
@@ -6424,6 +6469,7 @@ mod tests {
         // ignored (Mode-A `ops run`/`ops shell` stays all-verbs), with a warning so it is not silent.
         let global = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["h.test".into()],
                 deny: vec![],
@@ -7809,6 +7855,7 @@ mod tests {
         let r = resolve_no_plugins(
             RawConfig {
                 network: Some(NetworkField::Table(NetworkTable {
+                    mute: vec![],
                     mode: Some("bogus".into()),
                     allow: vec![],
                     deny: vec![],
@@ -7910,6 +7957,7 @@ mod tests {
     fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConfig {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".into()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
@@ -8240,6 +8288,7 @@ mod tests {
         // A `[network]` table carrying an explicit `stats` value.
         let net = |stats: Option<bool>| RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["github.com".into()],
                 deny: vec![],
@@ -8295,6 +8344,7 @@ mod tests {
             &[],
             &[],
             Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
@@ -8368,6 +8418,7 @@ mod tests {
     /// A trusted-shaped network allowlist for the given hosts.
     fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         Some(NetworkField::Table(NetworkTable {
+            mute: vec![],
             mode: Some("deny".into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],

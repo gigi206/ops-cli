@@ -656,7 +656,14 @@ impl ProxyCtx {
             StatKind::Deny => super::control::LogVerdict::Deny,
             StatKind::Blocked => super::control::LogVerdict::Blocked,
         };
-        self.push_log(host, port, method, path, verdict, reason)
+        // A `mute` (`dontaudit`) rule suppresses a *denied* request's log line — never a verdict, an
+        // allow, or a security-guard `blocked` — so the refusal drops out of the default view but its
+        // stat counter (bumped just above) still records it. Consulted through the **effective**
+        // policy (config mutes ∪ the live `--session` mute overlay), so a session mute takes effect
+        // the same as a config one.
+        let muted = matches!(kind, StatKind::Deny)
+            && effective_policy(self).muted(host, port, path, method);
+        self.push_log_maybe_muted(muted, host, port, method, path, verdict, reason)
     }
 
     /// The copy-paste `ops net allow` command a `denied-default` refusal body suggests. When the
@@ -686,9 +693,36 @@ impl ProxyCtx {
         verdict: super::control::LogVerdict,
         reason: &str,
     ) -> Option<u64> {
+        self.push_log_maybe_muted(false, host, port, method, path, verdict, reason)
+    }
+
+    /// The muted-aware inner of [`Self::push_log`]: when `muted` (a denied request matched a `mute`
+    /// rule), the event is routed to the log's separate muted ring so it is kept out of the default
+    /// `ops net log` view yet still recoverable via `--all` — the stat counter was already bumped by
+    /// the caller, so a muted refusal is *collapsed*, never destroyed. All non-deny sites route here
+    /// with `muted = false` via [`Self::push_log`].
+    #[allow(clippy::too_many_arguments)]
+    fn push_log_maybe_muted(
+        &self,
+        muted: bool,
+        host: &str,
+        port: u16,
+        method: Option<&str>,
+        path: Option<&str>,
+        verdict: super::control::LogVerdict,
+        reason: &str,
+    ) -> Option<u64> {
         let log = self.log.as_ref()?;
         let redacted = path.map(|p| self.redact_query(p));
-        Some(log.push(host, port, method, redacted.as_deref(), verdict, reason))
+        Some(log.push(
+            muted,
+            host,
+            port,
+            method,
+            redacted.as_deref(),
+            verdict,
+            reason,
+        ))
     }
 
     /// Amend the event `seq` (returned by a prior [`outcome`](Self::outcome)) with the upstream HTTP
@@ -802,6 +836,9 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
         .with_default(user.default_action())
         .with_ask_timeout(user.ask_timeout())
         .with_ask_notice(user.ask_notice())
+        // Carry the mute (`dontaudit`) set through — it is log-only, so the built-in allow union
+        // does not touch it, but a rebuild that dropped it would silently un-suppress the refusals.
+        .with_mute(user.mute_rules().to_vec())
 }
 
 /// The policy the proxy evaluates for a request: the immutable config policy, or — when a live
@@ -820,6 +857,11 @@ fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
     allow.extend(overlay_allow);
     let mut deny = ctx.policy.deny_rules().to_vec();
     deny.extend(overlay_deny);
+    // The mute (`dontaudit`) overlay — a live `ops net mute --session` — folds onto the config
+    // mutes, so a suppressed refusal is honored identically whether it came from config or the
+    // session. Carried through this rebuild (like default_action/ask), or it would be dropped.
+    let mut mute = ctx.policy.mute_rules().to_vec();
+    mute.extend(ctx.manual.mute_snapshot());
     // Carry default_action + ask_timeout + ask_notice through unchanged — a pure allow/deny merge
     // would silently flip the posture (lose the timeout, or demote deny↔ask), the same contract
     // `union_with_builtin` keeps.
@@ -827,7 +869,8 @@ fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
         EgressPolicy::new(allow, deny)
             .with_default(ctx.policy.default_action())
             .with_ask_timeout(ctx.policy.ask_timeout())
-            .with_ask_notice(ctx.policy.ask_notice()),
+            .with_ask_notice(ctx.policy.ask_notice())
+            .with_mute(mute),
     )
 }
 
@@ -3403,7 +3446,7 @@ mod tests {
         );
         // …and the same forwarded request emits exactly one `allow` log event carrying its method
         // and path (the `allow` site the refusal-transcript test cannot reach).
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one allow event: {events:?}");
         assert_eq!(
             events[0].verdict,
@@ -3413,6 +3456,127 @@ mod tests {
         assert_eq!(events[0].host, "upstream.test");
         assert_eq!(events[0].method.as_deref(), Some("GET"));
         assert_eq!(events[0].path.as_deref(), Some("/path"));
+    }
+
+    /// A muted refusal (`dontaudit`) is routed away from the default log view yet still counted — the
+    /// load-bearing routing: `outcome` sends a mute-matched deny to the log's separate ring, so the
+    /// default snapshot omits it, `--all` recovers it (tagged `muted`), and the stat counter records
+    /// it regardless (collapse, never destroy). Needs no TLS round-trip — `outcome` is the one
+    /// decision chokepoint, driven directly.
+    #[test]
+    fn a_muted_deny_is_kept_out_of_the_default_log_yet_still_counted() {
+        let sdir = TmpDir::new();
+        let stats = Arc::new(crate::sandbox::egress_stats::EgressStats::new(
+            sdir.join("stats"),
+            "/t".into(),
+            None,
+        ));
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
+        // Deny-by-default, muting exactly one host.
+        let policy = crate::allowlist::EgressPolicy::new(vec![], vec![]).with_mute(vec![
+            crate::allowlist::classify("play.googleapis.com").unwrap(),
+        ]);
+        let ctx = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy)
+            .unwrap()
+            .with_stats(stats.clone())
+            .with_log(log.clone());
+
+        // One refusal to the muted host, one to an unmuted host.
+        ctx.outcome(
+            "play.googleapis.com",
+            443,
+            Some("POST"),
+            Some("/log"),
+            StatKind::Deny,
+            "denied-default",
+        );
+        ctx.outcome(
+            "api.example.com",
+            443,
+            Some("GET"),
+            Some("/x"),
+            StatKind::Deny,
+            "denied-default",
+        );
+
+        // The default view shows ONLY the unmuted refusal.
+        let default_view = log.snapshot(None, None, false).events;
+        assert_eq!(
+            default_view.len(),
+            1,
+            "the default view hides the muted refusal: {default_view:?}"
+        );
+        assert_eq!(default_view[0].host, "api.example.com");
+        assert!(!default_view[0].muted);
+
+        // `--all` folds the muted ring back in, and the suppressed refusal is tagged.
+        let all = log.snapshot(None, None, true).events;
+        assert_eq!(all.len(), 2, "--all recovers the muted refusal: {all:?}");
+        let muted_ev = all
+            .iter()
+            .find(|e| e.host == "play.googleapis.com")
+            .expect("the muted refusal is recoverable under --all");
+        assert!(muted_ev.muted, "the recovered refusal is tagged muted");
+        assert_eq!(muted_ev.verdict, crate::sandbox::control::LogVerdict::Deny);
+
+        // Both refusals are counted regardless of muting — the audit collapses, it is not destroyed.
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap["play.googleapis.com"].deny, 1,
+            "a muted refusal is still counted in stats"
+        );
+        assert_eq!(snap["api.example.com"].deny, 1);
+    }
+
+    /// A live `--session` mute (loaded into the manual overlay, no config mute at all) suppresses a
+    /// deny exactly like a config mute — proving `outcome` consults the *effective* policy (config ∪
+    /// overlay), which is the whole point of the session path.
+    #[test]
+    fn a_session_mute_overlay_suppresses_a_deny_like_a_config_mute() {
+        let sdir = TmpDir::new();
+        let stats = Arc::new(crate::sandbox::egress_stats::EgressStats::new(
+            sdir.join("stats"),
+            "/t".into(),
+            None,
+        ));
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
+        // The policy carries NO config mute — the suppression can only come from the overlay.
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            crate::allowlist::EgressPolicy::new(vec![], vec![]),
+        )
+        .unwrap()
+        .with_stats(stats.clone())
+        .with_log(log.clone());
+        // Load a live session mute — exactly what `REMEMBER MUTE` does on the control socket.
+        ctx.manual
+            .remember_mute(crate::allowlist::classify("play.googleapis.com").unwrap());
+
+        ctx.outcome(
+            "play.googleapis.com",
+            443,
+            Some("POST"),
+            Some("/log"),
+            StatKind::Deny,
+            "denied-default",
+        );
+
+        assert!(
+            log.snapshot(None, None, false).events.is_empty(),
+            "a session mute keeps the refusal out of the default view"
+        );
+        let all = log.snapshot(None, None, true).events;
+        assert_eq!(all.len(), 1, "--all recovers the session-muted refusal");
+        assert!(all[0].muted, "the recovered refusal is tagged muted");
+        assert_eq!(
+            stats.snapshot()["play.googleapis.com"].deny,
+            1,
+            "a session-muted refusal is still counted"
+        );
     }
 
     /// A streamed response that idles longer than the per-read timeout must not be cut: the failure
@@ -3998,7 +4162,7 @@ mod tests {
         );
         // One `allow` outcome recorded, with the request's method and (origin) path.
         assert_eq!(stats.snapshot()["upstream.test"].allow, 1);
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one allow event: {events:?}");
         assert_eq!(events[0].reason, "allowed");
         assert_eq!(events[0].method.as_deref(), Some("GET"));
@@ -4208,7 +4372,7 @@ mod tests {
             up.join().unwrap();
         }
 
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 2, "one allow event per request: {events:?}");
         // Both are `allow` (ops permitted both); only the captured upstream status differs.
         assert!(events.iter().all(|e| e.verdict == LogVerdict::Allow));
@@ -4281,7 +4445,7 @@ mod tests {
             "the body bytes are unaltered across the chain seam"
         );
         // …and the status was still read off the front of that same stream.
-        assert_eq!(log.snapshot(None, None).events[0].status, Some(200));
+        assert_eq!(log.snapshot(None, None, false).events[0].status, Some(200));
     }
 
     /// The event log redacts a configured secret out of a request's path **before** it enters the
@@ -4312,7 +4476,7 @@ mod tests {
         )
         .unwrap();
         assert!(resp.contains("outbound-secret"), "{resp:?}");
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "outbound-secret");
@@ -5096,7 +5260,7 @@ mod tests {
             "a cert rejection must be distinguishable from an unreachable host: {resp:?}"
         );
         // Logged as an `error` (the host was allowed; its certificate failed downstream).
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(
             events[0].verdict,
@@ -5139,7 +5303,7 @@ mod tests {
         );
         // The log records it as an `error` (allowed but failed downstream), NOT a `deny`/`blocked`
         // (we never refused it) — the distinction the log exists to make.
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Error);
         assert_eq!(events[0].reason, "dns-failure");
@@ -5946,7 +6110,7 @@ mod tests {
         // exactly one event with the host, verdict, and reason category it recorded. A mis-emitted
         // or missing event here is a log/stats drift (or a missed site), even though the per-block
         // stat assertions passed.
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         let seen: Vec<(String, LogVerdict, String)> = events
             .iter()
             .map(|e| (e.host.clone(), e.verdict, e.reason.clone()))
@@ -6408,7 +6572,7 @@ mod tests {
         );
         let reply = splice_connect_reply(ctx, "127.0.0.1", 443);
         assert!(reply.contains("ip-literal"), "{reply:?}");
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "ip-literal");
@@ -6445,7 +6609,7 @@ mod tests {
         sock.flush().unwrap();
         let reply = read_until_blank(&mut sock).unwrap();
         assert!(reply.contains("method-not-allowed"), "{reply:?}");
-        let events = log.snapshot(None, None).events;
+        let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 1, "one event: {events:?}");
         assert_eq!(events[0].verdict, LogVerdict::Blocked);
         assert_eq!(events[0].reason, "method-not-allowed");

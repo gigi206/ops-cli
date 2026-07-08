@@ -452,6 +452,14 @@ pub(crate) struct NetworkTable {
     pub(crate) allow: Vec<String>,
     #[serde(default)]
     pub(crate) deny: Vec<String>,
+    /// Log-suppression entries (SELinux `dontaudit`): a **denied** request matching one is still
+    /// refused and still counted in `ops net stats`, but its refusal is kept out of the default
+    /// `ops net log` view (`ops net log --all` shows it). Same entry grammar as `allow`/`deny`
+    /// (hosts, `*.domain`, exact URLs, `re:`, ports, `{VERB}` prefixes, `@group` references). A
+    /// pure logging filter — it never changes a verdict. Trusted/global-only like the rest of the
+    /// table.
+    #[serde(default)]
+    pub(crate) mute: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ask_timeout: Option<String>,
     /// Whether to print the `ask`-mode park notice to stderr when a request parks. On by default; a
@@ -906,6 +914,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".into()),
                 allow: vec![
                     "github.com".into(),
@@ -928,6 +937,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: Some("deny".into()),
                 allow: vec![],
                 deny: vec![],
@@ -947,6 +957,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                mute: vec![],
                 mode: None,
                 allow: vec!["api.foo.com".into()],
                 deny: vec![],

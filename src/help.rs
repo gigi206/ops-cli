@@ -257,7 +257,8 @@ const PAGES: &[Page] = &[
         details:
             "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
             `groups` lists the reusable `[net.groups]` egress groups (referenced by `@<name>`) and\n\
-            resolves one to its entries; `allow`/`deny <rule>` persist a rule to config; `pending`\n\
+            resolves one to its entries; `allow`/`deny <rule>` persist a rule to config, and\n\
+            `mute`/`unmute <rule>` add/remove a log-suppression (`dontaudit`) rule; `pending`\n\
             lists and answers requests parked by the `ask` posture; `stats` reports the per-host\n\
             allow/deny/blocked decision counters launches recorded; `logs` is the live, per-request\n\
             egress log of a running session. Host-side — no launch, no nix. (Distinct from `ops test\n\
@@ -840,6 +841,52 @@ const PAGES: &[Page] = &[
             `--session`; scope the sessions with `-a <app>`/`--all`.",
     },
     Page {
+        path: &["net", "mute"],
+        synopsis: "ops net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        summary: "suppress a denied request's log line without changing the verdict (SELinux `dontaudit`)",
+        options: &[
+            ("<rule>", "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `ops net log`"),
+            ("-l, --local", "write the project .ops.toml (the default)"),
+            ("-g, --global", "write the global ops.toml"),
+            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]` (e.g. an imported profile); with `--session`, scope the live load to that app's session(s)"),
+            ("--session", "load the mute into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); it takes effect immediately and dies with the session. Scopes to the current project by default"),
+            ("--all", "with `--session`, widen the live load to every reachable session (all projects)"),
+        ],
+        details:
+            "Adds a `mute` (`dontaudit`) rule: a request matching it is still **denied** and still\n\
+            **counted** in `ops net stats` — only its line is kept out of the default `ops net log`\n\
+            (see it with `ops net log --all`). It is a log filter, never a verdict: it cannot open\n\
+            egress. Use it to quiet the refusals you have deliberately left denied (telemetry, feature\n\
+            flags, an optional CDN) so the actionable ones stand out.\n\
+            \n\
+            A config write needs an existing filtering posture (there is nothing to suppress under\n\
+            `shared`/`none`), so set one first on a fresh config; it re-trusts the project config (it\n\
+            must be absent or already trusted first), while the global config and app profiles are\n\
+            trusted by location. Remove a rule with `ops net unmute`.\n\
+            \n\
+            `--session` instead loads the mute into the **live overlay** of the running session(s),\n\
+            which the proxy folds into its effective policy — so it quiets the log immediately, on\n\
+            any filtering-posture session. It writes no file (no re-trust) and dies with the session;\n\
+            scope it with `-a <app>`/`--all`. A live mute is not un-loaded by `unmute` (it is a\n\
+            log filter with no counter-verdict) — it simply ends with the session.",
+    },
+    Page {
+        path: &["net", "unmute"],
+        synopsis: "ops net unmute <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove a mute rule from a config file (the inverse of `ops net mute`)",
+        options: &[
+            ("<rule>", "the mute rule to remove — an exact-string match of what was muted"),
+            ("-l, --local", "edit the project .ops.toml (the default)"),
+            ("-g, --global", "edit the global ops.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Removes a `mute` rule added by `ops net mute`. Idempotent: unmuting a rule that is not\n\
+            present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
+            when something actually changed); the global config and app profiles are trusted by\n\
+            location.",
+    },
+    Page {
         path: &["net", "pending"],
         synopsis:
             "ops net pending [-a <app>] [--json] | ops net pending allow|deny <id>|--all [-a <app>] [--save ...] | ops net pending watch [-i <secs>]",
@@ -950,13 +997,15 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "logs"],
         synopsis: "ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
-                   [-n <N>] [--with-query] [--with-status] [-f|--follow] [-i|--interval <secs>] [--json]",
+                   [-n <N>] [--all] [--with-query] [--with-status] [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
             ("--host <h>", "only events whose destination host is exactly <h>"),
             ("--verdict <v>", "only events with this verdict: allow, deny, blocked, or error"),
             ("-n <N>", "show only the most recent N events (per session)"),
+            ("--all", "also show refusals a `[network] mute` rule suppressed (tagged `muted`); the \
+                       default view omits them (they stay counted in `ops net stats`)"),
             ("--with-query", "keep the URL query in the shown path (dropped by default; already \
                               secret-redacted)"),
             ("--with-status", "show the upstream HTTP status (200/404/…) — completed L7 requests \
@@ -994,6 +1043,13 @@ const PAGES: &[Page] = &[
             A WebSocket is flagged `ws` on its line (it opens with a `101` status, which only an\n\
             upgrade produces) — shown even without `--with-status`, since a long-lived bidirectional\n\
             tunnel reads differently from a one-shot request.\n\
+            \n\
+            MUTE (SELinux `dontaudit`): a `[network] mute` rule suppresses a *denied* request's line\n\
+            from this view — never its verdict (the request is still refused) and never its count\n\
+            (`ops net stats` still records it). Muted refusals live in a separate ring, so a chatty\n\
+            muted host (telemetry, feature flags) can never evict a real event; `--all` folds them\n\
+            back in, each tagged `muted`. Use it to keep the log focused on the refusals worth acting\n\
+            on while still being able to see everything on demand.\n\
             \n\
             The URL query is dropped from the shown path by default (a token can ride in a query);\n\
             `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\

@@ -1149,6 +1149,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             ask_notice,
             allow,
             deny,
+            mute,
             builtin,
         } => {
             let _ = writeln!(
@@ -1240,6 +1241,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     for host in builtin {
                         let _ = writeln!(o, "      allow {n}{host}{r}");
                     }
+                }
+            }
+            // Mute (`dontaudit`) rules apply under every filtering posture — they suppress a denied
+            // request's log line (never a verdict), so they are surfaced here (dimmed) whenever any
+            // are declared, so the suppression is never silent.
+            if !mute.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "    {dim}mute (refusals kept out of `ops net log`; see `--all`):{r}"
+                );
+                for rule in mute {
+                    let _ = writeln!(o, "      {dim}mute{r}  {n}{rule}{r}");
                 }
             }
             // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
@@ -1630,6 +1643,7 @@ fn render_app_detail(
             ask_notice,
             allow,
             deny,
+            mute,
             builtin,
         } => {
             let _ = writeln!(
@@ -1654,6 +1668,9 @@ fn render_app_detail(
                 for rule in deny {
                     let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
                 }
+                for rule in mute {
+                    let _ = writeln!(o, "    {dim}mute{r}  {n}{rule}{r}");
+                }
                 let _ = writeln!(
                     o,
                     "    {dim}built-in (always allowed, so self-equip works):{r}"
@@ -1663,9 +1680,16 @@ fn render_app_detail(
                 }
                 let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
             } else {
+                // The mute count rides the summary only when non-zero, so a mute-free app reads
+                // exactly as before.
+                let mute_note = if mute.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} mute", mute.len())
+                };
                 let _ = writeln!(
                     o,
-                    "    {dim}({} allow, {} deny — see --details){r}",
+                    "    {dim}({} allow, {} deny{mute_note} — see --details){r}",
                     allow.len(),
                     deny.len()
                 );
@@ -3611,6 +3635,10 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("groups") => net_groups(&args[1..]),
         Some("allow") => net_add_rule(config::manage::EgressList::Allow, &args[1..]),
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
+        // `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one. Both are
+        // config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.
+        Some("mute") => net_add_rule(config::manage::EgressList::Mute, &args[1..]),
+        Some("unmute") => net_remove_rule(config::manage::EgressList::Mute, &args[1..]),
         Some("pending") => net_pending(&args[1..]),
         Some("stats") => net_stats(&args[1..]),
         // `log` is an accepted alias for `logs` so a typo does not error.
@@ -4519,6 +4547,10 @@ struct LogView {
     follow: bool,
     /// The `--follow` poll interval in seconds (`-i`), default 1. Ignored without `--follow`.
     interval_secs: u64,
+    /// `--all`: also show refusals a `mute` (`dontaudit`) rule suppressed from the default view —
+    /// tagged `muted`. They live in a separate ring and are still counted in `ops net stats`; the
+    /// default view omits them.
+    all: bool,
 }
 
 /// Parse `ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
@@ -4534,6 +4566,7 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--json") => v.json = true,
+            Some("--all") => v.all = true,
             Some("--with-query") => v.with_query = true,
             Some("--with-status") => v.with_status = true,
             Some("--follow") | Some("-f") => v.follow = true,
@@ -4597,11 +4630,12 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
 fn collect_logs(
     data_dir: &Path,
     app: Option<&str>,
+    include_muted: bool,
 ) -> (
     Vec<sandbox::control::SessionLog>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::log_all(data_dir);
+    let mut sessions = sandbox::control::log_all(data_dir, include_muted);
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
         sessions.retain(|s| pids.contains(&s.pid));
@@ -4693,7 +4727,7 @@ fn net_logs(args: &[OsString]) -> ExitCode {
         return net_logs_follow(&data_dir, &view, &pal);
     }
 
-    let (sessions, context) = collect_logs(&data_dir, view.app.as_deref());
+    let (sessions, context) = collect_logs(&data_dir, view.app.as_deref(), view.all);
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -4756,7 +4790,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
     // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
     // that pipes to `head` on an idle session emits no spurious line then spins.
-    let (sessions, context) = collect_logs(data_dir, view.app.as_deref());
+    let (sessions, context) = collect_logs(data_dir, view.app.as_deref(), view.all);
     let has_events = sessions
         .iter()
         .any(|s| !filtered_log_events(&s.snapshot.events, view).is_empty());
@@ -4834,6 +4868,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                 &sandbox::control::control_socket(data_dir, pid),
                 after,
                 after_amend,
+                view.all,
             ) else {
                 continue; // a session that vanished mid-read is handled next tick
             };
@@ -5048,6 +5083,13 @@ fn render_log_line(
     } else {
         String::new()
     };
+    // A refusal shown only because of `--all` — flag it so a suppressed (`mute`/`dontaudit`) line is
+    // never mistaken for one the default view would have shown.
+    let muted = if e.muted {
+        format!("  {dim}muted{r}")
+    } else {
+        String::new()
+    };
     // The upstream status, only under `--with-status`: the code (colored by class) for a completed
     // L7 request, or `-` where none was captured (an L4 splice, a refusal, or a not-yet-returned
     // response) so the column is legible rather than mysteriously blank.
@@ -5060,7 +5102,7 @@ fn render_log_line(
         String::new()
     };
     format!(
-        "    {dim}{pid}{r}  {dim}{time}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{ws}{status}",
+        "    {dim}{pid}{r}  {dim}{time}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{ws}{muted}{status}",
         e.verdict.as_str()
     )
 }
@@ -5087,6 +5129,7 @@ fn log_event_json(
         "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
         "verdict": e.verdict.as_str(),
         "reason": e.reason,
+        "muted": e.muted,
     });
     if view.with_status {
         obj["status"] = e
@@ -5655,10 +5698,10 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
         };
         for row in rows {
             let view = NetRuleView {
-                kind: if row.is_allow {
-                    NetRuleKind::Allow
-                } else {
-                    NetRuleKind::Deny
+                kind: match row.kind {
+                    sandbox::control::ManualKind::Allow => NetRuleKind::Allow,
+                    sandbox::control::ManualKind::Deny => NetRuleKind::Deny,
+                    sandbox::control::ManualKind::Mute => NetRuleKind::Mute,
                 },
                 source: RuleSourceView::Manual,
                 rule: row.rule,
@@ -5794,6 +5837,11 @@ fn render_net_rules(
             NetRuleKind::Deny => {
                 let _ = writeln!(o, "  {err}deny{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
             }
+            // A `mute` (`dontaudit`) rule suppresses the log line of a request that is *denied*
+            // anyway — dim, so it never reads as a third verdict beside allow/deny.
+            NetRuleKind::Mute => {
+                let _ = writeln!(o, "  {dim}mute{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
+            }
         }
     }
     o
@@ -5810,6 +5858,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     let verb = match list {
         manage::EgressList::Allow => "allow",
         manage::EgressList::Deny => "deny",
+        manage::EgressList::Mute => "mute",
     };
 
     // `--session` (load the rule into the live overlay of the running session(s) instead of a config
@@ -5925,6 +5974,64 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     }
 }
 
+/// `ops net unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove a `mute` rule from a
+/// config file — the inverse of `ops net mute`. Idempotent (removing a rule that is not there is a
+/// reported no-op, not an error); a project `.ops.toml` write is trust-gated and re-trusted exactly
+/// like `ops net mute`. There is no `--session` form — a live mute overlay is not yet wired, so a
+/// session-scope flag is refused rather than silently ignored.
+fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
+    if args
+        .iter()
+        .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
+    {
+        eprintln!(
+            "ops: net unmute: --session/--all do not apply — this removes a rule from a config file"
+        );
+        return ExitCode::from(2);
+    }
+    let parsed = match split_scope(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ops: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let rule = match parsed.positionals.as_slice() {
+        [r] => r.clone(),
+        [] => {
+            eprintln!("ops: usage: {}", help::synopsis_of(&["net", "unmute"]));
+            return ExitCode::from(2);
+        }
+        _ => {
+            eprintln!("ops: net unmute: expected exactly one rule");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(name) = &parsed.app {
+        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+            eprintln!("ops: invalid app name '{name}'");
+            return ExitCode::from(2);
+        }
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ops: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match persist_egress_removal(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => {
+            eprintln!("ops: {message}");
+            ExitCode::from(code)
+        }
+    }
+}
+
 /// `ops net allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
 /// the running session(s) instead of a config file — the proactive sibling of `ops net pending
 /// allow|deny <id> --session`, which remembers a decision for a request that already parked. It writes
@@ -5940,9 +6047,12 @@ fn net_inject_session(
     cwd: &Path,
 ) -> ExitCode {
     use config::manage::EgressList;
-    let (verdict, verb) = match list {
-        EgressList::Allow => (sandbox::control::Verdict::Allow, "allow"),
-        EgressList::Deny => (sandbox::control::Verdict::Deny, "deny"),
+    // `allow`/`deny` load a verdict rule; `mute` loads a log-suppression rule (a different overlay
+    // and control verb), so the injection call is dispatched per-list in the loop below.
+    let verb = match list {
+        EgressList::Allow => "allow",
+        EgressList::Deny => "deny",
+        EgressList::Mute => "mute",
     };
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
@@ -5977,7 +6087,21 @@ fn net_inject_session(
         if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
             continue;
         }
-        match sandbox::control::inject_rule(&data_dir, pid, verdict, rule) {
+        // A mute loads through the dedicated mute overlay (`REMEMBER MUTE`); allow/deny load a
+        // verdict rule (`REMEMBER ALLOW|DENY`).
+        let injected = match list {
+            EgressList::Mute => sandbox::control::inject_mute(&data_dir, pid, rule),
+            EgressList::Allow => sandbox::control::inject_rule(
+                &data_dir,
+                pid,
+                sandbox::control::Verdict::Allow,
+                rule,
+            ),
+            EgressList::Deny => {
+                sandbox::control::inject_rule(&data_dir, pid, sandbox::control::Verdict::Deny, rule)
+            }
+        };
+        match injected {
             Ok(sandbox::control::InjectOutcome::Loaded) => loaded.push(pid),
             Ok(sandbox::control::InjectOutcome::Refused) => refused.push(pid),
             // A dead/stale socket (the session went away) — skip it.
@@ -6342,6 +6466,7 @@ fn persist_egress_rule(
     let verb = match list {
         manage::EgressList::Allow => "allow",
         manage::EgressList::Deny => "deny",
+        manage::EgressList::Mute => "mute",
     };
     if matches!(scope, Scope::File(_)) {
         return Err((
@@ -6435,6 +6560,91 @@ fn persist_egress_rule(
             msg
         }
     })
+}
+
+/// Remove an egress `rule` from the scoped config file — the removal sibling of
+/// [`persist_egress_rule`], behind `ops net unmute`. A rule that is not present is a reported no-op
+/// (no write, no re-trust). Same scope vocabulary, trust-gate, and error codes as the add path: a
+/// `-c <file>` scope or an untrusted project config is code `2`; a trust-store/write/re-trust
+/// failure is code `1`.
+fn persist_egress_removal(
+    list: config::manage::EgressList,
+    rule: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage::{self, RemoveOutcome, Scope};
+    let (verb, noun) = match list {
+        manage::EgressList::Allow => ("unallow", "allow"),
+        manage::EgressList::Deny => ("undeny", "deny"),
+        manage::EgressList::Mute => ("unmute", "mute"),
+    };
+    if matches!(scope, Scope::File(_)) {
+        return Err((
+            2,
+            format!("`ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
+        ));
+    }
+    if let Some(name) = app {
+        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+            return Err((2, format!("`{name}` is not a valid app name")));
+        }
+    }
+    let (path, app_key, target) = egress_write_target(scope, app, base)?;
+
+    // A project `.ops.toml` edit is trust-gated and re-trusted, exactly like the add path — removing
+    // a rule still rewrites the file, so it must not silently bless an untrusted one.
+    let gated = matches!(scope, Scope::Local);
+    let store = if gated {
+        Some(trust::default_store_dir().ok_or((
+            1,
+            "cannot determine the trust store (set XDG_STATE_HOME or HOME)".to_string(),
+        ))?)
+    } else {
+        None
+    };
+    if let Some(store) = &store {
+        if !local_save_permitted(path.exists(), trust::state(store, &path)) {
+            return Err((
+                2,
+                format!(
+                    "{} is not trusted — review it and run `ops trust {}`, then retry",
+                    path.display(),
+                    config::PROJECT_CONFIG
+                ),
+            ));
+        }
+    }
+
+    let outcome =
+        manage::remove_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
+
+    match outcome {
+        RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
+        RemoveOutcome::Removed => {
+            // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
+            // crash between the write and the trust leaves a correct-but-untrusted file the next
+            // launch drops — never a security hole.
+            if let Some(store) = &store {
+                trust::trust(store, &path).map_err(|e| {
+                    (
+                        1,
+                        format!(
+                            "removed the rule but could not re-trust {}: {e} — run `ops trust {}`",
+                            path.display(),
+                            config::PROJECT_CONFIG
+                        ),
+                    )
+                })?;
+            }
+            let mut msg = format!("removed {noun} {rule} from {target}");
+            if gated {
+                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
+            }
+            Ok(msg)
+        }
+    }
 }
 
 /// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
@@ -8263,6 +8473,7 @@ mod tests {
             path: path.map(str::to_string),
             verdict,
             reason: reason.into(),
+            muted: false,
             status: None,
             amend_seq: None,
         }
@@ -9708,6 +9919,7 @@ mod tests {
                 ask_notice: None,
                 allow: vec!["github.com".into()],
                 deny: vec!["evil.com".into()],
+                mute: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -9890,6 +10102,7 @@ mod tests {
                 ask_notice: None,
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
+                mute: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,
