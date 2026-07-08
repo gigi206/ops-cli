@@ -1,0 +1,83 @@
+# Antigravity CLI (agy) — Google's terminal coding agent, sandboxed by ops.
+#
+#   ops app import profiles/agy.toml
+#   ops app agy
+#
+# `agy` is a genuine terminal TUI (distinct from the Antigravity *IDE*, a GUI desktop
+# app), shipped as a self-contained native Linux binary — so it needs no display and
+# runs headless in the hermetic cage. ops equips it in-cage from the upstream GitHub
+# release via mise's `aqua` backend (the aqua registry entry renames the archive's inner
+# `antigravity` binary to `agy`), so the first launch in a project needs the network and
+# the allowlist below.
+#
+# CREDENTIAL POSTURE — account / Google OAuth, NOT a header-injectable provider key.
+# Antigravity authenticates with **Google Sign-In** and, per Google, does **not** support
+# a bring-your-own Gemini API key for the CLI. There is therefore no HTTP header for ops's
+# `[secret]` broker to strip-and-inject on the wire, and this profile ships **no `[secret]`
+# block** (contrast the BYOK profiles like `cline`/`opencode`). Instead you log in ONCE
+# inside the cage; the CLI's SSH/headless mode prints an authorization URL to open in your
+# own browser, so no in-cage browser (and no Wayland display) is needed:
+#
+#   ops app agy        # then complete the printed Google Sign-In URL in your browser
+#
+# There is no separate `login` subcommand — the OAuth flow triggers on first real use. The
+# credential then persists in the app's dedicated, persistent, isolated home, so it survives
+# later launches and never bleeds into the project shell or another app. The sandbox + the
+# egress allowlist still bound everything the agent can reach.
+#
+# Headless use is `agy -p "<prompt>"` (a.k.a. `--print`, `--print-timeout` default 5m), with
+# `--dangerously-skip-permissions` to auto-approve tool actions — but a real prompt still needs
+# a completed login first.
+#
+# CAVEATS (honest, still to be proven with your Google account):
+#   * Keyring — Antigravity is documented to store its credential in the system keyring
+#     (Secret Service / dbus), which the hermetic cage does NOT provide. If it cannot fall
+#     back to a token FILE under the isolated home, the login will not persist across
+#     launches (or may fail outright). This is the one unproven blocker; test it with your
+#     account before relying on the profile.
+#   * Self-update — the binary self-updates in the background during runs, phoning a Google
+#     Cloud Run host (allowlisted below). That fights version pinning; it is the price of
+#     the vendor's distribution model.
+#   * Provenance — the `google-antigravity` GitHub org that ships the release binary is not
+#     a *verified* GitHub org, though the product is clearly Google's (domain, Sign-In,
+#     GCP billing). A supply-chain caveat, not a settled fact.
+#
+# If a request is blocked, the proxy reports the host it refused — add it to `allow` (or
+# check ahead with `ops test net <url>`).
+cmd = "agy"
+
+# Your host Antigravity CLI config, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
+# lets the caged `agy` read and write these host files (login, settings). Uncomment to share your
+# host setup with the cage instead of the app's isolated home (the default). The exact config path
+# is UNCONFIRMED (verify with a real run before relying on it).
+#binds = [
+#    { path = "~/.antigravity", mode = "rw" },
+#]
+
+[packages]
+# Antigravity's standalone terminal binary, pulled fresh from its upstream GitHub release by
+# mise's aqua backend (a native binary — no node/electron runtime). Trusted-only [packages];
+# this profile is trusted by location once imported. GitHub-distributed, so the install fetch
+# rides ops's built-in nix-cache allow-set (github / githubusercontent) — no extra `allow` needed
+# for the download itself.
+agy = "mise:aqua:google-antigravity/antigravity-cli"
+
+# An app is read-by-default ({GET,HEAD}); the login/token endpoints are write hosts, so each is
+# opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Google Sign-In: the OAuth authorization + token exchange the login flow POSTs to.
+    "{*} https://accounts.google.com",
+    "{*} https://oauth2.googleapis.com",
+    # The binary's background self-updater (a Google Cloud Run host) — a signed-binary download.
+    "{GET} https://antigravity-cli-auto-updater-974169037036.us-central1.run.app",
+    # Docs / bootstrap — a read-only fetch.
+    "{GET} https://antigravity.google",
+    # MODEL / AGENT TRAFFIC HOST — UNCONFIRMED. Almost certainly under Google's API surface
+    # (a `*.googleapis.com` endpoint), but the exact host was not captured on the wire. Run
+    # `ops net logs -a agy` on a real session and add the refused host here (opened `{*}`, since
+    # the agent POSTs completions). A likely-broad starting point, narrow it once observed:
+    #"{*} https://*.googleapis.com",
+]

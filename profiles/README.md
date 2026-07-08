@@ -28,15 +28,19 @@ with `ops app export <name>`.
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
 | `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
 | `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
+| `agy`             | `mise:aqua:google-antigravity/antigravity-cli`  | `accounts.google.com` (Google OAuth) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
 
 > **Two credential postures.** Most profiles are **BYOK** — your provider key is read
 > on the host and injected by the proxy, never entering the cage (see below).
-> `freebuff` is the other kind: it logs in to a service **account** and the token
-> persists in the app's isolated `$HOME` (so it *does* live in the — isolated — cage,
-> never in the project shell). Both stay bounded by the egress allowlist.
+> `freebuff` and `agy` are the other kind: they log in to a service **account** (a
+> Codebuff account; a Google account, respectively) and the token persists in the app's
+> isolated `$HOME` (so it *does* live in the — isolated — cage, never in the project
+> shell). Both stay bounded by the egress allowlist. `agy` carries an extra unproven
+> risk — it may want a **system keyring** the hermetic cage does not provide (see its
+> profile header and the status note below).
 
 ## Credentials — the key never enters the cage
 
@@ -62,13 +66,29 @@ can only reach the provider you listed.
 > over a `nix:nodejs` runtime — the npm launcher and its 46 MB binary both fetched through the
 > empty-netns MITM allowlist, then `freebuff --version`), and `cline` (3.0.29) and `droid`
 > (0.153.1) (both equipped via mise's **npm** backend over a `nix:nodejs` runtime — their
-> native platform binaries resolved through the empty-netns MITM allowlist, then `--version`).
+> native platform binaries resolved through the empty-netns MITM allowlist, then `--version`),
+> and `agy` (1.0.16, equipped via mise's **aqua** backend — the upstream GitHub release binary
+> resolved through the empty-netns MITM allowlist, then `agy --version` and `agy --help`, which
+> confirmed its headless `-p`/`--print` mode).
 > The one remaining *live* end-to-end is
 > the credential step: for the BYOK profiles, the CLI **authenticating** through the
 > proxy-injected key (does the tool accept the placeholder and let the proxy fill in the real
 > key?); for `freebuff`, completing its account **login** once inside the cage (the token then
 > persists in the isolated home). Both are the flagship validation, still to be proven with a
 > real key/account.
+>
+> `agy` is a special case of the account posture. Bringing it up surfaced a real **cage gap**,
+> now fixed: `agy` starts an internal language server that binds `localhost`, and a hermetic cage
+> had no `/etc/hosts`, so resolving the *name* `localhost` fell through to DNS the empty netns
+> cannot answer — `agy` exited immediately (`CLI failed to start … lookup localhost … connection
+> refused`). ops now synthesises an `/etc/hosts` mapping `localhost` (and the cage hostname) to
+> loopback, so `agy` gets past language-server startup and reaches its **Google Sign-In** step —
+> proven live (the process now blocks awaiting login instead of quitting). Two items remain,
+> both needing a real Google account: whether the OAuth credential **persists** in the cage
+> (Antigravity is documented to use the **system keyring** the hermetic cage lacks — it may or may
+> not fall back to a token file under the isolated home), and the runtime **model-traffic host**
+> (not captured without auth; the profile leaves a commented `*.googleapis.com` to narrow via
+> `ops net logs -a agy`).
 >
 > `hermes` installs its published PyPI wheel with **uv** (mise's `pipx` backend over a `nix:uv`
 > installer and `nix:python312`) — proven live in-cage under the profile's own allowlist
@@ -90,6 +110,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
+| `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
 (mise's `aqua`/`github`/registry backends pull the real release binary, its `pipx` backend a
@@ -171,16 +192,16 @@ broker to strip-and-replace. The tools below were each researched against primar
 do not guess the values, so each waits on a real fact or on a named feature:
 
 - **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
-  Sign-In / an OAuth token in the keyring** and exposes no env-var/API-key path. A header broker
-  has nothing to inject, and the `freebuff`-style account-login posture does not fit either — it
-  needs a browser/keyring, not a token file written under the isolated home. What would unblock
-  it is an **interactive device-code login** (prints a URL + code you approve in your own
-  browser; the token persists in the app's isolated `$HOME`, no in-cage browser) **plus**
-  observing the tool's runtime API host before writing `allow`.
+  Sign-In**, not a header-injectable key, so it ships as an **account** profile (above), not a
+  BYOK one. It equips and runs headless (proven), and its Sign-In prints an authorization URL
+  you complete in your own browser — no in-cage browser needed. The open caveat is credential
+  persistence: Antigravity may want a **system keyring** the hermetic cage lacks (see the profile
+  header + the status note). Its runtime model host is also not yet captured.
 
 - **GUI / desktop agents — blocked on the Wayland passthrough** — **opencode desktop** and
   **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that drives *other* agents,
-  not a CLI), plus Antigravity *IDE* and hermes desktop. These are Electron/desktop apps that
+  not a CLI), plus the Antigravity *IDE* (the desktop app — distinct from the `agy` CLI, which is
+  profiled above) and hermes desktop. These are Electron/desktop apps that
   need a graphical display, which the headless cage does not bind yet. Their headless siblings
   are the path: the `opencode` **CLI** is already profiled; t3 code's targets are the CLIs it
   wraps (`codex`/`claude`/`opencode`), already here.
