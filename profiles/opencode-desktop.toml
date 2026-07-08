@@ -1,0 +1,112 @@
+# opencode desktop — the Electron GUI of opencode, sandboxed by ops (with a Wayland display).
+#
+#   ops app import profiles/opencode-desktop.toml
+#   ops app opencode-desktop
+#
+# This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
+# `opencode-web` (the same server in your browser). opencode ships a native desktop app built
+# with Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`, neither of which
+# installs in the hermetic cage. ops therefore packages it from a nix flake.
+#
+# WHY THIS FLAKE (a community one, not opencode's official flake). opencode's OWN flake exposes an
+# `opencode-desktop` output, but it BUILDS the Electron app from source with bun — and its build
+# script requires bun `^1.3.14`, newer than anything nixpkgs packages (1.3.13 max), so `nix build`
+# fails at the prebuild step (the same wall that kept `kilocode` off its flake). Rather than
+# compile, `tomsch/opencode-desktop-nix#opencode-desktop` fetches the **prebuilt `.deb`** from
+# opencode's GitHub releases and `autoPatchelfHook`s it against the nix closure — no bun, no source
+# build. Every fetch goes through nix's own fetcher (which honours the cage's egress proxy) from
+# github (already in ops's built-in nix-cache allow-set), and the GUI libraries arrive in the
+# seeded store rather than needing a host `/usr`. The version tracks the `.deb` that flake pins
+# (currently 1.17.15); `ops upgrade flake` re-resolves it (bounded by what the flake has pinned).
+#
+# FIRST LAUNCH fetches the `.deb` + the Electron closure (hundreds of MiB) over the network under
+# this profile's allowlist — a couple of minutes; later launches reuse the warm build offline. The
+# reference FLOATS until you run `ops upgrade flake`, which pins it (a floating package is sticky to
+# its first build — it does not advance on its own).
+#
+# WHY `cmd` IS A `bash` WRAPPER (the MITM-CA import). Under the allowlist ops runs a TLS-terminating
+# proxy with a per-session CA, which it injects into the cage via the CA-file env vars
+# (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …). Electron/Chromium **ignores those** — it trusts its
+# own NSS database (`~/.pki/nssdb`), so without help every HTTPS request fails
+# `ERR_CERT_AUTHORITY_INVALID` and the UI cannot load. The wrapper imports ops's CA into that NSS db
+# with `certutil` (from the `nss` package below) and passes `--use-system-ca`, so the app trusts the
+# proxy and egress stays filtered. (`$SSL_CERT_FILE` is ops's CA under a filtering posture; the
+# `/opt/ops/egress-ca.pem` fallback is where ops binds it.) This is a profile-level shim; making ops
+# seed the NSS db for every Chromium app is a cleaner, separate improvement.
+#
+# DISPLAY. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and provisions
+# fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation is
+# compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
+# screen-capture/input-injection to ordinary clients (see docs/guide/configuration/gui.md). The
+# Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the
+# empty netns IS the boundary (it replaces Chromium's own redundant sandbox); `--ozone-platform=
+# wayland` selects the Wayland backend; `--disable-gpu` avoids needing `/dev/dri` (add `[devices]
+# allow = ["/dev/dri"]` and drop the flag for hardware acceleration); `--disable-dev-shm-usage`
+# avoids the small cage `/dev/shm`. The cage has no dbus bus, so desktop notifications, a tray icon,
+# and the system keyring are unavailable — benign for editing/chat; a keyring-backed login would
+# fall back to a file in the app's isolated home.
+cmd = ["bash", "-c", "DB=\"$HOME/.pki/nssdb\"; mkdir -p \"$DB\"; certutil -d \"sql:$DB\" -N --empty-password 2>/dev/null; certutil -d \"sql:$DB\" -A -n ops-mitm -t C,, -i \"${SSL_CERT_FILE:-/opt/ops/egress-ca.pem}\" 2>/dev/null; exec opencode-desktop --no-sandbox --ozone-platform=wayland --disable-gpu --disable-dev-shm-usage --use-system-ca"]
+
+gui = "wayland"
+
+# Your host opencode config/auth, mounted read-write at its real absolute path (so the GUI shares
+# the same login/sessions as your host opencode). `binds` is a security field, honored only
+# because this profile lives in your trusted config dir. Uncomment to share your host setup with
+# the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/opencode", mode = "rw" },       # config
+#    { path = "~/.local/share/opencode", mode = "rw" },  # auth + sessions (SQLite)
+#]
+
+[packages]
+opencode-desktop = "flake:github:tomsch/opencode-desktop-nix#opencode-desktop"
+# certutil (NSS tools) — the cmd wrapper above uses it to import ops's MITM CA into the cage's NSS
+# db so Electron/Chromium trusts the egress proxy under the allowlist. A stable substrate tool, so
+# it is a nixpkgs `nix:` package (seeded, offline-reusable).
+nss = "nix:nss.tools"
+
+[network]
+mode = "deny"
+# opencode desktop wraps the SAME opencode server as the CLI, so it is multi-provider and its
+# model traffic goes to the same hosts. models.dev is the read-only model catalogue; opencode.ai
+# is the gateway ("Zen") plus auth and the config/theme schemas, opened to every verb with `{*}`
+# (an app is read-by-default, and the app POSTs completions through the gateway). registry.npmjs.org
+# is a RUNTIME fetch — opencode pulls its `@opencode-ai/plugin` package at startup (and the app
+# checks GitHub releases for updates, already covered by the built-in github allow-set).
+#
+# If a request is refused, the proxy names the host — watch `ops net logs -a opencode-desktop` and
+# add it here (or check ahead with `ops test net <url>`). For a DIRECT provider instead of the
+# gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
+# `{*} https://openrouter.ai`) and fill the [secret] block below.
+allow = [
+    "{GET} https://models.dev",
+    "{*} https://registry.npmjs.org",
+    "{*} https://opencode.ai",
+    # /share syncs a session to opencode's servers on demand (HTTPS POST, not a WebSocket).
+    #"{*} https://opncd.ai",
+    # opencode streams completions over HTTPS (SSE), not a WebSocket, so the default posture needs
+    # no `{WS}` grant. A WebSocket is opened only by the OpenAI "Responses" transport, targeting
+    # the OpenAI provider's own base host — name it with `{WS}` if you use that (see the opencode
+    # CLI profile for the discovery recipe).
+    #"{WS} https://api.openai.com",
+    # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
+    #"{*} https://openrouter.ai",
+]
+# Silence the denied telemetry: the desktop app POSTs crash/usage envelopes to Sentry, which the
+# allowlist already refuses (`denied-default`). `mute` keeps those refusals out of the default
+# `ops net logs` (still denied, still counted in `ops net stats`; see them with `--all`).
+mute = ["*.sentry.io"]
+
+# The real key is read on the HOST and injected by the egress proxy — never in the cage. Provide
+# it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.
+# sops://secrets.yaml#openrouter). The in-cage placeholder lets the app start and issue the
+# request; the proxy strips it and substitutes the real key on the wire to openrouter.ai. (For a
+# direct provider add its host to `allow` above and keep this block; for Anthropic/OpenAI change
+# the host, header, and env var instead — see the `opencode` CLI profile.)
+[env]
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

@@ -96,6 +96,40 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **opencode GUI profiles — `opencode-web` + `opencode-desktop` (DONE 2026-07-08)**
+  (`profiles/opencode-web.toml` [new] + `profiles/opencode-desktop.toml` [new] + `profiles/
+  README.md`; no ops code change): two graphical ways to run opencode under ops, both live-proven.
+  **`opencode-web`** runs opencode's `web` server headless in the cage and reaches the host browser
+  via the inbound **`forward = [4096]`** hole (a TOP-LEVEL field): `mise:opencode` (no build),
+  `opencode web --port 4096` on the cage loopback, host `curl http://127.0.0.1:4096/` → HTTP 200
+  (proven) — the lightest graphical path, no Electron, no in-cage build. **`opencode-desktop`** is
+  the native **Electron** app (1.17.15). The desktop ships only as `.deb`/`.rpm`; opencode's OWN
+  flake `#opencode-desktop` builds it from source with **bun** and its prebuild script requires
+  `bun ^1.3.14` > the nixpkgs max (1.3.13) → `nix build` fails at prebuild (the same wall that kept
+  `kilocode` off its flake — proven live, incl. that `max-jobs=1` clears the earlier `/homeless-shelter`
+  parallel-build collision under ops's forced `sandbox = false`, and that a `--net shared` build then
+  fails on the bun-version check not the network). Fixed by packaging from the **prebuilt `.deb`** via
+  the community flake `flake:github:tomsch/opencode-desktop-nix#opencode-desktop` (autoPatchelf,
+  github-fetched, **no bun / no source build**) + `gui = "wayland"` + Electron flags (`--no-sandbox
+  --ozone-platform=wayland --disable-gpu --disable-dev-shm-usage`). **Load-bearing runtime finding:
+  Electron/Chromium ignores ops's CA-file env vars** (`SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS`) **and
+  trusts its own NSS db** (`~/.pki/nssdb`), so under the allowlist MITM every HTTPS fails
+  `ERR_CERT_AUTHORITY_INVALID` and the UI cannot load (proven: updater `checking → error` under
+  allowlist, `→ up-to-date` under `shared`). The `cmd` is a `bash` wrapper that `certutil`-imports
+  ops's per-session CA into the NSS db (+ `--use-system-ca`), with `nss = "nix:nss.tools"` supplying
+  certutil. **Proven live under the allowlist:** 1.17.15 built in-cage from the `.deb`, the Electron
+  window rendered on the Wayland compositor, and `ops net logs` showed models.dev / opencode.ai /
+  registry.npmjs.org (the `@opencode-ai/plugin` runtime fetch) allowed and Sentry telemetry denied —
+  `[network] mute = ["*.sentry.io"]` keeps that refusal out of the default log. **Gotcha recorded:** a
+  floating `flake:` package's out-link is keyed by package NAME, so switching the flake ref for the
+  same name reuses the stale build — remove the out-link (or `ops upgrade flake`, which pins a
+  rev-keyed out-link) to rebuild. **Upgrade:** `ops upgrade flake` rolls the app's flake package
+  (bounded by what tomsch's flake pins); a floating package is sticky to its first warm build until
+  then. **Named follow-up (not built):** generalize the CA→NSS seeding into ops-core so every
+  Chromium/Electron app trusts the MITM CA under the allowlist automatically (a sandbox increment —
+  tests + advisor), replacing the per-profile `certutil` wrapper; and a dbus session bus for GUI apps
+  (currently absent → no desktop notifications/tray/keyring, benign for editing/chat). `the_shipped_
+  profiles_import_and_resolve` now covers 12 profiles.
   **`[network] mute` — SELinux-`dontaudit` egress-log suppression (DONE 2026-07-08)**
   (`src/allowlist.rs` + `config/{schema,mod,view,manage}.rs` + `sandbox/{control,proxy,egress,
   netlearn}.rs` + `{main,help}.rs` + `docs/guide/networking/{observability,rules}.md` +

@@ -22,6 +22,8 @@ with `ops app export <name>`.
 | `claude-code`     | `mise:aqua:anthropics/claude-code`   | `api.anthropic.com`     |
 | `codex`           | `mise:aqua:openai/codex`             | `api.openai.com`        |
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
+| `opencode-web`    | `mise:opencode` (`opencode web` + `forward`) | provider-dependent |
+| `opencode-desktop`| `flake:github:tomsch/opencode-desktop-nix#opencode-desktop` (Electron GUI, `gui = "wayland"`) | provider-dependent |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
 | `hermes`          | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | `openrouter.ai` (BYOK)  |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
@@ -94,6 +96,23 @@ can only reach the provider you listed.
 > installer and `nix:python312`) — proven live in-cage under the profile's own allowlist
 > (`hermes --version` → v0.18.0, ~60 wheels resolved in seconds; only the live-auth above is
 > still pending). The `flake:` backend itself is proven separately on a reference flake.
+>
+> `opencode-web` and `opencode-desktop` are the two **graphical** ways to run opencode under ops,
+> both proven live. `opencode-web` runs opencode's `web` server headless in the cage and exposes it
+> to your host browser with `forward` (an inbound loopback hole) — proven end-to-end: opencode
+> equipped via mise under the allowlist, `opencode web` serving on the cage's `127.0.0.1:4096`, and
+> `curl http://127.0.0.1:4096/` from the host returning the UI (HTTP 200). No Electron, no in-cage
+> build — the lightest graphical path.
+>
+> `opencode-desktop` is the native Electron app, packaged from the prebuilt `.deb` (the community
+> `tomsch/opencode-desktop-nix` flake) so no bun/source build is needed, and displayed through
+> `gui = "wayland"`. Proven live **under the allowlist**: version 1.17.15 built in-cage
+> (`.deb` fetched from GitHub, autoPatchelf'd), the Electron window mapped and rendered on the
+> Wayland compositor, and its HTTPS ran through the egress MITM once ops's CA was imported into the
+> cage's NSS database (the `cmd` wrapper's `certutil` step — Electron ignores the CA-file env vars).
+> `ops net logs` showed the model catalogue / gateway / plugin fetches allowed and the Sentry
+> telemetry denied — egress filtered as intended. The remaining flagship step, as for every
+> profile, is the live credential/auth with your own provider key.
 
 ## Tool freshness
 
@@ -104,6 +123,8 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `claude-code` | `mise:aqua:anthropics/claude-code`           | Anthropic's standalone release |
 | `codex`       | `mise:aqua:openai/codex`                      | OpenAI's GitHub release        |
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
+| `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
+| `opencode-desktop` | `flake:github:tomsch/opencode-desktop-nix#opencode-desktop` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd in-cage |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `hermes`      | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | NousResearch PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
@@ -183,9 +204,9 @@ check a URL's verdict ahead of time with `ops test net <url>` (or `--method POST
 
 ## Not here yet — and why
 
-A profile needs three things: a **standalone CLI/TUI** (not a GUI app, not an editor
-extension), a way to **package it in the hermetic cage**, and a **header-injectable BYOK
-credential** — an API key supplied via an env var against an OpenAI-compatible or Anthropic
+A profile needs three things: a **runnable agent** — a CLI/TUI, or a GUI/Electron app packaged
+as described in the GUI bullet below (not an editor extension) — a way to **package it in the
+hermetic cage**, and a **header-injectable BYOK credential** — an API key supplied via an env var against an OpenAI-compatible or Anthropic
 endpoint (**OpenRouter** is the universal one: one key, hundreds of models, `Authorization:
 Bearer`). An OAuth/account login or a query-param key has no header for ops's `[secret]`
 broker to strip-and-replace. The tools below were each researched against primary sources; we
@@ -198,13 +219,18 @@ do not guess the values, so each waits on a real fact or on a named feature:
   persistence: Antigravity may want a **system keyring** the hermetic cage lacks (see the profile
   header + the status note). Its runtime model host is also not yet captured.
 
-- **GUI / desktop agents — blocked on the Wayland passthrough** — **opencode desktop** and
-  **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that drives *other* agents,
-  not a CLI), plus the Antigravity *IDE* (the desktop app — distinct from the `agy` CLI, which is
-  profiled above) and hermes desktop. These are Electron/desktop apps that
-  need a graphical display, which the headless cage does not bind yet. Their headless siblings
-  are the path: the `opencode` **CLI** is already profiled; t3 code's targets are the CLIs it
-  wraps (`codex`/`claude`/`opencode`), already here.
+- **GUI / desktop (Electron) agents** — no longer blocked in general: `opencode-desktop` (above)
+  is a working Electron profile, and it maps out the recipe for the next one. Three pieces make an
+  Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with a flake
+  that `autoPatchelfHook`s it (fetch via nix from GitHub — avoids the from-source `bun install`
+  wall); (2) **`gui = "wayland"`** plus the Chromium flags (`--no-sandbox --ozone-platform=wayland
+  --disable-gpu`); (3) under the allowlist, **import ops's MITM CA into the app's NSS db** (Chromium
+  ignores the CA-file env vars), as `opencode-desktop`'s `cmd` wrapper does with `certutil`. Still
+  waiting, each on a real fact: **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that
+  drives *other* agents — its targets `codex`/`claude`/`opencode` are already profiled as CLIs), the
+  Antigravity *IDE* (distinct from the `agy` CLI, profiled above), and hermes desktop — each needs a
+  prebuilt-`.deb`/flake package and a groundable credential, or is better served by its headless
+  sibling (the `opencode`/`hermes` CLIs are profiled).
 
 - **`aionui`** is the closest GUI candidate — it is an Electron app **but ships a genuine
   headless `--webui` HTTP-server mode** and is OpenRouter-keyable. It waits on two things:
