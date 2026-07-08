@@ -618,7 +618,10 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
 
     // The pinned revisions of any `flake:` packages, read network-free from the per-project lock —
     // the same source the launch consults — so the view can show a pin without resolving anything.
-    let flake_pins = sandbox::flake_pinned_revs(cwd);
+    // Pinned identities keyed by a package's locator: flake refs → revision, deb URLs → short
+    // content hash. The two key spaces are disjoint, so one map serves both backends.
+    let mut flake_pins = sandbox::flake_pinned_revs(cwd);
+    flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
 
     let packages = resolved
         .packages
@@ -725,12 +728,14 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
     }
 }
 
-/// The locked revision for a `flake:` package, looked up by its declared reference (the lock key,
-/// byte-identical to the locator); `None` for a floating flake package or any other backend.
+/// The locked pin for a `flake:` (revision) or `deb:` (short content hash) package, looked up by
+/// its locator in the merged pin map; `None` for an unpinned package or any other backend.
 fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) -> Option<String> {
     match backend {
+        // Both flake refs and deb URLs are looked up by locator in the merged pin map.
         Backend::Flake(reference) => flake_pins.get(reference).cloned(),
-        Backend::Nix(_) | Backend::Mise(_) | Backend::Deb(_) => None,
+        Backend::Deb(url) => flake_pins.get(url).cloned(),
+        Backend::Nix(_) | Backend::Mise(_) => None,
     }
 }
 
@@ -983,7 +988,10 @@ fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
 pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> {
     let resolved = super::load(cwd);
     let app = resolved.apps.get(name)?;
-    let flake_pins = sandbox::flake_pinned_revs(cwd);
+    // Pinned identities keyed by a package's locator: flake refs → revision, deb URLs → short
+    // content hash. The two key spaces are disjoint, so one map serves both backends.
+    let mut flake_pins = sandbox::flake_pinned_revs(cwd);
+    flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
     Some(app_detail_view(cwd, name, app, &resolved, &flake_pins))
 }
 
@@ -1465,6 +1473,26 @@ mod tests {
     /// miss the projection would otherwise hide if the two ever diverged. Covers both the baseline
     /// `packages:` line and an app's compact package list, since a profile may declare its flake
     /// package in an app overlay rather than the baseline.
+    #[test]
+    fn a_pinned_deb_hash_surfaces_keyed_by_the_url_locator() {
+        use crate::config::Package;
+        // A deb package's locator is its URL; the merged pin map keys deb hashes by that URL, so the
+        // same locator-keyed lookup that serves flake serves deb (disjoint key spaces, one map).
+        let url = "https://e/app-linux-amd64.deb";
+        let pins = BTreeMap::from([(url.to_string(), "jBGtMS5l".to_string())]);
+        let deb = Package {
+            name: "app".into(),
+            backend: Backend::Deb(url.into()),
+            state: TrustState::Trusted,
+        };
+        assert_eq!(deb.backend.locator(), url);
+        assert_eq!(
+            package_view(&deb, &pins).pinned_rev.as_deref(),
+            Some("jBGtMS5l")
+        );
+        assert_eq!(package_view(&deb, &BTreeMap::new()).pinned_rev, None);
+    }
+
     #[test]
     fn a_pinned_flake_revision_surfaces_keyed_by_the_locator() {
         use crate::config::{AppHomeScope, Package, ResolvedApp};

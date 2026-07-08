@@ -9822,6 +9822,64 @@ mod tests {
     }
 
     #[test]
+    fn short_hash_takes_the_base64_body_prefix() {
+        assert_eq!(
+            short_hash("sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w="),
+            "jBGtMS5l"
+        );
+        // no prefix and a short value degrade gracefully (no panic, min(8))
+        assert_eq!(short_hash("short"), "short");
+        assert_eq!(short_hash("sha256-ab"), "ab");
+    }
+
+    #[test]
+    fn deb_upgrade_summary_distinguishes_the_outcomes() {
+        use sandbox::DebUpgrade::*;
+
+        // an empty roll (no deb: packages) says so plainly; an untrusted one names the withheld
+        let empty = deb_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.contains("no deb: packages"));
+        let withheld = deb_upgrade_summary(&[], 1, &style::Palette::plain()).join("\n");
+        assert!(withheld.contains("1 deb: package(s) withheld (untrusted)"));
+        assert!(!withheld.contains("no deb: packages"));
+
+        let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
+        let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
+        let text = deb_upgrade_summary(
+            &[
+                Unchanged {
+                    url: "https://e/a.deb".into(),
+                    hash: h_a.into(),
+                },
+                Rolled {
+                    url: "https://e/b.deb".into(),
+                    from: h_a.into(),
+                    to: h_b.into(),
+                },
+                Pinned {
+                    url: "https://e/c.deb".into(),
+                    hash: h_b.into(),
+                },
+                Pruned {
+                    url: "https://e/old.deb".into(),
+                },
+                Failed {
+                    url: "https://e/d.deb".into(),
+                    error: "prefetch unreachable".into(),
+                },
+            ],
+            0,
+            &style::Palette::plain(),
+        )
+        .join("\n");
+        assert!(text.contains("deb:https://e/a.deb: jBGtMS5l — unchanged"));
+        assert!(text.contains("deb:https://e/b.deb: jBGtMS5l → XH0ykkcZ — rolled forward"));
+        assert!(text.contains("deb:https://e/c.deb: XH0ykkcZ — newly pinned"));
+        assert!(text.contains("deb:https://e/old.deb: removed from the lock"));
+        assert!(text.contains("deb:https://e/d.deb: re-resolve failed — prefetch unreachable"));
+    }
+
+    #[test]
     fn transactional_confirmations_are_plain_text_when_uncolored() {
         // The OFF path the integration capture and the existing substring assertions rely on:
         // empty spans, byte-identical plain text. Each line of the original wording is preserved.

@@ -124,13 +124,34 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-side resolve+build → Electron 1.17.15 renders on Wayland (via the catrust CA→NSS seed), updater
   `checking → up-to-date` through the MITM, egress filtered (models.dev/opencode.ai/npmjs allowed,
   Sentry muted); `deb-packages.lock` written (pin-on-first-use), `ops upgrade deb` → `unchanged`.
-  **965 unit (+4: parse/validate + is_sri + derivation-gen + lock round-trip) + 90 config green**,
-  fmt/clippy `-D warnings` clean, std-only (reuses `store::provision_expr`/`nix_command` + serde_json).
-  **Honest scope:** the install phase targets the **Electron layout** (find the app by `app.asar`), the
-  dominant `.deb`-desktop case — a non-Electron `.deb` or a different lib set is a future extension; the
-  `latest`-URL race (upstream releases between a stale lock and a rebuild) is a fail-closed hash mismatch
-  → `ops upgrade deb`; `equip_for_gc` does not re-provision `deb:` (its gcroot protects the shared-store
-  path; a project-store copy re-seeds next launch) — a named residual.
+  **Advisor-reviewed (code + security), findings addressed.** Security: **✅ no exploitable
+  vulnerability** — every interpolated value (`url`/`name`/`hash`/`nixpkgs`/`system`) is
+  charset-validated so it cannot inject nix or shell; `deb:` is trusted-only and the flagship
+  override-protection holds; host-side build is safe (`dpkg-deb -x` runs no maintainer script,
+  `dontBuild`, and nix's own build sandbox contains it); the CA→NSS import adds only the same
+  server-auth CA the env vars already trust, into the cage's isolated home NSS db. Code review
+  drove the fixes: unit tests for `declared_urls`/`all_declared_urls`/`withheld`/`deb_upgrade_summary`/
+  `short_hash` (the untested mirror logic); a **deterministic** launcher pick (`sort | head`); a
+  **layout-general** install (extract into a subdir, `cp -r extracted/. $out` — any prefix, no nix
+  build-metadata leak); `write_pins` dir at `0o700` (matching flake); and — the security review's
+  one real wrinkle — **catrust's NSS nickname is now keyed by the CA content** (`ops-mitm-<sha256>`,
+  no delete-then-add), so two concurrent same-app launches with distinct per-session CAs coexist
+  instead of racing a shared name (the accumulated dead ephemeral-CA entries are harmless — their
+  private keys are gone). And **`ops config show` now displays a deb's pinned short hash** (`@ …
+  (pinned)`, keyed by URL in the same merged pin map that serves flake revs — disjoint key spaces).
+  **970 unit (+5 over the pre-review 965) + 90 config green**, fmt/clippy `-D warnings` clean,
+  std-only (reuses `store::provision_expr`/`nix_command` + serde_json).
+  **Honest scope:** the install phase targets the **Electron layout** (locates the app by
+  `resources/app.asar` + wraps its launcher) — the deb-desktop class every current target belongs
+  to; a non-Electron `.deb` **fail-closes with a clear error** (a `.desktop`-`Exec` entry-point + a
+  per-profile lib set would generalize it — deferred, YAGNI). **The review's `upgrade` double-collection
+  is now optimized** (both backends together, for parity): `declared_urls`+`all_declared_urls` (and the
+  flake twins) collapsed into a single `declared(cfg) -> Declared { trusted, all }` that walks the apps
+  **once** and materializes each `merge_app` overlay a single time, feeding both the trusted roll set and
+  the trust-agnostic prune universe — so `ops upgrade` no longer merges every app twice. The
+  `latest`-URL TOFU/race (upstream moving between a stale lock and a genuinely-fresh rebuild — further
+  mitigated now that `equip_for_gc` seeds the deb roots, so gc keeps the built output) fails closed →
+  `ops upgrade deb`.
   **GUI CA trust — ops seeds the egress MITM CA into the cage's NSS db for Chromium/Electron apps
   (DONE 2026-07-08)** (`src/sandbox/catrust.rs` [new] + `mod.rs` + `egress.rs` [`CAGE_CA` →
   `pub(crate)`] + `launch.rs`): the ops-core generalization of the per-profile CA→NSS shim

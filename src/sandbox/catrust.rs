@@ -22,11 +22,15 @@ use std::path::{Path, PathBuf};
 /// contain, and the gcroot name. `nss.tools` is the NSS command-line tools output.
 const CERTUTIL: (&str, &str, &str) = ("nss.tools", "bin/certutil", "nss-tools");
 
-/// A fixed NSS nickname for ops's imported CA. The per-app home is persistent, so the db
-/// survives across launches while the CA is per-session — the import [`wrap`]s a *delete* of
-/// this nickname before the *add*, so the current session's CA replaces the previous one rather
-/// than colliding with it (certutil refuses a duplicate nickname).
-const CA_NICKNAME: &str = "ops-mitm";
+/// The NSS nickname prefix for ops's imported CA. The full nickname is
+/// `ops-mitm-<sha256(CA)[..16]>` — **keyed by the CA content**, so two concurrent launches of the
+/// same app (sharing the persistent home's `~/.pki/nssdb`), each with a distinct per-session CA,
+/// import under *different* nicknames and coexist rather than racing a shared name. No stale-entry
+/// delete is done (which under concurrency could drop the other session's CA); a same-CA re-add is
+/// idempotent (certutil refuses the duplicate, ignored). The accumulated dead entries are harmless:
+/// each is a server-auth CA whose per-session private key is ephemeral and gone, so nothing can
+/// present a cert it would validate.
+const CA_NICKNAME_PREFIX: &str = "ops-mitm";
 
 /// The provisioned certutil: the binary to invoke and the store root whose closure the project
 /// store must seed (so the cage reads it through `/nix`).
@@ -72,15 +76,22 @@ pub(crate) fn wrap(
     // is reused across launches) prompts for confirmation on stdin and would otherwise hang the
     // launch (no tty). The `-N` is also guarded on the db not already existing, so it runs once;
     // stdin redirection is the belt-and-suspenders that keeps any certutil step non-blocking.
+    //
+    // The nickname is keyed by the CA content (`sha256sum`), so two concurrent launches of the same
+    // app — sharing the persistent home's db, each with a distinct per-session CA — add under
+    // *different* nicknames and coexist, rather than racing a shared name with a delete-then-add
+    // (which could drop the other session's CA). A same-CA re-add is idempotent (certutil refuses
+    // the duplicate, ignored). Accumulated dead entries are harmless: each is a server-auth CA whose
+    // ephemeral private key is gone, so nothing can present a certificate it would validate.
     let script = format!(
         "DB=\"$HOME/.pki/nssdb\"\n\
          mkdir -p \"$DB\"\n\
          [ -f \"$DB/cert9.db\" ] || '{c}' -d \"sql:$DB\" -N --empty-password </dev/null 2>/dev/null || true\n\
-         '{c}' -d \"sql:$DB\" -D -n '{nick}' </dev/null 2>/dev/null || true\n\
-         '{c}' -d \"sql:$DB\" -A -n '{nick}' -t 'C,,' -i '{ca}' </dev/null 2>/dev/null || true\n\
+         nick=\"{prefix}-$(sha256sum '{ca}' 2>/dev/null | cut -c1-16)\"\n\
+         '{c}' -d \"sql:$DB\" -A -n \"$nick\" -t 'C,,' -i '{ca}' </dev/null 2>/dev/null || true\n\
          exec \"$@\"",
         c = certutil.to_string_lossy(),
-        nick = CA_NICKNAME,
+        prefix = CA_NICKNAME_PREFIX,
         ca = ca_cage_path,
     );
     let mut out = vec![
@@ -114,15 +125,18 @@ mod tests {
         assert_eq!(out[0], OsString::from("/nix/store/def-bash/bin/bash"));
         assert_eq!(out[1], OsString::from("-c"));
         let script = out[2].to_string_lossy();
-        // imports the bound CA into the NSS db Chromium reads, deleting any stale entry first
+        // imports the bound CA into the NSS db Chromium reads, under a nickname keyed by the CA
+        // content (so concurrent same-app launches coexist instead of racing a shared name)
         assert!(script.contains("sql:$DB"));
-        assert!(script.contains("-D -n 'ops-mitm'"));
-        assert!(script.contains("-A -n 'ops-mitm' -t 'C,,' -i '/opt/ops/egress-ca.pem'"));
+        assert!(script.contains("nick=\"ops-mitm-$(sha256sum '/opt/ops/egress-ca.pem'"));
+        assert!(script.contains("-A -n \"$nick\" -t 'C,,' -i '/opt/ops/egress-ca.pem'"));
         assert!(script.contains("/nix/store/abc-nss-tools/bin/certutil"));
+        // no `-D` (deleting a shared nickname is the concurrency race this avoids)
+        assert!(!script.contains("-D -n"));
         // `-N` only when the db is absent, and every certutil step reads /dev/null so an
         // existing-db confirmation prompt can never hang a tty-less launch (the bug this guards).
         assert!(script.contains("[ -f \"$DB/cert9.db\" ] ||"));
-        assert_eq!(script.matches("</dev/null").count(), 3);
+        assert_eq!(script.matches("</dev/null").count(), 2);
         assert!(script.trim_end().ends_with("exec \"$@\""));
         // the label, then the command verbatim after it (positional, never in the script)
         assert_eq!(out[3], OsString::from("ops-ca-trust"));

@@ -128,6 +128,32 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin
     map
 }
 
+/// The pinned content hashes for a project's `deb:` packages, keyed by the declared URL (a
+/// package's locator, so `ops config` can look each up directly), shortened for display. Reads
+/// only the per-project lock — surfaces a pin without resolving or building — so the config view
+/// stays side-effect-free, exactly like [`super::flake::pinned_revs`].
+pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
+    let Some(layout) = Layout::from_env() else {
+        return BTreeMap::new();
+    };
+    let Ok(id) = super::binds::project_runtime_id(cwd) else {
+        return BTreeMap::new();
+    };
+    pins(&layout, &id)
+        .into_iter()
+        .map(|(url, pin)| {
+            let short: String = pin
+                .hash
+                .strip_prefix("sha256-")
+                .unwrap_or(&pin.hash)
+                .chars()
+                .take(8)
+                .collect();
+            (url, short)
+        })
+        .collect()
+}
+
 /// Write the per-project deb lock atomically (temp + rename), so a concurrent same-project launch
 /// never observes a half-written file.
 fn write_pins(
@@ -137,7 +163,12 @@ fn write_pins(
 ) -> io::Result<()> {
     let path = lock_path(layout, project_id);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     let mut body = String::new();
     for (url, pin) in lock {
@@ -199,19 +230,18 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   nativeBuildInputs = with pkgs; [ dpkg makeWrapper autoPatchelfHook ];
   buildInputs = with pkgs; [ @LIBS@ ];
   autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ];
-  unpackPhase = "dpkg-deb -x $src .";
+  unpackPhase = "dpkg-deb -x $src extracted";
   dontConfigure = true;
   dontBuild = true;
   installPhase = ''
     mkdir -p $out
-    cp -r opt $out/ 2>/dev/null || true
-    cp -r usr $out/ 2>/dev/null || true
-    asar=$(find $out -type f -name app.asar -path '*/resources/*' | head -1)
+    cp -r extracted/. "$out"
+    asar=$(find $out -type f -name app.asar -path '*/resources/*' | sort | head -1)
     [ -n "$asar" ] || { echo "deb: no Electron resources/app.asar found in @NAME@" >&2; exit 1; }
     appdir=$(dirname "$(dirname "$asar")")
     main=$(find "$appdir" -maxdepth 1 -type f -executable \
       ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
-      ! -name '*.so' ! -name '*.so.*' | head -1)
+      ! -name '*.so' ! -name '*.so.*' | sort | head -1)
     [ -n "$main" ] || { echo "deb: no launcher binary found in $appdir" >&2; exit 1; }
     mkdir -p $out/bin
     makeWrapper "$main" "$out/bin/@NAME@" \
@@ -275,13 +305,16 @@ pub(crate) fn upgrade(
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<DebUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
-    let declared = declared_urls(cfg);
+    // One walk of the layers yields both the trusted roll set and the trust-agnostic prune universe.
+    let Declared {
+        trusted: declared,
+        all: universe,
+    } = declared(cfg);
     let mut lock = pins(layout, project_id.as_str());
     let mut outcomes = Vec::new();
 
     // Prune entries whose URL is no longer declared (across ALL layers regardless of trust, so a
     // withheld project's still-declared package keeps its pin rather than being silently unpinned).
-    let universe = all_declared_urls(cfg);
     let stale: Vec<String> = lock
         .keys()
         .filter(|k| !universe.contains(k.as_str()))
@@ -325,47 +358,43 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// The deduplicated `deb:` URLs a project declares (trusted), across the baseline and each app —
-/// the set `ops upgrade` rolls forward. Deterministic order (baseline first, then apps by name).
-pub(crate) fn declared_urls(cfg: &crate::config::Resolved) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut urls = Vec::new();
-    let mut push = |url: String| {
-        if seen.insert(url.clone()) {
-            urls.push(url);
-        }
-    };
-    for (_, url) in super::packages::deb_packages(&cfg.packages) {
-        push(url);
-    }
-    for app in cfg.apps.values() {
-        let mut merged = cfg.clone();
-        merged.merge_app(app.clone());
-        for (_, url) in super::packages::deb_packages(&merged.packages) {
-            push(url);
-        }
-    }
-    urls
+/// The two views `ops upgrade deb` needs of a project's declared `deb:` URLs, collected in one pass
+/// over the baseline and each app overlay (see [`declared`]).
+struct Declared {
+    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
+    /// then apps by name).
+    trusted: Vec<String>,
+    /// Every declared URL **regardless of trust** — the universe the lock is pruned against, so an
+    /// untrusted/Changed project's still-declared package keeps its pin instead of being unpinned.
+    all: std::collections::BTreeSet<String>,
 }
 
-/// Every declared `deb:` URL across all layers regardless of trust — the universe `ops upgrade`
-/// prunes the lock against (so an untrusted project's still-declared package is not unpinned).
-fn all_declared_urls(cfg: &crate::config::Resolved) -> std::collections::BTreeSet<String> {
-    let mut set = std::collections::BTreeSet::new();
-    let mut collect = |pkgs: &[crate::config::Package]| {
+/// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
+/// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
+/// universe — so `ops upgrade` walks the apps once, not twice.
+fn declared(cfg: &crate::config::Resolved) -> Declared {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut trusted = Vec::new();
+    let mut all = std::collections::BTreeSet::new();
+    let mut absorb = |pkgs: &[crate::config::Package]| {
+        for (_, url) in super::packages::deb_packages(pkgs) {
+            if seen.insert(url.clone()) {
+                trusted.push(url);
+            }
+        }
         for p in pkgs {
             if let crate::config::Backend::Deb(url) = &p.backend {
-                set.insert(url.clone());
+                all.insert(url.clone());
             }
         }
     };
-    collect(&cfg.packages);
+    absorb(&cfg.packages);
     for app in cfg.apps.values() {
         let mut merged = cfg.clone();
         merged.merge_app(app.clone());
-        collect(&merged.packages);
+        absorb(&merged.packages);
     }
-    set
+    Declared { trusted, all }
 }
 
 /// How many declared `deb:` packages are withheld for being untrusted — across the baseline and
@@ -419,7 +448,7 @@ mod tests {
         assert!(expr.contains("url = \"https://example.com/x/opencode-desktop-linux-amd64.deb\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
         // unpack-only, no build script (safe host-side); the Electron lib set is present
-        assert!(expr.contains("dpkg-deb -x $src ."));
+        assert!(expr.contains("dpkg-deb -x $src extracted"));
         assert!(expr.contains("dontBuild = true;"));
         assert!(expr.contains("nss") && expr.contains("gtk3") && expr.contains("xorg.libX11"));
         // generic Electron install: find the app by its app.asar, wrap the launcher as bin/<name>
@@ -457,5 +486,131 @@ mod tests {
         .unwrap();
         let read = pins(&layout, id);
         assert_eq!(read.len(), 1, "the corrupt line must self-heal (drop)");
+    }
+
+    fn deb_pkg(name: &str, url: &str, trusted: bool) -> crate::config::Package {
+        crate::config::Package {
+            name: name.into(),
+            backend: crate::config::Backend::Deb(url.into()),
+            state: if trusted {
+                crate::trust::TrustState::Trusted
+            } else {
+                crate::trust::TrustState::Untrusted
+            },
+        }
+    }
+
+    fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
+        crate::config::ResolvedApp {
+            cmd: vec!["x".into()],
+            home_scope: crate::config::AppHomeScope::Global,
+            env: vec![],
+            binds: vec![],
+            packages,
+            network: None,
+            gui: None,
+            limits: Default::default(),
+            forward: vec![],
+            secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            forward_origin: Default::default(),
+            limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
+            home_scope_origin: None,
+            warnings: vec![],
+        }
+    }
+
+    fn resolved(
+        packages: Vec<crate::config::Package>,
+        apps: Vec<(&str, crate::config::ResolvedApp)>,
+    ) -> crate::config::Resolved {
+        crate::config::Resolved {
+            env: vec![],
+            env_layer: Default::default(),
+            binds: vec![],
+            bind_layer: Default::default(),
+            packages,
+            nixpkgs_global: None,
+            nixpkgs_project: None,
+            mise: None,
+            network: crate::config::NetworkPolicy::default(),
+            network_origin: Default::default(),
+            egress_stats: true,
+            gui: crate::config::GuiPolicy::default(),
+            gui_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
+            limits: Default::default(),
+            limits_origin: Default::default(),
+            secrets: vec![],
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
+            declared_secrets: vec![],
+            apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn declared_trusted_covers_baseline_and_apps_dedups_and_drops_untrusted() {
+        let cfg = resolved(
+            vec![
+                deb_pkg("a", "https://e/a.deb", true),
+                deb_pkg("evil", "https://e/evil.deb", false), // untrusted: dropped
+            ],
+            vec![
+                (
+                    "alpha",
+                    app_with(vec![
+                        deb_pkg("b", "https://e/b.deb", true),
+                        deb_pkg("a2", "https://e/a.deb", true), // duplicate url: deduped
+                    ]),
+                ),
+                ("beta", app_with(vec![])), // no deb package: contributes nothing
+            ],
+        );
+        // baseline first, then the app's new url; the duplicate and the untrusted one are gone.
+        assert_eq!(
+            declared(&cfg).trusted,
+            vec!["https://e/a.deb", "https://e/b.deb"]
+        );
+    }
+
+    #[test]
+    fn the_prune_universe_keeps_untrusted_so_upgrade_never_prunes_a_withheld_pin() {
+        // The prune universe must NOT drop a still-declared url just because the project is
+        // untrusted — else `ops upgrade deb` on a Changed project unpins it. Unlike the trusted roll
+        // set, `declared().all` keeps the untrusted url; `withheld` counts it so the summary is honest.
+        let cfg = resolved(
+            vec![
+                deb_pkg("a", "https://e/a.deb", true),
+                deb_pkg("evil", "https://e/evil.deb", false),
+            ],
+            vec![(
+                "app",
+                app_with(vec![deb_pkg("c", "https://e/c.deb", false)]),
+            )],
+        );
+        let universe = declared(&cfg).all;
+        assert!(universe.contains("https://e/a.deb"));
+        assert!(
+            universe.contains("https://e/evil.deb"),
+            "a withheld-but-declared url must survive pruning"
+        );
+        assert!(universe.contains("https://e/c.deb"));
+        assert_eq!(
+            withheld(&cfg),
+            2,
+            "the two untrusted deb packages are counted"
+        );
     }
 }

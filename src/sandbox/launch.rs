@@ -1277,7 +1277,7 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
 /// lockstep with a launch's at the cost of that coupling — an accepted trade for a single
 /// source of the project's root set.
 fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, ExitCode> {
-    let packages = super::packages::provision(
+    let mut packages = super::packages::provision(
         &prep.nix,
         &prep.layout,
         &prep.cwd,
@@ -1290,6 +1290,26 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
     })?;
     for warning in &packages.warnings {
         crate::diag::warn(warning);
+    }
+
+    // `deb:` packages are host-side like `nix:`, so their roots must be part of the gc seed too —
+    // otherwise the per-project store copy would be collected and re-provisioned every launch. When
+    // warm (pinned + built) this is a fast no-op; it mirrors the launch path's deb provisioning.
+    for (name, url) in super::packages::deb_packages(&prep.cfg.packages) {
+        match super::deb::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &url,
+        ) {
+            Ok((_, root)) => packages.roots.push(root),
+            Err(e) => {
+                eprintln!("ops gc: cannot provision deb package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
     }
 
     let tools = mise_tools(prep)?;

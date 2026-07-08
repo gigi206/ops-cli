@@ -193,52 +193,44 @@ pub(crate) enum FlakeUpgrade {
     },
 }
 
-/// The deduplicated `flake:` references a project declares, generic over every layer: the
-/// baseline `[packages]` and each app's merged overlay (so an app's own flake package is rolled
-/// too), no app special-cased. Trusted-only by construction — [`super::packages::flake_packages`]
-/// keeps only trusted references — so an untrusted project's flake package is never rolled.
-/// Order is deterministic (baseline first, then apps in name order, first occurrence kept).
-pub(crate) fn declared_refs(cfg: &crate::config::Resolved) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut refs = Vec::new();
-    let mut push = |reference: String| {
-        if seen.insert(reference.clone()) {
-            refs.push(reference);
-        }
-    };
-    for (_, reference) in super::packages::flake_packages(&cfg.packages) {
-        push(reference);
-    }
-    for app in cfg.apps.values() {
-        let mut merged = cfg.clone();
-        merged.merge_app(app.clone());
-        for (_, reference) in super::packages::flake_packages(&merged.packages) {
-            push(reference);
-        }
-    }
-    refs
+/// The two views `ops upgrade flake` needs of a project's declared `flake:` references, collected
+/// in one pass over the baseline and each app overlay (see [`declared`]).
+struct Declared {
+    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
+    /// then apps in name order, first occurrence kept).
+    trusted: Vec<String>,
+    /// Every declared reference **regardless of trust** — the universe the lock is pruned against,
+    /// so an entry is removed only when its package is genuinely gone from the config, never merely
+    /// because the project is currently untrusted.
+    all: std::collections::BTreeSet<String>,
 }
 
-/// Every declared `flake:` reference across the baseline and each app overlay, **regardless of
-/// trust state** — the universe `ops upgrade flake` prunes against, so a lock entry is removed only
-/// when its package is genuinely gone from the config, never merely because the project is currently
-/// untrusted. (Rolling forward stays trusted-only via [`declared_refs`]; this decides only removal.)
-fn all_declared_refs(cfg: &crate::config::Resolved) -> std::collections::BTreeSet<String> {
-    let mut set = std::collections::BTreeSet::new();
-    let mut collect = |pkgs: &[crate::config::Package]| {
+/// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
+/// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
+/// universe — so `ops upgrade` walks the apps once, not twice.
+fn declared(cfg: &crate::config::Resolved) -> Declared {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut trusted = Vec::new();
+    let mut all = std::collections::BTreeSet::new();
+    let mut absorb = |pkgs: &[crate::config::Package]| {
+        for (_, reference) in super::packages::flake_packages(pkgs) {
+            if seen.insert(reference.clone()) {
+                trusted.push(reference);
+            }
+        }
         for p in pkgs {
             if let crate::config::Backend::Flake(reference) = &p.backend {
-                set.insert(reference.clone());
+                all.insert(reference.clone());
             }
         }
     };
-    collect(&cfg.packages);
+    absorb(&cfg.packages);
     for app in cfg.apps.values() {
         let mut merged = cfg.clone();
         merged.merge_app(app.clone());
-        collect(&merged.packages);
+        absorb(&merged.packages);
     }
-    set
+    Declared { trusted, all }
 }
 
 /// How many declared `flake:` packages are withheld for being untrusted — across the project
@@ -264,7 +256,7 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
 /// Re-resolve a project's declared `flake:` references against their upstreams and rewrite the
 /// per-project lock — pinning new ones, rolling changed ones forward, and pruning entries whose
 /// reference is no longer declared (so a removed-then-readded package never reuses a stale pin).
-/// References are collected generically by [`declared_refs`]; resolution is best-effort per
+/// References are collected generically by [`declared`]; resolution is best-effort per
 /// reference (a failure keeps the prior pin and is reported), and the lock is rewritten once at
 /// the end.
 pub(crate) fn upgrade(
@@ -275,17 +267,20 @@ pub(crate) fn upgrade(
 ) -> io::Result<Vec<FlakeUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     let project_id = project_id.as_str();
-    let declared = declared_refs(cfg);
+    // One walk of the layers yields both the trusted roll set and the trust-agnostic prune universe.
+    let Declared {
+        trusted: declared,
+        all: prune_universe,
+    } = declared(cfg);
     let mut lock = pins(layout, project_id);
     let mut outcomes = Vec::new();
 
     // Prune entries whose reference is truly no longer declared — measured against ALL declared
-    // refs regardless of trust, NOT the trusted-only `declared` set. A withheld (untrusted/Changed)
-    // project's refs are absent from `declared`, so pruning against it would drop a still-declared
+    // refs regardless of trust, NOT the trusted-only roll set. A withheld (untrusted/Changed)
+    // project's refs are absent from that set, so pruning against it would drop a still-declared
     // package's pin, silently unpinning it — a later re-trust would then float to the latest
     // upstream revision, exactly the movement the pin model forbids. Re-resolution below stays
     // trusted-only (over `declared`); pruning is state-agnostic.
-    let prune_universe = all_declared_refs(cfg);
     let stale: Vec<String> = lock
         .keys()
         .filter(|k| !prune_universe.contains(k.as_str()))
@@ -435,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_refs_covers_baseline_and_apps_dedups_and_drops_untrusted() {
+    fn declared_trusted_covers_baseline_and_apps_dedups_and_drops_untrusted() {
         let cfg = resolved(
             vec![
                 flake_pkg("a", "github:o/a#default", true),
@@ -453,16 +448,16 @@ mod tests {
                 ("beta", app_with(vec![])), // no flake package: contributes nothing
             ],
         );
-        let refs = declared_refs(&cfg);
+        let refs = declared(&cfg).trusted;
         // Baseline first, then the app's new ref; the duplicate and the untrusted one are gone.
         assert_eq!(refs, vec!["github:o/a#default", "github:o/b#default"]);
     }
 
     #[test]
-    fn all_declared_refs_keeps_untrusted_refs_so_upgrade_never_prunes_a_withheld_pin() {
+    fn the_prune_universe_keeps_untrusted_refs_so_upgrade_never_prunes_a_withheld_pin() {
         // The prune universe must NOT drop a still-declared ref just because the project is
         // untrusted — otherwise `ops upgrade flake` on a Changed project unpins it and a later
-        // re-trust floats to latest. Unlike `declared_refs`, this keeps the untrusted ref.
+        // re-trust floats to latest. Unlike the trusted roll set, `declared().all` keeps the ref.
         let cfg = resolved(
             vec![
                 flake_pkg("a", "github:o/a#default", true),
@@ -470,7 +465,7 @@ mod tests {
             ],
             vec![],
         );
-        let universe = all_declared_refs(&cfg);
+        let universe = declared(&cfg).all;
         assert!(universe.contains("github:o/a#default"));
         assert!(
             universe.contains("github:o/evil#x"),
