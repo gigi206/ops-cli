@@ -96,6 +96,41 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`deb:` package backend — a prebuilt `.deb` provisioned host-side (DONE 2026-07-09)**
+  (`src/sandbox/deb.rs` [new] + `mod.rs` + `config/{mod,view}.rs` + `packages.rs` + `launch.rs` +
+  `main.rs` + `help.rs` + `profiles/opencode-desktop.toml` + `profiles/README.md` + `docs/guide/
+  {configuration/packages,cli/upgrade,housekeeping/upgrade}.md`): a **fourth `[packages]` backend**,
+  `deb:<url>`, so opencode-desktop stops depending on the third-party `tomsch/opencode-desktop-nix`
+  flake (a single-maintainer repo, deemed unreliable by the user). A GUI/desktop app shipped **only
+  as a `.deb`** (no release binary, no nixpkgs attr, an official flake whose from-source `bun` build
+  is broken) is now packaged by ops directly: `Backend::Deb(url)` (`parse_backend`, `is_valid_deb_url`
+  — `https://` + ends `.deb` + injection-free charset); `packages::deb_packages` (trusted-only, like
+  every backend). `deb.rs` resolves the URL to an SRI hash via **`nix store prefetch-file`** (which
+  follows a `…/releases/latest/download/…` redirect), pins it in a per-project **`deb-packages.lock`**
+  (pin-on-first-use — reused offline after, `ops upgrade deb` re-resolves forward), and builds a
+  **generated derivation** (`derivation_expr`, a `@…@`-placeholder template to keep nix `${…}`/`{…}`
+  out of Rust's formatter) that `dpkg-deb -x`-unpacks the `.deb` and `autoPatchelfHook`s the Electron
+  binaries against a curated `ELECTRON_LIBS` set, then wraps the launcher (found generically by its
+  `resources/app.asar` signature) as `bin/<name>`. **Built HOST-SIDE** via `store::provision_expr`
+  (against ops's pinned nixpkgs) — like `nix:`, seeded + offline-reusable — **not** in-cage like
+  `flake:`, the justification being a `.deb` runs **no build script** (`dontBuild`), so evaluating it
+  host-side is safe (unlike an arbitrary flake's eval); the build uses the **host** network, so the
+  cage allowlist governs only the app's *runtime* egress. Wired in `build()` beside the `nix:`
+  provision (bins → PATH, roots → the seed); `ops upgrade deb` (dispatch + `upgrade_deb_packages` +
+  `deb_upgrade_summary`, mirroring flake) folded into `all`. **De-risked by a throwaway host `nix-build`
+  spike first** (our own derivation, buildInputs grounded on tomsch's working set) — autoPatchelf `0
+  unsatisfied`, binary + ldd clean. **Proven live under the allowlist:** `opencode-desktop` migrated
+  to `deb:https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-linux-amd64.deb`,
+  host-side resolve+build → Electron 1.17.15 renders on Wayland (via the catrust CA→NSS seed), updater
+  `checking → up-to-date` through the MITM, egress filtered (models.dev/opencode.ai/npmjs allowed,
+  Sentry muted); `deb-packages.lock` written (pin-on-first-use), `ops upgrade deb` → `unchanged`.
+  **965 unit (+4: parse/validate + is_sri + derivation-gen + lock round-trip) + 90 config green**,
+  fmt/clippy `-D warnings` clean, std-only (reuses `store::provision_expr`/`nix_command` + serde_json).
+  **Honest scope:** the install phase targets the **Electron layout** (find the app by `app.asar`), the
+  dominant `.deb`-desktop case — a non-Electron `.deb` or a different lib set is a future extension; the
+  `latest`-URL race (upstream releases between a stale lock and a rebuild) is a fail-closed hash mismatch
+  → `ops upgrade deb`; `equip_for_gc` does not re-provision `deb:` (its gcroot protects the shared-store
+  path; a project-store copy re-seeds next launch) — a named residual.
   **GUI CA trust — ops seeds the egress MITM CA into the cage's NSS db for Chromium/Electron apps
   (DONE 2026-07-08)** (`src/sandbox/catrust.rs` [new] + `mod.rs` + `egress.rs` [`CAGE_CA` →
   `pub(crate)`] + `launch.rs`): the ops-core generalization of the per-profile CA→NSS shim

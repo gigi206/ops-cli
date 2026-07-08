@@ -26,6 +26,7 @@ nix.
 | `nix:<attribute>` | host-side, into the shared store | tracks the nixpkgs channel | yes (seeded, durable) |
 | `mise:<token>` | in-cage, via `mise use -g` | upstream-direct, fetched at launch | first launch needs network |
 | `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `ops upgrade flake` | after a warm build |
+| `deb:<url>` | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `ops upgrade deb` | yes (seeded, durable) |
 
 ### `nix:` — a nixpkgs attribute
 
@@ -77,11 +78,29 @@ nix's fetcher is blocked under a filtering posture — prefer a release binary v
 `mise:github:` for such tools. Pins advance with
 [`ops upgrade flake`](../housekeeping/upgrade.md).
 
-## Why all three are trusted-only
+### `deb:` — a prebuilt Debian package
+
+```toml
+[packages]
+opencode-desktop = "deb:https://github.com/owner/repo/releases/latest/download/app-linux-amd64.deb"
+```
+
+For a GUI/desktop app distributed **only as a `.deb`** (no release binary, no nixpkgs
+attribute, no buildable flake). ops resolves the URL to a content hash (pinned in a
+per-project `deb-packages.lock`) and builds a generated derivation that `dpkg-deb -x`-unpacks
+the `.deb` and `autoPatchelfHook`s its Electron/Chromium binaries against a curated library
+set — **host-side** (like `nix:`, seeded and offline-reusable), because a `.deb` runs no build
+script so evaluating it host-side is safe. The URL must be `https://` and end in `.deb`. A
+`…/releases/latest/download/…` URL tracks upstream; the build uses the **host** network (not the
+cage allowlist), and `ops upgrade deb` re-resolves it forward. Pairs with
+[`gui = "wayland"`](gui.md) for the display; ops seeds its MITM CA into the cage's NSS store so
+the Chromium app trusts a filtering posture's proxy.
+
+## Why all four are trusted-only
 
 Loosening `packages` to an untrusted project would let it override a trusted app's
 package and run attacker code under that app's posture — the same class of hole as
-overriding a trusted app's command. So all three backends are gated. A trusted app's
+overriding a trusted app's command. So all four backends are gated. A trusted app's
 package **survives an untrusted project's override attempt** (the flagship "agent on
 untrusted code" property). The open self-equip path stays [`ops mise`](../cli/mise.md)
 and a project's [`[tools]`](tools.md).
@@ -111,6 +130,6 @@ OPS_PACKAGE_ripgrep=mise:aqua:BurntSushi/ripgrep ops shell
 ```
 
 The value carries the same mandatory backend prefix as the field
-(`nix:`/`mise:`/`flake:`). A one-shot package *adds* to whatever the config declares.
+(`nix:`/`mise:`/`flake:`/`deb:`). A one-shot package *adds* to whatever the config declares.
 The command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides.md).

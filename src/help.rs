@@ -544,7 +544,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "ops upgrade [all|nix|mise|flake]",
+        synopsis: "ops upgrade [all|nix|mise|flake|deb]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             ("all", "roll every managed channel (the default)"),
@@ -557,6 +557,7 @@ const PAGES: &[Page] = &[
                 "the mise engine, the project's nix: tools, and mise: packages",
             ),
             ("flake", "the project's and apps' flake: packages"),
+            ("deb", "the project's and apps' deb: packages"),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
             versions advance only here, never on an ops binary update.",

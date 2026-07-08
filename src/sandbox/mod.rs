@@ -12,6 +12,7 @@ mod catrust;
 pub(crate) mod cgroup;
 mod contract;
 pub(crate) mod control;
+mod deb;
 pub(crate) mod egress;
 pub(crate) mod egress_stats;
 mod fhs;
@@ -36,6 +37,7 @@ mod spec;
 
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
+pub(crate) use deb::{upgrade as upgrade_deb, withheld as withheld_deb_packages, DebUpgrade};
 pub(crate) use flake::{
     pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
     withheld as withheld_flake_packages, FlakeUpgrade,

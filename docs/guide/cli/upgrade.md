@@ -1,7 +1,7 @@
 # `ops upgrade`
 
 ```
-ops upgrade [all|nix|mise|flake]
+ops upgrade [all|nix|mise|flake|deb]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -13,6 +13,7 @@ advance **only here**, never on an `ops` binary update.
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
 | `mise` | the mise engine, the project's `nix:` tools, and `mise:` packages |
 | `flake` | the project's and apps' `flake:` packages |
+| `deb` | the project's and apps' `deb:` packages |
 
 See also: [Upgrading toolchains](../housekeeping/upgrade.md) · [Provisioning](../concepts/provisioning.md) · [`nixpkgs`](../configuration/nixpkgs.md) · [`packages`](../configuration/packages.md).
 

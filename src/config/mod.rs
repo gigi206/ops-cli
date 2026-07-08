@@ -159,6 +159,14 @@ pub(crate) enum Backend {
     /// (the same posture as the in-cage `mise:nix:` self-equip). On PATH at launch and
     /// later launches via a persistent out-link under the home.
     Flake(String),
+    /// `deb:<url>` — a prebuilt Debian package (a `.deb`) at an `https://` URL, provisioned
+    /// **host-side** into ops's store (seeded, offline-reusable, like `nix:`): ops resolves the
+    /// URL to a content hash, then builds a generated derivation that unpacks the `.deb` and
+    /// `autoPatchelfHook`s it against a curated Electron/Chromium library set. Extraction runs no
+    /// build script (`dontBuild`), so evaluating it host-side is safe (unlike a `flake:`). Meant
+    /// for a GUI/desktop app distributed only as a `.deb`; a GitHub `…/releases/latest/download/…`
+    /// URL tracks upstream, and `ops upgrade` re-resolves it.
+    Deb(String),
 }
 
 impl Backend {
@@ -170,6 +178,7 @@ impl Backend {
             Backend::Nix(attr) => attr,
             Backend::Mise(token) => token,
             Backend::Flake(reference) => reference,
+            Backend::Deb(url) => url,
         }
     }
 
@@ -179,6 +188,7 @@ impl Backend {
             Backend::Nix(_) => "nix",
             Backend::Mise(_) => "mise",
             Backend::Flake(_) => "flake",
+            Backend::Deb(_) => "deb",
         }
     }
 }
@@ -2546,12 +2556,35 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             return Err(format!("invalid flake reference `{reference}`"));
         }
         Ok(Backend::Flake(reference.to_string()))
+    } else if let Some(url) = value.strip_prefix("deb:") {
+        if !is_valid_deb_url(url) {
+            return Err(format!(
+                "invalid deb URL `{url}` — must be an `https://` URL ending in `.deb`"
+            ));
+        }
+        Ok(Backend::Deb(url.to_string()))
     } else {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
-             or `flake:<ref>`"
+             `flake:<ref>`, or `deb:<url>`"
         ))
     }
+}
+
+/// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
+/// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
+/// refused) and to end in `.deb` (so a mistyped value is caught, not silently built). The character
+/// set is the unreserved URL set plus the sub-delims a release URL uses, so the value carries no
+/// shell/nix metacharacter — it is interpolated into a generated nix expression and a
+/// `nix store prefetch-file` argument, both of which must stay injection-free.
+fn is_valid_deb_url(url: &str) -> bool {
+    url.strip_prefix("https://").is_some_and(|rest| {
+        !rest.is_empty()
+            && url.ends_with(".deb")
+            && url.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
+            })
+    })
 }
 
 /// Set the package named `name` to `backend` with the supplying layer's trust,
@@ -7401,6 +7434,44 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("local") && w.contains("flake reference")));
+    }
+
+    #[test]
+    fn a_deb_prefixed_package_parses_as_a_deb_backend_and_requires_https_dot_deb() {
+        // `deb:<url>` routes to the host-side prebuilt-.deb provisioner. Must be an `https://` URL
+        // ending in `.deb` (a `.deb` is executed after autoPatchelf, so a plaintext or mistyped
+        // source is refused) and carry no shell/nix metacharacter.
+        let r = resolve_no_plugins(
+            raw_packages(&[
+                (
+                    "ocd",
+                    "deb:https://github.com/o/r/releases/latest/download/app-linux-amd64.deb",
+                ),
+                ("plain", "deb:http://example.com/x.deb"), // not https: refused
+                ("notdeb", "deb:https://example.com/x.tar.gz"), // wrong extension: refused
+                ("empty", "deb:https://"),                 // no path: refused
+                ("spacey", "deb:https://example.com/a b.deb"), // whitespace: refused
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "ocd").unwrap().backend,
+            Backend::Deb(
+                "https://github.com/o/r/releases/latest/download/app-linux-amd64.deb".into()
+            )
+        );
+        for refused in ["plain", "notdeb", "empty", "spacey"] {
+            assert!(
+                pkg(&r.packages, refused).is_none(),
+                "{refused} should be refused"
+            );
+        }
+        assert!(is_valid_deb_url(
+            "https://github.com/o/r/releases/latest/download/app-linux-amd64.deb"
+        ));
+        assert!(!is_valid_deb_url("http://example.com/x.deb"));
+        assert!(!is_valid_deb_url("https://example.com/x.tar.gz"));
+        assert!(!is_valid_deb_url("https://example.com/a b.deb"));
     }
 
     #[test]

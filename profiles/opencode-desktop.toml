@@ -4,25 +4,25 @@
 #   ops app opencode-desktop
 #
 # This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
-# `opencode-web` (the same server in your browser). opencode ships a native desktop app built
-# with Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`, neither of which
-# installs in the hermetic cage. ops therefore packages it from a nix flake.
+# `opencode-web` (the same server in your browser). opencode ships a native desktop app built with
+# Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`, neither of which installs in
+# the hermetic cage. ops packages it with the `deb:` backend.
 #
-# WHY THIS FLAKE (a community one, not opencode's official flake). opencode's OWN flake exposes an
-# `opencode-desktop` output, but it BUILDS the Electron app from source with bun — and its build
-# script requires bun `^1.3.14`, newer than anything nixpkgs packages (1.3.13 max), so `nix build`
-# fails at the prebuild step (the same wall that kept `kilocode` off its flake). Rather than
-# compile, `tomsch/opencode-desktop-nix#opencode-desktop` fetches the **prebuilt `.deb`** from
-# opencode's GitHub releases and `autoPatchelfHook`s it against the nix closure — no bun, no source
-# build. Every fetch goes through nix's own fetcher (which honours the cage's egress proxy) from
-# github (already in ops's built-in nix-cache allow-set), and the GUI libraries arrive in the
-# seeded store rather than needing a host `/usr`. The version tracks the `.deb` that flake pins
-# (currently 1.17.15); `ops upgrade flake` re-resolves it (bounded by what the flake has pinned).
+# THE `deb:` BACKEND (no third party, tracks upstream). ops fetches opencode's **prebuilt `.deb`**
+# directly from its GitHub releases, resolves it to a content hash, and builds a generated
+# derivation that `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the Electron binaries against a
+# curated library set — no bun, no from-source build (opencode's own flake builds from source and
+# needs a bun newer than nixpkgs ships, which fails; a `.deb` sidesteps that entirely). The build is
+# HOST-SIDE (like `nix:`), not in-cage: a `.deb` runs no build script, so evaluating it host-side is
+# safe, and the result is seeded into the store and offline-reusable. The `…/releases/latest/…` URL
+# means the first launch tracks upstream, and `ops upgrade deb` re-resolves it forward — no
+# dependency on any community flake.
 #
-# FIRST LAUNCH fetches the `.deb` + the Electron closure (hundreds of MiB) over the network under
-# this profile's allowlist — a couple of minutes; later launches reuse the warm build offline. The
-# reference FLOATS until you run `ops upgrade flake`, which pins it (a floating package is sticky to
-# its first build — it does not advance on its own).
+# FIRST LAUNCH resolves the `.deb` (pinning its hash in the per-project deb lock) and builds it
+# host-side, pulling the Electron closure (hundreds of MiB) — a couple of minutes, over your host
+# network (the build does NOT use the cage allowlist). Later launches reuse the pinned build
+# offline. `ops upgrade deb` re-resolves the latest `.deb` and rewrites the lock (the new build
+# lands at the next launch).
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars ops sets and trusts its own NSS
@@ -64,7 +64,7 @@ gui = "wayland"
 #]
 
 [packages]
-opencode-desktop = "flake:github:tomsch/opencode-desktop-nix#opencode-desktop"
+opencode-desktop = "deb:https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-linux-amd64.deb"
 
 [network]
 mode = "deny"

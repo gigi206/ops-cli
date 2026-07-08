@@ -7499,10 +7499,10 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     let what = match args.first() {
         None => "all",
         Some(arg) => match arg.to_str() {
-            Some(w @ ("all" | "nix" | "mise" | "flake")) => w,
+            Some(w @ ("all" | "nix" | "mise" | "flake" | "deb")) => w,
             _ => {
                 eprintln!(
-                    "ops: unknown upgrade target '{}' (known: all, nix, mise, flake)",
+                    "ops: unknown upgrade target '{}' (known: all, nix, mise, flake, deb)",
                     arg.to_string_lossy()
                 );
                 return ExitCode::from(2);
@@ -7566,6 +7566,12 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // per-project flake lock is rewritten — a host-side lock rewrite (the new pin builds
         // in-cage at the next launch), like the `nix:` tools.
         ok &= upgrade_flake_packages(&nix, &layout, &cwd, &cfg, &pal);
+    }
+    if matches!(what, "deb" | "all") {
+        // The project's and apps' `deb:` `[packages]` re-resolve their `.deb` URL to a new content
+        // hash and the per-project deb lock is rewritten — a host-side lock rewrite (the new hash
+        // builds host-side at the next launch), like the `nix:` tools and `flake:` packages.
+        ok &= upgrade_deb_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
     if ok {
         ExitCode::SUCCESS
@@ -7884,6 +7890,97 @@ fn flake_upgrade_summary(
                     format!("  {n}flake:{reference}{r}: {err}re-resolve failed{r} — {error}")
                 }
             },
+        });
+    }
+    if withheld > 0 {
+        lines.push(withheld_note());
+    }
+    lines
+}
+
+/// Roll the project's and apps' `deb:` `[packages]`: re-resolve each `.deb` URL to its current
+/// content hash and rewrite the per-project deb lock (the new hash builds host-side at the next
+/// launch), like the `nix:` tools and `flake:` packages. Returns whether every reference re-resolved.
+fn upgrade_deb_packages(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+    pal: &style::Palette,
+) -> bool {
+    let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("ops: cannot roll the deb packages: {e}");
+            return false;
+        }
+    };
+    for line in deb_upgrade_summary(&outcomes, sandbox::withheld_deb_packages(cfg), pal) {
+        println!("{line}");
+    }
+    !outcomes
+        .iter()
+        .any(|o| matches!(o, sandbox::DebUpgrade::Failed { .. }))
+}
+
+/// A short, recognisable form of an SRI content hash for display (`sha256-<base64>` → the first
+/// few base64 characters), the deb analogue of a short git revision.
+fn short_hash(hash: &str) -> &str {
+    let body = hash.strip_prefix("sha256-").unwrap_or(hash);
+    &body[..body.len().min(8)]
+}
+
+/// The human-readable summary of a deb roll: one line per declared URL (newly pinned, rolled,
+/// unchanged, or failed) plus the entries pruned, and a note for any reference withheld for being
+/// untrusted. Pure, so every outcome is unit-tested without invoking nix.
+fn deb_upgrade_summary(
+    outcomes: &[sandbox::DebUpgrade],
+    withheld: usize,
+    pal: &style::Palette,
+) -> Vec<String> {
+    use sandbox::DebUpgrade::*;
+    let (h, n, ok, warn, err, dim, r) = (
+        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
+    );
+    let mut lines = vec![format!("{h}ops upgrade — deb packages{r}")];
+    let withheld_note = || {
+        format!(
+            "  {warn}{withheld} deb: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
+        )
+    };
+    if outcomes.is_empty() {
+        lines.push(if withheld > 0 {
+            withheld_note()
+        } else {
+            format!("  {dim}no deb: packages to roll.{r}")
+        });
+        return lines;
+    }
+    for outcome in outcomes {
+        lines.push(match outcome {
+            Unchanged { url, hash } => {
+                format!(
+                    "  {n}deb:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
+                    short_hash(hash)
+                )
+            }
+            Rolled { url, from, to } => format!(
+                "  {n}deb:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
+                short_hash(from),
+                short_hash(to)
+            ),
+            Pinned { url, hash } => {
+                format!(
+                    "  {n}deb:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
+                    short_hash(hash)
+                )
+            }
+            Pruned { url } => {
+                format!("  {n}deb:{url}{r}: {dim}removed from the lock (no longer declared).{r}")
+            }
+            Failed { url, error } => {
+                format!("  {n}deb:{url}{r}: {err}re-resolve failed{r} — {error}")
+            }
         });
     }
     if withheld > 0 {

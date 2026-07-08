@@ -127,7 +127,7 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
         .filter(|p| p.state == TrustState::Trusted)
         .filter_map(|p| match &p.backend {
             Backend::Mise(token) => Some(token.clone()),
-            Backend::Nix(_) | Backend::Flake(_) => None,
+            Backend::Nix(_) | Backend::Flake(_) | Backend::Deb(_) => None,
         })
         .collect()
 }
@@ -144,7 +144,22 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
         .filter(|p| p.state == TrustState::Trusted)
         .filter_map(|p| match &p.backend {
             Backend::Flake(reference) => Some((p.name.clone(), reference.clone())),
-            Backend::Nix(_) | Backend::Mise(_) => None,
+            Backend::Nix(_) | Backend::Mise(_) | Backend::Deb(_) => None,
+        })
+        .collect()
+}
+
+/// The `(name, url)` of the *admitted* `deb:` packages — the ones the launcher provisions
+/// host-side (resolve the URL to a hash, then build a generated unpack+autoPatchelf derivation).
+/// Trusted-only, exactly like the other backends: an untrusted project's `deb:` package is dropped
+/// here. The name keys the per-package gcroot; the url is the `.deb` source ops resolves and fetches.
+pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::Deb(url) => Some((p.name.clone(), url.clone())),
+            Backend::Nix(_) | Backend::Mise(_) | Backend::Flake(_) => None,
         })
         .collect()
 }

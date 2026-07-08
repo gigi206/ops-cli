@@ -711,6 +711,7 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
         Backend::Nix(_) => "host-side, durable",
         Backend::Mise(_) => "in-cage via mise, fetched at launch",
         Backend::Flake(_) => "in-cage via nix build, fetched at launch",
+        Backend::Deb(_) => "host-side from prebuilt .deb, durable",
     };
     let trusted = p.state == TrustState::Trusted;
     PackageView {
@@ -729,7 +730,7 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
 fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) -> Option<String> {
     match backend {
         Backend::Flake(reference) => flake_pins.get(reference).cloned(),
-        Backend::Nix(_) | Backend::Mise(_) => None,
+        Backend::Nix(_) | Backend::Mise(_) | Backend::Deb(_) => None,
     }
 }
 

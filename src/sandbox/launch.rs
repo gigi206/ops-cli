@@ -1815,7 +1815,7 @@ fn build(
     // effective nixpkgs reference; their bin dirs are prepended to PATH below. A
     // withheld (untrusted) tool only warns; an admitted tool that fails to realise is
     // fatal.
-    let packages = match super::packages::provision(
+    let mut packages = match super::packages::provision(
         &prep.nix,
         &prep.layout,
         &prep.cwd,
@@ -1841,6 +1841,31 @@ fn build(
     }
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
+
+    // `deb:` packages are provisioned host-side too (like `nix:`, not in-cage like `flake:`): ops
+    // resolves the `.deb` URL to a hash (pinned in the per-project lock), builds the generated
+    // unpack+autoPatchelf derivation into ops's store, prepends its bin to PATH, and seeds its
+    // closure (its root joins `packages.roots`). A declared package is a requirement — a
+    // provisioning failure aborts the launch naming it, never runs without it.
+    for (name, url) in super::packages::deb_packages(&prep.cfg.packages) {
+        match super::deb::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &url,
+        ) {
+            Ok((bin, root)) => {
+                bin_paths.push(bin);
+                packages.roots.push(root);
+            }
+            Err(e) => {
+                eprintln!("ops: cannot provision deb package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
 
     // `flake:` packages are built in-cage at launch (below), not host-provisioned, but their
     // out-link `bin` directories join PATH now — ahead of the base, like every other declared

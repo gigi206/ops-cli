@@ -23,7 +23,7 @@ with `ops app export <name>`.
 | `codex`           | `mise:aqua:openai/codex`             | `api.openai.com`        |
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
 | `opencode-web`    | `mise:opencode` (`opencode web` + `forward`) | provider-dependent |
-| `opencode-desktop`| `flake:github:tomsch/opencode-desktop-nix#opencode-desktop` (Electron GUI, `gui = "wayland"`) | provider-dependent |
+| `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
 | `hermes`          | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | `openrouter.ai` (BYOK)  |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
@@ -104,16 +104,17 @@ can only reach the provider you listed.
 > `curl http://127.0.0.1:4096/` from the host returning the UI (HTTP 200). No Electron, no in-cage
 > build — the lightest graphical path.
 >
-> `opencode-desktop` is the native Electron app, packaged from the prebuilt `.deb` (the community
-> `tomsch/opencode-desktop-nix` flake) so no bun/source build is needed, and displayed through
-> `gui = "wayland"`. Proven live **under the allowlist**: version 1.17.15 built in-cage
-> (`.deb` fetched from GitHub, autoPatchelf'd), the Electron window mapped and rendered on the
-> Wayland compositor, and its HTTPS ran through the egress MITM because ops seeds its per-session
-> CA into the cage's NSS database automatically for a `gui = "wayland"` cage under a filtering
-> posture (Electron ignores the CA-file env vars other tools honour). `ops net logs` showed the
-> model catalogue / gateway / plugin fetches allowed and the Sentry telemetry denied — egress
-> filtered as intended. The remaining flagship step, as for every profile, is the live
-> credential/auth with your own provider key.
+> `opencode-desktop` is the native Electron app, packaged from opencode's prebuilt `.deb` via ops's
+> **`deb:` backend** (no third-party flake, no bun/source build) and displayed through
+> `gui = "wayland"`. Proven live **under the allowlist**: version 1.17.15 provisioned host-side
+> (the `.deb` fetched from GitHub, resolved to a pinned hash, and autoPatchelf'd), the Electron
+> window mapped and rendered on the Wayland compositor, and its HTTPS ran through the egress MITM
+> because ops seeds its per-session CA into the cage's NSS database automatically for a
+> `gui = "wayland"` cage under a filtering posture (Electron ignores the CA-file env vars other
+> tools honour). `ops net logs` showed the model catalogue / gateway / plugin fetches allowed and
+> the Sentry telemetry denied — egress filtered as intended. `ops upgrade deb` rolls it forward
+> (re-resolving the `…/releases/latest/…` URL). The remaining flagship step, as for every profile,
+> is the live credential/auth with your own provider key.
 
 ## Tool freshness
 
@@ -125,7 +126,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `codex`       | `mise:aqua:openai/codex`                      | OpenAI's GitHub release        |
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
 | `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
-| `opencode-desktop` | `flake:github:tomsch/opencode-desktop-nix#opencode-desktop` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd in-cage |
+| `opencode-desktop` | `deb:…/releases/latest/download/opencode-desktop-linux-amd64.deb` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `hermes`      | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | NousResearch PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
@@ -157,6 +158,16 @@ runs under the cage's egress posture: a build step that fetches with its **own**
 `bun install`) rather than through nix's fetcher may not honour the proxy / MITM CA under an
 allowlist (for such a tool, prefer its release-binary `mise:` backend — that is exactly how
 `kilocode` is equipped here, after its `flake:` source build hit this very wall).
+
+A fourth backend, **`deb:<url>`**, packages a GUI/desktop app distributed **only as a prebuilt
+`.deb`** (no release binary, no nixpkgs attribute, and — for opencode-desktop — an official flake
+whose from-source build is broken). ops fetches the `.deb`, resolves it to a content hash (pinned
+in a per-project `deb-packages.lock`), and builds a generated derivation that `dpkg-deb -x`-unpacks
+it and `autoPatchelfHook`s the Electron binaries against a curated library set — **host-side**
+(like `nix:`, seeded and offline-reusable), because a `.deb` runs no build script so evaluating it
+host-side is safe. A `…/releases/latest/download/…` URL tracks upstream and `ops upgrade deb`
+re-resolves it forward. `opencode-desktop` ships this way. (Its build needs your host network at
+first launch, not the cage allowlist; only the app's *runtime* egress is filtered.)
 
 **npm/node CLIs** are also supported: declare a `node` runtime (`nix:nodejs`) and the
 tool via mise's npm backend (`mise:npm:<pkg>`). The cage synthesises `/usr/bin/env`, so
@@ -222,12 +233,12 @@ do not guess the values, so each waits on a real fact or on a named feature:
 
 - **GUI / desktop (Electron) agents** — no longer blocked in general: `opencode-desktop` (above)
   is a working Electron profile, and it maps out the recipe for the next one. Three pieces make an
-  Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with a flake
-  that `autoPatchelfHook`s it (fetch via nix from GitHub — avoids the from-source `bun install`
-  wall); (2) **`gui = "wayland"`** plus the Chromium flags (`--no-sandbox --ozone-platform=wayland
-  --disable-gpu --use-system-ca`); (3) nothing extra for CA trust — ops **seeds its MITM CA into
-  the cage's NSS db automatically** for a gui cage under a filtering posture (Chromium ignores the
-  CA-file env vars other tools honour). Still
+  Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with the
+  `deb:<url>` backend (ops fetches, hashes, and `autoPatchelfHook`s it host-side — avoids the
+  from-source `bun install` wall and any third-party flake); (2) **`gui = "wayland"`** plus the
+  Chromium flags (`--no-sandbox --ozone-platform=wayland --disable-gpu --use-system-ca`); (3)
+  nothing extra for CA trust — ops **seeds its MITM CA into the cage's NSS db automatically** for a
+  gui cage under a filtering posture (Chromium ignores the CA-file env vars other tools honour). Still
   waiting, each on a real fact: **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that
   drives *other* agents — its targets `codex`/`claude`/`opencode` are already profiled as CLIs), the
   Antigravity *IDE* (distinct from the `agy` CLI, profiled above), and hermes desktop — each needs a
