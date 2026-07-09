@@ -463,39 +463,54 @@ fn list_sessions() -> ExitCode {
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, r) = (pal.head, pal.name, pal.reset);
-    // The header is padded first, then wrapped, so the color spans never count toward the
-    // column widths and the alignment is identical with or without color.
-    // The NAME column is the cage's own name — `ops-<slug>`, the *same* name shown by its
-    // systemd scope (`systemctl --user`) and its in-cage hostname — so a session here can be
-    // cross-referenced with the host tooling and the shell inside it. It is computed from the
-    // record's app/project via the one `cage_name` helper the scope and hostname also use, so
-    // the three can never drift.
+    let uptime = uptime_seconds();
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    // Each row is materialized first so the column widths can flex to the widest value: an
+    // app session's KIND is `app:<name>` and a cage name is `ops-<slug>`, either of which can
+    // exceed a fixed width and shift every following column out of alignment.
+    let rows: Vec<(String, String, String, String, String)> = sessions
+        .iter()
+        .map(|s| {
+            let age = match uptime {
+                Some(up) if ticks_per_sec > 0 => {
+                    let started = s.start_ticks as f64 / ticks_per_sec as f64;
+                    format_age((up - started).max(0.0) as u64)
+                }
+                _ => "?".to_string(),
+            };
+            (
+                sandbox::cage_name(s.app(), &s.project),
+                s.label(),
+                s.pid.to_string(),
+                age,
+                s.project.display().to_string(),
+            )
+        })
+        .collect();
+
+    // NAME/KIND are left-aligned, PID/AGE right-aligned; each width is the wider of its header
+    // label and the widest value. Cage slugs and app/label names are ASCII, so a byte length
+    // equals the display width.
+    let name_w = rows.iter().map(|r| r.0.len()).chain([4]).max().unwrap();
+    let kind_w = rows.iter().map(|r| r.1.len()).chain([4]).max().unwrap();
+    let pid_w = rows.iter().map(|r| r.2.len()).chain([3]).max().unwrap();
+    let age_w = rows.iter().map(|r| r.3.len()).chain([3]).max().unwrap();
+
+    // The header is padded first, then wrapped in color, so the color spans never count toward
+    // the column widths and the alignment is identical with or without color.
     let header = format!(
-        "{:<20}  {:<14}  {:>8}  {:>8}  PROJECT",
+        "{:<name_w$}  {:<kind_w$}  {:>pid_w$}  {:>age_w$}  PROJECT",
         "NAME", "KIND", "PID", "AGE"
     );
     println!("{h}{header}{r}");
-    let uptime = uptime_seconds();
-    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    for s in &sessions {
-        let age = match uptime {
-            Some(up) if ticks_per_sec > 0 => {
-                let started = s.start_ticks as f64 / ticks_per_sec as f64;
-                format_age((up - started).max(0.0) as u64)
-            }
-            _ => "?".to_string(),
-        };
-        // An app session's KIND shows its app name (`app:<name>`), so the user can tell which
-        // sessions are agents — and that `ops attach`/`ops stop` act on that app's isolated
-        // environment. NAME/KIND are padded before coloring so the spans do not disturb the widths.
-        let name = format!("{:<20}", sandbox::cage_name(s.app(), &s.project));
-        let label = format!("{:<14}", s.label());
-        println!(
-            "{n}{name}{r}  {label}  {:>8}  {:>8}  {}",
-            s.pid,
-            age,
-            s.project.display()
-        );
+    for (name, label, pid, age, project) in &rows {
+        // NAME is the cage's own name — the same `ops-<slug>` its systemd scope and in-cage
+        // hostname show — so a session cross-references with the host tooling. An app session's
+        // KIND is `app:<name>`, so the user can tell which sessions are agents (and that
+        // `ops attach`/`ops stop` act on that app's isolated environment). NAME is padded before
+        // coloring so the color span does not disturb the width.
+        let name = format!("{name:<name_w$}");
+        println!("{n}{name}{r}  {label:<kind_w$}  {pid:>pid_w$}  {age:>age_w$}  {project}");
     }
     ExitCode::SUCCESS
 }
