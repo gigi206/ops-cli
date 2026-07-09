@@ -96,6 +96,71 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`gpu = true` — hardware-accelerated GPU rendering in the cage (DONE 2026-07-09)**
+  (`src/sandbox/gpu.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
+  `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{gpu,README}.md`
+  + `docs/guide/README.md` + `tests/{config,run}.rs`): a **trusted-only security field `gpu = true`**
+  (a boolean, mirroring `gui`) that opens hardware-accelerated GPU rendering. Born from live-debugging
+  why **`opencode-desktop`'s Electron window never mapped**: on Wayland a Chromium/Electron app with no
+  working GL **never maps a window** (its GPU process crashes `Exiting GPU process due to errors`, the
+  surface gets no buffer). The hermetic cage lacks **three** things the driver needs, found in cascade
+  (each fix revealed the next, live): (1) **`/dev/dri`** (else `drmGetDevices2() has not found any
+  devices`); (2) **`/sys`** — the cage has NONE by design, but mesa/`drmGetDevices2` read `/sys/dev/char`
+  + `/sys/class/drm` + each node's device dir to enumerate; (3) the **mesa DRI driver** (else
+  `MESA-LOADER: failed to open …/gbm/dri_gbm.so` — nixpkgs mesa hardcodes `/run/opengl-driver/lib`,
+  absent off NixOS). **`gpu.rs` supplies all three, all best-effort** (a missing piece degrades to
+  software rendering, never fails the launch): **mesa provisioned into ops's store** (like the fonts,
+  gcroot `gcroots/gpu/<rev>/mesa`) with `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/
+  `__EGL_VENDOR_LIBRARY_DIRS` pointed at its closure — **hermetic + drift-proof** (same pinned nixpkgs
+  as the app → same mesa hash → no ABI skew with the app's own libgbm/libEGL, no host driver path);
+  the **render node** `/dev/dri` granted through the existing `[devices]` dev-bind mechanism (appended
+  to the devices vec in `build`); and the **`/sys` DRM subtree read-only, scoped LEAST-PRIVILEGE**
+  (user's call over wholesale `/sys:ro`, proven equivalent for GL init) — `drm_sys_paths()` returns
+  `/sys/dev/char` + `/sys/class/drm` + `canonicalize(<node>/device)` for each `card<N>`/`renderD<N>`
+  (connectors `card1-DP-1` filtered by the pure `is_drm_node`). **Config side mirrors `gui` exactly**
+  (`RawConfig`/`RawApp` `gpu: Option<bool>`; `Resolved`/`ResolvedApp` `gpu: bool` + `gpu_origin`;
+  trusted/global-only gating in `resolve`/`resolve_app` with the same untrusted-drop warning;
+  `merge_app` replace; the flagship — a global app's GPU posture survives an untrusted project's
+  override; `ops config show` a `gpu: enabled` line, provenance-tagged, `--app` effective + `--json`).
+  The one-shot `--config` blob override carries `gpu` (`apply_override` applies it directly — a bool
+  needs no validation); the **typed `--gpu` flag is deferred** (parity to add later, like the
+  `--seccomp`/`--device` overrides were). Consumed in `launch.rs::build` (env + `/sys` ExtraBinds +
+  the `/dev/dri` device) **and** `equip_for_gc` (so `ops gc` keeps the mesa closure). **Scope
+  (honest): mesa GPUs (Intel/AMD/nouveau)** — the **NVIDIA proprietary stack is OUT** (userspace
+  version-locked to the host `nvidia.ko`, cannot be provisioned hermetically; a separate deferred
+  slice needing a host-lib bind + PRIME offload). On the user's Optimus laptop (Intel iris + NVIDIA
+  RTX 3050) it renders on the Intel iGPU — the correct GPU for a desktop app. **De-risked live before
+  coding** (the scoped `/sys` subset proven == full `/sys:ro` for EGL init; the full recipe proven via
+  one-shot `--bind`/`--env` overrides). **Live-proven end-to-end:** `ops app opencode-desktop` NU
+  (profile `gui = "wayland"` + `gpu = true`, `--disable-gpu` dropped) renders the Electron window with
+  GPU, **zero GL errors**, mesa provisioned automatically by the hole; `opencode-desktop.toml` migrated
+  off the manual `[devices]`+`--disable-gpu` stopgap. **Design answers recorded (user asked):** (a)
+  exposing **dbus wholesale is UNSAFE** — the session bus carries `gnome-keyring`/`org.freedesktop.secrets`
+  (the whole login keyring) + portals, the system bus privileged services; the only safe path is a
+  **filtered `xdg-dbus-proxy`** (interface allowlist — a deferred slice). (b) **`/proc`** is already in
+  the cage (namespaced, safe); never expose the **host** `/proc` (leaks other processes' `environ` =
+  secrets). (c) exposing **`/sys`** for a capability = a scoped ro subset tied to the grant, trusted-only,
+  never all of `/sys`. **972 unit (+2 gpu.rs: `driver_env`, `is_drm_node`) + 92 config (+2: gpu gating
+  + the flagship) green** + **1 run.rs e2e** `a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage`
+  (firm network-independent teeth: `/dev/dri` + `/sys/class/drm` ABSENT untrusted, PRESENT trusted; the
+  mesa env reported best-effort), fmt/clippy `-D warnings` clean, **std-only** (`gpu.rs` reuses
+  `store::provision`). **Advisor-reviewed (code + security), findings addressed.** Security: design
+  sound (gating/flagship/`/sys` ro/`/dev/dri` grant correct, within the accepted `[devices]` class, no
+  boundary breach) with **one real fix — SEC-001:** the mesa driver-path env vars are **code-load
+  paths** (mesa `dlopen`s a `.so` from them), unlike the data-only `FONTCONFIG_FILE`, so an untrusted
+  `[env]` could have re-pointed a *trusted* GPU app's mesa at an attacker `.so` in the project tree
+  (in-cage code-exec, confined but a vector a trusted app should not inherit) → the three vars
+  (`LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS`) are now on the untrusted-only
+  env denylist (`is_reserved_env_key`, beside `LD_*`/`NIX_LD`), with a unit test; ops still sets them
+  and a trusted config still may. Code review **APPROVE**; its minors folded in: the `/dev/dri` grant
+  is **deduped** against a trusted `[devices]` entry; the launch comment softened (the `/sys` binds are
+  firm `--ro-bind` checked at enumeration, same shape as the Wayland socket — not "never fails"); a
+  direct `merge_app` gpu-precedence assertion added; a `/sys/dev/char` char-device-name-leak note added
+  to `drm_sys_paths`. **Accepted (documented, not changed):** `/dev/dri` grants the whole dir incl.
+  the KMS `card0` node (parity with a `[devices] allow = ["/dev/dri"]`; its dangerous ioctls need
+  DRM-master held by the host compositor); the device+`/sys` are granted even when mesa provisioning
+  fails (keeps the e2e's firm teeth network-independent — surface without a driver, not a fail-open).
+  **Roadmap:** NVIDIA (opt-in slice, host-lib bind + PRIME), then a filtered dbus proxy.
   **`deb:` package backend — a prebuilt `.deb` provisioned host-side (DONE 2026-07-09)**
   (`src/sandbox/deb.rs` [new] + `mod.rs` + `config/{mod,view}.rs` + `packages.rs` + `launch.rs` +
   `main.rs` + `help.rs` + `profiles/opencode-desktop.toml` + `profiles/README.md` + `docs/guide/

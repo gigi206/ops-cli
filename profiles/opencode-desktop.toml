@@ -32,27 +32,31 @@
 # the GUI hole, like fonts), so the app trusts the proxy and egress stays filtered — no per-profile
 # shim needed. The app only has to be told to consult that store, hence `--use-system-ca`.
 #
-# DISPLAY. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and provisions
-# fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation is
-# compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
-# screen-capture/input-injection to ordinary clients (see docs/guide/configuration/gui.md). The
-# Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the
+# DISPLAY + GPU. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
+# provisions fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation
+# is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
+# screen-capture/input-injection to ordinary clients (see docs/guide/configuration/gui.md).
+# `gpu = true` opens hardware-accelerated rendering: ops provisions mesa's drivers into its own
+# store, grants the render node under `/dev/dri`, and read-only-binds the minimal `/sys` DRM subtree
+# the driver needs (see docs/guide/configuration/gpu.md). Without it a Chromium/Electron app on
+# Wayland often fails to produce a buffer and no window maps, so it is on by default here. mesa
+# covers Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower).
+# The Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the
 # empty netns IS the boundary (it replaces Chromium's own redundant sandbox); `--ozone-platform=
-# wayland` selects the Wayland backend; `--disable-gpu` avoids needing `/dev/dri` (add `[devices]
-# allow = ["/dev/dri"]` and drop the flag for hardware acceleration); `--disable-dev-shm-usage`
-# avoids the small cage `/dev/shm`. The cage has no dbus bus, so desktop notifications, a tray icon,
-# and the system keyring are unavailable — benign for editing/chat; a keyring-backed login would
-# fall back to a file in the app's isolated home.
+# wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+# The cage has no dbus bus, so desktop notifications, a tray icon, and the system keyring are
+# unavailable — benign for editing/chat; a keyring-backed login would fall back to a file in the
+# app's isolated home.
 cmd = [
     "opencode-desktop",
     "--no-sandbox",
     "--ozone-platform=wayland",
-    "--disable-gpu",
     "--disable-dev-shm-usage",
     "--use-system-ca",
 ]
 
 gui = "wayland"
+gpu = true
 
 # Your host opencode config/auth, mounted read-write at its real absolute path (so the GUI shares
 # the same login/sessions as your host opencode). `binds` is a security field, honored only

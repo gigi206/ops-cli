@@ -1322,9 +1322,19 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
     } else {
         None
     };
-    let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
+    let mut gui_roots: Vec<PathBuf> = font_layer
+        .as_ref()
+        .map_or_else(Vec::new, |l| l.roots.clone());
 
-    seed_project_store(prep, &packages.roots, &tools.roots, font_roots).map_err(|e| {
+    // mesa driver roots under `gpu = true`, so gc keeps the built output rather than collecting and
+    // re-provisioning it each launch — mirroring the launch path's GPU provisioning and the fonts.
+    if prep.cfg.gpu {
+        if let Ok(layer) = super::gpu::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            gui_roots.push(layer.root);
+        }
+    }
+
+    seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots).map_err(|e| {
         eprintln!("ops gc: cannot prepare the project's store: {e}");
         ExitCode::FAILURE
     })
@@ -1959,11 +1969,35 @@ fn build(
     } else {
         None
     };
-    // The GUI-hole store roots to seed: the fonts plus (when present) certutil, so the cage reads
-    // both through `/nix`.
+
+    // Under `gpu = true`, provision mesa's DRI drivers host-side so the cage can render with
+    // hardware acceleration. Provisioned here — before the seed — so mesa's store root joins the
+    // project store and the cage reads the drivers through `/nix`; the env pointing libgbm/libEGL
+    // at them is applied in the launch block below. Best-effort, like the fonts: a fetch that fails
+    // warns and the app runs (falling back to software rendering) rather than failing the launch.
+    let gpu_layer = if prep.cfg.gpu {
+        match super::gpu::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(layer) => Some(layer),
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "`gpu = true` but the mesa drivers could not be provisioned \
+                     ({e}) — rendering may fall back to software"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // The GUI-hole store roots to seed: the fonts plus (when present) certutil and mesa, so the
+    // cage reads them all through `/nix`.
     let mut gui_roots: Vec<PathBuf> = font_roots.to_vec();
     if let Some(ct) = &ca_trust {
         gui_roots.push(ct.root.clone());
+    }
+    if let Some(layer) = &gpu_layer {
+        gui_roots.push(layer.root.clone());
     }
 
     // Seed the project's own writable store with the closure of everything the cage
@@ -2236,6 +2270,30 @@ fn build(
         }
     }
 
+    // GPU: when `gpu = true`, point the cage's libgbm/libEGL at mesa's own drivers (provisioned and
+    // seeded above) and read-only-bind the minimal `/sys` DRM subtree the driver reads to enumerate
+    // the device. The render node itself is granted through the device-bind mechanism below. Mostly
+    // best-effort: a failed mesa provision or an absent render node degrades to software rendering.
+    // The `/sys` paths are checked for existence at enumeration (`drm_sys_paths`) and bound firmly —
+    // the same firm-`--ro-bind`-after-`.exists()` shape the Wayland socket uses — so a device
+    // vanishing between enumeration and exec (a GPU hot-unplug) would fail the launch, an accepted
+    // rarity, not "never fails".
+    // The driver-path env vars mesa `dlopen`s from are ops-controlled *and* reserved against an
+    // untrusted `[env]` (they load code, so `is_reserved_env_key` denylists them alongside `LD_*`);
+    // a *trusted* config may still override them — self-harm on its own cage, not an escape.
+    if prep.cfg.gpu {
+        if let Some(layer) = &gpu_layer {
+            gui_env.extend(layer.env.iter().cloned());
+        }
+        for path in super::gpu::drm_sys_paths() {
+            gui_binds.push(binds::ExtraBind {
+                src: path.clone(),
+                dest: path,
+                writable: false,
+            });
+        }
+    }
+
     // The launcher's extra binds, emitted after the structural mounts: the egress machinery
     // (socket + CA) and the GUI socket. Their destinations are ops's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
@@ -2293,6 +2351,15 @@ fn build(
     // posture, so a process inside the cage can see which hosts it can reach and why a
     // direct connection or `ping` fails. Informational only; bound read-only by `build_spec`.
     let egress_contract = super::contract::egress_contract(&prep.cfg.network);
+    // The device grant: the resolved `[devices]` plus, under `gpu = true`, the render node
+    // directory (`/dev/dri`), so the cage can reach the GPU. Both become `--dev-bind-try` mounts.
+    // Deduped: a trusted `[devices] allow = ["/dev/dri"]` alongside `gpu = true` must not emit the
+    // bind twice (harmless to bwrap, but tidy).
+    let mut devices = prep.cfg.devices.clone();
+    let dri = PathBuf::from(super::gpu::DRI_DIR);
+    if prep.cfg.gpu && !devices.contains(&dri) {
+        devices.push(dri);
+    }
     let spec = binds::build_spec(
         prep.layout.data_dir(),
         &prep.cwd,
@@ -2306,9 +2373,10 @@ fn build(
         // The trusted seccomp relaxation from the resolved (post-`merge_app`) config, so an app's
         // `[seccomp] allow` union is in effect for `ops app`, exactly like its limits.
         prep.cfg.seccomp.clone(),
-        // The trusted device grant from the resolved (post-`merge_app`) config, so an app's
-        // `[devices]` union is in effect for `ops app`, exactly like its seccomp relaxation.
-        &prep.cfg.devices,
+        // The trusted device grant from the resolved (post-`merge_app`) config, plus the GPU
+        // render node under `gpu = true`, so an app's `[devices]` union is in effect for `ops app`,
+        // exactly like its seccomp relaxation.
+        &devices,
         cmd,
     )
     .map_err(|e| {
@@ -3314,6 +3382,8 @@ mod tests {
             egress_stats: true,
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            gpu: false,
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits: Default::default(),
@@ -3362,6 +3432,7 @@ mod tests {
             packages,
             network: None,
             gui: None,
+            gpu: None,
             limits: Default::default(),
             forward: vec![],
             secrets: vec![],
@@ -3369,6 +3440,7 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
             seccomp: Default::default(),

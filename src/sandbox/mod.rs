@@ -20,6 +20,7 @@ mod flake;
 mod fonts;
 mod forward;
 mod gc;
+mod gpu;
 mod launch;
 mod mise;
 mod miseplugin;

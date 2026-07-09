@@ -4018,6 +4018,100 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
     );
 }
 
+/// A trusted `gpu = true` threads the GPU hole's device grant and `/sys` DRM subtree into the cage,
+/// gated by trust. The firm teeth are network-independent: the render node `/dev/dri` and the
+/// `/sys/class/drm` index are ABSENT under an untrusted (dropped) posture and PRESENT once trusted —
+/// the whole gpu→launch→`--dev-bind-try`/`--ro-bind` thread a `build_spec` unit test cannot reach.
+/// The mesa driver env is best-effort (its provisioning may not reach the cache in this env), so it
+/// is reported, not asserted; `driver_env` is unit-tested and the full render is proven live.
+/// Skips if the host has no GPU render node or cannot sandbox.
+#[test]
+fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
+    if !std::path::Path::new("/dev/dri").exists() {
+        eprintln!("skipping gpu e2e: no /dev/dri render node on this host");
+        return;
+    }
+
+    let project = TmpDir::new("gpu-proj");
+    let data = TmpDir::new("gpu-data");
+    let state = TmpDir::new("gpu-state");
+
+    std::fs::write(project.path().join(".ops.toml"), b"gpu = true\n").unwrap();
+    let check = "test -e /dev/dri && echo DRI-PRESENT || echo DRI-ABSENT; \
+                 test -e /sys/class/drm && echo SYS-PRESENT || echo SYS-ABSENT; \
+                 test -n \"$LIBGL_DRIVERS_PATH\" && echo ENV-SET || echo ENV-UNSET";
+
+    // Untrusted probe (also seeds the base userland): the posture is dropped, so neither the render
+    // node nor `/sys` is exposed. A failed launch means the host cannot sandbox → skip.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping gpu e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_out.contains("DRI-ABSENT"),
+        "the untrusted (dropped) gpu posture must leave /dev/dri out of the cage:\n{probe_out}"
+    );
+    assert!(
+        probe_out.contains("SYS-ABSENT"),
+        "the hermetic cage must carry no /sys without the gpu posture:\n{probe_out}"
+    );
+
+    // Trust the project so its `gpu = true` posture applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The render node and the `/sys` DRM index are now bound into the cage.
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check],
+    );
+    assert!(
+        out.status.success(),
+        "a trusted gpu posture must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("DRI-PRESENT"),
+        "the trusted `gpu = true` posture must bind the render node into the cage:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("SYS-PRESENT"),
+        "the trusted `gpu = true` posture must bind the /sys DRM subtree into the cage:\n{stdout}"
+    );
+    // The mesa driver env is best-effort (provisioning may not reach the cache here) — reported, not
+    // asserted, since a missing closure degrades to software rendering rather than a launch failure.
+    eprintln!(
+        "gpu e2e: mesa driver env {}",
+        if stdout.contains("ENV-SET") {
+            "reached the cage"
+        } else {
+            "was not provisioned (best-effort)"
+        }
+    );
+}
+
 /// The one-shot `--device` / `--seccomp` security overrides reach the cage — the CLI
 /// flag→collect→`apply_override`→build_spec→bwrap thread a config-file e2e cannot reach. Two arms,
 /// which build_spec consumes differently:

@@ -122,6 +122,14 @@ fn is_reserved_env_key(key: &str) -> bool {
                 | "NLSPATH"
                 | "RESOLV_HOST_CONF"
                 | "HOSTALIASES"
+                // GPU driver-load paths: mesa's libgbm/libEGL `dlopen` a `<driver>_dri.so` / gbm
+                // backend from these, so — like `LD_*`/`NIX_LD` — an untrusted `[env]` could aim a
+                // trusted GPU-enabled app's mesa at an attacker `.so` in the project tree and run
+                // code in the app's cage. Data-redirection vars (`FONTCONFIG_FILE`) stay free; these
+                // are code-load paths. ops sets them for `gpu = true`; a trusted config still may.
+                | "LIBGL_DRIVERS_PATH"
+                | "GBM_BACKENDS_PATH"
+                | "__EGL_VENDOR_LIBRARY_DIRS"
         )
 }
 
@@ -525,6 +533,12 @@ pub(crate) struct Resolved {
     pub(crate) gui: GuiPolicy,
     /// Which layer supplied the winning `gui` posture (`Default` when neither config set it).
     pub(crate) gui_origin: Provenance,
+    /// Whether hardware-accelerated GPU rendering is open (the default `false` unless the global
+    /// config or a trusted project set `gpu = true`). A security field, gated like `gui` — an
+    /// untrusted project may not open a render node and the `/sys` device tree.
+    pub(crate) gpu: bool,
+    /// Which layer supplied the winning `gpu` posture (`Default` when neither config set it).
+    pub(crate) gpu_origin: Provenance,
     /// Host loopback TCP ports forwarded into the cage (see [`RawConfig::forward`]). A security
     /// field, gated like `network`/`gui`; the merged set is the union of the global and a trusted
     /// project's ports (an untrusted project's ports are dropped, never added), so a trusted
@@ -620,6 +634,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own GUI posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place.
     pub(crate) gui: Option<GuiPolicy>,
+    /// The app's own GPU posture, set only when a trusted source declared one. `Some` overrides
+    /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gui`.
+    pub(crate) gpu: Option<bool>,
     /// The app's own cgroup limit overrides, set only from a trusted source (an untrusted
     /// project's app `[limits]` is dropped whole, like its `network`/`gui`). Each set field
     /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
@@ -656,6 +673,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) cmd_origin: Provenance,
     pub(crate) network_origin: Provenance,
     pub(crate) gui_origin: Provenance,
+    pub(crate) gpu_origin: Provenance,
     pub(crate) limits_origin: LimitsOrigin,
     /// Which app layer (`Global`/`Project`) supplied the app's own `forward` ports, or `Default`
     /// when the app declared none. The merged effective set is the app's own ∪ the baseline's;
@@ -711,6 +729,9 @@ impl Resolved {
         }
         if let Some(gui) = app.gui {
             self.gui = gui;
+        }
+        if let Some(gpu) = app.gpu {
+            self.gpu = gpu;
         }
         // The app's ports union onto the baseline's — an app adds ports, never removes or
         // overrides the trusted baseline set (the flagship "agent on untrusted code" property,
@@ -809,6 +830,7 @@ impl Resolved {
             packages,
             network,
             gui,
+            gpu,
             limits,
             secret,
             forward,
@@ -898,6 +920,13 @@ impl Resolved {
         if let Some(policy) = new_gui {
             self.gui = policy;
             self.gui_origin = Provenance::Override;
+        }
+        // `gpu` — a bool, so no value can be invalid (unlike `gui`/`network`); apply directly. The
+        // override is trusted by invocation and the final word, so it may open or close GPU for this
+        // launch regardless of the config layers.
+        if let Some(value) = gpu {
+            self.gpu = value;
+            self.gpu_origin = Provenance::Override;
         }
         if let Some(over) = new_limits {
             mark_limit_origins(&mut self.limits_origin, &over, Provenance::Override);
@@ -1180,6 +1209,16 @@ fn resolve(
         }
         None => GuiPolicy::default(),
     };
+    // The GPU posture is trusted by location at the global layer; the origin records `Global`
+    // whenever the layer set the flag at all (so `gpu = true` reads distinctly from the default).
+    let mut gpu_origin = Provenance::Default;
+    let mut gpu = match global.gpu {
+        Some(value) => {
+            gpu_origin = Provenance::Global;
+            value
+        }
+        None => false,
+    };
     // `forward` ports are trusted by location at the global layer; each invalid port is dropped
     // (warned) and the rest kept. The merged set is a union (a project adds ports, never
     // replaces), so the origin is `Global` only when this layer contributed any port.
@@ -1331,6 +1370,20 @@ fn resolve(
                 ));
             }
         }
+        // `gpu` is a security field — a trusted project may open GPU rendering; an untrusted or
+        // changed one may not (a render node and the `/sys` device tree widen the kernel attack
+        // surface, a choice an untrusted project must not make).
+        if let Some(value) = proj.gpu {
+            if trusted {
+                gpu = value;
+                gpu_origin = Provenance::Project;
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `gpu` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `forward` is a security field — a trusted project may add host loopback forward ports;
         // an untrusted or changed one may not (opening a host port is a deliberate inbound hole).
         // The ports union onto the global set: a project adds, never replaces (the flagship
@@ -1467,6 +1520,8 @@ fn resolve(
         egress_stats,
         gui,
         gui_origin,
+        gpu,
+        gpu_origin,
         forward,
         forward_origin,
         limits,
@@ -1960,6 +2015,7 @@ fn resolve_app(
     // Every Mode-B app reads by default ({GET,HEAD}); a trusted layer's `default_methods` overrides it.
     let mut default_methods = builtin_app_default_methods();
     let mut gui: Option<GuiPolicy> = None;
+    let mut gpu: Option<bool> = None;
     // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
     // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
     let mut limits = crate::sandbox::cgroup::Limits::default();
@@ -1990,6 +2046,7 @@ fn resolve_app(
     let mut cmd_origin = Provenance::Default;
     let mut network_origin = Provenance::Default;
     let mut gui_origin = Provenance::Default;
+    let mut gpu_origin = Provenance::Default;
     // The app's own loopback forward ports — a security field, gated like `network`/`gui`. The
     // merged effective set (app ∪ baseline) is computed at `merge_app`; this holds only the app's
     // own contribution, with its origin for the per-app view.
@@ -2032,6 +2089,10 @@ fn resolve_app(
                 gui = Some(policy);
                 gui_origin = Provenance::Global;
             }
+        }
+        if let Some(value) = app.gpu {
+            gpu = Some(value);
+            gpu_origin = Provenance::Global;
         }
         // `forward` is trusted by location at the global app layer; invalid ports are dropped
         // (warned). The app's own set is kept separate here — it unions onto the baseline at
@@ -2136,6 +2197,20 @@ fn resolve_app(
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `gui` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `gpu` mirrors `gui`: an untrusted project may not open GPU rendering, on its own app or
+        // by overriding a trusted one (a render node and the `/sys` device tree widen the kernel
+        // attack surface).
+        if let Some(value) = app.gpu {
+            if trusted {
+                gpu = Some(value);
+                gpu_origin = Provenance::Project;
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `gpu` posture ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -2270,6 +2345,7 @@ fn resolve_app(
         packages,
         network,
         gui,
+        gpu,
         limits,
         seccomp,
         devices,
@@ -2279,6 +2355,7 @@ fn resolve_app(
         cmd_origin,
         network_origin,
         gui_origin,
+        gpu_origin,
         forward_origin,
         seccomp_origin,
         devices_origin,
@@ -4419,6 +4496,7 @@ mod tests {
             nixpkgs: None,
             network: None,
             gui: None,
+            gpu: None,
             forward: None,
             secret: None,
             app: BTreeMap::new(),
@@ -4913,6 +4991,7 @@ mod tests {
                 .collect(),
             network,
             gui: None,
+            gpu: None,
             forward: None,
             secret: None,
             limits: None,
@@ -6293,6 +6372,8 @@ mod tests {
         };
         // Seed a baseline device so the app's grant is observably *unioned*, not replaced.
         base.devices = vec![PathBuf::from("/dev/dri")];
+        // Baseline GPU off, so the app turning it on is an observable *replace* (like `gui`).
+        base.gpu = false;
         let app = ResolvedApp {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
@@ -6301,6 +6382,7 @@ mod tests {
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
             gui: None,
+            gpu: Some(true),
             limits: crate::sandbox::cgroup::Limits {
                 tasks_max: Some("4096".into()),
                 ..Default::default()
@@ -6310,6 +6392,7 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6333,6 +6416,8 @@ mod tests {
         assert!(base.env.iter().any(|(k, v)| k == "C" && v == "app"));
         // The app's posture replaces the baseline's.
         assert!(matches!(base.network, NetworkPolicy::Isolated));
+        // The app's GPU posture (`Some(true)`) replaces the baseline's `false`, like `network`/`gui`.
+        assert!(base.gpu, "the app's gpu posture replaces the baseline's");
         // The app's limit override replaces the baseline per field; unset fields inherit it.
         assert_eq!(
             base.limits.tasks_max.as_deref(),
@@ -6362,12 +6447,14 @@ mod tests {
             packages: vec![],
             network: None, // inherits the baseline's shared posture
             gui: None,
+            gpu: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6399,12 +6486,14 @@ mod tests {
                 crate::allowlist::EgressPolicy::new(vec![], vec![]),
             )),
             gui: None,
+            gpu: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6432,12 +6521,14 @@ mod tests {
             packages: vec![],
             network,
             gui: None,
+            gpu: None,
             limits: Default::default(),
             secrets: vec![],
             default_methods,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6557,12 +6648,14 @@ mod tests {
             packages: vec![],
             network: None,
             gui: None,
+            gpu: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6602,12 +6695,14 @@ mod tests {
                 crate::allowlist::EgressPolicy::new(vec![], vec![]),
             )),
             gui: None,
+            gpu: None,
             limits: Default::default(),
             secrets: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -7186,6 +7281,11 @@ mod tests {
             "GLIBC_TUNABLES",
             "NLSPATH",
             "HOSTALIASES",
+            // GPU driver-load paths (mesa `dlopen`s a `.so` from these): an untrusted `[env]` must
+            // not aim a trusted GPU-enabled app's mesa at an attacker library — code-load, like `LD_*`.
+            "LIBGL_DRIVERS_PATH",
+            "GBM_BACKENDS_PATH",
+            "__EGL_VENDOR_LIBRARY_DIRS",
             // proxy-control (either case) and the CA-bundle keys: under an allowlist
             // the cage's only egress is ops's filtering proxy, so an untrusted project
             // may not redirect it or swap the CA it trusts.

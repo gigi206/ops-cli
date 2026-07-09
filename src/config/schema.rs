@@ -56,6 +56,16 @@ pub(crate) struct RawConfig {
     /// X client can snoop and drive every other window, which Wayland's per-client isolation
     /// prevents on a well-behaved compositor.
     pub(crate) gui: Option<String>,
+    /// Whether to open hardware-accelerated GPU rendering for the cage (`gpu = true`). ops
+    /// provisions mesa's DRI drivers into its own store and points the cage's libgbm/libEGL at
+    /// them, grants the render node(s) under `/dev/dri`, and read-only-binds the minimal `/sys`
+    /// DRM subtree the driver reads to enumerate the device. A security field — honored from the
+    /// global config or a trusted project, ignored from an untrusted one: a render node and the
+    /// `/sys` device tree widen the kernel attack surface (a GPU-driver bug becomes reachable
+    /// from the cage), a choice an untrusted project may not make. Covers mesa-supported GPUs
+    /// (Intel/AMD/nouveau); the NVIDIA proprietary stack is a separate, not-yet-built mechanism.
+    /// Most useful together with `gui = "wayland"`.
+    pub(crate) gpu: Option<bool>,
     /// Host loopback TCP ports to forward from the host into the cage — a list of port
     /// numbers (`forward = [1455]`). Each port is bound on the host's `127.0.0.1` and
     /// bridged, through a bound Unix socket, to the cage's own loopback at the same port,
@@ -251,6 +261,10 @@ pub(crate) struct RawApp {
     /// baseline `gui`. An unset `Option` is omitted by TOML on export, so an app with no GUI
     /// need carries no `gui` line.
     pub(crate) gui: Option<String>,
+    /// The app's GPU posture, overriding the baseline's when set (see `RawConfig.gpu`). A
+    /// security field, like the baseline `gpu`. An unset `Option` is omitted on export, so an
+    /// app with no GPU need carries no `gpu` line.
+    pub(crate) gpu: Option<bool>,
     /// Host loopback ports forwarded into this app's cage (see `RawConfig.forward`). A
     /// security field, gated like the baseline `forward`: an app's ports **union** onto
     /// the baseline's, so an untrusted project can only add its own, never remove or

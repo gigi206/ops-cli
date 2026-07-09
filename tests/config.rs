@@ -3372,3 +3372,66 @@ fn config_json_carries_the_devices_grant() {
         .collect();
     assert_eq!(paths, vec!["/dev/dri", "/dev/kvm"], "{doc}");
 }
+
+#[test]
+fn an_untrusted_gpu_posture_is_dropped_but_trusting_applies_it() {
+    // `gpu = true` opens a render node and the `/sys` device tree — a security field, so an
+    // untrusted project's posture is dropped (it widens the kernel attack surface) and applied only
+    // once the project is trusted.
+    let fx = Fixture::new();
+    fx.write_project("gpu = true\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("gpu:"),
+        "an untrusted gpu posture must not be applied:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("ignoring `gpu` posture"),
+        "a dropped gpu posture must be explained:\n{stderr}"
+    );
+
+    // Trust it → the posture applies, tagged with the project layer.
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("gpu: enabled"),
+        "a trusted gpu posture must render:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(project)"),
+        "the gpu origin must be tagged with its layer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_global_apps_gpu_posture_survives_an_untrusted_projects_override() {
+    // The flagship property, for gpu: a globally-declared app (a profile, trusted by location) keeps
+    // its GPU posture, and an untrusted project cannot flip it — so an agent can run *on* untrusted
+    // code without that code opening or closing the app's GPU access.
+    let fx = Fixture::new();
+    fx.write_profile("viz", "cmd = \"viz\"\ngpu = true\n");
+    // The untrusted project tries to turn the SAME app's GPU off.
+    fx.write_project("[app.viz]\ngpu = false\n");
+
+    let out = fx.run(&["config", "show", "--app", "viz"]);
+    assert!(
+        out.status.success(),
+        "config show --app failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("gpu:     enabled"),
+        "the trusted app GPU posture must stand:\n{stdout}"
+    );
+}

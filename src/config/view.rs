@@ -55,6 +55,10 @@ pub(crate) struct ConfigView {
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
     pub(crate) gui_origin: ProvenanceView,
+    /// Whether hardware-accelerated GPU rendering is open (`gpu = true`).
+    pub(crate) gpu: bool,
+    /// Which layer supplied the GPU posture (`Default` when neither config set it).
+    pub(crate) gpu_origin: ProvenanceView,
     /// Host loopback TCP ports forwarded into the cage (`forward`), each a port number. Empty when
     /// no layer declared any.
     pub(crate) forward: Vec<u16>,
@@ -469,6 +473,9 @@ pub(crate) struct AppView {
     /// The app's own GUI posture, when it set one — the same [`GuiView`] the baseline `gui` field
     /// carries, so the overlay and the baseline render and serialize a display identically.
     pub(crate) gui: Option<GuiView>,
+    /// The app's own GPU posture, when it set one (`Some(true)`/`Some(false)`); `None` inherits the
+    /// baseline. Mirrors the app's `gui`.
+    pub(crate) gpu: Option<bool>,
     /// The host loopback ports this overlay adds over the baseline — a security field, gated like
     /// the baseline `forward`. The overlay's own ports, not the baseline-merged set; the merge
     /// unions them only for the launch itself.
@@ -521,6 +528,9 @@ pub(crate) struct AppDetailView {
     /// The effective GUI posture (the app's own, else the baseline's).
     pub(crate) gui: GuiView,
     pub(crate) gui_origin: ProvenanceView,
+    /// The effective GPU posture (the app's own, else the baseline's).
+    pub(crate) gpu: bool,
+    pub(crate) gpu_origin: ProvenanceView,
     /// The effective host loopback forward ports — the app's own ∪ the baseline's. The origin is
     /// `Inherited` when the app added none of its own.
     pub(crate) forward: Vec<u16>,
@@ -688,6 +698,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         egress_stats: resolved.egress_stats,
         gui,
         gui_origin: resolved.gui_origin.into(),
+        gpu: resolved.gpu,
+        gpu_origin: resolved.gpu_origin.into(),
         forward: resolved.forward.clone(),
         forward_origin: resolved.forward_origin.into(),
         seccomp: resolved.seccomp.tokens(),
@@ -949,6 +961,7 @@ fn app_view(
             super::GuiPolicy::Wayland => GuiView::Wayland,
             super::GuiPolicy::None => GuiView::None,
         }),
+        gpu: app.gpu,
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
         devices: device_paths(&app.devices),
@@ -1026,6 +1039,8 @@ fn app_detail_view(
         super::GuiPolicy::None => GuiView::None,
     };
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
+    let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
+    let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin);
 
     // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app added none of its own.
@@ -1116,6 +1131,8 @@ fn app_detail_view(
         network_origin,
         gui,
         gui_origin,
+        gpu: eff_gpu,
+        gpu_origin,
         forward: eff_forward,
         forward_origin,
         seccomp: eff_seccomp.tokens(),
@@ -1347,6 +1364,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
+            gpu: true,
+            gpu_origin: ProvenanceView::Project,
             forward: vec![1455],
             forward_origin: ProvenanceView::Global,
             seccomp: vec![],
@@ -1386,6 +1405,7 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
+                gpu: None,
                 forward: vec![1455],
                 seccomp: vec![],
                 devices: vec![],
@@ -1427,6 +1447,9 @@ mod tests {
         // (default/global/project) travels with it.
         assert_eq!(json["network_origin"], "Project");
         assert_eq!(json["gui_origin"], "Global");
+        // The GPU posture and its provenance travel with the view too.
+        assert_eq!(json["gpu"], true);
+        assert_eq!(json["gpu_origin"], "Project");
         // The forward port list + its origin travel with the view, so a front-end can render
         // the host-loopback forward ports and where they came from.
         assert_eq!(json["forward"][0], 1455);
@@ -1532,6 +1555,7 @@ mod tests {
             packages: vec![flake],
             network: None,
             gui: None,
+            gpu: None,
             limits: Default::default(),
             forward: vec![],
             secrets: vec![],
@@ -1539,6 +1563,7 @@ mod tests {
             cmd_origin: Default::default(),
             network_origin: Default::default(),
             gui_origin: Default::default(),
+            gpu_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
             seccomp: Default::default(),
@@ -1604,6 +1629,8 @@ mod tests {
             egress_stats: true,
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
+            gpu: false,
+            gpu_origin: Provenance::Default,
             forward: vec![9090],
             forward_origin: Provenance::Global,
             limits: sandbox::cgroup::Limits {
@@ -1640,6 +1667,7 @@ mod tests {
             packages: vec![],
             network: Some(NetworkPolicy::Isolated),
             gui: None,
+            gpu: None,
             limits: sandbox::cgroup::Limits {
                 memory_high: None,
                 memory_max: None,
@@ -1652,6 +1680,7 @@ mod tests {
             cmd_origin: Provenance::Global,
             network_origin: Provenance::Global,
             gui_origin: Provenance::Default,
+            gpu_origin: Provenance::Default,
             forward_origin: Provenance::Global,
             limits_origin: crate::config::LimitsOrigin {
                 memory_high: Provenance::Default,

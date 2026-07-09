@@ -1279,6 +1279,15 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // The GPU posture — shown only when opened, so a non-GPU config stays uncluttered.
+    if view.gpu {
+        let _ = writeln!(
+            o,
+            "  {h}gpu:{r} enabled {dim}(mesa: Intel/AMD/nouveau){r}{}",
+            provenance_tag(view.gpu_origin, pal)
+        );
+    }
+
     // Inbound loopback forward ports — shown only when a layer declared any, so a default-profile
     // config stays uncluttered. Each port is bound on the host's `127.0.0.1` and bridged into the
     // cage at the same port (an OAuth `localhost:<port>` callback, or a cage-run dev server).
@@ -1517,6 +1526,16 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
                 None => {}
             }
+            // The GPU posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
+            match app.gpu {
+                Some(true) => {
+                    let _ = writeln!(o, "      {dim}gpu:{r} enabled {dim}(mesa){r}");
+                }
+                Some(false) => {
+                    let _ = writeln!(o, "      {dim}gpu:{r} disabled");
+                }
+                None => {}
+            }
             // The cgroup limits this overlay overrides — only the fields it tunes, since an app
             // does not carry the full effective set (an unset field inherits the baseline, shown in
             // `ops doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
@@ -1710,6 +1729,14 @@ fn render_app_detail(
             let _ = writeln!(o, "  {h}gui:{r}     none{gui_tag}");
         }
     }
+
+    // The effective GPU posture — shown either way, so the inherited story is visible.
+    let gpu_tag = app_provenance_tag(view.gpu_origin, pal);
+    let _ = writeln!(
+        o,
+        "  {h}gpu:{r}     {}{gpu_tag}",
+        if view.gpu { "enabled" } else { "disabled" }
+    );
 
     // The effective cgroup limits — every field its provenance (inherited from the baseline, or the
     // app layer that tuned it).
@@ -9582,6 +9609,8 @@ mod tests {
             egress_stats: true,
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            gpu: false,
+            gpu_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits: Default::default(),
@@ -10081,6 +10110,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10263,6 +10294,8 @@ mod tests {
             network_origin: ProvenanceView::Global,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
+            gpu: false,
+            gpu_origin: ProvenanceView::Inherited,
             forward: vec![],
             forward_origin: ProvenanceView::Inherited,
             seccomp: vec![],
@@ -10442,6 +10475,7 @@ mod tests {
             packages: vec![],
             network: None,
             gui: None,
+            gpu: None,
             forward: vec![],
             seccomp: vec![],
             devices: vec![],
@@ -10527,6 +10561,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10552,6 +10588,7 @@ mod tests {
                 }],
                 network: None,
                 gui: None,
+                gpu: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10611,6 +10648,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10635,6 +10674,7 @@ mod tests {
                     builtin: vec!["cache.nixos.org".into()],
                 }),
                 gui: None,
+                gpu: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10697,6 +10737,7 @@ mod tests {
             packages: vec![],
             network,
             gui,
+            gpu: None,
             forward: vec![],
             seccomp: vec![],
             devices: vec![],
@@ -10726,6 +10767,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10788,6 +10831,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10805,6 +10850,7 @@ mod tests {
                 packages: vec![],
                 network: None,
                 gui: None,
+                gpu: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10883,6 +10929,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10913,6 +10961,7 @@ mod tests {
                 packages: vec![],
                 network: None,
                 gui: None,
+                gpu: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10978,6 +11027,8 @@ mod tests {
             egress_stats: true,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            gpu: false,
+            gpu_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -11023,6 +11074,7 @@ mod tests {
                 ],
                 network: None,
                 gui: None,
+                gpu: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
