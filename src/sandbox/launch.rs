@@ -1394,6 +1394,14 @@ fn launch_pty_supervised(
     kind: Kind,
     cmd: Vec<OsString>,
 ) -> ExitCode {
+    // A graphical app's real interface is its window, not this terminal — Ctrl+C is forwarded
+    // faithfully but a GUI app may ignore it — so note how to stop it. Only for a foreground app
+    // launch (`Kind::Run`) with a display; a shell (`ops shell`/`ops attach`, `Kind::Shell`) uses
+    // Ctrl+C normally and needs no hint. Computed before `cmd`/`runtime` move into `build`.
+    let stop_hint = (matches!(kind, Kind::Run)
+        && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland))
+    .then(|| launch_display_name(&runtime, &cmd));
+
     let (spec, guard) = match build(prep, runtime, cmd) {
         Ok((s, g)) => (s.with_private_tty(), g),
         Err(code) => return code,
@@ -1402,6 +1410,13 @@ fn launch_pty_supervised(
     let _record = register(prep.layout.data_dir(), &spec, kind, runtime).map(RecordGuard::new);
     // Hold the guard (egress proxy / forward forwarder threads) for the whole pty session.
     let _guard = guard;
+
+    // The registered pid is this supervisor's own (`Session::current` records `std::process::id()`),
+    // which is exactly what `ops ls` shows and `ops stop` accepts, so the hint names the real id.
+    if let Some(name) = stop_hint {
+        let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
+        eprintln!("{}", render_gui_stop_hint(&name, std::process::id(), &epal));
+    }
 
     match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
         Ok(code) => ExitCode::from(code as u8),
@@ -1429,6 +1444,36 @@ fn render_attaching_project(project: &Path, pal: &crate::style::Palette) -> Stri
 fn render_attaching_app(name: &str, pal: &crate::style::Palette) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
     format!("ops: attaching a shell to app `{n}{name}{r}` {dim}(its isolated home and posture){r}")
+}
+
+/// The name a launch shows in the graphical-app stop hint: the app name for an `ops app`, else the
+/// program's own basename for a plain `ops run` into a GUI project. Falls back to a generic word if
+/// the command is somehow empty, so the hint is always well-formed.
+fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) -> String {
+    match runtime {
+        binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => (*name).to_string(),
+        binds::Runtime::ProjectDefault => cmd
+            .first()
+            .map(|c| {
+                Path::new(c)
+                    .file_name()
+                    .unwrap_or(c.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| "the app".to_string()),
+    }
+}
+
+/// The line a foreground graphical launch prints (stderr) so the user knows how to stop it: its UI
+/// is the window, and Ctrl+C — though forwarded — may be ignored by a GUI app, so the `ops stop`
+/// escape hatch is named with the session's real pid. The app name is the identifier (cyan); the
+/// rest is plain, matching the restraint of the attach announcements.
+fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> String {
+    let (n, r) = (pal.name, pal.reset);
+    format!(
+        "ops: {n}{name}{r} is graphical — close its window to quit; use `ops stop {pid}` to force-stop."
+    )
 }
 
 /// `ops attach <id>`: open an interactive shell in a running session's environment — a second
@@ -3380,6 +3425,10 @@ mod tests {
             "ops stop: no active sessions to stop."
         );
         assert_eq!(
+            render_gui_stop_hint("opencode-desktop", 4242, &p),
+            "ops: opencode-desktop is graphical — close its window to quit; use `ops stop 4242` to force-stop."
+        );
+        assert_eq!(
             render_stop_outcome(4242, "run", &session::StopOutcome::Terminated, grace, &p),
             "ops stop: stopped session 4242 (run)."
         );
@@ -3396,6 +3445,32 @@ mod tests {
         assert_eq!(
             render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p),
             "ops stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
+        );
+    }
+
+    #[test]
+    fn launch_display_name_prefers_the_app_then_the_program_basename() {
+        // An `ops app` launch names the app; a plain `ops run` into a GUI project names the
+        // program by its basename (never a store path); an empty command falls back cleanly.
+        assert_eq!(
+            launch_display_name(&binds::Runtime::GlobalApp("opencode-desktop"), &[]),
+            "opencode-desktop"
+        );
+        assert_eq!(
+            launch_display_name(&binds::Runtime::ProjectApp("agent"), &[]),
+            "agent"
+        );
+        let cmd = vec![
+            OsString::from("/nix/store/abc-foo/bin/foo"),
+            OsString::from("--flag"),
+        ];
+        assert_eq!(
+            launch_display_name(&binds::Runtime::ProjectDefault, &cmd),
+            "foo"
+        );
+        assert_eq!(
+            launch_display_name(&binds::Runtime::ProjectDefault, &[]),
+            "the app"
         );
     }
 
@@ -3428,6 +3503,11 @@ mod tests {
         assert!(attach.contains(&format!("{}demo-app{}", p.name, p.reset)));
         // The announcement verb is not green — only a completed change earns that.
         assert!(!attach.contains(&format!("{}attaching", p.ok)));
+
+        // The graphical stop hint colors only its app-name identifier (cyan) and names the pid.
+        let hint = render_gui_stop_hint("demo-app", 4242, &p);
+        assert!(hint.contains(&format!("{}demo-app{}", p.name, p.reset)));
+        assert!(hint.contains("ops stop 4242"));
 
         assert!(render_no_active_sessions(&p).contains(p.dim));
     }
