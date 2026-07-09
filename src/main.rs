@@ -2651,6 +2651,22 @@ fn flag_name(raw: &str) -> &str {
     raw.split_once('=').map(|(f, _)| f).unwrap_or(raw)
 }
 
+/// Consume one leading boolean override flag (`--gpu`/`--dbus`) from `head` into `sink`. Unlike
+/// [`take_flag_value`], a boolean flag is *optional-value*: a bare `--gpu` means `true`, and only the
+/// inline `--gpu=true`/`--gpu=false` form carries a value — the next argument is **never** consumed,
+/// so `--gpu <app>` leaves the app name in place. The raw `true`/`false` string is pushed as-is; the
+/// override collector validates it (a value other than true/false is a usage error there), keeping the
+/// grammar identical for the CLI flag and its `OPS_GPU`/`OPS_DBUS` environment twin.
+fn take_flag_bool(head: &mut Vec<OsString>, sink: &mut Vec<String>) {
+    let token = head.remove(0);
+    // `--gpu=value`: the value is inline; a bare `--gpu` normalizes to `true`.
+    let value = match token.to_str().and_then(|s| s.split_once('=')) {
+        Some((_, v)) => v.to_string(),
+        None => "true".to_string(),
+    };
+    sink.push(value);
+}
+
 /// If the leading token of `head` is a one-shot override flag, consume it and its value into `cli`
 /// and return `Some(result)` (`Ok` on success, `Err(code)` on a missing value); return `None` when
 /// the token is not an override flag, so the caller handles it (a command, the app name, an unknown
@@ -2665,6 +2681,20 @@ fn take_override_flag(
     // Resolve the flag name to an owned string first, ending the borrow of `head` before the value
     // is taken (which mutates `head`).
     let name = flag_name(head.first()?.to_str()?).to_string();
+    // The boolean flags are optional-value (`--gpu`, `--gpu=true`, `--gpu=false`) and must never
+    // consume the following argument — else `ops app --gpu <name>` would swallow the app name — so
+    // they take a dedicated path rather than the value-required `take_flag_value`.
+    match name.as_str() {
+        "--gpu" => {
+            take_flag_bool(head, &mut cli.gpu);
+            return Some(Ok(()));
+        }
+        "--dbus" => {
+            take_flag_bool(head, &mut cli.dbus);
+            return Some(Ok(()));
+        }
+        _ => {}
+    }
     let sink = match name.as_str() {
         "--config" => &mut cli.config,
         "--env" => &mut cli.env,
@@ -9317,6 +9347,14 @@ mod tests {
         assert_eq!(a.cli.forward, vec!["1455".to_string()]);
         assert_eq!(a.cli.limits, vec!["tasks_max=4096".to_string()]);
         assert_eq!(a.cli.packages, vec!["hello=nix:hello".to_string()]);
+
+        // The boolean flags are optional-value and must never consume the following token: a bare
+        // `--gpu` placed right before the name still leaves `claude` as the name (not swallowed as a
+        // value), normalizing to `"true"`; the inline `--dbus=false` form carries its value.
+        let a = parse_app_launch(&v(&["--gpu", "claude", "--dbus=false"])).unwrap();
+        assert_eq!(a.name, "claude");
+        assert_eq!(a.cli.gpu, vec!["true".to_string()]);
+        assert_eq!(a.cli.dbus, vec!["false".to_string()]);
 
         // Errors: a second name, an unknown flag, no name at all, `--` with no name before it, and a
         // value-taking flag with no value.

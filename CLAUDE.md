@@ -126,8 +126,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   `dbus_origin`; trusted/global-only gating in `resolve`/`resolve_app` with the untrusted-drop warning;
   `merge_app` replace; the flagship — a global app's dbus survives an untrusted project's override;
   `apply_override` direct-apply like `gpu`; `ops config show` a `dbus: filtered (theme + notifications)`
-  line, provenance-tagged, `--app` effective + `--json`). The typed `--dbus` one-shot flag is **deferred**
-  (parity, like `--gpu`). **Env:** `DBUS_SESSION_BUS_ADDRESS` is NOT denylisted (unlike the mesa
+  line, provenance-tagged, `--app` effective + `--json`). The typed `--dbus` one-shot flag **shipped**
+  alongside `--gpu` (see the entry below). **Env:** `DBUS_SESSION_BUS_ADDRESS` is NOT denylisted (unlike the mesa
   driver-path vars, which load code) — it is a data path like `WAYLAND_DISPLAY` (an untrusted `[env]`
   only mispoints the cage's own client → self-DoS). **Live-proven end-to-end through the REAL ops cage:**
   `ops run -- gdbus … Settings.Read appearance color-scheme` → `(<<uint32 1>>,)` = prefer-dark; keyring →
@@ -189,8 +189,12 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   `merge_app` replace; the flagship — a global app's GPU posture survives an untrusted project's
   override; `ops config show` a `gpu: enabled` line, provenance-tagged, `--app` effective + `--json`).
   The one-shot `--config` blob override carries `gpu` (`apply_override` applies it directly — a bool
-  needs no validation); the **typed `--gpu` flag is deferred** (parity to add later, like the
-  `--seccomp`/`--device` overrides were). Consumed in `launch.rs::build` (env + `/sys` ExtraBinds +
+  needs no validation); the **typed `--gpu`/`--dbus` flags shipped 2026-07-09** — optional-value
+  booleans (`--gpu` = true, `--gpu=true|false`, never a space-separated value so they cannot swallow an
+  app name), each with an `OPS_GPU`/`OPS_DBUS` env twin, routed through a dedicated `take_flag_bool`
+  in `main.rs` (not `take_flag_value`) and a shared `parse_bool` in `overrides.rs` (a value other than
+  true/false is a fail-closed usage error); `--gpu=false` disables a profile's `gpu = true` for one
+  launch. Consumed in `launch.rs::build` (env + `/sys` ExtraBinds +
   the `/dev/dri` device) **and** `equip_for_gc` (so `ops gc` keeps the mesa closure). **Scope
   (honest): mesa GPUs (Intel/AMD/nouveau)** — the **NVIDIA proprietary stack is OUT** (userspace
   version-locked to the host `nvidia.ko`, cannot be provisioned hermetically; a separate deferred

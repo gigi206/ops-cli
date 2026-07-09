@@ -70,6 +70,20 @@ project's app `gpu` is dropped.
 gpu = true
 ```
 
+## One-shot override
+
+To set the GPU posture for a single launch without editing the file, use `--gpu` or `OPS_GPU`:
+
+```sh
+ops app opencode-desktop --gpu=false   # disable the profile's gpu for this launch
+ops run --gpu -- some-gl-app           # bare --gpu means true
+```
+
+`--gpu` is a boolean: bare `--gpu` means `true`, or write `--gpu=true` / `--gpu=false` (it never
+takes a space-separated value, so it cannot swallow a following app name). Like the config field it
+is trusted by invocation. The command line beats the environment, and both beat the config file. See
+[One-shot overrides](overrides.md).
+
 ## Viewing the effective posture
 
 ```sh

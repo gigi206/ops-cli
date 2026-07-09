@@ -79,6 +79,19 @@ project's app `dbus` is dropped.
 dbus = true
 ```
 
+## One-shot override
+
+To set the D-Bus posture for a single launch without editing the file, use `--dbus` or `OPS_DBUS`:
+
+```sh
+ops app opencode-desktop --dbus=false   # no filtered bus for this launch
+ops run --dbus -- some-gtk-app          # bare --dbus means true
+```
+
+`--dbus` is a boolean: bare `--dbus` means `true`, or write `--dbus=true` / `--dbus=false` (it never
+takes a space-separated value). Like the config field it is trusted by invocation. The command line
+beats the environment, and both beat the config file. See [One-shot overrides](overrides.md).
+
 ## Viewing the effective posture
 
 ```sh

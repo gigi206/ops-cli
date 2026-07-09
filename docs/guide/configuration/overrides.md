@@ -45,6 +45,8 @@ Ergonomic shorthands for a single field, each with an `OPS_*` environment equiva
 | `--package <name>=<backend:locator>` | `OPS_PACKAGE_<name>` | a package |
 | `--seccomp <token[,token…]>` | `OPS_SECCOMP` | relax the syscall denylist ([`[seccomp]`](seccomp.md) grammar); repeatable |
 | `--device <path>` | `OPS_DEVICE` | grant a host device node ([`[devices]`](devices.md)); repeatable |
+| `--gpu[=true\|false]` | `OPS_GPU` | the [GPU](gpu.md) posture (bare `--gpu` means `true`) |
+| `--dbus[=true\|false]` | `OPS_DBUS` | the filtered [D-Bus](dbus.md) posture (bare `--dbus` means `true`) |
 
 ```sh
 ops run --net none --limit tasks_max=8192 -- ./build.sh

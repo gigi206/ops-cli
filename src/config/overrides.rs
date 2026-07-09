@@ -9,8 +9,9 @@
 //! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `OPS_CONFIG` — carries
 //! inline TOML shaped exactly like an `ops.toml`, so it can set *any* field the schema has. A
 //! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
-//! `--seccomp`/`--device` (and their `--env` sibling), each with an `OPS_*` environment equivalent —
-//! is an ergonomic shorthand for one field.
+//! `--seccomp`/`--device`/`--gpu`/`--dbus` (and their `--env` sibling), each with an `OPS_*`
+//! environment equivalent — is an ergonomic shorthand for one field. The two booleans `--gpu`/`--dbus`
+//! are optional-value (bare = `true`, or `=true`/`=false`); the rest take a required value.
 //!
 //! Because an override is trusted by invocation, its `--seccomp`/`--device` (and a blob's
 //! `[seccomp]`/`[devices]`) relax the mandatory syscall denylist and grant a host device for the
@@ -134,6 +135,10 @@ pub(crate) struct CliOverrides {
     pub(crate) seccomp: Vec<String>,
     /// `--device <path>` — grant one host device node (a `/dev/…` path) into the cage. A collection.
     pub(crate) devices: Vec<String>,
+    /// `--gpu[=true|false]` — the GPU posture (a boolean; bare `--gpu` means `true`). Last wins.
+    pub(crate) gpu: Vec<String>,
+    /// `--dbus[=true|false]` — the filtered-D-Bus posture (a boolean; bare means `true`). Last wins.
+    pub(crate) dbus: Vec<String>,
 }
 
 /// The ambient (`OPS_*`) override inputs, scanned from the environment. Passed to [`collect_from`]
@@ -164,6 +169,10 @@ struct AmbientOverrides {
     seccomp: Vec<String>,
     /// `OPS_DEVICE` — one host device path (a list is a blob concern, like `OPS_BIND`).
     devices: Vec<String>,
+    /// `OPS_GPU` — the GPU posture (`true`/`false`).
+    gpu: Option<String>,
+    /// `OPS_DBUS` — the filtered-D-Bus posture (`true`/`false`).
+    dbus: Option<String>,
 }
 
 /// The flag names a typed fragment reports in its structural-error messages, so a `--bind` error
@@ -175,6 +184,8 @@ struct TypedLabels {
     limit: &'static str,
     package: &'static str,
     forward: &'static str,
+    gpu: &'static str,
+    dbus: &'static str,
 }
 
 const CLI_LABELS: TypedLabels = TypedLabels {
@@ -183,6 +194,8 @@ const CLI_LABELS: TypedLabels = TypedLabels {
     limit: "--limit",
     package: "--package",
     forward: "--forward",
+    gpu: "--gpu",
+    dbus: "--dbus",
 };
 
 const ENV_LABELS: TypedLabels = TypedLabels {
@@ -191,6 +204,8 @@ const ENV_LABELS: TypedLabels = TypedLabels {
     limit: "OPS_LIMIT_*",
     package: "OPS_PACKAGE_*",
     forward: "OPS_FORWARD",
+    gpu: "OPS_GPU",
+    dbus: "OPS_DBUS",
 };
 
 /// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
@@ -209,6 +224,8 @@ fn scan_ambient() -> AmbientOverrides {
         net: env_nonempty("OPS_NET"),
         gui: env_nonempty("OPS_GUI"),
         nixpkgs: env_nonempty("OPS_NIXPKGS"),
+        gpu: env_nonempty("OPS_GPU"),
+        dbus: env_nonempty("OPS_DBUS"),
         ..AmbientOverrides::default()
     };
     if let Some(v) = env_nonempty("OPS_BIND") {
@@ -260,6 +277,8 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         ambient.net.as_deref(),
         ambient.gui.as_deref(),
         ambient.nixpkgs.as_deref(),
+        ambient.gpu.as_deref(),
+        ambient.dbus.as_deref(),
         &ambient.binds,
         &ambient.forward,
         &ambient.limits,
@@ -283,6 +302,8 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         cli.net.last().map(String::as_str),
         cli.gui.last().map(String::as_str),
         cli.nixpkgs.last().map(String::as_str),
+        cli.gpu.last().map(String::as_str),
+        cli.dbus.last().map(String::as_str),
         &cli.binds,
         &cli.forward,
         &cli_limits,
@@ -357,6 +378,8 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
             cli_side.network.is_some(),
         ),
         ("gui", env_side.gui.is_some(), cli_side.gui.is_some()),
+        ("gpu", env_side.gpu.is_some(), cli_side.gpu.is_some()),
+        ("dbus", env_side.dbus.is_some(), cli_side.dbus.is_some()),
         (
             "secret",
             env_side.secret.is_some(),
@@ -399,6 +422,12 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     if higher.gui.is_some() {
         base.gui = higher.gui;
+    }
+    if higher.gpu.is_some() {
+        base.gpu = higher.gpu;
+    }
+    if higher.dbus.is_some() {
+        base.dbus = higher.dbus;
     }
     if higher.secret.is_some() {
         base.secret = higher.secret;
@@ -520,6 +549,8 @@ fn build_typed_fragment(
     net: Option<&str>,
     gui: Option<&str>,
     nixpkgs: Option<&str>,
+    gpu: Option<&str>,
+    dbus: Option<&str>,
     binds: &[String],
     forward: &[String],
     limits: &[(String, String)],
@@ -538,6 +569,15 @@ fn build_typed_fragment(
     }
     if let Some(v) = nixpkgs {
         raw.nixpkgs = Some(v.to_string());
+    }
+    // `--gpu`/`--dbus` are booleans, so — unlike `gui`/`nixpkgs` whose value is validated downstream —
+    // the only valid grammar is `true`/`false`, checked here (structural, fail-closed). A bare
+    // `--gpu` is normalized to `"true"` by the CLI parser before it reaches this point.
+    if let Some(v) = gpu {
+        raw.gpu = Some(parse_bool(v, lbl.gpu)?);
+    }
+    if let Some(v) = dbus {
+        raw.dbus = Some(parse_bool(v, lbl.dbus)?);
     }
     for spec in binds {
         raw.binds.push(parse_bind(spec, lbl.bind)?);
@@ -577,6 +617,18 @@ fn build_typed_fragment(
         });
     }
     Ok(raw)
+}
+
+/// Parse a boolean typed-flag value (`--gpu`/`--dbus`, `OPS_GPU`/`OPS_DBUS`). Only `true`/`false` are
+/// valid; anything else is a structural error, fail-closed — an explicit request the user mistyped.
+fn parse_bool(value: &str, label: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "{label}: expected `true` or `false`, got `{other}`"
+        )),
+    }
 }
 
 /// Parse a `--net` value into a `network` field. The postures `none`/`shared`/`ask` pass through
@@ -738,6 +790,8 @@ mod tests {
         packages: &'a [&'a str],
         seccomp: &'a [&'a str],
         devices: &'a [&'a str],
+        gpu: &'a [&'a str],
+        dbus: &'a [&'a str],
     }
 
     fn owned(items: &[&str]) -> Vec<String> {
@@ -757,6 +811,8 @@ mod tests {
             packages: owned(cli.packages),
             seccomp: owned(cli.seccomp),
             devices: owned(cli.devices),
+            gpu: owned(cli.gpu),
+            dbus: owned(cli.dbus),
         };
         collect_from(&overrides, AmbientOverrides::default())
     }
@@ -814,6 +870,63 @@ mod tests {
             .notices()
             .iter()
             .any(|n| n.contains("forward") && n.contains("environment")));
+    }
+
+    #[test]
+    fn the_gpu_and_dbus_bool_flags_parse_bare_and_explicit() {
+        // The CLI parser normalizes a bare `--gpu` to `"true"`; `--gpu=false` disables (so a profile's
+        // `gpu = true` can be overridden off for one launch), and the last occurrence wins.
+        let ov = collect_cli(Cli {
+            gpu: &["true"],
+            dbus: &["false"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.gpu, Some(true));
+        assert_eq!(ov.raw.dbus, Some(false));
+
+        let last_wins = collect_cli(Cli {
+            gpu: &["true", "false"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(last_wins.raw.gpu, Some(false));
+    }
+
+    #[test]
+    fn a_non_boolean_gpu_value_is_a_hard_error() {
+        let err = collect_cli(Cli {
+            gpu: &["maybe"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("--gpu") && err.contains("true"));
+    }
+
+    #[test]
+    fn a_cli_gpu_flag_beats_an_ambient_ops_gpu_and_the_env_source_notice_fires() {
+        // The command line beats the environment (CLI `false` wins over `OPS_GPU=true`); and because
+        // `OPS_DBUS` (a security field) is set only in the environment, a source notice fires for it.
+        let ov = collect_from(
+            &CliOverrides {
+                gpu: owned(&["false"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                gpu: Some("true".into()),
+                dbus: Some("true".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ov.raw.gpu, Some(false));
+        assert_eq!(ov.raw.dbus, Some(true));
+        // `gpu` was also set on the CLI, so no notice for it; `dbus` came only from the environment.
+        assert!(ov
+            .notices()
+            .iter()
+            .any(|n| n.contains("dbus") && n.contains("environment")));
+        assert!(!ov.notices().iter().any(|n| n.contains("`gpu`")));
     }
 
     #[test]

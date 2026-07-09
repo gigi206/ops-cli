@@ -65,7 +65,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
-                 --seccomp / --device",
+                 --seccomp / --device / --gpu / --dbus",
                 "typed one-shot overrides for a single field each; see `ops help run`",
             ),
         ],
@@ -126,6 +126,14 @@ const PAGES: &[Page] = &[
                 "--device <path>",
                 "one-shot host device grant, one path per flag (e.g. /dev/kvm); repeatable",
             ),
+            (
+                "--gpu[=true|false]",
+                "one-shot GPU posture (bare --gpu means true); --gpu=false disables it",
+            ),
+            (
+                "--dbus[=true|false]",
+                "one-shot filtered-D-Bus posture (bare --dbus means true)",
+            ),
             ("--", "end ops's own flags; everything after runs literally"),
         ],
         details:
@@ -136,12 +144,16 @@ const PAGES: &[Page] = &[
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
             exactly like an `ops.toml`, so it can set any field; the typed flags\n\
             `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/`--seccomp`/\n\
-            `--device` are ergonomic shorthands for one field each. Every flag has an environment\n\
+            `--device`/`--gpu`/`--dbus` are ergonomic shorthands for one field each. The booleans\n\
+            `--gpu`/`--dbus` are optional-value (bare means `true`, or `=true`/`=false`); the rest take a\n\
+            value. Every flag has an environment\n\
             equivalent — `OPS_CONFIG`, `OPS_ENV_<KEY>`, `OPS_NET`, `OPS_GUI`, `OPS_NIXPKGS`, `OPS_BIND`,\n\
-            `OPS_FORWARD`, `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`, `OPS_SECCOMP`, `OPS_DEVICE`.\n\
+            `OPS_FORWARD`, `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`, `OPS_SECCOMP`, `OPS_DEVICE`,\n\
+            `OPS_GPU`, `OPS_DBUS`.\n\
             Precedence, lowest to highest:\n\
             `OPS_CONFIG < OPS_* typed < --config < --* typed` — the command line always beats the\n\
-            environment, and a typed flag beats the blob. Scalars (`net`/`gui`/`nixpkgs`) replace;\n\
+            environment, and a typed flag beats the blob. Scalars (`net`/`gui`/`nixpkgs`/`gpu`/`dbus`)\n\
+            replace;\n\
             collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`) union. An override\n\
             is the final word: it beats a trusted project config and an app's own posture — including\n\
             `--seccomp`/`--device`, which relax the denylist and grant a device a config file gates\n\
@@ -193,7 +205,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
-                 --seccomp / --device",
+                 --seccomp / --device / --gpu / --dbus",
                 "typed one-shot overrides for a single field each, beating the app's posture; \
                  see `ops help run`",
             ),
