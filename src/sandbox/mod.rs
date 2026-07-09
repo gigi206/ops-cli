@@ -12,6 +12,7 @@ mod catrust;
 pub(crate) mod cgroup;
 mod contract;
 pub(crate) mod control;
+mod dbus;
 mod deb;
 pub(crate) mod egress;
 pub(crate) mod egress_stats;

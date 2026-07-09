@@ -44,9 +44,13 @@
 # The Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the
 # empty netns IS the boundary (it replaces Chromium's own redundant sandbox); `--ozone-platform=
 # wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
-# The cage has no dbus bus, so desktop notifications, a tray icon, and the system keyring are
-# unavailable — benign for editing/chat; a keyring-backed login would fall back to a file in the
-# app's isolated home.
+#
+# DBUS. `dbus = true` opens a FILTERED session bus (an `xdg-dbus-proxy` ops runs host-side,
+# default-deny): the app follows your host light/dark theme (the `appearance` portal) and can raise
+# desktop notifications. The proxy exposes ONLY those — the login keyring
+# (`org.freedesktop.secrets`) and the file-chooser/screenshot portals stay refused, so a
+# keyring-backed login still falls back to a file in the app's isolated home. A tray icon
+# (StatusNotifier) is not in the allowlist.
 cmd = [
     "opencode-desktop",
     "--no-sandbox",
@@ -57,6 +61,7 @@ cmd = [
 
 gui = "wayland"
 gpu = true
+dbus = true
 
 # Your host opencode config/auth, mounted read-write at its real absolute path (so the GUI shares
 # the same login/sessions as your host opencode). `binds` is a security field, honored only

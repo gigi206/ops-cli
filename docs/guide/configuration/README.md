@@ -45,6 +45,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[devices]` | security | [devices](devices.md) |
 | `gui` | security | [gui](gui.md) |
 | `gpu` | security | [gpu](gpu.md) |
+| `dbus` | security | [dbus](dbus.md) |
 | `network` | security | [network](network.md) |
 | `[secret]` | security | [secret](secret.md) |
 | `[app.<name>]` | security overlay | [apps](apps.md) |

@@ -59,6 +59,10 @@ pub(crate) struct ConfigView {
     pub(crate) gpu: bool,
     /// Which layer supplied the GPU posture (`Default` when neither config set it).
     pub(crate) gpu_origin: ProvenanceView,
+    /// Whether a filtered D-Bus session bus is open (`dbus = true`).
+    pub(crate) dbus: bool,
+    /// Which layer supplied the D-Bus posture (`Default` when neither config set it).
+    pub(crate) dbus_origin: ProvenanceView,
     /// Host loopback TCP ports forwarded into the cage (`forward`), each a port number. Empty when
     /// no layer declared any.
     pub(crate) forward: Vec<u16>,
@@ -476,6 +480,9 @@ pub(crate) struct AppView {
     /// The app's own GPU posture, when it set one (`Some(true)`/`Some(false)`); `None` inherits the
     /// baseline. Mirrors the app's `gui`.
     pub(crate) gpu: Option<bool>,
+    /// The app's own filtered-D-Bus posture, when it set one; `None` inherits the baseline. Mirrors
+    /// the app's `gpu`.
+    pub(crate) dbus: Option<bool>,
     /// The host loopback ports this overlay adds over the baseline — a security field, gated like
     /// the baseline `forward`. The overlay's own ports, not the baseline-merged set; the merge
     /// unions them only for the launch itself.
@@ -531,6 +538,9 @@ pub(crate) struct AppDetailView {
     /// The effective GPU posture (the app's own, else the baseline's).
     pub(crate) gpu: bool,
     pub(crate) gpu_origin: ProvenanceView,
+    /// The effective filtered-D-Bus posture (the app's own, else the baseline's).
+    pub(crate) dbus: bool,
+    pub(crate) dbus_origin: ProvenanceView,
     /// The effective host loopback forward ports — the app's own ∪ the baseline's. The origin is
     /// `Inherited` when the app added none of its own.
     pub(crate) forward: Vec<u16>,
@@ -700,6 +710,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         gui_origin: resolved.gui_origin.into(),
         gpu: resolved.gpu,
         gpu_origin: resolved.gpu_origin.into(),
+        dbus: resolved.dbus,
+        dbus_origin: resolved.dbus_origin.into(),
         forward: resolved.forward.clone(),
         forward_origin: resolved.forward_origin.into(),
         seccomp: resolved.seccomp.tokens(),
@@ -962,6 +974,7 @@ fn app_view(
             super::GuiPolicy::None => GuiView::None,
         }),
         gpu: app.gpu,
+        dbus: app.dbus,
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
         devices: device_paths(&app.devices),
@@ -1041,6 +1054,8 @@ fn app_detail_view(
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
     let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
     let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin);
+    let eff_dbus = app.dbus.unwrap_or(baseline.dbus);
+    let dbus_origin = origin_or_inherited(app.dbus.is_some(), app.dbus_origin);
 
     // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app added none of its own.
@@ -1133,6 +1148,8 @@ fn app_detail_view(
         gui_origin,
         gpu: eff_gpu,
         gpu_origin,
+        dbus: eff_dbus,
+        dbus_origin,
         forward: eff_forward,
         forward_origin,
         seccomp: eff_seccomp.tokens(),
@@ -1365,7 +1382,9 @@ mod tests {
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
             gpu: true,
+            dbus: true,
             gpu_origin: ProvenanceView::Project,
+            dbus_origin: ProvenanceView::Project,
             forward: vec![1455],
             forward_origin: ProvenanceView::Global,
             seccomp: vec![],
@@ -1406,6 +1425,7 @@ mod tests {
                 }),
                 gui: None,
                 gpu: None,
+                dbus: None,
                 forward: vec![1455],
                 seccomp: vec![],
                 devices: vec![],
@@ -1450,6 +1470,9 @@ mod tests {
         // The GPU posture and its provenance travel with the view too.
         assert_eq!(json["gpu"], true);
         assert_eq!(json["gpu_origin"], "Project");
+        // The filtered-D-Bus posture and its provenance likewise.
+        assert_eq!(json["dbus"], true);
+        assert_eq!(json["dbus_origin"], "Project");
         // The forward port list + its origin travel with the view, so a front-end can render
         // the host-loopback forward ports and where they came from.
         assert_eq!(json["forward"][0], 1455);
@@ -1556,6 +1579,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             forward: vec![],
             secrets: vec![],
@@ -1564,6 +1588,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
             seccomp: Default::default(),
@@ -1630,7 +1655,9 @@ mod tests {
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             gpu: false,
+            dbus: false,
             gpu_origin: Provenance::Default,
+            dbus_origin: Provenance::Default,
             forward: vec![9090],
             forward_origin: Provenance::Global,
             limits: sandbox::cgroup::Limits {
@@ -1668,6 +1695,7 @@ mod tests {
             network: Some(NetworkPolicy::Isolated),
             gui: None,
             gpu: None,
+            dbus: None,
             limits: sandbox::cgroup::Limits {
                 memory_high: None,
                 memory_max: None,
@@ -1681,6 +1709,7 @@ mod tests {
             network_origin: Provenance::Global,
             gui_origin: Provenance::Default,
             gpu_origin: Provenance::Default,
+            dbus_origin: Provenance::Default,
             forward_origin: Provenance::Global,
             limits_origin: crate::config::LimitsOrigin {
                 memory_high: Provenance::Default,

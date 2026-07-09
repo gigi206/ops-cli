@@ -66,6 +66,17 @@ pub(crate) struct RawConfig {
     /// (Intel/AMD/nouveau); the NVIDIA proprietary stack is a separate, not-yet-built mechanism.
     /// Most useful together with `gui = "wayland"`.
     pub(crate) gpu: Option<bool>,
+    /// Whether to open a **filtered** D-Bus session bus for the cage (`dbus = true`). ops runs a
+    /// default-deny `xdg-dbus-proxy` host-side that forwards only a small curated allowlist — the
+    /// desktop `appearance` portal (so a graphical app follows the host light/dark theme) and the
+    /// notifications service — and binds only that filtered socket into the cage. A security field —
+    /// honored from the global config or a trusted project, ignored from an untrusted one: the
+    /// session bus carries the login keyring (every saved password) and every desktop portal, so
+    /// exposing even a filtered slice of it is a choice an untrusted project may not make. The filter
+    /// is only a boundary under an isolated network namespace, so it is not wired under
+    /// `network = "shared"` (the host bus would be reachable directly). Most useful together with
+    /// `gui = "wayland"`.
+    pub(crate) dbus: Option<bool>,
     /// Host loopback TCP ports to forward from the host into the cage — a list of port
     /// numbers (`forward = [1455]`). Each port is bound on the host's `127.0.0.1` and
     /// bridged, through a bound Unix socket, to the cage's own loopback at the same port,
@@ -265,6 +276,10 @@ pub(crate) struct RawApp {
     /// security field, like the baseline `gpu`. An unset `Option` is omitted on export, so an
     /// app with no GPU need carries no `gpu` line.
     pub(crate) gpu: Option<bool>,
+    /// The app's filtered-D-Bus posture, overriding the baseline's when set (see `RawConfig.dbus`).
+    /// A security field, like the baseline `dbus`. An unset `Option` is omitted on export, so an
+    /// app with no D-Bus need carries no `dbus` line.
+    pub(crate) dbus: Option<bool>,
     /// Host loopback ports forwarded into this app's cage (see `RawConfig.forward`). A
     /// security field, gated like the baseline `forward`: an app's ports **union** onto
     /// the baseline's, so an untrusted project can only add its own, never remove or

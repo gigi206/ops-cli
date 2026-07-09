@@ -181,10 +181,11 @@ fn launch_foreground(
             eprintln!("ops: failed to launch the sandbox: {err}");
             ExitCode::FAILURE
         }
-        // A network allowlist or an forward forwarder: ops cannot exec-replace, because a host
-        // thread (the filtering proxy and/or the forward accept pumps) must outlive the cage.
-        // Supervise instead — fork bwrap, wait, propagate the exit status — keeping the thread(s)
-        // alive and the guard (which unlinks the sockets and CA) held for the whole session.
+        // A network allowlist, a forward forwarder, or a filtered D-Bus proxy: ops cannot
+        // exec-replace, because a host thread or child (the filtering proxy, the forward accept
+        // pumps, and/or the `xdg-dbus-proxy` process) must outlive the cage. Supervise instead — fork
+        // bwrap, wait, propagate the exit status — keeping them alive and the guard (which unlinks the
+        // sockets/CA and kills the dbus proxy) held for the whole session.
         Some(guard) => {
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(guard);
@@ -1804,6 +1805,9 @@ fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<
 pub(crate) struct LaunchGuard {
     pub(crate) egress: Option<egress::Egress>,
     pub(crate) forward: Option<forward::Forwarder>,
+    /// The filtered D-Bus proxy (`dbus = true`), when one is running. Like the egress proxy it must
+    /// outlive the cage, so its presence forces the supervised path; dropping it kills the proxy.
+    pub(crate) dbus: Option<super::dbus::DbusProxy>,
 }
 
 impl LaunchGuard {
@@ -1828,6 +1832,9 @@ impl Drop for LaunchGuard {
         }
         if let Some(forward) = self.forward.take() {
             drop(forward);
+        }
+        if let Some(dbus) = self.dbus.take() {
+            drop(dbus);
         }
     }
 }
@@ -2294,6 +2301,53 @@ fn build(
         }
     }
 
+    // dbus hole: under `dbus = true`, provision `xdg-dbus-proxy` and stand up a host-side filtered
+    // session-bus proxy (default-deny; only the appearance/theme portal and notifications), binding
+    // just its filtered socket into the cage and pointing `DBUS_SESSION_BUS_ADDRESS` at it. Runs
+    // host-side (trusted infra, like the egress proxy) under its own minimal cage. Best-effort: no
+    // session bus, a provisioning failure, or a proxy that does not come up warns and runs without a
+    // bus (the raw session bus is never exposed — that is the fail-closed direction). The guard
+    // forces the supervised path (the proxy must outlive the cage). The wiring env sets
+    // `DBUS_SESSION_BUS_ADDRESS`; an untrusted `[env]` could only mispoint the cage's own client at a
+    // nonexistent bus (self-DoS), never redirect the bind or reach the raw bus — so, like
+    // `WAYLAND_DISPLAY`, the key needs no denylist entry.
+    let mut dbus_guard = None;
+    if prep.cfg.dbus {
+        if !dbus_filter_enforceable(&prep.cfg.network) {
+            // Under `network = "shared"` the cage shares the host netns, where the host session bus is
+            // reachable *directly*: abstract-namespace Unix sockets (`unix:abstract=…`, which legacy
+            // D-Bus sessions open) are namespace-scoped, not filesystem-scoped, so in-cage code could
+            // read `/proc/net/unix`, find the raw bus address, and connect around the proxy to the
+            // keyring and every portal. So the filtered proxy is NOT wired here — presenting a bus
+            // that is not actually filtered would be false confidence. Same shape as the `forward`
+            // block's shared-network skip.
+            crate::diag::warn(
+                "`dbus = true` but `network = \"shared\"` shares the host network namespace, where \
+                 the host session bus is directly reachable — the filtered D-Bus proxy is not wired \
+                 (it could not be enforced). Pair `dbus` with `network = \"none\"`/`\"deny\"`/\
+                 `\"allow\"` for a filtered bus.",
+            );
+        } else {
+            match super::dbus::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+                Ok(proxy_bin) => match super::dbus::start(&prep.layout, &proxy_bin, &prep.bwrap) {
+                    Ok((proxy, wiring)) => {
+                        gui_binds.extend(wiring.binds);
+                        gui_env.extend(wiring.env);
+                        dbus_guard = Some(proxy);
+                    }
+                    Err(e) => crate::diag::warn(&format!(
+                        "`dbus = true` but the filtered bus proxy could not start ({e}) — running \
+                         without a session bus (no theme following or notifications)"
+                    )),
+                },
+                Err(e) => crate::diag::warn(&format!(
+                    "`dbus = true` but `xdg-dbus-proxy` could not be provisioned ({e}) — running \
+                     without a session bus"
+                )),
+            }
+        }
+    }
+
     // The launcher's extra binds, emitted after the structural mounts: the egress machinery
     // (socket + CA) and the GUI socket. Their destinations are ops's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
@@ -2383,10 +2437,11 @@ fn build(
         eprintln!("ops: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
-    let guard = if egress_guard.is_some() || forward_guard.is_some() {
+    let guard = if egress_guard.is_some() || forward_guard.is_some() || dbus_guard.is_some() {
         Some(LaunchGuard {
             egress: egress_guard,
             forward: forward_guard,
+            dbus: dbus_guard,
         })
     } else {
         None
@@ -2407,6 +2462,17 @@ fn net_policy(network: &crate::config::NetworkPolicy) -> NetPolicy {
         crate::config::NetworkPolicy::Isolated => NetPolicy::Isolated,
         crate::config::NetworkPolicy::Allowlist(_) => NetPolicy::Isolated,
     }
+}
+
+/// Whether the filtered D-Bus proxy is a real boundary under `network`, so `dbus = true` should wire
+/// it. It is enforceable **only** when the cage has an isolated network namespace: under
+/// `network = "shared"` the cage shares the host netns, where the host session bus is reachable
+/// directly (abstract-namespace Unix sockets are namespace-scoped, not filesystem-scoped), so in-cage
+/// code could connect around the proxy to the raw bus — the filter would be false confidence. Every
+/// other posture (`none`/`deny`/`allow`/`ask`) maps to an empty netns (see [`net_policy`]), where the
+/// filter is airtight. Pure, so the security-relevant decision is pinned by a unit test.
+fn dbus_filter_enforceable(network: &crate::config::NetworkPolicy) -> bool {
+    !matches!(network, crate::config::NetworkPolicy::Shared)
 }
 
 /// Resolve the host's Wayland compositor socket and the cage environment that points a
@@ -3383,7 +3449,9 @@ mod tests {
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
+            dbus: false,
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits: Default::default(),
@@ -3433,6 +3501,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             forward: vec![],
             secrets: vec![],
@@ -3441,6 +3510,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
             seccomp: Default::default(),
@@ -3876,6 +3946,25 @@ mod tests {
             )),
             NetPolicy::Isolated
         );
+    }
+
+    #[test]
+    fn the_dbus_filter_is_enforceable_only_under_an_isolated_netns() {
+        // The security-relevant decision (a future refactor must not silently reintroduce the
+        // shared-netns bypass): the filtered D-Bus proxy is wired ONLY when the cage's netns is
+        // isolated. Under `shared` the host bus is reachable directly (abstract sockets are
+        // netns-scoped), so the filter is not a boundary and is not wired.
+        assert!(
+            !dbus_filter_enforceable(&crate::config::NetworkPolicy::Shared),
+            "the dbus filter must not be wired under a shared netns"
+        );
+        assert!(dbus_filter_enforceable(
+            &crate::config::NetworkPolicy::Isolated
+        ));
+        // every filtering posture also runs the cage in an empty netns, where the filter is airtight
+        assert!(dbus_filter_enforceable(
+            &crate::config::NetworkPolicy::Allowlist(crate::allowlist::EgressPolicy::default())
+        ));
     }
 
     #[test]

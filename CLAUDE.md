@@ -96,6 +96,72 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`dbus = true` — a filtered D-Bus session bus in the cage (DONE 2026-07-09)**
+  (`src/sandbox/dbus.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
+  `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{dbus,README}.md`
+  + `docs/guide/README.md` + `tests/{config,run}.rs`): a **trusted-only security field `dbus = true`**
+  (a boolean, mirroring `gpu`) that opens a **filtered** D-Bus session bus so a graphical app can
+  **follow the host light/dark theme** (the desktop `appearance` portal) and **raise notifications**.
+  Born from the `opencode-desktop` follow-up (the GTK theme hack the user rejected in favour of "propre
+  et sécurisé avec dbus"). Exposing the **raw** session bus is unsafe — it carries the login **keyring**
+  (`org.freedesktop.secrets` = every saved password) + every desktop portal — so ops runs
+  **`xdg-dbus-proxy`** (Flatpak's mechanism, provisioned via nix like the fonts/mesa, gcroot
+  `gcroots/gui/<rev>/xdg-dbus-proxy`) **host-side** as a **default-deny** filtering proxy, inside its
+  OWN minimal bwrap (built from the audited `to_argv` — all-ns, cap-drop, `--die-with-parent`; binds
+  ops's shared store ro at `/nix` so the store binary's interpreter resolves, the host bus socket ro, a
+  writable `<data>/dbus` output dir; **isolated netns** — D-Bus is AF_UNIX). Only the **filtered
+  socket** is bound into the agent cage at `/run/ops-dbus/bus` + `DBUS_SESSION_BUS_ADDRESS`. **The
+  curated filter** (`filter_args()`): `--filter` (deny-all) then `--call=…portal.Desktop=…Settings.Read`
+  + `.ReadAll` + `--broadcast=…Settings.SettingChanged` (theme, LIVE-following) + `--call=…portal.Desktop=
+  org.freedesktop.DBus.Properties.Get`/`.GetAll` (read-only interface `version` metadata a portal client
+  probes — **live-caught: without it Chromium/Electron hits `Properties.Get … AccessDenied` on the portal
+  and the theme does not apply**; `gdbus Settings.Read` alone does NOT prove the app's theme follows —
+  launch the real Electron app) + `--talk=…Notifications` — **method-scoping the portal via `--call` is
+  load-bearing** (opens ONLY the Settings + read-only Properties reads, so FileChooser/Screenshot/ScreenCast
+  on the SAME bus name stay refused; a whole-name `--talk` would open them all). A `DbusProxy` guard (`LaunchGuard.dbus`) kills+unlinks on Drop and **forces the supervised
+  path** (the proxy must outlive the cage, never exec-replace). **Best-effort:** no host bus / provision
+  fail / proxy dies → warn + run WITHOUT a bus (the raw bus is never a fallback = fail-closed; a
+  `try_wait` liveness check after the socket appears catches a create-then-die). **Config side mirrors
+  `gpu` exactly** (`RawConfig`/`RawApp` `dbus: Option<bool>`; `Resolved`/`ResolvedApp` `dbus` +
+  `dbus_origin`; trusted/global-only gating in `resolve`/`resolve_app` with the untrusted-drop warning;
+  `merge_app` replace; the flagship — a global app's dbus survives an untrusted project's override;
+  `apply_override` direct-apply like `gpu`; `ops config show` a `dbus: filtered (theme + notifications)`
+  line, provenance-tagged, `--app` effective + `--json`). The typed `--dbus` one-shot flag is **deferred**
+  (parity, like `--gpu`). **Env:** `DBUS_SESSION_BUS_ADDRESS` is NOT denylisted (unlike the mesa
+  driver-path vars, which load code) — it is a data path like `WAYLAND_DISPLAY` (an untrusted `[env]`
+  only mispoints the cage's own client → self-DoS). **Live-proven end-to-end through the REAL ops cage:**
+  `ops run -- gdbus … Settings.Read appearance color-scheme` → `(<<uint32 1>>,)` = prefer-dark; keyring →
+  `ServiceUnknown` (denied); FileChooser → `AccessDenied`. **AND the real `ops app opencode-desktop`
+  launch: the Electron window renders in DARK (user-confirmed "oui noire"), the portal `AccessDenied` gone
+  after the `Properties.Get` grant.** `opencode-desktop.toml` gained `dbus = true`. **Residual log noise
+  (benign, not fixed):** the app probes the SYSTEM bus (`/run/dbus/system_bus_socket`), which ops does not
+  expose (privileged — correct); and a `GLib-GIO-CRITICAL g_settings_schema_source_lookup` warning is
+  SEPARATE (absent GSettings schemas — the theme comes via the portal, not GSettings; a glib-schema
+  provisioning slice would silence it).
+  **Advisor-reviewed (code + security), findings addressed.** Security review found **one real
+  ship-blocker — SEC-001:** `dbus` and `network` are independent, so `dbus = true` + `network = "shared"`
+  is reachable, and under `shared` the cage shares the host netns where **abstract** Unix sockets
+  (`unix:abstract=…`, legacy sessions) are netns-scoped not filesystem-scoped — a hostile agent could
+  read `/proc/net/unix`, find the raw bus's abstract address, and connect AROUND the proxy to the
+  keyring. Fixed: the launch wires the proxy **only under an isolated netns** (`dbus_filter_enforceable(net)
+  = !matches!(net, Shared)`, unit-pinned); under `shared` it warns + does NOT wire (a bypassable filter =
+  false confidence; the exact residual Flatpak severs with `--unshare-net`). Every other posture
+  (`none`/`deny`/`allow`/`ask`) → empty netns → airtight; the e2e uses `network = "none"` (default is
+  `shared`, now skipped), opencode-desktop uses `deny` → safe. Live-proven both directions (theme under
+  `none`; warn + BUS-ABSENT under `shared`). Code review **APPROVE** (folded: the `try_wait` liveness
+  check; the guard-match comment now names dbus). **Accepted (documented, not fixed):** notification
+  spoofing within the allowed Notifications name; `Settings.Read` not argument-scoped to `appearance`
+  (the portal surfaces only appearance keys); a `SIGKILL` leaves a stale `<data>/dbus/*.sock` (0700,
+  dead — housekeeping, same as egress). **Tests:** 3 dbus.rs unit (`filter_args` allow+deny sets,
+  `parse_unix_path`, `proxy_spec` shape) + `dbus_filter_enforceable` (SEC-001) + 2 config gating
+  (untrusted-drop + flagship) + merge_app precedence + view `--json` + 1 run.rs e2e
+  `a_trusted_dbus_posture_binds_a_filtered_bus_into_the_cage` (firm netns-independent gating teeth;
+  firm BUS-PRESENT+ADDR-SET when the proxy comes up, best-effort otherwise, skips with no host bus). 976
+  unit + 94 config green, fmt/clippy `-D warnings` clean, **std-only** (no new dep — reuses
+  `store::provision`/`to_argv`). **Scope:** fixed curated allowlist (a custom `[dbus]` table is a
+  forward-compatible follow-up — `dbus` could become `bool | table`); tray icon (StatusNotifier) not in
+  the set; the GSettings-schema warning is separate/cosmetic (the theme comes via the portal, not
+  GSettings). **Roadmap:** NVIDIA GPU (opt-in slice), then a custom `[dbus]` interface allowlist.
   **`gpu = true` — hardware-accelerated GPU rendering in the cage (DONE 2026-07-09)**
   (`src/sandbox/gpu.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
   `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{gpu,README}.md`

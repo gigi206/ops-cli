@@ -1287,6 +1287,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             provenance_tag(view.gpu_origin, pal)
         );
     }
+    if view.dbus {
+        let _ = writeln!(
+            o,
+            "  {h}dbus:{r} filtered {dim}(theme + notifications){r}{}",
+            provenance_tag(view.dbus_origin, pal)
+        );
+    }
 
     // Inbound loopback forward ports — shown only when a layer declared any, so a default-profile
     // config stays uncluttered. Each port is bound on the host's `127.0.0.1` and bridged into the
@@ -1536,6 +1543,19 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
                 None => {}
             }
+            // The filtered-D-Bus posture the overlay sets; `None` inherits.
+            match app.dbus {
+                Some(true) => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}dbus:{r} filtered {dim}(theme + notifications){r}"
+                    );
+                }
+                Some(false) => {
+                    let _ = writeln!(o, "      {dim}dbus:{r} disabled");
+                }
+                None => {}
+            }
             // The cgroup limits this overlay overrides — only the fields it tunes, since an app
             // does not carry the full effective set (an unset field inherits the baseline, shown in
             // `ops doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
@@ -1736,6 +1756,14 @@ fn render_app_detail(
         o,
         "  {h}gpu:{r}     {}{gpu_tag}",
         if view.gpu { "enabled" } else { "disabled" }
+    );
+
+    // The effective filtered-D-Bus posture — shown either way, so the inherited story is visible.
+    let dbus_tag = app_provenance_tag(view.dbus_origin, pal);
+    let _ = writeln!(
+        o,
+        "  {h}dbus:{r}    {}{dbus_tag}",
+        if view.dbus { "filtered" } else { "disabled" }
     );
 
     // The effective cgroup limits — every field its provenance (inherited from the baseline, or the
@@ -9610,7 +9638,9 @@ mod tests {
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
+            dbus: false,
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits: Default::default(),
@@ -10111,7 +10141,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10295,7 +10327,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Inherited,
+            dbus_origin: ProvenanceView::Inherited,
             forward: vec![],
             forward_origin: ProvenanceView::Inherited,
             seccomp: vec![],
@@ -10476,6 +10510,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            dbus: None,
             forward: vec![],
             seccomp: vec![],
             devices: vec![],
@@ -10562,7 +10597,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10589,6 +10626,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                dbus: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10649,7 +10687,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10675,6 +10715,7 @@ mod tests {
                 }),
                 gui: None,
                 gpu: None,
+                dbus: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10738,6 +10779,7 @@ mod tests {
             network,
             gui,
             gpu: None,
+            dbus: None,
             forward: vec![],
             seccomp: vec![],
             devices: vec![],
@@ -10768,7 +10810,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10832,7 +10876,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10851,6 +10897,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                dbus: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -10930,7 +10977,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -10962,6 +11011,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                dbus: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],
@@ -11028,7 +11078,9 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
+            dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
             seccomp: vec![],
@@ -11075,6 +11127,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                dbus: None,
                 forward: vec![],
                 seccomp: vec![],
                 devices: vec![],

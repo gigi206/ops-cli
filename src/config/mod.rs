@@ -539,6 +539,12 @@ pub(crate) struct Resolved {
     pub(crate) gpu: bool,
     /// Which layer supplied the winning `gpu` posture (`Default` when neither config set it).
     pub(crate) gpu_origin: Provenance,
+    /// Whether a filtered D-Bus session bus is open (the default `false` unless the global config
+    /// or a trusted project set `dbus = true`). A security field, gated like `gui`/`gpu` — an
+    /// untrusted project may not expose even a filtered slice of the session bus.
+    pub(crate) dbus: bool,
+    /// Which layer supplied the winning `dbus` posture (`Default` when neither config set it).
+    pub(crate) dbus_origin: Provenance,
     /// Host loopback TCP ports forwarded into the cage (see [`RawConfig::forward`]). A security
     /// field, gated like `network`/`gui`; the merged set is the union of the global and a trusted
     /// project's ports (an untrusted project's ports are dropped, never added), so a trusted
@@ -637,6 +643,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own GPU posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gui`.
     pub(crate) gpu: Option<bool>,
+    /// The app's own filtered-D-Bus posture, set only when a trusted source declared one. `Some`
+    /// overrides the baseline; `None` leaves the baseline posture in place. Gated like the app's `gpu`.
+    pub(crate) dbus: Option<bool>,
     /// The app's own cgroup limit overrides, set only from a trusted source (an untrusted
     /// project's app `[limits]` is dropped whole, like its `network`/`gui`). Each set field
     /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
@@ -674,6 +683,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) network_origin: Provenance,
     pub(crate) gui_origin: Provenance,
     pub(crate) gpu_origin: Provenance,
+    pub(crate) dbus_origin: Provenance,
     pub(crate) limits_origin: LimitsOrigin,
     /// Which app layer (`Global`/`Project`) supplied the app's own `forward` ports, or `Default`
     /// when the app declared none. The merged effective set is the app's own ∪ the baseline's;
@@ -732,6 +742,9 @@ impl Resolved {
         }
         if let Some(gpu) = app.gpu {
             self.gpu = gpu;
+        }
+        if let Some(dbus) = app.dbus {
+            self.dbus = dbus;
         }
         // The app's ports union onto the baseline's — an app adds ports, never removes or
         // overrides the trusted baseline set (the flagship "agent on untrusted code" property,
@@ -831,6 +844,7 @@ impl Resolved {
             network,
             gui,
             gpu,
+            dbus,
             limits,
             secret,
             forward,
@@ -927,6 +941,12 @@ impl Resolved {
         if let Some(value) = gpu {
             self.gpu = value;
             self.gpu_origin = Provenance::Override;
+        }
+        // `dbus` — a bool, like `gpu`; apply directly. Trusted by invocation and the final word, so
+        // it may open or close the filtered bus for this launch regardless of the config layers.
+        if let Some(value) = dbus {
+            self.dbus = value;
+            self.dbus_origin = Provenance::Override;
         }
         if let Some(over) = new_limits {
             mark_limit_origins(&mut self.limits_origin, &over, Provenance::Override);
@@ -1219,6 +1239,17 @@ fn resolve(
         }
         None => false,
     };
+    // The filtered-D-Bus posture is trusted by location at the global layer; the origin records
+    // `Global` whenever the layer set the flag at all (so `dbus = true` reads distinctly from the
+    // default).
+    let mut dbus_origin = Provenance::Default;
+    let mut dbus = match global.dbus {
+        Some(value) => {
+            dbus_origin = Provenance::Global;
+            value
+        }
+        None => false,
+    };
     // `forward` ports are trusted by location at the global layer; each invalid port is dropped
     // (warned) and the rest kept. The merged set is a union (a project adds ports, never
     // replaces), so the origin is `Global` only when this layer contributed any port.
@@ -1384,6 +1415,20 @@ fn resolve(
                 ));
             }
         }
+        // `dbus` is a security field — a trusted project may open the filtered session bus; an
+        // untrusted or changed one may not (even a filtered slice of the bus, near the keyring and
+        // the portals, is a choice an untrusted project must not make).
+        if let Some(value) = proj.dbus {
+            if trusted {
+                dbus = value;
+                dbus_origin = Provenance::Project;
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `dbus` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `forward` is a security field — a trusted project may add host loopback forward ports;
         // an untrusted or changed one may not (opening a host port is a deliberate inbound hole).
         // The ports union onto the global set: a project adds, never replaces (the flagship
@@ -1522,6 +1567,8 @@ fn resolve(
         gui_origin,
         gpu,
         gpu_origin,
+        dbus,
+        dbus_origin,
         forward,
         forward_origin,
         limits,
@@ -2016,6 +2063,7 @@ fn resolve_app(
     let mut default_methods = builtin_app_default_methods();
     let mut gui: Option<GuiPolicy> = None;
     let mut gpu: Option<bool> = None;
+    let mut dbus: Option<bool> = None;
     // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
     // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
     let mut limits = crate::sandbox::cgroup::Limits::default();
@@ -2047,6 +2095,7 @@ fn resolve_app(
     let mut network_origin = Provenance::Default;
     let mut gui_origin = Provenance::Default;
     let mut gpu_origin = Provenance::Default;
+    let mut dbus_origin = Provenance::Default;
     // The app's own loopback forward ports — a security field, gated like `network`/`gui`. The
     // merged effective set (app ∪ baseline) is computed at `merge_app`; this holds only the app's
     // own contribution, with its origin for the per-app view.
@@ -2093,6 +2142,10 @@ fn resolve_app(
         if let Some(value) = app.gpu {
             gpu = Some(value);
             gpu_origin = Provenance::Global;
+        }
+        if let Some(value) = app.dbus {
+            dbus = Some(value);
+            dbus_origin = Provenance::Global;
         }
         // `forward` is trusted by location at the global app layer; invalid ports are dropped
         // (warned). The app's own set is kept separate here — it unions onto the baseline at
@@ -2211,6 +2264,19 @@ fn resolve_app(
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `gpu` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `dbus` mirrors `gpu`: an untrusted project may not open the filtered session bus, on its
+        // own app or by overriding a trusted one (the bus sits near the keyring and the portals).
+        if let Some(value) = app.dbus {
+            if trusted {
+                dbus = Some(value);
+                dbus_origin = Provenance::Project;
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `dbus` posture ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -2346,6 +2412,7 @@ fn resolve_app(
         network,
         gui,
         gpu,
+        dbus,
         limits,
         seccomp,
         devices,
@@ -2356,6 +2423,7 @@ fn resolve_app(
         network_origin,
         gui_origin,
         gpu_origin,
+        dbus_origin,
         forward_origin,
         seccomp_origin,
         devices_origin,
@@ -4497,6 +4565,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            dbus: None,
             forward: None,
             secret: None,
             app: BTreeMap::new(),
@@ -4992,6 +5061,7 @@ mod tests {
             network,
             gui: None,
             gpu: None,
+            dbus: None,
             forward: None,
             secret: None,
             limits: None,
@@ -6374,6 +6444,8 @@ mod tests {
         base.devices = vec![PathBuf::from("/dev/dri")];
         // Baseline GPU off, so the app turning it on is an observable *replace* (like `gui`).
         base.gpu = false;
+        // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
+        base.dbus = false;
         let app = ResolvedApp {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
@@ -6383,6 +6455,7 @@ mod tests {
             network: Some(NetworkPolicy::Isolated),
             gui: None,
             gpu: Some(true),
+            dbus: Some(true),
             limits: crate::sandbox::cgroup::Limits {
                 tasks_max: Some("4096".into()),
                 ..Default::default()
@@ -6393,6 +6466,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6418,6 +6492,7 @@ mod tests {
         assert!(matches!(base.network, NetworkPolicy::Isolated));
         // The app's GPU posture (`Some(true)`) replaces the baseline's `false`, like `network`/`gui`.
         assert!(base.gpu, "the app's gpu posture replaces the baseline's");
+        assert!(base.dbus, "the app's dbus posture replaces the baseline's");
         // The app's limit override replaces the baseline per field; unset fields inherit it.
         assert_eq!(
             base.limits.tasks_max.as_deref(),
@@ -6448,6 +6523,7 @@ mod tests {
             network: None, // inherits the baseline's shared posture
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
             default_methods: crate::allowlist::Methods::Unspecified,
@@ -6455,6 +6531,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6487,6 +6564,7 @@ mod tests {
             )),
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
             default_methods: crate::allowlist::Methods::Unspecified,
@@ -6494,6 +6572,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6522,6 +6601,7 @@ mod tests {
             network,
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             secrets: vec![],
             default_methods,
@@ -6529,6 +6609,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6649,6 +6730,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
             default_methods: crate::allowlist::Methods::Unspecified,
@@ -6656,6 +6738,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -6696,6 +6779,7 @@ mod tests {
             )),
             gui: None,
             gpu: None,
+            dbus: None,
             limits: Default::default(),
             secrets: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
@@ -6703,6 +6787,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
             limits_origin: Default::default(),

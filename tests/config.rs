@@ -3435,3 +3435,64 @@ fn a_global_apps_gpu_posture_survives_an_untrusted_projects_override() {
         "the trusted app GPU posture must stand:\n{stdout}"
     );
 }
+
+#[test]
+fn an_untrusted_dbus_posture_is_dropped_but_trusting_applies_it() {
+    // `dbus = true` exposes a filtered slice of the session bus (near the keyring and the portals) —
+    // a security field, so an untrusted project's posture is dropped and applied only once trusted.
+    let fx = Fixture::new();
+    fx.write_project("dbus = true\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("dbus:"),
+        "an untrusted dbus posture must not be applied:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("ignoring `dbus` posture"),
+        "a dropped dbus posture must be explained:\n{stderr}"
+    );
+
+    // Trust it → the posture applies, tagged with the project layer.
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dbus: filtered"),
+        "a trusted dbus posture must render:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(project)"),
+        "the dbus origin must be tagged with its layer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_global_apps_dbus_posture_survives_an_untrusted_projects_override() {
+    // The flagship property, for dbus: a globally-declared app (a profile, trusted by location) keeps
+    // its filtered-bus posture, and an untrusted project cannot flip it.
+    let fx = Fixture::new();
+    fx.write_profile("viz", "cmd = \"viz\"\ndbus = true\n");
+    // The untrusted project tries to turn the SAME app's D-Bus off.
+    fx.write_project("[app.viz]\ndbus = false\n");
+
+    let out = fx.run(&["config", "show", "--app", "viz"]);
+    assert!(
+        out.status.success(),
+        "config show --app failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dbus:    filtered"),
+        "the trusted app D-Bus posture must stand:\n{stdout}"
+    );
+}

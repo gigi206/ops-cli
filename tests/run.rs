@@ -4112,6 +4112,122 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
     );
 }
 
+/// A trusted `dbus = true` posture stands up the filtered session-bus proxy and binds ONLY its
+/// filtered socket into the cage (with `DBUS_SESSION_BUS_ADDRESS` pointed at it). The
+/// network-independent teeth are the gating: an untrusted (dropped) posture leaves the cage with no
+/// bus and no address at all. The trusted-present half needs a host session bus AND provisioning
+/// `xdg-dbus-proxy` (network), so it is asserted firmly when the proxy comes up and reported
+/// best-effort otherwise — like the gpu mesa env. Skips where there is no host session bus or the
+/// host cannot sandbox.
+#[test]
+fn a_trusted_dbus_posture_binds_a_filtered_bus_into_the_cage() {
+    // The proxy needs a host session bus to filter; skip on a headless host that has none.
+    let host_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .ok()
+        .and_then(|addr| {
+            addr.split(';').find_map(|one| {
+                one.strip_prefix("unix:").and_then(|rest| {
+                    rest.split(',')
+                        .find_map(|kv| kv.strip_prefix("path=").map(PathBuf::from))
+                })
+            })
+        })
+        .or_else(|| {
+            std::env::var("XDG_RUNTIME_DIR")
+                .ok()
+                .map(|x| PathBuf::from(x).join("bus"))
+        })
+        .filter(|p| p.exists());
+    if host_bus.is_none() {
+        eprintln!("skipping dbus e2e: no host D-Bus session bus to proxy");
+        return;
+    }
+
+    let project = TmpDir::new("dbus-proj");
+    let data = TmpDir::new("dbus-data");
+    let state = TmpDir::new("dbus-state");
+
+    // `network = "none"` gives the cage an empty netns — the posture under which the filter is a
+    // real boundary and the proxy is wired (under the default `shared` it is deliberately skipped,
+    // since the host bus would be reachable directly, so it would never wire and the teeth below
+    // could not fire). `network` is itself trusted-only, so the untrusted probe still gets `shared`
+    // — which is fine, its assertion is only that a *dropped* dbus posture binds no bus.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"dbus = true\nnetwork = \"none\"\n",
+    )
+    .unwrap();
+    // Only the filtered socket is ever bound in, at this fixed path, with the address pointed at it.
+    let check = "test -S /run/ops-dbus/bus && echo BUS-PRESENT || echo BUS-ABSENT; \
+                 test -n \"$DBUS_SESSION_BUS_ADDRESS\" && echo ADDR-SET || echo ADDR-UNSET";
+
+    // Untrusted probe (also seeds the base userland): the posture is dropped, so no bus and no
+    // address — firm, network-independent teeth for the gating. A failed launch means the host
+    // cannot sandbox → skip.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping dbus e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_out.contains("BUS-ABSENT"),
+        "the untrusted (dropped) dbus posture must leave the bus out of the cage:\n{probe_out}"
+    );
+    assert!(
+        probe_out.contains("ADDR-UNSET"),
+        "without the dbus posture the cage must carry no DBUS_SESSION_BUS_ADDRESS:\n{probe_out}"
+    );
+
+    // Trust the project so its `dbus = true` posture applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check],
+    );
+    assert!(
+        out.status.success(),
+        "a trusted dbus posture must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.contains("BUS-PRESENT") {
+        // The proxy came up: the filtered socket is bound AND its address is set — full teeth.
+        assert!(
+            stdout.contains("ADDR-SET"),
+            "a bound filtered bus must come with DBUS_SESSION_BUS_ADDRESS pointed at it:\n{stdout}"
+        );
+    } else {
+        // The proxy could not be provisioned/started here (no cached closure, etc.). Best-effort,
+        // like the gpu mesa env — the gating teeth above already ran firmly.
+        eprintln!(
+            "dbus e2e: the filtered bus proxy did not come up (best-effort); stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
 /// The one-shot `--device` / `--seccomp` security overrides reach the cage — the CLI
 /// flag→collect→`apply_override`→build_spec→bwrap thread a config-file e2e cannot reach. Two arms,
 /// which build_spec consumes differently:
