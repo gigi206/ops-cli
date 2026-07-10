@@ -59,8 +59,8 @@ pub(crate) struct ConfigView {
     pub(crate) gpu: bool,
     /// Which layer supplied the GPU posture (`Default` when neither config set it).
     pub(crate) gpu_origin: ProvenanceView,
-    /// Whether a filtered D-Bus session bus is open (`dbus = true`).
-    pub(crate) dbus: bool,
+    /// The resolved D-Bus posture (off, filtered host bus, or in-cage portal).
+    pub(crate) dbus: DbusView,
     /// Which layer supplied the D-Bus posture (`Default` when neither config set it).
     pub(crate) dbus_origin: ProvenanceView,
     /// Host loopback TCP ports forwarded into the cage (`forward`), each a port number. Empty when
@@ -377,6 +377,27 @@ pub(crate) enum GuiView {
     Wayland,
 }
 
+/// The resolved D-Bus posture (mirror of [`super::DbusPolicy`] for the view/JSON).
+#[derive(Serialize, PartialEq, Eq, Debug)]
+pub(crate) enum DbusView {
+    /// No session bus (`dbus = false`).
+    Off,
+    /// The filtered host session bus (`dbus = true`).
+    HostFiltered,
+    /// The private in-cage portal (`dbus = "incage"`).
+    InCagePortal,
+}
+
+impl From<super::DbusPolicy> for DbusView {
+    fn from(p: super::DbusPolicy) -> Self {
+        match p {
+            super::DbusPolicy::Off => DbusView::Off,
+            super::DbusPolicy::HostFiltered => DbusView::HostFiltered,
+            super::DbusPolicy::InCagePortal => DbusView::InCagePortal,
+        }
+    }
+}
+
 /// The cage's effective cgroup resource limits: the throttle threshold, the hard memory ceiling,
 /// and the task cap, each its config override when set or ops's built-in default otherwise.
 #[derive(Serialize, Default)]
@@ -480,9 +501,9 @@ pub(crate) struct AppView {
     /// The app's own GPU posture, when it set one (`Some(true)`/`Some(false)`); `None` inherits the
     /// baseline. Mirrors the app's `gui`.
     pub(crate) gpu: Option<bool>,
-    /// The app's own filtered-D-Bus posture, when it set one; `None` inherits the baseline. Mirrors
-    /// the app's `gpu`.
-    pub(crate) dbus: Option<bool>,
+    /// The app's own D-Bus posture, when it set one; `None` inherits the baseline. Mirrors the
+    /// app's `gpu`.
+    pub(crate) dbus: Option<DbusView>,
     /// The host loopback ports this overlay adds over the baseline — a security field, gated like
     /// the baseline `forward`. The overlay's own ports, not the baseline-merged set; the merge
     /// unions them only for the launch itself.
@@ -538,8 +559,8 @@ pub(crate) struct AppDetailView {
     /// The effective GPU posture (the app's own, else the baseline's).
     pub(crate) gpu: bool,
     pub(crate) gpu_origin: ProvenanceView,
-    /// The effective filtered-D-Bus posture (the app's own, else the baseline's).
-    pub(crate) dbus: bool,
+    /// The effective D-Bus posture (the app's own, else the baseline's).
+    pub(crate) dbus: DbusView,
     pub(crate) dbus_origin: ProvenanceView,
     /// The effective host loopback forward ports — the app's own ∪ the baseline's. The origin is
     /// `Inherited` when the app added none of its own.
@@ -710,7 +731,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         gui_origin: resolved.gui_origin.into(),
         gpu: resolved.gpu,
         gpu_origin: resolved.gpu_origin.into(),
-        dbus: resolved.dbus,
+        dbus: resolved.dbus.into(),
         dbus_origin: resolved.dbus_origin.into(),
         forward: resolved.forward.clone(),
         forward_origin: resolved.forward_origin.into(),
@@ -974,7 +995,7 @@ fn app_view(
             super::GuiPolicy::None => GuiView::None,
         }),
         gpu: app.gpu,
-        dbus: app.dbus,
+        dbus: app.dbus.map(DbusView::from),
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
         devices: device_paths(&app.devices),
@@ -1054,7 +1075,7 @@ fn app_detail_view(
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
     let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
     let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin);
-    let eff_dbus = app.dbus.unwrap_or(baseline.dbus);
+    let eff_dbus: DbusView = app.dbus.unwrap_or(baseline.dbus).into();
     let dbus_origin = origin_or_inherited(app.dbus.is_some(), app.dbus_origin);
 
     // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
@@ -1382,7 +1403,7 @@ mod tests {
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
             gpu: true,
-            dbus: true,
+            dbus: DbusView::HostFiltered,
             gpu_origin: ProvenanceView::Project,
             dbus_origin: ProvenanceView::Project,
             forward: vec![1455],
@@ -1471,7 +1492,7 @@ mod tests {
         assert_eq!(json["gpu"], true);
         assert_eq!(json["gpu_origin"], "Project");
         // The filtered-D-Bus posture and its provenance likewise.
-        assert_eq!(json["dbus"], true);
+        assert_eq!(json["dbus"], "HostFiltered");
         assert_eq!(json["dbus_origin"], "Project");
         // The forward port list + its origin travel with the view, so a front-end can render
         // the host-loopback forward ports and where they came from.
@@ -1627,7 +1648,7 @@ mod tests {
 
     #[test]
     fn the_detail_views_effective_scalars_agree_with_merge_app() {
-        use crate::config::{AppHomeScope, GuiPolicy, Provenance, ResolvedApp};
+        use crate::config::{AppHomeScope, DbusPolicy, GuiPolicy, Provenance, ResolvedApp};
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
@@ -1655,7 +1676,7 @@ mod tests {
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             gpu: false,
-            dbus: false,
+            dbus: DbusPolicy::Off,
             gpu_origin: Provenance::Default,
             dbus_origin: Provenance::Default,
             forward: vec![9090],

@@ -639,8 +639,10 @@ impl ProxyCtx {
     /// for a permitted request). The path is query-redacted against the configured secret needles
     /// **before** it enters the ring, so even the outbound-secret-blocked event — whose query is
     /// exactly the one carrying a secret — is safe to hold in RAM.
+    #[allow(clippy::too_many_arguments)]
     fn outcome(
         &self,
+        proto: super::control::Proto,
         host: &str,
         port: u16,
         method: Option<&str>,
@@ -663,7 +665,7 @@ impl ProxyCtx {
         // the same as a config one.
         let muted = matches!(kind, StatKind::Deny)
             && effective_policy(self).muted(host, port, path, method);
-        self.push_log_maybe_muted(muted, host, port, method, path, verdict, reason)
+        self.push_log_maybe_muted(muted, proto, host, port, method, path, verdict, reason)
     }
 
     /// The copy-paste `ops net allow` command a `denied-default` refusal body suggests. When the
@@ -684,8 +686,10 @@ impl ProxyCtx {
     /// failed downstream (`Error` — DNS/unreachable/cert) and a request ops declined before any
     /// verdict (`Blocked` — an IP-literal target or a malformed/smuggling request). Stats stay a
     /// pure allow/deny/blocked policy counter; the log is the richer record.
+    #[allow(clippy::too_many_arguments)]
     fn push_log(
         &self,
+        proto: super::control::Proto,
         host: &str,
         port: u16,
         method: Option<&str>,
@@ -693,7 +697,7 @@ impl ProxyCtx {
         verdict: super::control::LogVerdict,
         reason: &str,
     ) -> Option<u64> {
-        self.push_log_maybe_muted(false, host, port, method, path, verdict, reason)
+        self.push_log_maybe_muted(false, proto, host, port, method, path, verdict, reason)
     }
 
     /// The muted-aware inner of [`Self::push_log`]: when `muted` (a denied request matched a `mute`
@@ -705,6 +709,7 @@ impl ProxyCtx {
     fn push_log_maybe_muted(
         &self,
         muted: bool,
+        proto: super::control::Proto,
         host: &str,
         port: u16,
         method: Option<&str>,
@@ -722,6 +727,7 @@ impl ProxyCtx {
             redacted.as_deref(),
             verdict,
             reason,
+            proto,
         ))
     }
 
@@ -948,6 +954,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // not dark, but with no host/method/path (the raw line may hold whitespace the wire format
         // cannot carry as a single field).
         ctx.push_log(
+            super::control::Proto::Other,
             "",
             0,
             None,
@@ -973,6 +980,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             return handle_cleartext(client, &parsed, &head, &method, &target, ctx);
         }
         ctx.push_log(
+            super::control::Proto::Other,
             "",
             0,
             Some(method.as_str()),
@@ -992,6 +1000,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let Some((host, port)) = split_authority(&target) else {
         // The authority is malformed (not host:port): log the raw target the agent asked for.
         ctx.push_log(
+            super::control::Proto::Other,
             "",
             0,
             Some(method.as_str()),
@@ -1025,6 +1034,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // Log the attempt (host = the IP the agent tried to reach) before refusing. Pre-tunnel, so
         // there is no method/path yet.
         ctx.push_log(
+            super::control::Proto::Https,
             &connect_host,
             port,
             None,
@@ -1060,6 +1070,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     {
         // Pre-parse: the inner request is not decoded yet, so there is no method/path to log.
         ctx.outcome(
+            super::control::Proto::Https,
             &connect_host,
             port,
             None,
@@ -1078,6 +1089,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let inner = parse_head(&inner_bytes)?;
     let Some((imethod, itarget)) = request_line_parts(&inner.request_line) else {
         ctx.push_log(
+            super::control::Proto::Https,
             &connect_host,
             port,
             None,
@@ -1108,6 +1120,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // (`/login?next=https://…`) is not mistaken for absolute-form.
     if !itarget.starts_with('/') {
         ctx.push_log(
+            super::control::Proto::Https,
             &connect_host,
             port,
             Some(&imethod),
@@ -1129,6 +1142,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         || inner.count("host") > 1
     {
         ctx.push_log(
+            super::control::Proto::Https,
             &connect_host,
             port,
             Some(&imethod),
@@ -1149,6 +1163,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             Ok(n) => n,
             Err(_) => {
                 ctx.push_log(
+                    super::control::Proto::Https,
                     &connect_host,
                     port,
                     Some(&imethod),
@@ -1174,6 +1189,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         .unwrap_or(true)
     {
         ctx.outcome(
+            super::control::Proto::Https,
             &connect_host,
             port,
             Some(&imethod),
@@ -1197,6 +1213,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     the streamed body, and matches the value byte-for-byte (any encoding evades it).
     if carries_secret(&inner_bytes, &ctx.redactions) {
         ctx.outcome(
+            super::control::Proto::Https,
             &connect_host,
             port,
             Some(&imethod),
@@ -1225,6 +1242,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Decision::AllowedDefault => None,
         Decision::DeniedBy(_) => {
             ctx.outcome(
+                super::control::Proto::Https,
                 &connect_host,
                 port,
                 Some(&imethod),
@@ -1252,6 +1270,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 "denied-default"
             };
             ctx.outcome(
+                super::control::Proto::Https,
                 &connect_host,
                 port,
                 Some(&imethod),
@@ -1318,6 +1337,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 }
                 super::control::Verdict::Deny => {
                     ctx.outcome(
+                        super::control::Proto::Https,
                         &connect_host,
                         port,
                         Some(&imethod),
@@ -1344,6 +1364,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     upgrade to this host; a WS to a non-`{WS}` host was denied by method above.)
     if ws_upgrade && !matching_injections(ctx, &connect_host, port, &itarget).is_empty() {
         ctx.outcome(
+            super::control::Proto::Https,
             &connect_host,
             port,
             Some(&imethod),
@@ -1368,6 +1389,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             // Allowed, but the name did not resolve: an `error`, not a refusal — the log's whole
             // point is that this reads differently from "we said no".
             ctx.push_log(
+                super::control::Proto::Https,
                 &connect_host,
                 port,
                 Some(&imethod),
@@ -1388,6 +1410,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         .find(|ip| ip_permitted(*ip, &connect_host, deciding.as_ref()))
     else {
         ctx.outcome(
+            super::control::Proto::Https,
             &connect_host,
             port,
             Some(&imethod),
@@ -1414,6 +1437,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Ok(u) => u,
         Err(UpstreamError::Unreachable) => {
             ctx.push_log(
+                super::control::Proto::Https,
                 &connect_host,
                 port,
                 Some(&imethod),
@@ -1430,6 +1454,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         }
         Err(UpstreamError::CertRejected) => {
             ctx.push_log(
+                super::control::Proto::Https,
                 &connect_host,
                 port,
                 Some(&imethod),
@@ -1453,6 +1478,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // outcome here (a single count per request: a refusal above already returned, and the steps
     // below are I/O, not policy verdicts, so this is the sole place a forwarded request is counted).
     let allow_seq = ctx.outcome(
+        super::control::Proto::Https,
         &connect_host,
         port,
         Some(&imethod),
@@ -1642,6 +1668,7 @@ fn splice_l4(
     if guard.count() > MAX_CONCURRENT_SPLICES {
         // A raw splice has no HTTP head, so there is no method/path to log.
         ctx.outcome(
+            super::control::Proto::Tcp,
             connect_host,
             port,
             None,
@@ -1667,6 +1694,7 @@ fn splice_l4(
             Ok(ips) => ips,
             Err(_) => {
                 ctx.push_log(
+                    super::control::Proto::Tcp,
                     connect_host,
                     port,
                     None,
@@ -1688,6 +1716,7 @@ fn splice_l4(
         .find(|ip| ip_permitted(*ip, connect_host, Some(deciding)))
     else {
         ctx.outcome(
+            super::control::Proto::Tcp,
             connect_host,
             port,
             None,
@@ -1712,6 +1741,7 @@ fn splice_l4(
         Ok(s) => s,
         Err(_) => {
             ctx.push_log(
+                super::control::Proto::Tcp,
                 connect_host,
                 port,
                 None,
@@ -1730,7 +1760,15 @@ fn splice_l4(
 
     // Accept the tunnel — from here every byte is raw and uninspected.
     write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
-    ctx.outcome(connect_host, port, None, None, StatKind::Allow, "allowed");
+    ctx.outcome(
+        super::control::Proto::Tcp,
+        connect_host,
+        port,
+        None,
+        None,
+        StatKind::Allow,
+        "allowed",
+    );
     splice_copy(client, upstream)
 }
 
@@ -1799,6 +1837,7 @@ fn handle_cleartext(
         Ok(t) => t,
         Err(_) => {
             ctx.push_log(
+                super::control::Proto::Http,
                 "",
                 0,
                 Some(method),
@@ -1822,6 +1861,7 @@ fn handle_cleartext(
         || head.count("host") > 1
     {
         ctx.push_log(
+            super::control::Proto::Http,
             &host,
             port,
             Some(method),
@@ -1842,6 +1882,7 @@ fn handle_cleartext(
             Ok(n) => n,
             Err(_) => {
                 ctx.push_log(
+                    super::control::Proto::Http,
                     &host,
                     port,
                     Some(method),
@@ -1869,6 +1910,7 @@ fn handle_cleartext(
         .unwrap_or(true)
     {
         ctx.outcome(
+            super::control::Proto::Http,
             &host,
             port,
             Some(method),
@@ -1889,6 +1931,7 @@ fn handle_cleartext(
     //    in the clear is exposed on the wire, not just to the destination.
     if carries_secret(head_bytes, &ctx.redactions) {
         ctx.outcome(
+            super::control::Proto::Http,
             &host,
             port,
             Some(method),
@@ -1915,6 +1958,7 @@ fn handle_cleartext(
         Decision::AllowedBy(rule) => rule.clone(),
         Decision::DeniedBy(_) => {
             ctx.outcome(
+                super::control::Proto::Http,
                 &host,
                 port,
                 Some(method),
@@ -1939,6 +1983,7 @@ fn handle_cleartext(
                 "denied-default"
             };
             ctx.outcome(
+                super::control::Proto::Http,
                 &host,
                 port,
                 Some(method),
@@ -1977,6 +2022,7 @@ fn handle_cleartext(
         Ok(ips) => ips,
         Err(_) => {
             ctx.push_log(
+                super::control::Proto::Http,
                 &host,
                 port,
                 Some(method),
@@ -1997,6 +2043,7 @@ fn handle_cleartext(
         .find(|ip| ip_permitted(*ip, &host, Some(&deciding)))
     else {
         ctx.outcome(
+            super::control::Proto::Http,
             &host,
             port,
             Some(method),
@@ -2024,6 +2071,7 @@ fn handle_cleartext(
         }
         Err(_) => {
             ctx.push_log(
+                super::control::Proto::Http,
                 &host,
                 port,
                 Some(method),
@@ -2042,6 +2090,7 @@ fn handle_cleartext(
 
     // The request is permitted and the upstream is up — record the one `allow` outcome here.
     let allow_seq = ctx.outcome(
+        super::control::Proto::Http,
         &host,
         port,
         Some(method),
@@ -3485,6 +3534,7 @@ mod tests {
 
         // One refusal to the muted host, one to an unmuted host.
         ctx.outcome(
+            crate::sandbox::control::Proto::Https,
             "play.googleapis.com",
             443,
             Some("POST"),
@@ -3493,6 +3543,7 @@ mod tests {
             "denied-default",
         );
         ctx.outcome(
+            crate::sandbox::control::Proto::Https,
             "api.example.com",
             443,
             Some("GET"),
@@ -3557,6 +3608,7 @@ mod tests {
             .remember_mute(crate::allowlist::classify("play.googleapis.com").unwrap());
 
         ctx.outcome(
+            crate::sandbox::control::Proto::Https,
             "play.googleapis.com",
             443,
             Some("POST"),

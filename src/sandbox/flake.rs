@@ -419,7 +419,7 @@ mod tests {
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
-            dbus: false,
+            dbus: crate::config::DbusPolicy::Off,
             gpu_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],

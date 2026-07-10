@@ -26,7 +26,7 @@ use crate::allowlist::{Layer, Methods, Rule, RuleKind};
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
-    NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
+    NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawDbus, RawHostSecret, RawHostSecrets,
     RawSecretDefaults, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -275,6 +275,36 @@ pub(crate) enum GuiPolicy {
     None,
     /// Bind the host's Wayland compositor socket read-only so a graphical app can map a window.
     Wayland,
+}
+
+/// The sandbox's resolved D-Bus posture. A security choice, gated exactly like [`GuiPolicy`]:
+/// honored from the global config (trusted by location) or a trusted project, ignored from an
+/// untrusted one. `Off` (the default) gives the cage no session bus. `HostFiltered` opens a
+/// default-deny `xdg-dbus-proxy` view of the *host* bus (theme + notifications), only a boundary
+/// under an isolated netns. `InCagePortal` stands up a *private* in-cage bus carrying ops's own
+/// `xdg-desktop-portal` (the GTK backend), so a file chooser renders inside the cage; it touches
+/// no host socket and needs `gui = "wayland"` for the backend to render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DbusPolicy {
+    /// No session bus in the cage (the default).
+    #[default]
+    Off,
+    /// A default-deny filtered view of the host session bus (theme + notifications).
+    HostFiltered,
+    /// A private in-cage bus with ops's own desktop portal (in-cage file chooser + theme).
+    InCagePortal,
+}
+
+impl DbusPolicy {
+    /// Whether the filtered host-bus proxy is the posture (the `dbus = true` path).
+    pub(crate) fn is_host_filtered(self) -> bool {
+        matches!(self, DbusPolicy::HostFiltered)
+    }
+
+    /// Whether the private in-cage portal is the posture (the `dbus = "incage"` path).
+    pub(crate) fn is_in_cage_portal(self) -> bool {
+        matches!(self, DbusPolicy::InCagePortal)
+    }
 }
 
 /// A credential the egress proxy injects into matching outbound requests as an HTTP
@@ -539,10 +569,11 @@ pub(crate) struct Resolved {
     pub(crate) gpu: bool,
     /// Which layer supplied the winning `gpu` posture (`Default` when neither config set it).
     pub(crate) gpu_origin: Provenance,
-    /// Whether a filtered D-Bus session bus is open (the default `false` unless the global config
-    /// or a trusted project set `dbus = true`). A security field, gated like `gui`/`gpu` — an
-    /// untrusted project may not expose even a filtered slice of the session bus.
-    pub(crate) dbus: bool,
+    /// How the cage reaches a D-Bus session bus ([`DbusPolicy`]; the default `Off` unless the
+    /// global config or a trusted project set `dbus`). A security field, gated like `gui`/`gpu` —
+    /// an untrusted project may not expose even a filtered slice of the session bus nor stand up an
+    /// in-cage portal.
+    pub(crate) dbus: DbusPolicy,
     /// Which layer supplied the winning `dbus` posture (`Default` when neither config set it).
     pub(crate) dbus_origin: Provenance,
     /// Host loopback TCP ports forwarded into the cage (see [`RawConfig::forward`]). A security
@@ -643,9 +674,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own GPU posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gui`.
     pub(crate) gpu: Option<bool>,
-    /// The app's own filtered-D-Bus posture, set only when a trusted source declared one. `Some`
-    /// overrides the baseline; `None` leaves the baseline posture in place. Gated like the app's `gpu`.
-    pub(crate) dbus: Option<bool>,
+    /// The app's own D-Bus posture, set only when a trusted source declared one. `Some` overrides
+    /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gpu`.
+    pub(crate) dbus: Option<DbusPolicy>,
     /// The app's own cgroup limit overrides, set only from a trusted source (an untrusted
     /// project's app `[limits]` is dropped whole, like its `network`/`gui`). Each set field
     /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
@@ -863,13 +894,14 @@ impl Resolved {
         // lost with the dropped config; on success they merge into `self.warnings`.
         let mut notes = Vec::new();
         let (scalars, fatal) =
-            build_override_scalars(&self.network, network, gui, limits, &mut notes);
+            build_override_scalars(&self.network, network, gui, dbus, limits, &mut notes);
         if !fatal.is_empty() {
             return Err(override_fatal_error(fatal, notes));
         }
         let OverrideScalars {
             network: new_network,
             gui: new_gui,
+            dbus: new_dbus,
             limits: new_limits,
         } = scalars;
 
@@ -942,10 +974,11 @@ impl Resolved {
             self.gpu = value;
             self.gpu_origin = Provenance::Override;
         }
-        // `dbus` — a bool, like `gpu`; apply directly. Trusted by invocation and the final word, so
-        // it may open or close the filtered bus for this launch regardless of the config layers.
-        if let Some(value) = dbus {
-            self.dbus = value;
+        // `dbus` — a posture that may be an invalid string, so it was validated above (fatal on a
+        // bad value, like `gui`). Trusted by invocation and the final word, so it may change the
+        // D-Bus posture for this launch regardless of the config layers.
+        if let Some(policy) = new_dbus {
+            self.dbus = policy;
             self.dbus_origin = Provenance::Override;
         }
         if let Some(over) = new_limits {
@@ -1025,6 +1058,7 @@ impl Resolved {
             &self.network,
             ov.raw.network.clone(),
             ov.raw.gui.clone(),
+            ov.raw.dbus.clone(),
             ov.raw.limits.clone(),
             &mut notes,
         );
@@ -1045,6 +1079,7 @@ struct OverrideScalars {
     /// The resolved network policy plus the egress-stats toggle the `[network]` table carried.
     network: Option<(NetworkPolicy, Option<bool>)>,
     gui: Option<GuiPolicy>,
+    dbus: Option<DbusPolicy>,
     limits: Option<crate::sandbox::cgroup::Limits>,
 }
 
@@ -1056,6 +1091,7 @@ fn build_override_scalars(
     baseline: &NetworkPolicy,
     network: Option<NetworkField>,
     gui: Option<String>,
+    dbus: Option<RawDbus>,
     limits: Option<schema::RawLimits>,
     notes: &mut Vec<String>,
 ) -> (OverrideScalars, Vec<String>) {
@@ -1077,6 +1113,13 @@ fn build_override_scalars(
         match validate_gui(notes, OVERRIDE_SOURCE, value) {
             Some(policy) => scalars.gui = Some(policy),
             None => fatal.push("gui".to_string()),
+        }
+    }
+    if let Some(value) = dbus {
+        // A set-but-invalid posture is fatal for an override (no safe fallback), like `gui`.
+        match validate_dbus(notes, OVERRIDE_SOURCE, value) {
+            Some(policy) => scalars.dbus = Some(policy),
+            None => fatal.push("dbus".to_string()),
         }
     }
     if let Some(raw_limits) = limits {
@@ -1239,16 +1282,19 @@ fn resolve(
         }
         None => false,
     };
-    // The filtered-D-Bus posture is trusted by location at the global layer; the origin records
-    // `Global` whenever the layer set the flag at all (so `dbus = true` reads distinctly from the
-    // default).
+    // The D-Bus posture is trusted by location at the global layer; the origin records `Global`
+    // whenever the layer set a valid posture (so a set `dbus` reads distinctly from the default). An
+    // unknown string is dropped (warned) fail-closed to the default `Off`.
     let mut dbus_origin = Provenance::Default;
-    let mut dbus = match global.dbus {
-        Some(value) => {
+    let mut dbus = match global
+        .dbus
+        .and_then(|v| validate_dbus(&mut warnings, GLOBAL_CONFIG, v))
+    {
+        Some(policy) => {
             dbus_origin = Provenance::Global;
-            value
+            policy
         }
-        None => false,
+        None => DbusPolicy::default(),
     };
     // `forward` ports are trusted by location at the global layer; each invalid port is dropped
     // (warned) and the rest kept. The merged set is a union (a project adds ports, never
@@ -1415,13 +1461,16 @@ fn resolve(
                 ));
             }
         }
-        // `dbus` is a security field — a trusted project may open the filtered session bus; an
-        // untrusted or changed one may not (even a filtered slice of the bus, near the keyring and
-        // the portals, is a choice an untrusted project must not make).
-        if let Some(value) = proj.dbus {
+        // `dbus` is a security field — a trusted project may open the filtered session bus or the
+        // in-cage portal; an untrusted or changed one may not (any session bus, near the keyring and
+        // the portals, is a choice an untrusted project must not make). A trusted but unknown string
+        // is dropped (warned) fail-closed, leaving the prior posture.
+        if let Some(raw) = proj.dbus {
             if trusted {
-                dbus = value;
-                dbus_origin = Provenance::Project;
+                if let Some(policy) = validate_dbus(&mut warnings, PROJECT_CONFIG, raw) {
+                    dbus = policy;
+                    dbus_origin = Provenance::Project;
+                }
             } else {
                 warnings.push(format!(
                     "{PROJECT_CONFIG}: ignoring `dbus` posture ({})",
@@ -2063,7 +2112,7 @@ fn resolve_app(
     let mut default_methods = builtin_app_default_methods();
     let mut gui: Option<GuiPolicy> = None;
     let mut gpu: Option<bool> = None;
-    let mut dbus: Option<bool> = None;
+    let mut dbus: Option<DbusPolicy> = None;
     // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
     // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
     let mut limits = crate::sandbox::cgroup::Limits::default();
@@ -2144,8 +2193,10 @@ fn resolve_app(
             gpu_origin = Provenance::Global;
         }
         if let Some(value) = app.dbus {
-            dbus = Some(value);
-            dbus_origin = Provenance::Global;
+            if let Some(policy) = validate_dbus(&mut warnings, &source, value) {
+                dbus = Some(policy);
+                dbus_origin = Provenance::Global;
+            }
         }
         // `forward` is trusted by location at the global app layer; invalid ports are dropped
         // (warned). The app's own set is kept separate here — it unions onto the baseline at
@@ -2268,12 +2319,15 @@ fn resolve_app(
                 ));
             }
         }
-        // `dbus` mirrors `gpu`: an untrusted project may not open the filtered session bus, on its
-        // own app or by overriding a trusted one (the bus sits near the keyring and the portals).
-        if let Some(value) = app.dbus {
+        // `dbus` mirrors `gpu`: an untrusted project may not open a session bus (filtered host or
+        // in-cage portal), on its own app or by overriding a trusted one (a bus sits near the
+        // keyring and the portals). A trusted but unknown string is dropped (warned) fail-closed.
+        if let Some(raw) = app.dbus {
             if trusted {
-                dbus = Some(value);
-                dbus_origin = Provenance::Project;
+                if let Some(policy) = validate_dbus(&mut warnings, &source, raw) {
+                    dbus = Some(policy);
+                    dbus_origin = Provenance::Project;
+                }
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `dbus` posture ({})",
@@ -2796,6 +2850,33 @@ fn validate_gui(
             ));
             None
         }
+    }
+}
+
+/// Validate a `dbus` field into a [`DbusPolicy`]. `true` = the filtered host bus, `false` = no bus,
+/// `"incage"` = the private in-cage portal (with a few readable aliases). A typo must never silently
+/// open a bus, so an unknown string returns `None` (the layer keeps its prior/default posture) after
+/// a warning — the same fail-closed shape as `validate_gui`.
+fn validate_dbus(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    value: RawDbus,
+) -> Option<DbusPolicy> {
+    match value {
+        RawDbus::Bool(true) => Some(DbusPolicy::HostFiltered),
+        RawDbus::Bool(false) => Some(DbusPolicy::Off),
+        RawDbus::Mode(s) => match s.as_str() {
+            "off" | "none" | "false" => Some(DbusPolicy::Off),
+            "true" | "host" | "filtered" => Some(DbusPolicy::HostFiltered),
+            "incage" | "in-cage" | "portal" => Some(DbusPolicy::InCagePortal),
+            other => {
+                warnings.push(format!(
+                    "{source_label}: ignoring unknown dbus posture `{other}` \
+                     (expected true/false or \"incage\")"
+                ));
+                None
+            }
+        },
     }
 }
 
@@ -6445,7 +6526,7 @@ mod tests {
         // Baseline GPU off, so the app turning it on is an observable *replace* (like `gui`).
         base.gpu = false;
         // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
-        base.dbus = false;
+        base.dbus = DbusPolicy::Off;
         let app = ResolvedApp {
             cmd: vec!["x".into()],
             home_scope: AppHomeScope::Global,
@@ -6455,7 +6536,7 @@ mod tests {
             network: Some(NetworkPolicy::Isolated),
             gui: None,
             gpu: Some(true),
-            dbus: Some(true),
+            dbus: Some(DbusPolicy::HostFiltered),
             limits: crate::sandbox::cgroup::Limits {
                 tasks_max: Some("4096".into()),
                 ..Default::default()
@@ -6492,7 +6573,10 @@ mod tests {
         assert!(matches!(base.network, NetworkPolicy::Isolated));
         // The app's GPU posture (`Some(true)`) replaces the baseline's `false`, like `network`/`gui`.
         assert!(base.gpu, "the app's gpu posture replaces the baseline's");
-        assert!(base.dbus, "the app's dbus posture replaces the baseline's");
+        assert!(
+            base.dbus.is_host_filtered(),
+            "the app's dbus posture replaces the baseline's"
+        );
         // The app's limit override replaces the baseline per field; unset fields inherit it.
         assert_eq!(
             base.limits.tasks_max.as_deref(),
@@ -8292,6 +8376,36 @@ mod tests {
         // and nothing was applied — the baseline posture stands (never a silent wider fallback).
         assert_eq!(resolved.network, NetworkPolicy::Shared);
         assert_eq!(resolved.network_origin, Provenance::Default);
+    }
+
+    #[test]
+    fn an_override_dbus_posture_validates_incage_and_rejects_a_typo() {
+        // `--dbus=incage` sets the in-cage portal for one launch (trusted by invocation).
+        let mut resolved = resolve_no_plugins(RawConfig::default(), None);
+        assert_eq!(resolved.dbus, DbusPolicy::Off);
+        resolved
+            .apply_override(Override::for_test(RawConfig {
+                dbus: Some(RawDbus::Mode("incage".into())),
+                ..RawConfig::default()
+            }))
+            .unwrap();
+        assert_eq!(resolved.dbus, DbusPolicy::InCagePortal);
+        assert_eq!(resolved.dbus_origin, Provenance::Override);
+
+        // A typo'd posture has no safe fallback for an override → a hard error, nothing applied.
+        let mut resolved = resolve_no_plugins(RawConfig::default(), None);
+        let errs = resolved
+            .apply_override(Override::for_test(RawConfig {
+                dbus: Some(RawDbus::Mode("incagee".into())),
+                ..RawConfig::default()
+            }))
+            .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("dbus")),
+            "the error should name the offending field: {errs:?}"
+        );
+        assert_eq!(resolved.dbus, DbusPolicy::Off);
+        assert_eq!(resolved.dbus_origin, Provenance::Default);
     }
 
     #[test]

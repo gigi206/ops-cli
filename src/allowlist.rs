@@ -228,13 +228,18 @@ impl Methods {
     /// is special: it is a distinct, unredactable bidirectional capability, not just another HTTP
     /// method, so an unrestricted allowance does NOT grant it — only a rule that names `WS` explicitly
     /// (`{WS}` or `{…,WS}`) admits it. Neither a bare/`Unspecified` rule nor `{*}` opens a WebSocket.
+    ///
+    /// A `*` **inside** an `Only` set (`{*,WS}`) means "every HTTP verb" alongside the named extras, so
+    /// `{*,WS}` reads as "all HTTP methods **and** WebSocket" in one rule — the ergonomic form of an
+    /// all-verbs host that also needs the WS capability. `*` never matches the `WS` pseudo-verb (that
+    /// still needs an explicit `WS`), so `{*}`-widening a host and `WS`-opting it stay separate choices.
     fn admits(&self, method: &str) -> bool {
         if method == "WS" {
             return matches!(self, Methods::Only(ms) if ms.iter().any(|m| m == "WS"));
         }
         match self {
             Methods::Unspecified | Methods::Any => true,
-            Methods::Only(ms) => ms.iter().any(|m| m == method),
+            Methods::Only(ms) => ms.iter().any(|m| m == method || m == "*"),
         }
     }
 
@@ -380,6 +385,16 @@ impl Rule {
     fn matches(&self, req: &Request, method: &str) -> bool {
         self.methods.admits(method) && self.kind.matches(req)
     }
+
+    /// Whether this rule silences a denied request's log line for `method` — the `mute` match. Like
+    /// [`Self::matches`] but **port- and transport-agnostic** (via [`RuleKind::matches_any_port`]):
+    /// `mute` is a `dontaudit` log filter, so naming a host suppresses its refusals on every port
+    /// and scheme (a bare-host mute covers the host's cleartext `:80` noise as well as `:443`), and
+    /// the rule's own layer is irrelevant. Method and path scope are still honored, so a
+    /// `{POST} host/log` mute stays precise.
+    fn matches_mute(&self, req: &Request, method: &str) -> bool {
+        self.methods.admits(method) && self.kind.matches_any_port(req)
+    }
 }
 
 impl RuleKind {
@@ -408,6 +423,30 @@ impl RuleKind {
                 path: pa,
                 subtree,
             } => &req.host == h && ports.admits(req.port) && path_matches(&req.segs, pa, *subtree),
+            RuleKind::Regex { re, .. } => re.is_match(&req.url),
+        }
+    }
+
+    /// Like [`Self::matches`] but **ignoring the port** — used only for `mute` (via
+    /// [`Rule::matches_mute`]), a pure log-noise filter keyed by host/path: a named host's refusals
+    /// are silenced on every port, so a bare-host mute (implicitly the 443 web port) also covers that
+    /// host's cleartext `:80` noise. The verdict path never uses this — there the port is
+    /// load-bearing (opening `:80` cleartext is a real posture, distinct from `:443`).
+    fn matches_any_port(&self, req: &Request) -> bool {
+        match self {
+            RuleKind::Ip(ip, _) => req
+                .host
+                .parse::<IpAddr>()
+                .map(|h| &h == ip)
+                .unwrap_or(false),
+            RuleKind::Host(h, _) => &req.host == h,
+            RuleKind::Subdomain(d, _) => &req.host == d || req.host.ends_with(&format!(".{d}")),
+            RuleKind::Url {
+                host: h,
+                path: pa,
+                subtree,
+                ..
+            } => &req.host == h && path_matches(&req.segs, pa, *subtree),
             RuleKind::Regex { re, .. } => re.is_match(&req.url),
         }
     }
@@ -727,12 +766,15 @@ impl EgressPolicy {
     /// Whether a **denied** request to `host:port` for `path`/`method` matches a mute rule — a
     /// LOG-ONLY filter (SELinux `dontaudit`): it never affects the verdict (only [`Self::explain`]
     /// does), only whether the refusal enters the default `ops net log` view. The proxy consults it
-    /// at logging time, after the verdict, and still counts a muted refusal in `ops net stats`. Only
-    /// [`Layer::L7`] (inspected) rules participate, matched exactly as [`Self::explain`] matches
-    /// (same canonicalized request, same method-set semantics), so a mute entry reads identically to
-    /// an allow/deny entry. A method-less request (an early-CONNECT block) is matched with an empty
-    /// method, so a method-scoped mute rule does not match it — failing toward *showing* the log, the
-    /// safe direction when the verb is unknown.
+    /// at logging time, after the verdict, and still counts a muted refusal in `ops net stats`.
+    /// Matching is deliberately **port- and transport-agnostic** ([`Rule::matches_mute`]): a mute
+    /// names a *host* to silence, so a bare-host mute suppresses that host's refusals on every port
+    /// and scheme — its cleartext `http://…:80` noise (a component updater, an NTP-over-HTTP probe)
+    /// as well as its `:443` traffic, and whether the rule was written bare, `https://`, `http://`,
+    /// or `tcp://`. Method and path scope are still honored, so a `{POST} host/log` mute stays
+    /// precise. A method-less request (an early-CONNECT block) is matched with an empty method, so a
+    /// method-scoped mute rule does not match it — failing toward *showing* the log, the safe
+    /// direction when the verb is unknown.
     pub(crate) fn muted(
         &self,
         host: &str,
@@ -745,9 +787,7 @@ impl EgressPolicy {
         }
         let req = Request::new(host, port, path.unwrap_or("/"));
         let method = method.unwrap_or("").to_ascii_uppercase();
-        self.mute
-            .iter()
-            .any(|r| r.layer == Layer::L7 && r.matches(&req, &method))
+        self.mute.iter().any(|r| r.matches_mute(&req, &method))
     }
 
     /// Whether a request to `host`:`port` for `path` is permitted: it must match some
@@ -1163,9 +1203,11 @@ fn split_method_prefix(s: &str) -> Result<(Methods, &str), String> {
 
 /// Parse the inside of a `{...}` method prefix into a [`Methods::Only`] set: a non-empty,
 /// comma-separated list of verbs, each non-empty uppercase ASCII letters (`GET`, `POST`,
-/// `PROPFIND`, …), sorted and de-duplicated so equal specs compare and display identically. An
-/// empty set (`{}`), an empty item (`{GET,}`), or a non-uppercase verb is rejected — fail-closed,
-/// never a rule that can match nothing or a typo that silently never fires.
+/// `PROPFIND`, …), or the wildcard `*` meaning "every HTTP verb" (so `{*,WS}` reads as "all HTTP
+/// methods and WebSocket"). Sorted and de-duplicated so equal specs compare and display
+/// identically. An empty set (`{}`), an empty item (`{GET,}`), or a non-uppercase/non-`*` verb is
+/// rejected — fail-closed, never a rule that can match nothing or a typo that silently never fires.
+/// (A lone `{*}` never reaches here — it is the [`Methods::Any`] escape, handled by the caller.)
 fn parse_methods(spec: &str) -> Result<Methods, String> {
     let mut verbs: Vec<String> = Vec::new();
     for part in spec.split(',') {
@@ -1175,9 +1217,9 @@ fn parse_methods(spec: &str) -> Result<Methods, String> {
                 "empty method in the `{...}` prefix (expected e.g. `{GET,POST}`)".to_string(),
             );
         }
-        if !v.bytes().all(|b| b.is_ascii_uppercase()) {
+        if v != "*" && !v.bytes().all(|b| b.is_ascii_uppercase()) {
             return Err(format!(
-                "method `{v}` must be uppercase ASCII letters (e.g. GET, POST, DELETE)"
+                "method `{v}` must be uppercase ASCII letters (e.g. GET, POST, DELETE) or `*`"
             ));
         }
         verbs.push(v.to_string());
@@ -1823,6 +1865,49 @@ mod tests {
             both.explain("example.com", 443, "/", "WS"),
             Decision::AllowedBy(_)
         ));
+    }
+
+    #[test]
+    fn a_star_ws_prefix_grants_every_http_verb_and_the_websocket() {
+        // `{*,WS}` is the ergonomic "all HTTP methods AND WebSocket" — a `*` inside the set means
+        // every verb, and the explicit `WS` adds the upgrade. It round-trips through classify/render.
+        let r = classify("{*,WS} example.com").unwrap();
+        assert_eq!(
+            r.to_string(),
+            "{*,WS} https://example.com",
+            "the `*,WS` set round-trips through classify/render"
+        );
+
+        let p = allow(&["{*,WS} example.com"]);
+        for verb in ["GET", "POST", "PUT", "DELETE", "PATCH", "PROPFIND"] {
+            assert!(
+                matches!(
+                    p.explain("example.com", 443, "/", verb),
+                    Decision::AllowedBy(_)
+                ),
+                "`{{*,WS}}` admits every HTTP verb, including {verb}"
+            );
+        }
+        assert!(
+            matches!(
+                p.explain("example.com", 443, "/", "WS"),
+                Decision::AllowedBy(_)
+            ),
+            "`{{*,WS}}` admits the WebSocket upgrade"
+        );
+
+        // The distinction stays sharp: a `*` alone (`{*}`) is all-HTTP but NOT WS; only the explicit
+        // `WS` token opens the upgrade — so `{*,WS}` and two rules `{*}` + `{WS}` are equivalent.
+        assert!(matches!(
+            allow(&["{*} example.com"]).explain("example.com", 443, "/", "WS"),
+            Decision::DeniedDefault
+        ));
+
+        // A bogus token beside `*` is still rejected (fail-closed).
+        assert!(
+            classify("{*,ws} example.com").is_err(),
+            "lowercase verb rejected"
+        );
     }
 
     #[test]
@@ -2622,6 +2707,49 @@ mod tests {
         // A method-less request (an early-CONNECT block) does not match a method-scoped mute — the
         // safe direction (show the log) when the verb is unknown.
         assert!(!policy.muted("play.googleapis.com", 443, None, None));
+    }
+
+    #[test]
+    fn mute_covers_cleartext_port_80_and_is_transport_agnostic() {
+        // A bare-host mute is a pure log-noise filter: it silences the host's refusals on EVERY port
+        // and scheme, so a component-updater's cleartext `http://host:80` noise is muted by the same
+        // `host` entry that mutes its `:443` traffic — the port is not load-bearing for `mute`.
+        let policy =
+            EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("update.googleapis.com")]);
+        // :443 (TLS) — muted, as before.
+        let p = Some("/service/update2/json");
+        assert!(policy.muted("update.googleapis.com", 443, p, Some("POST")));
+        // :80 (cleartext HTTP) — now ALSO muted (the gap this fix closes).
+        assert!(policy.muted("update.googleapis.com", 80, p, Some("POST")));
+        // An arbitrary other port too — `mute` names a host, not a port.
+        assert!(policy.muted("update.googleapis.com", 8080, Some("/x"), Some("GET")));
+        // A different host is still not muted.
+        assert!(!policy.muted("api.example.com", 80, Some("/x"), Some("GET")));
+
+        // Transport-agnostic on the RULE side too: an `http://` mute (an `L7Clear` rule, previously
+        // ignored by `muted`) now silences the host on both schemes.
+        let clear =
+            EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("http://clients2.google.com")]);
+        assert!(clear.muted(
+            "clients2.google.com",
+            80,
+            Some("/time/1/current"),
+            Some("GET")
+        ));
+        assert!(clear.muted("clients2.google.com", 443, Some("/x"), Some("GET")));
+
+        // Path/method scope stays precise even though the port is ignored.
+        let scoped =
+            EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("{POST} host.example/log")]);
+        assert!(scoped.muted("host.example", 80, Some("/log"), Some("POST")));
+        assert!(!scoped.muted("host.example", 80, Some("/log"), Some("GET")));
+        assert!(!scoped.muted("host.example", 80, Some("/other"), Some("POST")));
+
+        // And `mute` still changes NO verdict — a muted cleartext host is still denied.
+        assert_eq!(
+            policy.explain_clear("update.googleapis.com", 80, "/service/update2/json", "POST"),
+            Decision::DeniedDefault
+        );
     }
 
     #[test]

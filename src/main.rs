@@ -1302,12 +1302,22 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             provenance_tag(view.gpu_origin, pal)
         );
     }
-    if view.dbus {
-        let _ = writeln!(
-            o,
-            "  {h}dbus:{r} filtered {dim}(theme + notifications){r}{}",
-            provenance_tag(view.dbus_origin, pal)
-        );
+    match view.dbus {
+        config::view::DbusView::Off => {}
+        config::view::DbusView::HostFiltered => {
+            let _ = writeln!(
+                o,
+                "  {h}dbus:{r} filtered {dim}(theme + notifications){r}{}",
+                provenance_tag(view.dbus_origin, pal)
+            );
+        }
+        config::view::DbusView::InCagePortal => {
+            let _ = writeln!(
+                o,
+                "  {h}dbus:{r} in-cage portal {dim}(file chooser + theme){r}{}",
+                provenance_tag(view.dbus_origin, pal)
+            );
+        }
     }
 
     // Inbound loopback forward ports — shown only when a layer declared any, so a default-profile
@@ -1558,15 +1568,21 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
                 None => {}
             }
-            // The filtered-D-Bus posture the overlay sets; `None` inherits.
+            // The D-Bus posture the overlay sets; `None` inherits.
             match app.dbus {
-                Some(true) => {
+                Some(config::view::DbusView::HostFiltered) => {
                     let _ = writeln!(
                         o,
                         "      {dim}dbus:{r} filtered {dim}(theme + notifications){r}"
                     );
                 }
-                Some(false) => {
+                Some(config::view::DbusView::InCagePortal) => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme){r}"
+                    );
+                }
+                Some(config::view::DbusView::Off) => {
                     let _ = writeln!(o, "      {dim}dbus:{r} disabled");
                 }
                 None => {}
@@ -1773,13 +1789,14 @@ fn render_app_detail(
         if view.gpu { "enabled" } else { "disabled" }
     );
 
-    // The effective filtered-D-Bus posture — shown either way, so the inherited story is visible.
+    // The effective D-Bus posture — shown either way, so the inherited story is visible.
     let dbus_tag = app_provenance_tag(view.dbus_origin, pal);
-    let _ = writeln!(
-        o,
-        "  {h}dbus:{r}    {}{dbus_tag}",
-        if view.dbus { "filtered" } else { "disabled" }
-    );
+    let dbus_label = match view.dbus {
+        config::view::DbusView::Off => "disabled",
+        config::view::DbusView::HostFiltered => "filtered",
+        config::view::DbusView::InCagePortal => "in-cage portal",
+    };
+    let _ = writeln!(o, "  {h}dbus:{r}    {dbus_label}{dbus_tag}");
 
     // The effective cgroup limits — every field its provenance (inherited from the baseline, or the
     // app layer that tuned it).
@@ -5169,6 +5186,9 @@ fn render_log_line(
         .as_deref()
         .map(|p| display_log_path(p, view.with_query))
         .unwrap_or("");
+    // The transport the request used (`https`/`http`/`tcp`, or `-` when refused before it was
+    // known) — shown because the port alone does not name it (a `tcp://` splice can ride 443).
+    let proto = e.proto.as_str();
     let vc = verdict_color(e.verdict, pal);
     let reason = if e.verdict == sandbox::control::LogVerdict::Allow {
         String::new()
@@ -5202,7 +5222,7 @@ fn render_log_line(
         String::new()
     };
     format!(
-        "    {dim}{pid}{r}  {dim}{time}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{ws}{muted}{status}",
+        "    {dim}{pid}{r}  {dim}{time}{r}  {dim}{proto}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{ws}{muted}{status}",
         e.verdict.as_str()
     )
 }
@@ -5228,6 +5248,7 @@ fn log_event_json(
         "method": e.method,
         "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
         "verdict": e.verdict.as_str(),
+        "proto": e.proto.as_str(),
         "reason": e.reason,
         "muted": e.muted,
     });
@@ -8670,6 +8691,7 @@ mod tests {
             path: path.map(str::to_string),
             verdict,
             reason: reason.into(),
+            proto: sandbox::control::Proto::Https,
             muted: false,
             status: None,
             amend_seq: None,
@@ -8834,6 +8856,58 @@ mod tests {
             j_raw["status"],
             serde_json::Value::Null,
             "null when none captured"
+        );
+    }
+
+    #[test]
+    fn the_proto_column_names_the_transport_in_render_and_json() {
+        use sandbox::control::LogVerdict::*;
+        use sandbox::control::Proto;
+        let p = style::Palette::plain();
+        let view = LogView::default();
+
+        // Each transport surfaces its own token in the human line AND the JSON `proto` field — the
+        // port alone would not tell them apart (a `tcp://` splice can ride 443).
+        let mut https = log_event(
+            1,
+            "claude.ai",
+            Some("WS"),
+            Some("/sub"),
+            Deny,
+            "denied-method",
+        );
+        https.proto = Proto::Https;
+        let mut http = log_event(
+            2,
+            "clients2.google.com",
+            Some("GET"),
+            Some("/t"),
+            Deny,
+            "denied-default",
+        );
+        http.proto = Proto::Http;
+        let mut tcp = log_event(3, "db.internal", None, None, Allow, "allowed");
+        tcp.proto = Proto::Tcp;
+
+        for (ev, tok) in [(&https, "https"), (&http, "http"), (&tcp, "tcp")] {
+            let line = render_log_line(ev, 42, &view, &p);
+            assert!(
+                line.contains(tok),
+                "the {tok} transport shows in the line: {line}"
+            );
+            assert_eq!(
+                log_event_json(ev, 7, None, None, &view)["proto"],
+                serde_json::json!(tok),
+                "the JSON proto field names the {tok} transport"
+            );
+        }
+
+        // A request refused before its transport was known renders and serializes as `-`.
+        let mut other = log_event(4, "", None, None, Blocked, "bad-request");
+        other.proto = Proto::Other;
+        assert_eq!(
+            log_event_json(&other, 7, None, None, &view)["proto"],
+            serde_json::json!("-")
         );
     }
 
@@ -9691,7 +9765,7 @@ mod tests {
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
-            dbus: false,
+            dbus: config::DbusPolicy::Off,
             gpu_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
@@ -10194,7 +10268,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -10380,7 +10454,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Inherited,
             dbus_origin: ProvenanceView::Inherited,
             forward: vec![],
@@ -10650,7 +10724,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -10740,7 +10814,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -10863,7 +10937,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -10929,7 +11003,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -11030,7 +11104,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -11131,7 +11205,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
-            dbus: false,
+            dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],

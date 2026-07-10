@@ -42,7 +42,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
 /// the engine, ops's store layout, the current directory, the resolved
@@ -575,7 +575,8 @@ fn launch_foreground_learning(
     let _record = interactive.then(|| record.map(RecordGuard::new));
 
     let code = if interactive {
-        match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
+        let gui = matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland);
+        match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
             Ok(c) => ExitCode::from(c as u8),
             Err(e) => {
                 eprintln!("ops: sandbox session failed: {e}");
@@ -1335,6 +1336,22 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         }
     }
 
+    // GSettings schema root under `gui = "wayland"`, same reason: gc keeps the compiled output.
+    if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        if let Ok(layer) = super::gschemas::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            gui_roots.push(layer.root);
+        }
+    }
+
+    // In-cage portal roots under `gui = "wayland"` + `dbus = "incage"`: gc keeps the portal closure.
+    if prep.cfg.dbus.is_in_cage_portal()
+        && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+    {
+        if let Ok(p) = super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            gui_roots.extend(p.roots);
+        }
+    }
+
     seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots).map_err(|e| {
         eprintln!("ops gc: cannot prepare the project's store: {e}");
         ExitCode::FAILURE
@@ -1418,7 +1435,8 @@ fn launch_pty_supervised(
         eprintln!("{}", render_gui_stop_hint(&name, std::process::id(), &epal));
     }
 
-    match supervise(&prep.bwrap, &spec, &prep.cfg.limits) {
+    let gui = matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland);
+    match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("ops: sandbox session failed: {e}");
@@ -1466,13 +1484,15 @@ fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) -> String {
 }
 
 /// The line a foreground graphical launch prints (stderr) so the user knows how to stop it: its UI
-/// is the window, and Ctrl+C — though forwarded — may be ignored by a GUI app, so the `ops stop`
-/// escape hatch is named with the session's real pid. The app name is the identifier (cyan); the
-/// rest is plain, matching the restraint of the attach announcements.
+/// is the window, and a single Ctrl+C — though forwarded — is ignored by a GUI app (and a tray-backed
+/// window may not quit on close), so the escape hatches are named: a double Ctrl+C force-quits the
+/// session, and `ops stop <pid>` works from any other terminal. The app name is the identifier
+/// (cyan); the rest is plain, matching the restraint of the attach announcements.
 fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> String {
     let (n, r) = (pal.name, pal.reset);
     format!(
-        "ops: {n}{name}{r} is graphical — close its window to quit; use `ops stop {pid}` to force-stop."
+        "ops: {n}{name}{r} is graphical — press Ctrl+C twice here to quit (closing its window may only \
+         hide it — a tray app keeps running); `ops stop {pid}` also stops it."
     )
 }
 
@@ -1997,6 +2017,59 @@ fn build(
     };
     let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
 
+    // Under `gui = "wayland"`, provision the GSettings schema set host-side. A GTK dialog (the
+    // file chooser Electron falls back to without a desktop portal) aborts FATAL without it (`No
+    // GSettings schemas are installed`). Provisioned here — before the seed — so its store root
+    // joins the project store. Best-effort like the fonts: a fetch that fails warns and the app
+    // runs (a GTK dialog will still crash, but the rest of the UI is unaffected).
+    let schema_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        match super::gschemas::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(layer) => Some(layer),
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "`gui = \"wayland\"` but the GSettings schemas could not be provisioned \
+                     ({e}) — a GTK dialog (file chooser) may crash"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // In-cage desktop portal: under `gui = "wayland"` AND `dbus = "incage"`, provision the portal
+    // stack (dbus + xdg-desktop-portal + the GTK backend) host-side — before the seed, so its roots
+    // join the project store — and read the host theme, best-effort, to seed the cage's light/dark
+    // scheme at launch. The wrap that starts the private bus is applied after every other command
+    // wrap (below), so the bus is up before the app. Best-effort: a provisioning failure warns and
+    // the app runs without an in-cage portal (its file chooser then falls back to its own dialog).
+    // Requires the Wayland display (the GTK backend renders through the compositor), so it is gated
+    // on both. Unlike the filtered host bus, the private bus touches no host socket, so the network
+    // posture does not gate it.
+    let portal = if prep.cfg.dbus.is_in_cage_portal()
+        && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+    {
+        match super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "`dbus = \"incage\"` but the in-cage portal could not be provisioned ({e}) — \
+                     running without an in-cage file chooser"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The host light/dark preference, read host-side (best-effort) to seed the cage theme.
+    let portal_scheme = portal.as_ref().and_then(|p| {
+        super::portal::read_host_color_scheme(&crate::store::physical_path(
+            &prep.layout,
+            &p.dbus_send,
+        ))
+    });
+
     // CA trust for a Chromium/Electron GUI app under a filtering posture: Chromium ignores the
     // CA-file env vars ops sets and reads its own NSS db, so under the egress MITM it rejects
     // ops's per-session CA and a graphical app's UI cannot load. When the cage is BOTH `gui =
@@ -2050,6 +2123,12 @@ fn build(
     }
     if let Some(layer) = &gpu_layer {
         gui_roots.push(layer.root.clone());
+    }
+    if let Some(layer) = &schema_layer {
+        gui_roots.push(layer.root.clone());
+    }
+    if let Some(p) = &portal {
+        gui_roots.extend(p.roots.iter().cloned());
     }
 
     // Seed the project's own writable store with the closure of everything the cage
@@ -2320,6 +2399,23 @@ fn build(
                 )),
             }
         }
+
+        // GSettings schemas: point the cage's glib at the provisioned, seeded schemas so a GTK
+        // dialog (the portal-less file chooser) finds `org.gtk.Settings.FileChooser` instead of
+        // aborting. `XDG_DATA_DIRS` is a data path, not a code-load path (unlike the mesa driver
+        // vars), so it needs no untrusted-`[env]` denylist entry — a project that re-points it only
+        // sabotages its own cage's schema lookup.
+        if let Some(layer) = &schema_layer {
+            gui_env.extend(layer.env.iter().cloned());
+        }
+
+        // In-cage portal: point the app's D-Bus/portal client at the private bus and the GTK
+        // backend (the bus itself is started by the outermost command wrap, below). The `XDG_*`
+        // keys are data paths, not code-load paths, so — like `WAYLAND_DISPLAY` — a project `[env]`
+        // that re-points them only self-DoSes its own cage's portal lookup and needs no denylist.
+        if let Some(p) = &portal {
+            gui_env.extend(super::portal::env(&p.gtk_root));
+        }
     }
 
     // GPU: when `gpu = true`, point the cage's libgbm/libEGL at mesa's own drivers (provisioned and
@@ -2357,7 +2453,7 @@ fn build(
     // nonexistent bus (self-DoS), never redirect the bind or reach the raw bus — so, like
     // `WAYLAND_DISPLAY`, the key needs no denylist entry.
     let mut dbus_guard = None;
-    if prep.cfg.dbus {
+    if prep.cfg.dbus.is_host_filtered() {
         if !dbus_filter_enforceable(&prep.cfg.network) {
             // Under `network = "shared"` the cage shares the host netns, where the host session bus is
             // reachable *directly*: abstract-namespace Unix sockets (`unix:abstract=…`, which legacy
@@ -2391,6 +2487,22 @@ fn build(
                 )),
             }
         }
+    }
+
+    // In-cage portal: wrap the command so the private session bus is stood up before the app runs.
+    // This is the **outermost** wrap — applied after every other command wrap (mise/flake/forward/
+    // egress/catrust) — so its preamble (`dbus-daemon --fork`, which blocks until the socket is
+    // ready) runs first, then execs the rest of the wrapped command. Only present under
+    // `gui = "wayland"` + `dbus = "incage"` with a successful provision.
+    if let Some(p) = &portal {
+        cmd = super::portal::wrap_command(
+            &prep.userland.shell_bin,
+            &p.dbus_daemon,
+            &p.xdp_root,
+            &p.gtk_root,
+            portal_scheme.as_deref(),
+            cmd,
+        );
     }
 
     // The launcher's extra binds, emitted after the structural mounts: the egress machinery
@@ -2929,7 +3041,12 @@ fn exec(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io:
 /// a pty, launches bwrap with the *slave* as its controlling terminal (via
 /// `login_tty`), keeps the *master* itself, puts the real terminal in raw mode,
 /// and relays bytes both ways until the session ends.
-fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io::Result<i32> {
+fn supervise(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+    limits: &super::cgroup::Limits,
+    gui: bool,
+) -> io::Result<i32> {
     // The seccomp filters are loaded into anonymous files *before* the fork so the
     // child inherits their descriptors; the parent holds `seccomp` alive through
     // `pump` so the descriptors stay open until bwrap has read them.
@@ -3023,7 +3140,7 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -
         copy_winsize(0, master);
     }
     let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
-    let status = pump(master, child, winch_fd);
+    let status = pump(master, child, winch_fd, gui);
     drop(winch);
     unsafe { libc::close(master) };
     status
@@ -3033,7 +3150,43 @@ fn supervise(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -
 /// ends, then reap the child and return its exit status code. `winch_fd` is the read
 /// end of the resize relay's self-pipe (or `-1` when it could not be installed — `poll`
 /// ignores a negative fd), readable when a `SIGWINCH` has arrived.
-fn pump(master: libc::c_int, child: libc::pid_t, winch_fd: libc::c_int) -> io::Result<i32> {
+/// A second Ctrl+C within this window force-quits a graphical session (see the stdin relay below).
+const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(2);
+
+/// What a chunk of graphical-session stdin means for the double-Ctrl+C escape hatch.
+#[derive(Debug, PartialEq, Eq)]
+enum CtrlC {
+    /// No Ctrl+C in the chunk — forward it unchanged.
+    None,
+    /// The first Ctrl+C (or one after the window lapsed) — forward it, and arm the window.
+    Arm,
+    /// A second Ctrl+C within the window (across reads, or two buffered in one read) — force-quit.
+    Escalate,
+}
+
+/// Decide, purely, what a stdin `chunk` means for the double-Ctrl+C force-quit: escalate when a
+/// Ctrl+C (`0x03`) follows a prior one still inside [`DOUBLE_CTRL_C_WINDOW`] (`last` → `now`), or when
+/// two arrive buffered in the same chunk; arm on the first; otherwise nothing. Kept side-effect-free
+/// so the timing/threshold logic is unit-testable without a live pty.
+fn classify_ctrl_c(chunk: &[u8], last: Option<Instant>, now: Instant) -> CtrlC {
+    let count = chunk.iter().filter(|&&b| b == 0x03).count();
+    if count == 0 {
+        return CtrlC::None;
+    }
+    let armed = last.is_some_and(|t| now.duration_since(t) < DOUBLE_CTRL_C_WINDOW);
+    if armed || count >= 2 {
+        CtrlC::Escalate
+    } else {
+        CtrlC::Arm
+    }
+}
+
+fn pump(
+    master: libc::c_int,
+    child: libc::pid_t,
+    winch_fd: libc::c_int,
+    gui: bool,
+) -> io::Result<i32> {
     let mut fds = [
         libc::pollfd {
             fd: 0,
@@ -3053,6 +3206,9 @@ fn pump(master: libc::c_int, child: libc::pid_t, winch_fd: libc::c_int) -> io::R
     ];
     let mut buf = [0u8; 8192];
     let mut stdin_open = true;
+    // For a GUI cage: the instant of the last unescalated Ctrl+C, so a second within the window
+    // force-quits (a graphical app ignores the forwarded SIGINT). `None` outside a GUI cage.
+    let mut last_ctrl_c: Option<Instant> = None;
 
     loop {
         let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
@@ -3093,8 +3249,31 @@ fn pump(master: libc::c_int, child: libc::pid_t, winch_fd: libc::c_int) -> io::R
         if stdin_open && fds[0].revents != 0 {
             let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
+                let chunk = &buf[..n as usize];
+                // A graphical app ignores the forwarded SIGINT, so a single Ctrl+C does nothing and
+                // closing a tray-backed window may not terminate it. Offer a deterministic escape
+                // hatch on a GUI cage only: a second Ctrl+C within the window force-quits the cage.
+                // The first is still forwarded, so a non-GUI shell's own SIGINT stays untouched (the
+                // relay never intercepts Ctrl+C there — `gui` is false).
+                if gui {
+                    let now = Instant::now();
+                    match classify_ctrl_c(chunk, last_ctrl_c, now) {
+                        CtrlC::Escalate => {
+                            let _ = write_all(2, b"\r\nops: force-quitting the session.\r\n");
+                            return terminate_and_reap(child);
+                        }
+                        CtrlC::Arm => {
+                            last_ctrl_c = Some(now);
+                            let _ = write_all(
+                                2,
+                                b"\r\nops: press Ctrl+C again to force-quit this graphical session.\r\n",
+                            );
+                        }
+                        CtrlC::None => {}
+                    }
+                }
                 // best-effort: if the child is gone, the master read above ends us
-                let _ = write_all(master, &buf[..n as usize]);
+                let _ = write_all(master, chunk);
             } else if n == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 stdin_open = false;
                 fds[0].fd = -1; // poll ignores a negative fd
@@ -3110,14 +3289,48 @@ fn pump(master: libc::c_int, child: libc::pid_t, winch_fd: libc::c_int) -> io::R
         }
         break;
     }
-    let code = if libc::WIFEXITED(status) {
+    Ok(exit_code(status))
+}
+
+/// Translate a `waitpid` status into the process exit-code convention (`128 + signal` for a
+/// signalled child), shared by the pty relay's normal reap and its force-quit path.
+fn exit_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
         128 + libc::WTERMSIG(status)
     } else {
         1
-    };
-    Ok(code)
+    }
+}
+
+/// Force-terminate a supervised cage and reap it, returning its exit-status code — `SIGTERM`, a
+/// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `ops stop` uses. Invoked
+/// from the pty relay when a graphical session is force-quit with a double Ctrl+C.
+fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
+    unsafe { libc::kill(child, libc::SIGTERM) };
+    // Poll for a graceful exit for up to ~2s before the hard kill.
+    for _ in 0..40 {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if r == child {
+            return Ok(exit_code(status));
+        }
+        if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Ok(1); // already reaped / gone
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe { libc::kill(child, libc::SIGKILL) };
+    let mut status: libc::c_int = 0;
+    loop {
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    Ok(exit_code(status))
 }
 
 /// Write the whole buffer, retrying short writes and interrupts.
@@ -3426,7 +3639,8 @@ mod tests {
         );
         assert_eq!(
             render_gui_stop_hint("opencode-desktop", 4242, &p),
-            "ops: opencode-desktop is graphical — close its window to quit; use `ops stop 4242` to force-stop."
+            "ops: opencode-desktop is graphical — press Ctrl+C twice here to quit (closing its window may only \
+             hide it — a tray app keeps running); `ops stop 4242` also stops it."
         );
         assert_eq!(
             render_stop_outcome(4242, "run", &session::StopOutcome::Terminated, grace, &p),
@@ -3512,6 +3726,33 @@ mod tests {
         assert!(render_no_active_sessions(&p).contains(p.dim));
     }
 
+    #[test]
+    fn double_ctrl_c_escalates_only_within_the_window() {
+        let now = Instant::now();
+        // Ordinary keystrokes carry no Ctrl+C.
+        assert_eq!(classify_ctrl_c(b"ls -la\r", None, now), CtrlC::None);
+        // The first Ctrl+C arms the window but does not force-quit.
+        assert_eq!(classify_ctrl_c(b"\x03", None, now), CtrlC::Arm);
+        // A second Ctrl+C while the window is still open escalates.
+        let recent = now - Duration::from_millis(500);
+        assert_eq!(classify_ctrl_c(b"\x03", Some(recent), now), CtrlC::Escalate);
+        // A second after the window lapsed only re-arms (no force-quit on a stale first press).
+        let stale = now - (DOUBLE_CTRL_C_WINDOW + Duration::from_millis(1));
+        assert_eq!(classify_ctrl_c(b"\x03", Some(stale), now), CtrlC::Arm);
+        // Two Ctrl+C buffered in a single read (a fast double-tap) escalate immediately.
+        assert_eq!(classify_ctrl_c(b"\x03\x03", None, now), CtrlC::Escalate);
+        // An armed window plus a chunk with no Ctrl+C is still nothing (a real keystroke can pass).
+        assert_eq!(classify_ctrl_c(b"y\r", Some(recent), now), CtrlC::None);
+    }
+
+    #[test]
+    fn exit_code_maps_clean_and_signalled_children() {
+        // waitpid encodes a clean exit in the high byte; code 7 -> 7.
+        assert_eq!(exit_code(7 << 8), 7);
+        // A signalled child is 128 + signo — the SIGKILL the force-quit escalates to.
+        assert_eq!(exit_code(libc::SIGKILL), 128 + libc::SIGKILL);
+    }
+
     /// A minimal resolved config carrying only the channel choices the builder reads.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
         crate::config::Resolved {
@@ -3529,7 +3770,7 @@ mod tests {
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
-            dbus: false,
+            dbus: crate::config::DbusPolicy::Off,
             gpu_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],

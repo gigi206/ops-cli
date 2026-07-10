@@ -12,7 +12,10 @@
 //!   (`Read`/`ReadAll` plus the `SettingChanged` broadcast) — so the app can read and live-follow the
 //!   `appearance` color-scheme (light/dark) — plus the standard read-only `Properties.Get`/`GetAll`
 //!   a portal client (Chromium/Electron) probes to read an interface's `version` before using it. The
-//!   file chooser, screenshot, and screencast interfaces of the same service stay refused;
+//!   file chooser, screenshot, and screencast interfaces of the same service stay refused — the file
+//!   chooser in particular because its host-rendered dialog is a full host-privileged file manager
+//!   (browse/create/delete anywhere), which the caged app must not be able to summon (a GUI app that
+//!   needs a folder renders its picker inside the cage, under `dbus = false`, seeing only the cage FS);
 //! - `org.freedesktop.Notifications`, so the app can raise desktop notifications.
 //!
 //! Everything else — the keyring/secrets service, every other portal, and every other client on the
@@ -252,6 +255,15 @@ fn filter_args() -> Vec<String> {
         // object-path scope keeps them to the portal, and no property on it is sensitive.
         format!("--call={PORTAL}=org.freedesktop.DBus.Properties.Get{PATH}"),
         format!("--call={PORTAL}=org.freedesktop.DBus.Properties.GetAll{PATH}"),
+        // The file-chooser interface is deliberately NOT allowed. Its dialog is rendered host-side by
+        // the portal backend with the user's full privileges — a complete host file manager that can
+        // browse, create, rename and delete anywhere on the host FS. Even though the caged app gains
+        // no *direct* file access from it (the returned path is only reachable if it is a `binds`
+        // mount — the cage has no document-portal fuse), letting the caged app *summon* a
+        // host-privileged file manager is a real reduction of isolation (host-FS visibility + user-
+        // driven host-FS writes), so it stays refused. A GUI app that needs a folder should render
+        // its picker INSIDE the cage (a GTK dialog under `dbus = false`), which sees only the cage's
+        // own filesystem (its home + `[binds]` mounts).
         // Desktop notifications.
         "--talk=org.freedesktop.Notifications".to_string(),
     ]
@@ -332,7 +344,8 @@ mod tests {
         assert!(args
             .iter()
             .any(|a| a == "--talk=org.freedesktop.Notifications"));
-        // NOT the keyring, and NOT the other (dangerous) portal interfaces
+        // NOT the keyring, and NOT the other (dangerous) portal interfaces — the file chooser in
+        // particular, whose host-rendered dialog is a full host-privileged file manager.
         let joined = args.join(" ");
         assert!(
             !joined.contains("secrets"),
@@ -340,7 +353,7 @@ mod tests {
         );
         assert!(
             !joined.contains("FileChooser"),
-            "the file chooser must stay refused"
+            "the file chooser must stay refused (a host-privileged file manager)"
         );
         assert!(
             !joined.contains("Screenshot"),

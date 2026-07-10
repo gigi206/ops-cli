@@ -96,6 +96,105 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **catrust CA-purge — the NSS db no longer accumulates per-session CAs (DONE 2026-07-10)**
+  (`src/sandbox/catrust.rs` + `tests/run.rs`): a real bug surfaced live while validating the in-cage
+  portal — `ops app claude-desktop` failed every HTTPS with `ERR_CERT_AUTHORITY_INVALID`, and a full
+  variable-by-variable isolation (fresh home vs the user's polluted home; chromium-150 vs the app's
+  Electron-148; `ops run` vs `ops app`; all three `dbus` postures) proved it was **orthogonal to the
+  portal** and preexisting. Root cause: the egress MITM CA has a **fixed subject DN** (`CN=ops egress
+  proxy CA`, `proxy.rs`) but a fresh key each session, and catrust added one per launch under a
+  **content-keyed nickname with NO delete** — the earlier design deemed the accumulation "harmless"
+  (it is not). After N launches (the user's app home had **30**), N same-subject CAs collide on the
+  NSS issuer lookup and Chromium picks a stale one whose key does not match the current cert →
+  `ERR_CERT_AUTHORITY_INVALID`. **Fix:** `catrust::wrap` now **purges every `ops-mitm*` entry**
+  (`certutil -L | grep -oE 'ops-mitm[0-9a-f-]*'` → `-D -n` each) **before re-adding the current CA
+  under a fixed nickname** `ops-mitm`, so the persistent home's db holds exactly one. This is a
+  delete-then-add, consciously **superseding** the content-keyed-nickname scheme (the accumulation
+  bug beats the race it dodged). **Residual (documented honestly, not "harmless"):** a concurrent
+  SECOND launch of the same app can delete the still-running first instance's CA from the shared db;
+  that instance keeps failing HTTPS until its next restart — rare, since these are single-instance
+  GUI apps. **Payoff: the first launch self-purges, so nobody needs a manual reset** — every GUI app
+  under the allowlist (opencode-desktop too) is fixed automatically. **Live-proven on the shipped
+  shell:** the user's real 30-CA broken db → one `ops app claude-desktop --dbus=incage` launch →
+  **db purged to 1 CA, `net_error -202` gone, the app connects** (assets + login page load). **Tests:**
+  the catrust unit test now pins the purge loop + fixed nickname (was pinning the keyed nickname +
+  asserting NO `-D`), and a new run.rs e2e `catrust_purges_stale_cas_so_the_nss_db_never_accumulates`
+  (**ran live 58.6s**) does **two sequential `ops app` launches** sharing the persistent home and
+  asserts the `ops-mitm` count stays **1, not 2** (2 is exactly the pre-fix accumulation) — teeth on
+  the actual property, not a string shape. The false "harmless" claim in the deb: entry below is
+  corrected in place. 993 unit + run e2e green, fmt/clippy clean, std-only. See [[dbus-hole]],
+  [[electron-gui-profiles]].
+  **`dbus = "incage"` — a private in-cage desktop portal (picker + theme-at-launch), increment A
+  (DONE 2026-07-10)** (`src/sandbox/portal.rs` [new] + `mod.rs` + `config/{schema,mod,view,
+  overrides}.rs` + `src/main.rs` + `sandbox/launch.rs` + `docs/guide/configuration/dbus.md` +
+  `tests/{config,run}.rs`; design + spike `docs/bwrap-incage-portal-plan.md`): a **third `dbus`
+  posture** solving why a Chromium/Electron app's **file chooser fails** under `dbus = true`. Root
+  cause (traced to the Chromium 148/Electron 42.5.1 sources shipped in claude-desktop 1.18286.2):
+  `SelectFileDialogLinuxPortal` probes `Properties.Get(FileChooser, version)` on a **process-wide
+  singleton** (`dbus_xdg::PortalRegistrar`), our filter **allows** that read (the theme needs it —
+  `xdg-dbus-proxy` filters by destination/interface/method, **never by argument**, so the theme's
+  version read and the FileChooser version read are the *same* message), so Chromium sees the host
+  portal's real version (≥3), commits to the portal path, and `OpenFile` is refused by the filter →
+  `CancelOpen` (the GTK fallback fires only at version <3; the M145 refactor removed the
+  `--xdg-portal-required-version` escape hatch, electron#50057). **`dbus = "incage"` gives the cage
+  its OWN portal:** a **private** `dbus-daemon` runs *inside* the cage carrying ops-provisioned
+  `xdg-desktop-portal` + the **reference GTK backend** (`xdg-desktop-portal-gtk`), so the app probes
+  *that* portal (real version 4, live-proven) and the file chooser it opens is **rendered in-cage**
+  by the GTK backend — a dialog that by construction lists only the cage FS (the backend runs in the
+  cage's mount ns; live `ls /` = `bin dev etc home lib64 nix opt proc run tmp usr`). **NOT GNOME-tied:**
+  `xdg-desktop-portal-gtk` is the freedesktop *reference* backend (the universal fallback for
+  sway/XFCE/MATE), depending only on the GTK lib the Electron app already carries; the host desktop
+  never participates (works under GNOME/KDE/wlroots alike). **Config: `dbus` grew from `Option<bool>`
+  to 3 postures** (`DbusPolicy{Off,HostFiltered,InCagePortal}` mirroring `GuiPolicy`; a `RawDbus`
+  untagged `bool | string` keeps `dbus = true/false` and adds `"incage"`; `validate_dbus`
+  fail-closes an unknown string to the default with a warning, like `validate_gui`); threaded through
+  every site (schema/resolve global+project gating/merge_app/apply_override/resolve_app/view/`--dbus
+  =incage` override, an unknown override value fatal→exit 2 like `gui`). **launch (`portal.rs` +
+  `build`):** under `gui = "wayland"` **AND** `dbus = "incage"` — provision the 3 packages (gcroot
+  `gui/<rev>`, seeded, `equip_for_gc` too), read the host theme **host-side** best-effort (the
+  provisioned `dbus-send` run against the real bus → `org.freedesktop.appearance color-scheme`), and
+  wrap the command **outermost** (after catrust) so a `bash -c` preamble writes the generated
+  `session.conf` + `portals.conf` (`default=gtk` — the load-bearing key, NOT `XDG_CURRENT_DESKTOP`),
+  seeds the GLib keyfile from the host scheme (and, under a dark host, exports `GTK_THEME=Adwaita:dark`
+  so the portal's GTK3 file-dialog backend — which does not follow the `color-scheme` gsetting for its
+  own theme — renders the picker dark to match the app, not light against a dark app), and starts
+  `dbus-daemon --config-file … --fork` (which
+  **blocks until the socket is ready** — no race, no sleep). Env: `DBUS_SESSION_BUS_ADDRESS` at the
+  cage-tmpfs socket, `GSETTINGS_BACKEND=keyfile` (no dconf), `XDG_DESKTOP_PORTAL_DIR` (the GTK
+  backend's `gtk.portal`), `XDG_CONFIG_DIRS` (the generated `portals.conf`) — all data paths, no
+  denylist entry (self-DoS only, like `WAYLAND_DISPLAY`). **Needs `gui = "wayland"`** (the GTK backend
+  renders through the compositor) and — unlike the host-filtered bus — is **network-independent** (the
+  private bus touches no host socket; works even under `network = "shared"`). Best-effort throughout
+  (provision fail → no portal; theme read fail → default theme; never a wider fallback). **The command
+  wrap `super::egress::wrap_background` is reused** (positional `"$@"`, zero shell injection; the
+  config heredocs use a quoted delimiter so the already-substituted ops-controlled content is verbatim).
+  **Live-proven end-to-end through the REAL ops cage** (before any code, a throwaway spike proved
+  dbus-daemon + D-Bus activation + FileChooser version 4 + the theme seed + a real `OpenFile` rendering
+  an in-cage dialog + clean PID-ns teardown; and after wiring, `ops run` under a trusted
+  `gui="wayland"` + `dbus="incage"` + `network="none"` project: `FileChooser version = (<uint32 4>,)`
+  and `Settings.Read appearance color-scheme = (<<uint32 1>>,)` [prefer-dark, seeded] on the private
+  bus, keyring `ServiceUnknown`). **The advisor caught the load-bearing scope question** (spike proved
+  only the *probe*, not the *picker*): a follow-up spike proved **`dbus = false` + the (uncommitted)
+  `gschemas.rs` already gives a working in-cage GTK file chooser** (schema `org.gtk.Settings.FileChooser`
+  present; a zenity dialog mapped in-cage with no bus), so the picker alone is a two-line fix and the
+  in-cage portal's marginal value is **theme-at-launch** (increment A) + **live theme + notifications**
+  (increment B). **User chose A+B together** (nothing regresses vs `dbus = true`), cadence A-first;
+  **claude-desktop stays on `dbus = true` until B** (migrating to increment-A-only would drop its
+  notifications). **Increment B (next, NOT built):** reintroduce the filtered host bus (the existing
+  `dbus.rs`, bound at a side path) + an in-cage keyfile updater fed by the host `SettingChanged` (live
+  theme) + an `org.freedesktop.Notifications` relay on the private bus (notifications — likely a `zbus`
+  dependency to validate), then migrate the profiles. **Tests:** 5 portal.rs unit (`session_conf`
+  servicedirs + cage-socket-only, `env`, `wrap_command` positional shape + theme seed + no-theme,
+  `parse_color_scheme`) + 1 override unit (`--dbus=incage` applies, typo fatal) + 3 config integration
+  (untrusted-drop→trust for incage, flagship untrusted-override, unknown-posture fail-closed) + 1
+  run.rs e2e `a_trusted_incage_dbus_stands_up_an_in_cage_portal` (**ran live 33.6s**, not skipped:
+  FileChooser version served on the private bus under `network="none"` + keyring absent; skips without
+  Wayland/cache). 993 unit + 97 config + run e2e green, fmt/clippy `-D warnings` clean, **std-only** (no
+  new dep — `portal.rs` reuses `store::provision`/`egress::wrap_background`). **Honest scope:** the real
+  claude-desktop end-to-end (login + a click on "browse folder") is the pending live-user validation, as
+  for every GUI increment; the host-side theme read needs a host `/nix` with compatible paths
+  (best-effort — a host without it opens the app in the default theme). See [[dbus-hole]], [[gpu-hole]],
+  [[electron-gui-profiles]].
   **`dbus = true` — a filtered D-Bus session bus in the cage (DONE 2026-07-09)**
   (`src/sandbox/dbus.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
   `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{dbus,README}.md`
@@ -269,10 +368,13 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   `short_hash` (the untested mirror logic); a **deterministic** launcher pick (`sort | head`); a
   **layout-general** install (extract into a subdir, `cp -r extracted/. $out` — any prefix, no nix
   build-metadata leak); `write_pins` dir at `0o700` (matching flake); and — the security review's
-  one real wrinkle — **catrust's NSS nickname is now keyed by the CA content** (`ops-mitm-<sha256>`,
-  no delete-then-add), so two concurrent same-app launches with distinct per-session CAs coexist
-  instead of racing a shared name (the accumulated dead ephemeral-CA entries are harmless — their
-  private keys are gone). And **`ops config show` now displays a deb's pinned short hash** (`@ …
+  one real wrinkle — catrust's NSS nickname was keyed by the CA content (`ops-mitm-<sha256>`) with
+  no delete-then-add, so concurrent same-app launches coexist. **[REVISED 2026-07-10 — the claim
+  that "the accumulated dead ephemeral-CA entries are harmless" was WRONG and is fixed: every
+  per-session CA shares a fixed subject DN, so N accumulated entries collide on NSS issuer lookup and
+  Chromium rejects the current MITM cert (`ERR_CERT_AUTHORITY_INVALID`) after enough launches. See
+  the catrust CA-purge entry at the top.]** And **`ops config show` now displays a deb's pinned short
+  hash** (`@ …
   (pinned)`, keyed by URL in the same merged pin map that serves flake revs — disjoint key spaces).
   **970 unit (+5 over the pre-review 965) + 90 config green**, fmt/clippy `-D warnings` clean,
   std-only (reuses `store::provision_expr`/`nix_command` + serde_json).

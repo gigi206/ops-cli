@@ -38,9 +38,11 @@ const ELECTRON_LIBS: &[&str] = &[
     "gdk-pixbuf",
     "glib",
     "gtk3",
+    "libcap_ng",
     "libdrm",
     "libGL",
     "libnotify",
+    "libseccomp",
     "libsecret",
     "libxkbcommon",
     "mesa",
@@ -48,14 +50,14 @@ const ELECTRON_LIBS: &[&str] = &[
     "nspr",
     "nss",
     "pango",
-    "xorg.libX11",
-    "xorg.libxcb",
-    "xorg.libXcomposite",
-    "xorg.libXdamage",
-    "xorg.libXext",
-    "xorg.libXfixes",
-    "xorg.libXrandr",
-    "xorg.libxshmfence",
+    "libx11",
+    "libxcb",
+    "libxcomposite",
+    "libxdamage",
+    "libxext",
+    "libxfixes",
+    "libxrandr",
+    "libxshmfence",
 ];
 
 /// A locked `deb:` package: the SRI content hash the URL resolved to. Keyed by the declared URL.
@@ -230,7 +232,17 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   nativeBuildInputs = with pkgs; [ dpkg makeWrapper autoPatchelfHook ];
   buildInputs = with pkgs; [ @LIBS@ ];
   autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ];
-  unpackPhase = "dpkg-deb -x $src extracted";
+  # Extract the data tarball with a plain, unprivileged `tar` instead of `dpkg-deb -x`. The latter
+  # restores exact modes and aborts when a `.deb` ships a setuid file (Chromium's `chrome-sandbox`,
+  # mode 04755): a non-root nix builder cannot chmod setuid ("Operation not permitted"), which fails
+  # the whole unpack. `tar` without `--preserve-permissions` simply does not restore the setuid bit.
+  # This is safe and load-bearing for Electron apps: the launcher runs with `--no-sandbox` (bubblewrap
+  # + seccomp + the empty netns is the boundary), so that helper is never used, and setuid could not
+  # take effect in the cage anyway.
+  unpackPhase = ''
+    mkdir extracted
+    dpkg-deb --fsys-tarfile $src | tar -x --no-same-permissions --no-same-owner -C extracted
+  '';
   dontConfigure = true;
   dontBuild = true;
   installPhase = ''
@@ -447,10 +459,12 @@ mod tests {
         ));
         assert!(expr.contains("url = \"https://example.com/x/opencode-desktop-linux-amd64.deb\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
-        // unpack-only, no build script (safe host-side); the Electron lib set is present
-        assert!(expr.contains("dpkg-deb -x $src extracted"));
+        // unpack-only, no build script (safe host-side); the Electron lib set is present. The
+        // extraction pipes the data tarball through a non-root `tar` so a setuid file (Chromium's
+        // `chrome-sandbox`) does not abort the unpack in the unprivileged nix builder.
+        assert!(expr.contains("dpkg-deb --fsys-tarfile $src | tar -x --no-same-permissions"));
         assert!(expr.contains("dontBuild = true;"));
-        assert!(expr.contains("nss") && expr.contains("gtk3") && expr.contains("xorg.libX11"));
+        assert!(expr.contains("nss") && expr.contains("gtk3") && expr.contains("libx11"));
         // generic Electron install: find the app by its app.asar, wrap the launcher as bin/<name>
         assert!(expr.contains("resources/"));
         assert!(expr.contains("app.asar"));
@@ -550,7 +564,7 @@ mod tests {
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
-            dbus: false,
+            dbus: crate::config::DbusPolicy::Off,
             gpu_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],

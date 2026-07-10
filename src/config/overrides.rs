@@ -48,8 +48,8 @@
 //! launch aborts rather than silently dropping the field and running a different posture than asked.
 
 use super::schema::{
-    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawDevices, RawLimit,
-    RawLimits, RawSeccomp,
+    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawDbus, RawDevices,
+    RawLimit, RawLimits, RawSeccomp,
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
@@ -137,7 +137,8 @@ pub(crate) struct CliOverrides {
     pub(crate) devices: Vec<String>,
     /// `--gpu[=true|false]` — the GPU posture (a boolean; bare `--gpu` means `true`). Last wins.
     pub(crate) gpu: Vec<String>,
-    /// `--dbus[=true|false]` — the filtered-D-Bus posture (a boolean; bare means `true`). Last wins.
+    /// `--dbus[=true|false|incage]` — the D-Bus posture (bare `--dbus` means `true` = filtered host
+    /// bus; `incage` = the in-cage portal). Last wins.
     pub(crate) dbus: Vec<String>,
 }
 
@@ -171,7 +172,7 @@ struct AmbientOverrides {
     devices: Vec<String>,
     /// `OPS_GPU` — the GPU posture (`true`/`false`).
     gpu: Option<String>,
-    /// `OPS_DBUS` — the filtered-D-Bus posture (`true`/`false`).
+    /// `OPS_DBUS` — the D-Bus posture (`true`/`false`/`incage`).
     dbus: Option<String>,
 }
 
@@ -185,7 +186,8 @@ struct TypedLabels {
     package: &'static str,
     forward: &'static str,
     gpu: &'static str,
-    dbus: &'static str,
+    // `--dbus`/`OPS_DBUS` carry their value verbatim (validated downstream by `validate_dbus`, like
+    // `gui`/`nixpkgs`), so — unlike `--gpu`, whose bool is parsed in `collect` — they need no label.
 }
 
 const CLI_LABELS: TypedLabels = TypedLabels {
@@ -195,7 +197,6 @@ const CLI_LABELS: TypedLabels = TypedLabels {
     package: "--package",
     forward: "--forward",
     gpu: "--gpu",
-    dbus: "--dbus",
 };
 
 const ENV_LABELS: TypedLabels = TypedLabels {
@@ -205,7 +206,6 @@ const ENV_LABELS: TypedLabels = TypedLabels {
     package: "OPS_PACKAGE_*",
     forward: "OPS_FORWARD",
     gpu: "OPS_GPU",
-    dbus: "OPS_DBUS",
 };
 
 /// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
@@ -570,14 +570,16 @@ fn build_typed_fragment(
     if let Some(v) = nixpkgs {
         raw.nixpkgs = Some(v.to_string());
     }
-    // `--gpu`/`--dbus` are booleans, so — unlike `gui`/`nixpkgs` whose value is validated downstream —
-    // the only valid grammar is `true`/`false`, checked here (structural, fail-closed). A bare
-    // `--gpu` is normalized to `"true"` by the CLI parser before it reaches this point.
+    // `--gpu` is a boolean, so — unlike `gui`/`nixpkgs` whose value is validated downstream — the
+    // only valid grammar is `true`/`false`, checked here (structural, fail-closed). A bare `--gpu`
+    // is normalized to `"true"` by the CLI parser before it reaches this point.
     if let Some(v) = gpu {
         raw.gpu = Some(parse_bool(v, lbl.gpu)?);
     }
+    // `--dbus` has three postures (`true`/`false`/`incage`), so its value is carried verbatim and
+    // validated downstream by `validate_dbus` (a bad string is fatal for an override, like `gui`).
     if let Some(v) = dbus {
-        raw.dbus = Some(parse_bool(v, lbl.dbus)?);
+        raw.dbus = Some(RawDbus::Mode(v.to_string()));
     }
     for spec in binds {
         raw.binds.push(parse_bind(spec, lbl.bind)?);
@@ -883,7 +885,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ov.raw.gpu, Some(true));
-        assert_eq!(ov.raw.dbus, Some(false));
+        assert_eq!(ov.raw.dbus, Some(RawDbus::Mode("false".to_string())));
 
         let last_wins = collect_cli(Cli {
             gpu: &["true", "false"],
@@ -920,7 +922,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ov.raw.gpu, Some(false));
-        assert_eq!(ov.raw.dbus, Some(true));
+        assert_eq!(ov.raw.dbus, Some(RawDbus::Mode("true".to_string())));
         // `gpu` was also set on the CLI, so no notice for it; `dbus` came only from the environment.
         assert!(ov
             .notices()

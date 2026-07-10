@@ -308,6 +308,7 @@ mod tests {
             method: method.map(str::to_string),
             path: path.map(str::to_string),
             verdict: LogVerdict::Deny,
+            proto: crate::sandbox::control::Proto::Https,
             reason: reason.to_string(),
             muted: false,
             status: None,

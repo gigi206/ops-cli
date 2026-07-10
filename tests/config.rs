@@ -3496,3 +3496,80 @@ fn a_global_apps_dbus_posture_survives_an_untrusted_projects_override() {
         "the trusted app D-Bus posture must stand:\n{stdout}"
     );
 }
+
+#[test]
+fn an_untrusted_incage_dbus_is_dropped_but_trusting_applies_it() {
+    // `dbus = "incage"` stands up a private in-cage portal — a security field like `dbus = true`, so
+    // an untrusted project's posture is dropped and applied only once trusted, then rendered as the
+    // in-cage portal (distinct from the filtered host bus).
+    let fx = Fixture::new();
+    fx.write_project("dbus = \"incage\"\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("dbus:"),
+        "an untrusted in-cage dbus posture must not be applied"
+    );
+    assert!(
+        stderr.contains("ignoring `dbus` posture"),
+        "a dropped dbus posture must be explained:\n{stderr}"
+    );
+
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(trusted.status.success(), "trust failed");
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dbus: in-cage portal"),
+        "a trusted in-cage dbus posture must render as the in-cage portal:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(project)"),
+        "the dbus origin must be tagged with its layer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_global_apps_incage_dbus_survives_an_untrusted_projects_override() {
+    // The flagship property for the in-cage posture: a global app (a profile, trusted by location)
+    // keeps its `dbus = "incage"`, and an untrusted project cannot flip it off.
+    let fx = Fixture::new();
+    fx.write_profile("viz", "cmd = \"viz\"\ndbus = \"incage\"\n");
+    fx.write_project("[app.viz]\ndbus = false\n");
+
+    let out = fx.run(&["config", "show", "--app", "viz"]);
+    assert!(out.status.success(), "config show --app failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dbus:    in-cage portal"),
+        "the trusted app's in-cage posture must stand:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_trusted_but_unknown_dbus_posture_is_dropped_fail_closed() {
+    // A typo'd posture must never silently open a bus: a trusted but unknown string is dropped
+    // (warned), leaving the default (no bus) — the same fail-closed shape as `gui`.
+    let fx = Fixture::new();
+    fx.write_project("dbus = \"incagee\"\n");
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(trusted.status.success(), "trust failed");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(
+        out.status.success(),
+        "an unknown dbus posture must not hard-fail"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("dbus:"),
+        "an unknown dbus posture must leave the default (no bus):\n{stdout}"
+    );
+    assert!(
+        stderr.contains("unknown dbus posture"),
+        "an unknown dbus posture must be explained:\n{stderr}"
+    );
+}

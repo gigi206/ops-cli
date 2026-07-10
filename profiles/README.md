@@ -24,6 +24,7 @@ with `ops app export <name>`.
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
 | `opencode-web`    | `mise:opencode` (`opencode web` + `forward`) | provider-dependent |
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
+| `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
 | `hermes`          | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | `openrouter.ai` (BYOK)  |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
@@ -37,12 +38,13 @@ across projects by default (`home_scope`).
 
 > **Two credential postures.** Most profiles are **BYOK** — your provider key is read
 > on the host and injected by the proxy, never entering the cage (see below).
-> `freebuff` and `agy` are the other kind: they log in to a service **account** (a
-> Codebuff account; a Google account, respectively) and the token persists in the app's
-> isolated `$HOME` (so it *does* live in the — isolated — cage, never in the project
-> shell). Both stay bounded by the egress allowlist. `agy` carries an extra unproven
-> risk — it may want a **system keyring** the hermetic cage does not provide (see its
-> profile header and the status note below).
+> `freebuff`, `agy`, and `claude-desktop` are the other kind: they log in to a service
+> **account** (a Codebuff account; a Google account; an Anthropic/claude.ai account or SSO,
+> respectively) and the token persists in the app's isolated `$HOME` (so it *does* live in
+> the — isolated — cage, never in the project shell). All stay bounded by the egress
+> allowlist. `agy` and `claude-desktop` carry an extra unproven risk — they may want a
+> **system keyring** the hermetic cage does not provide (see each profile header and the
+> status note below).
 
 ## Credentials — the key never enters the cage
 
@@ -127,6 +129,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
 | `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
 | `opencode-desktop` | `deb:…/releases/latest/download/opencode-desktop-linux-amd64.deb` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
+| `claude-desktop` | `deb:…/apt/stable/pool/main/c/claude-desktop/claude-desktop_<ver>_amd64.deb` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — version-pinned |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `hermes`      | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | NousResearch PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
@@ -231,9 +234,9 @@ do not guess the values, so each waits on a real fact or on a named feature:
   persistence: Antigravity may want a **system keyring** the hermetic cage lacks (see the profile
   header + the status note). Its runtime model host is also not yet captured.
 
-- **GUI / desktop (Electron) agents** — no longer blocked in general: `opencode-desktop` (above)
-  is a working Electron profile, and it maps out the recipe for the next one. Three pieces make an
-  Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with the
+- **GUI / desktop (Electron) agents** — no longer blocked in general: `opencode-desktop` and
+  `claude-desktop` (above) are working Electron profiles, and they map out the recipe for the next
+  one. Three pieces make an Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with the
   `deb:<url>` backend (ops fetches, hashes, and `autoPatchelfHook`s it host-side — avoids the
   from-source `bun install` wall and any third-party flake); (2) **`gui = "wayland"`** plus the
   Chromium flags (`--no-sandbox --ozone-platform=wayland --disable-gpu --use-system-ca`); (3)

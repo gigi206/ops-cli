@@ -344,6 +344,49 @@ impl LogVerdict {
     }
 }
 
+/// The transport the proxy used for a decided request — the *how*, distinct from the port. The three
+/// enforcement paths map one-to-one: an inspected TLS tunnel (a MITM'd `CONNECT`, including a
+/// WebSocket over TLS) is [`Https`](Self::Https); an inspected cleartext `http://` absolute-form is
+/// [`Http`](Self::Http); a raw `tcp://` L4 splice is [`Tcp`](Self::Tcp). [`Other`](Self::Other) is
+/// the honest fallback for a request refused before its transport was known (a malformed `CONNECT`
+/// line, a non-routable non-`CONNECT` request). Shown as a column in `ops net logs` because the port
+/// alone is ambiguous — a `tcp://` splice can ride 443, and an inspected host can ride any port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Proto {
+    /// Inspected over TLS (a MITM'd `CONNECT`) — the default `https://` path, WebSockets included.
+    Https,
+    /// Inspected in the clear (an `http://` absolute-form request).
+    Http,
+    /// A raw L4 splice selected by a `tcp://` rule — bytes forwarded uninspected.
+    Tcp,
+    /// The transport was not yet known when the request was refused (a malformed `CONNECT`, a
+    /// non-routable request). Rendered as `-`.
+    Other,
+}
+
+impl Proto {
+    /// The stable wire/display token.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Proto::Https => "https",
+            Proto::Http => "http",
+            Proto::Tcp => "tcp",
+            Proto::Other => "-",
+        }
+    }
+
+    /// Parse a proto token back, defaulting to [`Other`](Self::Other) for an absent or unknown token
+    /// (an older persisted log line carries no `proto=`, so it reads as `-` rather than failing).
+    pub(crate) fn parse(s: &str) -> Self {
+        match s {
+            "https" => Proto::Https,
+            "http" => Proto::Http,
+            "tcp" => Proto::Tcp,
+            _ => Proto::Other,
+        }
+    }
+}
+
 /// One decided egress request captured for the live view: when, where, how, and why. `method`/`path`
 /// are present only for the inspected L7 path (an early-CONNECT block or a raw `tcp://` splice has no
 /// HTTP head to read). The `path` is stored **already query-redacted** by the proxy, so the ring is
@@ -361,6 +404,10 @@ pub(crate) struct LogEvent {
     pub(crate) path: Option<String>,
     pub(crate) verdict: LogVerdict,
     pub(crate) reason: String,
+    /// The transport the proxy used (or would have): `https` (inspected TLS), `http` (inspected
+    /// cleartext), `tcp` (raw L4 splice), or `-` when unknown at refusal time. Shown as a column
+    /// because the port alone does not name the protocol (a `tcp://` splice can ride 443).
+    pub(crate) proto: Proto,
     /// Whether this refusal was suppressed from the default `ops net log` view by a `mute`
     /// (SELinux `dontaudit`) rule. A muted event is still counted in `ops net stats` and lives in a
     /// **separate** ring (so a muted flood never evicts a real event); it appears only under
@@ -442,6 +489,7 @@ impl LogRing {
         path: Option<&str>,
         verdict: LogVerdict,
         reason: &str,
+        proto: Proto,
     ) -> u64 {
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -459,6 +507,7 @@ impl LogRing {
             path: path.map(str::to_string),
             verdict,
             reason: reason.to_string(),
+            proto,
             muted,
             status: None,
             amend_seq: None,
@@ -751,11 +800,12 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
 /// round-trips (it is the only field that can carry one, and an HTTP request-target has no spaces).
 fn format_event_line(ev: &LogEvent) -> String {
     let mut line = format!(
-        "event seq={} at={} port={} verdict={} reason={}",
+        "event seq={} at={} port={} verdict={} proto={} reason={}",
         ev.seq,
         ev.at_epoch_ms,
         ev.port,
         ev.verdict.as_str(),
+        ev.proto.as_str(),
         ev.reason,
     );
     if let Some(status) = ev.status {
@@ -989,6 +1039,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut path = None;
     let mut status = None;
     let mut muted = false;
+    let mut proto = Proto::Other;
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "event" {
         return None;
@@ -1000,6 +1051,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
             "at" => at = value.parse().ok(),
             "port" => port = value.parse().ok(),
             "verdict" => verdict = LogVerdict::parse(value),
+            "proto" => proto = Proto::parse(value),
             "reason" => reason = Some(value.to_string()),
             "method" => method = Some(value.to_string()),
             "host" => host = Some(value.to_string()),
@@ -1018,6 +1070,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         path,
         verdict: verdict?,
         reason: reason?,
+        proto,
         muted,
         status,
         // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
@@ -1831,7 +1884,16 @@ mod tests {
     // ── The live egress event log ──────────────────────────────────────────────────────────────
 
     fn push_event(ring: &LogRing, host: &str, verdict: LogVerdict, reason: &str) {
-        ring.push(false, host, 443, Some("GET"), Some("/x"), verdict, reason);
+        ring.push(
+            false,
+            host,
+            443,
+            Some("GET"),
+            Some("/x"),
+            verdict,
+            reason,
+            Proto::Https,
+        );
     }
 
     #[test]
@@ -1893,6 +1955,7 @@ mod tests {
             Some("/1"),
             LogVerdict::Allow,
             "allowed",
+            Proto::Https,
         );
         let s2 = ring.push(
             false,
@@ -1902,6 +1965,7 @@ mod tests {
             Some("/2"),
             LogVerdict::Allow,
             "allowed",
+            Proto::Https,
         );
         // A status amends the matching still-resident event, and only it.
         ring.set_status(s2, 404);
@@ -1926,6 +1990,7 @@ mod tests {
             Some("/3"),
             LogVerdict::Allow,
             "allowed",
+            Proto::Https,
         );
         ring.push(
             false,
@@ -1935,6 +2000,7 @@ mod tests {
             Some("/4"),
             LogVerdict::Allow,
             "allowed",
+            Proto::Https,
         );
         ring.set_status(s1, 500);
         let after = ring.snapshot(None, None, false);
@@ -1959,6 +2025,7 @@ mod tests {
             Some("/1"),
             LogVerdict::Allow,
             "allowed",
+            Proto::Https,
         );
         // A follow reader catches up: it has seen seq s1, with no amendment yet.
         let seen = ring.snapshot(Some(s1), Some(0), false);
@@ -2000,6 +2067,7 @@ mod tests {
             method: Some("POST".into()),
             path: Some("/v1/x?a=1&b=2".into()),
             verdict: LogVerdict::Allow,
+            proto: Proto::Https,
             reason: "allowed".into(),
             muted: false,
             // A captured upstream status round-trips on the wire alongside the query path.
@@ -2022,6 +2090,7 @@ mod tests {
             method: None,
             path: None,
             verdict: LogVerdict::Allow,
+            proto: Proto::Https,
             reason: "allowed".into(),
             muted: false,
             status: None,
@@ -2051,6 +2120,7 @@ mod tests {
                 path: Some("/p".into()),
                 verdict,
                 reason: "dns-failure".into(),
+                proto: Proto::Https,
                 // A muted deny exercises the `muted=1` token on the wire (mute only ever applies to
                 // a deny), so its round-trip is covered here alongside every verdict token.
                 muted: verdict == LogVerdict::Deny,
@@ -2087,6 +2157,7 @@ mod tests {
             Some("/one"),
             LogVerdict::Allow,
             "allowed",
+            Proto::Https,
         );
         log.push(
             false,
@@ -2096,6 +2167,7 @@ mod tests {
             Some("/two?t=1"),
             LogVerdict::Deny,
             "denied-by-rule",
+            Proto::Https,
         );
 
         let listener = UnixListener::bind(&socket).unwrap();

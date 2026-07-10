@@ -1135,6 +1135,164 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
 }
 
 #[test]
+fn a_trusted_incage_dbus_stands_up_an_in_cage_portal() {
+    // `dbus = "incage"` under `gui = "wayland"` stands up a *private* session bus inside the cage
+    // carrying ops's own `xdg-desktop-portal` with the GTK backend, so a Chromium/Electron app's
+    // file chooser renders in-cage (seeing only the cage filesystem). Proven with the cage's network
+    // CUT (`network = "none"`, empty netns): the only session bus reachable is the private one the
+    // command wrapper created, so a `FileChooser` version probe that answers on it can only be the
+    // in-cage portal — and the GTK backend that serves that interface needs the Wayland display to
+    // start, so the probe also exercises the display hole. Teeth on isolation too: the login keyring
+    // (`org.freedesktop.secrets`) must be ABSENT on the private bus. `gdbus` comes from the
+    // project's own `nix:glib.bin`. Skips (never fails) when the host cannot sandbox, has no
+    // compositor, or the cache is unreachable (the portal stack is provisioned on the first launch).
+    let project = TmpDir::new("incage-proj");
+    let data = TmpDir::new("incage-data");
+    let state = TmpDir::new("incage-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\ndbus = \"incage\"\nnetwork = \"none\"\n\
+         [packages]\nglib = \"nix:glib.bin\"\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping incage-dbus e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if wayland_socket().is_none() {
+        eprintln!("skipping incage-dbus e2e: no Wayland compositor on the host");
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping incage-dbus e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // `gui`/`dbus`/`[packages]` are trusted-only, so trust the project before launching.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The cage script probes the private bus: the FileChooser version (the in-cage portal serves it)
+    // and the keyring (must be refused). Both markers in one run, so a false "no bus" cannot pass.
+    let script = "gdbus call --session --dest org.freedesktop.portal.Desktop \
+         --object-path /org/freedesktop/portal/desktop \
+         --method org.freedesktop.DBus.Properties.Get \
+         org.freedesktop.portal.FileChooser version 2>&1 | sed 's/^/FILECHOOSER: /'; \
+         gdbus call --session --dest org.freedesktop.secrets \
+         --object-path /org/freedesktop/secrets \
+         --method org.freedesktop.DBus.Peer.Ping 2>&1 | sed 's/^/KEYRING: /'";
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "bash", "-c", script],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The FileChooser interface answered with a version on the private bus — the in-cage portal is
+    // up and serving the file chooser (the whole point).
+    assert!(
+        stdout.contains("FILECHOOSER: (<uint32 "),
+        "the in-cage portal did not serve a FileChooser version on the private bus: {log}"
+    );
+    // Isolation teeth: the keyring is not on the private bus (the raw host bus is never exposed).
+    assert!(
+        stdout.contains("KEYRING:") && !stdout.contains("KEYRING: ()"),
+        "the login keyring must be absent from the in-cage portal's private bus: {log}"
+    );
+}
+
+#[test]
+fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
+    // catrust imports the egress MITM CA into the cage's NSS db so a Chromium/Electron GUI app
+    // trusts the proxy. Each launch has a distinct per-session CA sharing a FIXED subject DN, so
+    // without the purge two launches would leave two same-subject CAs — which collide on the NSS
+    // issuer lookup and make Chromium reject the current cert (ERR_CERT_AUTHORITY_INVALID, the bug
+    // that shipped). The wrap purges every prior `ops-mitm*` entry before re-adding the current one,
+    // so the persistent app home's db holds exactly ONE. Teeth: two sequential `ops app` launches
+    // share the app's persistent home; the second reports the `ops-mitm` count read from the db with
+    // its own `nix:nss.tools` certutil — it must be 1, not 2 (a count of 2 is exactly the pre-fix
+    // accumulation). `gui = "wayland"` + a filtering posture is what gates catrust on (no real
+    // compositor needed — the CA import does not render). Skips when the host cannot sandbox or the
+    // cache is unreachable (nss.tools is provisioned on the first launch).
+    let project = TmpDir::new("catrust-proj");
+    let data = TmpDir::new("catrust-data");
+    let state = TmpDir::new("catrust-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\n[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
+         [packages]\nnss = \"nix:nss.tools\"\n\
+         [app.probe]\ncmd = [\"bash\", \"-c\", \
+         \"certutil -L -d sql:$HOME/.pki/nssdb 2>/dev/null | grep -c ops-mitm | sed 's/^/MITM-COUNT=/'\"]\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping catrust e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping catrust e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // `gui`/`network`/`[packages]` are trusted-only, so trust before launching.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Launch 1: imports the first session's CA (db now holds one ops-mitm entry).
+    let first = ops_in(project.path(), data.path(), state.path(), &["app", "probe"]);
+    assert!(
+        first.status.success(),
+        "first launch failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // Launch 2: a NEW session CA. Without the purge the shared home's db would now hold TWO
+    // same-subject CAs; with it, the count stays 1.
+    let second = ops_in(project.path(), data.path(), state.path(), &["app", "probe"]);
+    let out = String::from_utf8_lossy(&second.stdout);
+    let log = format!("{}{}", String::from_utf8_lossy(&second.stderr), out);
+    assert!(second.status.success(), "second launch failed: {log}");
+    assert!(
+        out.contains("MITM-COUNT=1"),
+        "the NSS db must hold exactly one ops-mitm CA after two launches (the purge), not accumulate: {log}"
+    );
+}
+
+#[test]
 fn a_network_allowlist_filters_egress_through_the_proxy() {
     // The Model-B egress path end to end through the real binary: a trusted
     // `network = "deny"` stands up the host filtering proxy on a bound socket, the

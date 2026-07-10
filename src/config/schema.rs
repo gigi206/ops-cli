@@ -66,17 +66,22 @@ pub(crate) struct RawConfig {
     /// (Intel/AMD/nouveau); the NVIDIA proprietary stack is a separate, not-yet-built mechanism.
     /// Most useful together with `gui = "wayland"`.
     pub(crate) gpu: Option<bool>,
-    /// Whether to open a **filtered** D-Bus session bus for the cage (`dbus = true`). ops runs a
-    /// default-deny `xdg-dbus-proxy` host-side that forwards only a small curated allowlist — the
-    /// desktop `appearance` portal (so a graphical app follows the host light/dark theme) and the
-    /// notifications service — and binds only that filtered socket into the cage. A security field —
-    /// honored from the global config or a trusted project, ignored from an untrusted one: the
-    /// session bus carries the login keyring (every saved password) and every desktop portal, so
-    /// exposing even a filtered slice of it is a choice an untrusted project may not make. The filter
-    /// is only a boundary under an isolated network namespace, so it is not wired under
-    /// `network = "shared"` (the host bus would be reachable directly). Most useful together with
-    /// `gui = "wayland"`.
-    pub(crate) dbus: Option<bool>,
+    /// How the cage reaches a D-Bus session bus. Three postures ([`RawDbus`] → [`DbusPolicy`]):
+    /// `false` (no bus, the default); `true` — a **filtered host** bus (ops runs a default-deny
+    /// `xdg-dbus-proxy` host-side forwarding only the desktop `appearance` portal and the
+    /// notifications service, binding that one filtered socket into the cage — so a graphical app
+    /// follows the host light/dark theme and can raise notifications); or `"incage"` — a **private
+    /// in-cage bus** carrying ops's own `xdg-desktop-portal` with the GTK backend, so a Chromium/
+    /// Electron app's file chooser renders **inside** the cage (seeing only the cage filesystem)
+    /// and the host theme is seeded at launch. A security field — honored from the global config or
+    /// a trusted project, ignored from an untrusted one: a session bus carries the login keyring
+    /// (every saved password) and every desktop portal, so exposing even a filtered slice of it,
+    /// or standing up an in-cage portal, is a choice an untrusted project may not make. The `true`
+    /// (filtered host) posture is only a boundary under an isolated network namespace, so it is not
+    /// wired under `network = "shared"` (the host bus would be reachable directly); the `"incage"`
+    /// posture touches no host socket and so is unaffected. Most useful together with
+    /// `gui = "wayland"` (the in-cage portal's GTK backend needs the compositor to render).
+    pub(crate) dbus: Option<RawDbus>,
     /// Host loopback TCP ports to forward from the host into the cage — a list of port
     /// numbers (`forward = [1455]`). Each port is bound on the host's `127.0.0.1` and
     /// bridged, through a bound Unix socket, to the cage's own loopback at the same port,
@@ -205,6 +210,20 @@ pub(crate) enum RawLimit {
     Text(String),
 }
 
+/// How `dbus` is declared: a bool (`dbus = true`/`false`, the historical form) or a string naming
+/// a posture (`dbus = "incage"`). An untagged enum so both TOML forms parse, rather than a type
+/// mismatch failing the whole config. Validated into a [`DbusPolicy`] downstream, where an unknown
+/// string is dropped (warned) fail-closed to the default.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawDbus {
+    /// The historical bool form: `true` = the filtered host bus, `false` = no bus.
+    Bool(bool),
+    /// A named posture, e.g. `"incage"` (the private in-cage portal). Aliases and validation live
+    /// in `validate_dbus`.
+    Mode(String),
+}
+
 impl RawLimit {
     /// The value as the string token systemd's `-p KEY=VALUE` receives: a number renders as its
     /// decimal form, a string is taken verbatim (and validated downstream before it is used).
@@ -276,10 +295,10 @@ pub(crate) struct RawApp {
     /// security field, like the baseline `gpu`. An unset `Option` is omitted on export, so an
     /// app with no GPU need carries no `gpu` line.
     pub(crate) gpu: Option<bool>,
-    /// The app's filtered-D-Bus posture, overriding the baseline's when set (see `RawConfig.dbus`).
-    /// A security field, like the baseline `dbus`. An unset `Option` is omitted on export, so an
-    /// app with no D-Bus need carries no `dbus` line.
-    pub(crate) dbus: Option<bool>,
+    /// The app's D-Bus posture, overriding the baseline's when set (see `RawConfig.dbus`). A
+    /// security field, like the baseline `dbus`. An unset `Option` is omitted on export, so an app
+    /// with no D-Bus need carries no `dbus` line.
+    pub(crate) dbus: Option<RawDbus>,
     /// Host loopback ports forwarded into this app's cage (see `RawConfig.forward`). A
     /// security field, gated like the baseline `forward`: an app's ports **union** onto
     /// the baseline's, so an untrusted project can only add its own, never remove or
@@ -803,6 +822,29 @@ mod tests {
         let serialized = serialize_app(&app).unwrap();
         let reparsed = parse_app(serialized.as_bytes()).unwrap();
         assert_eq!(app, reparsed, "export must round-trip losslessly");
+    }
+
+    #[test]
+    fn the_dbus_posture_round_trips_both_untagged_forms() {
+        // `RawDbus` is an untagged `bool | string`, so `ops app export` must preserve which form the
+        // author wrote: `dbus = "incage"` stays a string, `dbus = true` stays a bool.
+        let incage = parse_app(b"cmd = \"demo\"\ndbus = \"incage\"\n").unwrap();
+        assert_eq!(incage.dbus, Some(RawDbus::Mode("incage".to_string())));
+        let out = serialize_app(&incage).unwrap();
+        assert!(
+            out.contains("dbus = \"incage\""),
+            "the string posture must serialize as a string, got:\n{out}"
+        );
+        assert_eq!(parse_app(out.as_bytes()).unwrap(), incage);
+
+        let filtered = parse_app(b"cmd = \"demo\"\ndbus = true\n").unwrap();
+        assert_eq!(filtered.dbus, Some(RawDbus::Bool(true)));
+        let out = serialize_app(&filtered).unwrap();
+        assert!(
+            out.contains("dbus = true"),
+            "the bool posture must serialize as a bool, got:\n{out}"
+        );
+        assert_eq!(parse_app(out.as_bytes()).unwrap(), filtered);
     }
 
     #[test]

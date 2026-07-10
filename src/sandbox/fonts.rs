@@ -23,10 +23,15 @@ use std::path::{Path, PathBuf};
 
 /// The base font set the GUI hole provisions: `(nixpkgs attribute, a directory the output
 /// must contain, gcroot name)`. DejaVu covers the Latin sans/serif/monospace families a
-/// general UI needs; broader script coverage is a per-need extension, not a default (font
+/// general UI needs; Noto Color Emoji covers the emoji codepoints a modern chat/GUI renders
+/// (without it, a `👋` in a message shows as a tofu box — the hermetic cage has no emoji font).
+/// Broader script coverage (CJK, Arabic, …) is a per-need extension, not a default (font
 /// closures are large). The marker is a directory (`share/fonts`), since a font package has
 /// no binary to key on.
-const GUI_FONTS: &[(&str, &str, &str)] = &[("dejavu_fonts", "share/fonts", "dejavu")];
+const GUI_FONTS: &[(&str, &str, &str)] = &[
+    ("dejavu_fonts", "share/fonts", "dejavu"),
+    ("noto-fonts-color-emoji", "share/fonts", "noto-emoji"),
+];
 
 /// Where the cage's fontconfig keeps its on-disk cache: a path on the cage's private tmpfs
 /// `/tmp`, always writable and self-contained (no dependency on the home layout). The cache
@@ -91,6 +96,10 @@ pub(crate) fn fonts_conf(dirs: &[PathBuf], cache_dir: &str) -> String {
         ("sans-serif", "DejaVu Sans"),
         ("serif", "DejaVu Serif"),
         ("monospace", "DejaVu Sans Mono"),
+        // The `emoji` generic family maps to the provisioned color-emoji face, so an app that
+        // requests it resolves a real font; fontconfig's own charset matching then falls emoji
+        // codepoints in ordinary text back to it too (so `👋` renders in a chat message).
+        ("emoji", "Noto Color Emoji"),
     ] {
         s.push_str(&format!(
             "  <alias><family>{generic}</family><prefer><family>{concrete}</family></prefer></alias>\n"
@@ -187,6 +196,9 @@ mod tests {
         assert!(conf.contains("<family>DejaVu Sans</family>"));
         assert!(conf.contains("<family>monospace</family>"));
         assert!(conf.contains("<family>DejaVu Sans Mono</family>"));
+        // the emoji generic maps to the color-emoji face, so `👋` in a message renders
+        assert!(conf.contains("<family>emoji</family>"));
+        assert!(conf.contains("<family>Noto Color Emoji</family>"));
         // self-contained: a well-formed fontconfig document, no <include> of a host path
         assert!(conf.starts_with("<?xml version=\"1.0\"?>"));
         assert!(conf.trim_end().ends_with("</fontconfig>"));
