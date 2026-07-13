@@ -349,7 +349,7 @@ fn detach_parent(
             log.display()
         );
         eprintln!(
-            "ops: `ops ls` lists it, `ops attach {child}` opens a shell beside it, \
+            "ops: `ops ls` lists it, `ops attach {child}` opens a shell inside its live cage, \
              `ops stop {child}` ends it."
         );
         ExitCode::SUCCESS
@@ -1455,23 +1455,15 @@ fn launch_pty_supervised(
     }
 }
 
-/// Render the line `ops attach` prints before opening a second terminal in a plain session's
-/// project (stderr). Attaching is an announcement, not a completed change, so the verb stays plain;
-/// the project path is the identifier (cyan) and the parenthetical is secondary detail (dim).
-fn render_attaching_project(project: &Path, pal: &crate::style::Palette) -> String {
+/// Render the line `ops attach` prints before entering a live cage (stderr). Attaching is an
+/// announcement, not a completed change, so the verb stays plain; the session pid and label are the
+/// identifier (cyan) and the parenthetical is secondary detail (dim).
+fn render_attaching(pid: u32, label: &str, pal: &crate::style::Palette) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
     format!(
-        "ops: attaching a shell to {n}{}{r} {dim}(a second terminal in the same sandbox){r}",
-        project.display()
+        "ops: attaching to session {n}{pid}{r} ({n}{label}{r}) {dim}\
+         (a shell in its live cage — type `exit` to leave the agent running){r}"
     )
-}
-
-/// Render the line `ops attach` prints before opening a shell in an app's isolated environment
-/// (stderr). Same restraint as [`render_attaching_project`]: the app name is the identifier (cyan),
-/// the parenthetical secondary (dim), the verb plain.
-fn render_attaching_app(name: &str, pal: &crate::style::Palette) -> String {
-    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
-    format!("ops: attaching a shell to app `{n}{name}{r}` {dim}(its isolated home and posture){r}")
 }
 
 /// The name a launch shows in the graphical-app stop hint: the app name for an `ops app`, else the
@@ -1506,15 +1498,15 @@ fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> St
     )
 }
 
-/// `ops attach <id>`: open an interactive shell in a running session's environment — a second
-/// terminal sharing that session's persistent home and store (the deterministic per-project
-/// runtime), **not** a join of the running process (there is no setns). `<id>` is the PID `ops ls`
-/// shows. For a plain `ops run`/`ops shell` session that is the project's default home; for an
-/// `ops app` agent it is the app's isolated home plus the app's current posture (its egress
-/// allowlist, packages, and injected secrets), so attaching to a running agent drops you into the
-/// same environment it works in.
+/// `ops attach <id>`: join a *running* session's cage and open an interactive shell **inside** it —
+/// the agent's live processes, its real `/tmp`, its network — the way `docker exec -it` works.
+/// `<id>` is the PID `ops ls` shows. Unlike a launch, this enters namespaces bubblewrap already
+/// built (via `setns`), so it provisions nothing and re-resolves no config; it re-applies the cage's
+/// confinement to the joined shell (seccomp denylist + `no_new_privs` + capability drop) so the
+/// shell is confined at least as tightly as the agent. See [`super::attach`] for the mechanism and
+/// its one inherent residual (the shell binary comes from the agent's own mount namespace).
 pub(crate) fn attach(id: &str) -> ExitCode {
-    let Some(layout) = crate::store::Layout::from_env() else {
+    let Some(layout) = Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
@@ -1536,31 +1528,127 @@ pub(crate) fn attach(id: &str) -> ExitCode {
         eprintln!("ops: `ops attach` needs a terminal on stdin.");
         return ExitCode::from(2);
     }
-    let project = target.project;
-    let runtime = target.runtime;
 
-    // A new cage in the session's project: changing directory makes the launch resolve that
-    // project (and its config), exactly as if the user had `cd`'d there.
-    if let Err(e) = std::env::set_current_dir(&project) {
+    // Locate a live process inside the cage (the session pid is the cage's host-side anchor). A
+    // `None` here means the cage has no in-namespace process left — it exited between `ops ls` and
+    // now, or the host has no user namespaces (then it never had a cage).
+    let Some(cage_pid) = super::attach::find_cage_pid(target.pid) else {
         eprintln!(
-            "ops attach: the session's project is no longer reachable ({}): {e}",
-            project.display()
+            "ops attach: session '{id}' has no live process to enter — it may have just exited \
+             (run `ops ls`)."
         );
         return ExitCode::FAILURE;
-    }
-    let prep = match prepare() {
-        Ok(p) => p,
-        Err(code) => return code,
     };
-    match runtime {
-        session::SessionRuntime::Project => {
-            let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
-            eprintln!("{}", render_attaching_project(&project, &epal));
-            launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
+    let cage = match super::attach::open_cage_handle(cage_pid) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("ops attach: cannot open a handle to session '{id}''s cage: {e}");
+            return ExitCode::FAILURE;
         }
-        session::SessionRuntime::GlobalApp(name) => attach_app_shell(prep, &name, true),
-        session::SessionRuntime::ProjectApp(name) => attach_app_shell(prep, &name, false),
+    };
+    let environ = super::attach::read_environ(cage_pid);
+
+    let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
+    eprintln!("{}", render_attaching(target.pid, &target.label(), &epal));
+
+    match supervise_attach(cage, &environ) {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => {
+            eprintln!("ops: attach session failed: {e}");
+            ExitCode::FAILURE
+        }
     }
+}
+
+/// Supervise a real attach: open a pty, fork a child that joins the cage's namespaces and execs a
+/// confined interactive shell inside it, and relay the terminal — the same pty machinery as
+/// [`supervise`], but the child enters an *existing* cage rather than launching a new one, so there
+/// is no bwrap argv, no cgroup scope, and no session record (the attach shell is a transient guest
+/// of the agent's cage, not a session of its own).
+fn supervise_attach(cage: super::attach::CageHandle, environ: &[u8]) -> io::Result<i32> {
+    // The baseline mandatory denylist — never a project's `[seccomp] allow` relaxation — so the
+    // joined shell is confined at least as tightly as the agent. Compiled before the fork.
+    let filters = super::seccomp::filter_bytes(&super::seccomp::SeccompPolicy::default());
+
+    // argv: an interactive bash reading the in-cage rc (mise activation + the `(ops-<slug>)` prompt),
+    // exactly like `ops shell`. `/bin/bash` and the rc are absolute cage paths that resolve in the
+    // cage's own mount namespace once the child has entered it. Built as C strings before the fork.
+    let argv_owned = [
+        cstring(binds::SANDBOX_BASH.as_bytes())?,
+        cstring(b"--rcfile")?,
+        cstring(binds::SHELL_RC_INCAGE.as_bytes())?,
+    ];
+    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // envp: the agent's own cage environment (its PATH, proxy, and CA settings), with TERM set to
+    // the attaching terminal's so rendering and resize match.
+    let term = std::env::var("TERM").ok();
+    let envp_owned = super::attach::build_env(environ, term.as_deref());
+    let mut envp: Vec<*const libc::c_char> = envp_owned.iter().map(|c| c.as_ptr()).collect();
+    envp.push(std::ptr::null());
+
+    // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
+    // the start (as `supervise` does).
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let winp = if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0 {
+        &ws as *const libc::winsize
+    } else {
+        std::ptr::null()
+    };
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            winp,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // The master must never reach the cage; the parent keeps it and never execs.
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFD);
+        libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    }
+
+    // SAFETY: between fork and exec the child calls only async-signal-safe code — `close`, then
+    // `attach::enter_and_exec`, which uses only raw syscalls — and argv/envp/filters/pidfd are all
+    // prebuilt above. The parent is single-threaded here (attach starts no egress proxy thread).
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        let e = io::Error::last_os_error();
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return Err(e);
+    }
+    if child == 0 {
+        unsafe {
+            libc::close(master);
+            super::attach::enter_and_exec(&cage, &filters, slave, argv.as_ptr(), envp.as_ptr());
+        }
+    }
+
+    // Parent: drop the slave and the cage handle (the child holds its own copies across the fork),
+    // keep the master, go raw, relay — identical to `supervise`'s tail (no GUI double-Ctrl+C here).
+    unsafe { libc::close(slave) };
+    drop(cage);
+    let _raw = RawMode::enable(0)?;
+    let winch = WinchRelay::install().ok();
+    if winch.is_some() {
+        copy_winsize(0, master);
+    }
+    let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
+    let status = pump(master, child, winch_fd, false);
+    drop(winch);
+    unsafe { libc::close(master) };
+    status
 }
 
 /// Render the `ops stop --all` line for an empty registry (stdout): nothing to stop is a no-op
@@ -1683,43 +1771,6 @@ fn stop_session(
         render_stop_outcome(target.pid, &target.label(), &outcome, grace, pal)
     );
     registry.reap(target);
-}
-
-/// Open an interactive shell in app `name`'s environment: its isolated home — kept by the
-/// session's recorded scope (`global_home`), where the agent's state actually lives — plus the
-/// app's current overlay posture (egress, packages, secrets), folded in by re-resolving the app
-/// from the project's config. Refuses if the app is no longer configured for this project, since
-/// its posture could not then be reproduced.
-///
-/// Residual: the posture is reproduced from the **current** config and trust, so if the project was
-/// untrusted or its config edited since the agent launched, the attach shell can get a different
-/// posture than the running agent (e.g. a since-dropped `network` allowlist). That is inherent to
-/// reproducing from current config; any security field the trust gate drops on re-resolution is
-/// surfaced as a warning by [`build`], so a weaker shell is never silent.
-fn attach_app_shell(mut prep: Prepared, name: &str, global_home: bool) -> ExitCode {
-    let Some(app) = prep.cfg.apps.remove(name) else {
-        eprintln!(
-            "ops attach: app `{name}` is no longer configured for this project — cannot reproduce \
-             its environment."
-        );
-        return ExitCode::FAILURE;
-    };
-    // The home is keyed by the record's scope (where the agent runs); the overlay — network,
-    // packages, secrets — comes from the app's current resolution.
-    prep.cfg.merge_app(app);
-    // An attached shell runs commands in the app's environment; it does not serve the app's
-    // forwarded port, and the running app session already holds that host port. Re-binding it here
-    // would clash (`Address already in use`), so drop the forward: the shell doesn't need it, and
-    // this lets `ops attach` coexist with the live session instead of fighting it for the port.
-    prep.cfg.forward.clear();
-    let runtime = if global_home {
-        binds::Runtime::GlobalApp(name)
-    } else {
-        binds::Runtime::ProjectApp(name)
-    };
-    let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
-    eprintln!("{}", render_attaching_app(name, &epal));
-    launch_interactive_shell(&prep, runtime)
 }
 
 /// Hard prerequisites + per-launch resolution shared by `run` and `shell`. Returns
@@ -3760,12 +3811,9 @@ mod tests {
         let p = crate::style::Palette::plain();
         let grace = Duration::from_secs(10);
         assert_eq!(
-            render_attaching_project(Path::new("/home/me/proj"), &p),
-            "ops: attaching a shell to /home/me/proj (a second terminal in the same sandbox)"
-        );
-        assert_eq!(
-            render_attaching_app("demo-app", &p),
-            "ops: attaching a shell to app `demo-app` (its isolated home and posture)"
+            render_attaching(4242, "app:demo-app", &p),
+            "ops: attaching to session 4242 (app:demo-app) \
+             (a shell in its live cage — type `exit` to leave the agent running)"
         );
         assert_eq!(
             render_no_active_sessions(&p),
@@ -3847,8 +3895,9 @@ mod tests {
         let killed = render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p);
         assert!(killed.contains(&format!("{}sent SIGKILL{}", p.warn, p.reset)));
 
-        let attach = render_attaching_app("demo-app", &p);
-        assert!(attach.contains(&format!("{}demo-app{}", p.name, p.reset)));
+        let attach = render_attaching(4242, "app:demo-app", &p);
+        assert!(attach.contains(&format!("{}4242{}", p.name, p.reset)));
+        assert!(attach.contains(&format!("{}app:demo-app{}", p.name, p.reset)));
         // The announcement verb is not green — only a completed change earns that.
         assert!(!attach.contains(&format!("{}attaching", p.ok)));
 

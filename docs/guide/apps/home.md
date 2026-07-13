@@ -57,10 +57,12 @@ rebuild). The credentials/login/identity you chose `"global"` *for* persist corr
 only tool self-equip is the caveat. The mitigation is `home_scope = "project"` (mise
 data and store both per-project, aligned).
 
-## Reproducing an app's environment
+## Inspecting a running app
 
 ```sh
-ops attach <id>     # open a shell in a running app session's isolated home
+ops attach <id>     # join the running app's cage and open a shell inside it
 ```
 
-See [`ops attach`](../cli/attach.md) and [Sessions](../housekeeping/sessions.md).
+`ops attach` enters the live cage (its processes, its real `/tmp`, its network, and the
+app's isolated home as the agent currently sees it) — not a fresh cage. See
+[`ops attach`](../cli/attach.md) and [Sessions](../housekeeping/sessions.md).

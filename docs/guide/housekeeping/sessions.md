@@ -33,13 +33,15 @@ derives its runtime id from — so the registry and the runtime never disagree.
 
 ```sh
 ops ls                 # the live sessions (app sessions show their app name)
-ops attach <id>        # open a shell in a session's environment
+ops attach <id>        # open a shell inside a session's live cage
 ops stop <id>          # SIGTERM, then SIGKILL after the grace delay
 ops stop --all         # every session
 ```
 
-- [`ops attach <id>`](../cli/attach.md) reproduces a session's environment — for an app,
-  its isolated [home](../apps/home.md).
+- [`ops attach <id>`](../cli/attach.md) joins the running cage and opens a shell **inside**
+  it (the agent's live processes, its real `/tmp`, its network) — like `docker exec -it`. The
+  shell re-applies the cage's confinement (seccomp denylist, `no_new_privs`, dropped
+  capabilities), so it is never a wider hole than the agent.
 - [`ops stop`](../cli/stop.md) tears down the whole cage subtree (SIGTERM → SIGKILL after
   `--delay`, default 10s).
 

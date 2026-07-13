@@ -4851,3 +4851,355 @@ fn host_cgroup_path(pid: u32) -> Option<String> {
         .find_map(|l| l.strip_prefix("0::"))
         .map(str::to_string)
 }
+
+/// True once `session_pid` has a descendant process in a *child* user namespace — i.e. the cage's
+/// bubblewrap has created its namespaces, so `ops attach` will find a live process to enter. Used to
+/// wait deterministically for the background cage to come up, rather than sleeping a fixed guess.
+fn cage_userns_ready(session_pid: u32) -> bool {
+    let host = std::fs::read_link("/proc/self/ns/user").ok();
+    let mut children: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // The ppid is the field after the `(comm)` group, so parse past the last `)`.
+            if let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) {
+                if let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) {
+                    children.entry(ppid).or_default().push(pid);
+                }
+            }
+        }
+    }
+    let mut queue = children.get(&session_pid).cloned().unwrap_or_default();
+    while let Some(pid) = queue.pop() {
+        let ns = std::fs::read_link(format!("/proc/{pid}/ns/user")).ok();
+        if ns.is_some() && ns != host {
+            return true;
+        }
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids);
+        }
+    }
+    false
+}
+
+/// `ops attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
+/// fresh cage that merely shares the home. Driven through a pty against a live background session,
+/// with two teeth:
+///  - **live cage, not a reopened one:** the joined shell reads a unique marker the agent wrote to
+///    the cage's own `/tmp` tmpfs. A fresh cage's tmpfs would be empty, so this fails for anything
+///    but a true join of the running cage's mount namespace.
+///  - **confinement re-applied over `setns` (the security ship-gate):** `setns` inherits none of the
+///    cage's confinement, so the joined shell must re-apply it. `/proc/self/status` shows
+///    `Seccomp: 2` with **both** filters loaded (`Seccomp_filters: 2` — the EPERM *and* the ENOSYS
+///    denylist, so a regression installing only one is caught even though the mode would still read
+///    2), `NoNewPrivs: 1`, and an empty `CapEff` — a regression that skipped the re-application would
+///    read `Seccomp: 0` / `NoNewPrivs: 0` and fail.
+///
+/// This proves the confinement is **present and active**, not that it *blocks* a given syscall: no
+/// base-toolset command triggers a denied syscall distinguishably (the same reason `sandbox::seccomp`
+/// owns the real-cage *enforcement* tests, on the identical baseline policy this path installs). So
+/// the teeth here are re-application + live-cage, not enforcement.
+///
+/// Skips (never fails) where the host cannot sandbox or the cage does not come up.
+#[test]
+fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    // A distinctive token the agent writes into the cage /tmp; it appears in the joined shell's
+    // output only if that shell truly shares the agent's live tmpfs.
+    const MARKER: &str = "ATTACH-LIVE-9c3f1a7e";
+    // Assembled at runtime from /proc inside the joined shell, so it can never leak in from the
+    // echoed command text — the assertion has real teeth on the re-applied confinement. The trailing
+    // `2` is `Seccomp_filters` (both denylists loaded, not just one).
+    const CONFINE: &str = "CONFINE=2-1-0000000000000000-2";
+
+    let project = TmpDir::new("attach-proj");
+    let data = TmpDir::new("attach-data");
+
+    // Capability probe (also warms the base userland so the background agent and the attach start
+    // fast). No config, no trust — a real attach provisions nothing and re-resolves no config.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping attach e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // A background agent: write the marker into the cage's own /tmp, then sleep so the cage stays
+    // alive to be attached. `child.id()` is the session pid `ops ls`/`ops attach` use.
+    let mut agent = ops()
+        .args(["run", "--"])
+        .args([
+            "sh",
+            "-c",
+            &format!("echo {MARKER} > /tmp/attach-marker; exec sleep 120"),
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the background ops run");
+    let session_pid = agent.id();
+
+    // Wait deterministically for the cage's namespaces to exist before attaching.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !cage_userns_ready(session_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    if !cage_userns_ready(session_pid) {
+        let _ = agent.kill();
+        let _ = agent.wait();
+        eprintln!("skipping attach e2e: the background cage never came up (userns not created)");
+        return;
+    }
+
+    // Drive `ops attach` through a pty (it needs a real terminal on stdin), exactly like the
+    // `ops shell` supervisor test.
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+
+    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    let mut attach = ops()
+        .args(["attach", &session_pid.to_string()])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .spawn()
+        .expect("spawn ops attach");
+    unsafe { libc::close(slave) };
+
+    // Read the agent's live marker; assemble the confinement triple from /proc (so it cannot come
+    // from the echoed command); then leave. `awk` and `cat` are in the cage's base toolset.
+    let script = b"cat /tmp/attach-marker\n\
+        awk '/^Seccomp:/{s=$2}/^Seccomp_filters:/{f=$2}/^NoNewPrivs:/{n=$2}/^CapEff:/{c=$2}END{print \"CONFINE=\" s \"-\" n \"-\" c \"-\" f}' /proc/self/status\n\
+        exit\n";
+
+    // Send the script once the cage prompt appears (its PS1 ends in `$`), then read until the
+    // session ends (master EIO) or a deadline — the same wait-for-prompt pattern the shell test uses.
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut sent = false;
+    let read_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < read_deadline {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break; // EIO/EOF: the attach session ended
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        if !sent && out.contains(&b'$') {
+            unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
+            sent = true;
+        }
+    }
+    unsafe { libc::close(master) };
+    let _ = attach.kill();
+    let _ = attach.wait();
+    let _ = agent.kill();
+    let _ = agent.wait();
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains(MARKER),
+        "the joined shell did not see the agent's live /tmp marker — it is not inside the running \
+         cage (a fresh cage's tmpfs would be empty):\n{text}"
+    );
+    assert!(
+        text.contains(CONFINE),
+        "the joined shell's confinement was not re-applied — want Seccomp 2 (both filters) / \
+         NoNewPrivs 1 / empty CapEff ({CONFINE}); a shell entered without re-applying it reads \
+         Seccomp 0 / NoNewPrivs 0:\n{text}"
+    );
+}
+
+/// Ending a session tears down every shell attached to it. `ops attach` runs the shell **inside**
+/// the cage's pid namespace, so when the cage's init (bubblewrap, pid 1 of that namespace) dies —
+/// here via `ops stop` — the kernel SIGKILLs every process in the namespace, the attached shell
+/// included. So an attached shell can neither outlive nor keep alive the agent it joined. (The same
+/// pid-namespace-collapse mechanism fires when the agent exits on its own; `ops stop` is the
+/// deterministic trigger to assert on.)
+///
+/// Teeth: with a shell attached and confirmed live, `ops stop <session>` must make the `ops attach`
+/// process exit **on its own** (the SIGKILL of its in-cage shell ends its pty relay) — the test polls
+/// `try_wait` and never kills it, so a survivor is a real failure (a regression where the attached
+/// shell escaped the cage's pid namespace). Skips where the host cannot sandbox.
+#[test]
+fn ending_a_session_kills_a_shell_attached_to_it() {
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let project = TmpDir::new("attachkill-proj");
+    let data = TmpDir::new("attachkill-data");
+    let state = TmpDir::new("attachkill-state");
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping attach-kill e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // A background agent to attach to.
+    let mut agent = ops()
+        .args(["run", "--", "sleep", "120"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the background ops run");
+    let session_pid = agent.id();
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !cage_userns_ready(session_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    if !cage_userns_ready(session_pid) {
+        let _ = agent.kill();
+        let _ = agent.wait();
+        eprintln!("skipping attach-kill e2e: the background cage never came up");
+        return;
+    }
+
+    // Attach a shell under a pty.
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    let mut attach = ops()
+        .args(["attach", &session_pid.to_string()])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .spawn()
+        .expect("spawn ops attach");
+    unsafe { libc::close(slave) };
+
+    // Confirm the attached shell is really live before killing the session — a runtime-assembled
+    // sentinel (`ALIVE-42` from shell arithmetic) that can never come from the echoed command text.
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut sent = false;
+    let confirm_deadline = Instant::now() + Duration::from_secs(30);
+    let mut confirmed = false;
+    while Instant::now() < confirm_deadline && !confirmed {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        if !sent && out.contains(&b'$') {
+            let cmd = b"echo ALIVE-$((6 * 7))\n";
+            unsafe { libc::write(master, cmd.as_ptr().cast(), cmd.len()) };
+            sent = true;
+        }
+        confirmed = String::from_utf8_lossy(&out).contains("ALIVE-42");
+    }
+    if !confirmed {
+        unsafe { libc::close(master) };
+        let _ = attach.kill();
+        let _ = attach.wait();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        panic!(
+            "the attached shell never came up, cannot test its teardown:\n{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    // End the session. The attached shell is in its pid namespace, so it must die with it.
+    let stop = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["stop", &session_pid.to_string()],
+    );
+    assert!(
+        stop.status.success(),
+        "ops stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    // The `ops attach` process must now exit on its own: the pid-namespace collapse SIGKILLs its
+    // in-cage shell, ending the pty relay. Poll `try_wait` (master still open, so it is the session's
+    // death — not our cleanup — that ends it); never `kill()`, so a survivor is a real failure.
+    let kill_deadline = Instant::now() + Duration::from_secs(15);
+    let mut attach_exited = false;
+    while Instant::now() < kill_deadline {
+        // Drain the pty so the relay never blocks on a full master while we wait.
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 100) } > 0 {
+            let _ = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        }
+        if matches!(attach.try_wait(), Ok(Some(_))) {
+            attach_exited = true;
+            break;
+        }
+    }
+    unsafe { libc::close(master) };
+    // Reap both children on every path (a survivor is force-killed first), so the test leaves no
+    // process behind whether it passes or fails.
+    if !attach_exited {
+        let _ = attach.kill();
+    }
+    let _ = attach.wait();
+    let _ = agent.wait();
+    assert!(
+        attach_exited,
+        "`ops attach` outlived the session it joined — the attached shell escaped the cage's pid \
+         namespace instead of being killed with it"
+    );
+}

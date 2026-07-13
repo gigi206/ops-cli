@@ -7,6 +7,7 @@
 //! place — a security review has a single surface to audit.
 
 mod argv;
+mod attach;
 mod audio;
 mod binds;
 mod catrust;

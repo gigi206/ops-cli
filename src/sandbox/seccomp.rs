@@ -331,6 +331,50 @@ pub(crate) fn argv_prefix(memfds: &[File]) -> Vec<OsString> {
     a
 }
 
+/// The compiled denylist filters (serialized cBPF) for `policy`, in load order — the
+/// same bytes [`memfds`] hands to bwrap, exposed for direct in-process installation
+/// by [`install_filters`]. `ops attach` needs this because, entering an existing
+/// cage's namespaces, there is no bwrap to load the filters for it.
+pub(crate) fn filter_bytes(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
+    programs(policy)
+}
+
+/// `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, …)` — the classic filter install
+/// (`SECCOMP_MODE_STRICT` is 1, `SECCOMP_MODE_FILTER` is 2).
+const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+
+/// Install each compiled filter on the *calling thread* via `prctl`, stacking them
+/// exactly as bwrap's two `--add-seccomp-fd` do (a non-matching filter yields
+/// *allow*, an `errno` action outranks it). Returns `false` on the first failure.
+///
+/// Async-signal-safe: called between `fork` and `exec` (in `ops attach`'s cage-entry
+/// child), it only reads the prebuilt bytes and builds a `sock_fprog` on the stack —
+/// no allocation. The caller MUST have set `PR_SET_NO_NEW_PRIVS` first, or an
+/// unprivileged install is refused with `EACCES`.
+pub(crate) fn install_filters(filters: &[Vec<u8>]) -> bool {
+    for bytes in filters {
+        // Each cBPF instruction serializes to 8 bytes (see `serialize`).
+        let prog = libc::sock_fprog {
+            len: (bytes.len() / 8) as libc::c_ushort,
+            filter: bytes.as_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: `prog` is a valid `sock_fprog` for the duration of the call, and
+        // `PR_SET_SECCOMP` with `SECCOMP_MODE_FILTER` reads it to install the filter
+        // on the current thread. No memory is retained past the call.
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                SECCOMP_MODE_FILTER,
+                &prog as *const libc::sock_fprog,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// A resolved relaxation of the mandatory denylist: which denied syscalls (or argument-filtered
 /// sub-rules) a trusted `[seccomp] allow` re-permits. The **default is empty** — the full
 /// mandatory denylist, byte-identical to a cage with no `[seccomp]` config. Only a trusted config

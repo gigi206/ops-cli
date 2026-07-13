@@ -305,11 +305,15 @@ const PAGES: &[Page] = &[
     Page {
         path: &["attach"],
         synopsis: "ops attach <id>",
-        summary: "open a shell in a running session's environment",
+        summary: "open a shell inside a running session's live cage",
         options: &[("<id>", "the PID `ops ls` shows for the session")],
         details:
-            "Opens a shell in a running session's environment. For an app session, that is the\n\
-            app's isolated environment.",
+            "Joins the running cage and opens an interactive shell inside it — the agent's live\n\
+            processes, its real /tmp, and its network, the way `docker exec -it` does. The shell\n\
+            re-applies the cage's confinement — the same seccomp denylist, no_new_privs, and\n\
+            dropped capabilities — so it is never a wider hole than the agent. Provisions nothing\n\
+            and reads no config; needs a live session (run `ops ls`). Type `exit` to leave — the\n\
+            agent keeps running.",
     },
     Page {
         path: &["stop"],
