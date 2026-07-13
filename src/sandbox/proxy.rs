@@ -63,7 +63,7 @@
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target |
-//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing |
+//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is not a routable `http://` absolute-form (a bare origin-form or a non-`http` scheme has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
@@ -1135,12 +1135,48 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             "the tunneled request target must be origin-form (a path)",
         );
     }
-    // Anti request-smuggling, fail-closed: a Transfer-Encoding at all (no chunked framing in this
-    // slice), or a duplicated Content-Length / Host — each a classic request-desync vector.
-    if inner.header("transfer-encoding").is_some()
-        || inner.count("content-length") > 1
-        || inner.count("host") > 1
-    {
+    // Anti request-smuggling, fail-closed. A duplicated Content-Length or Host is an unambiguous
+    // desync vector and is refused outright. A `Transfer-Encoding` is refused UNLESS it is exactly
+    // `chunked` — the one streaming coding the proxy de-chunks and re-frames with a synthesized
+    // Content-Length below (so no CL/TE ambiguity reaches the upstream); any other TE coding is
+    // unsupported and refused.
+    let te = inner.header("transfer-encoding");
+    let cl_count = inner.count("content-length");
+    let host_count = inner.count("host");
+    let chunked = match te.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("chunked") => true,
+        Some(_) => {
+            ctx.push_log(
+                super::control::Proto::Https,
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                super::control::LogVerdict::Blocked,
+                "bad-request:transfer-encoding",
+            );
+            return respond_refusal_tls(
+                &mut br,
+                "400 Bad Request",
+                "bad-request:transfer-encoding",
+                "the request carries a Transfer-Encoding coding other than `chunked`, which this \
+                 egress proxy does not forward",
+            );
+        }
+        None => false,
+    };
+    if cl_count > 1 || host_count > 1 {
+        let (reason, detail) = if cl_count > 1 {
+            (
+                "bad-request:dup-content-length",
+                "the request carries a duplicated Content-Length header",
+            )
+        } else {
+            (
+                "bad-request:dup-host",
+                "the request carries a duplicated Host header",
+            )
+        };
         ctx.push_log(
             super::control::Proto::Https,
             &connect_host,
@@ -1148,38 +1184,38 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             Some(&imethod),
             Some(&itarget),
             super::control::LogVerdict::Blocked,
-            "bad-request",
+            reason,
         );
-        return respond_refusal_tls(
-            &mut br,
-            "400 Bad Request",
-            "bad-request",
-            "the request has ambiguous framing (Transfer-Encoding, or a duplicated \
-             Content-Length or Host)",
-        );
+        return respond_refusal_tls(&mut br, "400 Bad Request", reason, detail);
     }
-    let body_len: u64 = match inner.header("content-length") {
-        Some(v) => match v.trim().parse() {
-            Ok(n) => n,
-            Err(_) => {
-                ctx.push_log(
-                    super::control::Proto::Https,
-                    &connect_host,
-                    port,
-                    Some(&imethod),
-                    Some(&itarget),
-                    super::control::LogVerdict::Blocked,
-                    "bad-request",
-                );
-                return respond_refusal_tls(
-                    &mut br,
-                    "400 Bad Request",
-                    "bad-request",
-                    "the Content-Length header is not a valid number",
-                );
-            }
-        },
-        None => 0,
+    // The body length is known up-front only for a Content-Length-framed request; a `chunked`
+    // request's length is discovered by de-chunking below, so no Content-Length is parsed here.
+    let body_len: u64 = if chunked {
+        0
+    } else {
+        match inner.header("content-length") {
+            Some(v) => match v.trim().parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    ctx.push_log(
+                        super::control::Proto::Https,
+                        &connect_host,
+                        port,
+                        Some(&imethod),
+                        Some(&itarget),
+                        super::control::LogVerdict::Blocked,
+                        "bad-request:invalid-content-length",
+                    );
+                    return respond_refusal_tls(
+                        &mut br,
+                        "400 Bad Request",
+                        "bad-request:invalid-content-length",
+                        "the Content-Length header is not a valid number",
+                    );
+                }
+            },
+            None => 0,
+        }
     };
 
     // CONNECT-host == Host header (== SNI, already checked): the decrypted Host must agree too.
@@ -1520,18 +1556,61 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    request is never forwarded, so it cannot skip the per-request check. The head is
     //    reserialized with `Connection: close` forced so a keep-alive upstream closes after the
     //    one response (otherwise there is no EOF and the read would block until the timeout).
-    upstream.write_all(&reserialize_request(&inner, &injected))?;
-    // If the client announced `Expect: 100-continue` it withholds the body until it sees a 100.
-    // The request is already permitted and the upstream is up, so answer the continue now — else
-    // `copy_exact` below would block reading a body the client will not send, until the timeout.
-    // `Expect` is stripped from the forwarded head (see `reserialize_request`), so the upstream does
-    // not run the handshake a second time.
-    if body_len > 0 && head_expects_continue(&inner) {
-        let client = br.get_mut();
-        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-        let _ = client.flush();
+    if chunked {
+        // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and
+        // forward a clean `Content-Length`-framed request (the `Transfer-Encoding` header is
+        // stripped by `reserialize_request` when a length is forced), so no chunked framing — and
+        // no CL/TE request-smuggling ambiguity — reaches the upstream. The cap bounds memory for
+        // an agent prompt body (KB–MB); a larger chunked upload fails closed.
+        //
+        // Answer a client `Expect: 100-continue` before reading, else it withholds the body. A
+        // de-chunk failure (malformed framing, or over the cap) is fail-closed: log + refuse 400
+        // (the interim 100 already sent is harmless — a final 4xx may follow it on one connection).
+        if head_expects_continue(&inner) {
+            let client = br.get_mut();
+            let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = client.flush();
+        }
+        let body = match read_chunked_body(&mut br, CHUNKED_REQUEST_CAP) {
+            Ok(b) => b,
+            Err(e) => {
+                ctx.push_log(
+                    super::control::Proto::Https,
+                    &connect_host,
+                    port,
+                    Some(&imethod),
+                    Some(&itarget),
+                    super::control::LogVerdict::Blocked,
+                    "bad-request:chunked",
+                );
+                return respond_refusal_tls(
+                    &mut br,
+                    "400 Bad Request",
+                    "bad-request:chunked",
+                    &format!("the chunked request body could not be read: {e}"),
+                );
+            }
+        };
+        upstream.write_all(&reserialize_request(
+            &inner,
+            &injected,
+            Some(body.len() as u64),
+        ))?;
+        upstream.write_all(&body)?;
+    } else {
+        upstream.write_all(&reserialize_request(&inner, &injected, None))?;
+        // If the client announced `Expect: 100-continue` it withholds the body until it sees a 100.
+        // The request is already permitted and the upstream is up, so answer the continue now — else
+        // `copy_exact` below would block reading a body the client will not send, until the timeout.
+        // `Expect` is stripped from the forwarded head (see `reserialize_request`), so the upstream
+        // does not run the handshake a second time.
+        if body_len > 0 && head_expects_continue(&inner) {
+            let client = br.get_mut();
+            let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = client.flush();
+        }
+        copy_exact(&mut br, &mut upstream, body_len)?;
     }
-    copy_exact(&mut br, &mut upstream, body_len)?;
     upstream.flush().ok();
 
     // The request is permitted and fully forwarded; the response may now idle between bursts (a
@@ -2112,7 +2191,7 @@ fn handle_cleartext(
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),
     };
-    upstream.write_all(&reserialize_request(&origin, &[]))?;
+    upstream.write_all(&reserialize_request(&origin, &[], None))?;
     if body_len > 0 && head_expects_continue(head) {
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
         let _ = client.flush();
@@ -2290,7 +2369,11 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// dropped, then ops's value is appended. The agent in the cage is the adversary, so it must never
 /// be able to leave its own copy of an injected header alongside ops's (which a permissive proxy
 /// would forward as a second, attacker-controlled value).
-fn reserialize_request(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
+fn reserialize_request(
+    head: &Head,
+    injections: &[(&str, &str)],
+    force_content_length: Option<u64>,
+) -> Vec<u8> {
     let mut out = String::with_capacity(head.request_line.len() + 64);
     out.push_str(&head.request_line);
     out.push_str("\r\n");
@@ -2308,6 +2391,15 @@ fn reserialize_request(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
         if injections.iter().any(|(name, _)| header_name_eq(k, name)) {
             continue;
         }
+        // A chunked request is re-framed with a synthesized Content-Length below, so drop the
+        // client's Transfer-Encoding and any client Content-Length (the forced value is the only
+        // one the upstream sees — no CL/TE smuggling ambiguity can reach it).
+        if force_content_length.is_some()
+            && (k.eq_ignore_ascii_case("transfer-encoding")
+                || k.eq_ignore_ascii_case("content-length"))
+        {
+            continue;
+        }
         out.push_str(k);
         out.push_str(": ");
         out.push_str(v);
@@ -2317,6 +2409,11 @@ fn reserialize_request(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
         out.push_str(name);
         out.push_str(": ");
         out.push_str(value);
+        out.push_str("\r\n");
+    }
+    if let Some(n) = force_content_length {
+        out.push_str("Content-Length: ");
+        out.push_str(&n.to_string());
         out.push_str("\r\n");
     }
     out.push_str("Connection: close\r\n\r\n");
@@ -2696,6 +2793,107 @@ fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result
         n -= got as u64;
     }
     Ok(())
+}
+
+/// The most request body the proxy will buffer to de-chunk a `Transfer-Encoding: chunked` request
+/// before re-framing it with a synthesized Content-Length. Agent prompt bodies are KB–MB, so 64 MiB
+/// is generous; a larger chunked upload fails closed (the proxy does not stream chunked through).
+const CHUNKED_REQUEST_CAP: u64 = 64 * 1024 * 1024;
+
+/// The most one chunk-size line (or one trailer line) may be before it is refused. A chunk-size
+/// line is a hex count plus optional `;extensions`; a trailer is one header — both are short, so 8
+/// KiB is generous. Without this bound a bare `read_until` would buffer an arbitrarily long
+/// no-newline flood *before* any size check, letting an in-cage client force unbounded host-side
+/// allocation (this proxy runs outside the cage's cgroup) — the same footgun `read_head_buffered`
+/// caps.
+const CHUNK_LINE_MAX: u64 = 8 * 1024;
+
+/// De-chunk a `Transfer-Encoding: chunked` request body into one buffer, fail-closed on malformed
+/// framing (a non-hex chunk size, a short data read, a missing trailing CRLF) or a body over
+/// [`CHUNKED_REQUEST_CAP`]. The caller re-frames the result with a synthesized `Content-Length`
+/// (stripping `Transfer-Encoding`), so the upstream receives one unambiguous Content-Length and no
+/// TE — no CL/TE request-smuggling ambiguity can reach it. Trailers after the zero chunk are read
+/// and discarded (the proxy does not forward them; they are not part of any secret-tripwire path).
+fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    loop {
+        let size = read_chunk_size_line(r)?;
+        if size == 0 {
+            // trailers (if any) end at a blank line; read until it, each trailer line bounded.
+            loop {
+                let t = read_line_bounded(r, CHUNK_LINE_MAX)?;
+                if t.is_empty() || strip_eol(&t).is_empty() {
+                    break;
+                }
+            }
+            return Ok(buf);
+        }
+        // `checked_add` so a crafted `ffffffffffffffff` (u64::MAX) size cannot overflow the running
+        // total and slip past the cap (which would then panic in `resize`/the slice below).
+        let start = buf.len();
+        if (start as u64)
+            .checked_add(size)
+            .is_none_or(|total| total > cap)
+        {
+            return Err(invalid("chunked request body exceeds the proxy cap"));
+        }
+        buf.resize(start + size as usize, 0);
+        r.read_exact(&mut buf[start..])?;
+        let mut crlf = [0u8; 2];
+        r.read_exact(&mut crlf)?;
+        if crlf != [b'\r', b'\n'] {
+            return Err(invalid("chunk data not followed by CRLF"));
+        }
+    }
+}
+
+/// Read one `\n`-terminated line, bounded to `max` bytes (a no-newline flood over the bound is a
+/// hard error, not unbounded buffering — mirrors `read_head_buffered`). Returns the line including
+/// its terminator; an empty return means EOF before any byte.
+fn read_line_bounded<R: BufRead>(r: &mut R, max: u64) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    // +1 so a line of exactly `max` bytes plus its terminator is distinguishable from an overflow.
+    let n = r.take(max + 1).read_until(b'\n', &mut line)?;
+    if n == 0 {
+        return Ok(line);
+    }
+    if line.len() as u64 > max {
+        return Err(invalid("chunked framing line too long"));
+    }
+    Ok(line)
+}
+
+/// Read one chunk-size line (hex, optionally followed by `;extensions`), parse the size, and
+/// require a CRLF/LF terminator so an EOF mid-line is a malformed-body error, not a silent short
+/// read. The line is length-bounded (see [`read_line_bounded`]).
+fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
+    let line = read_line_bounded(r, CHUNK_LINE_MAX)?;
+    if line.is_empty() {
+        return Err(invalid("chunked body ended before a chunk size"));
+    }
+    if !line.ends_with(b"\n") {
+        return Err(invalid("chunk size line has no line terminator"));
+    }
+    let s = strip_eol(&line);
+    let size_field = match s.iter().position(|&b| b == b';') {
+        Some(i) => &s[..i],
+        None => s,
+    };
+    let size_str =
+        std::str::from_utf8(size_field).map_err(|_| invalid("chunk size is not ASCII"))?;
+    u64::from_str_radix(size_str.trim(), 16).map_err(|_| invalid("chunk size is not hexadecimal"))
+}
+
+/// Drop a trailing `\r\n` (or a lone `\n`) from a line read with `read_until(b'\n')`.
+fn strip_eol(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && line[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// Enter the response-streaming phase of an inspected (L7) request: lift the per-read timeout on
@@ -4686,12 +4884,90 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_framing_is_refused_with_400_before_the_policy_check() {
-        // Transfer-Encoding, or a duplicated Content-Length / Host, is a classic request-desync
-        // vector — refused fail-closed at the proxy, before policy/resolve (the resolver panics if
-        // reached, so the guard is proven to precede it).
+    fn read_chunked_body_dechunks_a_well_formed_body() {
+        // one chunk + the terminating zero chunk, with a chunk extension on the size line (ignored).
+        let body = std::io::Cursor::new(b"b\r\nhello world\r\n0\r\n\r\n".to_vec());
+        let mut br = std::io::BufReader::new(body);
+        let out = read_chunked_body(&mut br, 1024).unwrap();
+        assert_eq!(
+            out, b"hello world",
+            "de-chunked body is the chunk data alone"
+        );
+    }
+
+    #[test]
+    fn read_chunked_body_concatenates_multiple_chunks_and_strips_trailers() {
+        // two chunks then a trailer section (discarded) then the final blank line.
+        let body = std::io::Cursor::new(
+            b"5\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: yes\r\n\r\n".to_vec(),
+        );
+        let mut br = std::io::BufReader::new(body);
+        let out = read_chunked_body(&mut br, 1024).unwrap();
+        assert_eq!(
+            out, b"hello world",
+            "chunks concatenate; trailers are not in the body"
+        );
+    }
+
+    #[test]
+    fn read_chunked_body_fails_closed_on_malformed_framing() {
+        // a non-hex chunk size
+        let mut br =
+            std::io::BufReader::new(std::io::Cursor::new(b"zz\r\nx\r\n0\r\n\r\n".to_vec()));
+        let err = read_chunked_body(&mut br, 1024).unwrap_err();
+        assert!(err.to_string().contains("not hexadecimal"), "{err}");
+        // chunk data not followed by CRLF
+        let mut br =
+            std::io::BufReader::new(std::io::Cursor::new(b"5\r\nhelloXX\r\n0\r\n\r\n".to_vec()));
+        let err = read_chunked_body(&mut br, 1024).unwrap_err();
+        assert!(err.to_string().contains("CRLF"), "{err}");
+        // the body ends before a chunk size (EOF mid-frame)
+        let mut br = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+        let err = read_chunked_body(&mut br, 1024).unwrap_err();
+        assert!(err.to_string().contains("ended before"), "{err}");
+        // a chunk size line with no terminator (truncated)
+        let mut br = std::io::BufReader::new(std::io::Cursor::new(b"5".to_vec()));
+        let err = read_chunked_body(&mut br, 1024).unwrap_err();
+        assert!(err.to_string().contains("no line terminator"), "{err}");
+    }
+
+    #[test]
+    fn read_chunked_body_fails_closed_when_the_body_exceeds_the_cap() {
+        // a single chunk claiming more than the cap is refused before any oversized allocation.
+        let mut br = std::io::BufReader::new(std::io::Cursor::new(b"ffffff\r\n".to_vec()));
+        let err = read_chunked_body(&mut br, 64).unwrap_err();
+        assert!(err.to_string().contains("exceeds the proxy cap"), "{err}");
+    }
+
+    #[test]
+    fn read_chunked_body_does_not_overflow_on_a_max_u64_chunk_size() {
+        // A running-total overflow: a small first chunk, then a size line of `u64::MAX` (16 hex
+        // digits). `buf.len() + size` would overflow — checked_add refuses it (else it panics in
+        // resize/the slice). The cap check must catch it as an over-cap error, never panic.
+        let mut br = std::io::BufReader::new(std::io::Cursor::new(
+            b"1\r\nX\r\nffffffffffffffff\r\n".to_vec(),
+        ));
+        let err = read_chunked_body(&mut br, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds the proxy cap"), "{err}");
+    }
+
+    #[test]
+    fn read_chunked_body_bounds_a_no_newline_size_line_flood() {
+        // A chunk-size line with no terminator and more than CHUNK_LINE_MAX bytes must be a hard
+        // error (bounded), not unbounded host-side buffering.
+        let flood = vec![b'a'; (CHUNK_LINE_MAX + 4096) as usize];
+        let mut br = std::io::BufReader::new(std::io::Cursor::new(flood));
+        let err = read_chunked_body(&mut br, 64 * 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn duplicated_framing_headers_are_refused_with_400_before_the_policy_check() {
+        // A duplicated Content-Length or Host is a classic request-desync vector — refused
+        // fail-closed at the proxy, before policy/resolve (the resolver panics if reached, so the
+        // guard is proven to precede it). (`Transfer-Encoding: chunked` is NOT refused here — it is
+        // de-chunked and re-framed; see `a_chunked_request_body_is_dechunked_and_reframed`.)
         for req in [
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
             b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".to_vec(),
             b"GET / HTTP/1.1\r\nHost: allowed.test\r\nHost: evil.test\r\nConnection: close\r\n\r\n".to_vec(),
         ] {
@@ -4718,6 +4994,163 @@ mod tests {
                 "expected a 400 bad-request framing refusal: {resp:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_non_chunked_transfer_encoding_is_refused() {
+        // `Transfer-Encoding` codings other than `chunked` are not supported (the proxy de-chunks
+        // only `chunked`); anything else is refused fail-closed before policy.
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a framing refusal")
+                })),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "allowed.test",
+            "allowed.test",
+            8443,
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("400") && resp.contains("bad-request:transfer-encoding"),
+            "an unsupported Transfer-Encoding coding must be refused: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunked_request_body_is_dechunked_and_reframed_with_content_length() {
+        // A streaming client (e.g. agy's `POST /v1internal:streamGenerateContent`) sends
+        // `Transfer-Encoding: chunked` with no Content-Length. The proxy de-chunks the body and
+        // re-frames the request with a synthesized Content-Length, stripping Transfer-Encoding — so
+        // the upstream sees one unambiguous CL-framed request (no CL/TE smuggling ambiguity) and the
+        // response is relayed. The captured upstream head is the proof.
+        let body = b"hello world";
+        let chunked = format!(
+            "POST /v1internal:streamGenerateContent HTTP/1.1\r\n\
+             Host: chunked.test\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n\
+             {size:x}\r\n{data}\r\n0\r\n\r\n",
+            size = body.len(),
+            data = std::str::from_utf8(body).unwrap(),
+        );
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["chunked.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "chunked.test",
+            "chunked.test",
+            addr.port(),
+            chunked.as_bytes(),
+        )
+        .unwrap();
+        let head = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the upstream must receive the forwarded request");
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "the upstream head must carry the synthesized Content-Length (re-framed): {head:?}"
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("transfer-encoding"),
+            "the upstream head must NOT carry Transfer-Encoding (de-chunked, not forwarded): {head:?}"
+        );
+        assert!(
+            resp.contains("200 OK"),
+            "the upstream response must be relayed back: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunked_request_carrying_a_content_length_is_reframed_without_ambiguity() {
+        // The canonical CL.TE/TE.CL request-smuggling vector: the client sends BOTH
+        // `Transfer-Encoding: chunked` and a (misleading) `Content-Length`. The proxy must resolve
+        // it deterministically — chunked wins, the body is de-chunked, and the upstream sees ONE
+        // synthesized Content-Length (the real de-chunked length) and NO Transfer-Encoding and NOT
+        // the client's bogus Content-Length. So no desync can reach the upstream.
+        let body = b"hello world";
+        let chunked = format!(
+            "POST /v1internal:streamGenerateContent HTTP/1.1\r\n\
+             Host: smug.test\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Content-Length: 3\r\n\
+             Connection: close\r\n\r\n\
+             {size:x}\r\n{data}\r\n0\r\n\r\n",
+            size = body.len(),
+            data = std::str::from_utf8(body).unwrap(),
+        );
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["smug.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "smug.test",
+            "smug.test",
+            addr.port(),
+            chunked.as_bytes(),
+        )
+        .unwrap();
+        let head = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the upstream must receive the forwarded request");
+        // exactly one Content-Length, and it is the real de-chunked length (not the client's `3`).
+        assert_eq!(
+            head.to_ascii_lowercase().matches("content-length:").count(),
+            1,
+            "the upstream head must carry exactly one Content-Length: {head:?}"
+        );
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "the one Content-Length must be the de-chunked length, not the client's bogus 3: {head:?}"
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("transfer-encoding"),
+            "the upstream head must NOT carry Transfer-Encoding: {head:?}"
+        );
+        assert!(
+            resp.contains("200 OK"),
+            "the response must be relayed: {resp:?}"
+        );
     }
 
     /// Under the `ask` posture an undecided request parks; an out-of-band `allow` lets it proceed
@@ -5786,6 +6219,7 @@ mod tests {
         let out = reserialize_request(
             &head,
             &[("Authorization", "Bearer ops"), ("X-Api-Key", "K")],
+            None,
         );
         let s = String::from_utf8(out).unwrap();
         assert_eq!(

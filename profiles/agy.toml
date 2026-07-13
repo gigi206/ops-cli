@@ -74,6 +74,9 @@ allow = [
     # Google Sign-In profile lookup — the OAuth userinfo endpoint the login flow reads after the
     # token exchange. Path-scoped to the OAuth namespace (www.googleapis.com hosts many other APIs).
     "{GET} https://www.googleapis.com/oauth2/*",
+    # The profile photo URL returned by userinfo points here — the login flow fetches the actual
+    # avatar bytes (GET /a/<id>=s96-c) from Google's image CDN.
+    "{GET} https://lh3.googleusercontent.com",
     # The binary's background self-updater (a Google Cloud Run host) — a signed-binary download.
     "{GET} https://antigravity-cli-auto-updater-974169037036.us-central1.run.app",
     # Docs / bootstrap — a read-only fetch.
