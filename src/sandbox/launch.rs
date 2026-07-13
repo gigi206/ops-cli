@@ -181,11 +181,13 @@ fn launch_foreground(
             eprintln!("ops: failed to launch the sandbox: {err}");
             ExitCode::FAILURE
         }
-        // A network allowlist, a forward forwarder, or a filtered D-Bus proxy: ops cannot
-        // exec-replace, because a host thread or child (the filtering proxy, the forward accept
-        // pumps, and/or the `xdg-dbus-proxy` process) must outlive the cage. Supervise instead — fork
-        // bwrap, wait, propagate the exit status — keeping them alive and the guard (which unlinks the
-        // sockets/CA and kills the dbus proxy) held for the whole session.
+        // A network allowlist, a forward forwarder, a filtered D-Bus proxy, or an in-cage portal:
+        // ops cannot exec-replace, because a host thread or child (the filtering proxy, the forward
+        // accept pumps, the `xdg-dbus-proxy` process) must outlive the cage, and the in-cage portal's
+        // host runtime directory must be cleaned up when the launch ends rather than leaked. Supervise
+        // instead — fork bwrap, wait, propagate the exit status — keeping them alive and the guard
+        // (which unlinks the sockets/CA, kills the dbus proxy, and removes the portal directory) held
+        // for the whole session.
         Some(guard) => {
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(guard);
@@ -1336,6 +1338,14 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         }
     }
 
+    // audio userspace roots under `audio = true`, same reason: gc keeps the client libraries and
+    // ALSA shim rather than collecting and re-provisioning them each launch.
+    if prep.cfg.audio {
+        if let Ok(layer) = super::audio::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            gui_roots.extend(layer.roots);
+        }
+    }
+
     // GSettings schema root under `gui = "wayland"`, same reason: gc keeps the compiled output.
     if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
         if let Ok(layer) = super::gschemas::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
@@ -1697,6 +1707,11 @@ fn attach_app_shell(mut prep: Prepared, name: &str, global_home: bool) -> ExitCo
     // The home is keyed by the record's scope (where the agent runs); the overlay — network,
     // packages, secrets — comes from the app's current resolution.
     prep.cfg.merge_app(app);
+    // An attached shell runs commands in the app's environment; it does not serve the app's
+    // forwarded port, and the running app session already holds that host port. Re-binding it here
+    // would clash (`Address already in use`), so drop the forward: the shell doesn't need it, and
+    // this lets `ops attach` coexist with the live session instead of fighting it for the port.
+    prep.cfg.forward.clear();
     let runtime = if global_home {
         binds::Runtime::GlobalApp(name)
     } else {
@@ -1873,6 +1888,16 @@ pub(crate) struct LaunchGuard {
     /// The filtered D-Bus proxy (`dbus = true`), when one is running. Like the egress proxy it must
     /// outlive the cage, so its presence forces the supervised path; dropping it kills the proxy.
     pub(crate) dbus: Option<super::dbus::DbusProxy>,
+    /// The in-cage desktop-notifications relay (`dbus = "incage"`), when one is running. It runs on a
+    /// host thread bridging the private bus to the host notifications daemon, so it must outlive the
+    /// cage; dropping it stops the thread. Dropped before `portal`, so it disconnects from the private
+    /// bus before the portal's host directory (and its socket) is removed.
+    pub(crate) notify: Option<super::notify_relay::NotifyRelay>,
+    /// The in-cage portal's host runtime directory (`dbus = "incage"`), when one is bound. The
+    /// private bus socket lives under it on the host, so it must be cleaned up when the launch ends
+    /// rather than leaked by an exec — its presence forces the supervised path; dropping it removes
+    /// the directory (socket and generated config).
+    pub(crate) portal: Option<super::portal::HostDir>,
 }
 
 impl LaunchGuard {
@@ -1900,6 +1925,14 @@ impl Drop for LaunchGuard {
         }
         if let Some(dbus) = self.dbus.take() {
             drop(dbus);
+        }
+        // Before the portal directory: the relay must disconnect from the private bus before its
+        // socket is removed.
+        if let Some(notify) = self.notify.take() {
+            drop(notify);
+        }
+        if let Some(portal) = self.portal.take() {
+            drop(portal);
         }
     }
 }
@@ -2046,11 +2079,36 @@ fn build(
     // Requires the Wayland display (the GTK backend renders through the compositor), so it is gated
     // on both. Unlike the filtered host bus, the private bus touches no host socket, so the network
     // posture does not gate it.
+    // The portal's host-side runtime directory, bound into the cage so the in-cage dbus-daemon's
+    // socket is reachable from the host (the notifications relay attaches there). Created alongside
+    // the provision so `portal` being `Some` implies the directory exists; a create failure drops the
+    // portal (fail-closed: no bus rather than a broken one). Held until the launch ends by the guard.
+    let mut portal_host: Option<super::portal::HostDir> = None;
+    let mut notify_relay: Option<super::notify_relay::NotifyRelay> = None;
     let portal = if prep.cfg.dbus.is_in_cage_portal()
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
     {
         match super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(p) => Some(p),
+            Ok(p) => match super::portal::HostDir::create(&prep.layout) {
+                Ok(hd) => {
+                    // Start the desktop-notifications relay against the private-bus socket the portal
+                    // exposes on the host. It waits for the in-cage dbus-daemon to create the socket,
+                    // then owns `org.freedesktop.Notifications` on the private bus and forwards to the
+                    // host daemon (re-emitting its signals back). Best-effort: no host bus or a socket
+                    // that never appears just leaves the app without notifications — the in-cage picker
+                    // and at-launch theme are unaffected.
+                    notify_relay = Some(super::notify_relay::NotifyRelay::start(hd.socket()));
+                    portal_host = Some(hd);
+                    Some(p)
+                }
+                Err(e) => {
+                    crate::diag::warn(&format!(
+                        "`dbus = \"incage\"` but the portal runtime directory could not be created \
+                         ({e}) — running without an in-cage file chooser"
+                    ));
+                    None
+                }
+            },
             Err(e) => {
                 crate::diag::warn(&format!(
                     "`dbus = \"incage\"` but the in-cage portal could not be provisioned ({e}) — \
@@ -2115,14 +2173,37 @@ fn build(
         None
     };
 
-    // The GUI-hole store roots to seed: the fonts plus (when present) certutil and mesa, so the
-    // cage reads them all through `/nix`.
+    // Under `audio = true`, provision the PulseAudio client library (`libpulse.so.0`) host-side so
+    // the cage can open capture/playback streams. Provisioned here — before the seed — so its store
+    // root joins the project store and the cage reads the library through `/nix`; the env pointing
+    // the app's loader at it (and the socket bind) is applied in the launch block below. Best-effort,
+    // like the fonts and mesa: a fetch that fails warns and the app runs (without audio).
+    let audio_layer = if prep.cfg.audio {
+        match super::audio::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(layer) => Some(layer),
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "`audio = true` but the audio userspace could not be provisioned \
+                     ({e}) — the app runs without audio"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // The GUI-hole store roots to seed: the fonts plus (when present) certutil, mesa, and
+    // libpulseaudio, so the cage reads them all through `/nix`.
     let mut gui_roots: Vec<PathBuf> = font_roots.to_vec();
     if let Some(ct) = &ca_trust {
         gui_roots.push(ct.root.clone());
     }
     if let Some(layer) = &gpu_layer {
         gui_roots.push(layer.root.clone());
+    }
+    if let Some(layer) = &audio_layer {
+        gui_roots.extend(layer.roots.iter().cloned());
     }
     if let Some(layer) = &schema_layer {
         gui_roots.push(layer.root.clone());
@@ -2415,6 +2496,16 @@ fn build(
         // that re-points them only self-DoSes its own cage's portal lookup and needs no denylist.
         if let Some(p) = &portal {
             gui_env.extend(super::portal::env(&p.gtk_root));
+            // Bind the portal's host runtime directory (read-write) at the cage path the bus config,
+            // env, and command wrap all reference, so the in-cage dbus-daemon writes its config and
+            // creates its socket there — and the socket is reachable from the host for the relay.
+            if let Some(hd) = &portal_host {
+                gui_binds.push(binds::ExtraBind {
+                    src: hd.dir().to_path_buf(),
+                    dest: PathBuf::from(super::portal::CAGE_DIR),
+                    writable: true,
+                });
+            }
         }
     }
 
@@ -2439,6 +2530,43 @@ fn build(
                 dest: path,
                 writable: false,
             });
+        }
+    }
+
+    // Audio: when `audio = true`, bind the host PulseAudio socket read-only at the fixed cage path
+    // and point the app's loader at the provisioned libpulse (both provisioned/seeded above). Both
+    // pieces must be present — no host socket, or a failed provision, means no audio (best-effort, a
+    // warning, never a failed launch). The socket bind is read-only: same-uid, so a `connect()` still
+    // works (exactly like the Wayland socket). `PULSE_SERVER` is a data path (an untrusted `[env]`
+    // only self-DoSes its own cage's audio), so it needs no denylist entry; `LD_LIBRARY_PATH` is
+    // already reserved against an untrusted `[env]` (a code-load path, alongside `LD_*`).
+    if prep.cfg.audio {
+        let host_socket =
+            super::audio::host_socket(std::env::var("XDG_RUNTIME_DIR").ok().as_deref());
+        match host_socket {
+            Some(sock) if sock.exists() => {
+                // The socket bind + `PULSE_SERVER` are firm (independent of the userspace provision);
+                // the client libraries, the ALSA→pulse shim's `asound.conf`, and its env are added
+                // only when the userspace was provisioned (best-effort — a failed provision already
+                // warned, and the app then simply finds no audio).
+                gui_binds.push(binds::ExtraBind {
+                    src: sock,
+                    dest: PathBuf::from(super::audio::CAGE_SOCK),
+                    writable: false,
+                });
+                if let Some(alsa) = audio_layer.as_ref().and_then(|l| l.alsa.as_ref()) {
+                    gui_binds.push(binds::ExtraBind {
+                        src: alsa.asound_conf.clone(),
+                        dest: PathBuf::from(super::audio::ASOUND_CONF_INCAGE),
+                        writable: false,
+                    });
+                }
+                gui_env.extend(super::audio::env(audio_layer.as_ref()));
+            }
+            _ => crate::diag::warn(
+                "`audio = true` but no PulseAudio socket was found at \
+                 `$XDG_RUNTIME_DIR/pulse/native` — the app runs without audio",
+            ),
         }
     }
 
@@ -2594,11 +2722,17 @@ fn build(
         eprintln!("ops: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
-    let guard = if egress_guard.is_some() || forward_guard.is_some() || dbus_guard.is_some() {
+    let guard = if egress_guard.is_some()
+        || forward_guard.is_some()
+        || dbus_guard.is_some()
+        || portal_host.is_some()
+    {
         Some(LaunchGuard {
             egress: egress_guard,
             forward: forward_guard,
             dbus: dbus_guard,
+            notify: notify_relay,
+            portal: portal_host,
         })
     } else {
         None
@@ -3770,8 +3904,10 @@ mod tests {
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
+            audio: false,
             dbus: crate::config::DbusPolicy::Off,
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -3822,6 +3958,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             forward: vec![],
@@ -3831,6 +3968,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),

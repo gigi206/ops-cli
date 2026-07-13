@@ -69,9 +69,25 @@ allow = [
     "{*} https://api.workos.com",
     "{GET,HEAD} https://docs.factory.ai",
     "{POST} https://github.com/Factory-AI/factory-plugins.git/git-upload-pack",
-    #"{POST} telemetry.factory.ai",
     # Uncomment for the direct-OpenRouter BYOK path below.
     #"{*} https://openrouter.ai",
+]
+
+# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# leave DENIED — here Factory's telemetry sink (POST /api/ingest), which a live run hits every few
+# seconds and whose `denied-default` lines would drown the ones worth acting on. A `mute` never
+# changes the verdict (the telemetry is still refused) and never hides a count (`ops net stats`
+# still tallies it); it only keeps the line out of the default log. See it anytime with
+# `ops net log --all`, and edit this list from the CLI with `ops net mute|unmute <host> -a droid`.
+# Remove the entry here the day you decide to allow the endpoint (uncomment the `{POST} telemetry.factory.ai`
+# line above instead).
+mute = [
+    "telemetry.factory.ai",            # Factory telemetry (POST /api/ingest)
+    # Factory's OpenTelemetry collector on Google Cloud Run — a regional host whose `us-central1`
+    # (or other region) label varies while the project number `123358924663` stays stable, so a
+    # regex covers every regional variant rather than enumerating them. POST /v1/metrics.
+    "re:^https://otel-collector-123358924663\\.[^.]+\\.run\\.app",
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # OPTIONAL direct-OpenRouter BYOK (commented). Droid's default is the Factory account above,

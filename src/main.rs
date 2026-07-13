@@ -1302,6 +1302,14 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             provenance_tag(view.gpu_origin, pal)
         );
     }
+    // The audio posture — shown only when opened, same as GPU.
+    if view.audio {
+        let _ = writeln!(
+            o,
+            "  {h}audio:{r} enabled {dim}(microphone + playback via PulseAudio){r}{}",
+            provenance_tag(view.audio_origin, pal)
+        );
+    }
     match view.dbus {
         config::view::DbusView::Off => {}
         config::view::DbusView::HostFiltered => {
@@ -1568,6 +1576,19 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
                 None => {}
             }
+            // The audio posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
+            match app.audio {
+                Some(true) => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}audio:{r} enabled {dim}(microphone + playback){r}"
+                    );
+                }
+                Some(false) => {
+                    let _ = writeln!(o, "      {dim}audio:{r} disabled");
+                }
+                None => {}
+            }
             // The D-Bus posture the overlay sets; `None` inherits.
             match app.dbus {
                 Some(config::view::DbusView::HostFiltered) => {
@@ -1787,6 +1808,14 @@ fn render_app_detail(
         o,
         "  {h}gpu:{r}     {}{gpu_tag}",
         if view.gpu { "enabled" } else { "disabled" }
+    );
+
+    // The effective audio posture — shown either way, so the inherited story is visible.
+    let audio_tag = app_provenance_tag(view.audio_origin, pal);
+    let _ = writeln!(
+        o,
+        "  {h}audio:{r}   {}{audio_tag}",
+        if view.audio { "enabled" } else { "disabled" }
     );
 
     // The effective D-Bus posture — shown either way, so the inherited story is visible.
@@ -2704,6 +2733,10 @@ fn take_override_flag(
     match name.as_str() {
         "--gpu" => {
             take_flag_bool(head, &mut cli.gpu);
+            return Some(Ok(()));
+        }
+        "--audio" => {
+            take_flag_bool(head, &mut cli.audio);
             return Some(Ok(()));
         }
         "--dbus" => {
@@ -9765,8 +9798,10 @@ mod tests {
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
             gpu: false,
+            audio: false,
             dbus: config::DbusPolicy::Off,
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -10268,8 +10303,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -10454,8 +10491,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Inherited,
+            audio_origin: ProvenanceView::Inherited,
             dbus_origin: ProvenanceView::Inherited,
             forward: vec![],
             forward_origin: ProvenanceView::Inherited,
@@ -10637,6 +10676,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             forward: vec![],
             seccomp: vec![],
@@ -10724,8 +10764,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -10753,6 +10795,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                audio: None,
                 dbus: None,
                 forward: vec![],
                 seccomp: vec![],
@@ -10814,8 +10857,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -10842,6 +10887,7 @@ mod tests {
                 }),
                 gui: None,
                 gpu: None,
+                audio: None,
                 dbus: None,
                 forward: vec![],
                 seccomp: vec![],
@@ -10906,6 +10952,7 @@ mod tests {
             network,
             gui,
             gpu: None,
+            audio: None,
             dbus: None,
             forward: vec![],
             seccomp: vec![],
@@ -10937,8 +10984,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -11003,8 +11052,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -11024,6 +11075,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                audio: None,
                 dbus: None,
                 forward: vec![],
                 seccomp: vec![],
@@ -11104,8 +11156,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -11138,6 +11192,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                audio: None,
                 dbus: None,
                 forward: vec![],
                 seccomp: vec![],
@@ -11205,8 +11260,10 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            audio: false,
             dbus: config::view::DbusView::Off,
             gpu_origin: ProvenanceView::Default,
+            audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
             forward_origin: ProvenanceView::Default,
@@ -11254,6 +11311,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                audio: None,
                 dbus: None,
                 forward: vec![],
                 seccomp: vec![],

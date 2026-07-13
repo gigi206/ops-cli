@@ -28,6 +28,13 @@ bundled-nix = []
 bundled-bwrap = []
 
 [dependencies]
+# The in-cage desktop notifications relay (`dbus = "incage"`): bridges the cage's private D-Bus bus
+# to the host `org.freedesktop.Notifications`. The async runtime is the pure-Rust `async-io` backend
+# (NOT tokio), driven by `async_io::block_on` on a single dedicated thread inside `notify_relay`, so
+# nothing async leaks into ops's std-thread world (the egress proxy stays sync std threads).
+async-channel = "2"
+async-io = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 libc = "0.2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
 regex = "1"
@@ -40,6 +47,7 @@ serde_json = "1"
 toml = "0.8"
 toml_edit = "0.22"
 webpki-roots = "1"
+zbus = { version = "5", default-features = false, features = ["async-io"] }
 
 [build-dependencies]
 # Hash the embedded engines (nix, bwrap) at build time (same crate as the runtime dep,

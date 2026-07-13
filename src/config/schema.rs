@@ -66,6 +66,15 @@ pub(crate) struct RawConfig {
     /// (Intel/AMD/nouveau); the NVIDIA proprietary stack is a separate, not-yet-built mechanism.
     /// Most useful together with `gui = "wayland"`.
     pub(crate) gpu: Option<bool>,
+    /// Whether to open audio (microphone + playback) for the cage (`audio = true`). ops provisions
+    /// the PulseAudio client library into its own store and puts it on the app's loader path, and
+    /// binds the host PulseAudio socket (`$XDG_RUNTIME_DIR/pulse/native`, which a PipeWire host
+    /// exposes via `pipewire-pulse`) into the cage. A security field — honored from the global
+    /// config or a trusted project, ignored from an untrusted one: the PulseAudio bus is not
+    /// per-client isolated, so a connected client can capture the microphone and every `.monitor`
+    /// source (record whatever is playing on the host), a capability an untrusted project may not
+    /// grant itself. Most useful together with `gui = "wayland"`.
+    pub(crate) audio: Option<bool>,
     /// How the cage reaches a D-Bus session bus. Three postures ([`RawDbus`] → [`DbusPolicy`]):
     /// `false` (no bus, the default); `true` — a **filtered host** bus (ops runs a default-deny
     /// `xdg-dbus-proxy` host-side forwarding only the desktop `appearance` portal and the
@@ -295,6 +304,10 @@ pub(crate) struct RawApp {
     /// security field, like the baseline `gpu`. An unset `Option` is omitted on export, so an
     /// app with no GPU need carries no `gpu` line.
     pub(crate) gpu: Option<bool>,
+    /// The app's audio posture, overriding the baseline's when set (see `RawConfig.audio`). A
+    /// security field, like the baseline `audio`. An unset `Option` is omitted on export, so an
+    /// app with no audio need carries no `audio` line.
+    pub(crate) audio: Option<bool>,
     /// The app's D-Bus posture, overriding the baseline's when set (see `RawConfig.dbus`). A
     /// security field, like the baseline `dbus`. An unset `Option` is omitted on export, so an app
     /// with no D-Bus need carries no `dbus` line.

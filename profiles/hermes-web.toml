@@ -1,0 +1,90 @@
+# Hermes — NousResearch's open-source agent, served as a browser dashboard by ops.
+#
+#   ops app import profiles/hermes-web.toml
+#   ops app hermes-web        # then open http://127.0.0.1:9119 in your host browser
+#
+# A second way to run Hermes alongside `ops app hermes` (the terminal CLI). Hermes ships a
+# browser dashboard — `hermes dashboard` serves a FastAPI/React SPA (the built `web_dist/`
+# bundle, packaged inside the wheel) on 127.0.0.1:9119. ops serves it headless in the cage
+# (`--no-open`, no in-cage browser) and forwards the host's localhost:9119 into the cage, so
+# you reach the same agent in a real browser UI on the host: chat with streaming tool output,
+# side-by-side previews, a file browser, settings — no terminal.
+#
+# The dashboard needs the optional Python `[web]` extra (fastapi + uvicorn + starlette), which
+# is NOT in the base `hermes-agent` wheel. ops's mise-token grammar now admits PEP 508 extras
+# (`[]`,`)`), so the package below installs `hermes-agent[web]` — the launcher equips it in-cage
+# via mise's pipx backend (uv tool install), the same path as the CLI profile, plus the extra.
+# `nix:uv` puts uv on PATH before the equip; `nix:python312` supplies the interpreter (Python
+# >=3.11,<3.14). The first launch resolves ~60+ wheels in a few tens of MiB and seconds; later
+# launches reuse the warm install from the app's own home.
+#
+# CREDENTIAL POSTURE — identical to the CLI profile. Hermes is BYOK and multi-provider; this
+# template keys it to OpenRouter (Hermes' default — one key, hundreds of models, OpenAI-
+# compatible bearer auth). BYOK is commented out below, so this profile ships with no baked-in
+# credential. Uncomment the [env] placeholder and the [secret] block, and provide
+# $OPENROUTER_API_KEY on the host, to have the egress proxy inject the key on the wire to
+# openrouter.ai — the plaintext never enters the cage. To use a different provider, change the
+# allowlist host + the [secret] block + the env var — e.g. Anthropic (api.anthropic.com,
+# ANTHROPER_API_KEY, header "x-api-key", type "raw") or OpenAI (api.openai.com, OPENAI_API_KEY,
+# header "Authorization", type "bearer"). The dashboard itself may ask you to complete an auth
+# step in the browser (the same provider login, or a local dashboard password); that traffic
+# rides the allowlist below. If a request is blocked, the proxy reports the host it refused —
+# add it to `allow` (or check ahead with `ops test net <url>`).
+cmd = ["hermes", "dashboard", "--no-open"]
+
+# Forward the host's localhost:9119 into the cage so your host browser reaches the dashboard.
+# `hermes dashboard` binds 127.0.0.1:9119 inside the cage; this hole bridges it to the host. A
+# port already in use on the host fails the launch closed. Must stay a top-level key: written
+# after a `[table]` header, TOML would fold it into that table (e.g. `network.forward`) and it
+# would be silently ignored.
+forward = [9119]
+
+# Your host Hermes config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `hermes` read and write these host files (login, settings, sessions). Uncomment to
+# share your host Hermes setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.hermes", mode = "rw" },
+#]
+
+[packages]
+# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the in-cage
+# equip; then Hermes itself via mise's pipx backend WITH the [web] extra (fastapi/uvicorn/
+# starlette) the dashboard server needs. All three are trusted-only [packages]; this profile is
+# trusted by location once imported.
+uv     = "nix:uv"
+python = "nix:python312"
+hermes = "mise:pipx:hermes-agent[web]"
+
+[network]
+mode = "deny"
+allow = [
+    # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter;
+    # with the NousResearch account login instead (no BYOK key set — the shipped default), the
+    # model traffic goes to the account's own API: portal is the OAuth token endpoint, and
+    # inference-api serves the models (GET /v1/models, POST /v1/chat/completions). The dashboard's
+    # own auth flow rides these same hosts.
+    "{*} https://openrouter.ai",
+    "{*} https://portal.nousresearch.com",
+    "{*} https://inference-api.nousresearch.com",
+    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
+    "{*} https://hermes-agent.nousresearch.com",
+    "{GET} https://models.dev",
+    # Install-time (`uv tool install`): the Python wheels and the package index, read-only.
+    "{GET} https://files.pythonhosted.org",
+    "{GET} https://pypi.org",
+    # (cache.nixos.org + github.com — the nix binary cache for uv and Python — are already in
+    # ops's built-in nix-cache allow-set, so they need no entry here.)
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage.
+# Uncomment both blocks and provide $OPENROUTER_API_KEY on the host to enable BYOK; the in-cage
+# placeholder lets Hermes start and issue the request, and the proxy substitutes the real key
+# on the wire to openrouter.ai.
+[env]
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

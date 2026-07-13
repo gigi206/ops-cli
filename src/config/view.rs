@@ -59,6 +59,10 @@ pub(crate) struct ConfigView {
     pub(crate) gpu: bool,
     /// Which layer supplied the GPU posture (`Default` when neither config set it).
     pub(crate) gpu_origin: ProvenanceView,
+    /// Whether audio (microphone + playback) is open (`audio = true`).
+    pub(crate) audio: bool,
+    /// Which layer supplied the audio posture (`Default` when neither config set it).
+    pub(crate) audio_origin: ProvenanceView,
     /// The resolved D-Bus posture (off, filtered host bus, or in-cage portal).
     pub(crate) dbus: DbusView,
     /// Which layer supplied the D-Bus posture (`Default` when neither config set it).
@@ -501,6 +505,9 @@ pub(crate) struct AppView {
     /// The app's own GPU posture, when it set one (`Some(true)`/`Some(false)`); `None` inherits the
     /// baseline. Mirrors the app's `gui`.
     pub(crate) gpu: Option<bool>,
+    /// The app's own audio posture, when it set one; `None` inherits the baseline. Mirrors the
+    /// app's `gpu`.
+    pub(crate) audio: Option<bool>,
     /// The app's own D-Bus posture, when it set one; `None` inherits the baseline. Mirrors the
     /// app's `gpu`.
     pub(crate) dbus: Option<DbusView>,
@@ -559,6 +566,9 @@ pub(crate) struct AppDetailView {
     /// The effective GPU posture (the app's own, else the baseline's).
     pub(crate) gpu: bool,
     pub(crate) gpu_origin: ProvenanceView,
+    /// The effective audio posture (the app's own, else the baseline's).
+    pub(crate) audio: bool,
+    pub(crate) audio_origin: ProvenanceView,
     /// The effective D-Bus posture (the app's own, else the baseline's).
     pub(crate) dbus: DbusView,
     pub(crate) dbus_origin: ProvenanceView,
@@ -731,6 +741,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         gui_origin: resolved.gui_origin.into(),
         gpu: resolved.gpu,
         gpu_origin: resolved.gpu_origin.into(),
+        audio: resolved.audio,
+        audio_origin: resolved.audio_origin.into(),
         dbus: resolved.dbus.into(),
         dbus_origin: resolved.dbus_origin.into(),
         forward: resolved.forward.clone(),
@@ -995,6 +1007,7 @@ fn app_view(
             super::GuiPolicy::None => GuiView::None,
         }),
         gpu: app.gpu,
+        audio: app.audio,
         dbus: app.dbus.map(DbusView::from),
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
@@ -1075,6 +1088,8 @@ fn app_detail_view(
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
     let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
     let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin);
+    let eff_audio = app.audio.unwrap_or(baseline.audio);
+    let audio_origin = origin_or_inherited(app.audio.is_some(), app.audio_origin);
     let eff_dbus: DbusView = app.dbus.unwrap_or(baseline.dbus).into();
     let dbus_origin = origin_or_inherited(app.dbus.is_some(), app.dbus_origin);
 
@@ -1169,6 +1184,8 @@ fn app_detail_view(
         gui_origin,
         gpu: eff_gpu,
         gpu_origin,
+        audio: eff_audio,
+        audio_origin,
         dbus: eff_dbus,
         dbus_origin,
         forward: eff_forward,
@@ -1403,8 +1420,10 @@ mod tests {
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
             gpu: true,
+            audio: true,
             dbus: DbusView::HostFiltered,
             gpu_origin: ProvenanceView::Project,
+            audio_origin: ProvenanceView::Project,
             dbus_origin: ProvenanceView::Project,
             forward: vec![1455],
             forward_origin: ProvenanceView::Global,
@@ -1446,6 +1465,7 @@ mod tests {
                 }),
                 gui: None,
                 gpu: None,
+                audio: None,
                 dbus: None,
                 forward: vec![1455],
                 seccomp: vec![],
@@ -1600,6 +1620,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             forward: vec![],
@@ -1609,6 +1630,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward_origin: Default::default(),
             limits_origin: Default::default(),
@@ -1676,8 +1698,10 @@ mod tests {
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             gpu: false,
+            audio: false,
             dbus: DbusPolicy::Off,
             gpu_origin: Provenance::Default,
+            audio_origin: Provenance::Default,
             dbus_origin: Provenance::Default,
             forward: vec![9090],
             forward_origin: Provenance::Global,
@@ -1716,6 +1740,7 @@ mod tests {
             network: Some(NetworkPolicy::Isolated),
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: sandbox::cgroup::Limits {
                 memory_high: None,
@@ -1730,6 +1755,7 @@ mod tests {
             network_origin: Provenance::Global,
             gui_origin: Provenance::Default,
             gpu_origin: Provenance::Default,
+            audio_origin: Provenance::Default,
             dbus_origin: Provenance::Default,
             forward_origin: Provenance::Global,
             limits_origin: crate::config::LimitsOrigin {

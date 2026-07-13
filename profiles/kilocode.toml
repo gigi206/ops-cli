@@ -42,10 +42,28 @@ mode = "deny"
 allow = [
   "{GET} https://models.dev",
   "{*} https://api.kilo.ai",
-  #"{*} https://supermassive-black-hole.kiloapps.io",
+  # Kilo's session-export / cloud-sync ingest (POST /v1/session-export/batch) — the feature that
+  # backs up/syncs your coding sessions to the cloud. Allowed so cloud sync works; the host stays
+  # out of `mute` so a sync failure stays visible in the log.
+  "{*} https://supermassive-black-hole.kiloapps.io",
   #"{*} https://us.i.posthog.com",
   # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
   #"{*} https://openrouter.ai",
+]
+
+# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# leave DENIED and do NOT want to hear about. Here Kilo Code's PostHog product telemetry (POST
+# /batch/), which a live run hits periodically and whose `denied-default` lines would clutter the
+# ones worth acting on. `*.i.posthog.com` is regional (apex + subdomains muted together, spoof-safe).
+# A `mute` never changes the verdict (the telemetry is still refused) and never hides a count
+# (`ops net stats` still tallies it); it only keeps the line out of the default log. See it
+# anytime with `ops net log --all`, and edit this list from the CLI with `ops net mute|unmute
+# <host> -a kilocode`. Remove the entry here the day you decide to allow the endpoint.
+#
+# Not here: `supermassive-black-hole.kiloapps.io` (Kilo's session-export / cloud-sync ingest) is
+# ALLOWED in `allow` above (cloud sync enabled), so it never reaches the mute filter.
+mute = [
+    "*.i.posthog.com",                        # Kilo PostHog product telemetry (POST /batch/)
 ]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage.

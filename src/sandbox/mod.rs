@@ -7,6 +7,7 @@
 //! place — a security review has a single surface to audit.
 
 mod argv;
+mod audio;
 mod binds;
 mod catrust;
 pub(crate) mod cgroup;
@@ -29,6 +30,7 @@ mod miseplugin;
 mod naming;
 pub(crate) mod netlearn;
 mod nixhub;
+mod notify_relay;
 mod packages;
 mod portal;
 mod projectstore;

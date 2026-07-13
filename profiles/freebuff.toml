@@ -56,9 +56,22 @@ allow = [
   "{*} https://www.codebuff.com/api/*",
   "{GET} https://freebuff.com",
   "{POST} https://freebuff.com/api/auth/cli/code",
-  #"{POST} https://us.i.posthog.com/batch/"
   # Uncomment only if you route freebuff to a direct OpenRouter endpoint (see the note below).
   #"{*} https://openrouter.ai",
+]
+
+# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# leave DENIED — here Codebuff's PostHog product telemetry (POST /batch/), which a live run hits
+# periodically and whose `denied-default` lines would clutter the ones worth acting on. PostHog's
+# ingest endpoint is regional (`us.i.posthog.com`, `eu.i.posthog.com`), so the apex + subdomains are
+# muted together via `*.i.posthog.com` (spoof-safe). A `mute` never changes the verdict (the
+# telemetry is still refused) and never hides a count (`ops net stats` still tallies it); it only
+# keeps the line out of the default log. See it anytime with `ops net log --all`, and edit this list
+# from the CLI with `ops net mute|unmute <host> -a freebuff`. Remove the entry here the day you
+# decide to allow the endpoint (uncomment the `{POST} https://us.i.posthog.com/batch/` line above).
+mute = [
+    "*.i.posthog.com",                # Codebuff PostHog telemetry (POST /batch/)
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # OPTIONAL direct-OpenRouter BYOK (commented). By default freebuff authenticates to a CODEBUFF

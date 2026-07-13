@@ -86,33 +86,6 @@ allow = [
     # the same backend. Opened to all verbs (`{*}`) since they carry request bodies.
     "{*} https://cloudcode-pa.googleapis.com",
     "{*} https://daily-cloudcode-pa.googleapis.com",
-    #
-    # OBSERVED-BUT-OPTIONAL hosts (seen refused in `ops net logs -a agy`, NONE indispensable —
-    # `agy` reaches Google Sign-In without any of them). Left commented; uncomment only if you
-    # want the capability the comment describes.
-    #
-    # Browser automation — Playwright driver download (Microsoft's Azure CDN). Uncomment to let
-    # `agy` drive a browser. NOTE: the driver is not the whole browser — Playwright then fetches
-    # Chromium/Firefox from OTHER hosts (`cdn.playwright.dev`, `playwright.download.prss.microsoft.com`),
-    # which will show as new denies to add. `playwright.azureedge.net` alone suffices; the
-    # `-akamai` / `-verizon` variants are only its fallback mirrors.
-    #"{GET} https://playwright.azureedge.net/builds/*",
-    #"{GET} https://playwright-akamai.azureedge.net/builds/*",
-    #"{GET} https://playwright-verizon.azureedge.net/builds/*",
-    #
-    # Feature flags — an Unleash service (`/api/client/register` POST + `/api/client/features` GET)
-    # that lets Google toggle `agy` features remotely. The client falls back to defaults when
-    # blocked, so this is not model or auth traffic; keep it off unless a feature is visibly missing.
-    #"{GET,POST} https://antigravity-unleash.goog",
-    #
-    # Telemetry — Google Play Services logging (`POST /log`). Pure analytics; DISCOURAGED (leave
-    # denied under the least-privilege posture). Listed only for completeness.
-    #"{POST} https://play.googleapis.com/log",
-    #
-    # Broader Google API surface — a fallback if a future agent feature reaches another
-    # `*.googleapis.com` host beyond `cloudcode-pa` above. Prefer the exact host (add it here, or
-    # `ops net logs -a agy` to catch the refused one); this wildcard is a wide starting point only.
-    #"{*} https://*.googleapis.com",
 ]
 
 # Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately

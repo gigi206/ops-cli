@@ -11,6 +11,16 @@
 # in the app's own home and rolls the aqua package forward to the newest upstream release.
 cmd = "claude"
 
+# AUDIO — Claude Code has a terminal voice-dictation mode (the `/voice` command). It captures the
+# microphone through a native module (falling back to `arecord`/SoX), all of which speak the ALSA API.
+# `audio = true` provisions the PulseAudio client + the ALSA→PulseAudio compatibility shim
+# (alsa-plugins + an asound.conf routing `default` → pulse), so an ALSA capture reaches the host
+# microphone — see docs/guide/configuration/audio.md. A security field, trusted-only: the PulseAudio
+# bus exposes the microphone AND all system-audio output.
+# NOTE: `/voice` requires signing in with a Claude.ai account; it is NOT available with an API key
+# (which this profile uses by default). Comment `audio` out if you never use voice dictation.
+audio = true
+
 # Your host Claude config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir;
 # `mode = "rw"` lets the caged claude write back to these host files (login refresh,

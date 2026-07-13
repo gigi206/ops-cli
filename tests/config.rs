@@ -3437,6 +3437,69 @@ fn a_global_apps_gpu_posture_survives_an_untrusted_projects_override() {
 }
 
 #[test]
+fn an_untrusted_audio_posture_is_dropped_but_trusting_applies_it() {
+    // `audio = true` opens the PulseAudio bus (the microphone and every system-audio `.monitor`
+    // source) — a security field, so an untrusted project's posture is dropped and applied only once
+    // the project is trusted.
+    let fx = Fixture::new();
+    fx.write_project("audio = true\n");
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("audio:"),
+        "an untrusted audio posture must not be applied:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("ignoring `audio` posture"),
+        "a dropped audio posture must be explained:\n{stderr}"
+    );
+
+    // Trust it → the posture applies, tagged with the project layer.
+    let trusted = fx.run(&["trust", ".ops.toml"]);
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("audio: enabled"),
+        "a trusted audio posture must render:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(project)"),
+        "the audio origin must be tagged with its layer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_global_apps_audio_posture_survives_an_untrusted_projects_override() {
+    // The flagship property, for audio: a globally-declared app (a profile, trusted by location)
+    // keeps its audio posture, and an untrusted project cannot flip it — so an agent can run *on*
+    // untrusted code without that code opening or closing the app's microphone access.
+    let fx = Fixture::new();
+    fx.write_profile("rec", "cmd = \"rec\"\naudio = true\n");
+    // The untrusted project tries to turn the SAME app's audio off.
+    fx.write_project("[app.rec]\naudio = false\n");
+
+    let out = fx.run(&["config", "show", "--app", "rec"]);
+    assert!(
+        out.status.success(),
+        "config show --app failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("audio:   enabled"),
+        "the trusted app audio posture must stand:\n{stdout}"
+    );
+}
+
+#[test]
 fn an_untrusted_dbus_posture_is_dropped_but_trusting_applies_it() {
     // `dbus = true` exposes a filtered slice of the session bus (near the keyring and the portals) —
     // a security field, so an untrusted project's posture is dropped and applied only once trusted.

@@ -61,14 +61,25 @@ allow = [
     # host, the proxy names it; add it here.
     "{*} https://api.cline.bot",
     "{*} https://data.cline.bot",
-    # A third-party model catalogue Cline fetches to suggest models, and Cline's
-    # OpenTelemetry telemetry sink — both observed on a live run.
+    # A third-party model catalogue Cline fetches to suggest models (observed on a live run).
     "{GET} https://models.dev",
-    #"{*} https://otel.cline.bot",
     # WorkOS device-authorization endpoint — Cline's account login flow.
     "{*} https://api.workos.com",
     # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
     #"{*} https://openrouter.ai",
+]
+
+# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# leave DENIED — here Cline's OpenTelemetry telemetry sink (POST /v1/logs), which a live run hammers
+# every few seconds and whose `denied-default` lines would drown the ones worth acting on. A `mute`
+# never changes the verdict (the telemetry is still refused) and never hides a count (`ops net stats`
+# still tallies it); it only keeps the line out of the default log. See it anytime with
+# `ops net log --all`, and edit this list from the CLI with `ops net mute|unmute <host> -a cline`.
+# Remove the entry here the day you decide to allow the endpoint (uncomment the `{*} https://otel.cline.bot`
+# line above instead).
+mute = [
+    "otel.cline.bot",                  # Cline OpenTelemetry telemetry (POST /v1/logs)
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.

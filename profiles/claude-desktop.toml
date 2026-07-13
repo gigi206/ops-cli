@@ -38,19 +38,28 @@
 # (The bundled Claude Code engine in the Code tab is Node-based and DOES honour ops's CA-file env
 # vars, so it needs no extra help.)
 #
-# DISPLAY + GPU + DBUS — identical to opencode-desktop. `gui = "wayland"` binds the host Wayland
+# DISPLAY + GPU + AUDIO + DBUS — `gui = "wayland"` binds the host Wayland
 # socket (read-only) and provisions fonts so the window maps (X11 is never offered; isolation is
 # compositor-dependent — Mutter/GNOME is safe, wlroots exposes screen-capture/input-injection, see
 # docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa's
 # drivers into ops's store + the `/dev/dri` render node + the minimal `/sys` DRM subtree); without
 # it a Chromium/Electron app on Wayland often produces no buffer and no window maps. mesa covers
 # Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower).
-# `dbus = true` opens a FILTERED session bus (a host-side `xdg-dbus-proxy`, default-deny): the app
-# follows your host light/dark theme (the `appearance` portal) and can raise desktop notifications —
-# the login keyring (`org.freedesktop.secrets`) and the file-chooser/screenshot portals stay
-# refused. The Electron flags: `--no-sandbox` is mandatory and acceptable (bubblewrap + seccomp +
-# the empty netns IS the boundary, replacing Chromium's own redundant sandbox); `--ozone-platform=
-# wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+# `audio = true` provisions the PulseAudio client library (`libpulse.so.0`, absent from the app's
+# own closure, which carries only ALSA) and binds the host PulseAudio socket into the cage, so the
+# microphone and sound work (voice input). It is trusted-only because the PulseAudio bus exposes the
+# microphone AND every system-audio `.monitor` source (recording all host output), see
+# docs/guide/configuration/audio.md.
+# `dbus = "incage"` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
+# IN-CAGE and lists only the cage filesystem. A filtered *host* bus (`dbus = true`) cannot do this:
+# Chromium commits to the host portal, whose host-privileged file manager stays refused, so "browse
+# for a folder" silently fails. `"incage"` also seeds your host light/dark theme at launch, and a
+# host-side relay bridges `org.freedesktop.Notifications` so desktop notifications still work — while
+# the login keyring (`org.freedesktop.secrets`) stays absent. The Electron flags: `--no-sandbox` is
+# mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary, replacing
+# Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the Wayland backend;
+# `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
 #
 # CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key. Claude Desktop signs in
 # with your **claude.ai subscription or your organization's SSO**; the docs are explicit that
@@ -104,7 +113,7 @@
 # this (see the header).
 #
 # `--password-store=basic` (on both the app and Chromium): Chromium normally encrypts its session
-# cookie with a key from the OS keyring (Secret Service, over dbus), which the cage's filtered bus does
+# cookie with a key from the OS keyring (Secret Service, over dbus), which the cage's private bus does
 # not expose — so without it the cookie cannot be re-decrypted next launch and you are logged out.
 # `basic` forces the file store in the isolated $HOME (a weak fixed key — acceptable: the token already
 # lives only in the per-app isolated cage home, never the project shell).
@@ -139,6 +148,32 @@ esac
 WRAP
 chmod +x "$HOME/.local/bin/xdg-open"
 export PATH="$HOME/.local/bin:$PATH"
+
+# Route the desktop portal's OpenURI back to the xdg-open wrapper above. Under `dbus = "incage"` the
+# cage has a real portal, so Electron opens external URLs via `org.freedesktop.portal.OpenURI` instead
+# of calling `xdg-open` — and the portal shows "Open With… no apps available" unless a default handler
+# is registered, which silently breaks the login/re-verification links (Google consent, the device
+# re-verification page, the `claude://` OAuth callback). Register the wrapper as the default handler
+# for the web + `claude` schemes so those links route through it exactly as they did without a portal.
+# The Exec path is ABSOLUTE (`$HOME` is expanded here) because the portal-launched handler does not
+# inherit this shell's PATH. Harmless under `dbus = true`/`false` (no portal calls OpenURI).
+mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
+cat > "$HOME/.local/share/applications/ops-open-uri.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=ops URL handler
+Exec=$HOME/.local/bin/xdg-open %U
+MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/claude;
+NoDisplay=true
+Terminal=false
+EOF
+cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
+[Default Applications]
+x-scheme-handler/http=ops-open-uri.desktop
+x-scheme-handler/https=ops-open-uri.desktop
+x-scheme-handler/claude=ops-open-uri.desktop
+MIMEAPPS
+
 exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
     --use-system-ca --password-store=basic
 ''',
@@ -146,7 +181,8 @@ exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usag
 
 gui = "wayland"
 gpu = true
-dbus = true
+audio = true
+dbus = "incage"
 
 # Your host Claude Desktop config/login, mounted read-write at its real absolute path (so the caged
 # app shares your host login/state). `binds` is a security field, honored only because this profile

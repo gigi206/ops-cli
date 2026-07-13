@@ -17,10 +17,16 @@
 //! *reference* backend (the universal fallback used by sway/XFCE/MATE), depending only on the GTK
 //! library the Electron app already carries.
 //!
-//! The bus is private and internal, so unlike the filtered host bus it touches no host socket and
-//! is unaffected by the network posture. The host light/dark theme is seeded into the cage at
-//! launch (read host-side, best-effort) so the window opens in the right theme; live theme
-//! following and desktop notifications are a follow-up that reintroduces the filtered host bus.
+//! The bus carries only in-cage services and never connects to the host session bus, so — unlike
+//! the filtered host bus — it is unaffected by the network posture. Its socket, however, lives on a
+//! host directory ops bind-mounts into the cage (at [`CAGE_DIR`]): the in-cage `dbus-daemon` creates
+//! it there, so a host-side process can reach the private bus. That is what lets the desktop
+//! notifications relay (`org.freedesktop.Notifications`, forwarded to the host daemon) attach to the
+//! bus. The exposure is benign under ops's same-uid model: the directory is owner-only (0700), the
+//! only host process that connects is ops's own relay, and every portal backend on the bus is
+//! confined to the cage (the socket carries no reach the user's own uid does not already have). The
+//! host light/dark theme is seeded into the cage at launch (read host-side, best-effort) so the
+//! window opens in the right theme; live theme following is a further follow-up.
 //!
 //! Needs `gui = "wayland"`: the GTK backend renders through the compositor, so without a display it
 //! cannot start and the FileChooser interface never appears.
@@ -37,6 +43,7 @@
 use crate::store::{self, Layout};
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -60,12 +67,63 @@ const PACKAGES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The cage-side directory holding the private bus socket and the generated portal config — a path
-/// on the cage's own tmpfs `/tmp` (per-launch, private, always writable), so nothing is bound from
-/// the host and the socket is reachable only inside the cage.
-const CAGE_DIR: &str = "/tmp/.ops-portal";
-/// The private session-bus socket inside the cage.
-const CAGE_SOCK: &str = "/tmp/.ops-portal/bus";
+/// The cage-side mount point of the portal runtime directory: ops bind-mounts a host directory here
+/// (read-write), so the private bus socket the in-cage `dbus-daemon` creates under it is reachable
+/// from the host (the notifications relay connects to it). Under `/run/ops-portal` — ops's own path,
+/// not `$XDG_RUNTIME_DIR` (which holds the pulse/gpg/ssh sockets) — it holds the generated bus config
+/// and the socket.
+pub(crate) const CAGE_DIR: &str = "/run/ops-portal";
+/// The private session-bus socket, at its cage path. Through the bind this is the same file as
+/// [`HostDir::socket`] on the host.
+const CAGE_SOCK: &str = "/run/ops-portal/bus";
+
+/// The host directory bind-mounted into the cage at [`CAGE_DIR`]. Per-launch (the pid keeps
+/// concurrent launches from colliding), under `<data>/portal`.
+fn host_dir(layout: &Layout) -> PathBuf {
+    layout
+        .data_dir()
+        .join("portal")
+        .join(std::process::id().to_string())
+}
+
+/// Owns the host portal directory bound into the cage. Creating it (0700) sets up the shared runtime
+/// dir; dropping it removes the socket and the generated config the cage wrote there. Its presence in
+/// the launch guard forces the supervised path — the in-cage bus (and, once wired, the host-side
+/// relay attached to it) must be cleaned up when the launch ends rather than leaked by an exec.
+pub(crate) struct HostDir {
+    dir: PathBuf,
+}
+
+impl HostDir {
+    /// Create the per-launch host portal directory (0700, owner-only), clearing any stale
+    /// predecessor from a crashed prior launch of the same pid.
+    pub(crate) fn create(layout: &Layout) -> io::Result<HostDir> {
+        let dir = host_dir(layout);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+        Ok(HostDir { dir })
+    }
+
+    /// The host path of the directory, to bind into the cage at [`CAGE_DIR`].
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The host path of the private bus socket (the in-cage `dbus-daemon` creates it here through the
+    /// bind), for the notifications relay to connect to.
+    pub(crate) fn socket(&self) -> PathBuf {
+        self.dir.join("bus")
+    }
+}
+
+impl Drop for HostDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
 /// The provisioned in-cage portal: the store roots to seed and the logical paths the cage uses.
 pub(crate) struct Provision {
@@ -284,8 +342,8 @@ mod tests {
             Path::new("/nix/store/aaa-xdg-desktop-portal"),
             Path::new("/nix/store/bbb-xdg-desktop-portal-gtk"),
         );
-        // listens on the cage tmpfs socket, never a host path
-        assert!(conf.contains("<listen>unix:path=/tmp/.ops-portal/bus</listen>"));
+        // listens on the portal runtime socket (a host dir bound into the cage at /run/ops-portal)
+        assert!(conf.contains("<listen>unix:path=/run/ops-portal/bus</listen>"));
         // both portal packages' service dirs are activation sources
         assert!(conf.contains("/nix/store/aaa-xdg-desktop-portal/share/dbus-1/services"));
         assert!(conf.contains("/nix/store/bbb-xdg-desktop-portal-gtk/share/dbus-1/services"));
@@ -303,14 +361,14 @@ mod tests {
         let get = |k: &str| env.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
         assert_eq!(
             get("DBUS_SESSION_BUS_ADDRESS").as_deref(),
-            Some("unix:path=/tmp/.ops-portal/bus")
+            Some("unix:path=/run/ops-portal/bus")
         );
         assert_eq!(get("GSETTINGS_BACKEND").as_deref(), Some("keyfile"));
         assert_eq!(
             get("XDG_DESKTOP_PORTAL_DIR").as_deref(),
             Some("/nix/store/bbb-xdg-desktop-portal-gtk/share/xdg-desktop-portal/portals")
         );
-        assert_eq!(get("XDG_CONFIG_DIRS").as_deref(), Some("/tmp/.ops-portal"));
+        assert_eq!(get("XDG_CONFIG_DIRS").as_deref(), Some("/run/ops-portal"));
     }
 
     #[test]
@@ -329,7 +387,9 @@ mod tests {
         assert_eq!(argv[1], OsString::from("-c"));
         let script = argv[2].to_string_lossy();
         // the daemon is started with --fork (blocks until the socket is ready), config from the cage
-        assert!(script.contains("/nix/store/ddd-dbus/bin/dbus-daemon --config-file=/tmp/.ops-portal/session.conf --fork"));
+        assert!(script.contains(
+            "/nix/store/ddd-dbus/bin/dbus-daemon --config-file=/run/ops-portal/session.conf --fork"
+        ));
         // portals.conf selects the gtk backend
         assert!(script.contains("default=gtk"));
         // the theme is seeded into the keyfile GSettings store
@@ -356,6 +416,40 @@ mod tests {
         let script = argv[2].to_string_lossy();
         assert!(!script.contains("color-scheme"));
         assert!(!script.contains("keyfile"));
+    }
+
+    #[test]
+    fn host_dir_is_per_launch_and_the_socket_sits_under_it() {
+        let layout = Layout::under(Path::new("/data"));
+        let dir = host_dir(&layout);
+        // under <data>/portal, keyed by pid so concurrent launches never collide
+        assert!(dir.starts_with(Path::new("/data").join("portal")));
+        assert_eq!(
+            dir.file_name().unwrap().to_string_lossy(),
+            std::process::id().to_string()
+        );
+    }
+
+    #[test]
+    fn host_dir_create_makes_an_owner_only_dir_and_drop_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("ops-portal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let layout = Layout::under(&tmp);
+        let path;
+        {
+            let hd = HostDir::create(&layout).expect("create host dir");
+            path = hd.dir().to_path_buf();
+            assert!(path.is_dir());
+            // owner-only
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+            // the socket path is `bus` under the dir
+            assert_eq!(hd.socket(), path.join("bus"));
+        }
+        // dropped → removed
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -96,6 +96,92 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`audio = true` — microphone + playback in the cage via PulseAudio (DONE 2026-07-13)**
+  (`src/sandbox/audio.rs` [new] + `mod.rs` + `config/{schema,mod,view,overrides}.rs` + `src/{main,help}.rs`
+  + `sandbox/launch.rs` + `profiles/claude-desktop.toml` + `docs/guide/configuration/{audio,README}.md`
+  + `docs/guide/README.md` + `tests/{config,run}.rs`): a **trusted-only security field `audio = true`**
+  (a boolean, mirroring `gpu` **exactly** across schema/resolve/gating/merge_app/view/`--audio`+`OPS_AUDIO`
+  /`equip_for_gc`/the flagship) that opens **microphone + playback** for a graphical app. Born from the
+  user reporting the mic didn't work in `claude-desktop` under `dbus = "incage"`. **Root cause (verified,
+  not assumed):** a hermetic cage has no audio-server socket and no PulseAudio client library, so
+  Chromium/Electron (which uses the **PulseAudio** backend for capture) has nothing to connect to; the
+  mic does **not** go through a desktop portal (portals are screen-capture/camera only — getUserMedia
+  audio talks to PulseAudio directly), so the in-cage GTK portal is irrelevant to it. **The hole supplies
+  two pieces, both proven live via a one-shot override BEFORE any code** (spike-first, advisor-required):
+  (1) **`libpulse.so.0`** — `deb.rs`'s `ELECTRON_LIBS` carries `alsa-lib` but **not** `libpulseaudio`, so
+  the autoPatchelf'd app lacks libpulse and Chromium's `dlopen("libpulse.so.0")` fails; ops provisions
+  `libpulseaudio` (marker `lib/libpulse.so.0`, gcroot `gcroots/audio/<rev>`, ~113 MB closure) via
+  `store::provision` (**not** the `[packages]` path — that requires a `bin/`, which libpulseaudio lacks;
+  `store::provision` like mesa has no such requirement) and puts its `lib` dir on **`LD_LIBRARY_PATH`**
+  (unlike mesa's dedicated driver-path vars, libpulse has no indirection var, so LD_LIBRARY_PATH is the
+  only mechanism — the way nixpkgs Electron wrappers do it). (2) **the host PulseAudio socket** — bind
+  `$XDG_RUNTIME_DIR/pulse/native` (a PipeWire host exposes it via `pipewire-pulse`) **read-only** at the
+  fixed cage path **`/run/ops-pulse`** (parity with `/run/ops-portal`/`/run/ops-dbus`), named through
+  **`PULSE_SERVER=unix:/run/ops-pulse`** (same-uid → a ro bind still permits `connect()`, like Wayland).
+  **Wiring nuance (advisor-driven):** the socket bind + `PULSE_SERVER` are wired whenever the host socket
+  exists, **decoupled** from the libpulse provision succeeding (mirrors gpu granting `/dev/dri` even if
+  mesa fails) → gives the run.rs e2e network-independent teeth; `audio::env(Option<&Path>)` returns
+  PULSE_SERVER always + LD_LIBRARY_PATH when the lib was provisioned (best-effort, else the app finds no
+  libpulse and simply has no audio). **deb-wrapper interaction (verified, load-bearing):** the `deb.rs`
+  derivation wraps the launcher with `makeWrapper --prefix LD_LIBRARY_PATH` (**prepend, not `--set`**), so
+  it prepends the app's buildInputs and **keeps** ops's inherited value → libpulse (present nowhere else)
+  is found appended after buildInputs, no shadowing; a `--set` would have clobbered it and forced injection
+  into the derivation instead. **Security:** the PulseAudio bus is **not** per-client isolated — a client
+  captures the mic **and** every `.monitor` source (records all host audio output), so `audio` is
+  trusted-only; `PULSE_SERVER` is a data path (like `WAYLAND_DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`) → no
+  untrusted-`[env]` denylist entry (self-DoS only), and `LD_LIBRARY_PATH` is already reserved
+  (`is_reserved_env_key` matches `LD_*`). **Scope v1 = PulseAudio** (covers mic + playback); the
+  PipeWire-native `pipewire-0` socket is deferred. **Live-proven end-to-end:** the real mic in
+  `claude-desktop` records (user confirmed "le micro fonctionne") via the one-shot override with the full
+  stack on (gui + gpu + dbus=incage); then codified, and `profiles/claude-desktop.toml` migrated to
+  `audio = true`. **Tests:** 3 audio.rs unit (`host_socket`, `env`, `asound_conf`) + 2 config integration
+  (untrusted-drop, the flagship untrusted-override) + 1 run.rs e2e
+  `a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage`
+  (**ran live**: socket + `PULSE_SERVER` firm network-independent teeth; **v2 update** captures a real
+  32044-byte `arecord -D default` through the shim end-to-end — see below; skips without a host pulse
+  socket / sandbox). fmt/clippy `-D warnings` clean, **std-only** (`audio.rs` reuses `store::provision`).
+  See [[audio-hole]], [[gpu-hole]], [[dbus-hole]], [[electron-gui-profiles]].
+  **`audio = true` — v2: the ALSA→PulseAudio shim, for CLI voice tools (DONE 2026-07-13)** (`src/sandbox/
+  audio.rs` + `launch.rs` + `profiles/{codex,hermes,claude-code}.toml` + `docs/guide/configuration/audio.md`
+  + `tests/run.rs`): the user asked *which profiles need audio*, and a source-verified research pass found
+  it is **not only the GUI apps** — the terminal CLIs **claude-code** (`/voice`), **codex**
+  (voice_transcription, `cpal`), and **hermes** (voice mode Ctrl+B, `sounddevice`) all have in-process voice
+  input. **The load-bearing finding (golden-rule catch):** those CLI tools capture through the **ALSA API**
+  (`cpal`/PortAudio/`arecord`), which does **not** honor `PULSE_SERVER`, so the v1 hole (pulse socket +
+  libpulse) is **insufficient** for them — migrating their profiles to a bare `audio = true` would have been
+  a false fix. v2 adds the standard **ALSA→PulseAudio compatibility shim**: ops also provisions `alsa-lib`
+  (marker `lib/libasound.so.2`) + `alsa-plugins` (marker `lib/alsa-lib/libasound_module_pcm_pulse.so`),
+  stages a fixed `asound.conf` (`pcm.!default`/`ctl.!default` → `type pulse`) bound ro at `/etc/asound.conf`,
+  and sets `ALSA_CONFIG_DIR` (alsa-lib's `share/alsa`, holding the base `alsa.conf` that loads the plugins)
+  + `ALSA_PLUGIN_DIR` + libasound on `LD_LIBRARY_PATH` — so an ALSA `default` capture/playback routes to the
+  same bound pulse socket. **(ALSA is not deprecated** — it is the kernel sound layer every server runs on,
+  and the alsa-plugins pulse bridge is the standard way an ALSA app reaches PipeWire/pulse.) **`AudioLayer`
+  grew** from a single `root`/`lib_dir` to `roots: Vec` + `lib_dirs: Vec` + `alsa_config_dir` +
+  `alsa_plugin_dir` + `asound_conf`; `env(Option<&AudioLayer>)` emits the ALSA vars alongside PULSE_SERVER +
+  LD_LIBRARY_PATH; the launch binds the asound.conf when the userspace provisioned. **De-risked spike-first**
+  (advisor discipline): a throwaway bwrap proved `arecord -D default` captures a real 32044-byte WAV through
+  the shim in an **empty-netns** cage with only the pulse socket exposed; then the run.rs e2e was extended to
+  provision `nix:alsa-utils` and do the same **through the real `ops run`** — `CAPTURED-32044` (**ran live
+  29.39s**), the full ops-wired shim proven end-to-end (not just the mechanism). **Migrated** codex/hermes/
+  claude-code to `audio = true` (each with an honest comment on its capture path; claude-code's `/voice`
+  additionally needs a Claude.ai account, noted). **Not migrated:** the playback-only tools
+  (opencode/droid/kilocode — notification sounds, lower value) and the no-audio ones (cline/pi/agy/freebuff,
+  opencode-web = host-browser audio; `hermes-web` = the dashboard served headless in-cage + `forward`ed to
+  the HOST browser, so its UI/mic are host-side → no cage hole). Same security/gating/flagship as v1;
+  `ASOUND_CONF`/`ALSA_*` are data paths (self-DoS only, no denylist), `LD_LIBRARY_PATH` already reserved.
+  **Advisor-reviewed (v2): the one fix — the Electron path is DECOUPLED from the ALSA shim.** `provision`
+  was all-or-nothing, so an `alsa-plugins` fetch failure would have returned `Err` → `env(None)` → no
+  libpulse on `LD_LIBRARY_PATH` → **claude-desktop's mic broken even though libpulse was available** (a
+  regression of the proven flagship path). Fixed: `libpulseaudio` is the **core** (`?`), the ALSA shim
+  (`alsa-lib` + `alsa-plugins` + `asound.conf`) is a **best-effort add-on** on `AudioLayer.alsa:
+  Option<AlsaShim>` — a shim-provision failure warns and yields `alsa: None`, and `env`/the launch still
+  put libpulse on the loader path (Electron keeps audio; only the ALSA CLI path is lost). Unit-guarded
+  (`a_layer_without_the_alsa_shim_still_gives_a_native_pulseaudio_app_its_library`). The CLI mic profiles
+  stay `audio = true` **default-on** (user's call over commented-opt-in). ~1009 unit + 99 config + the
+  e2e (re-ran `CAPTURED-32044` after the refactor) green, fmt/clippy `-D warnings` clean. **Open ship-gate
+  (honest):** claude-desktop's mic on the *shipped* `libpulseaudio` path (vs the `pulseaudio`-full
+  override it was first proven with) and each CLI tool's real voice mode are the pending live-user gates.
+  See [[audio-hole]].
   **catrust CA-purge — the NSS db no longer accumulates per-session CAs (DONE 2026-07-10)**
   (`src/sandbox/catrust.rs` + `tests/run.rs`): a real bug surfaced live while validating the in-cage
   portal — `ops app claude-desktop` failed every HTTPS with `ERR_CERT_AUTHORITY_INVALID`, and a full

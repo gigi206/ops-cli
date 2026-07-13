@@ -1222,6 +1222,100 @@ fn a_trusted_incage_dbus_stands_up_an_in_cage_portal() {
 }
 
 #[test]
+fn a_trusted_incage_notifications_relay_attaches_and_forwards() {
+    // Under `dbus = "incage"`, ops runs a host-side relay that owns `org.freedesktop.Notifications`
+    // on the cage's private bus and forwards to the host daemon, so the app's desktop notifications
+    // work. Teeth on the wiring, end to end through a real cage: on the private bus (the only one
+    // reachable — `network = "none"`, empty netns) the notifications name must have an OWNER (the
+    // relay; without it the name is unowned, as the in-cage portal serves only the portal), and
+    // `GetServerInformation` on it must return the HOST daemon's info (a forward can only succeed if
+    // the relay bridged the private bus to the host). A short retry absorbs the startup race (the
+    // relay attaches within milliseconds of the in-cage dbus-daemon creating the socket). `gdbus`
+    // comes from the project's own `nix:glib.bin`. Skips (never fails) when the host cannot sandbox,
+    // has no compositor, no session bus, or the cache is unreachable.
+    let project = TmpDir::new("relay-proj");
+    let data = TmpDir::new("relay-data");
+    let state = TmpDir::new("relay-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\ndbus = \"incage\"\nnetwork = \"none\"\n\
+         [packages]\nglib = \"nix:glib.bin\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping incage-relay e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if wayland_socket().is_none() {
+        eprintln!("skipping incage-relay e2e: no Wayland compositor on the host");
+        return;
+    }
+    // The relay bridges to the host session bus; without one it cannot attach.
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        eprintln!("skipping incage-relay e2e: no host D-Bus session bus");
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping incage-relay e2e: the binary cache is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Retry GetNameOwner until the relay has claimed the name (the startup race), then read the
+    // forwarded server information. `--session` is the private bus (the portal env points it there).
+    let script = "for _ in $(seq 1 60); do \
+           owner=$(gdbus call --session --dest org.freedesktop.DBus \
+             --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.GetNameOwner \
+             org.freedesktop.Notifications 2>&1); \
+           case \"$owner\" in *NameHasNoOwner*|*Error*) sleep 0.1;; *) break;; esac; \
+         done; \
+         echo \"OWNER: $owner\"; \
+         gdbus call --session --dest org.freedesktop.Notifications \
+           --object-path /org/freedesktop/Notifications \
+           --method org.freedesktop.Notifications.GetServerInformation 2>&1 | sed 's/^/SERVERINFO: /'";
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "bash", "-c", script],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The relay owns the notifications name on the private bus — it attached. A unique bus name owner
+    // renders as `(':1.N',)`; without the relay this would be a `NameHasNoOwner` error.
+    assert!(
+        stdout.contains("OWNER: (':"),
+        "the notifications relay did not claim org.freedesktop.Notifications on the private bus: {log}"
+    );
+    // The forward reached the host daemon: GetServerInformation returns its string tuple
+    // `('name', 'vendor', …)` — an error (no forward) would render as `SERVERINFO: Error…`.
+    assert!(
+        stdout.contains("SERVERINFO: ('"),
+        "GetServerInformation did not forward to the host notifications daemon: {log}"
+    );
+}
+
+#[test]
 fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     // catrust imports the egress MITM CA into the cage's NSS db so a Chromium/Electron GUI app
     // trusts the proxy. Each launch has a distinct per-session CA sharing a FIXED subject DN, so
@@ -4267,6 +4361,123 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
         } else {
             "was not provisioned (best-effort)"
         }
+    );
+}
+
+/// A trusted `audio = true` binds the host PulseAudio socket into the cage and wires the ALSA→pulse
+/// shim, gated by trust. The firm teeth are network-independent: the cage socket `/run/ops-pulse` and
+/// `PULSE_SERVER` are ABSENT under an untrusted (dropped) posture and PRESENT once trusted — the whole
+/// audio→launch→`--ro-bind` thread a `build_spec` unit test cannot reach. The shim (the `asound.conf`
+/// bind + `ALSA_*` env) and a REAL `arecord` capture through it are best-effort (they need the
+/// userspace provisioned AND a live microphone), so they are reported, not asserted; the shim
+/// mechanism is proven separately (an ALSA client captures via the pulse socket in a hermetic cage),
+/// and a real voice-mode recording in a shipped CLI is the live user ship-gate. Skips if the host has
+/// no PulseAudio socket or cannot sandbox.
+#[test]
+fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
+    let host_socket = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join("pulse/native"));
+    match &host_socket {
+        Some(p) if p.exists() => {}
+        _ => {
+            eprintln!("skipping audio e2e: no PulseAudio socket at $XDG_RUNTIME_DIR/pulse/native");
+            return;
+        }
+    }
+
+    let project = TmpDir::new("audio-proj");
+    let data = TmpDir::new("audio-data");
+    let state = TmpDir::new("audio-state");
+
+    // `alsa-utils` gives the cage `arecord`, so the e2e can attempt a real ALSA capture through the
+    // shim (best-effort). A `[packages]` backend is trusted-only, so it is also dropped untrusted.
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"audio = true\n\n[packages]\nalsautils = \"nix:alsa-utils\"\n",
+    )
+    .unwrap();
+    let check = "test -S /run/ops-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT; \
+                 test -n \"$PULSE_SERVER\" && echo ENV-SET || echo ENV-UNSET; \
+                 test -f /etc/asound.conf && echo ASOUND-PRESENT || echo ASOUND-ABSENT; \
+                 test -n \"$ALSA_PLUGIN_DIR\" && echo ALSAENV-SET || echo ALSAENV-UNSET; \
+                 arecord -D default -f S16_LE -r 16000 -c 1 -d 1 /tmp/cap.wav >/dev/null 2>&1 \
+                    && echo CAPTURED-$(wc -c </tmp/cap.wav) || echo CAPTURE-FAILED";
+
+    // Untrusted probe (also seeds the base userland): the posture is dropped, so no socket is bound.
+    // A failed launch means the host cannot sandbox → skip.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping audio e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_out.contains("PULSE-ABSENT"),
+        "the untrusted (dropped) audio posture must leave the PulseAudio socket out of the cage:\n{probe_out}"
+    );
+
+    // Trust the project so its `audio = true` posture applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The host PulseAudio socket is now bound into the cage and named through PULSE_SERVER.
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", check],
+    );
+    assert!(
+        out.status.success(),
+        "a trusted audio posture must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("PULSE-PRESENT"),
+        "the trusted `audio = true` posture must bind the PulseAudio socket into the cage:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ENV-SET"),
+        "the trusted `audio = true` posture must set PULSE_SERVER:\n{stdout}"
+    );
+    // The ALSA→pulse shim + a real capture are best-effort (need provisioning + a live mic here) —
+    // reported, not asserted, since a missing closure or absent mic degrades to no-audio rather than
+    // a launch failure. A `CAPTURED-<bytes>` line is the full ops-wired shim proven end-to-end.
+    let capture = stdout
+        .lines()
+        .find(|l| l.starts_with("CAPTURED-") || *l == "CAPTURE-FAILED")
+        .unwrap_or("CAPTURE-?");
+    eprintln!(
+        "audio e2e: ALSA shim asound.conf={} env={}, real capture: {capture}",
+        if stdout.contains("ASOUND-PRESENT") {
+            "bound"
+        } else {
+            "absent (best-effort)"
+        },
+        if stdout.contains("ALSAENV-SET") {
+            "set"
+        } else {
+            "unset (best-effort)"
+        },
     );
 }
 

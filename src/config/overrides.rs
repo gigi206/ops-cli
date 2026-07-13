@@ -9,9 +9,10 @@
 //! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `OPS_CONFIG` — carries
 //! inline TOML shaped exactly like an `ops.toml`, so it can set *any* field the schema has. A
 //! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
-//! `--seccomp`/`--device`/`--gpu`/`--dbus` (and their `--env` sibling), each with an `OPS_*`
-//! environment equivalent — is an ergonomic shorthand for one field. The two booleans `--gpu`/`--dbus`
-//! are optional-value (bare = `true`, or `=true`/`=false`); the rest take a required value.
+//! `--seccomp`/`--device`/`--gpu`/`--audio`/`--dbus` (and their `--env` sibling), each with an
+//! `OPS_*` environment equivalent — is an ergonomic shorthand for one field. The booleans
+//! `--gpu`/`--audio`/`--dbus` are optional-value (bare = `true`, or `=true`/`=false`); the rest take
+//! a required value.
 //!
 //! Because an override is trusted by invocation, its `--seccomp`/`--device` (and a blob's
 //! `[seccomp]`/`[devices]`) relax the mandatory syscall denylist and grant a host device for the
@@ -137,6 +138,8 @@ pub(crate) struct CliOverrides {
     pub(crate) devices: Vec<String>,
     /// `--gpu[=true|false]` — the GPU posture (a boolean; bare `--gpu` means `true`). Last wins.
     pub(crate) gpu: Vec<String>,
+    /// `--audio[=true|false]` — the audio posture (a boolean; bare `--audio` means `true`). Last wins.
+    pub(crate) audio: Vec<String>,
     /// `--dbus[=true|false|incage]` — the D-Bus posture (bare `--dbus` means `true` = filtered host
     /// bus; `incage` = the in-cage portal). Last wins.
     pub(crate) dbus: Vec<String>,
@@ -172,6 +175,8 @@ struct AmbientOverrides {
     devices: Vec<String>,
     /// `OPS_GPU` — the GPU posture (`true`/`false`).
     gpu: Option<String>,
+    /// `OPS_AUDIO` — the audio posture (`true`/`false`).
+    audio: Option<String>,
     /// `OPS_DBUS` — the D-Bus posture (`true`/`false`/`incage`).
     dbus: Option<String>,
 }
@@ -186,8 +191,10 @@ struct TypedLabels {
     package: &'static str,
     forward: &'static str,
     gpu: &'static str,
+    audio: &'static str,
     // `--dbus`/`OPS_DBUS` carry their value verbatim (validated downstream by `validate_dbus`, like
-    // `gui`/`nixpkgs`), so — unlike `--gpu`, whose bool is parsed in `collect` — they need no label.
+    // `gui`/`nixpkgs`), so — unlike `--gpu`/`--audio`, whose bool is parsed in `collect` — they need
+    // no label.
 }
 
 const CLI_LABELS: TypedLabels = TypedLabels {
@@ -197,6 +204,7 @@ const CLI_LABELS: TypedLabels = TypedLabels {
     package: "--package",
     forward: "--forward",
     gpu: "--gpu",
+    audio: "--audio",
 };
 
 const ENV_LABELS: TypedLabels = TypedLabels {
@@ -206,6 +214,7 @@ const ENV_LABELS: TypedLabels = TypedLabels {
     package: "OPS_PACKAGE_*",
     forward: "OPS_FORWARD",
     gpu: "OPS_GPU",
+    audio: "OPS_AUDIO",
 };
 
 /// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
@@ -225,6 +234,7 @@ fn scan_ambient() -> AmbientOverrides {
         gui: env_nonempty("OPS_GUI"),
         nixpkgs: env_nonempty("OPS_NIXPKGS"),
         gpu: env_nonempty("OPS_GPU"),
+        audio: env_nonempty("OPS_AUDIO"),
         dbus: env_nonempty("OPS_DBUS"),
         ..AmbientOverrides::default()
     };
@@ -278,6 +288,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         ambient.gui.as_deref(),
         ambient.nixpkgs.as_deref(),
         ambient.gpu.as_deref(),
+        ambient.audio.as_deref(),
         ambient.dbus.as_deref(),
         &ambient.binds,
         &ambient.forward,
@@ -303,6 +314,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         cli.gui.last().map(String::as_str),
         cli.nixpkgs.last().map(String::as_str),
         cli.gpu.last().map(String::as_str),
+        cli.audio.last().map(String::as_str),
         cli.dbus.last().map(String::as_str),
         &cli.binds,
         &cli.forward,
@@ -379,6 +391,7 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ),
         ("gui", env_side.gui.is_some(), cli_side.gui.is_some()),
         ("gpu", env_side.gpu.is_some(), cli_side.gpu.is_some()),
+        ("audio", env_side.audio.is_some(), cli_side.audio.is_some()),
         ("dbus", env_side.dbus.is_some(), cli_side.dbus.is_some()),
         (
             "secret",
@@ -425,6 +438,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     if higher.gpu.is_some() {
         base.gpu = higher.gpu;
+    }
+    if higher.audio.is_some() {
+        base.audio = higher.audio;
     }
     if higher.dbus.is_some() {
         base.dbus = higher.dbus;
@@ -550,6 +566,7 @@ fn build_typed_fragment(
     gui: Option<&str>,
     nixpkgs: Option<&str>,
     gpu: Option<&str>,
+    audio: Option<&str>,
     dbus: Option<&str>,
     binds: &[String],
     forward: &[String],
@@ -575,6 +592,11 @@ fn build_typed_fragment(
     // is normalized to `"true"` by the CLI parser before it reaches this point.
     if let Some(v) = gpu {
         raw.gpu = Some(parse_bool(v, lbl.gpu)?);
+    }
+    // `--audio` is a boolean, exactly like `--gpu`: `true`/`false` only, checked here (a bare
+    // `--audio` is normalized to `"true"` by the CLI parser before it reaches this point).
+    if let Some(v) = audio {
+        raw.audio = Some(parse_bool(v, lbl.audio)?);
     }
     // `--dbus` has three postures (`true`/`false`/`incage`), so its value is carried verbatim and
     // validated downstream by `validate_dbus` (a bad string is fatal for an override, like `gui`).
@@ -793,6 +815,7 @@ mod tests {
         seccomp: &'a [&'a str],
         devices: &'a [&'a str],
         gpu: &'a [&'a str],
+        audio: &'a [&'a str],
         dbus: &'a [&'a str],
     }
 
@@ -814,6 +837,7 @@ mod tests {
             seccomp: owned(cli.seccomp),
             devices: owned(cli.devices),
             gpu: owned(cli.gpu),
+            audio: owned(cli.audio),
             dbus: owned(cli.dbus),
         };
         collect_from(&overrides, AmbientOverrides::default())

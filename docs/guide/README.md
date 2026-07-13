@@ -43,6 +43,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`[devices]`](configuration/devices.md) — expose host device nodes into the cage (trusted-only).
 - [`gui`](configuration/gui.md) — the Wayland display posture.
 - [`gpu`](configuration/gpu.md) — hardware-accelerated GPU rendering (mesa: Intel/AMD/nouveau).
+- [`audio`](configuration/audio.md) — microphone and playback via PulseAudio.
 - [`dbus`](configuration/dbus.md) — a filtered D-Bus session bus (host theme + notifications).
 - [`network`](configuration/network.md) — the egress posture (links to [Networking](networking/README.md)).
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).

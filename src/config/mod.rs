@@ -569,6 +569,13 @@ pub(crate) struct Resolved {
     pub(crate) gpu: bool,
     /// Which layer supplied the winning `gpu` posture (`Default` when neither config set it).
     pub(crate) gpu_origin: Provenance,
+    /// Whether audio (microphone + playback) is open (the default `false` unless the global config
+    /// or a trusted project set `audio = true`). A security field, gated like `gui`/`gpu` — an
+    /// untrusted project may not open the PulseAudio bus (which exposes the microphone and every
+    /// system-audio `.monitor` source).
+    pub(crate) audio: bool,
+    /// Which layer supplied the winning `audio` posture (`Default` when neither config set it).
+    pub(crate) audio_origin: Provenance,
     /// How the cage reaches a D-Bus session bus ([`DbusPolicy`]; the default `Off` unless the
     /// global config or a trusted project set `dbus`). A security field, gated like `gui`/`gpu` —
     /// an untrusted project may not expose even a filtered slice of the session bus nor stand up an
@@ -674,6 +681,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own GPU posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gui`.
     pub(crate) gpu: Option<bool>,
+    /// The app's own audio posture, set only when a trusted source declared one. `Some` overrides
+    /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gpu`.
+    pub(crate) audio: Option<bool>,
     /// The app's own D-Bus posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gpu`.
     pub(crate) dbus: Option<DbusPolicy>,
@@ -714,6 +724,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) network_origin: Provenance,
     pub(crate) gui_origin: Provenance,
     pub(crate) gpu_origin: Provenance,
+    pub(crate) audio_origin: Provenance,
     pub(crate) dbus_origin: Provenance,
     pub(crate) limits_origin: LimitsOrigin,
     /// Which app layer (`Global`/`Project`) supplied the app's own `forward` ports, or `Default`
@@ -773,6 +784,9 @@ impl Resolved {
         }
         if let Some(gpu) = app.gpu {
             self.gpu = gpu;
+        }
+        if let Some(audio) = app.audio {
+            self.audio = audio;
         }
         if let Some(dbus) = app.dbus {
             self.dbus = dbus;
@@ -875,6 +889,7 @@ impl Resolved {
             network,
             gui,
             gpu,
+            audio,
             dbus,
             limits,
             secret,
@@ -973,6 +988,12 @@ impl Resolved {
         if let Some(value) = gpu {
             self.gpu = value;
             self.gpu_origin = Provenance::Override;
+        }
+        // `audio` — a bool, like `gpu`; apply directly. Trusted by invocation and the final word, so
+        // it may open or close audio for this launch regardless of the config layers.
+        if let Some(value) = audio {
+            self.audio = value;
+            self.audio_origin = Provenance::Override;
         }
         // `dbus` — a posture that may be an invalid string, so it was validated above (fatal on a
         // bad value, like `gui`). Trusted by invocation and the final word, so it may change the
@@ -1282,6 +1303,16 @@ fn resolve(
         }
         None => false,
     };
+    // The audio posture is trusted by location at the global layer; the origin records `Global`
+    // whenever the layer set the flag at all (so `audio = true` reads distinctly from the default).
+    let mut audio_origin = Provenance::Default;
+    let mut audio = match global.audio {
+        Some(value) => {
+            audio_origin = Provenance::Global;
+            value
+        }
+        None => false,
+    };
     // The D-Bus posture is trusted by location at the global layer; the origin records `Global`
     // whenever the layer set a valid posture (so a set `dbus` reads distinctly from the default). An
     // unknown string is dropped (warned) fail-closed to the default `Off`.
@@ -1461,6 +1492,20 @@ fn resolve(
                 ));
             }
         }
+        // `audio` is a security field — a trusted project may open audio; an untrusted or changed one
+        // may not (the PulseAudio bus exposes the microphone and every system-audio `.monitor`
+        // source, a choice an untrusted project must not make).
+        if let Some(value) = proj.audio {
+            if trusted {
+                audio = value;
+                audio_origin = Provenance::Project;
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `audio` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `dbus` is a security field — a trusted project may open the filtered session bus or the
         // in-cage portal; an untrusted or changed one may not (any session bus, near the keyring and
         // the portals, is a choice an untrusted project must not make). A trusted but unknown string
@@ -1616,6 +1661,8 @@ fn resolve(
         gui_origin,
         gpu,
         gpu_origin,
+        audio,
+        audio_origin,
         dbus,
         dbus_origin,
         forward,
@@ -2112,6 +2159,7 @@ fn resolve_app(
     let mut default_methods = builtin_app_default_methods();
     let mut gui: Option<GuiPolicy> = None;
     let mut gpu: Option<bool> = None;
+    let mut audio: Option<bool> = None;
     let mut dbus: Option<DbusPolicy> = None;
     // The app's own cgroup limit overrides, accumulated like `network`/`gui`: the global layer
     // sets them by location, a trusted project overlays per field, an untrusted one is dropped.
@@ -2144,6 +2192,7 @@ fn resolve_app(
     let mut network_origin = Provenance::Default;
     let mut gui_origin = Provenance::Default;
     let mut gpu_origin = Provenance::Default;
+    let mut audio_origin = Provenance::Default;
     let mut dbus_origin = Provenance::Default;
     // The app's own loopback forward ports — a security field, gated like `network`/`gui`. The
     // merged effective set (app ∪ baseline) is computed at `merge_app`; this holds only the app's
@@ -2191,6 +2240,10 @@ fn resolve_app(
         if let Some(value) = app.gpu {
             gpu = Some(value);
             gpu_origin = Provenance::Global;
+        }
+        if let Some(value) = app.audio {
+            audio = Some(value);
+            audio_origin = Provenance::Global;
         }
         if let Some(value) = app.dbus {
             if let Some(policy) = validate_dbus(&mut warnings, &source, value) {
@@ -2315,6 +2368,19 @@ fn resolve_app(
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `gpu` posture ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `audio` mirrors `gpu`: an untrusted project may not open audio, on its own app or by
+        // overriding a trusted one (the PulseAudio bus exposes the microphone and all system audio).
+        if let Some(value) = app.audio {
+            if trusted {
+                audio = Some(value);
+                audio_origin = Provenance::Project;
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `audio` posture ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -2466,6 +2532,7 @@ fn resolve_app(
         network,
         gui,
         gpu,
+        audio,
         dbus,
         limits,
         seccomp,
@@ -2477,6 +2544,7 @@ fn resolve_app(
         network_origin,
         gui_origin,
         gpu_origin,
+        audio_origin,
         dbus_origin,
         forward_origin,
         seccomp_origin,
@@ -3706,11 +3774,17 @@ fn is_valid_attr(attr: &str) -> bool {
 /// `npm:@anthropic-ai/claude-code`, or `aqua:openai/codex@0.141.0`. It rides the equip
 /// wrapper positionally, so it cannot inject shell whatever it contains; the charset is
 /// still restricted to what a real token uses (no whitespace or control characters) so a
-/// malformed value is refused rather than handed to mise.
+/// malformed value is refused rather than handed to mise. The `[`, `]`, and `,` are admitted
+/// for PEP 508 extras (`pipx:hermes-agent[web]`, `pipx:hermes-agent[web,messaging]`) — a
+/// Python install selects optional dependency groups that way. They are not shell or nix
+/// metacharacters in any backend (the token is positional argv to mise, and the equip never
+/// interpolates it into a nix expression or a shell string), so admitting them adds no
+/// injection surface; a backend that does not understand them simply rejects the token.
 fn is_valid_mise_token(token: &str) -> bool {
     !token.is_empty()
         && token.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '@' | '.' | '_' | '-' | '+')
+            c.is_ascii_alphanumeric()
+                || matches!(c, ':' | '/' | '@' | '.' | '_' | '-' | '+' | '[' | ']' | ',')
         })
 }
 
@@ -4646,6 +4720,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             forward: None,
             secret: None,
@@ -5142,6 +5217,7 @@ mod tests {
             network,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             forward: None,
             secret: None,
@@ -6536,6 +6612,7 @@ mod tests {
             network: Some(NetworkPolicy::Isolated),
             gui: None,
             gpu: Some(true),
+            audio: Some(true),
             dbus: Some(DbusPolicy::HostFiltered),
             limits: crate::sandbox::cgroup::Limits {
                 tasks_max: Some("4096".into()),
@@ -6547,6 +6624,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -6607,6 +6685,7 @@ mod tests {
             network: None, // inherits the baseline's shared posture
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
@@ -6615,6 +6694,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -6648,6 +6728,7 @@ mod tests {
             )),
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
@@ -6656,6 +6737,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -6685,6 +6767,7 @@ mod tests {
             network,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             secrets: vec![],
@@ -6693,6 +6776,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -6814,6 +6898,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             secrets: vec![a_header_secret()],
@@ -6822,6 +6907,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -6863,6 +6949,7 @@ mod tests {
             )),
             gui: None,
             gpu: None,
+            audio: None,
             dbus: None,
             limits: Default::default(),
             secrets: vec![],
@@ -6871,6 +6958,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward: vec![],
             forward_origin: Default::default(),
@@ -7762,6 +7850,23 @@ mod tests {
         }
         for a in ["", "a b", "a#b", "a;b", "a$b", "a\"b"] {
             assert!(!is_valid_attr(a), "{a} should be rejected");
+        }
+        // mise tokens: the everyday forms plus PEP 508 extras (`pkg[web]`, `pkg[web,messaging]`)
+        // admitted so a Python install can select optional dependency groups, and the
+        // whitespace/control characters that a real token never carries still refused.
+        for t in [
+            "aqua:openai/codex",
+            "opencode",
+            "npm:@anthropic-ai/claude-code",
+            "aqua:openai/codex@0.141.0",
+            "pipx:hermes-agent",
+            "pipx:hermes-agent[web]",
+            "pipx:hermes-agent[web,messaging]",
+        ] {
+            assert!(is_valid_mise_token(t), "{t} should be a valid mise token");
+        }
+        for t in ["", "a b", "a$b", "a\"b", "a;b", "a\0b"] {
+            assert!(!is_valid_mise_token(t), "{t} should be rejected");
         }
     }
 

@@ -1,0 +1,131 @@
+# Hermes Desktop — NousResearch's native Electron desktop app, built from source in the cage.
+#
+#   ops app import profiles/hermes-desktop.toml
+#   ops app hermes-desktop
+#
+# A third way to run Hermes alongside `ops app hermes` (the terminal CLI) and `ops app
+# hermes-web` (the browser dashboard). Hermes Desktop is the native Electron app — a real
+# window with chat, streaming tool output, side-by-side previews, a file browser, voice, and
+# settings. Unlike opencode-desktop (which ships a prebuilt .deb), Hermes Desktop has NO prebuilt
+# binary: not on the GitHub releases (only the Python tarball), not on the website (Linux installs
+# via install.sh, which builds the CLI). The only way to get the desktop app is to BUILD it from
+# source with `hermes desktop`.
+#
+# `hermes desktop` resolves the desktop source from the hermes *package install location*
+# (PROJECT_ROOT = Path(__file__).parent.parent → <install>/apps/desktop), so it only finds the
+# source when Hermes is installed FROM THE REPO. This profile therefore clones the repo into the
+# app's persistent home and installs Hermes EDITABLE from that clone (uv pip install -e .), so
+# `hermes desktop` finds `apps/desktop` at the repo root and builds it.
+#
+# THE BUILD IS LIVE-PROVEN IN THE CAGE. A throwaway spike ran the full chain through ops: clone →
+# editable install → npm install (1305 packages) → node-pty native compile (C++) → Electron
+# download → vite renderer build → electron-builder packaging → `✓ Desktop packaged app ready`.
+# Every wall hit was fixable and is folded into this profile:
+#   * node-pty (native module) has no linux-x64 prebuild → node-gyp compiles it, needing the Node
+#     headers from nodejs.org (allowlisted) + `make` + a C++ compiler (`gnumake`, `gcc` in
+#     [packages]; the base userland's gcc is C-only).
+#   * `@electron/get` (Electron's binary downloader) does NOT honor the proxy by default and does
+#     direct DNS, which the empty netns has no resolver for (EAI_AGAIN). `ELECTRON_GET_USE_PROXY`
+#     makes it read the `HTTPS_PROXY` ops already sets — set in [env] below.
+#
+# First launch builds (~a few minutes; the toolchain + allowlist below are what make it work) and
+# the build is content-stamped, so later launches reuse `apps/desktop/release/linux-unpacked` and
+# are fast. The clone + venv + editable install live in the app's persistent (global) home, so
+# they survive across launches and projects.
+#
+# HONEST SCOPE — the BUILD is live-proven; the LAUNCH (the Electron window mapping + a real chat
+# through the spawned backend) is the pending live-user validation, as for every GUI profile.
+# `gui = "wayland"` + `gpu = true` + `dbus = "incage"` open the proven GUI hole (the same machinery
+# opencode-desktop uses). One known runtime caveat: the build warns node-pty's prebuilds don't
+# cover linux-x64; if the Electron-runtime native rebuild left it empty, the in-app terminal pane
+# may not work (the rest of the app still does) — re-run `npx electron-rebuild -w node-pty` in the
+# clone if so. The spawned backend rides the runtime allowlist below + the BYOK credential.
+#
+# CREDENTIAL POSTURE — identical to the CLI profile. Hermes is BYOK and multi-provider; this
+# template keys it to OpenRouter (one key, hundreds of models, OpenAI-compatible bearer auth).
+# BYOK is commented out below, so this profile ships with no baked-in credential. Uncomment the
+# [env] placeholder and the [secret] block, and provide $OPENROUTER_API_KEY on the host, to have
+# the egress proxy inject the key on the wire to openrouter.ai — the plaintext never enters the
+# cage. To use a different provider, change the allowlist host + the [secret] block + the env var.
+cmd = ["bash", "-c", "set -e; SRC=\"$HOME/hermes-src\"; if [ ! -d \"$SRC/.git\" ]; then git clone --depth 1 https://github.com/NousResearch/hermes-agent \"$SRC\"; fi; cd \"$SRC\"; if [ ! -d .venv ]; then uv venv --python 3.12 .venv; fi; . .venv/bin/activate; uv pip install -e .; hermes desktop"]
+
+# The native desktop window: the Wayland socket (gui), the GPU render node + scoped /sys (gpu), and
+# a private in-cage desktop portal (dbus) so the app's file chooser renders in-cage and follows the
+# host theme. All three are trusted-only security fields, honored because this profile lives in
+# your trusted config dir. Drop any you don't need (the app still launches without them, software-
+# rendered with no file portal).
+gui = "wayland"
+gpu = true
+dbus = "incage"
+audio = true
+
+[packages]
+# The Python toolchain (uv + a supported Python) and the native-build toolchain Hermes Desktop
+# needs (nodejs for npm/electron, git to clone the repo, gnumake + gcc for node-pty's C++ compile).
+# All are trusted-only [packages]; this profile is trusted by location once imported.
+uv     = "nix:uv"
+python = "nix:python312"
+nodejs = "nix:nodejs"
+git    = "nix:git"
+make   = "nix:gnumake"
+gcc    = "nix:gcc"
+
+# Electron's binary downloader (@electron/get) ignores the proxy env by default and does direct
+# DNS, which the empty netns has no resolver for. `ELECTRON_GET_USE_PROXY` makes it read the
+# HTTPS_PROXY ops sets. The OPENROUTER_API_KEY line is the BYOK placeholder (commented) — uncomment
+# it together with the [secret] block below to enable BYOK.
+[env]
+ELECTRON_GET_USE_PROXY = "true"
+#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+
+[network]
+mode = "deny"
+allow = [
+    # --- Build-time ---
+    # The editable `uv pip install -e .` — Hermes + its Python deps from PyPI.
+    "{GET} https://pypi.org",
+    "{GET} https://files.pythonhosted.org",
+    # The git clone of the repo (smart-HTTP).
+    "{*} https://github.com",
+    "{*} https://codeload.github.com",
+    # npm install (workspace deps) + electron + electron-builder binaries (GitHub releases /
+    # githubusercontent CDN). The cage trusts the MITM CA via NODE_EXTRA_CA_CERTS, and npm honors
+    # https_proxy; ELECTRON_GET_USE_PROXY (above) makes the Electron download do the same.
+    "{GET} https://registry.npmjs.org",
+    "{*} https://*.githubusercontent.com",
+    # node-gyp fetches the Node headers (to compile native modules like node-pty) from nodejs.org.
+    "{GET} https://nodejs.org/download/release/*",
+    # --- Runtime ---
+    # The LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter; with the
+    # NousResearch account login instead (no BYOK key set — the shipped default), model traffic goes
+    # to the account's own API: portal is the OAuth token endpoint, inference-api serves the models.
+    "{*} https://openrouter.ai",
+    "{*} https://portal.nousresearch.com",
+    "{*} https://inference-api.nousresearch.com",
+    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
+    "{*} https://hermes-agent.nousresearch.com",
+    "{GET} https://models.dev",
+    # (cache.nixos.org — the nix binary cache for uv/Python/node — is already in ops's built-in
+    # nix-cache allow-set, so it needs no entry here.)
+]
+
+# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): npm's audit check POSTs
+# the installed package list to registry.npmjs.org's security-advisories endpoint, but the install
+# itself only needs GET (packuments + tarballs), so registry.npmjs.org stays `{GET}` and the audit
+# POST is `denied-method` — non-essential to the build (it still succeeds) and noisy on every install.
+# A `mute` never changes the verdict (the audit is still refused) and never hides a count (`ops net
+# stats` still tallies it); it only keeps the line out of the default log. Run `npm audit` on the
+# host if you want the advisory report. Edit this list from the CLI with `ops net mute|unmute -a
+# hermes-desktop`. Remove the entry here the day you decide to `allow` the POST.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (advisory bulk lookup)
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage.
+# Uncomment the OPENROUTER_API_KEY line in the [env] block above AND the [secret] block below,
+# and provide $OPENROUTER_API_KEY on the host, to enable BYOK: the in-cage placeholder lets Hermes
+# start and issue the request, and the proxy substitutes the real key on the wire to openrouter.ai.
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
