@@ -683,21 +683,41 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "rm"],
-        synopsis: "ops app rm <name>",
-        summary: "remove an imported profile",
-        options: &[("<name>", "the imported profile to remove")],
-        details: "Removes only an imported profile (a file in the profiles directory). A project\n\
-            [app.<name>] overlay lives in that project's .ops.toml and is yours to edit there.",
+        synopsis: "ops app rm <name> [--purge] [--gc]",
+        summary: "remove an imported profile (and, with --purge, the app's home + tools)",
+        options: &[
+            ("<name>", "the app to remove"),
+            (
+                "--purge",
+                "also remove the app's isolated home(s): its mise tools, config, and login state",
+            ),
+            (
+                "--gc",
+                "after --purge, sweep the current project's nix store (requires --purge)",
+            ),
+        ],
+        details: "Without --purge, removes only an imported profile (a file in the profiles\n\
+            directory); a project [app.<name>] overlay lives in that project's .ops.toml and is\n\
+            yours to edit there. With --purge it also removes the app's per-app home(s) — the\n\
+            global one and any per-project ones — which hold the tools its mise: backends\n\
+            installed, its config, and its login state; those are freed immediately. A missing\n\
+            profile is tolerated under --purge (the homes may still exist). The shared per-project\n\
+            nix store is not touched by --purge alone: add --gc to sweep the current project's\n\
+            store in the same command (equivalent to `ops gc --prune` there), or run that yourself\n\
+            in each project the app used to reclaim its nix:/flake: closures. A purge refuses while\n\
+            a session of the app is still running.",
     },
     Page {
         path: &["app", "list"],
         synopsis: "ops app list  (alias: ops app ls)",
-        summary: "list the imported profiles",
+        summary: "list imported profiles and installed app homes",
         options: &[],
         details:
-            "The imported profiles `import`/`rm` manage, by name. `ops app ls` is the same\n\
-            command — a shorter alias. The full resolved app set — inline, project, and\n\
-            profile apps with their gating — is `ops config show`.",
+            "Two things, by name: the imported profiles `import`/`rm` manage, and the apps with an\n\
+            installed home on disk (their mise tools + login state, with disk size) — which\n\
+            `ops app rm <name> --purge` removes. An app can have a profile with no home yet, or a\n\
+            home with no profile. `ops app ls` is the same command. The full resolved app set —\n\
+            inline, project, and profile apps with their gating — is `ops config show`.",
     },
     // ---- test subcommands ---------------------------------------------------------
     Page {

@@ -4,7 +4,7 @@
 ops app <name> [--detach] [override flags] [-- <args>...]
 ops app import <file> [--as <name>] [--force]
 ops app export <name> [--out <file>]
-ops app rm <name>
+ops app rm <name> [--purge] [--gc]
 ops app list
 ```
 
@@ -40,11 +40,28 @@ keep it.
 | `import <file> [--as <name>] [--force]` | place a portable profile (trusted by location); the granted posture is printed |
 | `export <name> [--out <file>]` | write a named app out as a portable profile (stdout by default) |
 | `rm <name>` | remove an **imported** profile (a project `[app.<name>]` lives in that project's `.ops.toml`) |
-| `list` | list the imported profiles |
+| `rm <name> --purge` | also remove the app's isolated **home(s)** — the tools its `mise:` backends installed, its config, and its login state |
+| `rm <name> --purge --gc` | after the purge, sweep the **current project's** nix store too (one command; requires `--purge`) |
+| `list` | list the imported profiles **and** the apps with an installed home (with disk size) |
 
 `import`/`export`/`rm`/`list` are reserved verbs and cannot be app names. `import` is a
 deliberate consent act — an agent in the cage cannot run it, and the profile stays
 inert until `ops app <name>`. See [Portable profiles](../apps/profiles.md).
+
+### Removing an app
+
+`rm <name>` deletes only the imported profile. To also reclaim what a launch left on
+disk, add `--purge`: it removes the app's [isolated home(s)](../apps/home.md) — the
+global one and any per-project ones — which hold the tools installed by the app's
+`mise:` backends, its config, and its login/session state, freed immediately. A running
+session of the app is a hard stop (stop it first with [`ops stop`](stop.md)).
+
+`--purge` on its own does **not** touch the shared per-project nix store, which backs
+every app in a project. Add **`--gc`** (which requires `--purge`) to sweep the **current
+project's** store in the same command — equivalent to running [`ops gc --prune`](gc.md)
+there — reclaiming the app's now-unreferenced `nix:`/`flake:` closures. For a global app
+used in several projects, run the sweep in each of them (one command covers the current
+project only). Use `ops app list` to see which apps have an installed home to purge.
 
 ## Examples
 
@@ -53,6 +70,8 @@ ops app import profiles/claude-code.toml
 ops app claude-code                    # launch with its own isolated home
 ops app claude-code -- -c              # resume the previous session
 ops app claude-code --net none         # one run with no network
-ops app list
+ops app list                           # imported profiles + installed homes
 ops app export claude-code > my-claude.toml
+ops app rm claude-code --purge         # remove the profile, home, and tools
+ops app rm claude-code --purge --gc    # …and sweep this project's nix store too
 ```

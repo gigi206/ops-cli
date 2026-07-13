@@ -66,3 +66,13 @@ ops attach <id>     # join the running app's cage and open a shell inside it
 `ops attach` enters the live cage (its processes, its real `/tmp`, its network, and the
 app's isolated home as the agent currently sees it) — not a fresh cage. See
 [`ops attach`](../cli/attach.md) and [Sessions](../housekeeping/sessions.md).
+
+## Removing an app's home
+
+The home persists until you remove it. `ops app rm <name> --purge` deletes the app's
+home(s) — the global one and any per-project ones — freeing the tools its `mise:`
+backends installed, its config, and its login state. `ops app list` shows which apps
+have an installed home, with size. Any `nix:`/`flake:` closures in the shared per-project
+store are reclaimed by [`ops gc --prune`](../cli/gc.md) — or add `--gc` to the purge to
+sweep the current project's store in one command. See
+[`ops app`](../cli/app.md#removing-an-app).

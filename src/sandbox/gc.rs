@@ -381,6 +381,153 @@ pub(crate) fn reap_one(
     ReapOneOutcome::Tree { dir, bytes }
 }
 
+/// One home directory a purge removed, and the bytes it freed.
+pub(crate) struct PurgedHome {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+}
+
+/// The outcome of purging an app's isolated home directories: what was removed, and what could not
+/// be. Best-effort by design — one directory that fails to remove never stops the others.
+pub(crate) struct AppPurgeReport {
+    /// Homes removed, each with the bytes it freed.
+    pub(crate) removed: Vec<PurgedHome>,
+    /// Homes that existed but could not be removed (path and the reason), reported not swallowed.
+    pub(crate) failed: Vec<(PathBuf, io::Error)>,
+}
+
+impl AppPurgeReport {
+    /// No home was found at all (nothing removed, nothing failed) — the caller uses this to tell a
+    /// genuine no-op (a typo, an app that left no runtime state) from a successful purge.
+    pub(crate) fn found_nothing(&self) -> bool {
+        self.removed.is_empty() && self.failed.is_empty()
+    }
+
+    /// Total bytes reclaimed across the removed homes.
+    pub(crate) fn freed(&self) -> u64 {
+        self.removed.iter().map(|h| h.bytes).sum()
+    }
+}
+
+/// Remove app `name`'s isolated home directories — the global home `<data>/apps/<name>/` (shared
+/// across projects) and each per-project home `<data>/projects/<id>/apps/<name>/`. These hold the
+/// app's mise data (the tools its `mise:` backends installed), its config, and its login/session
+/// state — all app-exclusive, so removing them frees that state immediately. The shared per-project
+/// nix store, which backs *every* app in a project, is deliberately **not** touched here; `ops gc`
+/// owns its reclamation (a purged app's `nix:`/`flake:` closures become collectable there).
+///
+/// `name` reaches [`force_remove_dir_all`], so the same single-ordinary-component guard the reap
+/// sink applies ([`is_safe_tree_id`]) is re-applied here before any `join`: a separator, a `..`, or
+/// an absolute form would turn the join into a delete outside the data directory. The CLI validates
+/// the name too (with a clearer message); this is defense at the sink. Best-effort per directory.
+pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    // Defense at the sink: `name` is about to be joined onto a path that reaches a recursive delete.
+    if !is_safe_tree_id(name) {
+        return AppPurgeReport { removed, failed };
+    }
+    // The global home, then each per-project home under an existing project tree.
+    let mut candidates = vec![data_dir.join("apps").join(name)];
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("projects")) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                candidates.push(entry.path().join("apps").join(name));
+            }
+        }
+    }
+    for dir in candidates {
+        if !dir.is_dir() {
+            continue;
+        }
+        let bytes = tree_size(&dir);
+        match force_remove_dir_all(&dir) {
+            Ok(()) => removed.push(PurgedHome { path: dir, bytes }),
+            Err(e) => failed.push((dir, e)),
+        }
+    }
+    AppPurgeReport { removed, failed }
+}
+
+/// One app that has isolated runtime state on disk — its home(s) under the data directory. The
+/// read-only counterpart of [`purge_app_homes`], for the `ops app list` view: it lets a user see
+/// which apps have installed tools/login state (even ones with no imported profile) before deciding
+/// what to purge. An app may have a global home (shared across projects), per-project homes, or both.
+pub(crate) struct InstalledApp {
+    pub(crate) name: String,
+    /// Size of the global home `<data>/apps/<name>/`, or `None` when there is none.
+    pub(crate) global_bytes: Option<u64>,
+    /// Number of per-project homes `<data>/projects/<id>/apps/<name>/`.
+    pub(crate) project_homes: usize,
+    /// Total size across the per-project homes.
+    pub(crate) project_bytes: u64,
+}
+
+impl InstalledApp {
+    /// Total disk a full `ops app rm <name> --purge` would free (global + every per-project home).
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.global_bytes.unwrap_or(0) + self.project_bytes
+    }
+}
+
+/// Enumerate the apps with an isolated home on disk, grouped and sized by name. Scans the global
+/// homes under `<data>/apps/` and the per-project homes under `<data>/projects/<id>/apps/`, sizing
+/// each with [`tree_size`]. Sorted by name. Read-only; a missing tree is simply no homes. Sizing is
+/// a recursive stat, so a very large mise data dir makes this proportionally slower — acceptable for
+/// an interactive management listing, where the size is the point (it drives the purge decision).
+pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
+    use std::collections::BTreeMap;
+    // name -> (global_bytes, project_homes, project_bytes)
+    let mut apps: BTreeMap<String, (Option<u64>, usize, u64)> = BTreeMap::new();
+
+    // Global homes: <data>/apps/<name>/
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("apps")) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                let bytes = tree_size(&entry.path());
+                apps.entry(name.to_string()).or_default().0 = Some(bytes);
+            }
+        }
+    }
+
+    // Per-project homes: <data>/projects/<id>/apps/<name>/
+    if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
+        for project in projects.flatten() {
+            if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(project.path().join("apps")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    let bytes = tree_size(&entry.path());
+                    let e = apps.entry(name.to_string()).or_default();
+                    e.1 += 1;
+                    e.2 += bytes;
+                }
+            }
+        }
+    }
+
+    apps.into_iter()
+        .map(
+            |(name, (global_bytes, project_homes, project_bytes))| InstalledApp {
+                name,
+                global_bytes,
+                project_homes,
+                project_bytes,
+            },
+        )
+        .collect()
+}
+
 /// The state of one project tree, for `ops path`'s per-project annotation. The non-destructive,
 /// finer-grained counterpart of [`reap_dead_projects`] (which folds `Live` and `Idle` into "keep"):
 /// `Live` (a running session holds it), `Idle` (no session, the marker points at a project
@@ -480,7 +627,7 @@ fn project_is_gone(path: &Path) -> bool {
 /// directories read-only (`0555`), so a plain `remove_dir_all` cannot unlink their entries; this
 /// chmods each directory owner-writable before descending. Symlinks are unlinked, never followed —
 /// `file_type` reads the entry's own type without dereferencing.
-fn force_remove_dir_all(path: &Path) -> io::Result<()> {
+pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     for entry in std::fs::read_dir(path)? {
@@ -498,7 +645,7 @@ fn force_remove_dir_all(path: &Path) -> io::Result<()> {
 /// accounts for sparse files). Symlinks are not followed. Best-effort: an unreadable entry is
 /// skipped rather than failing the report. Reflinked content shared with another project counts
 /// per file, so the figure is an upper bound on what a prune actually frees.
-fn tree_size(path: &Path) -> u64 {
+pub(crate) fn tree_size(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let mut total = 0;
     let Ok(entries) = std::fs::read_dir(path) else {
@@ -966,5 +1113,102 @@ mod tests {
         assert!(!gcroots.join("gui/stale").exists() && gcroots.join("gui/live").is_dir());
         assert!(!gcroots.join("mise/oldeng").exists() && gcroots.join("mise/eng").is_dir());
         assert!(!gcroots.join("projects/p2").exists() && gcroots.join("projects/p1").is_dir());
+    }
+
+    /// Create an app home directory with one small file, so it is a non-empty tree with a size.
+    fn mk_home(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("state"), b"x").unwrap();
+    }
+
+    #[test]
+    fn purge_app_homes_removes_the_global_and_per_project_homes_only() {
+        let data = TmpDir::new();
+        let d = data.path();
+        // the target app: a global home and a per-project home
+        mk_home(&d.join("apps/claude/home"));
+        mk_home(&d.join("apps/claude/etc"));
+        mk_home(&d.join("projects/p1/apps/claude/home"));
+        // a different app, and unrelated project state, must all survive
+        mk_home(&d.join("apps/codex/home"));
+        mk_home(&d.join("projects/p1/apps/other/home"));
+        mk_home(&d.join("projects/p1/store/nix"));
+
+        let report = purge_app_homes(d, "claude");
+
+        // both of claude's homes removed, nothing failed
+        assert_eq!(
+            report.removed.len(),
+            2,
+            "removed: {:?}",
+            report.removed.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert!(report.failed.is_empty());
+        assert!(report.freed() > 0);
+        assert!(!d.join("apps/claude").exists());
+        assert!(!d.join("projects/p1/apps/claude").exists());
+        // everything else is untouched
+        assert!(d.join("apps/codex/home").is_dir());
+        assert!(d.join("projects/p1/apps/other/home").is_dir());
+        assert!(d.join("projects/p1/store/nix").is_dir());
+    }
+
+    #[test]
+    fn purge_app_homes_reports_nothing_for_an_unknown_app() {
+        let data = TmpDir::new();
+        mk_home(&data.path().join("apps/claude/home"));
+        let report = purge_app_homes(data.path(), "ghost");
+        assert!(report.found_nothing());
+        assert!(data.path().join("apps/claude").is_dir()); // the real app is untouched
+    }
+
+    #[test]
+    fn purge_app_homes_refuses_a_traversing_name_at_the_sink() {
+        let data = TmpDir::new();
+        // a sibling of apps/ that a traversal would try to reach
+        mk_home(&data.path().join("victim"));
+        // names that are not a single ordinary component must be refused before any join
+        for name in ["../victim", "a/b", "/etc", ".", ".."] {
+            let report = purge_app_homes(data.path(), name);
+            assert!(report.found_nothing(), "removed something for {name:?}");
+        }
+        assert!(data.path().join("victim").is_dir());
+    }
+
+    #[test]
+    fn installed_app_homes_groups_global_and_per_project() {
+        let data = TmpDir::new();
+        let d = data.path();
+        // claude: a global home + two per-project homes
+        mk_home(&d.join("apps/claude/home"));
+        mk_home(&d.join("projects/p1/apps/claude/home"));
+        mk_home(&d.join("projects/p2/apps/claude/home"));
+        // codex: a global home only
+        mk_home(&d.join("apps/codex/home"));
+        // scratch: a single per-project home, no global one
+        mk_home(&d.join("projects/p1/apps/scratch/home"));
+
+        let apps = installed_app_homes(d);
+        let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["claude", "codex", "scratch"]); // sorted
+
+        let claude = &apps[0];
+        assert!(claude.global_bytes.is_some());
+        assert_eq!(claude.project_homes, 2);
+        assert!(claude.total_bytes() > 0);
+
+        let codex = &apps[1];
+        assert!(codex.global_bytes.is_some());
+        assert_eq!(codex.project_homes, 0);
+
+        let scratch = &apps[2];
+        assert!(scratch.global_bytes.is_none());
+        assert_eq!(scratch.project_homes, 1);
+    }
+
+    #[test]
+    fn installed_app_homes_is_empty_without_a_data_tree() {
+        let data = TmpDir::new();
+        assert!(installed_app_homes(data.path()).is_empty());
     }
 }

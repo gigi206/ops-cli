@@ -52,7 +52,9 @@ pub(crate) use flake::{
     pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
     withheld as withheld_flake_packages, FlakeUpgrade,
 };
-pub(crate) use gc::classify_tree;
+pub(crate) use gc::{
+    classify_tree, human_bytes, installed_app_homes, purge_app_homes, InstalledApp,
+};
 pub(crate) use launch::{
     app, attach, effective_lock_target, gc, gc_one_tree, run, run_mise, shell, stop,
     upgrade_mise_packages,

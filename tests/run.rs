@@ -5203,3 +5203,147 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
          namespace instead of being killed with it"
     );
 }
+
+/// Materialize a non-empty file at `path`, creating parents. A helper for the app-purge e2es, which
+/// stand up fake app homes on disk (the purge is host-side filesystem work — no sandbox needed).
+fn touch_under(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, b"x").unwrap();
+}
+
+/// `ops <args>` with only the data dir redirected — enough for the host-side `ops app` management
+/// verbs (list/rm), which read the config and data dirs but never launch a cage.
+fn ops_data(data: &Path, args: &[&str]) -> Output {
+    ops()
+        .args(args)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("spawn ops")
+}
+
+#[test]
+fn ops_app_rm_purge_removes_the_installed_homes_and_lists_them() {
+    let data = TmpDir::new("purge-data");
+    let ops_dir = data.path().join("ops");
+    // The target app 'claude': a global home (with a sibling etc) and one per-project home.
+    touch_under(&ops_dir.join("apps/claude/home/state"));
+    touch_under(&ops_dir.join("apps/claude/etc/passwd"));
+    touch_under(&ops_dir.join("projects/testproj/apps/claude/home/state"));
+    // A different app and unrelated project state that must all survive the purge.
+    touch_under(&ops_dir.join("apps/codex/home/state"));
+    touch_under(&ops_dir.join("projects/testproj/store/nix/keepme"));
+
+    // `ops app list` shows the installed homes, so a user can see what there is to purge.
+    let listed = ops_data(data.path(), &["app", "list"]);
+    assert!(listed.status.success(), "app list failed: {listed:?}");
+    let list_out = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        list_out.contains("installed app homes")
+            && list_out.contains("claude")
+            && list_out.contains("codex"),
+        "app list did not report the installed homes:\n{list_out}"
+    );
+
+    // Purge 'claude': profile absent (fine), both homes removed, everything else intact.
+    let purged = ops_data(data.path(), &["app", "rm", "claude", "--purge"]);
+    assert!(purged.status.success(), "purge failed: {purged:?}");
+    let purge_out = String::from_utf8_lossy(&purged.stdout);
+    assert!(
+        purge_out.contains("purged"),
+        "no purge summary:\n{purge_out}"
+    );
+    assert!(
+        !ops_dir.join("apps/claude").exists(),
+        "global home survived"
+    );
+    assert!(
+        !ops_dir.join("projects/testproj/apps/claude").exists(),
+        "per-project home survived"
+    );
+    assert!(
+        ops_dir.join("apps/codex/home/state").exists(),
+        "codex was collateral"
+    );
+    assert!(
+        ops_dir.join("projects/testproj/store/nix/keepme").exists(),
+        "the shared per-project store was touched — purge must leave it to `ops gc`"
+    );
+
+    // A second purge finds nothing and says so (a typo/no-op must not report success).
+    let again = ops_data(data.path(), &["app", "rm", "claude", "--purge"]);
+    assert!(!again.status.success(), "a no-op purge reported success");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("nothing to purge"),
+        "no-op purge did not explain itself: {again:?}"
+    );
+}
+
+#[test]
+fn ops_app_rm_gc_requires_purge() {
+    // `--gc` sweeps the store a purged home referenced, so it is meaningless without `--purge`.
+    // This errors before any work, so it needs no capable host and no data setup.
+    let data = TmpDir::new("gc-needs-purge");
+    let out = ops_data(data.path(), &["app", "rm", "agent", "--gc"]);
+    assert!(
+        !out.status.success(),
+        "`--gc` without `--purge` should be a usage error"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "usage error should exit 2: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires `--purge`"),
+        "the error should explain the --gc/--purge relationship: {out:?}"
+    );
+}
+
+#[test]
+fn ops_app_rm_purge_refuses_while_a_session_is_live() {
+    let data = TmpDir::new("purge-live-data");
+    let ops_dir = data.path().join("ops");
+    touch_under(&ops_dir.join("apps/agent/home/state"));
+
+    // A real live process to anchor a session record: the guard is decided by a start-time match
+    // against /proc, so a fabricated record must name a genuinely-running pid.
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc stat");
+    let after = &stat[stat.rfind(')').unwrap() + 1..];
+    let start_ticks: u64 = after.split_whitespace().nth(19).unwrap().parse().unwrap();
+
+    // A session record tagging that live pid as `ops app agent` (runtime `global-app:agent`); the
+    // record format is the module's `key=value` text, project hex-encoded (`/x` = 2f78).
+    let sessions = ops_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}-{start_ticks}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:agent\nproject=2f78\n"
+        ),
+    )
+    .unwrap();
+
+    let out = ops_data(data.path(), &["app", "rm", "agent", "--purge"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        !out.status.success(),
+        "purge did not refuse a live app: {out:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("running session"),
+        "refusal did not name the live session: {err}"
+    );
+    // Nothing was removed — the home is still there for a retry after the session stops.
+    assert!(
+        ops_dir.join("apps/agent/home/state").exists(),
+        "purge removed the home despite the live session"
+    );
+}

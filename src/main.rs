@@ -2816,7 +2816,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("import") => app_import(&args[1..]),
         Some("export") => app_export(&args[1..]),
-        Some("rm") => app_rm(args.get(1).and_then(|a| a.to_str())),
+        Some("rm") => app_rm(&args[1..]),
         Some("list" | "ls") => app_list(),
         // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
         // background as a session `ops ls`/`attach`/`stop` can see. Tokens after a `--` are passed
@@ -3318,19 +3318,96 @@ fn app_export(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops app rm <name>`: remove an imported profile. Only an imported profile (a file in the
-/// profiles directory) is removed here — a project `[app.<name>]` overlay lives in that project's
-/// `.ops.toml` and is the user's to edit there (a global app is always a profile file, so there is
-/// nothing else to remove). The name is validated before it is joined to a path (anti-traversal).
-fn app_rm(name: Option<&str>) -> ExitCode {
-    let Some(name) = name else {
-        eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
-        return ExitCode::from(2);
+/// `ops app rm <name> [--purge] [--gc]`: remove an app.
+///
+/// By default this removes only the imported **profile** (a file in the profiles directory) — a
+/// project `[app.<name>]` overlay lives in that project's `.ops.toml` and is the user's to edit
+/// there. With `--purge` it also removes the app's isolated **runtime state**: its per-app home(s)
+/// (the mise tools its `mise:` backends installed, its config, and its login/session state), which
+/// is freed immediately. `--gc` (which requires `--purge`) then sweeps the **current project's**
+/// nix store — reclaiming the app's now-unreferenced `nix:`/`flake:` closures in one command for the
+/// common single-project case (see [`app_rm_purge`]). The name is validated before it is joined to
+/// any path (anti-traversal).
+fn app_rm(args: &[OsString]) -> ExitCode {
+    let (purge, gc, name) = match parse_app_rm(args) {
+        AppRmArgs::Ok { purge, gc, name } => (purge, gc, name),
+        AppRmArgs::MissingName => {
+            eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
+            return ExitCode::from(2);
+        }
+        AppRmArgs::UnknownOption(tok) => {
+            eprintln!("ops: app rm: unknown option `{tok}`");
+            eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
+            return ExitCode::from(2);
+        }
+        AppRmArgs::Extra(tok) => {
+            eprintln!("ops: app rm: unexpected argument `{tok}` (one app name only)");
+            return ExitCode::from(2);
+        }
+        AppRmArgs::NonUtf8 => {
+            eprintln!("ops: app rm: argument is not valid UTF-8");
+            return ExitCode::from(2);
+        }
     };
     if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
         eprintln!("ops: '{name}' is not a valid app name");
         return ExitCode::from(2);
     }
+    // `--gc` reclaims the store an app's homes referenced, so it only makes sense alongside the
+    // home removal `--purge` performs — never on a bare profile removal.
+    if gc && !purge {
+        eprintln!(
+            "ops: app rm: `--gc` requires `--purge` (it sweeps the store the purged home used)"
+        );
+        return ExitCode::from(2);
+    }
+    if purge {
+        app_rm_purge(name, gc)
+    } else {
+        app_rm_profile(name)
+    }
+}
+
+/// The structural parse of `ops app rm` arguments (before name validation). Kept pure so the flag/
+/// positional handling — `--purge`, `--gc`, and the single app name in any order — is unit-tested.
+/// The name's charset/reserved-verb validation and the `--gc`-requires-`--purge` rule are the
+/// caller's next steps.
+enum AppRmArgs<'a> {
+    Ok {
+        purge: bool,
+        gc: bool,
+        name: &'a str,
+    },
+    MissingName,
+    UnknownOption(&'a str),
+    Extra(&'a str),
+    NonUtf8,
+}
+
+fn parse_app_rm(args: &[OsString]) -> AppRmArgs<'_> {
+    let mut purge = false;
+    let mut gc = false;
+    let mut name: Option<&str> = None;
+    for arg in args {
+        match arg.to_str() {
+            Some("--purge") => purge = true,
+            Some("--gc") => gc = true,
+            Some(tok) if tok.starts_with('-') => return AppRmArgs::UnknownOption(tok),
+            Some(tok) if name.is_none() => name = Some(tok),
+            Some(tok) => return AppRmArgs::Extra(tok),
+            None => return AppRmArgs::NonUtf8,
+        }
+    }
+    match name {
+        Some(name) => AppRmArgs::Ok { purge, gc, name },
+        None => AppRmArgs::MissingName,
+    }
+}
+
+/// Remove app `name`'s imported profile only (the default `ops app rm`). A missing profile is an
+/// error here — the user asked to remove a profile and there is none to remove (with `--purge` a
+/// missing profile is tolerated, since the homes may still exist).
+fn app_rm_profile(name: &str) -> ExitCode {
     let Some(dir) = config::profiles_dir() else {
         eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
         return ExitCode::FAILURE;
@@ -3345,7 +3422,8 @@ fn app_rm(name: Option<&str>) -> ExitCode {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "ops: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
-                 project's .ops.toml — edit it there)"
+                 project's .ops.toml — edit it there). To also remove an app's home/tools, use \
+                 `ops app rm {name} --purge`."
             );
             ExitCode::FAILURE
         }
@@ -3356,47 +3434,232 @@ fn app_rm(name: Option<&str>) -> ExitCode {
     }
 }
 
-/// `ops app list`: the imported profiles (the artifacts `import`/`rm` manage), by name. The full
-/// resolved app set — inline, project, and profile apps together with their gating — is `ops
-/// config`; this is the focused view of what is on disk to manage.
-fn app_list() -> ExitCode {
-    let Some(dir) = config::profiles_dir() else {
-        eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+/// `ops app rm <name> --purge`: remove the profile **and** the app's isolated runtime state.
+///
+/// The runtime state is the per-app home(s): the global `<data>/apps/<name>/` and each per-project
+/// `<data>/projects/<id>/apps/<name>/`. They hold the tools the app's `mise:` backends installed
+/// (under the home's mise data dir), the app's config, and its login/session state — all removed
+/// immediately, so "delete from mise" is satisfied here, not deferred. What this does **not** touch
+/// is the shared per-project nix store: it backs every app in a project, so a purged app's
+/// `nix:`/`flake:` closures are reclaimed by `ops gc`, which the closing note points at.
+///
+/// A running session of the app is a hard stop — deleting its home mid-run would corrupt it — so
+/// this refuses until the session is stopped (the same live guard `ops gc` applies). Under `--purge`
+/// a missing profile is tolerated (the homes may still exist), but finding *nothing at all* — no
+/// profile and no home — is reported as a no-op so a typo never silently "succeeds".
+///
+/// When `gc` is set (the `--gc` flag), it then sweeps the **current project's** store via the same
+/// path as `ops gc --prune`, reclaiming the app's now-unreferenced closures there in one command.
+/// The sweep is a distinct step with its own prerequisites (a capable host, nix); its failure is
+/// reflected in the exit code but never undoes the purge that already happened.
+fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
+
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("ops: cannot locate ops's data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
-    let mut names: Vec<String> = Vec::new();
-    match std::fs::read_dir(&dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|x| x.to_str()) == Some("toml") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        names.push(stem.to_string());
-                    }
-                }
+
+    // Live-session guard: a session running as this app holds its home open. Refuse until it is
+    // stopped, and fail closed if the registry cannot be read (a purge must not run unproven).
+    match session::Registry::at(layout.data_dir()).list() {
+        Ok(sessions) => {
+            let pids: Vec<String> = sessions
+                .iter()
+                .filter(|s| s.app() == Some(name))
+                .map(|s| s.pid.to_string())
+                .collect();
+            if !pids.is_empty() {
+                eprintln!(
+                    "ops: app '{name}' has a running session (pid {}); stop it first \
+                     (see `ops ls`; then `ops stop {}`).",
+                    pids.join(", "),
+                    pids.join(" ")
+                );
+                return ExitCode::FAILURE;
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            eprintln!("ops: cannot read {}: {e}", dir.display());
+            eprintln!("ops: cannot read the session registry ({e}); not purging '{name}'.");
             return ExitCode::FAILURE;
         }
     }
-    names.sort();
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
-    if names.is_empty() {
-        println!("{dim}no imported app profiles (import one with: ops app import <file>){r}");
-    } else {
-        println!("{h}imported app profiles{r} (in {n}{}{r}):", dir.display());
-        for name in &names {
-            println!("  {n}{name}{r}");
-        }
+
+    // 1. The profile (if any). Under --purge a missing profile is not fatal — the homes may still
+    //    exist (an app whose profile was already removed, or a project/inline app that has none).
+    let profile_removed = match config::profile_path(name) {
+        Some(path) => match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!("{}", render_removed(Some("app profile"), name, &pal));
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                eprintln!("ops: cannot remove {}: {e}", path.display());
+                false
+            }
+        },
+        None => false,
+    };
+
+    // 2. The isolated home(s): mise tools + config + login state, freed immediately.
+    let report = sandbox::purge_app_homes(layout.data_dir(), name);
+    for home in &report.removed {
         println!(
-            "{dim}(remove one with: ops app rm <name>; see all resolved apps with: ops config show){r}"
+            "{ok}removed{r} home {n}{}{r} {dim}({}){r}",
+            home.path.display(),
+            sandbox::human_bytes(home.bytes)
         );
     }
+    for (path, e) in &report.failed {
+        eprintln!("{warn}ops: could not remove {}: {e}{r}", path.display());
+    }
+
+    // 3. Nothing found across either source → a no-op (likely a typo); do not report success.
+    if !profile_removed && report.found_nothing() {
+        eprintln!("ops: nothing to purge for '{name}' (no profile and no home)");
+        return ExitCode::FAILURE;
+    }
+
+    // Name only what was actually removed: a purge with no profile present must not claim one.
+    let removed_what = if profile_removed {
+        "profile + mise tools + login state"
+    } else {
+        "mise tools + login state"
+    };
+    // A partial failure (a home that would not delete) is not a clean purge — say so, so the green
+    // summary never contradicts the non-zero exit below.
+    let verb = if report.failed.is_empty() {
+        format!("{ok}purged{r}")
+    } else {
+        format!("{warn}purged with errors{r}")
+    };
+    println!(
+        "{verb} app {n}{name}{r} — freed {n}{}{r} {dim}({removed_what}){r}",
+        sandbox::human_bytes(report.freed())
+    );
+    // The purge itself left state behind if a home would not delete — surface it in the exit code.
+    let purge_ok = report.failed.is_empty();
+
+    // Any `nix:`/`flake:` tool closures the app built live in the shared per-project store, which
+    // backs every app in a project. `--gc` sweeps the *current* project's store now; without it, the
+    // reclamation is a separate manual step, and either way other projects need their own sweep.
+    if gc {
+        println!();
+        let gc_code = sandbox::gc(true, false, false, &pal);
+        println!(
+            "{dim}note: `--gc` swept this project's store; run `ops gc --prune` in the app's other \
+             projects to reclaim their copies too.{r}"
+        );
+        // The purge succeeded independently of the sweep; when it did, defer to the sweep's own exit
+        // code so a sweep that could not run (no capable host, nix missing) is not hidden — but never
+        // undo the purge's failure signal.
+        return if purge_ok { gc_code } else { ExitCode::FAILURE };
+    }
+
+    println!(
+        "{dim}note: an app's nix:/flake: tool closures live in the shared per-project store; \
+         run `ops gc --prune` in a project to reclaim any no longer referenced there \
+         (or re-run with --gc for the current project).{r}"
+    );
+    if purge_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `ops app list`: what is on disk to manage — the imported **profiles** (`import`/`rm` artifacts),
+/// and the apps with an **installed home** (their mise tools + login state, which `--purge` removes).
+/// The two are distinct: an app can have a profile with no home yet (never launched), or a home with
+/// no profile (launched from an inline/project app, or a profile since removed). The full resolved
+/// app set — inline, project, and profile apps with their gating — is `ops config show`.
+fn app_list() -> ExitCode {
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+
+    // Imported profiles under <config>/ops/apps/*.toml.
+    let profiles_dir = config::profiles_dir();
+    let mut profiles: Vec<String> = Vec::new();
+    if let Some(dir) = &profiles_dir {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|x| x.to_str()) == Some("toml") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            profiles.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("ops: cannot read {}: {e}", dir.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    profiles.sort();
+
+    // Installed homes under the data dir (an app can have one with no profile).
+    let installed = store::Layout::from_env()
+        .map(|l| sandbox::installed_app_homes(l.data_dir()))
+        .unwrap_or_default();
+
+    if profiles.is_empty() && installed.is_empty() {
+        println!(
+            "{dim}no imported app profiles and no installed app homes \
+             (import one with: ops app import <file>){r}"
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(dir) = &profiles_dir {
+        if profiles.is_empty() {
+            println!("{dim}no imported app profiles (in {}){r}", dir.display());
+        } else {
+            println!("{h}imported app profiles{r} (in {n}{}{r}):", dir.display());
+            for name in &profiles {
+                println!("  {n}{name}{r}");
+            }
+        }
+    }
+
+    if !installed.is_empty() {
+        println!("{h}installed app homes{r} {dim}(remove with --purge){r}:");
+        let width = installed.iter().map(|a| a.name.len()).max().unwrap_or(0);
+        for app in &installed {
+            let padded = format!("{:<width$}", app.name);
+            println!(
+                "  {n}{padded}{r}  {dim}{}  ({}){r}",
+                sandbox::human_bytes(app.total_bytes()),
+                describe_home_locations(app),
+            );
+        }
+    }
+
+    println!(
+        "{dim}(remove a profile: ops app rm <name>; also remove its home + tools: \
+         ops app rm <name> --purge){r}"
+    );
     ExitCode::SUCCESS
+}
+
+/// A compact description of where an app's installed homes live — `global`, `N project home(s)`, or
+/// both joined with ` + ` — for the `ops app list` installed-homes line.
+fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
+    let mut parts = Vec::new();
+    if app.global_bytes.is_some() {
+        parts.push("global".to_string());
+    }
+    match app.project_homes {
+        0 => {}
+        1 => parts.push("1 project home".to_string()),
+        n => parts.push(format!("{n} project homes")),
+    }
+    parts.join(" + ")
 }
 
 /// `ops search <query>`: discover the `nix:` tools (and `[packages]` attributes) a
@@ -8302,6 +8565,88 @@ mod tests {
         std::fs::write(&f, b"1\n").unwrap();
         assert_eq!(read_sysctl(f.to_str().unwrap()).as_deref(), Some("1"));
         assert_eq!(read_sysctl(dir.join("nope").to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn parse_app_rm_handles_flag_and_name_in_either_order() {
+        let os = |s: &str| OsString::from(s);
+        // name only
+        assert!(matches!(
+            parse_app_rm(&[os("claude")]),
+            AppRmArgs::Ok {
+                purge: false,
+                gc: false,
+                name: "claude"
+            }
+        ));
+        // --purge before the name
+        assert!(matches!(
+            parse_app_rm(&[os("--purge"), os("claude")]),
+            AppRmArgs::Ok {
+                purge: true,
+                gc: false,
+                name: "claude"
+            }
+        ));
+        // --purge after the name (either order)
+        assert!(matches!(
+            parse_app_rm(&[os("claude"), os("--purge")]),
+            AppRmArgs::Ok {
+                purge: true,
+                gc: false,
+                name: "claude"
+            }
+        ));
+        // --purge and --gc together, name interleaved between the flags
+        assert!(matches!(
+            parse_app_rm(&[os("--gc"), os("claude"), os("--purge")]),
+            AppRmArgs::Ok {
+                purge: true,
+                gc: true,
+                name: "claude"
+            }
+        ));
+        // --gc alone parses; the --gc-requires---purge rule is the caller's, not the parser's
+        assert!(matches!(
+            parse_app_rm(&[os("--gc"), os("claude")]),
+            AppRmArgs::Ok {
+                purge: false,
+                gc: true,
+                name: "claude"
+            }
+        ));
+        // no name — even with the flag, --purge alone must never mean "purge everything"
+        assert!(matches!(parse_app_rm(&[]), AppRmArgs::MissingName));
+        assert!(matches!(
+            parse_app_rm(&[os("--purge")]),
+            AppRmArgs::MissingName
+        ));
+        // unknown option and a second positional are distinct errors
+        assert!(matches!(
+            parse_app_rm(&[os("--nope"), os("claude")]),
+            AppRmArgs::UnknownOption("--nope")
+        ));
+        assert!(matches!(
+            parse_app_rm(&[os("claude"), os("codex")]),
+            AppRmArgs::Extra("codex")
+        ));
+    }
+
+    #[test]
+    fn describe_home_locations_names_each_scope() {
+        let app = |global: Option<u64>, homes: usize| sandbox::InstalledApp {
+            name: "x".to_string(),
+            global_bytes: global,
+            project_homes: homes,
+            project_bytes: 0,
+        };
+        assert_eq!(describe_home_locations(&app(Some(1), 0)), "global");
+        assert_eq!(describe_home_locations(&app(None, 1)), "1 project home");
+        assert_eq!(describe_home_locations(&app(None, 3)), "3 project homes");
+        assert_eq!(
+            describe_home_locations(&app(Some(1), 2)),
+            "global + 2 project homes"
+        );
     }
 
     #[test]
