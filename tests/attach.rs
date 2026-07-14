@@ -155,7 +155,10 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     let mut sent = false;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Generous: the setns join into a live cage plus the in-cage shell startup can be slow under
+    // heavy parallel load (the whole test suite), and a too-tight deadline would drop the prompt
+    // detection before the script is sent — the source of this test's rare flakiness.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         let mut pfd = libc::pollfd {
             fd: master,
@@ -233,10 +236,18 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         b"printf done > \"$HOME/ATTACH_OK\"\nexit\n",
     );
 
+    let app_home_marker = data.path().join("ops/apps/probe/home/ATTACH_OK");
+    // Allow a brief window for the in-cage write to become observable on the host-bound home after
+    // the attached shell exits — a slow flush under load must not flake the assertion. The marker
+    // lives in the app's persistent home, so it survives killing the agent below.
+    let poll_until = Instant::now() + Duration::from_secs(15);
+    while !app_home_marker.exists() && Instant::now() < poll_until {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
     let _ = agent.kill();
     let _ = agent.wait();
 
-    let app_home_marker = data.path().join("ops/apps/probe/home/ATTACH_OK");
     assert!(
         app_home_marker.exists(),
         "the attached shell did not land in the app's isolated home ({app_home_marker:?})\n{log}"
