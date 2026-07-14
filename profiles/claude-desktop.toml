@@ -50,13 +50,12 @@
 # microphone and sound work (voice input). It is trusted-only because the PulseAudio bus exposes the
 # microphone AND every system-audio `.monitor` source (recording all host output), see
 # docs/guide/configuration/audio.md.
-# `dbus = "incage"` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `dbus = true` gives the cage its OWN private desktop portal (a `dbus-daemon` +
 # `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
-# IN-CAGE and lists only the cage filesystem. A filtered *host* bus (`dbus = true`) cannot do this:
-# Chromium commits to the host portal, whose host-privileged file manager stays refused, so "browse
-# for a folder" silently fails. `"incage"` also seeds your host light/dark theme at launch, and a
-# host-side relay bridges `org.freedesktop.Notifications` so desktop notifications still work — while
-# the login keyring (`org.freedesktop.secrets`) stays absent. The Electron flags: `--no-sandbox` is
+# IN-CAGE and lists only the cage filesystem (a host-privileged file manager over the host bus would
+# never be summonable from the cage). It also seeds your host light/dark theme at launch and follows
+# it live, and a host-side relay bridges `org.freedesktop.Notifications` so desktop notifications
+# work — while the login keyring (`org.freedesktop.secrets`) stays absent. The Electron flags: `--no-sandbox` is
 # mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary, replacing
 # Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the Wayland backend;
 # `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
@@ -149,14 +148,14 @@ WRAP
 chmod +x "$HOME/.local/bin/xdg-open"
 export PATH="$HOME/.local/bin:$PATH"
 
-# Route the desktop portal's OpenURI back to the xdg-open wrapper above. Under `dbus = "incage"` the
+# Route the desktop portal's OpenURI back to the xdg-open wrapper above. Under `dbus = true` the
 # cage has a real portal, so Electron opens external URLs via `org.freedesktop.portal.OpenURI` instead
 # of calling `xdg-open` — and the portal shows "Open With… no apps available" unless a default handler
 # is registered, which silently breaks the login/re-verification links (Google consent, the device
 # re-verification page, the `claude://` OAuth callback). Register the wrapper as the default handler
 # for the web + `claude` schemes so those links route through it exactly as they did without a portal.
 # The Exec path is ABSOLUTE (`$HOME` is expanded here) because the portal-launched handler does not
-# inherit this shell's PATH. Harmless under `dbus = true`/`false` (no portal calls OpenURI).
+# inherit this shell's PATH. Harmless under `dbus = false` (no portal to call OpenURI).
 mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
 cat > "$HOME/.local/share/applications/ops-open-uri.desktop" <<EOF
 [Desktop Entry]
@@ -182,7 +181,7 @@ exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usag
 gui = "wayland"
 gpu = true
 audio = true
-dbus = "incage"
+dbus = true
 
 # Your host Claude Desktop config/login, mounted read-write at its real absolute path (so the caged
 # app shares your host login/state). `binds` is a security field, honored only because this profile

@@ -1310,22 +1310,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             provenance_tag(view.audio_origin, pal)
         );
     }
-    match view.dbus {
-        config::view::DbusView::Off => {}
-        config::view::DbusView::HostFiltered => {
-            let _ = writeln!(
-                o,
-                "  {h}dbus:{r} filtered {dim}(theme + notifications){r}{}",
-                provenance_tag(view.dbus_origin, pal)
-            );
-        }
-        config::view::DbusView::InCagePortal => {
-            let _ = writeln!(
-                o,
-                "  {h}dbus:{r} in-cage portal {dim}(file chooser + theme){r}{}",
-                provenance_tag(view.dbus_origin, pal)
-            );
-        }
+    // The D-Bus posture — the in-cage desktop portal; shown only when opened, same as GPU.
+    if view.dbus {
+        let _ = writeln!(
+            o,
+            "  {h}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}{}",
+            provenance_tag(view.dbus_origin, pal)
+        );
     }
 
     // Inbound loopback forward ports — shown only when a layer declared any, so a default-profile
@@ -1591,19 +1582,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             }
             // The D-Bus posture the overlay sets; `None` inherits.
             match app.dbus {
-                Some(config::view::DbusView::HostFiltered) => {
+                Some(true) => {
                     let _ = writeln!(
                         o,
-                        "      {dim}dbus:{r} filtered {dim}(theme + notifications){r}"
+                        "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}"
                     );
                 }
-                Some(config::view::DbusView::InCagePortal) => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme){r}"
-                    );
-                }
-                Some(config::view::DbusView::Off) => {
+                Some(false) => {
                     let _ = writeln!(o, "      {dim}dbus:{r} disabled");
                 }
                 None => {}
@@ -1820,10 +1805,10 @@ fn render_app_detail(
 
     // The effective D-Bus posture — shown either way, so the inherited story is visible.
     let dbus_tag = app_provenance_tag(view.dbus_origin, pal);
-    let dbus_label = match view.dbus {
-        config::view::DbusView::Off => "disabled",
-        config::view::DbusView::HostFiltered => "filtered",
-        config::view::DbusView::InCagePortal => "in-cage portal",
+    let dbus_label = if view.dbus {
+        "in-cage portal"
+    } else {
+        "disabled"
     };
     let _ = writeln!(o, "  {h}dbus:{r}    {dbus_label}{dbus_tag}");
 
@@ -10144,7 +10129,7 @@ mod tests {
             gui_origin: Default::default(),
             gpu: false,
             audio: false,
-            dbus: config::DbusPolicy::Off,
+            dbus: false,
             gpu_origin: Default::default(),
             audio_origin: Default::default(),
             dbus_origin: Default::default(),
@@ -10649,7 +10634,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
@@ -10837,7 +10822,7 @@ mod tests {
             gui_origin: ProvenanceView::Inherited,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Inherited,
             audio_origin: ProvenanceView::Inherited,
             dbus_origin: ProvenanceView::Inherited,
@@ -11110,7 +11095,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
@@ -11203,7 +11188,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
@@ -11330,7 +11315,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
@@ -11398,7 +11383,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
@@ -11502,7 +11487,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
@@ -11606,7 +11591,7 @@ mod tests {
             gui_origin: ProvenanceView::Default,
             gpu: false,
             audio: false,
-            dbus: config::view::DbusView::Off,
+            dbus: false,
             gpu_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,

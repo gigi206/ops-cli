@@ -1,4 +1,4 @@
-//! The in-cage desktop portal (`dbus = "incage"`).
+//! The in-cage desktop portal (`dbus = true`).
 //!
 //! A Chromium/Electron app on Linux opens its file chooser through the desktop portal
 //! (`org.freedesktop.portal.FileChooser`). Under the filtered *host* bus (`dbus = true`) that
@@ -7,7 +7,7 @@
 //! then fails (recent Chromium commits to the portal and no longer falls back to its in-process
 //! GTK dialog once a portal advertises a new-enough version).
 //!
-//! `dbus = "incage"` gives the cage its **own** portal instead: a private D-Bus session bus runs
+//! `dbus = true` gives the cage its **own** portal instead: a private D-Bus session bus runs
 //! inside the cage carrying ops-provisioned `xdg-desktop-portal` with the reference GTK backend
 //! (`xdg-desktop-portal-gtk`). The app probes *that* portal, gets a real version, and the file
 //! chooser it opens is rendered **in-cage** by the GTK backend — a dialog that by construction sees

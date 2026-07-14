@@ -1,4 +1,4 @@
-//! The in-cage live-theme relay (`dbus = "incage"`).
+//! The in-cage live-theme relay (`dbus = true`).
 //!
 //! The in-cage portal ([`super::portal`]) seeds the host light/dark theme into the cage **once** at
 //! launch (so the app opens in the right scheme), but does not follow a host theme switch made

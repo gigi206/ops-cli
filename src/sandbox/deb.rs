@@ -567,7 +567,7 @@ mod tests {
             gui_origin: Default::default(),
             gpu: false,
             audio: false,
-            dbus: crate::config::DbusPolicy::Off,
+            dbus: false,
             gpu_origin: Default::default(),
             audio_origin: Default::default(),
             dbus_origin: Default::default(),

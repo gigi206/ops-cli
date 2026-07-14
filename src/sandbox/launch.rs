@@ -1353,10 +1353,8 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         }
     }
 
-    // In-cage portal roots under `gui = "wayland"` + `dbus = "incage"`: gc keeps the portal closure.
-    if prep.cfg.dbus.is_in_cage_portal()
-        && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
-    {
+    // In-cage portal roots under `gui = "wayland"` + `dbus = true`: gc keeps the portal closure.
+    if prep.cfg.dbus && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
         if let Ok(p) = super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             gui_roots.extend(p.roots);
         }
@@ -1936,20 +1934,17 @@ fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<
 pub(crate) struct LaunchGuard {
     pub(crate) egress: Option<egress::Egress>,
     pub(crate) forward: Option<forward::Forwarder>,
-    /// The filtered D-Bus proxy (`dbus = true`), when one is running. Like the egress proxy it must
-    /// outlive the cage, so its presence forces the supervised path; dropping it kills the proxy.
-    pub(crate) dbus: Option<super::dbus::DbusProxy>,
-    /// The in-cage desktop-notifications relay (`dbus = "incage"`), when one is running. It runs on a
+    /// The in-cage desktop-notifications relay (`dbus = true`), when one is running. It runs on a
     /// host thread bridging the private bus to the host notifications daemon, so it must outlive the
     /// cage; dropping it stops the thread. Dropped before `portal`, so it disconnects from the private
     /// bus before the portal's host directory (and its socket) is removed.
     pub(crate) notify: Option<super::notify_relay::NotifyRelay>,
-    /// The in-cage live-theme relay (`dbus = "incage"`), when one is running. It runs on a host thread
+    /// The in-cage live-theme relay (`dbus = true`), when one is running. It runs on a host thread
     /// mirroring host light/dark changes into the cage's GSettings keyfile, so it must outlive the
     /// cage; dropping it stops the thread. It writes only a host-side file (no private-bus dependency),
     /// so its drop order relative to `portal` is not load-bearing.
     pub(crate) theme: Option<super::theme_relay::ThemeRelay>,
-    /// The in-cage portal's host runtime directory (`dbus = "incage"`), when one is bound. The
+    /// The in-cage portal's host runtime directory (`dbus = true`), when one is bound. The
     /// private bus socket lives under it on the host, so it must be cleaned up when the launch ends
     /// rather than leaked by an exec — its presence forces the supervised path; dropping it removes
     /// the directory (socket and generated config).
@@ -1978,9 +1973,6 @@ impl Drop for LaunchGuard {
         }
         if let Some(forward) = self.forward.take() {
             drop(forward);
-        }
-        if let Some(dbus) = self.dbus.take() {
-            drop(dbus);
         }
         // Before the portal directory: the relay must disconnect from the private bus before its
         // socket is removed.
@@ -2129,7 +2121,7 @@ fn build(
         None
     };
 
-    // In-cage desktop portal: under `gui = "wayland"` AND `dbus = "incage"`, provision the portal
+    // In-cage desktop portal: under `gui = "wayland"` AND `dbus = true`, provision the portal
     // stack (dbus + xdg-desktop-portal + the GTK backend) host-side — before the seed, so its roots
     // join the project store — and read the host theme, best-effort, to seed the cage's light/dark
     // scheme at launch. The wrap that starts the private bus is applied after every other command
@@ -2145,9 +2137,7 @@ fn build(
     let mut portal_host: Option<super::portal::HostDir> = None;
     let mut notify_relay: Option<super::notify_relay::NotifyRelay> = None;
     let mut theme_relay: Option<super::theme_relay::ThemeRelay> = None;
-    let portal = if prep.cfg.dbus.is_in_cage_portal()
-        && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
-    {
+    let portal = if prep.cfg.dbus && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
         match super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             Ok(p) => match super::portal::HostDir::create(&prep.layout) {
                 Ok(hd) => {
@@ -2173,7 +2163,7 @@ fn build(
                 }
                 Err(e) => {
                     crate::diag::warn(&format!(
-                        "`dbus = \"incage\"` but the portal runtime directory could not be created \
+                        "`dbus = true` but the portal runtime directory could not be created \
                          ({e}) — running without an in-cage file chooser"
                     ));
                     None
@@ -2181,12 +2171,20 @@ fn build(
             },
             Err(e) => {
                 crate::diag::warn(&format!(
-                    "`dbus = \"incage\"` but the in-cage portal could not be provisioned ({e}) — \
+                    "`dbus = true` but the in-cage portal could not be provisioned ({e}) — \
                      running without an in-cage file chooser"
                 ));
                 None
             }
         }
+    } else if prep.cfg.dbus {
+        // `dbus = true` without a display: the in-cage portal's GTK backend renders on the
+        // compositor, so it cannot stand up. Warn rather than silently doing nothing.
+        crate::diag::warn(
+            "`dbus = true` needs `gui = \"wayland\"` (the in-cage portal renders on the \
+             compositor) — running without a desktop portal",
+        );
+        None
     } else {
         None
     };
@@ -2658,58 +2656,11 @@ fn build(
         }
     }
 
-    // dbus hole: under `dbus = true`, provision `xdg-dbus-proxy` and stand up a host-side filtered
-    // session-bus proxy (default-deny; only the appearance/theme portal and notifications), binding
-    // just its filtered socket into the cage and pointing `DBUS_SESSION_BUS_ADDRESS` at it. Runs
-    // host-side (trusted infra, like the egress proxy) under its own minimal cage. Best-effort: no
-    // session bus, a provisioning failure, or a proxy that does not come up warns and runs without a
-    // bus (the raw session bus is never exposed — that is the fail-closed direction). The guard
-    // forces the supervised path (the proxy must outlive the cage). The wiring env sets
-    // `DBUS_SESSION_BUS_ADDRESS`; an untrusted `[env]` could only mispoint the cage's own client at a
-    // nonexistent bus (self-DoS), never redirect the bind or reach the raw bus — so, like
-    // `WAYLAND_DISPLAY`, the key needs no denylist entry.
-    let mut dbus_guard = None;
-    if prep.cfg.dbus.is_host_filtered() {
-        if !dbus_filter_enforceable(&prep.cfg.network) {
-            // Under `network = "shared"` the cage shares the host netns, where the host session bus is
-            // reachable *directly*: abstract-namespace Unix sockets (`unix:abstract=…`, which legacy
-            // D-Bus sessions open) are namespace-scoped, not filesystem-scoped, so in-cage code could
-            // read `/proc/net/unix`, find the raw bus address, and connect around the proxy to the
-            // keyring and every portal. So the filtered proxy is NOT wired here — presenting a bus
-            // that is not actually filtered would be false confidence. Same shape as the `forward`
-            // block's shared-network skip.
-            crate::diag::warn(
-                "`dbus = true` but `network = \"shared\"` shares the host network namespace, where \
-                 the host session bus is directly reachable — the filtered D-Bus proxy is not wired \
-                 (it could not be enforced). Pair `dbus` with `network = \"none\"`/`\"deny\"`/\
-                 `\"allow\"` for a filtered bus.",
-            );
-        } else {
-            match super::dbus::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-                Ok(proxy_bin) => match super::dbus::start(&prep.layout, &proxy_bin, &prep.bwrap) {
-                    Ok((proxy, wiring)) => {
-                        gui_binds.extend(wiring.binds);
-                        gui_env.extend(wiring.env);
-                        dbus_guard = Some(proxy);
-                    }
-                    Err(e) => crate::diag::warn(&format!(
-                        "`dbus = true` but the filtered bus proxy could not start ({e}) — running \
-                         without a session bus (no theme following or notifications)"
-                    )),
-                },
-                Err(e) => crate::diag::warn(&format!(
-                    "`dbus = true` but `xdg-dbus-proxy` could not be provisioned ({e}) — running \
-                     without a session bus"
-                )),
-            }
-        }
-    }
-
     // In-cage portal: wrap the command so the private session bus is stood up before the app runs.
     // This is the **outermost** wrap — applied after every other command wrap (mise/flake/forward/
     // egress/catrust) — so its preamble (`dbus-daemon --fork`, which blocks until the socket is
     // ready) runs first, then execs the rest of the wrapped command. Only present under
-    // `gui = "wayland"` + `dbus = "incage"` with a successful provision.
+    // `gui = "wayland"` + `dbus = true` with a successful provision.
     if let Some(p) = &portal {
         cmd = super::portal::wrap_command(
             &prep.userland.shell_bin,
@@ -2810,15 +2761,10 @@ fn build(
         eprintln!("ops: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
-    let guard = if egress_guard.is_some()
-        || forward_guard.is_some()
-        || dbus_guard.is_some()
-        || portal_host.is_some()
-    {
+    let guard = if egress_guard.is_some() || forward_guard.is_some() || portal_host.is_some() {
         Some(LaunchGuard {
             egress: egress_guard,
             forward: forward_guard,
-            dbus: dbus_guard,
             notify: notify_relay,
             theme: theme_relay,
             portal: portal_host,
@@ -2842,17 +2788,6 @@ fn net_policy(network: &crate::config::NetworkPolicy) -> NetPolicy {
         crate::config::NetworkPolicy::Isolated => NetPolicy::Isolated,
         crate::config::NetworkPolicy::Allowlist(_) => NetPolicy::Isolated,
     }
-}
-
-/// Whether the filtered D-Bus proxy is a real boundary under `network`, so `dbus = true` should wire
-/// it. It is enforceable **only** when the cage has an isolated network namespace: under
-/// `network = "shared"` the cage shares the host netns, where the host session bus is reachable
-/// directly (abstract-namespace Unix sockets are namespace-scoped, not filesystem-scoped), so in-cage
-/// code could connect around the proxy to the raw bus — the filter would be false confidence. Every
-/// other posture (`none`/`deny`/`allow`/`ask`) maps to an empty netns (see [`net_policy`]), where the
-/// filter is airtight. Pure, so the security-relevant decision is pinned by a unit test.
-fn dbus_filter_enforceable(network: &crate::config::NetworkPolicy) -> bool {
-    !matches!(network, crate::config::NetworkPolicy::Shared)
 }
 
 /// Resolve the host's Wayland compositor socket and the cage environment that points a
@@ -3992,7 +3927,7 @@ mod tests {
             gui_origin: Default::default(),
             gpu: false,
             audio: false,
-            dbus: crate::config::DbusPolicy::Off,
+            dbus: false,
             gpu_origin: Default::default(),
             audio_origin: Default::default(),
             dbus_origin: Default::default(),
@@ -4492,25 +4427,6 @@ mod tests {
             )),
             NetPolicy::Isolated
         );
-    }
-
-    #[test]
-    fn the_dbus_filter_is_enforceable_only_under_an_isolated_netns() {
-        // The security-relevant decision (a future refactor must not silently reintroduce the
-        // shared-netns bypass): the filtered D-Bus proxy is wired ONLY when the cage's netns is
-        // isolated. Under `shared` the host bus is reachable directly (abstract sockets are
-        // netns-scoped), so the filter is not a boundary and is not wired.
-        assert!(
-            !dbus_filter_enforceable(&crate::config::NetworkPolicy::Shared),
-            "the dbus filter must not be wired under a shared netns"
-        );
-        assert!(dbus_filter_enforceable(
-            &crate::config::NetworkPolicy::Isolated
-        ));
-        // every filtering posture also runs the cage in an empty netns, where the filter is airtight
-        assert!(dbus_filter_enforceable(
-            &crate::config::NetworkPolicy::Allowlist(crate::allowlist::EgressPolicy::default())
-        ));
     }
 
     #[test]

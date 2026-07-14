@@ -136,7 +136,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--dbus[=true|false]",
-                "one-shot filtered-D-Bus posture (bare --dbus means true)",
+                "one-shot in-cage desktop portal (bare --dbus means true)",
             ),
             ("--", "end ops's own flags; everything after runs literally"),
         ],

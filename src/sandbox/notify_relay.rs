@@ -1,4 +1,4 @@
-//! The in-cage desktop notifications relay (`dbus = "incage"`).
+//! The in-cage desktop notifications relay (`dbus = true`).
 //!
 //! The in-cage portal ([`super::portal`]) gives a Chromium/Electron app its own private D-Bus bus so
 //! its file chooser renders in-cage. That private bus carries the portal, but nothing serves

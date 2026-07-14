@@ -40,7 +40,7 @@
 # LOGIN NEEDS AN IN-CAGE BROWSER. Sign-in is a Privy device-code grant: the app shows a code and opens
 # `portal.nousresearch.com/…?user_code=…` in a browser for you to authorize, then polls the token
 # endpoint. The hermetic cage has no host browser, so the `cmd` installs an `xdg-open` wrapper (and,
-# because `dbus = "incage"` routes external opens through the portal's OpenURI, registers it as the
+# because `dbus = true` routes external opens through the portal's OpenURI, registers it as the
 # default http/https handler) that launches an IN-CAGE Chromium (`nix:chromium`, see [packages]). You
 # then sign in there (Privy: email / social / wallet). Google was live-proven; the login pulls Privy +
 # Cloudflare Turnstile + Google OAuth hosts, all in the allowlist below.
@@ -85,10 +85,10 @@ hermes desktop --build-only --source
 
 # 4. In-cage browser for the OAuth login. Sign-in is a device-code grant: the app shows a code and
 #    opens `portal.nousresearch.com/...?user_code=...` in a browser (via shell.openExternal →
-#    xdg-open, or the portal's OpenURI under dbus="incage") for you to authorize; it then polls the
+#    xdg-open, or the portal's OpenURI under dbus=true) for you to authorize; it then polls the
 #    token endpoint. The hermetic cage has no host browser, so route those opens to an in-cage
 #    Chromium (see [packages]). Prepend an xdg-open wrapper AND register it as the portal's default
-#    http/https handler (under dbus="incage" Electron uses OpenURI, not xdg-open directly — without
+#    http/https handler (under dbus=true Electron uses OpenURI, not xdg-open directly — without
 #    the handler the portal shows "no apps available" and the login link goes nowhere).
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.config"
 cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
@@ -135,7 +135,7 @@ exec electron "$SRC/apps/desktop" --no-sandbox --ozone-platform=wayland --disabl
 # rendered with no file portal).
 gui = "wayland"
 gpu = true
-dbus = "incage"
+dbus = true
 audio = true
 
 [packages]

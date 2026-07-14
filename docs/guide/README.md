@@ -44,7 +44,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`gui`](configuration/gui.md) — the Wayland display posture.
 - [`gpu`](configuration/gpu.md) — hardware-accelerated GPU rendering (mesa: Intel/AMD/nouveau).
 - [`audio`](configuration/audio.md) — microphone and playback via PulseAudio.
-- [`dbus`](configuration/dbus.md) — a filtered D-Bus session bus (host theme + notifications).
+- [`dbus`](configuration/dbus.md) — a private in-cage desktop portal (file chooser + theme + notifications).
 - [`network`](configuration/network.md) — the egress posture (links to [Networking](networking/README.md)).
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).
 - [`[app.<name>]`](configuration/apps.md) — named launch profiles (links to [Apps](apps/README.md)).

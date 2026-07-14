@@ -49,8 +49,8 @@
 //! launch aborts rather than silently dropping the field and running a different posture than asked.
 
 use super::schema::{
-    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawDbus, RawDevices,
-    RawLimit, RawLimits, RawSeccomp,
+    self, NetworkField, NetworkTable, RawBind, RawBindTable, RawConfig, RawDevices, RawLimit,
+    RawLimits, RawSeccomp,
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
@@ -140,8 +140,8 @@ pub(crate) struct CliOverrides {
     pub(crate) gpu: Vec<String>,
     /// `--audio[=true|false]` — the audio posture (a boolean; bare `--audio` means `true`). Last wins.
     pub(crate) audio: Vec<String>,
-    /// `--dbus[=true|false|incage]` — the D-Bus posture (bare `--dbus` means `true` = filtered host
-    /// bus; `incage` = the in-cage portal). Last wins.
+    /// `--dbus[=true|false]` — the in-cage desktop portal (a boolean; bare `--dbus` means `true`).
+    /// Last wins.
     pub(crate) dbus: Vec<String>,
 }
 
@@ -177,7 +177,7 @@ struct AmbientOverrides {
     gpu: Option<String>,
     /// `OPS_AUDIO` — the audio posture (`true`/`false`).
     audio: Option<String>,
-    /// `OPS_DBUS` — the D-Bus posture (`true`/`false`/`incage`).
+    /// `OPS_DBUS` — the in-cage desktop portal (`true`/`false`).
     dbus: Option<String>,
 }
 
@@ -192,9 +192,7 @@ struct TypedLabels {
     forward: &'static str,
     gpu: &'static str,
     audio: &'static str,
-    // `--dbus`/`OPS_DBUS` carry their value verbatim (validated downstream by `validate_dbus`, like
-    // `gui`/`nixpkgs`), so — unlike `--gpu`/`--audio`, whose bool is parsed in `collect` — they need
-    // no label.
+    dbus: &'static str,
 }
 
 const CLI_LABELS: TypedLabels = TypedLabels {
@@ -205,6 +203,7 @@ const CLI_LABELS: TypedLabels = TypedLabels {
     forward: "--forward",
     gpu: "--gpu",
     audio: "--audio",
+    dbus: "--dbus",
 };
 
 const ENV_LABELS: TypedLabels = TypedLabels {
@@ -215,6 +214,7 @@ const ENV_LABELS: TypedLabels = TypedLabels {
     forward: "OPS_FORWARD",
     gpu: "OPS_GPU",
     audio: "OPS_AUDIO",
+    dbus: "OPS_DBUS",
 };
 
 /// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
@@ -598,10 +598,10 @@ fn build_typed_fragment(
     if let Some(v) = audio {
         raw.audio = Some(parse_bool(v, lbl.audio)?);
     }
-    // `--dbus` has three postures (`true`/`false`/`incage`), so its value is carried verbatim and
-    // validated downstream by `validate_dbus` (a bad string is fatal for an override, like `gui`).
+    // `--dbus` is a boolean, exactly like `--gpu`: `true`/`false` only, checked here (a bare `--dbus`
+    // is normalized to `"true"` by the CLI parser). A stale `--dbus=incage` is rejected here (exit 2).
     if let Some(v) = dbus {
-        raw.dbus = Some(RawDbus::Mode(v.to_string()));
+        raw.dbus = Some(parse_bool(v, lbl.dbus)?);
     }
     for spec in binds {
         raw.binds.push(parse_bind(spec, lbl.bind)?);
@@ -909,7 +909,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ov.raw.gpu, Some(true));
-        assert_eq!(ov.raw.dbus, Some(RawDbus::Mode("false".to_string())));
+        assert_eq!(ov.raw.dbus, Some(false));
 
         let last_wins = collect_cli(Cli {
             gpu: &["true", "false"],
@@ -930,6 +930,18 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_dbus_incage_value_is_a_hard_error() {
+        // `dbus` is now a bool; the former `--dbus=incage` string must fail LOUDLY (a usage error),
+        // never silently drop to no-portal.
+        let err = collect_cli(Cli {
+            dbus: &["incage"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("--dbus") && err.contains("true"));
+    }
+
+    #[test]
     fn a_cli_gpu_flag_beats_an_ambient_ops_gpu_and_the_env_source_notice_fires() {
         // The command line beats the environment (CLI `false` wins over `OPS_GPU=true`); and because
         // `OPS_DBUS` (a security field) is set only in the environment, a source notice fires for it.
@@ -946,7 +958,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ov.raw.gpu, Some(false));
-        assert_eq!(ov.raw.dbus, Some(RawDbus::Mode("true".to_string())));
+        assert_eq!(ov.raw.dbus, Some(true));
         // `gpu` was also set on the CLI, so no notice for it; `dbus` came only from the environment.
         assert!(ov
             .notices()
