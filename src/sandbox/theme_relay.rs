@@ -67,7 +67,10 @@ impl ThemeRelay {
                     // — a benign teardown race, not worth alarming the user. Only a genuinely
                     // unexpected failure warns.
                     let msg = e.to_string();
-                    if !msg.contains("Connection refused") && !msg.contains("Broken pipe") {
+                    if !msg.contains("Connection refused")
+                        && !msg.contains("Broken pipe")
+                        && !msg.contains("reset by peer")
+                    {
                         diag::warn(&format!(
                             "`dbus = true`: the live-theme relay stopped ({e}) — the app keeps its \
                              at-launch theme"

@@ -156,9 +156,12 @@ impl NotifyRelay {
                     // launch, not worth alarming the user. Only a genuinely unexpected failure (e.g.
                     // no host session bus) warns.
                     let msg = e.to_string();
-                    if !msg.contains("Connection refused") && !msg.contains("Broken pipe") {
+                    if !msg.contains("Connection refused")
+                        && !msg.contains("Broken pipe")
+                        && !msg.contains("reset by peer")
+                    {
                         diag::warn(&format!(
-                            "`dbus = \"incage\"`: the notifications relay stopped ({e}) — the app \
+                            "`dbus = true`: the notifications relay stopped ({e}) — the app \
                              runs without desktop notifications"
                         ));
                     }
