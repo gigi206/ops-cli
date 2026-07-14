@@ -227,8 +227,21 @@ pub(crate) const KEYFILE_REL: &str = ".config/glib-2.0/settings/keyfile";
 /// The keyfile body seeding the host theme so the app opens in the right light/dark scheme. Maps a
 /// color-scheme name to its GSettings keyfile form. Shared by the launch seed and the theme relay so
 /// the two write byte-identical content. Pure.
+///
+/// It sets `gtk-theme` (the dark/light Adwaita variant) alongside `color-scheme`: a dark
+/// `color-scheme` alone does not switch GTK3's own theme (the file dialog, and any GTK-drawn window
+/// chrome), so the dark variant is named directly. Because it lives in the keyfile the theme relay
+/// rewrites live, GTK follows a host light/dark switch too — rather than being pinned at launch, as a
+/// static `GTK_THEME` env would be.
 pub(crate) fn keyfile_body(color_scheme: &str) -> String {
-    format!("[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\n")
+    let gtk_theme = if color_scheme == "prefer-dark" {
+        "Adwaita-dark"
+    } else {
+        "Adwaita"
+    };
+    format!(
+        "[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\ngtk-theme='{gtk_theme}'\n"
+    )
 }
 
 /// Wrap `cmd` so the cage stands up its private portal before the app runs: write the generated bus
@@ -249,21 +262,14 @@ pub(crate) fn wrap_command(
     let session = session_conf(CAGE_SOCK, xdp_root, gtk_root);
     let seed = match color_scheme {
         Some(scheme) => {
-            // The keyfile color-scheme drives the *app* (Chromium/GTK4 read it), but the portal's
-            // GTK3 file-dialog backend does not follow it for its own theme — so under a dark host
-            // force the dark variant of its Adwaita theme, so the in-cage dialog matches the app
-            // rather than opening light against a dark app. `export` in the preamble reaches both
-            // the app and the dbus-daemon-activated backend; light/default leaves Adwaita default.
-            let gtk_dark = if scheme == "prefer-dark" {
-                "export GTK_THEME=Adwaita:dark\n"
-            } else {
-                ""
-            };
             // The keyfile path is shared with the theme relay via `KEYFILE_REL` (its parent is the
-            // dir to create) so the seed and the live rewrites always target the same file.
+            // dir to create) so the seed and the live rewrites always target the same file. The GTK
+            // theme (dark/light) is set via `gtk-theme` inside the keyfile (see `keyfile_body`), NOT a
+            // static `GTK_THEME` env, so the file dialog and any GTK-drawn app chrome follow a live
+            // host light/dark switch instead of being pinned to the launch-time theme.
             let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
-                "{gtk_dark}mkdir -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
+                "mkdir -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
                  cat > \"$HOME/{KEYFILE_REL}\" <<'OPSPORTALKF' 2>/dev/null || true\n\
                  {keyfile}OPSPORTALKF\n",
                 keyfile = keyfile_body(scheme),
@@ -403,10 +409,11 @@ mod tests {
         ));
         // portals.conf selects the gtk backend
         assert!(script.contains("default=gtk"));
-        // the theme is seeded into the keyfile GSettings store
+        // the theme is seeded into the keyfile GSettings store: color-scheme + the dark GTK theme
         assert!(script.contains("color-scheme='prefer-dark'"));
-        // and the GTK3 dialog backend is forced to the dark Adwaita variant to match the app
-        assert!(script.contains("export GTK_THEME=Adwaita:dark"));
+        assert!(script.contains("gtk-theme='Adwaita-dark'"));
+        // no static GTK_THEME env — the GTK theme rides the keyfile, so it follows a live host switch
+        assert!(!script.contains("GTK_THEME"));
         // the command runs as "$@", never spliced into the script text
         assert!(script.trim_end().ends_with("exec \"$@\""));
         assert_eq!(argv[3], OsString::from("ops-incage-portal"));
