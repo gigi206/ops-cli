@@ -9,6 +9,7 @@
 //! on-disk layout, bootstraps it, and builds the daemonless nix invocation that
 //! drives it.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io;
@@ -1071,6 +1072,18 @@ pub(crate) fn provision(
 /// notably — so the expression must reference nixpkgs itself; a `builtins.getFlake` on a
 /// rev-pinned `github:NixOS/nixpkgs/<rev>` reference is a *locked* flake, so it evaluates purely
 /// (no `--impure`). `label` names the build in an error and drives the marked-output selection.
+///
+/// Unlike a flake-attr build, an `--expr` build is **not** covered by nix's flake eval-cache, so
+/// `nix build` re-evaluates the whole `getFlake` expression (~1s) on every launch even when the
+/// output is fully built. To avoid that, this short-circuits: a sibling stamp (`<gcroot>.expr`)
+/// records the SHA-256 of the expression that produced the current out-link, and when a launch's
+/// expression hashes the same *and* the out-link still carries `marker`, the built output is
+/// returned without spawning nix. Keying on the expression (not just the gcroot path) is
+/// load-bearing: the expression is ops-controlled and changes across ops releases — a rev/system
+/// change is in it too — so a changed expression mismatches and falls through to a rebuild, which
+/// re-points the same out-link (no stale-serve, no accumulation). The one residual is that skipping
+/// nix forfeits its self-heal of an out-of-band-corrupted store closure; that degrades to a loud
+/// failure downstream (the per-project seed's `nix-store -qR`/copy aborts), never a silent bad cage.
 pub(crate) fn provision_expr(
     nix: &Path,
     layout: &Layout,
@@ -1087,6 +1100,12 @@ pub(crate) fn provision_expr(
             .recursive(true)
             .mode(0o700)
             .create(parent)?;
+    }
+
+    let stamp = expr_stamp_path(gcroot);
+    let digest = expr_digest(expr);
+    if let Some(path) = reuse_built_expr(layout, gcroot, marker, &stamp, &digest) {
+        return Ok(path);
     }
 
     let mut cmd = nix_command(nix, layout);
@@ -1115,7 +1134,67 @@ pub(crate) fn provision_expr(
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    select_marked_output(layout, &stdout, label, marker)
+    let resolved = select_marked_output(layout, &stdout, label, marker)?;
+    // Stamp only after a successful, marked build, so a failed or partial build never leaves a stamp
+    // that would short-circuit to a nonexistent output on the next launch.
+    write_expr_stamp(&stamp, &digest);
+    Ok(resolved)
+}
+
+/// The sibling stamp recording which expression built a gcroot's output: `<gcroot>.expr`. Appended
+/// (not `with_extension`, which would eat a `.` in the gcroot name) so it never collides with the
+/// out-link itself. It is a plain file, so it is inert to the gcroot symlink walks.
+fn expr_stamp_path(gcroot: &Path) -> PathBuf {
+    let mut s = gcroot.as_os_str().to_owned();
+    s.push(".expr");
+    PathBuf::from(s)
+}
+
+/// The SHA-256 (hex) of a provisioning expression — the key deciding whether a prior build can be
+/// reused. The expression carries the nixpkgs revision, system, and every ops-controlled input
+/// verbatim, so an equal hash means an identical derivation and output.
+fn expr_digest(expr: &str) -> String {
+    Sha256::digest(expr.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The already-built output for an expression, when it can be reused without rebuilding: the stamp
+/// records this exact expression's digest, the out-link still resolves, and its output still carries
+/// `marker`. `None` (⇒ rebuild) on any miss — absent/stale stamp, a dangling or garbage-collected
+/// out-link, or a missing marker — so a changed expression or a vanished output always rebuilds. The
+/// out-link points at the logical `/nix/store/<hash>` path (mapped through [`physical_path`] for the
+/// marker probe, never followed, exactly as [`select_marked_output`] does).
+fn reuse_built_expr(
+    layout: &Layout,
+    gcroot: &Path,
+    marker: &str,
+    stamp: &Path,
+    digest: &str,
+) -> Option<PathBuf> {
+    if std::fs::read_to_string(stamp).ok()?.trim() != digest {
+        return None;
+    }
+    let logical = std::fs::read_link(gcroot).ok()?;
+    physical_path(layout, &logical)
+        .join(marker)
+        .symlink_metadata()
+        .ok()?;
+    Some(logical)
+}
+
+/// Write the expression stamp atomically (temp + rename). Best-effort: a write failure just makes
+/// the next launch rebuild instead of short-circuiting — slower, never incorrect.
+fn write_expr_stamp(stamp: &Path, digest: &str) {
+    let mut tmp = stamp.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, digest).is_ok() {
+        let _ = std::fs::rename(&tmp, stamp);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Pick, among the logical store paths a build printed (`--print-out-paths` may list several —
@@ -2139,6 +2218,70 @@ mod tests {
             "bw-hash-2"
         );
     }
+
+    #[test]
+    fn expr_stamp_path_and_digest_are_well_formed() {
+        // The stamp is a sibling of the out-link, appended (not extension-replaced) so a dotted
+        // gcroot name keeps all of it.
+        assert_eq!(
+            expr_stamp_path(Path::new("/g/guidata")),
+            PathBuf::from("/g/guidata.expr")
+        );
+        assert_eq!(
+            expr_stamp_path(Path::new("/g/deb-a.b")),
+            PathBuf::from("/g/deb-a.b.expr")
+        );
+        // The digest is a stable 64-hex SHA-256 that distinguishes expressions.
+        assert_eq!(expr_digest("x").len(), 64);
+        assert_eq!(expr_digest("x"), expr_digest("x"));
+        assert_ne!(expr_digest("x"), expr_digest("y"));
+    }
+
+    #[test]
+    fn reuse_built_expr_reuses_only_the_same_expression_and_a_live_marked_output() {
+        // The correctness spine of the `provision_expr` short-circuit, without a real nix: it must
+        // reuse a build only when the expression is unchanged AND the marked output is still there,
+        // and must fall through to a rebuild (None) on any change — above all a changed expression.
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("ops"));
+
+        // A fabricated built output: a logical /nix/store path whose physical copy carries the marker.
+        let logical = PathBuf::from("/nix/store/00000000000000000000000000000000-probe");
+        let physical = physical_path(&layout, &logical);
+        std::fs::create_dir_all(physical.join("bin")).unwrap();
+        std::fs::write(physical.join("bin").join("tool"), b"x").unwrap();
+
+        // The out-link points at the logical path, exactly as `nix build --out-link` leaves it.
+        let gcroot = base.join("roots").join("probe");
+        std::fs::create_dir_all(gcroot.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&logical, &gcroot).unwrap();
+
+        let marker = "bin/tool";
+        let stamp = expr_stamp_path(&gcroot);
+        let da = expr_digest("EXPR-A");
+        let db = expr_digest("EXPR-B");
+
+        // No stamp yet (a first provision) → rebuild.
+        assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_none());
+
+        // Stamp records EXPR-A and the marked out-link is live → reuse, returning the logical path.
+        std::fs::write(&stamp, &da).unwrap();
+        assert_eq!(
+            reuse_built_expr(&layout, &gcroot, marker, &stamp, &da),
+            Some(logical.clone())
+        );
+
+        // THE headline: a changed expression (EXPR-B) over the SAME stamp/out-link must rebuild
+        // (None), never serve the stale EXPR-A output. A naive rev-only key would fail here.
+        assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &db).is_none());
+
+        // A missing marker → rebuild, even though the stamp matches (the output is not the one wanted).
+        assert!(reuse_built_expr(&layout, &gcroot, "bin/gone", &stamp, &da).is_none());
+
+        // A garbage-collected output (the out-link's target is gone) → rebuild rather than reuse.
+        std::fs::remove_dir_all(&physical).unwrap();
+        assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_none());
+    }
 }
 
 /// Provisioning a real package needs a real nix, so this is an integration check:
@@ -2187,5 +2330,66 @@ mod provision_tests {
             layout.data_dir().join(NIXPKGS_LOCK).is_file(),
             "channel lock not seeded"
         );
+    }
+
+    #[test]
+    fn provision_expr_short_circuits_a_repeat_and_rebuilds_a_changed_expression() {
+        let Some(nix) = resolve_nix(None) else {
+            eprintln!("skipping provision_expr: no nix on PATH");
+            return;
+        };
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("ops"));
+        let Ok(nixpkgs) = LockTarget::global(&layout, None).resolve(&nix, &layout) else {
+            eprintln!("skipping provision_expr: cannot resolve nixpkgs (offline?)");
+            return;
+        };
+        let system = format!("{}-linux", std::env::consts::ARCH);
+        let gcroot = base.join("roots").join("probe");
+        // A trivial `getFlake` runCommand whose output differs by `tag`; `--expr` is pure (the rev is
+        // locked), so no `--impure` is needed.
+        let expr = |tag: &str| {
+            format!(
+                "let pkgs = (builtins.getFlake \"{nixpkgs}\").legacyPackages.{system}; \
+                 in pkgs.runCommand \"ops-scprobe\" {{}} ''mkdir -p $out; echo {tag} > $out/tag''"
+            )
+        };
+        let read_tag = |p: &Path| {
+            std::fs::read_to_string(physical_path(&layout, p).join("tag"))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+
+        // First build (real nix): produces the AAA output and writes the expr stamp.
+        let Ok(out_a) = provision_expr(&nix, &layout, &gcroot, &expr("AAA"), "probe", "tag") else {
+            eprintln!("skipping provision_expr: cold build failed (cache unreachable?)");
+            return;
+        };
+        assert_eq!(read_tag(&out_a), "AAA");
+        assert!(
+            expr_stamp_path(&gcroot).exists(),
+            "a successful build stamps the expression"
+        );
+
+        // The same expression again short-circuits WITHOUT spawning nix — proven by passing a
+        // nonexistent nix binary: reaching the build would error, so returning the same output is
+        // proof the reuse path was taken.
+        let out_a2 = provision_expr(
+            Path::new("/nonexistent/ops-nix"),
+            &layout,
+            &gcroot,
+            &expr("AAA"),
+            "probe",
+            "tag",
+        )
+        .expect("an unchanged expression must reuse the build without spawning nix");
+        assert_eq!(out_a2, out_a);
+
+        // A changed expression MUST rebuild through real nix (not serve the stale AAA out-link).
+        let out_b = provision_expr(&nix, &layout, &gcroot, &expr("BBB"), "probe", "tag")
+            .expect("a changed expression rebuilds");
+        assert_ne!(out_b, out_a, "a changed expression must produce a new output");
+        assert_eq!(read_tag(&out_b), "BBB");
     }
 }
