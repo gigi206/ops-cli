@@ -134,13 +134,14 @@ fn is_reserved_env_key(key: &str) -> bool {
 }
 
 /// The proxy-control variables, matched case-insensitively (tools honor both
-/// `http_proxy` and `HTTP_PROXY`). `no_proxy`/`all_proxy` are reserved alongside the
-/// two ops sets, so an untrusted project can neither redirect the cage's egress nor
-/// carve a hole around it.
+/// `http_proxy` and `HTTP_PROXY`). `no_proxy`/`all_proxy` and the WebSocket variants
+/// (`ws_proxy`/`wss_proxy`, which ops sets so a WS client routes through the proxy too)
+/// are reserved alongside the HTTP ones, so an untrusted project can neither redirect the
+/// cage's egress nor carve a hole around it.
 fn is_proxy_env_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy"
+        "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy" | "ws_proxy" | "wss_proxy"
     )
 }
 
@@ -7550,6 +7551,8 @@ mod tests {
             "HTTPS_PROXY",
             "no_proxy",
             "all_proxy",
+            "ws_proxy",
+            "WSS_PROXY",
             "NIX_SSL_CERT_FILE",
             "SSL_CERT_FILE",
             "CURL_CA_BUNDLE",

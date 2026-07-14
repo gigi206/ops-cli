@@ -52,10 +52,12 @@ pub(crate) const CAGE_CA: &str = "/opt/ops/egress-ca.pem";
 /// The CA-bundle environment variables ops sets so the cage's toolchains trust its
 /// per-session CA, and — being the keys it sets — exactly the keys an untrusted project
 /// is forbidden to set (see `config::is_reserved_env_key`, which consumes this list so
-/// the two can never drift). All are *file*-valued and point at [`CAGE_CA`]; since every
-/// cage connection is ops-minted under the empty netns, trusting only this CA is complete
-/// (replace, not append). A tool that reads `/etc/ssl` directly and honors none of these
-/// simply fails closed.
+/// the two can never drift). All are *file*-valued and point at [`CAGE_CA`], whose bundle is
+/// the per-session MITM CA followed by the base root bundle: every cage connection is ops-minted
+/// under the empty netns, so the MITM CA alone verifies the wire, but a bundle of a single cert
+/// is unusual and trips tools that reject a "too small" CA file, so it is paired with the normal
+/// roots to stay a full, ordinary bundle (the extra roots are inert for egress). A tool that reads
+/// `/etc/ssl` directly and honors none of these simply fails closed.
 pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
     "NIX_SSL_CERT_FILE",   // nix's libcurl (the self-equip path the spike proved)
     "SSL_CERT_FILE",       // openssl default file (curl, python, many others)
@@ -174,6 +176,7 @@ pub(super) fn wrap_background(
 /// a [`HeaderInjection`]. The plaintext never crosses into the cage — only the per-host
 /// injection does, applied by the proxy to matching allowed requests. A missing or malformed
 /// source aborts the launch (fail-closed), so the proxy never injects an empty credential.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     layout: &Layout,
     policy: EgressPolicy,
@@ -182,6 +185,7 @@ pub(crate) fn start(
     bwrap: &Path,
     app: Option<&str>,
     stats_enabled: bool,
+    ca_bundle: Option<&Path>,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -275,8 +279,14 @@ pub(crate) fn start(
     }
     let ctx = Arc::new(ctx);
 
-    // Write the CA owner-only, outside every writable mount, then bind it read-only — the
-    // agent gets a trust anchor it cannot rewrite.
+    // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
+    // agent gets a trust anchor it cannot rewrite. The bundle is the per-session MITM CA FOLLOWED BY
+    // the base root bundle (`ca_bundle`, the same Mozilla roots ops binds at /etc/ssl): every allowed
+    // egress is MITM'd and so presents the MITM CA, but a bundle of a single cert is unusual and trips
+    // tools that heuristically reject a "too small" CA file (e.g. a client that sanity-checks
+    // `certifi`), so pairing it with the normal roots keeps the file a full, ordinary bundle. The
+    // extra roots are inert for egress (the empty netns permits no un-proxied TLS) — the MITM CA is
+    // what verifies the wire.
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -286,6 +296,12 @@ pub(crate) fn start(
             .mode(0o600)
             .open(&ca_file)?;
         f.write_all(ctx.ca_cert_pem().as_bytes())?;
+        if let Some(bundle) = ca_bundle {
+            if let Ok(roots) = std::fs::read(bundle) {
+                f.write_all(b"\n")?;
+                f.write_all(&roots)?;
+            }
+        }
     }
 
     // Bind+listen happens here on the main thread, before the thread accepts, so connections
@@ -307,7 +323,17 @@ pub(crate) fn start(
         ("http_proxy".to_string(), proxy_url.clone()),
         ("https_proxy".to_string(), proxy_url.clone()),
         ("HTTP_PROXY".to_string(), proxy_url.clone()),
-        ("HTTPS_PROXY".to_string(), proxy_url),
+        ("HTTPS_PROXY".to_string(), proxy_url.clone()),
+        // WebSocket proxy vars. A client library resolves a proxy per URL *scheme*, so a `ws://` or
+        // `wss://` connection does NOT match `http_proxy`/`https_proxy` — without a `ws_proxy`/
+        // `wss_proxy` it connects directly, which in the empty netns fails at DNS ("Temporary failure
+        // in name resolution"). The ops proxy is an HTTP CONNECT proxy, which is exactly what a WS
+        // client tunnels through, so it is the correct value here too. Agnostic — any WebSocket client
+        // that honors these (aiohttp `trust_env`, etc.) then routes through the proxy.
+        ("ws_proxy".to_string(), proxy_url.clone()),
+        ("wss_proxy".to_string(), proxy_url.clone()),
+        ("WS_PROXY".to_string(), proxy_url.clone()),
+        ("WSS_PROXY".to_string(), proxy_url),
         ("no_proxy".to_string(), no_proxy.clone()),
         ("NO_PROXY".to_string(), no_proxy),
     ];
@@ -616,6 +642,14 @@ mod tests {
         let layout = Layout::under(data.path());
         std::fs::create_dir_all(layout.data_dir()).unwrap();
 
+        // A stand-in base root bundle, to prove the injected CA file pairs the MITM CA with the roots.
+        let roots = data.path().join("roots.pem");
+        std::fs::write(
+            &roots,
+            "# ops-test-base-roots\n-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
         let (guard, wiring) = start(
             &layout,
             EgressPolicy::default(),
@@ -624,12 +658,23 @@ mod tests {
             Path::new(UNUSED_BWRAP),
             None,
             false,
+            Some(roots.as_path()),
         )
         .expect("start the egress proxy");
 
-        // the proxy address reaches the in-cage forwarder
+        // the proxy address reaches the in-cage forwarder — for HTTP and WebSocket schemes alike (a
+        // WS client resolves its proxy by URL scheme, so it needs its own ws/wss vars, not http/https).
         let url = format!("http://127.0.0.1:{CAGE_PROXY_PORT}");
-        for k in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        for k in [
+            "http_proxy",
+            "https_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ws_proxy",
+            "wss_proxy",
+            "WS_PROXY",
+            "WSS_PROXY",
+        ] {
             let v = wiring
                 .env
                 .iter()
@@ -678,9 +723,14 @@ mod tests {
         // the CA file is owner-only and a real certificate
         let mode = std::fs::metadata(&ca.src).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the CA key/cert file must be owner-only");
-        assert!(std::fs::read_to_string(&ca.src)
-            .unwrap()
-            .contains("BEGIN CERTIFICATE"));
+        let ca_pem = std::fs::read_to_string(&ca.src).unwrap();
+        assert!(ca_pem.contains("BEGIN CERTIFICATE"));
+        // it is a full bundle: the per-session MITM CA PLUS the base roots (a lone cert trips tools
+        // that reject a "too small" CA bundle).
+        assert!(
+            ca_pem.contains("# ops-test-base-roots"),
+            "the CA file must append the base root bundle to the MITM CA"
+        );
 
         let (host_uds, ca_file) = (guard.host_uds.clone(), guard.ca_file.clone());
         // Every proxy posture — even this allowlist (non-ask) one — now stands up the control
@@ -730,6 +780,7 @@ mod tests {
             Path::new(UNUSED_BWRAP),
             None,
             false,
+            None,
         )
         .expect("start the ask egress proxy");
 
@@ -793,6 +844,7 @@ mod tests {
             Path::new(UNUSED_BWRAP),
             None,
             false,
+            None,
         )
         .expect("start with stats off");
         drop(guard);
@@ -813,6 +865,7 @@ mod tests {
             Path::new(UNUSED_BWRAP),
             None,
             true,
+            None,
         )
         .expect("start with stats on");
         drop(guard);

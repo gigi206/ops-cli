@@ -75,47 +75,25 @@ const PORTAUDIO: (&str, &str, &str) = ("portaudio", "lib/libportaudio.so.2", "po
 /// `sitecustomize.py` runs at interpreter startup (parity with the other fixed cage paths).
 pub(crate) const PYSHIM_INCAGE: &str = "/opt/ops/audio-pyshim";
 
-/// A `sitecustomize.py` that makes `ctypes.util.find_library` fall back to scanning `LD_LIBRARY_PATH`
-/// for a matching `lib<name>.so*`. A hermetic cage has no `ldconfig`/`gcc`/`ld`, so the stock
-/// `find_library` (which shells out to one of those) always returns `None` — breaking any Python
-/// package that loads a native library by name, notably `sounddevice`, which resolves PortAudio via
-/// `find_library('portaudio')`. Its full path is then `dlopen`ed directly. The patch is additive (it
-/// only extends `find_library` when the stock lookup fails) and generic (any ctypes consumer
-/// benefits). Fixed and ops-controlled (no interpolation), so it is safe to stage verbatim.
+/// A `sitecustomize.py` for the Python voice stack, patching two ecosystem quirks a hermetic MITM
+/// cage exposes. **(1)** `ctypes.util.find_library` falls back to scanning `LD_LIBRARY_PATH` for a
+/// matching `lib<name>.so*`: a hermetic cage has no `ldconfig`/`gcc`/`ld`, so the stock `find_library`
+/// (which shells out to one of those) always returns `None` — breaking any package that loads a native
+/// library by name, notably `sounddevice`, which resolves PortAudio via `find_library('portaudio')`.
+/// Its full path is then `dlopen`ed directly. **(2)** `certifi.where()` returns `SSL_CERT_FILE` when
+/// set: a certifi-pinned TLS client (edge-tts's read-aloud) verifies against certifi's Mozilla bundle
+/// and ignores `SSL_CERT_FILE`, so under the egress allowlist it rejects ops's per-session MITM CA;
+/// this makes it trust the same CA ops already exports to every other client. Both patches are
+/// additive/conditional (find_library only extends the stock lookup; certifi only when SSL_CERT_FILE
+/// is set) and generic (any ctypes / any certifi consumer benefits). Fixed and ops-controlled (no
+/// interpolation), so it is safe to stage verbatim.
 ///
 /// A `sitecustomize` on `PYTHONPATH` shadows one an app might ship (Python imports only the first on
 /// `sys.path`). This is an accepted, documented trade-off: it is staged only under the opt-in,
 /// trusted `audio = true`, and shipping a `sitecustomize.py` inside an installed package is rare; the
 /// alternative (a language-agnostic `/sbin/ldconfig` + generated `ld.so.cache`) costs more moving
 /// parts for a case this narrow.
-const SITECUSTOMIZE: &str = r#"# ops audio shim: resolve native libraries from LD_LIBRARY_PATH.
-# A hermetic cage has no ldconfig/gcc/ld, so ctypes.util.find_library returns None; a Python audio
-# tool (sounddevice -> find_library('portaudio')) then cannot locate the provisioned library. This
-# makes find_library scan LD_LIBRARY_PATH as a last resort. Additive: the stock lookup wins when it
-# succeeds.
-import os
-import glob
-import ctypes.util
-
-_ops_orig_find_library = ctypes.util.find_library
-
-
-def _ops_find_library(name):
-    found = _ops_orig_find_library(name)
-    if found:
-        return found
-    for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
-        if not directory:
-            continue
-        for pattern in ("lib%s.so.*" % name, "lib%s.so" % name, "%s.so.*" % name, "%s.so" % name):
-            hits = sorted(glob.glob(os.path.join(directory, pattern)))
-            if hits:
-                return hits[-1]
-    return found
-
-
-ctypes.util.find_library = _ops_find_library
-"#;
+const SITECUSTOMIZE: &str = include_str!("audio_sitecustomize.py");
 
 /// The fixed cage path the host PulseAudio socket is bound at (parity with the portal and dbus
 /// sockets under `/run/ops-*`), named through `PULSE_SERVER` — so audio does not depend on the
@@ -275,13 +253,15 @@ fn stage_pyshim(data_dir: &Path) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Atomically stage `content` at `dir/name` (temp + `rename`), creating `dir`. The content is
-/// constant, so a present file is already correct (idempotent); a concurrent launch that lost the
-/// rename race just reuses the identical winner. Returns the staged file path.
+/// Atomically stage `content` at `dir/name` (temp + `rename`), creating `dir`. Re-stages whenever the
+/// on-disk bytes differ from `content` — the content is fixed within one ops build but CHANGES across
+/// releases (a new binary ships an updated shim/config), so a skip-if-present would pin a stale file
+/// forever. An atomic `rename` replaces in place; a concurrent launch writing the identical bytes is
+/// harmless (last writer wins with the same content). Returns the staged file path.
 fn stage_atomically(dir: &Path, name: &str, content: &str) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let file = dir.join(name);
-    if file.is_file() {
+    if std::fs::read(&file).is_ok_and(|existing| existing == content.as_bytes()) {
         return Ok(file);
     }
     let tmp = dir.join(format!(".tmp-{}", std::process::id()));
@@ -291,10 +271,6 @@ fn stage_atomically(dir: &Path, name: &str, content: &str) -> io::Result<PathBuf
     }
     match std::fs::rename(&tmp, &file) {
         Ok(()) => Ok(file),
-        Err(_) if file.is_file() => {
-            let _ = std::fs::remove_file(&tmp);
-            Ok(file)
-        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -326,12 +302,22 @@ pub(crate) fn host_socket(runtime_dir: Option<&str>) -> Option<PathBuf> {
 /// `[env]` (a code-load path, denylisted alongside `LD_*`); the `ALSA_*` keys are data paths (a
 /// project re-pointing them only self-DoSes its own cage's audio); a trusted config overriding any of
 /// them only breaks its own cage's audio.
-pub(crate) fn env(layer: Option<&AudioLayer>) -> Vec<(String, String)> {
+pub(crate) fn env(layer: Option<&AudioLayer>, base_lib_dirs: &[PathBuf]) -> Vec<(String, String)> {
     let mut env = vec![("PULSE_SERVER".to_string(), format!("unix:{CAGE_SOCK}"))];
     if let Some(l) = layer {
+        // LD_LIBRARY_PATH = the provisioned audio client libraries, then the base C++/glibc runtime
+        // (`base_lib_dirs`, the same directories as `NIX_LD_LIBRARY_PATH`). A voice speech-to-text
+        // engine's native library — faster-whisper's ctranslate2, or onnxruntime, both foreign
+        // manylinux `.so`s — is `dlopen`ed by the tool's own interpreter, and `dlopen` honors
+        // `LD_LIBRARY_PATH` but NOT `NIX_LD_LIBRARY_PATH` (which only nix-ld consults, and only for a
+        // foreign *executable* it launches). Without the base runtime here the load fails with
+        // `libstdc++.so.6: cannot open shared object file`. This is language-agnostic — any voice
+        // library linked against the C++ runtime needs it, whatever wrapper (Python/Rust/Node) drives
+        // it. Appended (not prepended), so the app's own closure and the audio libraries stay ahead.
         let ld = l
             .lib_dirs
             .iter()
+            .chain(base_lib_dirs)
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(":");
@@ -402,20 +388,27 @@ mod tests {
         let get = |e: &[(String, String)], k: &str| {
             e.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
         };
+        let base = [
+            PathBuf::from("/nix/store/eee-glibc-2.42/lib"),
+            PathBuf::from("/nix/store/fff-gcc-15.2.0-lib/lib"),
+        ];
         let layer = sample_layer();
-        let full = env(Some(&layer));
+        let full = env(Some(&layer), &base);
         // The client connects to the fixed cage socket path, not the host's XDG_RUNTIME_DIR.
         assert_eq!(
             get(&full, "PULSE_SERVER").as_deref(),
             Some("unix:/run/ops-pulse")
         );
         // All three client libraries (native libpulse + ALSA libasound + PortAudio) are on the loader
-        // path — the last so `sounddevice`'s `find_library` shim can resolve `libportaudio.so.2`.
+        // path — the last so `sounddevice`'s `find_library` shim can resolve `libportaudio.so.2` — then
+        // the base C++/glibc runtime, so a voice STT engine's `dlopen`ed native library finds
+        // `libstdc++.so.6` (it is not on NIX_LD_LIBRARY_PATH, which `dlopen` ignores).
         assert_eq!(
             get(&full, "LD_LIBRARY_PATH").as_deref(),
             Some(
                 "/nix/store/aaa-libpulseaudio-17.0/lib:/nix/store/bbb-alsa-lib-1.2.16/lib:\
-                 /nix/store/ddd-portaudio-19/lib"
+                 /nix/store/ddd-portaudio-19/lib:/nix/store/eee-glibc-2.42/lib:\
+                 /nix/store/fff-gcc-15.2.0-lib/lib"
             )
         );
         // ALSA finds its base config and the pulse plugin.
@@ -430,8 +423,9 @@ mod tests {
         // The `find_library` shim is on PYTHONPATH (the fixed cage path, not the host staging dir).
         assert_eq!(get(&full, "PYTHONPATH").as_deref(), Some(PYSHIM_INCAGE));
         // Without a provisioned userspace (best-effort failure), only PULSE_SERVER is set — the socket
-        // is still bound, but the app finds no client library and simply has no audio.
-        let bare = env(None);
+        // is still bound, but the app finds no client library and simply has no audio. The base
+        // runtime is not added either (there is no audio library for it to support).
+        let bare = env(None, &base);
         assert_eq!(
             get(&bare, "PULSE_SERVER").as_deref(),
             Some("unix:/run/ops-pulse")
@@ -455,11 +449,12 @@ mod tests {
             alsa: None,
             pyshim: None,
         };
-        let e = env(Some(&pulse_only));
+        let base = [PathBuf::from("/nix/store/fff-gcc-15.2.0-lib/lib")];
+        let e = env(Some(&pulse_only), &base);
         assert_eq!(
             get(&e, "LD_LIBRARY_PATH").as_deref(),
-            Some("/nix/store/aaa-libpulseaudio-17.0/lib"),
-            "libpulse must be on the loader path even without the ALSA shim"
+            Some("/nix/store/aaa-libpulseaudio-17.0/lib:/nix/store/fff-gcc-15.2.0-lib/lib"),
+            "libpulse must be on the loader path even without the ALSA shim, followed by the base C++ runtime"
         );
         // No ALSA vars and no PYTHONPATH without the shim (an ALSA/PortAudio CLI tool would have no
         // audio, but Electron does).
@@ -486,5 +481,30 @@ mod tests {
         assert!(SITECUSTOMIZE.contains("_ops_orig_find_library = ctypes.util.find_library"));
         assert!(SITECUSTOMIZE.contains("os.environ.get(\"LD_LIBRARY_PATH\""));
         assert!(SITECUSTOMIZE.contains("ctypes.util.find_library = _ops_find_library"));
+        // Part 2: certifi.where() is redirected to SSL_CERT_FILE (ops's MITM CA), conditionally — so a
+        // certifi-pinned voice TTS client (edge-tts) trusts the same CA as every other client under the
+        // allowlist, and is untouched when SSL_CERT_FILE is unset (no MITM).
+        assert!(SITECUSTOMIZE.contains("os.environ.get(\"SSL_CERT_FILE\")"));
+        assert!(SITECUSTOMIZE.contains("certifi.where = lambda: _ops_ca"));
+    }
+
+    #[test]
+    fn stage_atomically_rewrites_a_stale_file_when_the_content_changes() {
+        // A new ops release ships an updated shim; the staged file must be replaced, not kept stale.
+        // (This is the bug that left the pre-certifi sitecustomize on disk after an upgrade.)
+        let dir = crate::testutil::TmpDir::new();
+        let d = dir.path().join("audio");
+
+        let p = stage_atomically(&d, "shim.py", "v1").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "v1");
+
+        // Changed content → the same path is overwritten with the new bytes.
+        let p2 = stage_atomically(&d, "shim.py", "v2").unwrap();
+        assert_eq!(p2, p);
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "v2");
+
+        // Unchanged content → idempotent no-op (still correct on disk).
+        stage_atomically(&d, "shim.py", "v2").unwrap();
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "v2");
     }
 }

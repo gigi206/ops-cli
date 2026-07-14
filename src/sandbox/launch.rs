@@ -2450,6 +2450,9 @@ fn build(
             &prep.bwrap,
             app,
             prep.cfg.egress_stats,
+            // Pair the per-session MITM CA with the base root bundle so the injected CA file is a full,
+            // ordinary bundle (a lone cert trips tools that heuristically reject a "too small" CA).
+            Some(prep.userland.ca_bundle_src.as_path()),
         )
         .map_err(|e| {
             eprintln!("ops: cannot start the egress filtering proxy: {e}");
@@ -2621,7 +2624,13 @@ fn build(
                         writable: false,
                     });
                 }
-                gui_env.extend(super::audio::env(audio_layer.as_ref()));
+                // Pass the base C++/glibc runtime dirs (the same set as NIX_LD_LIBRARY_PATH) so a
+                // voice speech-to-text engine's `dlopen`ed native library (ctranslate2/onnxruntime)
+                // finds `libstdc++.so.6` — `dlopen` consults LD_LIBRARY_PATH, not NIX_LD_LIBRARY_PATH.
+                gui_env.extend(super::audio::env(
+                    audio_layer.as_ref(),
+                    &prep.userland.foreign_lib_paths,
+                ));
             }
             _ => crate::diag::warn(
                 "`audio = true` but no PulseAudio socket was found at \
