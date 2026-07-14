@@ -2380,7 +2380,10 @@ mod provision_tests {
         // A changed expression MUST rebuild through real nix (not serve the stale AAA out-link).
         let out_b = provision_expr(&nix, &layout, &gcroot, &expr("BBB"), "probe", "tag")
             .expect("a changed expression rebuilds");
-        assert_ne!(out_b, out_a, "a changed expression must produce a new output");
+        assert_ne!(
+            out_b, out_a,
+            "a changed expression must produce a new output"
+        );
         assert_eq!(read_tag(&out_b), "BBB");
     }
 }
