@@ -79,14 +79,23 @@ allow = [
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
     "{GET} https://models.dev",
+    # Hermes' "pet" gallery (agent/pet) — a public, read-only pixel-art sprite gallery: the manifest
+    # (petdex.dev/api/manifest, 307 → R2) and the sprite assets (assets.petdex.dev), all pinned to
+    # *.petdex.dev by Hermes (anti-SSRF), GET-only, no data sent. Cosmetic; drop this line if you do
+    # not want the pixel pets.
+    "{GET} https://*.petdex.dev",
     # Voice STT (`/voice on` / Ctrl+B): the local faster-whisper model is fetched from Hugging Face
     # on first use — metadata/resolve on huggingface.co, the model blobs via the Xet CDN under
     # *.xethub.hf.co (read-only, cached in the app home after). Live-verified via hermes-web.
     "{GET,HEAD} https://huggingface.co",
     "{GET,HEAD} https://*.xethub.hf.co",
-    # Voice replies (edge-tts): Microsoft's free online TTS endpoint (a WebSocket the proxy relays).
-    # Host from the edge-tts package source; the first spoken reply confirms it in `ops net log`.
-    "{GET} https://speech.platform.bing.com",
+    # Voice replies / read-aloud (edge-tts) — Microsoft's free online TTS, over a WebSocket. `{WS}` is
+    # the explicit WebSocket opt-in (ops gates a WS behind it) and `{GET}` covers the voice-list fetch.
+    # Two things make it work under the MITM allowlist: ops sets `wss_proxy` so the WS routes through
+    # the proxy (a WS client resolves its proxy by URL scheme — `https_proxy` alone would not cover it,
+    # and it would connect directly and fail DNS in the empty netns); and the audio hole's Python shim
+    # points certifi at ops's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
+    "{GET,WS} https://speech.platform.bing.com",
     # Install-time (the launch cmd's `uv pip install`): the Python wheels and the package index.
     "{GET} https://files.pythonhosted.org",
     "{GET} https://pypi.org",
