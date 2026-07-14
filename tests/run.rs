@@ -3641,15 +3641,15 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
 }
 
 #[test]
-fn ops_gc_all_reaps_a_deleted_projects_tree() {
-    // The live proof of `ops gc --all --prune` (the cross-project dead-tree reap), through the real
-    // binary. A launch records the project's canonical path in a `<data>/projects/<id>/project`
-    // marker and seeds the project's own (read-only, 0555) nix store; once the project directory is
-    // deleted, `ops gc --all --prune` reads that marker, sees the path is gone (its parent — the
-    // scratch root — still present), and reclaims the whole tree (store dirs and all, which is why
-    // the reaper forces them writable). Run from a *separate* scratch project so the reap is what
-    // removes the dead tree, not the current-project sweep. Skips (never fails) without sandbox or
-    // network.
+fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
+    // The live proof of `ops projects rm --dead --yes --gc` (the cross-project dead-tree reap plus
+    // the chained shared-store collection), through the real binary. A launch records the project's
+    // canonical path in a `<data>/projects/<id>/project` marker and seeds the project's own
+    // (read-only, 0555) nix store; once the project directory is deleted, `ops projects rm --dead`
+    // reads that marker, sees the path is gone (its parent — the scratch root — still present), and
+    // reclaims the whole tree (store dirs and all, which is why the reaper forces them writable).
+    // `--gc` then runs the shared-store collection in the same command. Skips (never fails) without
+    // sandbox or network.
     use std::os::unix::ffi::OsStrExt;
     let project = TmpDir::new("gca-proj");
     let scratch = TmpDir::new("gca-scratch");
@@ -3661,13 +3661,13 @@ fn ops_gc_all_reaps_a_deleted_projects_tree() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping ops gc --all e2e: host cannot sandbox ({})",
+            "skipping ops projects rm --dead e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping ops gc --all e2e: the network is unreachable");
+        eprintln!("skipping ops projects rm --dead e2e: the network is unreachable");
         return;
     }
 
@@ -3692,20 +3692,24 @@ fn ops_gc_all_reaps_a_deleted_projects_tree() {
     // as a deleted project, not an unmounted drive.
     std::fs::remove_dir_all(project.path()).unwrap();
 
-    // Reap from a separate scratch project: the dead tree is reclaimed by the cross-project pass,
-    // not by the current-project sweep (which runs on `scratch`).
+    // Reap from a separate scratch directory (`ops projects rm` never seeds or sweeps a current
+    // project, so the scratch dir just gives the command a cwd): the dead tree is reclaimed by the
+    // `--dead` sweep, and `--gc` chains the shared-store collection.
     let gc = ops_in(
         scratch.path(),
         data.path(),
         state.path(),
-        &["gc", "--all", "--prune"],
+        &["projects", "rm", "--dead", "--yes", "--gc"],
     );
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&gc.stderr),
         String::from_utf8_lossy(&gc.stdout)
     );
-    assert!(gc.status.success(), "ops gc --all --prune failed: {log}");
+    assert!(
+        gc.status.success(),
+        "ops projects rm --dead --yes --gc failed: {log}"
+    );
     assert!(
         !tree.exists(),
         "the deleted project's tree (read-only store and all) was not reclaimed: {tree:?}\n{log}"
@@ -3714,14 +3718,8 @@ fn ops_gc_all_reaps_a_deleted_projects_tree() {
         String::from_utf8_lossy(&gc.stdout).contains(&canonical.display().to_string()),
         "the reap should name the reclaimed project path: {log}"
     );
-    // The scratch project was never launched, so the current-project sweep must SKIP it, not seed a
-    // fresh store for it — otherwise `ops gc --all` from a bare directory would silently materialise
-    // a new (and immediately stale) project tree. The skip message proves the no-store branch, and
-    // with A reaped and scratch skipped the projects directory is left empty.
-    assert!(
-        String::from_utf8_lossy(&gc.stdout).contains("no per-project store yet"),
-        "the sweep must skip the never-launched scratch project, not seed it: {log}"
-    );
+    // The dead tree was the only one; `ops projects rm` seeds nothing, so after the reap the
+    // projects directory is left empty.
     let remaining = std::fs::read_dir(&projects)
         .map(|d| {
             d.flatten()
@@ -3731,7 +3729,7 @@ fn ops_gc_all_reaps_a_deleted_projects_tree() {
         .unwrap_or(0);
     assert_eq!(
         remaining, 0,
-        "a project tree survived — the scratch project was seeded by the sweep instead of skipped\n{log}"
+        "a project tree survived the --dead reap\n{log}"
     );
 
     // The shared-store gc pass ran (its own line) and must NOT have collected the live base: the

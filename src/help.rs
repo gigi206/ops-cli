@@ -586,45 +586,80 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["gc"],
-        synopsis: "ops gc [--all] [--prune] [--unidentified] [--id <id>]",
-        summary: "reclaim ops's per-project store space",
+        synopsis: "ops gc [--all] [--prune]",
+        summary: "reclaim ops's nix store space",
         options: &[
             (
                 "--all",
-                "also reap whole runtime trees whose project directory is gone",
+                "also collect the shared store across every project (orphaned closures)",
             ),
             (
                 "--prune",
                 "actually reclaim (default is a dry run that touches nothing)",
-            ),
-            (
-                "--unidentified",
-                "with --all --prune, also reap markerless legacy trees (no deadness proof)",
-            ),
-            (
-                "--id <id>",
-                "reap (with --prune) or measure one named project tree; the id is the directory\n\
-                 name `ops path` lists under projects/. No deadness proof — naming it is consent.\n\
-                 A tree a live session holds is refused; run `ops stop` first.",
             ),
         ],
         details:
             "By default it sweeps the current project's store. Reclamation is irreversible, so\n\
             the destructive form is opt-in.\n\
             \n\
-            A project tree is reaped only when ops can prove it is dead: it carries a `project`\n\
-            marker, that path is gone (its parent still present), and no live session holds it.\n\
-            Markerless trees predate marker-recording, so their project path is unknown and\n\
-            deadness cannot be verified — they are listed for a manual removal by default.\n\
-            `--unidentified` opts into reaping them anyway (it requires `--all`). It is a\n\
-            fail-closed escape hatch, not the default: a markerless tree of a project still in\n\
-            use would be lost, so ops leaves the decision to you unless you ask explicitly.\n\
+            `--all` additionally collects the shared store — the closures no live project or\n\
+            locked channel revision still roots — under an exclusive lock.\n\
             \n\
-            `--id <id>` targets one tree you name — the focused counterpart of the broad reaps.\n\
-            It needs no marker and no deadness proof (you named it, so it is not an accident),\n\
-            works on markerless trees, and refuses only a tree a live session holds. Use `ops\n\
-            path` to find the id (the directory name under projects/, with the recorded project\n\
-            path beside it), then `ops gc --id <id> --prune` to remove it.",
+            Removing whole per-project runtime *trees* (a project whose directory is gone, or a\n\
+            markerless legacy tree) is `ops projects rm` — see `ops help projects`. After a tree\n\
+            is removed, its store closures are reclaimed by `ops gc --all --prune`, or in one step\n\
+            with `ops projects rm <id> --gc`.",
+    },
+    Page {
+        path: &["projects"],
+        synopsis: "ops projects [list] [--json]\n       \
+                   ops projects rm <id>... [--dead] [--markerless] [-n] [-y] [--gc] [-f]",
+        summary: "list and remove per-project runtime trees",
+        options: &[
+            (
+                "list",
+                "list every runtime tree with its state, size, and last-used date (the default)",
+            ),
+            ("--json", "with list, emit the trees as a JSON document"),
+            (
+                "rm <id>...",
+                "remove one or more named trees; the id is what `ops projects` lists. Immediate —\n\
+                 naming it is consent. A live-held tree is refused (run `ops stop` first); the\n\
+                 current project is refused without --force.",
+            ),
+            (
+                "--dead",
+                "with rm, sweep every tree whose project directory is gone (dry run unless --yes)",
+            ),
+            (
+                "--markerless",
+                "with rm, also sweep markerless legacy trees, no deadness proof (needs --yes)",
+            ),
+            ("-n, --dry-run", "preview a targeted rm instead of removing"),
+            (
+                "-y, --yes",
+                "apply a --dead / --markerless sweep (they preview by default)",
+            ),
+            (
+                "--gc",
+                "after a real removal, collect the shared store's now-orphaned closures",
+            ),
+            ("-f, --force", "allow removing the current project's own tree"),
+        ],
+        details:
+            "The per-project runtime trees live under `<data>/projects/<id>` and hold each\n\
+            project's writable store, isolated home, and locks. `ops projects` lists them (richer\n\
+            than `ops path`'s projects section — it adds each tree's on-disk size); `ops projects\n\
+            rm` removes them.\n\
+            \n\
+            A named `rm <id>` removes immediately (you named it, so it is not an accident); pass\n\
+            `--dry-run` to preview first. The bulk selectors `--dead` and `--markerless` preview\n\
+            by default and require `--yes` to apply, since they act on more than one tree. A tree\n\
+            a live session holds is always refused — stop it with `ops stop` first — and the\n\
+            current project is refused without `--force`.\n\
+            \n\
+            Removing a tree is host-side only and leaves its store closures for `ops gc` to\n\
+            reclaim; `--gc` runs that shared-store collection in the same command.",
     },
     Page {
         path: &["path"],
@@ -638,9 +673,10 @@ const PAGES: &[Page] = &[
             marks which exist, so it is clear where ops puts things even before any file is\n\
             created. Under `projects/` it enumerates each project's runtime tree and annotates it\n\
             with a liveness state — `live` (a running session holds it), `idle` (the project\n\
-            directory still exists, just not active), `dead` (the project is gone — reclaimable\n\
-            by `ops gc --all`), or `markerless` (a legacy tree pre-dating marker recording) — plus\n\
-            the last-used date. Under `apps/` it lists each global app home, and under the config\n\
+            directory still exists, just not active), `dead` (the project is gone — removable\n\
+            by `ops projects rm --dead`), or `markerless` (a legacy tree pre-dating marker\n\
+            recording) — plus the last-used date, and (via `ops projects`) its size. Under `apps/`\n\
+            it lists each global app home, and under the config\n\
             `apps/` each imported profile. Read-only: no trust gate, no network. For the config\n\
             files in resolution order, see `ops config path`.",
     },

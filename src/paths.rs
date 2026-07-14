@@ -398,7 +398,7 @@ fn enumerate(
 /// project's liveness state. Civil-from-days-since-epoch via the Howard Hinnant algorithm, so no
 /// `chrono` dependency; UTC is the right choice for a date-only column (a local day would shift by
 /// your timezone and mislead across a midnight boundary). `UNIX_EPOCH` falls back to `-`.
-fn civil_date(t: SystemTime) -> String {
+pub(crate) fn civil_date(t: SystemTime) -> String {
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

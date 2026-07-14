@@ -69,6 +69,7 @@ fn main() -> ExitCode {
         "config" => config_cmd(rest),
         "upgrade" => upgrade_cmd(rest),
         "gc" => gc_cmd(rest),
+        "projects" | "project" => projects_cmd(rest),
         "path" => path_cmd(&rest),
         "run" => {
             let mut cmd: Vec<OsString> = rest;
@@ -3532,7 +3533,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     // reclamation is a separate manual step, and either way other projects need their own sweep.
     if gc {
         println!();
-        let gc_code = sandbox::gc(true, false, false, &pal);
+        let gc_code = sandbox::gc(true, false, &pal);
         println!(
             "{dim}note: `--gc` swept this project's store; run `ops gc --prune` in the app's other \
              projects to reclaim their copies too.{r}"
@@ -7995,22 +7996,10 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
 fn gc_cmd(args: Vec<OsString>) -> ExitCode {
     let mut prune = false;
     let mut all = false;
-    let mut unidentified = false;
-    let mut id: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].to_str() {
+    for a in &args {
+        match a.to_str() {
             Some("--prune") => prune = true,
             Some("--all") => all = true,
-            Some("--unidentified") => unidentified = true,
-            Some("--id") => {
-                i += 1;
-                let Some(val) = args.get(i).and_then(|a| a.to_str()) else {
-                    eprintln!("ops: `--id` needs a project id (run `ops path` to list them).");
-                    return ExitCode::from(2);
-                };
-                id = Some(val.to_string());
-            }
             Some(_) => {
                 eprintln!("ops: usage: {}", help::synopsis("gc"));
                 return ExitCode::from(2);
@@ -8020,30 +8009,86 @@ fn gc_cmd(args: Vec<OsString>) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
-        i += 1;
     }
-    // `--unidentified` reaps markerless trees without a deadness proof — a cross-project tree
-    // operation, so it needs `--all`. It is meaningless without the tree reap, and the dry-run
-    // already lists them by default, so the only new effect is the reaping, which is destructive.
-    if unidentified && !all {
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    sandbox::gc(prune, all, &pal)
+}
+
+/// `ops projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
+/// default) and `rm`. The reaping primitives it drives are shared with `ops gc` (which keeps the
+/// nix-store side); this is the discoverable front-end over the project-tree lifecycle.
+fn projects_cmd(args: Vec<OsString>) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("--help") | Some("-h") => help::show(&["projects"]),
+        Some("rm") | Some("remove") => projects_rm_cmd(&args[1..]),
+        Some("list") | Some("ls") => projects_list_cmd(&args[1..]),
+        // No subcommand, or a leading flag like `--json`: default to `list` over all the args.
+        _ => projects_list_cmd(&args),
+    }
+}
+
+fn projects_list_cmd(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    for a in args {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some("--help") | Some("-h") => return help::show(&["projects"]),
+            Some(other) => {
+                eprintln!("ops: projects: unknown argument `{other}`");
+                eprintln!("       run `ops help projects` for usage.");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("ops: projects: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    sandbox::projects_list(json, &pal)
+}
+
+fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
+    let mut ids: Vec<String> = Vec::new();
+    let (mut dead, mut markerless) = (false, false);
+    let (mut dry_run, mut yes) = (false, false);
+    let (mut do_gc, mut force) = (false, false);
+    for a in args {
+        match a.to_str() {
+            Some("--dead") => dead = true,
+            Some("--markerless") => markerless = true,
+            Some("-n") | Some("--dry-run") => dry_run = true,
+            Some("-y") | Some("--yes") => yes = true,
+            Some("--gc") => do_gc = true,
+            Some("-f") | Some("--force") => force = true,
+            Some("--help") | Some("-h") => return help::show(&["projects"]),
+            Some(flag) if flag.starts_with('-') => {
+                eprintln!("ops: projects rm: unknown flag `{flag}`");
+                eprintln!("       run `ops help projects` for usage.");
+                return ExitCode::from(2);
+            }
+            Some(id) => ids.push(id.to_string()),
+            None => {
+                eprintln!("ops: projects rm: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if ids.is_empty() && !dead && !markerless {
         eprintln!(
-            "ops: `--unidentified` reaps markerless project trees and requires `--all` — \
-             run `ops gc --all --unidentified --prune`."
+            "ops: projects rm: name a project id, or use --dead / --markerless. \
+             Run `ops projects` to list them."
         );
         return ExitCode::from(2);
     }
-    // `--id` targets one named tree. It is incompatible with `--unidentified` (which is a broad
-    // reap, not a targeted one) and needs neither `--all` nor a deadness proof — the user naming
-    // the id IS the proof. It runs the focused reap and returns, skipping the broad sweep.
-    if unidentified && id.is_some() {
-        eprintln!("ops: `--unidentified` cannot be combined with `--id` — pick one.");
+    let targeted = !ids.is_empty();
+    let bulk = dead || markerless;
+    let Some(apply) = sandbox::projects_rm_apply(targeted, bulk, dry_run, yes) else {
+        eprintln!("ops: projects rm: `--dry-run` and `--yes` are contradictory — pick one.");
         return ExitCode::from(2);
-    }
+    };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    if let Some(id) = id {
-        return sandbox::gc_one_tree(&id, prune, &pal);
-    }
-    sandbox::gc(prune, all, unidentified, &pal)
+    sandbox::projects_rm(&ids, dead, markerless, apply, do_gc, force, &pal)
 }
 
 /// Roll the nixpkgs channel the current directory tracks — a trusted project pin, else

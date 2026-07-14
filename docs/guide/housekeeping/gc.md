@@ -1,10 +1,11 @@
 # Garbage collection
 
 `ops` provisions a per-project nix store and, over time, leaves reclaimable residue —
-superseded closures, stale rev-keyed `flake:` out-links, and whole runtime trees for
-projects that no longer exist. `ops gc` reclaims it.
+superseded closures and stale rev-keyed `flake:` out-links. `ops gc` reclaims the nix
+store; whole per-project runtime **trees** (for projects that no longer exist) are removed
+by [`ops projects rm`](../cli/projects.md).
 
-See also: [`ops gc`](../cli/gc.md) · [Provisioning](../concepts/provisioning.md) · [Directory layout](../concepts/directory-layout.md).
+See also: [`ops gc`](../cli/gc.md) · [`ops projects`](../cli/projects.md) · [Provisioning](../concepts/provisioning.md) · [Directory layout](../concepts/directory-layout.md).
 
 ## Dry run by default
 
@@ -22,22 +23,24 @@ ops gc --prune            # reclaim this project's store
 |---|---|
 | `ops gc` | the **current project's** store (dry run) |
 | `ops gc --prune` | the current project's store (reclaim) |
-| `ops gc --all` | also whole runtime trees whose **project directory is gone** (dry run) |
-| `ops gc --all --prune` | the above, and a shared-store collection under an exclusive lock |
+| `ops gc --all` | also the **shared** store's orphaned closures (dry run) |
+| `ops gc --all --prune` | the above, collected under an exclusive lock |
 
 - The per-project sweep reclaims a project's own store residue, including the **stale
   rev-keyed `flake:` out-links** an [`ops upgrade flake`](upgrade.md) leaves behind
   (each roll `A → B` leaves the old `<name>-A` out-link and its closure).
-- `--all` reaps whole per-project runtime trees whose project directory no longer exists
-  (a project you deleted), and collects the shared nix store under an exclusive lock so a
-  concurrent launch cannot race it.
+- `--all` collects the shared nix store — the closures no live project or locked channel
+  revision still roots — under an exclusive lock so a concurrent launch cannot race it.
+- Removing a whole per-project runtime **tree** is [`ops projects rm`](../cli/projects.md);
+  its store closures are then reclaimed by `ops gc --all --prune` (or in one step,
+  `ops projects rm <id> --gc`).
 
 ## Examples
 
 ```sh
 ops gc                    # see what's reclaimable in this project
 ops gc --prune            # free this project's residue
-ops gc --all --prune      # + reap dead project trees + collect the shared store
+ops gc --all --prune      # + collect the shared store
 ```
 
 Re-seeding heals what a sweep removes: a launch re-seeds the project store from the

@@ -211,10 +211,10 @@ pub(crate) struct ReapReport {
     pub(crate) dead: Vec<DeadTree>,
     /// Trees with no marker — their project path predates marker-recording and is unknown, so
     /// deadness cannot be verified: listed for a manual decision, reclaimed only when the caller
-    /// opts in with `--unidentified` (the entries actually removed land in `reaped_unidentified`).
+    /// opts in with `--markerless` (the entries actually removed land in `reaped_unidentified`).
     pub(crate) unidentified: Vec<UnidentifiedTree>,
-    /// Markerless trees reclaimed under the `--unidentified` opt-in. Empty unless the caller passed
-    /// `prune_unidentified` *and* `prune`; the trees in this list have already been removed.
+    /// Markerless trees reclaimed under the `--markerless` opt-in. Empty unless the caller passed
+    /// `prune_unidentified`; the trees in this list have already been removed.
     pub(crate) reaped_unidentified: Vec<UnidentifiedTree>,
 }
 
@@ -239,11 +239,15 @@ pub(crate) struct UnidentifiedTree {
 ///
 /// A tree with no usable marker is **never** reclaimed on deadness, because its path is unknown and
 /// deadness cannot be verified. It is reclaimed only under the explicit `prune_unidentified` opt-in
-/// — a fail-closed escape hatch (`ops gc --all --unidentified --prune`) that reaps markerless trees
+/// — a fail-closed escape hatch (`ops projects rm --markerless --yes`) that reaps markerless trees
 /// *without* a deadness proof, after the live-session guard has already excluded any tree a running
 /// session holds. The caller owns that risk: a markerless tree belonging to a project still in use
 /// (a pre-marker launch, or a marker write that failed) would be lost, so the flag is never the
-/// default. Destructive only when `prune`; a dry run computes the same sets and changes nothing.
+/// default.
+///
+/// The two switches are **independent**: `prune` reaps the dead (marker-identified, gone) trees and
+/// `prune_unidentified` reaps the markerless ones, so a caller can sweep either category alone or
+/// both. With neither set the call is a pure dry run — it computes the same sets and changes nothing.
 pub(crate) fn reap_dead_projects(
     projects_dir: &Path,
     live_ids: &BTreeSet<String>,
@@ -287,11 +291,12 @@ pub(crate) fn reap_dead_projects(
             }
             // Identified and still live (or only its mount is absent) — keep.
             Some(_) => {}
-            // No usable marker. Default: report for a manual decision. With the `--unidentified`
-            // opt-in, reclaim the tree too (no deadness proof — the caller accepts that risk).
+            // No usable marker. Default: report for a manual decision. With the `--markerless`
+            // opt-in (`prune_unidentified`, independent of the dead reap), reclaim the tree too (no
+            // deadness proof — the caller accepts that risk).
             None => {
                 let bytes = tree_size(&dir);
-                if prune_unidentified && prune {
+                if prune_unidentified {
                     let _ = force_remove_dir_all(&dir);
                     reaped_unidentified.push(UnidentifiedTree { bytes, dir });
                 } else {
@@ -1003,8 +1008,8 @@ mod tests {
         make_tree(&projects, "bbbbbbbbbbbbbbbb", None);
         let live = BTreeSet::from(["bbbbbbbbbbbbbbbb".to_string()]);
 
-        // dry run with the opt-in: both reported as candidates, neither removed
-        let report = reap_dead_projects(&projects, &live, false, true);
+        // dry run (neither switch): both reported as candidates, neither removed
+        let report = reap_dead_projects(&projects, &live, false, false);
         assert_eq!(
             report.unidentified.len(),
             1,
@@ -1023,8 +1028,9 @@ mod tests {
             "the live markerless tree disappeared in a dry run"
         );
 
-        // prune with the opt-in: the unheld markerless tree is reaped, the live one is kept
-        let report = reap_dead_projects(&projects, &live, true, true);
+        // the markerless opt-in reaps the unheld markerless tree with the dead-prune OFF — the two
+        // switches are independent — and the live one is still kept
+        let report = reap_dead_projects(&projects, &live, false, true);
         assert_eq!(
             report.reaped_unidentified.len(),
             1,

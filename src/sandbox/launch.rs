@@ -838,32 +838,30 @@ pub(crate) fn upgrade_mise_packages(
 /// current-project sweep needs — so `ops gc --all` reclaims even from a directory that is not a
 /// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
 /// the destructive form.
-pub(crate) fn gc(
-    prune: bool,
-    all: bool,
-    prune_unidentified: bool,
-    pal: &crate::style::Palette,
-) -> ExitCode {
+pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCode {
     if all {
         match crate::store::Layout::from_env() {
             Some(layout) => {
-                let live_ids = session_housekeeping(&layout, pal);
-                reap_dead_trees(&layout, &live_ids, prune, prune_unidentified, pal);
+                // Prune stale session records, then collect the shared store. Reaping whole
+                // per-project runtime *trees* is `ops projects rm`; `--all` here is purely the
+                // nix-store side — the shared store's orphaned closures across every project.
+                let _ = session_housekeeping(&layout, pal);
                 shared_store_gc(&layout, prune, pal);
             }
             None => eprintln!(
-                "ops gc: cannot locate ops's data directory; skipping the cross-project housekeeping."
+                "ops gc: cannot locate ops's data directory; skipping the shared-store housekeeping."
             ),
         }
     }
     match sweep_current(prune, pal) {
         Ok(()) => ExitCode::SUCCESS,
-        // Under `--all` the reap above already ran, so a current-project sweep that could not run
-        // (the host cannot sandbox, nix is unavailable) — or that hit an error — must not fail the
-        // whole command. Its own message is already printed above; only the exit code is flattened.
+        // Under `--all` the shared-store collection above already ran, so a current-project sweep
+        // that could not run (the host cannot sandbox, nix is unavailable) — or that hit an error —
+        // must not fail the whole command. Its own message is already printed above; only the exit
+        // code is flattened.
         Err(_) if all => {
             eprintln!(
-                "ops gc: the current project's store was not swept (see above); the cross-project reap ran."
+                "ops gc: the current project's store was not swept (see above); the shared-store collection ran."
             );
             ExitCode::SUCCESS
         }
@@ -883,7 +881,7 @@ fn session_housekeeping(
         Ok((live, pruned)) => {
             if pruned > 0 {
                 println!(
-                    "{}ops gc --all:{} pruned {}{pruned}{} stale session record(s); {} live.",
+                    "{}ops:{} pruned {}{pruned}{} stale session record(s); {} live.",
                     pal.head,
                     pal.reset,
                     pal.name,
@@ -910,7 +908,8 @@ fn session_housekeeping(
 /// guard, not a reliable unmount check — the dry-run default is the backstop there), and no live
 /// session holds it. Markerless trees (their project path unknown) are listed for a manual decision
 /// by default; `prune_unidentified` opts into reaping them without a deadness proof (the
-/// `--unidentified` escape hatch). Pure host-side filesystem work — no sandbox, no nix.
+/// `--markerless` escape hatch). Pure host-side filesystem work — no sandbox, no nix. This drives
+/// the bulk `ops projects rm --dead` / `--markerless` sweeps.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
@@ -925,7 +924,7 @@ fn reap_dead_trees(
         && report.unidentified.is_empty()
         && report.reaped_unidentified.is_empty()
     {
-        println!("{h}ops gc --all:{r} {dim}no dead project trees to reclaim.{r}");
+        println!("{h}ops projects rm:{r} {dim}no dead project trees to reclaim.{r}");
         return;
     }
 
@@ -947,21 +946,21 @@ fn reap_dead_trees(
     if !report.dead.is_empty() {
         if prune {
             println!(
-                "{h}ops gc --all:{r} reclaimed {} dead project tree(s), freed up to {}.",
+                "{h}ops projects rm:{r} reclaimed {} dead project tree(s), freed up to {}.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
         } else {
             println!(
-                "{h}ops gc --all:{r} {} dead project tree(s) reclaimable (up to {}) — \
-                 run `ops gc --all --prune` to reclaim.",
+                "{h}ops projects rm:{r} {} dead project tree(s) reclaimable (up to {}) — \
+                 run `ops projects rm --dead --yes` to reclaim.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
         }
     }
 
-    // Markerless trees reaped under the `--unidentified` opt-in. Their deadness was NOT verified
+    // Markerless trees reaped under the `--markerless` opt-in. Their deadness was NOT verified
     // (the marker is absent, so the project path is unknown) — the caller accepted that risk. They
     // are gone now, so report them as reclaimed rather than as candidates.
     let mut ufreed = 0u64;
@@ -975,18 +974,18 @@ fn reap_dead_trees(
     }
     if !report.reaped_unidentified.is_empty() {
         println!(
-            "{h}ops gc --all --unidentified:{r} reclaimed {} markerless tree(s), freed up to {}.",
+            "{h}ops projects rm --markerless:{r} reclaimed {} markerless tree(s), freed up to {}.",
             report.reaped_unidentified.len(),
             super::gc::human_bytes(ufreed)
         );
     }
 
     // Markerless trees not reaped (no opt-in, or a dry run): surfaced for a manual decision. The
-    // hint adapts to whether the user is using the `--unidentified` hatch — a dry run of it points
-    // at the prune form, the default still points at a by-hand removal (the fail-closed stance).
+    // hint adapts to whether the user is using the `--markerless` hatch — a dry run of it points
+    // at the apply form, the default still points at a by-hand removal (the fail-closed stance).
     for tree in &report.unidentified {
         let hint = if prune_unidentified {
-            "run `ops gc --all --unidentified --prune` to reclaim (no deadness proof)"
+            "run `ops projects rm --markerless --yes` to reclaim (no deadness proof)"
         } else {
             "remove by hand if unwanted"
         };
@@ -998,69 +997,286 @@ fn reap_dead_trees(
     }
 }
 
-/// Reap — or, in a dry run, measure — one named project tree (`ops gc --id <id>`). The caller
-/// supplies the id, so this needs no deadness proof and no marker: it works on markerless trees
-/// too, and on trees a marker would call idle. The live-session guard still holds — a tree a
-/// running session holds is refused, with a pointer at `ops stop`. Pure host-side filesystem
-/// work — no sandbox, no nix — so it runs even where the broad reap cannot.
-pub(crate) fn gc_one_tree(id: &str, prune: bool, pal: &crate::style::Palette) -> ExitCode {
-    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
-    // Reject a traversal/absolute id before any work: it is joined onto `projects/` and reaches a
-    // recursive delete, so only a single path component is allowed (a real id is a 16-hex hash the
-    // `ops path` listing shows). `reap_one` re-checks at the sink; this gives the clearer message.
-    if !super::gc::is_safe_tree_id(id) {
-        eprintln!(
-            "ops gc: invalid project id `{id}` — expected a single tree name \
-             (the directory name `ops path` lists under projects/), not a path."
-        );
-        return ExitCode::from(2);
-    }
+/// One per-project runtime tree, classified and sized, for `ops projects [list]`.
+#[derive(serde::Serialize)]
+struct ProjectTreeView {
+    /// The tree's directory name under `<data>/projects/` — the id `ops projects rm` takes.
+    id: String,
+    /// `live` (a running session holds it), `idle` (its project still exists), `dead` (the project
+    /// directory is gone), or `markerless` (a legacy tree pre-dating marker recording).
+    state: &'static str,
+    /// On-disk size in bytes (an upper bound — reflinked content shared with another tree counts
+    /// per file).
+    bytes: u64,
+    /// The `bytes` figure rendered human-readably (the text listing shows this).
+    size: String,
+    /// `YYYY-MM-DD` of the last launch (the marker's mtime), else the tree directory's mtime.
+    last_used: String,
+    /// The canonical project path the tree belongs to, when it carries a marker.
+    project: Option<String>,
+    /// Whether this tree is the current working directory's project (marked `*` in the listing).
+    current: bool,
+}
+
+/// The project id of the current working directory, so the tree you are standing in can be marked
+/// `*` in the listing and guarded against an accidental `ops projects rm <that-id>`. Best-effort:
+/// `None` when the cwd cannot be read or canonicalized. Hashed the way a launch hashes its cwd, so
+/// the value matches the runtime tree's directory name.
+fn current_tree_id() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let canonical = cwd.canonicalize().ok()?;
+    Some(binds::project_id(&canonical))
+}
+
+/// Gather the per-project runtime trees under `<data>/projects/`, classified and sized, sorted by
+/// id — the shared core of `ops projects [list]` (text or JSON). Live ids come from the session
+/// registry (the same self-healing housekeep `ops ls` runs), so a tree in use reads `live`. Pure
+/// host-side filesystem work — no sandbox, no nix.
+fn collect_project_trees(
+    layout: &crate::store::Layout,
+    pal: &crate::style::Palette,
+) -> Vec<ProjectTreeView> {
+    let live_ids = session_housekeeping(layout, pal);
+    let current = current_tree_id();
+    let projects_dir = layout.data_dir().join("projects");
+    let mut rows: Vec<ProjectTreeView> = match std::fs::read_dir(&projects_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| {
+                let dir = e.path();
+                let id = e.file_name().to_string_lossy().into_owned();
+                let class = super::gc::classify_tree(&dir, &live_ids);
+                let bytes = super::gc::tree_size(&dir);
+                ProjectTreeView {
+                    current: current.as_deref() == Some(id.as_str()),
+                    id,
+                    state: class.state.label(),
+                    bytes,
+                    size: super::gc::human_bytes(bytes),
+                    last_used: crate::paths::civil_date(class.last_used),
+                    project: class.project_path.map(|p| p.display().to_string()),
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// List the per-project runtime trees — `ops projects` / `ops projects list`. A read-only overview
+/// (richer than `ops path`'s projects section: it adds each tree's on-disk size), in aligned text
+/// or `--json`.
+pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("ops gc: cannot locate ops's data directory; cannot reap a project tree.");
+        eprintln!("ops projects: cannot locate ops's data directory.");
+        return ExitCode::FAILURE;
+    };
+    let rows = collect_project_trees(&layout, pal);
+
+    if json {
+        return match serde_json::to_string_pretty(&rows) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("ops projects: failed to serialize: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    if rows.is_empty() {
+        println!("{h}ops projects{r} {dim}— no per-project runtime trees.{r}");
+        return ExitCode::SUCCESS;
+    }
+    let total: u64 = rows.iter().map(|row| row.bytes).sum();
+    println!(
+        "{h}ops projects{r} {dim}({} tree(s), {}){r}",
+        rows.len(),
+        super::gc::human_bytes(total)
+    );
+    let state_w = rows.iter().map(|row| row.state.len()).max().unwrap_or(0);
+    let size_w = rows.iter().map(|row| row.size.len()).max().unwrap_or(0);
+    for row in &rows {
+        let state = format!("{:<state_w$}", row.state);
+        let size = format!("{:>size_w$}", row.size);
+        let mark = if row.current {
+            format!("  {n}*{r}")
+        } else {
+            String::new()
+        };
+        let path = row.project.as_deref().unwrap_or("(no marker)");
+        println!(
+            "  {n}{id}{r}  {state}  {size}  {dim}{last}{r}  {path}{mark}",
+            id = row.id,
+            last = row.last_used,
+        );
+    }
+    println!(
+        "{dim}remove one with `ops projects rm <id>`; sweep dead trees with `ops projects rm --dead --yes`.{r}"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Decide whether `ops projects rm` applies the removal or only previews it. A *targeted* removal
+/// (ids named, no bulk selector) applies immediately — naming the id is the intent, like `rm`; a
+/// *bulk* selector (`--dead`/`--markerless`) previews by default and requires `--yes`. `--dry-run`
+/// forces a preview, `--yes` forces apply; the two together are contradictory (`None`).
+pub(crate) fn rm_apply(targeted: bool, bulk: bool, dry_run: bool, yes: bool) -> Option<bool> {
+    if dry_run && yes {
+        return None;
+    }
+    if dry_run {
+        return Some(false);
+    }
+    if yes {
+        return Some(true);
+    }
+    Some(targeted && !bulk)
+}
+
+/// Whether `ops projects rm <id>` must refuse `id` because it is the tree of the current working
+/// directory — deleting the store and home you are standing in — unless `--force` overrides it.
+/// `current` is [`current_tree_id`]; `None` (cwd unresolvable) never guards.
+fn rm_refuses_current(id: &str, current: Option<&str>, force: bool) -> bool {
+    !force && current == Some(id)
+}
+
+/// Remove named project trees and/or sweep the dead/markerless ones — `ops projects rm`. Each named
+/// id is reaped through the shared [`super::gc::reap_one`] (no deadness proof — naming the id is the
+/// proof), the bulk selectors through [`reap_dead_trees`]; a live-held tree is always refused, and
+/// the current project is refused without `--force`. `apply` gates the actual deletion (a preview
+/// otherwise). With `--gc`, the shared-store collection runs after a real removal to reclaim the
+/// now-orphaned closures. Pure host-side filesystem work (bar the optional `--gc`) — no sandbox.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn projects_rm(
+    ids: &[String],
+    dead: bool,
+    markerless: bool,
+    apply: bool,
+    do_gc: bool,
+    force: bool,
+    pal: &crate::style::Palette,
+) -> ExitCode {
+    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let Some(layout) = crate::store::Layout::from_env() else {
+        eprintln!("ops projects rm: cannot locate ops's data directory.");
         return ExitCode::FAILURE;
     };
     let live_ids = session_housekeeping(&layout, pal);
+    let current = current_tree_id();
     let projects_dir = layout.data_dir().join("projects");
-    match super::gc::reap_one(&projects_dir, id, &live_ids, prune) {
-        super::gc::ReapOneOutcome::NotFound => {
+    let mut had_error = false;
+
+    for id in ids {
+        if !super::gc::is_safe_tree_id(id) {
             eprintln!(
-                "ops gc: no project tree for id `{id}` under {}.",
-                projects_dir.display()
+                "ops projects rm: invalid project id `{id}` — expected a single tree name \
+                 (an id `ops projects` lists), not a path."
             );
-            ExitCode::FAILURE
+            had_error = true;
+            continue;
         }
-        super::gc::ReapOneOutcome::Live => {
+        // Guard the tree you are standing in: an idle current project is not `Live`, so naming its
+        // exact id would delete the store and home of this very directory. `--force` is the opt-in.
+        if rm_refuses_current(id, current.as_deref(), force) {
             eprintln!(
-                "ops gc: project tree {n}{id}{r} is held by a live session — \
-                 stop it first with {n}ops stop{r} (then `ops gc --id {id} --prune`)."
+                "ops projects rm: {n}{id}{r} is the current project — refusing without {n}--force{r}."
             );
-            ExitCode::FAILURE
+            had_error = true;
+            continue;
         }
-        super::gc::ReapOneOutcome::Tree { dir, bytes } => {
-            let verb = if prune {
-                format!("{ok}reclaimed{r}")
-            } else {
-                format!("{dim}reclaimable{r}")
-            };
-            println!(
-                "  {verb}: {n}{}{r} ({})",
-                dir.display(),
-                super::gc::human_bytes(bytes)
-            );
-            if prune {
-                println!(
-                    "{h}ops gc --id:{r} reclaimed project tree {n}{id}{r}, freed up to {}.",
-                    super::gc::human_bytes(bytes)
+        match super::gc::reap_one(&projects_dir, id, &live_ids, apply) {
+            super::gc::ReapOneOutcome::NotFound => {
+                eprintln!(
+                    "ops projects rm: no project tree for id `{id}` under {}.",
+                    projects_dir.display()
                 );
-            } else {
-                println!(
-                    "{h}ops gc --id:{r} {n}{id}{r} reclaimable ({}) — \
-                     run `ops gc --id {id} --prune` to reclaim.",
-                    super::gc::human_bytes(bytes)
-                );
+                had_error = true;
             }
-            ExitCode::SUCCESS
+            super::gc::ReapOneOutcome::Live => {
+                eprintln!(
+                    "ops projects rm: project tree {n}{id}{r} is held by a live session — \
+                     stop it first with {n}ops stop{r}, then `ops projects rm {id}`."
+                );
+                had_error = true;
+            }
+            super::gc::ReapOneOutcome::Tree { dir, bytes } => {
+                let verb = if apply {
+                    format!("{ok}removed{r}")
+                } else {
+                    format!("{dim}removable{r}")
+                };
+                println!(
+                    "  {verb}: {n}{}{r} ({})",
+                    dir.display(),
+                    super::gc::human_bytes(bytes)
+                );
+                if !apply {
+                    println!(
+                        "{h}ops projects rm:{r} {n}{id}{r} removable ({}) — \
+                         run `ops projects rm {id}` (without `--dry-run`) to remove.",
+                        super::gc::human_bytes(bytes)
+                    );
+                }
+            }
         }
+    }
+
+    if dead || markerless {
+        reap_dead_trees(&layout, &live_ids, apply && dead, apply && markerless, pal);
+    }
+
+    if do_gc {
+        if apply {
+            shared_store_gc(&layout, true, pal);
+        } else {
+            eprintln!(
+                "ops projects rm: {dim}--gc runs the shared-store collection only when the removal \
+                 is applied (add --yes, or drop --dry-run).{r}"
+            );
+        }
+    }
+
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod projects_rm_tests {
+    use super::{rm_apply, rm_refuses_current};
+
+    #[test]
+    fn a_named_id_applies_immediately_but_a_bulk_selector_previews() {
+        // Pure targeted: apply now.
+        assert_eq!(rm_apply(true, false, false, false), Some(true));
+        // Bulk selector present: preview by default (needs --yes).
+        assert_eq!(rm_apply(false, true, false, false), Some(false));
+        assert_eq!(rm_apply(true, true, false, false), Some(false));
+    }
+
+    #[test]
+    fn dry_run_and_yes_override_the_default_and_conflict_together() {
+        assert_eq!(rm_apply(true, false, true, false), Some(false)); // --dry-run wins over targeted
+        assert_eq!(rm_apply(false, true, false, true), Some(true)); // --yes applies a bulk sweep
+        assert_eq!(rm_apply(true, false, true, true), None); // contradictory
+    }
+
+    #[test]
+    fn the_current_project_tree_is_refused_unless_forced() {
+        // The id matches the cwd's tree: refuse without --force, allow with it.
+        assert!(rm_refuses_current("abc", Some("abc"), false));
+        assert!(!rm_refuses_current("abc", Some("abc"), true));
+        // A different tree, or an unresolvable cwd, never guards.
+        assert!(!rm_refuses_current("abc", Some("def"), false));
+        assert!(!rm_refuses_current("abc", None, false));
     }
 }
 
@@ -1122,7 +1338,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
 
     if prune {
         println!(
-            "{h}ops gc --all:{r} shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
+            "{h}ops gc:{r} shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
             stale.len(),
             report.paths,
             super::gc::human_bytes(report.bytes)
@@ -1132,7 +1348,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
         // yet counted as collectable; the count of stale roots is the signal, and `--prune` frees
         // their closures on top of the orphans reported here (a lower bound).
         println!(
-            "{h}ops gc --all:{r} shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
+            "{h}ops gc:{r} shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
              reclaimable now ({}). Run `ops gc --all --prune` to drop the roots and reclaim their closures.",
             stale.len(),
             report.paths,
