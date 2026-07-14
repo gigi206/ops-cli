@@ -47,7 +47,7 @@
 # [env] placeholder and the [secret] block, and provide $OPENROUTER_API_KEY on the host, to have
 # the egress proxy inject the key on the wire to openrouter.ai — the plaintext never enters the
 # cage. To use a different provider, change the allowlist host + the [secret] block + the env var.
-cmd = ["bash", "-c", "set -e; SRC=\"$HOME/hermes-src\"; if [ ! -d \"$SRC/.git\" ]; then git clone --depth 1 https://github.com/NousResearch/hermes-agent \"$SRC\"; fi; cd \"$SRC\"; if [ ! -d .venv ]; then uv venv --python 3.12 .venv; fi; . .venv/bin/activate; uv pip install -e .; hermes desktop"]
+cmd = ["bash", "-c", "set -e; SRC=\"$HOME/hermes-src\"; if [ ! -d \"$SRC/.git\" ]; then git clone --depth 1 https://github.com/NousResearch/hermes-agent \"$SRC\"; fi; cd \"$SRC\"; if [ ! -d .venv ]; then uv venv --python 3.12 .venv; fi; . .venv/bin/activate; uv pip install -e \".[web,pty,cli,voice,vision,cron,mcp,exa,firecrawl,youtube,edge-tts,acp]\"; hermes desktop"]
 
 # The native desktop window: the Wayland socket (gui), the GPU render node + scoped /sys (gpu), and
 # a private in-cage desktop portal (dbus) so the app's file chooser renders in-cage and follows the
@@ -82,7 +82,11 @@ ELECTRON_GET_USE_PROXY = "true"
 mode = "deny"
 allow = [
     # --- Build-time ---
-    # The editable `uv pip install -e .` — Hermes + its Python deps from PyPI.
+    # The editable `uv pip install -e '.[<extras>]'` — Hermes + its Python deps (including the
+    # curated feature extras: voice, vision, cron, mcp, web search, youtube, edge-tts, acp) from
+    # PyPI. Edit the extras list in `cmd` above to add or drop a feature. Note: `voice`'s Whisper
+    # model and `edge-tts` fetch runtime assets on first use from hosts NOT listed here — the first
+    # use will show the refused host in `ops net log -a hermes-desktop`; add it with `ops net allow`.
     "{GET} https://pypi.org",
     "{GET} https://files.pythonhosted.org",
     # The git clone of the repo (smart-HTTP).
@@ -105,6 +109,14 @@ allow = [
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
     "{GET} https://models.dev",
+    # Voice STT (`/voice on`): the local faster-whisper model is fetched from Hugging Face on first
+    # use — metadata/resolve on huggingface.co, the model blobs via the Xet CDN under *.xethub.hf.co
+    # (read-only, cached in the app home after). Live-verified via hermes-web.
+    "{GET,HEAD} https://huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+    # Voice replies (edge-tts): Microsoft's free online TTS endpoint (a WebSocket the proxy relays).
+    # Host from the edge-tts package source; the first spoken reply confirms it in `ops net log`.
+    "{GET} https://speech.platform.bing.com",
     # (cache.nixos.org — the nix binary cache for uv/Python/node — is already in ops's built-in
     # nix-cache allow-set, so it needs no entry here.)
 ]

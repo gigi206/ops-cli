@@ -4,13 +4,14 @@
 #   ops app hermes
 #
 # Hermes is a Python agent published to PyPI as a pure `py3-none-any` wheel, so ops installs
-# it with uv instead of building it from source. `nix:uv` puts the uv installer on PATH (a
-# `nix:` package is provisioned host-side and on PATH BEFORE the in-cage equip runs); mise's
-# pipx backend then runs `uv tool install hermes-agent`, fetching the wheel and its
-# dependencies from PyPI. `nix:python312` supplies the interpreter (Hermes requires Python
-# >=3.11,<3.14). The first launch resolves ~60 wheels in a few tens of MiB and seconds; later
-# launches reuse the warm install from the app's own home. The install lays down the `hermes`,
-# `hermes-acp`, and `hermes-agent` CLIs; `cmd` launches `hermes`.
+# it with uv instead of building it from source. `nix:uv` puts the uv installer on PATH and
+# `nix:python312` the interpreter (Hermes requires Python >=3.11,<3.14). mise's pipx backend
+# STRIPS PEP 508 extras from an install token, and this profile needs the `[voice]` extra (and
+# more) for `/voice on`, so the launch `cmd` below installs Hermes itself: it creates a uv venv in
+# the app's persistent home, runs `uv pip install 'hermes-agent[<extras>]'` into it once
+# (idempotent — re-installing only when the extras list changes), then execs the venv's `hermes`.
+# The first launch resolves the wheels from PyPI in a few tens of MiB and seconds; later launches
+# reuse the warm venv. The install lays down the `hermes`, `hermes-acp`, and `hermes-agent` CLIs.
 #
 # (Hermes also ships as a nix flake — `flake:github:NousResearch/hermes-agent#default` — which
 # ADDITIONALLY bundles the node-based TUI/web front-ends, at the cost of a multi-minute, ~2 GiB
@@ -29,7 +30,7 @@
 # (api.openai.com, OPENAI_API_KEY, header "Authorization", type "bearer"). If a request is
 # blocked, the proxy reports the host it refused — add it to `allow` (or check ahead with
 # `ops test net <url>`).
-cmd = "hermes"
+cmd = ["bash", "-c", "set -e; VENV=\"$HOME/.hermes-venv\"; EXTRAS=\"web,pty,cli,voice,vision,cron,mcp,exa,firecrawl,youtube,edge-tts,acp\"; if [ ! -x \"$VENV/bin/hermes\" ] || ! grep -qxF \"$EXTRAS\" \"$VENV/.ops-extras\" 2>/dev/null; then uv venv --clear --python 3.12 \"$VENV\"; . \"$VENV/bin/activate\"; uv pip install \"hermes-agent[$EXTRAS]\"; echo \"$EXTRAS\" > \"$VENV/.ops-extras\"; fi; exec \"$VENV/bin/hermes\""]
 
 # AUDIO — Hermes has a first-class terminal voice mode (push-to-talk Ctrl+B: Whisper speech-to-text,
 # confirmation beeps, and text-to-speech that reads the reply). It captures and plays through
@@ -50,12 +51,20 @@ audio = true
 #]
 
 [packages]
-# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the in-cage
-# equip; then Hermes itself via mise's pipx backend, which uses uv to install the wheel. All
-# three are trusted-only [packages]; this profile is trusted by location once imported.
+# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the launch cmd
+# runs its `uv pip install`. Hermes itself is installed by that cmd (see the top note), not here —
+# mise's pipx backend cannot carry the extras. Both are trusted-only [packages]; this profile is
+# trusted by location once imported.
+#
+# The curated feature set is the EXTRAS list in the cmd above. `[voice]` adds the terminal
+# voice-mode deps (sounddevice, numpy, local faster-whisper STT) that `/voice on` needs, and
+# `audio = true` above provides the actual microphone access; without the extra, voice mode aborts
+# with "Voice mode requires sounddevice and numpy". `[voice]`'s Whisper model and `[edge-tts]`'s
+# text-to-speech fetch runtime assets on first use from hosts NOT in the allowlist below — the
+# first `/voice on` will show the refused host in `ops net log -a hermes`; add it with `ops net
+# allow -a hermes <url>` (installing the extra ≠ the feature works offline).
 uv     = "nix:uv"
 python = "nix:python312"
-hermes = "mise:pipx:hermes-agent"
 
 [network]
 mode = "deny"
@@ -70,7 +79,15 @@ allow = [
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
     "{GET} https://models.dev",
-    # Install-time (`uv tool install`): the Python wheels and the package index, read-only.
+    # Voice STT (`/voice on` / Ctrl+B): the local faster-whisper model is fetched from Hugging Face
+    # on first use — metadata/resolve on huggingface.co, the model blobs via the Xet CDN under
+    # *.xethub.hf.co (read-only, cached in the app home after). Live-verified via hermes-web.
+    "{GET,HEAD} https://huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+    # Voice replies (edge-tts): Microsoft's free online TTS endpoint (a WebSocket the proxy relays).
+    # Host from the edge-tts package source; the first spoken reply confirms it in `ops net log`.
+    "{GET} https://speech.platform.bing.com",
+    # Install-time (the launch cmd's `uv pip install`): the Python wheels and the package index.
     "{GET} https://files.pythonhosted.org",
     "{GET} https://pypi.org",
     # (cache.nixos.org + github.com — the nix binary cache for uv and Python — are already in

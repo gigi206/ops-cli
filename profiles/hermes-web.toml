@@ -10,13 +10,16 @@
 # you reach the same agent in a real browser UI on the host: chat with streaming tool output,
 # side-by-side previews, a file browser, settings — no terminal.
 #
-# The dashboard needs the optional Python `[web]` extra (fastapi + uvicorn + starlette), which
-# is NOT in the base `hermes-agent` wheel. ops's mise-token grammar now admits PEP 508 extras
-# (`[]`,`)`), so the package below installs `hermes-agent[web]` — the launcher equips it in-cage
-# via mise's pipx backend (uv tool install), the same path as the CLI profile, plus the extra.
-# `nix:uv` puts uv on PATH before the equip; `nix:python312` supplies the interpreter (Python
-# >=3.11,<3.14). The first launch resolves ~60+ wheels in a few tens of MiB and seconds; later
-# launches reuse the warm install from the app's own home.
+# The dashboard and several agent features need optional Python extras that are NOT in the base
+# `hermes-agent` wheel — `[web]` (fastapi + uvicorn + starlette) for the server, `[voice]`
+# (sounddevice + faster-whisper) for `/voice on`, and more (the curated set in [packages] below).
+# mise's pipx backend STRIPS PEP 508 extras from an install token (`mise:pipx:hermes-agent[web]`
+# installs only the bare wheel), so ops cannot equip the extras that way. Instead the launch `cmd`
+# below creates a uv venv in the app's persistent home and runs `uv pip install
+# 'hermes-agent[<extras>]'` into it once — idempotent, re-installing only when the extras list
+# changes (a stamp file) — then execs the venv's `hermes`. `nix:uv` supplies the installer and
+# `nix:python312` the interpreter (both on PATH before the cmd runs). The first launch resolves the
+# wheels from PyPI in a few tens of MiB and seconds; later launches reuse the warm venv.
 #
 # CREDENTIAL POSTURE — identical to the CLI profile. Hermes is BYOK and multi-provider; this
 # template keys it to OpenRouter (Hermes' default — one key, hundreds of models, OpenAI-
@@ -30,7 +33,7 @@
 # step in the browser (the same provider login, or a local dashboard password); that traffic
 # rides the allowlist below. If a request is blocked, the proxy reports the host it refused —
 # add it to `allow` (or check ahead with `ops test net <url>`).
-cmd = ["hermes", "dashboard", "--no-open"]
+cmd = ["bash", "-c", "set -e; VENV=\"$HOME/.hermes-venv\"; EXTRAS=\"web,pty,cli,voice,vision,cron,mcp,exa,firecrawl,youtube,edge-tts,acp\"; if [ ! -x \"$VENV/bin/hermes\" ] || ! grep -qxF \"$EXTRAS\" \"$VENV/.ops-extras\" 2>/dev/null; then uv venv --clear --python 3.12 \"$VENV\"; . \"$VENV/bin/activate\"; uv pip install \"hermes-agent[$EXTRAS]\"; echo \"$EXTRAS\" > \"$VENV/.ops-extras\"; fi; exec \"$VENV/bin/hermes\" dashboard --no-open"]
 
 # Forward the host's localhost:9119 into the cage so your host browser reaches the dashboard.
 # `hermes dashboard` binds 127.0.0.1:9119 inside the cage; this hole bridges it to the host. A
@@ -47,17 +50,57 @@ forward = [9119]
 #    { path = "~/.hermes", mode = "rw" },
 #]
 
+# Microphone + audio playback for the dashboard's voice mode (`/voice on`). A security field,
+# honored only because this profile is trusted by location; it provisions the PulseAudio client +
+# the ALSA→PulseAudio shim and binds the host's PulseAudio socket into the cage. The PulseAudio bus
+# is NOT per-client isolated — it exposes the microphone AND all system-audio output — so this is
+# trusted-only. Comment it out if you never use voice mode. Must stay a top-level key (like
+# `forward`): written after a `[table]` header, TOML would fold it into that table and drop it.
+audio = true
+
 [packages]
-# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the in-cage
-# equip; then Hermes itself via mise's pipx backend WITH the [web] extra (fastapi/uvicorn/
-# starlette) the dashboard server needs. All three are trusted-only [packages]; this profile is
+# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the launch cmd
+# runs its `uv pip install`. Hermes itself is installed by that cmd (see the top note), not here —
+# mise's pipx backend cannot carry the extras. All are trusted-only [packages]; this profile is
 # trusted by location once imported.
+#
+# `nix:nodejs` is required by the dashboard's `/chat` tab: chat is served as an embedded
+# terminal (WebSocket → PTY) that runs Hermes' Node.js TUI. The TUI is prebuilt and bundled in
+# the wheel (`hermes_cli/tui_dist/entry.js`), so only the `node` runtime is needed — no
+# `npm install`, no npmjs network. Without node the tab fails with "Chat unavailable: 1"
+# (the TUI launcher does `sys.exit(1)` when node is absent). Hermes is a Python package, hence the
+# explicit node here. Node alone is necessary but not sufficient — see HERMES_TUI_DIR in [env] below.
+#
+# Curated Hermes feature set — installed by the launch cmd above (edit the EXTRAS list there to add
+# or drop one). Most extras are a single small SDK; the one heavyweight is `voice` (`faster-whisper`
+# → ctranslate2/onnxruntime + `sounddevice` + `numpy`). Chosen for a personal agent driven from the
+# web dashboard:
+#   web    dashboard server (fastapi/uvicorn)      pty   the chat tab's embedded terminal
+#   cli    TUI menus                                voice `/voice on` — STT deps (needs audio=true)
+#   vision image understanding                     cron  scheduled tasks
+#   mcp    Model Context Protocol tools            exa firecrawl  web search / scraping
+#   youtube video transcripts                      edge-tts  text-to-speech (voice replies)
+#   acp    Agent Client Protocol (editor/agent-to-agent)
+# Deliberately OMITTED (add to EXTRAS on demand): provider SDKs (anthropic/mistral/bedrock/vertex/
+# azure — this profile routes via OpenRouter/NousResearch, OpenAI-compatible), `parallel-web` and
+# `computer-use`, chat-platform bridges (slack/matrix/teams/wecom/dingtalk/feishu/homeassistant/sms),
+# cloud memory SaaS (mem0/supermemory/honcho/hindsight), infra (modal/daytona/fal/nemo-relay),
+# google-workspace tools, and `dev` tooling. Some extras fetch runtime assets on FIRST USE — `voice`'s
+# Whisper model from Hugging Face, `edge-tts` from a Microsoft endpoint — which are NOT in the
+# allowlist below: the first `/voice on` will show the refused host in `ops net log -a hermes-web`;
+# add it with `ops net allow -a hermes-web <url>` (installing the extra ≠ the feature works offline).
 uv     = "nix:uv"
 python = "nix:python312"
-hermes = "mise:pipx:hermes-agent[web]"
+nodejs = "nix:nodejs"
 
 [network]
 mode = "deny"
+# Silence the cloud-metadata probe (169.254.169.254 / AWS IMDS) that a cloud SDK in the closure
+# fires on startup to auto-discover credentials. There is nothing to discover off-cloud, and the
+# proxy refuses link-local/metadata addresses by construction (SSRF guard) — the verdict is
+# unchanged, this only drops the noisy denied line from the default `ops net log` (SELinux
+# dontaudit semantics). Still visible via `ops net log --all`.
+mute = ["169.254.169.254"]
 allow = [
     # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter;
     # with the NousResearch account login instead (no BYOK key set — the shipped default), the
@@ -70,7 +113,15 @@ allow = [
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
     "{GET} https://models.dev",
-    # Install-time (`uv tool install`): the Python wheels and the package index, read-only.
+    # Voice STT (`/voice on`): the local faster-whisper model is fetched from Hugging Face on first
+    # use — metadata/resolve on huggingface.co, the model blobs via the Xet CDN under *.xethub.hf.co
+    # (read-only, cached in the app home after the first download). Live-verified.
+    "{GET,HEAD} https://huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+    # Voice replies (edge-tts): Microsoft's free online TTS endpoint (a WebSocket the proxy relays).
+    # Host from the edge-tts package source; the first spoken reply confirms it in `ops net log`.
+    "{GET} https://speech.platform.bing.com",
+    # Install-time (the launch cmd's `uv pip install`): the Python wheels and the package index.
     "{GET} https://files.pythonhosted.org",
     "{GET} https://pypi.org",
     # (cache.nixos.org + github.com — the nix binary cache for uv and Python — are already in
@@ -82,6 +133,16 @@ allow = [
 # placeholder lets Hermes start and issue the request, and the proxy substitutes the real key
 # on the wire to openrouter.ai.
 [env]
+# The `/chat` tab spawns Hermes' Node.js TUI. In a git checkout the launcher runs the TUI from
+# a source workspace (`ui-tui/` + `npm install`); a pipx/pip install has no such workspace, so
+# without this the launcher aborts in `_ensure_tui_workspace` with "Chat unavailable: 1" (a
+# `sys.exit(1)` — it can't `git restore` a missing `ui-tui/`). Setting HERMES_TUI_DIR makes the
+# launcher skip the source-workspace check and fall through to the prebuilt TUI bundled in the
+# wheel (`hermes_cli/tui_dist/entry.js`, run by `node`). The value is a sentinel that need not
+# exist — any path without a `dist/entry.js` selects the wheel-bundled TUI; a non-existent path
+# is used so it can never be hijacked to point at a rogue bundle.
+HERMES_TUI_DIR = "/opt/ops/hermes-tui-prebuilt"
+
 #OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
