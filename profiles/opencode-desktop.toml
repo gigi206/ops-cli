@@ -45,12 +45,17 @@
 # empty netns IS the boundary (it replaces Chromium's own redundant sandbox); `--ozone-platform=
 # wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
 #
-# DBUS. `dbus = true` opens a FILTERED session bus (an `xdg-dbus-proxy` ops runs host-side,
-# default-deny): the app follows your host light/dark theme (the `appearance` portal) and can raise
-# desktop notifications. The proxy exposes ONLY those — the login keyring
-# (`org.freedesktop.secrets`) and the file-chooser/screenshot portals stay refused, so a
-# keyring-backed login still falls back to a file in the app's isolated home. A tray icon
-# (StatusNotifier) is not in the allowlist.
+# DBUS. `dbus = "incage"` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER — the
+# "+" attach-a-file button — opens IN-CAGE and lists the cage filesystem (the project bind + the
+# app's isolated home). A filtered *host* bus (`dbus = true`) canNOT do this: Chromium probes the
+# host portal, sees a real version, commits to the portal path, and its `OpenFile` call is then
+# refused by the host-bus filter — so the picker silently does nothing. `"incage"` also seeds your
+# host light/dark theme at launch, and is network-independent (the private bus touches no host
+# socket). Trade-off vs `dbus = true`: the in-cage portal does not (yet) relay desktop notifications
+# or follow live theme changes — a fair trade for a working file picker, and the same posture the
+# `claude-desktop` profile uses. Requires `gui = "wayland"` (the GTK backend renders on the
+# compositor). The login keyring is never exposed by either posture.
 cmd = [
     "opencode-desktop",
     "--no-sandbox",
@@ -61,7 +66,7 @@ cmd = [
 
 gui = "wayland"
 gpu = true
-dbus = true
+dbus = "incage"
 
 # Your host opencode config/auth, mounted read-write at its real absolute path (so the GUI shares
 # the same login/sessions as your host opencode). `binds` is a security field, honored only
