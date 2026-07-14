@@ -1034,18 +1034,12 @@ pub(crate) fn provision(
     let mut cmd = nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .arg("build")
-        // Quiet nix's per-launch chatter. On a TTY nix's default `bar` logger prints an
-        // `evaluating derivation '<flake>#<attr>'` activity line for every flake-attr build, on
-        // every launch, even when the output is fully cached; with ~15 base + GUI-hole packages
-        // provisioned per launch that is a wall of noise. `--quiet` does NOT drop it — the activity
-        // is shown by the progress bar independently of verbosity (even `-qq` keeps it). The
-        // non-animated `raw` logger does not render those activities, so it clears the chatter.
-        // Errors still surface: a build failure prints its log tail and the `nix log` hint under
-        // `raw` too. The trade is that `raw` also omits the cold-download `copying path …` progress,
-        // so a first launch is silent until it finishes (rare, one-time per channel; the warm
-        // launches that dominate are what this cleans up). Affects stderr only; the out path still
-        // comes back on stdout via `--print-out-paths`.
-        .args(["--log-format", "raw"])
+        // Nix's own progress is left visible on purpose. On a TTY it prints an `evaluating
+        // derivation` line per flake-attr build (cheap eval-cache hits) and, on a cold launch, the
+        // `copying path …` download progress — both worth seeing. An earlier `--log-format raw` hid
+        // the eval chatter but also silenced the cold download (a first launch looked hung); the real
+        // per-launch cost it papered over was the `--expr` re-evaluation, since removed by
+        // [`provision_expr`]'s short-circuit, so there is nothing worth hiding here.
         .args(["--option", "sandbox", "true"])
         .arg("--out-link")
         .arg(gcroot)
@@ -1111,12 +1105,9 @@ pub(crate) fn provision_expr(
     let mut cmd = nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .arg("build")
-        // Quiet nix's per-launch chatter with the non-animated `raw` logger, exactly as
-        // [`provision`] does (see there for why `--quiet` is not enough): an `--expr` build (a
-        // `deb:`/`flake:` package, or the GUI-data set) re-evaluates its expression every launch and
-        // would otherwise print an activity line each time even when fully cached. Build failures
-        // still surface under `raw`.
-        .args(["--log-format", "raw"])
+        // Nix's own progress is left visible (see [`provision`]). This build now runs only when the
+        // short-circuit above misses — a cold or changed expression — exactly when the evaluation and
+        // download progress is worth showing.
         .args(["--option", "sandbox", "true"])
         .arg("--out-link")
         .arg(gcroot)
