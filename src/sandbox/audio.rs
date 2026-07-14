@@ -2,18 +2,34 @@
 //!
 //! A hermetic cage carries no audio: no audio-server socket and no client libraries, so an app
 //! cannot open a capture or playback stream — its microphone and sound are silently unavailable.
-//! When `audio = true` a trusted config opens audio, covering both kinds of Linux audio client:
+//! When `audio = true` a trusted config opens audio, covering the kinds of Linux audio client:
 //!
 //! 1. **A native PulseAudio client** (Chromium/Electron): ops provisions the PulseAudio client
 //!    library (`libpulse.so.0`, absent from an autoPatchelf'd app's closure, which carries only
 //!    ALSA) and puts it on the app's loader path (`LD_LIBRARY_PATH`); the client connects to the
 //!    bound socket named by `PULSE_SERVER`.
-//! 2. **An ALSA client** (a CLI tool using `cpal`/PortAudio/`arecord`, e.g. a terminal agent's voice
-//!    mode): these speak the ALSA API (`libasound`) and do **not** honor `PULSE_SERVER`, so ops adds
-//!    the standard ALSA→PulseAudio compatibility shim — `alsa-plugins` (the `pcm_pulse`/`ctl_pulse`
+//! 2. **An ALSA client** (a CLI tool using `cpal`/`arecord`, e.g. a terminal agent's voice mode):
+//!    these speak the ALSA API (`libasound`) and do **not** honor `PULSE_SERVER`, so ops adds the
+//!    standard ALSA→PulseAudio compatibility shim — `alsa-plugins` (the `pcm_pulse`/`ctl_pulse`
 //!    plugins) plus an `asound.conf` routing the default PCM/CTL to `pulse` — so an ALSA `default`
 //!    capture/playback is transparently routed to the same PulseAudio socket. `libasound` itself is
 //!    provisioned too (on `LD_LIBRARY_PATH`) for a CLI binary that does not carry its own.
+//! 3. **A PortAudio client** (e.g. a Python tool such as `sounddevice`): PortAudio speaks ALSA under
+//!    the hood, so it rides the shim from (2) — but the tool must first `dlopen`
+//!    `libportaudio.so.2`, which the cage lacks, so ops provisions `portaudio` onto
+//!    `LD_LIBRARY_PATH`.
+//!
+//! Delivery is **runtime-agnostic**: putting the client libraries (libpulse, libasound, portaudio) on
+//! `LD_LIBRARY_PATH` is all a C/C++/Rust/Node tool needs — they load a native library the normal way
+//! (`dlopen` a soname, or RUNPATH), which honors `LD_LIBRARY_PATH`. That path is proven for C
+//! (`arecord`), C++ (Electron/libpulse), and Rust (`cpal`/libasound). **Python is the one exception**:
+//! `ctypes.util.find_library(name)` does NOT consult `LD_LIBRARY_PATH` — on Linux it shells out to
+//! `ldconfig`/`gcc`/`ld`, none of which a hermetic cage carries, so it always returns `None` and
+//! `sounddevice` cannot locate PortAudio. So ops additionally stages a `sitecustomize.py` (on
+//! `PYTHONPATH`) that makes `find_library` fall back to scanning `LD_LIBRARY_PATH`. This is **not**
+//! Python favoritism — it is a targeted patch for a Python-specific discovery defect; it is inert for
+//! any non-Python runtime (`PYTHONPATH` is a no-op for them), generic across ctypes consumers, and
+//! staged only under `audio = true`.
 //!
 //! The host PulseAudio socket (`$XDG_RUNTIME_DIR/pulse/native`, which a PipeWire host exposes via
 //! `pipewire-pulse`) is bound **read-only** into the cage at a fixed path and named through
@@ -51,6 +67,55 @@ const ALSA_PLUGINS: (&str, &str, &str) = (
     "lib/alsa-lib/libasound_module_pcm_pulse.so",
     "alsa-plugins",
 );
+/// PortAudio, which a Python audio tool such as `sounddevice` `dlopen`s (`lib/libportaudio.so.2`).
+/// PortAudio speaks ALSA, so it rides the ALSA→PulseAudio shim; provisioned only alongside it.
+const PORTAUDIO: (&str, &str, &str) = ("portaudio", "lib/libportaudio.so.2", "portaudio");
+
+/// The fixed cage path the `find_library` shim directory is bound at, placed on `PYTHONPATH` so its
+/// `sitecustomize.py` runs at interpreter startup (parity with the other fixed cage paths).
+pub(crate) const PYSHIM_INCAGE: &str = "/opt/ops/audio-pyshim";
+
+/// A `sitecustomize.py` that makes `ctypes.util.find_library` fall back to scanning `LD_LIBRARY_PATH`
+/// for a matching `lib<name>.so*`. A hermetic cage has no `ldconfig`/`gcc`/`ld`, so the stock
+/// `find_library` (which shells out to one of those) always returns `None` — breaking any Python
+/// package that loads a native library by name, notably `sounddevice`, which resolves PortAudio via
+/// `find_library('portaudio')`. Its full path is then `dlopen`ed directly. The patch is additive (it
+/// only extends `find_library` when the stock lookup fails) and generic (any ctypes consumer
+/// benefits). Fixed and ops-controlled (no interpolation), so it is safe to stage verbatim.
+///
+/// A `sitecustomize` on `PYTHONPATH` shadows one an app might ship (Python imports only the first on
+/// `sys.path`). This is an accepted, documented trade-off: it is staged only under the opt-in,
+/// trusted `audio = true`, and shipping a `sitecustomize.py` inside an installed package is rare; the
+/// alternative (a language-agnostic `/sbin/ldconfig` + generated `ld.so.cache`) costs more moving
+/// parts for a case this narrow.
+const SITECUSTOMIZE: &str = r#"# ops audio shim: resolve native libraries from LD_LIBRARY_PATH.
+# A hermetic cage has no ldconfig/gcc/ld, so ctypes.util.find_library returns None; a Python audio
+# tool (sounddevice -> find_library('portaudio')) then cannot locate the provisioned library. This
+# makes find_library scan LD_LIBRARY_PATH as a last resort. Additive: the stock lookup wins when it
+# succeeds.
+import os
+import glob
+import ctypes.util
+
+_ops_orig_find_library = ctypes.util.find_library
+
+
+def _ops_find_library(name):
+    found = _ops_orig_find_library(name)
+    if found:
+        return found
+    for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for pattern in ("lib%s.so.*" % name, "lib%s.so" % name, "%s.so.*" % name, "%s.so" % name):
+            hits = sorted(glob.glob(os.path.join(directory, pattern)))
+            if hits:
+                return hits[-1]
+    return found
+
+
+ctypes.util.find_library = _ops_find_library
+"#;
 
 /// The fixed cage path the host PulseAudio socket is bound at (parity with the portal and dbus
 /// sockets under `/run/ops-*`), named through `PULSE_SERVER` — so audio does not depend on the
@@ -90,6 +155,12 @@ pub(crate) struct AudioLayer {
     /// The ALSA→PulseAudio shim, present only when it provisioned. `None` still leaves a working
     /// native-PulseAudio layer (Electron) — the ALSA add-on is decoupled from the core.
     pub(crate) alsa: Option<AlsaShim>,
+    /// The staged `find_library` shim directory (holding `sitecustomize.py`), present only when
+    /// PortAudio provisioned. Bound read-only at [`PYSHIM_INCAGE`] and placed on `PYTHONPATH`, it
+    /// lets a Python PortAudio tool (`sounddevice`) locate `libportaudio.so.2` on `LD_LIBRARY_PATH`.
+    /// `None` leaves ALSA-direct capture (arecord/cpal) working — PortAudio support rides the shim
+    /// but is decoupled from it.
+    pub(crate) pyshim: Option<PathBuf>,
 }
 
 /// Provision the audio userspace into ops's store against the pinned `nixpkgs`. The gcroots are keyed
@@ -118,6 +189,7 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
     let mut lib_dirs = vec![pulse_root.join("lib")];
 
     // Best-effort ALSA→pulse shim — a failure leaves the native-PulseAudio layer intact.
+    let mut pyshim = None;
     let alsa = match provision_alsa_shim(&provision_one, layout.data_dir()) {
         Ok((alsa_lib_root, plugins_root, asound_conf)) => {
             let shim = AlsaShim {
@@ -128,6 +200,21 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
             lib_dirs.push(alsa_lib_root.join("lib"));
             roots.push(alsa_lib_root);
             roots.push(plugins_root);
+            // PortAudio (sounddevice) support builds on the ALSA backend just wired: provision
+            // `libportaudio` and stage the `find_library` shim. Best-effort within the shim — a
+            // failure leaves ALSA-direct capture (arecord/cpal) working; only a Python PortAudio tool
+            // loses audio, so it must not sink the ALSA layer.
+            match provision_portaudio(&provision_one, layout.data_dir()) {
+                Ok((pa_root, shim_dir)) => {
+                    lib_dirs.push(pa_root.join("lib"));
+                    roots.push(pa_root);
+                    pyshim = Some(shim_dir);
+                }
+                Err(e) => crate::diag::warn(&format!(
+                    "`audio = true`: PortAudio support could not be provisioned ({e}) — ALSA-direct \
+                     capture still works, but a Python PortAudio tool (e.g. `sounddevice`) will not"
+                )),
+            }
             Some(shim)
         }
         Err(e) => {
@@ -143,6 +230,7 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
         roots,
         lib_dirs,
         alsa,
+        pyshim,
     })
 }
 
@@ -159,18 +247,45 @@ fn provision_alsa_shim(
     Ok((alsa_lib_root, plugins_root, asound_conf))
 }
 
-/// Stage the fixed `asound.conf` under the data dir, written atomically (temp + `rename`). The
-/// content is constant, so a present file is already correct (idempotent); a concurrent launch that
-/// lost the rename race just reuses the identical winner.
+/// Provision PortAudio and stage the `find_library` shim, so a Python PortAudio tool (`sounddevice`)
+/// can locate and `dlopen` `libportaudio.so.2`. Returned as `(portaudio root, shim dir)` so
+/// [`provision`] can seed the root and carry the shim dir (bound at [`PYSHIM_INCAGE`]). Best-effort:
+/// any failure propagates and the caller keeps the ALSA-direct layer.
+fn provision_portaudio(
+    provision_one: &impl Fn((&str, &str, &str)) -> io::Result<PathBuf>,
+    data_dir: &Path,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let pa_root = provision_one(PORTAUDIO)?;
+    let pyshim_dir = stage_pyshim(data_dir)?;
+    Ok((pa_root, pyshim_dir))
+}
+
+/// Stage the fixed `asound.conf` under the data dir. The content is constant, so a present file is
+/// already correct (idempotent).
 fn stage_asound_conf(data_dir: &Path) -> io::Result<PathBuf> {
-    let base = data_dir.join("audio");
-    std::fs::create_dir_all(&base)?;
-    let file = base.join("asound.conf");
+    stage_atomically(&data_dir.join("audio"), "asound.conf", ASOUND_CONF)
+}
+
+/// Stage the `find_library` shim (`sitecustomize.py`) in its own directory under the data dir, and
+/// return that **directory** (to bind at [`PYSHIM_INCAGE`] and put on `PYTHONPATH`). A dedicated dir
+/// so `PYTHONPATH` exposes only this one file, not the whole `audio/` staging area.
+fn stage_pyshim(data_dir: &Path) -> io::Result<PathBuf> {
+    let dir = data_dir.join("audio").join("pyshim");
+    stage_atomically(&dir, "sitecustomize.py", SITECUSTOMIZE)?;
+    Ok(dir)
+}
+
+/// Atomically stage `content` at `dir/name` (temp + `rename`), creating `dir`. The content is
+/// constant, so a present file is already correct (idempotent); a concurrent launch that lost the
+/// rename race just reuses the identical winner. Returns the staged file path.
+fn stage_atomically(dir: &Path, name: &str, content: &str) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let file = dir.join(name);
     if file.is_file() {
         return Ok(file);
     }
-    let tmp = base.join(format!(".tmp-{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, ASOUND_CONF) {
+    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, content) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -233,6 +348,14 @@ pub(crate) fn env(layer: Option<&AudioLayer>) -> Vec<(String, String)> {
                 alsa.plugin_dir.display().to_string(),
             ));
         }
+        // The `find_library` shim only when PortAudio provisioned: put its bound cage directory on
+        // `PYTHONPATH` so the staged `sitecustomize.py` runs and `find_library('portaudio')` resolves
+        // the provisioned `libportaudio.so.2` from `LD_LIBRARY_PATH`. `PYTHONPATH` is a data path (an
+        // untrusted `[env]` re-pointing it only self-DoSes the cage's own Python audio), so it needs
+        // no denylist entry.
+        if l.pyshim.is_some() {
+            env.push(("PYTHONPATH".to_string(), PYSHIM_INCAGE.to_string()));
+        }
     }
     env
 }
@@ -247,16 +370,19 @@ mod tests {
                 PathBuf::from("/nix/store/aaa-libpulseaudio-17.0"),
                 PathBuf::from("/nix/store/bbb-alsa-lib-1.2.16"),
                 PathBuf::from("/nix/store/ccc-alsa-plugins-1.2.12"),
+                PathBuf::from("/nix/store/ddd-portaudio-19"),
             ],
             lib_dirs: vec![
                 PathBuf::from("/nix/store/aaa-libpulseaudio-17.0/lib"),
                 PathBuf::from("/nix/store/bbb-alsa-lib-1.2.16/lib"),
+                PathBuf::from("/nix/store/ddd-portaudio-19/lib"),
             ],
             alsa: Some(AlsaShim {
                 config_dir: PathBuf::from("/nix/store/bbb-alsa-lib-1.2.16/share/alsa"),
                 plugin_dir: PathBuf::from("/nix/store/ccc-alsa-plugins-1.2.12/lib/alsa-lib"),
                 asound_conf: PathBuf::from("/data/audio/asound.conf"),
             }),
+            pyshim: Some(PathBuf::from("/data/audio/pyshim")),
         }
     }
 
@@ -283,10 +409,14 @@ mod tests {
             get(&full, "PULSE_SERVER").as_deref(),
             Some("unix:/run/ops-pulse")
         );
-        // Both client libraries (native libpulse + ALSA libasound) are on the loader path.
+        // All three client libraries (native libpulse + ALSA libasound + PortAudio) are on the loader
+        // path — the last so `sounddevice`'s `find_library` shim can resolve `libportaudio.so.2`.
         assert_eq!(
             get(&full, "LD_LIBRARY_PATH").as_deref(),
-            Some("/nix/store/aaa-libpulseaudio-17.0/lib:/nix/store/bbb-alsa-lib-1.2.16/lib")
+            Some(
+                "/nix/store/aaa-libpulseaudio-17.0/lib:/nix/store/bbb-alsa-lib-1.2.16/lib:\
+                 /nix/store/ddd-portaudio-19/lib"
+            )
         );
         // ALSA finds its base config and the pulse plugin.
         assert_eq!(
@@ -297,6 +427,8 @@ mod tests {
             get(&full, "ALSA_PLUGIN_DIR").as_deref(),
             Some("/nix/store/ccc-alsa-plugins-1.2.12/lib/alsa-lib")
         );
+        // The `find_library` shim is on PYTHONPATH (the fixed cage path, not the host staging dir).
+        assert_eq!(get(&full, "PYTHONPATH").as_deref(), Some(PYSHIM_INCAGE));
         // Without a provisioned userspace (best-effort failure), only PULSE_SERVER is set — the socket
         // is still bound, but the app finds no client library and simply has no audio.
         let bare = env(None);
@@ -306,6 +438,7 @@ mod tests {
         );
         assert_eq!(get(&bare, "LD_LIBRARY_PATH"), None);
         assert_eq!(get(&bare, "ALSA_PLUGIN_DIR"), None);
+        assert_eq!(get(&bare, "PYTHONPATH"), None);
     }
 
     #[test]
@@ -320,6 +453,7 @@ mod tests {
             roots: vec![PathBuf::from("/nix/store/aaa-libpulseaudio-17.0")],
             lib_dirs: vec![PathBuf::from("/nix/store/aaa-libpulseaudio-17.0/lib")],
             alsa: None,
+            pyshim: None,
         };
         let e = env(Some(&pulse_only));
         assert_eq!(
@@ -327,9 +461,11 @@ mod tests {
             Some("/nix/store/aaa-libpulseaudio-17.0/lib"),
             "libpulse must be on the loader path even without the ALSA shim"
         );
-        // No ALSA vars without the shim (an ALSA CLI tool would have no audio, but Electron does).
+        // No ALSA vars and no PYTHONPATH without the shim (an ALSA/PortAudio CLI tool would have no
+        // audio, but Electron does).
         assert_eq!(get(&e, "ALSA_CONFIG_DIR"), None);
         assert_eq!(get(&e, "ALSA_PLUGIN_DIR"), None);
+        assert_eq!(get(&e, "PYTHONPATH"), None);
     }
 
     #[test]
@@ -339,5 +475,16 @@ mod tests {
         assert!(ASOUND_CONF.contains("pcm.!default"));
         assert!(ASOUND_CONF.contains("ctl.!default"));
         assert!(ASOUND_CONF.contains("type pulse"));
+    }
+
+    #[test]
+    fn sitecustomize_patches_find_library_to_scan_ld_library_path() {
+        // The load-bearing pieces: it wraps `ctypes.util.find_library`, only extends it (calls the
+        // original first), and scans `LD_LIBRARY_PATH` for the library, so PortAudio is found in a
+        // toolchain-less cage. It is valid, executable Python (parsed by an interpreter at startup).
+        assert!(SITECUSTOMIZE.contains("import ctypes.util"));
+        assert!(SITECUSTOMIZE.contains("_ops_orig_find_library = ctypes.util.find_library"));
+        assert!(SITECUSTOMIZE.contains("os.environ.get(\"LD_LIBRARY_PATH\""));
+        assert!(SITECUSTOMIZE.contains("ctypes.util.find_library = _ops_find_library"));
     }
 }

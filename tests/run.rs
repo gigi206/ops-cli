@@ -4481,6 +4481,150 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
     );
 }
 
+/// A trusted `audio = true` also equips a Python **PortAudio** tool (`sounddevice`) — the third audio
+/// client kind, distinct from the ALSA-direct path the `arecord` e2e above covers (that one passed
+/// while PortAudio was broken — the false-green this test closes). The firm, network-independent
+/// teeth: the `find_library` shim `/opt/ops/audio-pyshim/sitecustomize.py` is ABSENT under an
+/// untrusted (dropped) posture — the shim is gated by trust. When provisioning succeeds (needs the nix
+/// cache), the test installs an UNPATCHED PyPI `sounddevice` and asserts it imports: that exercises
+/// the real PortAudio path — the shim resolving `libportaudio.so.2` off `LD_LIBRARY_PATH`, which the
+/// stock hermetic `find_library` (no ldconfig/gcc/ld) cannot. A real recorded sample needs a live mic,
+/// so it is reported, not asserted. App-agnostic: a generic project with `nix:python312` + PyPI
+/// `sounddevice`, never a shipped profile. Skips if the host has no PulseAudio socket or cannot
+/// sandbox.
+#[test]
+fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
+    let host_socket = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join("pulse/native"));
+    match &host_socket {
+        Some(p) if p.exists() => {}
+        _ => {
+            eprintln!(
+                "skipping PortAudio e2e: no PulseAudio socket at $XDG_RUNTIME_DIR/pulse/native"
+            );
+            return;
+        }
+    }
+
+    let project = TmpDir::new("pa-proj");
+    let data = TmpDir::new("pa-data");
+    let state = TmpDir::new("pa-state");
+
+    // `python312` + `uv` give the cage an interpreter and installer, so the e2e can install an
+    // UNPATCHED PyPI `sounddevice` — the nixpkgs one is patched to hardcode the store path, which
+    // would bypass the very `find_library` shim under test. A `[packages]` backend is trusted-only,
+    // so it is dropped untrusted (no python/uv on PATH there).
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        b"audio = true\n\n[packages]\npython = \"nix:python312\"\nuv = \"nix:uv\"\n",
+    )
+    .unwrap();
+
+    let check = r#"test -S /run/ops-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT
+test -f /opt/ops/audio-pyshim/sitecustomize.py && echo PYSHIM-PRESENT || echo PYSHIM-ABSENT
+test -n "$PYTHONPATH" && echo PYTHONPATH-SET || echo PYTHONPATH-UNSET
+case ":$LD_LIBRARY_PATH:" in *portaudio*) echo PORTAUDIO-ON-LDPATH;; *) echo PORTAUDIO-OFF-LDPATH;; esac
+if command -v uv >/dev/null 2>&1 && uv venv /tmp/pv >/dev/null 2>&1 && VIRTUAL_ENV=/tmp/pv uv pip install -q sounddevice >/dev/null 2>&1; then
+  /tmp/pv/bin/python -c "import sounddevice as sd; print('PA-IMPORT-OK'); print('PA-DEVICES-%d' % len(sd.query_devices()))" 2>&1 | tail -4
+else
+  echo PA-NOT-INSTALLED
+fi"#;
+
+    // Untrusted probe (also seeds the base userland): the posture is dropped, so the shim is unbound.
+    // A failed launch means the host cannot sandbox → skip.
+    let probe = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "bash", "-c", check],
+    );
+    if !probe.status.success() {
+        eprintln!(
+            "skipping PortAudio e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_out.contains("PYSHIM-ABSENT"),
+        "the untrusted (dropped) audio posture must leave the find_library shim out of the cage:\n{probe_out}"
+    );
+
+    // Trust so the audio posture applies.
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "bash", "-c", check],
+    );
+    assert!(
+        out.status.success(),
+        "a trusted audio posture must launch a working cage; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Firm: the socket is bound (network-independent).
+    assert!(
+        stdout.contains("PULSE-PRESENT"),
+        "the trusted `audio = true` posture must bind the PulseAudio socket:\n{stdout}"
+    );
+    // When PortAudio provisioned (best-effort — needs the nix cache), the whole path must hold: the
+    // shim is bound, PYTHONPATH points at it, portaudio is on the loader path, and — unless offline —
+    // an UNPATCHED PyPI `sounddevice` imports through the shim. These are the teeth on the PortAudio
+    // path (not the ALSA-direct one); they degrade cleanly when the cache is unreachable
+    // (PYSHIM-ABSENT) or the install is offline (PA-NOT-INSTALLED).
+    if stdout.contains("PYSHIM-PRESENT") {
+        assert!(
+            stdout.contains("PYTHONPATH-SET"),
+            "the shim is bound but PYTHONPATH is unset:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("PORTAUDIO-ON-LDPATH"),
+            "the shim is bound but portaudio is not on LD_LIBRARY_PATH:\n{stdout}"
+        );
+        if !stdout.contains("PA-NOT-INSTALLED") {
+            assert!(
+                stdout.contains("PA-IMPORT-OK"),
+                "PortAudio is wired and PyPI sounddevice installed, but its import failed — the \
+                 find_library shim + libportaudio integration is broken:\n{stdout}"
+            );
+        }
+    }
+    let devices = stdout
+        .lines()
+        .find(|l| l.starts_with("PA-DEVICES-"))
+        .unwrap_or("PA-DEVICES-?");
+    eprintln!(
+        "PortAudio e2e: shim={}, sounddevice import={}, {devices}",
+        if stdout.contains("PYSHIM-PRESENT") {
+            "bound"
+        } else {
+            "absent (best-effort)"
+        },
+        if stdout.contains("PA-IMPORT-OK") {
+            "OK"
+        } else if stdout.contains("PA-NOT-INSTALLED") {
+            "not-installed (offline)"
+        } else {
+            "n/a"
+        },
+    );
+}
+
 /// A trusted `dbus = true` posture stands up the filtered session-bus proxy and binds ONLY its
 /// filtered socket into the cage (with `DBUS_SESSION_BUS_ADDRESS` pointed at it). The
 /// network-independent teeth are the gating: an untrusted (dropped) posture leaves the cage with no

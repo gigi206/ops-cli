@@ -2612,6 +2612,15 @@ fn build(
                         writable: false,
                     });
                 }
+                // The `find_library` shim directory (for a Python PortAudio tool), bound read-only and
+                // placed on `PYTHONPATH` by `audio::env`. Present only when PortAudio provisioned.
+                if let Some(pyshim) = audio_layer.as_ref().and_then(|l| l.pyshim.as_ref()) {
+                    gui_binds.push(binds::ExtraBind {
+                        src: pyshim.clone(),
+                        dest: PathBuf::from(super::audio::PYSHIM_INCAGE),
+                        writable: false,
+                    });
+                }
                 gui_env.extend(super::audio::env(audio_layer.as_ref()));
             }
             _ => crate::diag::warn(
