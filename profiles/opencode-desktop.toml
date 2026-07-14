@@ -50,12 +50,13 @@
 # "+" attach-a-file button — opens IN-CAGE and lists the cage filesystem (the project bind + the
 # app's isolated home). A filtered *host* bus (`dbus = true`) canNOT do this: Chromium probes the
 # host portal, sees a real version, commits to the portal path, and its `OpenFile` call is then
-# refused by the host-bus filter — so the picker silently does nothing. `"incage"` also seeds your
-# host light/dark theme at launch, and is network-independent (the private bus touches no host
-# socket). Trade-off vs `dbus = true`: the in-cage portal does not (yet) relay desktop notifications
-# or follow live theme changes — a fair trade for a working file picker, and the same posture the
-# `claude-desktop` profile uses. Requires `gui = "wayland"` (the GTK backend renders on the
-# compositor). The login keyring is never exposed by either posture.
+# refused by the host-bus filter — so the picker silently does nothing. `"incage"` also relays
+# desktop notifications (a host-side relay bridges the private bus to your notifications daemon) and
+# follows your host light/dark theme both at launch AND live (a relay mirrors host theme switches
+# into the cage), and is network-independent (the private bus touches no host socket). So it matches
+# `dbus = true` on theme and notifications while additionally giving the file picker — the same
+# posture the `claude-desktop` profile uses. Requires `gui = "wayland"` (the GTK backend renders on
+# the compositor). The login keyring is never exposed by either posture.
 cmd = [
     "opencode-desktop",
     "--no-sandbox",

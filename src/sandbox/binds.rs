@@ -798,6 +798,15 @@ fn project_runtime(data_dir: &Path, project: &Path, runtime: Runtime) -> Project
     }
 }
 
+/// The host path of the cage's persistent `$HOME` for this launch — the exact directory
+/// [`build_spec`] binds writable as the home (derived identically: canonicalise the cwd, then
+/// [`project_runtime`]). Lets a host-side helper place a file the cage reads through the home bind
+/// (the live-theme keyfile the in-cage portal watches).
+pub(crate) fn home_src(data_dir: &Path, cwd: &Path, runtime: Runtime) -> io::Result<PathBuf> {
+    let project = canonicalize_project(cwd)?;
+    Ok(project_runtime(data_dir, &project, runtime).home_src)
+}
+
 /// A collision-resistant directory name for a canonical project path, stable within a given binary
 /// build. Housekeeping hashes a running session's recorded canonical path with this to match it
 /// against a runtime tree's id, so it can skip a tree a live session still holds. The hash is

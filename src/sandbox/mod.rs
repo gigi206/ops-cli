@@ -41,6 +41,7 @@ mod search;
 pub(crate) mod seccomp;
 mod smoke;
 mod spec;
+mod theme_relay;
 
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};

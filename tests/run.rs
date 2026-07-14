@@ -1316,6 +1316,95 @@ fn a_trusted_incage_notifications_relay_attaches_and_forwards() {
 }
 
 #[test]
+fn a_keyfile_rewrite_makes_the_incage_portal_re_emit_setting_changed() {
+    // The live-theme relay follows host light/dark switches by rewriting the in-cage GSettings
+    // keyfile; the in-cage `xdg-desktop-portal-gtk` watches that file and re-emits its own
+    // `Settings.SettingChanged`, which the Chromium/Electron app follows. This test proves that
+    // load-bearing seam — keyfile change -> portal re-emits — end to end through a real incage cage:
+    // it activates the portal, subscribes to `SettingChanged` on the private bus (the only one
+    // reachable, `network = "none"`), rewrites the keyfile to both schemes (so at least one differs
+    // from the at-launch seed), and asserts the portal emitted a `color-scheme` `SettingChanged`.
+    // (The relay itself writes this keyfile from the HOST across the home bind — proven live in the
+    // theme-relay spike; here the cage writes the same file, isolating the portal-emits-on-change
+    // half deterministically. `gdbus` comes from the project's own `nix:glib.bin`.) Skips (never
+    // fails) when the host cannot sandbox, has no compositor, or the cache is unreachable.
+    let project = TmpDir::new("theme-proj");
+    let data = TmpDir::new("theme-data");
+    let state = TmpDir::new("theme-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "gui = \"wayland\"\ndbus = \"incage\"\nnetwork = \"none\"\n\
+         [packages]\nglib = \"nix:glib.bin\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping incage-theme e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if wayland_socket().is_none() {
+        eprintln!("skipping incage-theme e2e: no Wayland compositor on the host");
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping incage-theme e2e: the binary cache is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Activate the portal (so its GTK backend is running and watching GSettings), subscribe to its
+    // SettingChanged on the private bus, then rewrite the keyfile to both schemes. `>` truncates the
+    // file in place. At least one write differs from the at-launch seed, so the portal must emit.
+    let script = "KF=\"$HOME/.config/glib-2.0/settings/keyfile\"; \
+         gdbus call --session --dest org.freedesktop.portal.Desktop \
+           --object-path /org/freedesktop/portal/desktop \
+           --method org.freedesktop.portal.Settings.Read \
+           org.freedesktop.appearance color-scheme >/dev/null 2>&1; \
+         gdbus monitor --session --dest org.freedesktop.portal.Desktop >/tmp/mon.log 2>&1 & \
+         MON=$!; sleep 1; \
+         mkdir -p \"$(dirname \"$KF\")\"; \
+         { echo \"[org/gnome/desktop/interface]\"; echo \"color-scheme='prefer-light'\"; } > \"$KF\"; sleep 2; \
+         { echo \"[org/gnome/desktop/interface]\"; echo \"color-scheme='prefer-dark'\"; } > \"$KF\"; sleep 2; \
+         kill $MON 2>/dev/null; \
+         echo \"CHANGED: $(grep -c SettingChanged /tmp/mon.log 2>/dev/null)\"; \
+         grep SettingChanged /tmp/mon.log 2>/dev/null | sed 's/^/SIG: /'";
+    let out = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "bash", "-c", script],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The in-cage portal re-emitted a color-scheme SettingChanged in response to the keyfile rewrite
+    // — the exact chain the live-theme relay drives. Without the keyfile->GSettings->portal seam
+    // there would be no such signal on the private bus.
+    assert!(
+        stdout.contains("SIG:") && stdout.contains("color-scheme"),
+        "the in-cage portal did not re-emit a color-scheme SettingChanged after a keyfile rewrite: {log}"
+    );
+}
+
+#[test]
 fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     // catrust imports the egress MITM CA into the cage's NSS db so a Chromium/Electron GUI app
     // trusts the proxy. Each launch has a distinct per-session CA sharing a FIXED subject DN, so

@@ -219,10 +219,15 @@ fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> String {
 /// (a "last-resort" fallback it honours), rather than needing `XDG_CURRENT_DESKTOP`.
 const PORTALS_CONF: &str = "[preferred]\ndefault=gtk\n";
 
-/// The keyfile line seeding the host theme so the app opens in the right light/dark scheme. Maps a
-/// GVariant color-scheme value to its GSettings keyfile form. `None` means the host theme could not
-/// be read (best-effort) and no keyfile is written (the app uses its default theme). Pure.
-fn keyfile_body(color_scheme: &str) -> String {
+/// The in-cage GSettings keyfile, relative to the cage's `$HOME`. The launch seed writes it in-cage;
+/// the live-theme relay rewrites it host-side through the home bind. The in-cage GSettings keyfile
+/// backend watches this file, so a rewrite makes `xdg-desktop-portal-gtk` re-emit `SettingChanged`.
+pub(crate) const KEYFILE_REL: &str = ".config/glib-2.0/settings/keyfile";
+
+/// The keyfile body seeding the host theme so the app opens in the right light/dark scheme. Maps a
+/// color-scheme name to its GSettings keyfile form. Shared by the launch seed and the theme relay so
+/// the two write byte-identical content. Pure.
+pub(crate) fn keyfile_body(color_scheme: &str) -> String {
     format!("[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\n")
 }
 
@@ -254,9 +259,12 @@ pub(crate) fn wrap_command(
             } else {
                 ""
             };
+            // The keyfile path is shared with the theme relay via `KEYFILE_REL` (its parent is the
+            // dir to create) so the seed and the live rewrites always target the same file.
+            let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
-                "{gtk_dark}mkdir -p \"$HOME/.config/glib-2.0/settings\" 2>/dev/null\n\
-                 cat > \"$HOME/.config/glib-2.0/settings/keyfile\" <<'OPSPORTALKF' 2>/dev/null || true\n\
+                "{gtk_dark}mkdir -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
+                 cat > \"$HOME/{KEYFILE_REL}\" <<'OPSPORTALKF' 2>/dev/null || true\n\
                  {keyfile}OPSPORTALKF\n",
                 keyfile = keyfile_body(scheme),
             )
@@ -311,9 +319,19 @@ pub(crate) fn read_host_color_scheme(dbus_send: &Path) -> Option<String> {
     parse_color_scheme(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The GSettings keyfile value for a freedesktop `appearance color-scheme` `uint32`: `1` =
+/// prefer-dark, `2` = prefer-light, anything else (`0`/no-preference) = default. Shared by the
+/// launch-time read and the live theme relay so the two cannot map the same value differently.
+pub(crate) fn color_scheme_name(n: u32) -> &'static str {
+    match n {
+        1 => "prefer-dark",
+        2 => "prefer-light",
+        _ => "default",
+    }
+}
+
 /// Parse the `org.freedesktop.appearance color-scheme` reply into its GSettings keyfile value. The
-/// value is a nested variant carrying a `uint32`: `1` = prefer-dark, `2` = prefer-light, anything
-/// else (`0`/no-preference) = default. `None` when no `uint32` is present. Pure.
+/// value is a nested variant carrying a `uint32`. `None` when no `uint32` is present. Pure.
 fn parse_color_scheme(reply: &str) -> Option<String> {
     let n: u32 = reply
         .split_whitespace()
@@ -321,14 +339,7 @@ fn parse_color_scheme(reply: &str) -> Option<String> {
         .nth(1)?
         .parse()
         .ok()?;
-    Some(
-        match n {
-            1 => "prefer-dark",
-            2 => "prefer-light",
-            _ => "default",
-        }
-        .to_string(),
-    )
+    Some(color_scheme_name(n).to_string())
 }
 
 #[cfg(test)]

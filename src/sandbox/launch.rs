@@ -1944,6 +1944,11 @@ pub(crate) struct LaunchGuard {
     /// cage; dropping it stops the thread. Dropped before `portal`, so it disconnects from the private
     /// bus before the portal's host directory (and its socket) is removed.
     pub(crate) notify: Option<super::notify_relay::NotifyRelay>,
+    /// The in-cage live-theme relay (`dbus = "incage"`), when one is running. It runs on a host thread
+    /// mirroring host light/dark changes into the cage's GSettings keyfile, so it must outlive the
+    /// cage; dropping it stops the thread. It writes only a host-side file (no private-bus dependency),
+    /// so its drop order relative to `portal` is not load-bearing.
+    pub(crate) theme: Option<super::theme_relay::ThemeRelay>,
     /// The in-cage portal's host runtime directory (`dbus = "incage"`), when one is bound. The
     /// private bus socket lives under it on the host, so it must be cleaned up when the launch ends
     /// rather than leaked by an exec — its presence forces the supervised path; dropping it removes
@@ -1981,6 +1986,9 @@ impl Drop for LaunchGuard {
         // socket is removed.
         if let Some(notify) = self.notify.take() {
             drop(notify);
+        }
+        if let Some(theme) = self.theme.take() {
+            drop(theme);
         }
         if let Some(portal) = self.portal.take() {
             drop(portal);
@@ -2136,6 +2144,7 @@ fn build(
     // portal (fail-closed: no bus rather than a broken one). Held until the launch ends by the guard.
     let mut portal_host: Option<super::portal::HostDir> = None;
     let mut notify_relay: Option<super::notify_relay::NotifyRelay> = None;
+    let mut theme_relay: Option<super::theme_relay::ThemeRelay> = None;
     let portal = if prep.cfg.dbus.is_in_cage_portal()
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
     {
@@ -2149,6 +2158,16 @@ fn build(
                     // that never appears just leaves the app without notifications — the in-cage picker
                     // and at-launch theme are unaffected.
                     notify_relay = Some(super::notify_relay::NotifyRelay::start(hd.socket()));
+                    // Start the live-theme relay: it mirrors later host light/dark switches into the
+                    // in-cage GSettings keyfile (through the home bind), so the in-cage portal
+                    // re-emits SettingChanged and the app follows the change live. The keyfile's home
+                    // is derived exactly as `build_spec` binds it, so both target the same file.
+                    // Best-effort: a home path that cannot be resolved just leaves the at-launch theme.
+                    if let Ok(home) = binds::home_src(prep.layout.data_dir(), &prep.cwd, runtime) {
+                        theme_relay = Some(super::theme_relay::ThemeRelay::start(
+                            home.join(super::portal::KEYFILE_REL),
+                        ));
+                    }
                     portal_host = Some(hd);
                     Some(p)
                 }
@@ -2801,6 +2820,7 @@ fn build(
             forward: forward_guard,
             dbus: dbus_guard,
             notify: notify_relay,
+            theme: theme_relay,
             portal: portal_host,
         })
     } else {
