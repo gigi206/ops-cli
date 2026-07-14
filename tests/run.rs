@@ -1135,7 +1135,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
 }
 
 #[test]
-fn a_trusted_incage_dbus_stands_up_an_in_cage_portal() {
+fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     // `dbus = true` under `gui = "wayland"` stands up a *private* session bus inside the cage
     // carrying ops's own `xdg-desktop-portal` with the GTK backend, so a Chromium/Electron app's
     // file chooser renders in-cage (seeing only the cage filesystem). Proven with the cage's network
@@ -1146,9 +1146,9 @@ fn a_trusted_incage_dbus_stands_up_an_in_cage_portal() {
     // (`org.freedesktop.secrets`) must be ABSENT on the private bus. `gdbus` comes from the
     // project's own `nix:glib.bin`. Skips (never fails) when the host cannot sandbox, has no
     // compositor, or the cache is unreachable (the portal stack is provisioned on the first launch).
-    let project = TmpDir::new("incage-proj");
-    let data = TmpDir::new("incage-data");
-    let state = TmpDir::new("incage-state");
+    let project = TmpDir::new("portal-proj");
+    let data = TmpDir::new("portal-data");
+    let state = TmpDir::new("portal-state");
     std::fs::write(
         project.path().join(".ops.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
@@ -1160,17 +1160,17 @@ fn a_trusted_incage_dbus_stands_up_an_in_cage_portal() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping incage-dbus e2e: host cannot sandbox ({})",
+            "skipping in-cage dbus e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping incage-dbus e2e: no Wayland compositor on the host");
+        eprintln!("skipping in-cage dbus e2e: no Wayland compositor on the host");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping incage-dbus e2e: the binary cache is unreachable");
+        eprintln!("skipping in-cage dbus e2e: the binary cache is unreachable");
         return;
     }
 
@@ -1222,7 +1222,7 @@ fn a_trusted_incage_dbus_stands_up_an_in_cage_portal() {
 }
 
 #[test]
-fn a_trusted_incage_notifications_relay_attaches_and_forwards() {
+fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
     // Under `dbus = true`, ops runs a host-side relay that owns `org.freedesktop.Notifications`
     // on the cage's private bus and forwards to the host daemon, so the app's desktop notifications
     // work. Teeth on the wiring, end to end through a real cage: on the private bus (the only one
@@ -1246,22 +1246,22 @@ fn a_trusted_incage_notifications_relay_attaches_and_forwards() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping incage-relay e2e: host cannot sandbox ({})",
+            "skipping in-cage relay e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping incage-relay e2e: no Wayland compositor on the host");
+        eprintln!("skipping in-cage relay e2e: no Wayland compositor on the host");
         return;
     }
     // The relay bridges to the host session bus; without one it cannot attach.
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        eprintln!("skipping incage-relay e2e: no host D-Bus session bus");
+        eprintln!("skipping in-cage relay e2e: no host D-Bus session bus");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping incage-relay e2e: the binary cache is unreachable");
+        eprintln!("skipping in-cage relay e2e: the binary cache is unreachable");
         return;
     }
 
@@ -1316,11 +1316,11 @@ fn a_trusted_incage_notifications_relay_attaches_and_forwards() {
 }
 
 #[test]
-fn a_keyfile_rewrite_makes_the_incage_portal_re_emit_setting_changed() {
+fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
     // The live-theme relay follows host light/dark switches by rewriting the in-cage GSettings
     // keyfile; the in-cage `xdg-desktop-portal-gtk` watches that file and re-emits its own
     // `Settings.SettingChanged`, which the Chromium/Electron app follows. This test proves that
-    // load-bearing seam — keyfile change -> portal re-emits — end to end through a real incage cage:
+    // load-bearing seam — keyfile change -> portal re-emits — end to end through a real in-cage cage:
     // it activates the portal, subscribes to `SettingChanged` on the private bus (the only one
     // reachable, `network = "none"`), rewrites the keyfile to both schemes (so at least one differs
     // from the at-launch seed), and asserts the portal emitted a `color-scheme` `SettingChanged`.
@@ -1341,17 +1341,17 @@ fn a_keyfile_rewrite_makes_the_incage_portal_re_emit_setting_changed() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping incage-theme e2e: host cannot sandbox ({})",
+            "skipping in-cage theme e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping incage-theme e2e: no Wayland compositor on the host");
+        eprintln!("skipping in-cage theme e2e: no Wayland compositor on the host");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping incage-theme e2e: the binary cache is unreachable");
+        eprintln!("skipping in-cage theme e2e: the binary cache is unreachable");
         return;
     }
 

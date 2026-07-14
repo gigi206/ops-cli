@@ -28,7 +28,7 @@ bundled-nix = []
 bundled-bwrap = []
 
 [dependencies]
-# The in-cage desktop notifications relay (`dbus = "incage"`): bridges the cage's private D-Bus bus
+# The in-cage desktop notifications relay (`dbus = true`): bridges the cage's private D-Bus bus
 # to the host `org.freedesktop.Notifications`. The async runtime is the pure-Rust `async-io` backend
 # (NOT tokio), driven by `async_io::block_on` on a single dedicated thread inside `notify_relay`, so
 # nothing async leaks into ops's std-thread world (the egress proxy stays sync std threads).
