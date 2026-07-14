@@ -60,7 +60,11 @@ mode = "deny"
 #     "*.datadoghq.com:*",  # Datadog telemetry / operational logs
 # ]
 allow = [
-    "{*} https://api.anthropic.com",
+    # Claude API — the account/connectivity check plus the `/voice` speech-to-text WebSocket
+    # (`api.anthropic.com/api/ws/speech_to_text/voice_stream`). `{*,WS}` = all HTTP verbs AND the
+    # WebSocket: ops requires an explicit `WS` opt-in that a plain `{*}` does NOT cover (a WS is an
+    # unredactable bidirectional channel), so without the `WS` voice dictation reads `denied-method`.
+    "{*,WS} https://api.anthropic.com",
     "{*} https://platform.claude.com",
     "{GET} https://downloads.claude.ai",
     "{*} https://mcp-proxy.anthropic.com",

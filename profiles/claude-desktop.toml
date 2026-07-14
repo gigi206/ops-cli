@@ -211,8 +211,11 @@ chromium = "nix:chromium"
 [network]
 mode = "deny"
 allow = [
-    # Claude API — model completions, the Code-tab engine, and the WebFetch domain-safety preflight.
-    "{*} https://api.anthropic.com",
+    # Claude API — model completions, the Code-tab engine, the WebFetch domain-safety preflight, and
+    # the voice speech-to-text WebSocket (`/api/ws/speech_to_text/voice_stream`). `{*,WS}` = all HTTP
+    # verbs AND the WebSocket: ops requires an explicit `WS` opt-in that a plain `{*}` does NOT cover
+    # (a WS is an unredactable bidirectional channel), so without the `WS` voice STT reads `denied-method`.
+    "{*,WS} https://api.anthropic.com",
     # Account authentication — a claude.ai subscription login — plus the real-time session channel
     # (`claude.ai/v1/sessions/ws/<id>/subscribe`, a WebSocket). `{*,WS}` = all HTTP verbs AND the
     # WebSocket: ops requires an explicit `WS` opt-in that a plain `{*}` does not cover (a WS is an
