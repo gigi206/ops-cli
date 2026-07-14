@@ -5083,6 +5083,12 @@ fn display_log_path(path: &str, with_query: bool) -> &str {
 /// library (`localtime_r`, the reentrant/thread-safe form); a conversion failure (an implausible
 /// stamp) renders `--:--:--` rather than panicking.
 fn format_log_time(at_epoch_ms: u128) -> String {
+    // `libc::time_t` is the exact argument type `localtime_r` expects. On musl it carries a
+    // deprecation notice — a heads-up that musl 1.2 widened `time_t` to 64-bit and a future `libc`
+    // will drop this alias — but it stays the correct FFI type, and on ops's x86_64 target it is
+    // already 64-bit, so the widening is a no-op here. Silence the notice on the one line that names
+    // it rather than reach for a hardcoded integer type that would be wrong on a 32-bit target.
+    #[allow(deprecated)]
     let secs = (at_epoch_ms / 1000) as libc::time_t;
     // SAFETY: `localtime_r` writes the broken-down local time into our stack `tm` and reads only the
     // `time_t` we pass; it is the thread-safe variant, so no shared state is mutated.
