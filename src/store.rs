@@ -1080,6 +1080,13 @@ pub(crate) fn provision_expr(
     let mut cmd = nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .arg("build")
+        // `--quiet` drops nix's per-derivation "evaluating derivation …" progress. An `--expr` build
+        // (a `deb:`/`flake:` package) is not covered by nix's flake eval-cache, so it re-evaluates the
+        // whole expression on every launch and prints that chatter each time even when the result is
+        // fully cached. Quiet only lowers the info-level progress; build failures still surface (the
+        // builder's log and `nix log` hint are shown), and this is scoped to the `--expr` path — a
+        // flake-attr `provision` (base userland, GUI hole) keeps its cold-download progress.
+        .arg("--quiet")
         .args(["--option", "sandbox", "true"])
         .arg("--out-link")
         .arg(gcroot)
