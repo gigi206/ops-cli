@@ -226,22 +226,15 @@ pub(crate) const KEYFILE_REL: &str = ".config/glib-2.0/settings/keyfile";
 
 /// The keyfile body seeding the host theme so the app opens in the right light/dark scheme. Maps a
 /// color-scheme name to its GSettings keyfile form. Shared by the launch seed and the theme relay so
-/// the two write byte-identical content. Pure.
+/// the two write byte-identical content, and rewritten live by the relay so the app (Chromium reads
+/// `color-scheme`) follows a host light/dark switch. Pure.
 ///
-/// It sets `gtk-theme` (the dark/light Adwaita variant) alongside `color-scheme`: a dark
-/// `color-scheme` alone does not switch GTK3's own theme (the file dialog, and any GTK-drawn window
-/// chrome), so the dark variant is named directly. Because it lives in the keyfile the theme relay
-/// rewrites live, GTK follows a host light/dark switch too — rather than being pinned at launch, as a
-/// static `GTK_THEME` env would be.
+/// Only `color-scheme` is set — deliberately not `gtk-theme`. GTK3's dark Adwaita is a *variant*
+/// (`Adwaita:dark`), not a theme named `Adwaita-dark`, so a `gtk-theme='Adwaita-dark'` gsetting names
+/// a theme that does not exist and GTK falls back to light. The GTK backend's dark theme is handled
+/// separately, via a `GTK_THEME` env scoped to the in-cage portal daemon (see [`wrap_command`]).
 pub(crate) fn keyfile_body(color_scheme: &str) -> String {
-    let gtk_theme = if color_scheme == "prefer-dark" {
-        "Adwaita-dark"
-    } else {
-        "Adwaita"
-    };
-    format!(
-        "[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\ngtk-theme='{gtk_theme}'\n"
-    )
+    format!("[org/gnome/desktop/interface]\ncolor-scheme='{color_scheme}'\n")
 }
 
 /// Wrap `cmd` so the cage stands up its private portal before the app runs: write the generated bus
@@ -262,11 +255,9 @@ pub(crate) fn wrap_command(
     let session = session_conf(CAGE_SOCK, xdp_root, gtk_root);
     let seed = match color_scheme {
         Some(scheme) => {
-            // The keyfile path is shared with the theme relay via `KEYFILE_REL` (its parent is the
-            // dir to create) so the seed and the live rewrites always target the same file. The GTK
-            // theme (dark/light) is set via `gtk-theme` inside the keyfile (see `keyfile_body`), NOT a
-            // static `GTK_THEME` env, so the file dialog and any GTK-drawn app chrome follow a live
-            // host light/dark switch instead of being pinned to the launch-time theme.
+            // The keyfile (color-scheme) is shared with the theme relay via `KEYFILE_REL` (its parent
+            // is the dir to create) so the seed and the live rewrites target the same file. The app
+            // (Chromium) reads color-scheme and follows a host light/dark switch through it.
             let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
                 "mkdir -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
@@ -277,6 +268,17 @@ pub(crate) fn wrap_command(
         }
         None => String::new(),
     };
+    // The GTK backend's own theme. GTK3's dark Adwaita is a *variant* reached via
+    // `GTK_THEME=Adwaita:dark` (a `gtk-theme='Adwaita-dark'` gsetting names a theme that does not
+    // exist, so GTK falls back to light). It is set ONLY on the dbus-daemon that activates the in-cage
+    // portal — so the file dialog it renders is dark under a dark host — and is NOT exported to the
+    // app, so the app keeps following the live theme via color-scheme rather than being pinned to the
+    // launch-time theme. A light/default host leaves it unset (light Adwaita).
+    let daemon_env = if color_scheme == Some("prefer-dark") {
+        "GTK_THEME=Adwaita:dark "
+    } else {
+        ""
+    };
     // A quoted heredoc delimiter (`'OPSPORTALCF'`) disables every shell expansion, so the config —
     // already fully substituted host-side — is written verbatim.
     let preamble = format!(
@@ -284,7 +286,7 @@ pub(crate) fn wrap_command(
          cat > {dir}/session.conf <<'OPSPORTALCF'\n{session}OPSPORTALCF\n\
          cat > {dir}/xdg-desktop-portal/portals.conf <<'OPSPORTALPF'\n{portals}OPSPORTALPF\n\
          {seed}\
-         {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n",
+         {daemon_env}{daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n",
         dir = CAGE_DIR,
         daemon = dbus_daemon.display(),
         portals = PORTALS_CONF,
@@ -409,11 +411,13 @@ mod tests {
         ));
         // portals.conf selects the gtk backend
         assert!(script.contains("default=gtk"));
-        // the theme is seeded into the keyfile GSettings store: color-scheme + the dark GTK theme
+        // the theme is seeded into the keyfile (color-scheme only; the app follows it live via Chromium)
         assert!(script.contains("color-scheme='prefer-dark'"));
-        assert!(script.contains("gtk-theme='Adwaita-dark'"));
-        // no static GTK_THEME env — the GTK theme rides the keyfile, so it follows a live host switch
-        assert!(!script.contains("GTK_THEME"));
+        assert!(!script.contains("gtk-theme"));
+        // the GTK backend's dark theme is scoped to the portal daemon (so the dialog is dark), never
+        // exported to the app (so the app follows the live theme rather than being pinned)
+        assert!(script.contains("GTK_THEME=Adwaita:dark /nix/store/ddd-dbus/bin/dbus-daemon"));
+        assert!(!script.contains("export GTK_THEME"));
         // the command runs as "$@", never spliced into the script text
         assert!(script.trim_end().ends_with("exec \"$@\""));
         assert_eq!(argv[3], OsString::from("ops-incage-portal"));
