@@ -36,9 +36,10 @@ The app probes *that* portal and gets three things:
   Flatpak model with the cage as the world, and it is **not tied to GNOME**: `xdg-desktop-portal-gtk`
   is the freedesktop *reference* backend (the universal fallback used by sway/XFCE/MATE), depending
   only on the GTK library the Electron app already carries.
-- **Theme** — the host light/dark preference is read host-side and seeded into the cage so the window
-  opens in the right theme, and a host-side relay mirrors later host theme switches into the cage, so
-  the app **follows the theme live**.
+- **Theme** — the host light/dark preference is read host-side and seeded into the cage so both the
+  app window **and the file chooser** open in the right theme, and a host-side relay mirrors later
+  host theme switches into the cage, so both surfaces **follow the theme live** (the file dialog
+  re-themes even while it is open).
 - **Notifications** — a host-side relay bridges `org.freedesktop.Notifications` on the private bus to
   the host notifications daemon, so the app's desktop notifications work end to end (including
   click-to-focus and dismiss).

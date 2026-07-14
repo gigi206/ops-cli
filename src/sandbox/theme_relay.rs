@@ -5,13 +5,16 @@
 //! afterwards. This relay closes that gap. It runs **host-side** (ops's own trusted infrastructure,
 //! like the notifications relay and the egress proxy), connects to the real host session bus,
 //! subscribes to the desktop portal's `org.freedesktop.portal.Settings.SettingChanged` signal for
-//! the `org.freedesktop.appearance` `color-scheme` key (the same signal the filtered host bus
-//! `dbus = true` forwards), and on each change **rewrites the in-cage GSettings keyfile** through the
-//! home bind. The in-cage keyfile backend watches that file, so `xdg-desktop-portal-gtk` re-emits its
-//! own `SettingChanged` on the private bus and the Chromium/Electron app follows the new scheme live.
+//! the `org.freedesktop.appearance` `color-scheme` key, and on each change **rewrites the in-cage
+//! GSettings keyfile** through the home bind. The keyfile carries both surface keys
+//! ([`super::portal::keyfile_body`]):
+//! `color-scheme`, which the in-cage portal re-emits so the Chromium/Electron **app** follows the new
+//! scheme live; and `gtk-theme`, which GTK3 watches through the same keyfile backend so the **file
+//! dialog** rendered by `xdg-desktop-portal-gtk` re-themes itself live.
 //!
-//! It adds no capability: the value written is only a light/dark preference, into the app's own
-//! isolated home; the relay reads one host setting and touches no other bus service. Best-effort
+//! It adds no capability: the values written are only a light/dark preference and its matching GTK
+//! theme name, into the app's own isolated home; the relay reads one host setting and touches no
+//! other bus service. Best-effort
 //! throughout — no host session bus, no host portal, or a home that cannot be written simply leaves
 //! the app on its at-launch theme (the seed), never blocking the launch.
 //!
@@ -66,8 +69,8 @@ impl ThemeRelay {
                     let msg = e.to_string();
                     if !msg.contains("Connection refused") && !msg.contains("Broken pipe") {
                         diag::warn(&format!(
-                            "`dbus = \"incage\"`: the live-theme relay stopped ({e}) — the app keeps \
-                             its at-launch theme"
+                            "`dbus = true`: the live-theme relay stopped ({e}) — the app keeps its \
+                             at-launch theme"
                         ));
                     }
                 }

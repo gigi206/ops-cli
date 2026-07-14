@@ -1346,9 +1346,10 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         }
     }
 
-    // GSettings schema root under `gui = "wayland"`, same reason: gc keeps the compiled output.
+    // GUI data root (GSettings schemas + GTK themes) under `gui = "wayland"`, same reason: gc keeps
+    // the provisioned output.
     if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        if let Ok(layer) = super::gschemas::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+        if let Ok(layer) = super::guidata::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             gui_roots.push(layer.root);
         }
     }
@@ -2101,18 +2102,19 @@ fn build(
     };
     let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
 
-    // Under `gui = "wayland"`, provision the GSettings schema set host-side. A GTK dialog (the
-    // file chooser Electron falls back to without a desktop portal) aborts FATAL without it (`No
-    // GSettings schemas are installed`). Provisioned here — before the seed — so its store root
-    // joins the project store. Best-effort like the fonts: a fetch that fails warns and the app
-    // runs (a GTK dialog will still crash, but the rest of the UI is unaffected).
-    let schema_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        match super::gschemas::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+    // Under `gui = "wayland"`, provision the GUI data set (GSettings schemas + GTK themes)
+    // host-side. A GTK dialog (the file chooser Electron falls back to without a desktop portal)
+    // aborts FATAL without the schemas (`No GSettings schemas are installed`); the themes let the
+    // in-cage portal's file dialog render in the host light/dark theme. Provisioned here — before
+    // the seed — so its store root joins the project store. Best-effort like the fonts: a fetch
+    // that fails warns and the app runs (a GTK dialog will still crash, but the rest is unaffected).
+    let guidata_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        match super::guidata::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             Ok(layer) => Some(layer),
             Err(e) => {
                 crate::diag::warn(&format!(
-                    "`gui = \"wayland\"` but the GSettings schemas could not be provisioned \
-                     ({e}) — a GTK dialog (file chooser) may crash"
+                    "`gui = \"wayland\"` but the GUI data (GSettings schemas + themes) could not \
+                     be provisioned ({e}) — a GTK dialog (file chooser) may crash"
                 ));
                 None
             }
@@ -2273,7 +2275,7 @@ fn build(
     if let Some(layer) = &audio_layer {
         gui_roots.extend(layer.roots.iter().cloned());
     }
-    if let Some(layer) = &schema_layer {
+    if let Some(layer) = &guidata_layer {
         gui_roots.push(layer.root.clone());
     }
     if let Some(p) = &portal {
@@ -2552,12 +2554,14 @@ fn build(
             }
         }
 
-        // GSettings schemas: point the cage's glib at the provisioned, seeded schemas so a GTK
-        // dialog (the portal-less file chooser) finds `org.gtk.Settings.FileChooser` instead of
-        // aborting. `XDG_DATA_DIRS` is a data path, not a code-load path (unlike the mesa driver
-        // vars), so it needs no untrusted-`[env]` denylist entry — a project that re-points it only
-        // sabotages its own cage's schema lookup.
-        if let Some(layer) = &schema_layer {
+        // GUI data: point the cage's glib/GTK at the provisioned, seeded schemas + themes via one
+        // `XDG_DATA_DIRS` entry, so a GTK dialog finds `org.gtk.Settings.FileChooser` (else it
+        // aborts) and the in-cage portal's file dialog finds the named `Adwaita-dark` theme. An
+        // app's own launcher prepends its GTK data dirs, so ops's entry (carrying the themes) stays
+        // reachable at the tail. `XDG_DATA_DIRS` is a data path, not a code-load path (unlike the
+        // mesa driver vars), so it needs no untrusted-`[env]` denylist entry — a project that
+        // re-points it only sabotages its own cage's schema/theme lookup.
+        if let Some(layer) = &guidata_layer {
             gui_env.extend(layer.env.iter().cloned());
         }
 

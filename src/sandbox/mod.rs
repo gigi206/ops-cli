@@ -23,7 +23,7 @@ mod fonts;
 mod forward;
 mod gc;
 mod gpu;
-mod gschemas;
+mod guidata;
 mod launch;
 mod mise;
 mod miseplugin;
