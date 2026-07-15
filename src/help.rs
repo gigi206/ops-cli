@@ -8,8 +8,8 @@
 //!
 //! Help is dispatched centrally: [`maybe_help`] resolves the deepest command path a
 //! `--help`/`-h` flag asks about, so `ops plugins store add --help` shows that exact
-//! page. Subcommand listings are sorted alphabetically; the top-level command list
-//! keeps its logical (loose-to-specific) order.
+//! page. The top-level command list and each subcommand listing are both sorted
+//! alphabetically.
 //!
 //! Option descriptions duplicate knowledge that also lives in each handler's argument
 //! parser — a deliberate, documented maintenance seam (options change rarely, and the
@@ -37,8 +37,8 @@ struct Page {
     details: &'static str,
 }
 
-/// Every command and subcommand. Top-level entries are in logical order (the order the
-/// command list shows); subcommands may be in any order — the renderer sorts them.
+/// Every command and subcommand. Entries may be declared in any order — the renderer sorts
+/// both the top-level command list and each subcommand listing alphabetically.
 const PAGES: &[Page] = &[
     // ---- top-level commands -------------------------------------------------------
     Page {
@@ -1378,16 +1378,46 @@ fn item(out: &mut String, color: &str, reset: &str, key: &str, width: usize, des
     }
 }
 
+/// Paint the `<metavar>` placeholders in a usage synopsis, leaving the literal command words,
+/// flags, and `[...]`/`|` punctuation untouched. Each `<...>` span (its angle brackets included)
+/// is wrapped in the palette's placeholder style; with color off every span is empty, so the
+/// string is returned byte-for-byte. An unterminated `<` is emitted verbatim (never a dangling
+/// open span), so malformed input can only under-style, never corrupt the output.
+fn paint_synopsis(syn: &str, pal: &Palette) -> String {
+    let mut out = String::with_capacity(syn.len());
+    let mut rest = syn;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        match rest[start..].find('>') {
+            Some(end) => {
+                out.push_str(pal.arg);
+                out.push_str(&rest[start..start + end + 1]); // the whole `<…>`
+                out.push_str(pal.reset);
+                rest = &rest[start + end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]); // no closing `>`: emit the remainder as-is
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Render the top-level command list — the body of `ops --help` and the no-command usage.
-/// Top-level commands keep their table (logical) order.
+/// Top-level commands are sorted alphabetically, like each subcommand listing.
 fn top_level(pal: &Palette) -> String {
     let mut out = String::from("ops — a sandbox launcher (bubblewrap + daemonless nix)\n\n");
     out.push_str(&format!(
-        "{}Usage:{}\n  ops <command> [arguments]\n\n",
-        pal.head, pal.reset
+        "{}Usage:{}\n  {}\n\n",
+        pal.head,
+        pal.reset,
+        paint_synopsis("ops <command> [arguments]", pal)
     ));
     out.push_str(&format!("{}Commands:{}\n", pal.head, pal.reset));
-    let tops: Vec<&Page> = PAGES.iter().filter(|p| p.path.len() == 1).collect();
+    let mut tops: Vec<&Page> = PAGES.iter().filter(|p| p.path.len() == 1).collect();
+    tops.sort_by_key(|p| p.path[0]);
     let width = tops.iter().map(|p| p.path[0].len()).max().unwrap_or(0);
     for p in tops {
         item(&mut out, pal.name, pal.reset, p.path[0], width, p.summary);
@@ -1405,7 +1435,9 @@ fn render(page: &Page, pal: &Palette) -> String {
     );
     out.push_str(&format!(
         "{}Usage:{}\n  {}\n",
-        pal.head, pal.reset, page.synopsis
+        pal.head,
+        pal.reset,
+        paint_synopsis(page.synopsis, pal)
     ));
 
     if !page.options.is_empty() {
@@ -1597,5 +1629,53 @@ mod tests {
         for page in PAGES {
             assert_balanced(&render(page, &Palette::colored()));
         }
+    }
+
+    #[test]
+    fn paint_synopsis_wraps_only_metavariables() {
+        let pal = Palette::colored();
+        let painted = paint_synopsis("ops stop <id>...|--all [--delay <secs>]", &pal);
+        // Each `<…>` span (angle brackets included) is wrapped; literals stay untouched.
+        assert!(painted.contains("\x1b[1m<id>\x1b[0m"));
+        assert!(painted.contains("\x1b[1m<secs>\x1b[0m"));
+        assert!(painted.contains("--all"));
+        assert!(!painted.contains("\x1b[1m--all")); // a literal flag is never painted as a metavar
+
+        // A plain palette returns the input byte-for-byte.
+        assert_eq!(
+            paint_synopsis("ops stop <id>...|--all", &Palette::plain()),
+            "ops stop <id>...|--all"
+        );
+
+        // An unterminated `<` is emitted verbatim — never a dangling open span.
+        let weird = paint_synopsis("ops x <unterminated", &pal);
+        assert!(weird.ends_with("<unterminated"));
+        assert!(!weird.trim_end().ends_with("\x1b["));
+    }
+
+    #[test]
+    fn top_level_commands_are_listed_alphabetically() {
+        // Parse the rendered command column and assert its order — the user-visible property.
+        let plain = top_level(&Palette::plain());
+        let block = plain
+            .split_once("Commands:\n")
+            .and_then(|(_, rest)| rest.split_once("\n\nRun "))
+            .map(|(cmds, _)| cmds)
+            .expect("command block");
+        let listed: Vec<&str> = block
+            .lines()
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        let mut sorted = listed.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            listed, sorted,
+            "top-level commands must render alphabetically"
+        );
+        // Every command is present (nothing dropped), and the declaration order was reordered.
+        assert_eq!(
+            listed.len(),
+            PAGES.iter().filter(|p| p.path.len() == 1).count()
+        );
     }
 }

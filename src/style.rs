@@ -10,6 +10,8 @@ pub(crate) struct Palette {
     pub(crate) name: &'static str,
     /// Option and operand flags.
     pub(crate) flag: &'static str,
+    /// Placeholder metavariables in a usage synopsis (`<name>`, `<file>`).
+    pub(crate) arg: &'static str,
     /// Section headers (`Usage:`, `Options:`, `env:`, …).
     pub(crate) head: &'static str,
     /// A success status (`[ ok ]`, `ALLOWED`).
@@ -24,12 +26,14 @@ pub(crate) struct Palette {
 }
 
 impl Palette {
-    /// The active ANSI styling — names in bold cyan, flags in bold green, headers in bold, and
-    /// the conventional status hues (green ok, yellow warn, red fail) with dim secondary text.
+    /// The active ANSI styling — names in bold cyan, flags in bold green, usage placeholders and
+    /// headers in bold, and the conventional status hues (green ok, yellow warn, red fail) with
+    /// dim secondary text.
     pub(crate) fn colored() -> Self {
         Palette {
             name: "\x1b[1;36m",
             flag: "\x1b[1;32m",
+            arg: "\x1b[1m",
             head: "\x1b[1m",
             ok: "\x1b[32m",
             warn: "\x1b[33m",
@@ -45,6 +49,7 @@ impl Palette {
         Palette {
             name: "",
             flag: "",
+            arg: "",
             head: "",
             ok: "",
             warn: "",
@@ -76,7 +81,9 @@ mod tests {
     #[test]
     fn plain_spans_are_all_empty_so_captured_output_is_byte_for_byte_plain() {
         let p = Palette::plain();
-        for span in [p.name, p.flag, p.head, p.ok, p.warn, p.err, p.dim, p.reset] {
+        for span in [
+            p.name, p.flag, p.arg, p.head, p.ok, p.warn, p.err, p.dim, p.reset,
+        ] {
             assert!(span.is_empty(), "a plain span must be empty");
         }
     }
@@ -84,7 +91,7 @@ mod tests {
     #[test]
     fn colored_spans_are_all_non_empty_escapes_with_a_reset() {
         let p = Palette::colored();
-        for span in [p.name, p.flag, p.head, p.ok, p.warn, p.err, p.dim] {
+        for span in [p.name, p.flag, p.arg, p.head, p.ok, p.warn, p.err, p.dim] {
             assert!(
                 span.starts_with('\x1b'),
                 "a colored span must be an ANSI escape"
