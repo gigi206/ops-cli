@@ -173,8 +173,12 @@ pub(crate) enum Backend {
     /// URL to a content hash, then builds a generated derivation that unpacks the `.deb` and
     /// `autoPatchelfHook`s it against a curated Electron/Chromium library set. Extraction runs no
     /// build script (`dontBuild`), so evaluating it host-side is safe (unlike a `flake:`). Meant
-    /// for a GUI/desktop app distributed only as a `.deb`; a GitHub `…/releases/latest/download/…`
-    /// URL tracks upstream, and `ops upgrade` re-resolves it.
+    /// for a GUI/desktop app distributed only as a `.deb`. Two forms: a direct `https://…/….deb`
+    /// URL (a GitHub `…/releases/latest/download/<stable-name>.deb` URL already rolls forward), or
+    /// `github:<owner>/<repo>` — which queries the repo's latest release and selects its linux
+    /// `.deb` asset, so a project whose asset name embeds the version still rolls forward on
+    /// `ops upgrade`. The stored string is the raw locator (the URL or `github:<owner>/<repo>`);
+    /// [`super::sandbox::deb`] dispatches on its shape.
     Deb(String),
 }
 
@@ -2769,17 +2773,18 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             return Err(format!("invalid flake reference `{reference}`"));
         }
         Ok(Backend::Flake(reference.to_string()))
-    } else if let Some(url) = value.strip_prefix("deb:") {
-        if !is_valid_deb_url(url) {
+    } else if let Some(rest) = value.strip_prefix("deb:") {
+        if !is_valid_deb_url(rest) && !is_valid_deb_github_locator(rest) {
             return Err(format!(
-                "invalid deb URL `{url}` — must be an `https://` URL ending in `.deb`"
+                "invalid deb reference `{rest}` — use an `https://` URL ending in `.deb`, \
+                 or `github:<owner>/<repo>` to track the latest release's `.deb`"
             ));
         }
-        Ok(Backend::Deb(url.to_string()))
+        Ok(Backend::Deb(rest.to_string()))
     } else {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
-             `flake:<ref>`, or `deb:<url>`"
+             `flake:<ref>`, or `deb:<url>` / `deb:github:<owner>/<repo>`"
         ))
     }
 }
@@ -2790,13 +2795,38 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
 /// set is the unreserved URL set plus the sub-delims a release URL uses, so the value carries no
 /// shell/nix metacharacter — it is interpolated into a generated nix expression and a
 /// `nix store prefetch-file` argument, both of which must stay injection-free.
-fn is_valid_deb_url(url: &str) -> bool {
+pub(crate) fn is_valid_deb_url(url: &str) -> bool {
     url.strip_prefix("https://").is_some_and(|rest| {
         !rest.is_empty()
             && url.ends_with(".deb")
             && url.chars().all(|c| {
                 c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
             })
+    })
+}
+
+/// A `deb:github:<owner>/<repo>` locator: track the newest GitHub release's linux `.deb` asset,
+/// instead of pinning one versioned URL by hand. `owner` and `repo` are restricted to GitHub's
+/// identifier set (`[A-Za-z0-9._-]`, exactly two segments, no empty or bare-dot segment), so the
+/// value carries no shell/nix metacharacter — it is interpolated into a
+/// `https://api.github.com/repos/<owner>/<repo>/releases/latest` request that must stay
+/// injection-free, and the asset URL that request returns is re-validated by [`is_valid_deb_url`]
+/// before it is fetched or built.
+pub(crate) fn is_valid_deb_github_locator(s: &str) -> bool {
+    let Some(path) = s.strip_prefix("github:") else {
+        return false;
+    };
+    let mut parts = path.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    [owner, repo].iter().all(|seg| {
+        !seg.is_empty()
+            && *seg != "."
+            && *seg != ".."
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     })
 }
 
@@ -7747,6 +7777,51 @@ mod tests {
         assert!(!is_valid_deb_url("http://example.com/x.deb"));
         assert!(!is_valid_deb_url("https://example.com/x.tar.gz"));
         assert!(!is_valid_deb_url("https://example.com/a b.deb"));
+    }
+
+    #[test]
+    fn a_deb_github_locator_parses_as_a_deb_backend_and_is_charset_validated() {
+        // `deb:github:<owner>/<repo>` routes to the same host-side provisioner, resolving the repo's
+        // latest release to a `.deb` asset — so a project whose asset name embeds the version rolls
+        // forward. The locator is stored verbatim in `Backend::Deb`.
+        let r = resolve_no_plugins(
+            raw_packages(&[
+                ("aionui", "deb:github:iOfficeAI/AionUi"),
+                ("norepo", "deb:github:iOfficeAI"), // one segment: refused
+                ("extra", "deb:github:a/b/c"),      // three segments: refused
+                ("dots", "deb:github:../evil"),     // traversal segment: refused
+                ("meta", "deb:github:o/r$x"),       // metacharacter: refused
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "aionui").unwrap().backend,
+            Backend::Deb("github:iOfficeAI/AionUi".into())
+        );
+        for refused in ["norepo", "extra", "dots", "meta"] {
+            assert!(
+                pkg(&r.packages, refused).is_none(),
+                "{refused} should be refused"
+            );
+        }
+        // the validator directly: two safe segments accepted, everything malformed rejected.
+        assert!(is_valid_deb_github_locator("github:NixOS/nixpkgs"));
+        assert!(is_valid_deb_github_locator("github:a-b.c/d_e-f.g"));
+        for bad in [
+            "NixOS/nixpkgs",       // no github: prefix
+            "github:only",         // one segment
+            "github:a/b/c",        // three segments
+            "github:/repo",        // empty owner
+            "github:owner/",       // empty repo
+            "github:../repo",      // traversal
+            "github:owner/re po",  // whitespace
+            "github:owner/re\"po", // quote
+        ] {
+            assert!(
+                !is_valid_deb_github_locator(bad),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]

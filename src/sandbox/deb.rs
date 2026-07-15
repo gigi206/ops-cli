@@ -9,10 +9,16 @@
 //! it is therefore provisioned like `nix:` (into ops's store, seeded, offline-reusable) rather than
 //! in-cage.
 //!
-//! Update model: pin-on-first-use. A launch resolves the URL to a hash and records it in a
-//! per-project lock (`deb-packages.lock`), so later launches reuse the pinned hash offline; a
-//! GitHub `…/releases/latest/download/…` URL means the *first* resolve tracks upstream, and
-//! `ops upgrade` re-resolves it forward. Trusted-only, like every `[packages]` backend.
+//! Two source forms (both trusted-only, like every `[packages]` backend):
+//!   * `deb:<https url>` — a fixed `.deb` URL. A GitHub `…/releases/latest/download/<stable>.deb`
+//!     URL already rolls forward via the redirect; a version-embedding URL does not.
+//!   * `deb:github:<owner>/<repo>` — query the repo's latest release and select its linux `.deb`
+//!     asset, so even a project whose asset name embeds the version rolls forward.
+//!
+//! Update model: pin-on-first-use. A launch resolves the source to a concrete `.deb` URL and its
+//! content hash, records both in a per-project lock (`deb-packages.lock`), and later launches reuse
+//! the pin offline — the launch hot path never touches GitHub. `ops upgrade` re-resolves each
+//! declared source forward (re-querying GitHub for the `github:` form) and rewrites the lock.
 
 use crate::store::{self, Layout};
 use std::collections::BTreeMap;
@@ -47,6 +53,7 @@ const ELECTRON_LIBS: &[&str] = &[
     "libxkbcommon",
     "mesa",
     "musl",
+    "ncurses",
     "nspr",
     "nss",
     "pango",
@@ -60,10 +67,35 @@ const ELECTRON_LIBS: &[&str] = &[
     "libxshmfence",
 ];
 
-/// A locked `deb:` package: the SRI content hash the URL resolved to. Keyed by the declared URL.
+/// A locked `deb:` package, keyed in the lock by its declared *locator* (the `.deb` URL, or a
+/// `github:<owner>/<repo>`). `url` is the concrete `.deb` the pin resolved to (== the locator for a
+/// direct URL, the selected release asset for a `github:` locator), and `hash` its SRI content hash
+/// — so a warm launch fetches and builds the pinned asset offline without re-querying GitHub.
 #[derive(Clone)]
 pub(crate) struct DebPin {
     pub(crate) hash: String,
+    pub(crate) url: String,
+}
+
+/// The two shapes a declared `deb:` locator can take, dispatched from its prefix.
+enum DebSource {
+    /// A direct `https://…/….deb` URL — resolved to itself.
+    Url(String),
+    /// `github:<owner>/<repo>` — resolved via the repo's latest release.
+    Github { owner: String, repo: String },
+}
+
+/// Parse a declared locator (already validated by `config::parse_backend`) into its [`DebSource`].
+fn parse_source(locator: &str) -> DebSource {
+    if let Some(path) = locator.strip_prefix("github:") {
+        if let Some((owner, repo)) = path.split_once('/') {
+            return DebSource::Github {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+            };
+        }
+    }
+    DebSource::Url(locator.to_string())
 }
 
 /// The outcome of re-resolving one declared `deb:` reference during `ops upgrade`.
@@ -107,21 +139,25 @@ fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
         .join(DEB_LOCK)
 }
 
-/// Read the per-project deb lock (`url\thash` per line). A corrupt line self-heals by being dropped;
-/// an absent lock is an empty map (the unpinned state).
+/// Read the per-project deb lock. Each line is `key\thash` or `key\thash\turl`: a two-column line
+/// (a direct-URL pin, and the legacy format) takes the key as its resolved URL; a three-column line
+/// (a `github:` pin) carries the resolved asset URL separately. A corrupt line self-heals by being
+/// dropped; an absent lock is an empty map (the unpinned state).
 pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin> {
     let mut map = BTreeMap::new();
     let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id)) else {
         return map;
     };
     for line in text.lines() {
-        let mut it = line.splitn(2, '\t');
-        if let (Some(url), Some(hash)) = (it.next(), it.next()) {
-            if !url.is_empty() && is_sri(hash) {
+        let mut it = line.splitn(3, '\t');
+        if let (Some(key), Some(hash)) = (it.next(), it.next()) {
+            if !key.is_empty() && is_sri(hash) {
+                let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
                 map.insert(
-                    url.to_string(),
+                    key.to_string(),
                     DebPin {
                         hash: hash.to_string(),
+                        url: url.to_string(),
                     },
                 );
             }
@@ -173,8 +209,15 @@ fn write_pins(
             .create(parent)?;
     }
     let mut body = String::new();
-    for (url, pin) in lock {
-        body.push_str(&format!("{url}\t{}\n", pin.hash));
+    for (key, pin) in lock {
+        // A direct-URL pin keeps the compact two-column form (key == resolved url), byte-identical
+        // to the legacy lock; a `github:` pin, whose resolved asset url differs from its key, needs
+        // the third column.
+        if pin.url == *key {
+            body.push_str(&format!("{key}\t{}\n", pin.hash));
+        } else {
+            body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
+        }
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&tmp, body)?;
@@ -187,10 +230,97 @@ fn write_pins(
     }
 }
 
-/// Resolve a `.deb` URL to its SRI content hash via `nix store prefetch-file`, which follows
-/// redirects (so a `…/releases/latest/download/…` URL resolves to the current asset) and adds the
-/// file to ops's store. Pure fetch — no code runs.
-pub(crate) fn resolve(nix: &Path, layout: &Layout, url: &str) -> io::Result<String> {
+/// Resolve a declared `deb:` locator to `(concrete .deb url, SRI content hash)`. A direct URL
+/// resolves to itself; a `github:<owner>/<repo>` locator queries the repo's latest release, selects
+/// its linux `.deb` asset, and **re-validates that GitHub-supplied URL** through the same
+/// injection-free barrier a hand-written `deb:` URL passes before it is fetched or interpolated into
+/// the generated derivation. `fresh` bypasses the fetch cache (set on `ops upgrade`, so it sees a
+/// new release). Fail-closed: an unvalidated or unselectable asset returns an error and no pin.
+pub(crate) fn resolve_source(
+    nix: &Path,
+    layout: &Layout,
+    locator: &str,
+    system: &str,
+    fresh: bool,
+) -> io::Result<(String, String)> {
+    let url = match parse_source(locator) {
+        DebSource::Url(url) => url,
+        DebSource::Github { owner, repo } => {
+            let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+            let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
+            let url = select_deb_asset(&json, system).ok_or_else(|| {
+                io::Error::other(format!(
+                    "no linux {} `.deb` asset in the latest release of {owner}/{repo}",
+                    deb_arch_label(system)
+                ))
+            })?;
+            if !crate::config::is_valid_deb_url(&url) {
+                return Err(io::Error::other(format!(
+                    "the latest release of {owner}/{repo} selected an asset URL that is not a \
+                     valid `.deb` URL: {url}"
+                )));
+            }
+            url
+        }
+    };
+    let hash = prefetch_hash(nix, layout, &url)?;
+    Ok((url, hash))
+}
+
+/// Select the linux `.deb` asset URL matching `system` from a GitHub release's JSON. A `.deb` is a
+/// Linux package by definition, so the discriminant is CPU architecture, not the OS: an asset whose
+/// name names a *foreign* arch is dropped, then one positively naming this arch is chosen
+/// (deterministic by name); a single unambiguous `.deb` with no arch token is the fallback for a
+/// single-arch repo. Pure, so selection is testable against captured release JSON.
+fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
+    let (accept, reject) = arch_tokens(system);
+    let mut native: Vec<(String, String)> = json
+        .get("assets")?
+        .as_array()?
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name")?.as_str()?.to_ascii_lowercase();
+            let url = a.get("browser_download_url")?.as_str()?;
+            (name.ends_with(".deb") && !reject.iter().any(|t| name.contains(t)))
+                .then(|| (name, url.to_string()))
+        })
+        .collect();
+    native.sort();
+    native
+        .iter()
+        .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
+        .or_else(|| native.first().filter(|_| native.len() == 1))
+        .map(|(_, url)| url.clone())
+}
+
+/// The architecture name tokens for `system`: `(accepted, rejected)`. An asset whose lowercased
+/// name contains an accepted token is a native build; one containing a rejected token is foreign.
+fn arch_tokens(system: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+    let x86 = vec!["amd64", "x86_64", "x86-64", "x64"];
+    let arm = vec!["arm64", "aarch64"];
+    let other = vec![
+        "armhf", "armv7", "armv7l", "i386", "i686", "riscv64", "ppc64", "s390x",
+    ];
+    if system.starts_with("aarch64") {
+        (arm, [x86, other].concat())
+    } else {
+        (x86, [arm, other].concat())
+    }
+}
+
+/// The Debian architecture label for `system`, for the "no matching asset" error message.
+fn deb_arch_label(system: &str) -> &'static str {
+    if system.starts_with("aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
+/// Resolve a concrete `.deb` URL to its SRI content hash via `nix store prefetch-file`, which
+/// follows redirects (so a `…/releases/latest/download/…` URL resolves to the current asset) and
+/// adds the file to ops's store. Pure fetch — no code runs.
+fn prefetch_hash(nix: &Path, layout: &Layout, url: &str) -> io::Result<String> {
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .args(["store", "prefetch-file", "--json"])
@@ -281,21 +411,27 @@ pub(crate) fn provision(
     project: &Path,
     nixpkgs: &str,
     name: &str,
-    url: &str,
+    locator: &str,
 ) -> io::Result<(PathBuf, PathBuf)> {
     let project_id = super::binds::project_runtime_id(project)?;
+    let system = super::current_system();
     let mut lock = pins(layout, project_id.as_str());
-    let hash = match lock.get(url) {
-        Some(pin) => pin.hash.clone(),
+    let (url, hash) = match lock.get(locator) {
+        Some(pin) => (pin.url.clone(), pin.hash.clone()),
         None => {
-            let h = resolve(nix, layout, url)?;
-            lock.insert(url.to_string(), DebPin { hash: h.clone() });
+            let (u, h) = resolve_source(nix, layout, locator, &system, false)?;
+            lock.insert(
+                locator.to_string(),
+                DebPin {
+                    hash: h.clone(),
+                    url: u.clone(),
+                },
+            );
             write_pins(layout, project_id.as_str(), &lock)?;
-            h
+            (u, h)
         }
     };
-    let system = super::current_system();
-    let expr = derivation_expr(nixpkgs, &system, name, url, &hash);
+    let expr = derivation_expr(nixpkgs, &system, name, &url, &hash);
     let gcroot = layout
         .data_dir()
         .join("gcroots")
@@ -322,11 +458,12 @@ pub(crate) fn upgrade(
         trusted: declared,
         all: universe,
     } = declared(cfg);
+    let system = super::current_system();
     let mut lock = pins(layout, project_id.as_str());
     let mut outcomes = Vec::new();
 
-    // Prune entries whose URL is no longer declared (across ALL layers regardless of trust, so a
-    // withheld project's still-declared package keeps its pin rather than being silently unpinned).
+    // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so
+    // a withheld project's still-declared package keeps its pin rather than being silently unpinned).
     let stale: Vec<String> = lock
         .keys()
         .filter(|k| !universe.contains(k.as_str()))
@@ -337,30 +474,32 @@ pub(crate) fn upgrade(
         outcomes.push(DebUpgrade::Pruned { url });
     }
 
-    for url in &declared {
-        let previous = lock.get(url).map(|p| p.hash.clone());
-        match resolve(nix, layout, url) {
-            Ok(hash) => {
+    for locator in &declared {
+        let previous = lock.get(locator).map(|p| p.hash.clone());
+        // `fresh` re-queries GitHub (for a `github:` locator) past the fetch cache, so a new release
+        // is seen; a direct URL ignores it. The lock records the resolved asset URL, not the locator.
+        match resolve_source(nix, layout, locator, &system, true) {
+            Ok((url, hash)) => {
                 let outcome = match &previous {
                     Some(old) if old == &hash => DebUpgrade::Unchanged {
-                        url: url.clone(),
+                        url: locator.clone(),
                         hash: hash.clone(),
                     },
                     Some(old) => DebUpgrade::Rolled {
-                        url: url.clone(),
+                        url: locator.clone(),
                         from: old.clone(),
                         to: hash.clone(),
                     },
                     None => DebUpgrade::Pinned {
-                        url: url.clone(),
+                        url: locator.clone(),
                         hash: hash.clone(),
                     },
                 };
-                lock.insert(url.clone(), DebPin { hash });
+                lock.insert(locator.clone(), DebPin { hash, url });
                 outcomes.push(outcome);
             }
             Err(e) => outcomes.push(DebUpgrade::Failed {
-                url: url.clone(),
+                url: locator.clone(),
                 error: e.to_string(),
             }),
         }
@@ -475,24 +614,48 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_round_trips_and_a_corrupt_line_self_heals() {
+    fn the_lock_round_trips_both_forms_and_a_corrupt_line_self_heals() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         let id = "proj1";
         let mut lock = BTreeMap::new();
+        // a direct-URL pin (url == key) and a `github:` pin (url != key, the resolved asset).
         lock.insert(
             "https://example.com/a.deb".to_string(),
             DebPin {
                 hash: HASH.to_string(),
+                url: "https://example.com/a.deb".to_string(),
+            },
+        );
+        lock.insert(
+            "github:iOfficeAI/AionUi".to_string(),
+            DebPin {
+                hash: HASH.to_string(),
+                url: "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb".to_string(),
             },
         );
         write_pins(&layout, id, &lock).expect("write the lock");
 
-        let read = pins(&layout, id);
-        assert_eq!(read.len(), 1);
-        assert_eq!(read["https://example.com/a.deb"].hash, HASH);
+        // the direct-URL pin stays a compact two-column line (byte-compatible with the legacy lock).
+        let raw = std::fs::read_to_string(lock_path(&layout, id)).unwrap();
+        assert!(
+            raw.contains(&format!("https://example.com/a.deb\t{HASH}\n")),
+            "a direct-URL pin keeps the two-column form:\n{raw}"
+        );
 
-        // a corrupt (non-SRI) line is dropped, not surfaced
+        let read = pins(&layout, id);
+        assert_eq!(read.len(), 2);
+        assert_eq!(
+            read["https://example.com/a.deb"].url,
+            "https://example.com/a.deb"
+        );
+        assert_eq!(
+            read["github:iOfficeAI/AionUi"].url,
+            "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb"
+        );
+        assert_eq!(read["github:iOfficeAI/AionUi"].hash, HASH);
+
+        // a legacy two-column line reads with url == key; a corrupt (non-SRI) line self-heals (drop).
         std::fs::write(
             lock_path(&layout, id),
             format!("https://example.com/a.deb\t{HASH}\nhttps://bad.example/b.deb\tnot-a-hash\n"),
@@ -500,6 +663,84 @@ mod tests {
         .unwrap();
         let read = pins(&layout, id);
         assert_eq!(read.len(), 1, "the corrupt line must self-heal (drop)");
+        assert_eq!(
+            read["https://example.com/a.deb"].url, "https://example.com/a.deb",
+            "a two-column (legacy) line takes its key as the resolved url"
+        );
+    }
+
+    #[test]
+    fn parse_source_dispatches_github_from_url() {
+        match parse_source("github:iOfficeAI/AionUi") {
+            DebSource::Github { owner, repo } => {
+                assert_eq!(owner, "iOfficeAI");
+                assert_eq!(repo, "AionUi");
+            }
+            DebSource::Url(_) => panic!("github locator misparsed as a URL"),
+        }
+        assert!(matches!(
+            parse_source("https://example.com/x.deb"),
+            DebSource::Url(u) if u == "https://example.com/x.deb"
+        ));
+    }
+
+    // A trimmed capture of iOfficeAI/AionUi's `releases/latest` asset set (real names + URLs), the
+    // shape [`select_deb_asset`] must pick from: two linux `.deb`s (amd64 + arm64) beside mac/win.
+    const AIONUI_ASSETS: &str = r#"{
+      "tag_name": "v2.1.35",
+      "assets": [
+        { "name": "AionUi-2.1.35-linux-amd64.deb",
+          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb" },
+        { "name": "AionUi-2.1.35-linux-arm64.deb",
+          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-arm64.deb" },
+        { "name": "AionUi-2.1.35-mac-x64.dmg",
+          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-mac-x64.dmg" },
+        { "name": "AionUi-2.1.35-win-x64.exe",
+          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-win-x64.exe" }
+      ]
+    }"#;
+
+    #[test]
+    fn select_deb_asset_picks_the_native_arch_and_rejects_the_foreign_one() {
+        let json: serde_json::Value = serde_json::from_str(AIONUI_ASSETS).unwrap();
+        // x86_64 selects the amd64 deb, never the arm64 deb or the mac/win assets.
+        assert_eq!(
+            select_deb_asset(&json, "x86_64-linux").as_deref(),
+            Some("https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb")
+        );
+        // aarch64 selects the arm64 deb from the same release.
+        assert_eq!(
+            select_deb_asset(&json, "aarch64-linux").as_deref(),
+            Some("https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-arm64.deb")
+        );
+    }
+
+    #[test]
+    fn select_deb_asset_falls_back_to_a_single_untokened_deb_and_none_when_absent() {
+        // a single-arch repo whose one `.deb` carries no arch token is taken (x86_64 host).
+        let single = serde_json::json!({
+            "assets": [
+                { "name": "myapp_1.2.3.deb", "browser_download_url": "https://e/myapp_1.2.3.deb" },
+                { "name": "myapp_1.2.3.AppImage", "browser_download_url": "https://e/x.AppImage" }
+            ]
+        });
+        assert_eq!(
+            select_deb_asset(&single, "x86_64-linux").as_deref(),
+            Some("https://e/myapp_1.2.3.deb")
+        );
+        // no `.deb` at all → None (the caller turns this into a fail-closed error, no pin).
+        let none = serde_json::json!({
+            "assets": [ { "name": "app.AppImage", "browser_download_url": "https://e/app.AppImage" } ]
+        });
+        assert_eq!(select_deb_asset(&none, "x86_64-linux"), None);
+        // two arch-tokened debs but neither native, and >1 survivor → ambiguous → None (no guess).
+        let foreign = serde_json::json!({
+            "assets": [
+                { "name": "app-arm64.deb", "browser_download_url": "https://e/arm64.deb" },
+                { "name": "app-armhf.deb", "browser_download_url": "https://e/armhf.deb" }
+            ]
+        });
+        assert_eq!(select_deb_asset(&foreign, "x86_64-linux"), None);
     }
 
     fn deb_pkg(name: &str, url: &str, trusted: bool) -> crate::config::Package {
