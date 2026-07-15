@@ -27,24 +27,30 @@ with `ops app export <name>`.
 | `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
 | `hermes`          | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | `openrouter.ai` (BYOK)  |
+| `vibe`            | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, `nix:chromium`, `gui = "wayland"`) | `console.mistral.ai` (Mistral account SSO, in-cage browser) / `api.mistral.ai` (BYOK) |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
 | `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
 | `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
 | `agy`             | `mise:aqua:google-antigravity/antigravity-cli`  | `accounts.google.com` (Google OAuth) |
+| `auggie`          | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | `*.api.augmentcode.com` (Augment account) |
+| `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
+| `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | **`network = "shared"`** (host-local LLM, see note ‡) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
 
 > **Two credential postures.** Most profiles are **BYOK** — your provider key is read
 > on the host and injected by the proxy, never entering the cage (see below).
-> `freebuff`, `agy`, and `claude-desktop` are the other kind: they log in to a service
-> **account** (a Codebuff account; a Google account; an Anthropic/claude.ai account or SSO,
-> respectively) and the token persists in the app's isolated `$HOME` (so it *does* live in
-> the — isolated — cage, never in the project shell). All stay bounded by the egress
-> allowlist. `agy` and `claude-desktop` carry an extra unproven risk — they may want a
-> **system keyring** the hermetic cage does not provide (see each profile header and the
-> status note below).
+> `freebuff`, `agy`, `droid`, `auggie`, and `claude-desktop` are the other kind: they log in
+> to a service **account** (a Codebuff account; a Google account; a Factory account; an Augment
+> account; an Anthropic/claude.ai account or SSO, respectively) and the token persists in the
+> app's isolated `$HOME` (so it *does* live in the — isolated — cage, never in the project
+> shell). All stay bounded by the egress allowlist. `agy` and `claude-desktop` carry an extra
+> unproven risk — they may want a **system keyring** the hermetic cage does not provide (see each
+> profile header and the status note below). `auggie` has a cleaner headless path: pass a
+> host-minted session token for one launch with `--env AUGMENT_SESSION_AUTH=…` (never baked into
+> the profile), sidestepping the in-cage OAuth loopback-callback that the empty netns would break.
 
 ## Credentials — the key never enters the cage
 
@@ -94,6 +100,18 @@ can only reach the provider you listed.
 > (not captured without auth; the profile leaves a commented `*.googleapis.com` to narrow via
 > `ops net logs -a agy`).
 >
+> `auggie` (Augment Code's CLI, `@augmentcode/auggie`) is an **account** profile like the above:
+> it routes model traffic through Augment's per-user tenant backend (`<tenant>.api.augmentcode.com`,
+> covered by the `*.api.augmentcode.com` subdomain wildcard) and authenticates to your Augment
+> account, so there is no header-injectable BYOK key. It **imports and resolves** cleanly (allowlist
+> verified; the tenant wildcard and the `{GET}`-only npm registry confirmed with `ops test net`), but
+> — like every profile — the **live equip/run and auth** are still to be proven with a real account.
+> The recommended credential path is headless: on the host `auggie login` then `auggie token print`,
+> and inject the session JSON for one caged launch with
+> `ops app auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"`. Auggie is a **pure-node** CLI
+> (unlike the native-binary `cline`/`droid`), so it needs the `nix:nodejs` runtime at run time, not
+> only to install.
+>
 > `hermes` installs its published PyPI wheel with **uv** (mise's `pipx` backend over a `nix:uv`
 > installer and `nix:python312`) — proven live in-cage under the profile's own allowlist
 > (`hermes --version` → v0.18.0, ~60 wheels resolved in seconds; only the live-auth above is
@@ -132,11 +150,14 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `claude-desktop` | `deb:…/apt/stable/pool/main/c/claude-desktop/claude-desktop_<ver>_amd64.deb` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — version-pinned |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `hermes`      | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | NousResearch PyPI wheel (via uv) |
+| `vibe`        | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`) | Mistral PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
+| `auggie`      | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | Augment Code npm package (pure-node CLI, node at runtime) |
+| `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
 (mise's `aqua`/`github`/registry backends pull the real release binary, its `pipx` backend a
@@ -161,6 +182,12 @@ runs under the cage's egress posture: a build step that fetches with its **own**
 `bun install`) rather than through nix's fetcher may not honour the proxy / MITM CA under an
 allowlist (for such a tool, prefer its release-binary `mise:` backend — that is exactly how
 `kilocode` is equipped here, after its `flake:` source build hit this very wall).
+
+When the flake is one you author yourself, write the whole `flake.nix` **inline** in a
+`[flakes.<name>]` table instead of hosting a separate repo — same in-cage build and read-only
+staging as `flake:`, but the out-link is keyed by the source's content hash, so editing the flake
+in the profile rebuilds. See [inline flakes](../docs/guide/configuration/packages.md). An inline
+flake floats, so pin its inputs inside the `flake.nix`.
 
 A fourth backend, **`deb:<url>`**, packages a GUI/desktop app distributed **only as a prebuilt
 `.deb`** (no release binary, no nixpkgs attribute, and — for opencode-desktop — an official flake
@@ -234,19 +261,33 @@ do not guess the values, so each waits on a real fact or on a named feature:
   persistence: Antigravity may want a **system keyring** the hermetic cage lacks (see the profile
   header + the status note). Its runtime model host is also not yet captured.
 
-- **GUI / desktop (Electron) agents** — no longer blocked in general: `opencode-desktop` and
-  `claude-desktop` (above) are working Electron profiles, and they map out the recipe for the next
-  one. Three pieces make an Electron desktop app work in the cage: (1) **package it from its prebuilt `.deb`** with the
-  `deb:<url>` backend (ops fetches, hashes, and `autoPatchelfHook`s it host-side — avoids the
-  from-source `bun install` wall and any third-party flake); (2) **`gui = "wayland"`** plus the
-  Chromium flags (`--no-sandbox --ozone-platform=wayland --disable-gpu --use-system-ca`); (3)
-  nothing extra for CA trust — ops **seeds its MITM CA into the cage's NSS db automatically** for a
-  gui cage under a filtering posture (Chromium ignores the CA-file env vars other tools honour). Still
-  waiting, each on a real fact: **t3 code** (`pingdotgg/t3code`, a web+Electron control plane that
-  drives *other* agents — its targets `codex`/`claude`/`opencode` are already profiled as CLIs), the
-  Antigravity *IDE* (distinct from the `agy` CLI, profiled above), and hermes desktop — each needs a
-  prebuilt-`.deb`/flake package and a groundable credential, or is better served by its headless
-  sibling (the `opencode`/`hermes` CLIs are profiled).
+- **GUI / desktop (Electron) agents** — no longer blocked in general: `opencode-desktop`,
+  `claude-desktop`, and `t3code` (above) are working Electron profiles, and they map out the recipe
+  for the next one. Three pieces make an Electron desktop app work in the cage: (1) **package it from
+  its prebuilt binary** — the `deb:<url>` / `deb:github:<owner>/<repo>` backend for a `.deb`, or the
+  `appimage:<url>` / `appimage:github:<owner>/<repo>` backend for an `.AppImage` (ops fetches, hashes,
+  and `autoPatchelfHook`s it host-side — avoids the from-source `bun install` wall and any third-party
+  flake; an AppImage is extracted at build time, never self-mounted, since the runtime FUSE mount is
+  seccomp-blocked); (2) **`gui = "wayland"`** (usually with `gpu = true` and `dbus = true`) plus the
+  Chromium flags (`--no-sandbox --ozone-platform=wayland --use-system-ca`); (3) nothing extra for CA
+  trust — ops **seeds its MITM CA into the cage's NSS db automatically** for a gui cage under a
+  filtering posture (Chromium ignores the CA-file env vars other tools honour). **`t3code`** — a
+  control plane driving *other* agents (`codex`/`claude`/`opencode`, already profiled as CLIs) — is
+  the AppImage-backend flagship: it packages, imports, resolves, renders + logs in, and its build seam
+  is proven through `ops run` (the launcher lands on the cage PATH). **‡ It is one of two shipped
+  profiles that ship `network = "shared"` and cannot filter egress** (the other, `openfox`, does so for
+  an unrelated reason — to reach a LLM on the host's `localhost`, which the empty netns cannot; see its
+  header) — t3code's model traffic is made by a SEPARATE,
+  proxy-blind Node backend (`ELECTRON_RUN_AS_NODE`, Effect's undici with its own Agent) that no
+  profile-level mechanism can route through the egress proxy: proxychains' `LD_PRELOAD` breaks
+  Chromium's renderer (spiked 1-vs-0 rendered docs), Electron strips `NODE_OPTIONS` so a preload never
+  reaches the backend, and a transparent redirect is an ops-sized feature (a Chromium-safe LD_PRELOAD
+  connect-shim, or a cap-free loopback-DNS + SNI-relay interceptor), not a profile knob. So t3code keeps
+  bwrap + seccomp + the isolated home + the minimal `/dev`, but reaches the host network unfiltered —
+  the honest posture for an Electron app whose backend is proxy-blind. Still waiting, each on a real
+  fact: the Antigravity *IDE*
+  (distinct from the `agy` CLI, profiled above) and hermes desktop — each needs a prebuilt package and
+  a groundable credential, or is better served by its headless sibling (the `hermes` CLI is profiled).
 
 - **`aionui`** is the closest GUI candidate — it is an Electron app **but ships a genuine
   headless `--webui` HTTP-server mode** and is OpenRouter-keyable. It waits on two things:

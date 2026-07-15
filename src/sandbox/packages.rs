@@ -127,7 +127,11 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
         .filter(|p| p.state == TrustState::Trusted)
         .filter_map(|p| match &p.backend {
             Backend::Mise(token) => Some(token.clone()),
-            Backend::Nix(_) | Backend::Flake(_) | Backend::Deb(_) => None,
+            Backend::Nix(_)
+            | Backend::Flake(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_)
+            | Backend::AppImage(_) => None,
         })
         .collect()
 }
@@ -144,7 +148,11 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
         .filter(|p| p.state == TrustState::Trusted)
         .filter_map(|p| match &p.backend {
             Backend::Flake(reference) => Some((p.name.clone(), reference.clone())),
-            Backend::Nix(_) | Backend::Mise(_) | Backend::Deb(_) => None,
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_)
+            | Backend::AppImage(_) => None,
         })
         .collect()
 }
@@ -159,7 +167,54 @@ pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
         .filter(|p| p.state == TrustState::Trusted)
         .filter_map(|p| match &p.backend {
             Backend::Deb(url) => Some((p.name.clone(), url.clone())),
-            Backend::Nix(_) | Backend::Mise(_) | Backend::Flake(_) => None,
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::Flake(_)
+            | Backend::FlakeInline { .. }
+            | Backend::AppImage(_) => None,
+        })
+        .collect()
+}
+
+/// The `(name, url)` of the *admitted* `appimage:` packages — the ones the launcher provisions
+/// host-side (resolve the URL to a hash, then build a generated squashfs-extract+autoPatchelf
+/// derivation). Trusted-only, exactly like the other backends: an untrusted project's `appimage:`
+/// package is dropped here. The name keys the per-package gcroot; the url is the `.AppImage` source
+/// ops resolves and fetches.
+pub(crate) fn appimage_packages(packages: &[Package]) -> Vec<(String, String)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::AppImage(url) => Some((p.name.clone(), url.clone())),
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::Flake(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_) => None,
+        })
+        .collect()
+}
+
+/// The `(name, content, attr)` of the *admitted* inline-flake packages — the ones the launcher
+/// stages, binds read-only into the cage, and builds `path:<dir>#<attr>` in-cage. Trusted-only,
+/// exactly like [`flake_packages`] and the other backends: an untrusted project's inline flake is
+/// dropped here. The name keys the per-package out-link (with the content hash) and the
+/// `ops-flake-<name>` gcroot; the content is the `flake.nix` source staged to a file, the attr the
+/// output to build.
+pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String, String)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::FlakeInline { content, attr } => {
+                Some((p.name.clone(), content.clone(), attr.clone()))
+            }
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::Flake(_)
+            | Backend::Deb(_)
+            | Backend::AppImage(_) => None,
         })
         .collect()
 }
@@ -190,6 +245,44 @@ mod tests {
             backend: Backend::Flake(reference.to_string()),
             state,
         }
+    }
+
+    fn inline_flake_package(name: &str, content: &str, attr: &str, state: TrustState) -> Package {
+        Package {
+            name: name.to_string(),
+            backend: Backend::FlakeInline {
+                content: content.to_string(),
+                attr: attr.to_string(),
+            },
+            state,
+        }
+    }
+
+    #[test]
+    fn flake_inline_packages_yields_only_trusted_inline_flakes() {
+        // Trusted-only, like every other backend collector: an untrusted inline flake is dropped
+        // here (its withholding is warned once by `admit`), and only inline flakes are returned.
+        let pkgs = [
+            inline_flake_package(
+                "keep",
+                "{ outputs = {...}: {}; }",
+                "default",
+                TrustState::Trusted,
+            ),
+            inline_flake_package("drop", "{ }", "default", TrustState::Untrusted),
+            flake_package("remote", "github:o/r#default", TrustState::Trusted),
+            package("nixtool", "jq", TrustState::Trusted),
+        ];
+        let got = flake_inline_packages(&pkgs);
+        assert_eq!(
+            got,
+            vec![(
+                "keep".to_string(),
+                "{ outputs = {...}: {}; }".to_string(),
+                "default".to_string()
+            )],
+            "only the trusted inline flake, carrying its content and attr"
+        );
     }
 
     #[test]

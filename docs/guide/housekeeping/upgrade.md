@@ -17,6 +17,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/projects/<id>/tools.lock` — resolved `nix:` mise tools.
 - `<data>/projects/<id>/flake-packages.lock` — pinned `flake:` packages.
 - `<data>/projects/<id>/deb-packages.lock` — pinned `deb:` packages (URL → content hash).
+- `<data>/projects/<id>/appimage-packages.lock` — pinned `appimage:` packages (URL → content hash).
 
 A launch reads these locks; it does not re-resolve. So updating the `ops` binary leaves
 your versions exactly where they were. `ops upgrade` is the one place that rewrites a
@@ -25,7 +26,7 @@ lock.
 ## The upgrade targets
 
 ```sh
-ops upgrade [all|nix|mise|flake|deb]
+ops upgrade [all|nix|mise|flake|deb|appimage]
 ```
 
 | Target | Rolls forward |
@@ -34,6 +35,7 @@ ops upgrade [all|nix|mise|flake|deb]
 | `mise` | the mise engine, the project's `nix:` tools, and `mise:` packages |
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
+| `appimage` | the project's and apps' `appimage:` packages |
 | `all` | all of the above (the default) |
 
 The three are **decoupled**: `ops upgrade nix` leaves `mise-engine.lock` untouched, and
@@ -64,6 +66,9 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
 - **`deb:`** — re-resolves each declared `.deb` URL to its current content hash
   (`nix store prefetch-file`, following a `…/releases/latest/…` redirect) and rewrites
   `deb-packages.lock`; a changed hash rebuilds host-side at the next launch.
+- **`appimage:`** — the `deb:` twin for a prebuilt `.AppImage`: re-resolves each declared URL
+  (or a `github:` locator's latest release asset) to its current content hash and rewrites
+  `appimage-packages.lock`; a changed hash rebuilds host-side at the next launch.
 
 ## The fresh-release hold (`mise:` packages)
 

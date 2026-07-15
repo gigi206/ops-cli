@@ -648,10 +648,15 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
 
     // The pinned revisions of any `flake:` packages, read network-free from the per-project lock —
     // the same source the launch consults — so the view can show a pin without resolving anything.
-    // Pinned identities keyed by a package's locator: flake refs → revision, deb URLs → short
-    // content hash. The two key spaces are disjoint, so one map serves both backends.
+    // Pinned identities keyed by a package's locator: flake refs → revision, deb/appimage URLs →
+    // short content hash. Keys almost never collide across backends (a `.deb` URL, an `.AppImage`
+    // URL, and a flake ref look nothing alike); the one overlap is a `github:<owner>/<repo>` locator
+    // shared by a `deb:`/`appimage:` pair pointing at the SAME repo, where the last `.extend` wins and
+    // the display shows one pin for both. That is cosmetic — provisioning, upgrade, and gc each read
+    // their own per-backend lock directly, never this merged display map.
     let mut flake_pins = sandbox::flake_pinned_revs(cwd);
     flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
+    flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
 
     let packages = resolved
         .packages
@@ -750,7 +755,9 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
         Backend::Nix(_) => "host-side, durable",
         Backend::Mise(_) => "in-cage via mise, fetched at launch",
         Backend::Flake(_) => "in-cage via nix build, fetched at launch",
+        Backend::FlakeInline { .. } => "in-cage via nix build (inline flake)",
         Backend::Deb(_) => "host-side from prebuilt .deb, durable",
+        Backend::AppImage(_) => "host-side from prebuilt AppImage, durable",
     };
     let trusted = p.state == TrustState::Trusted;
     PackageView {
@@ -764,14 +771,18 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
     }
 }
 
-/// The locked pin for a `flake:` (revision) or `deb:` (short content hash) package, looked up by
-/// its locator in the merged pin map; `None` for an unpinned package or any other backend.
+/// The locked pin for a `flake:` (revision) or `deb:`/`appimage:` (short content hash) package,
+/// looked up by its locator in the merged pin map; `None` for an unpinned package or any other
+/// backend. A `deb:`/`appimage:` pair naming the same `github:<owner>/<repo>` shares a key here, so
+/// the display can show one the other's pin — cosmetic only (each backend provisions from its own
+/// lock).
 fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) -> Option<String> {
     match backend {
-        // Both flake refs and deb URLs are looked up by locator in the merged pin map.
+        // Flake refs and deb/appimage URLs are all looked up by locator in the merged pin map.
         Backend::Flake(reference) => flake_pins.get(reference).cloned(),
-        Backend::Deb(url) => flake_pins.get(url).cloned(),
-        Backend::Nix(_) | Backend::Mise(_) => None,
+        Backend::Deb(url) | Backend::AppImage(url) => flake_pins.get(url).cloned(),
+        // An inline flake floats — no persisted lock, so nothing to show.
+        Backend::Nix(_) | Backend::Mise(_) | Backend::FlakeInline { .. } => None,
     }
 }
 
@@ -1027,10 +1038,15 @@ fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
 pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> {
     let resolved = super::load(cwd);
     let app = resolved.apps.get(name)?;
-    // Pinned identities keyed by a package's locator: flake refs → revision, deb URLs → short
-    // content hash. The two key spaces are disjoint, so one map serves both backends.
+    // Pinned identities keyed by a package's locator: flake refs → revision, deb/appimage URLs →
+    // short content hash. Keys almost never collide across backends (a `.deb` URL, an `.AppImage`
+    // URL, and a flake ref look nothing alike); the one overlap is a `github:<owner>/<repo>` locator
+    // shared by a `deb:`/`appimage:` pair pointing at the SAME repo, where the last `.extend` wins and
+    // the display shows one pin for both. That is cosmetic — provisioning, upgrade, and gc each read
+    // their own per-backend lock directly, never this merged display map.
     let mut flake_pins = sandbox::flake_pinned_revs(cwd);
     flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
+    flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
     Some(app_detail_view(cwd, name, app, &resolved, &flake_pins))
 }
 

@@ -1,0 +1,81 @@
+# OpenFox — a local-LLM web coding agent (github.com/co-l/openfox), sandboxed by ops.
+#
+#   ops app import profiles/openfox.toml
+#   ops app openfox
+#   # then open http://127.0.0.1:10369 in your browser
+#
+# OpenFox is a Node.js/TypeScript coding agent with a "Plan → Builder" workflow, an integrated
+# terminal, and sub-agents — but instead of a cloud provider it drives a LOCAL, OpenAI-compatible
+# LLM backend (vLLM / sglang / ollama / llama.cpp). It ships as the npm package `openfox` (Node
+# >= 24) and, unlike a TUI CLI, serves a WEB dashboard: it starts a local HTTP server (default
+# 127.0.0.1:10369) and you drive it from your browser. So ops equips it in-cage with a node
+# runtime (pure-Node CLI — the cage synthesises `/usr/bin/env`, so its `#!/usr/bin/env node`
+# shebang resolves; node is needed at RUNTIME, not only to install) plus mise's npm backend. The
+# install fetches from registry.npmjs.org, so the first launch needs the network.
+#
+# WHY `network = "shared"` (AND WHAT IT COSTS). OpenFox talks to a LLM on your machine's
+# `localhost` (OPENFOX_LLM_URL default `http://localhost:8000/v1`; ollama is usually :11434,
+# llama.cpp :8080). The default ops posture is Model-B — an EMPTY network namespace whose
+# `127.0.0.1` is the CAGE's own loopback, NOT the host's — and there is no outbound bridge to a
+# host-local service (`forward` is INBOUND only). So under the empty netns the caged openfox
+# simply cannot reach a LLM running on your host. `network = "shared"` makes the cage share the
+# host's network namespace, so `localhost:8000` in the cage IS your host's `localhost:8000` and
+# openfox reaches the LLM — and, as a bonus, the web UI it serves on the cage's `127.0.0.1:10369`
+# is then already on host loopback, so your browser reaches it directly (no `forward` needed; a
+# `forward` would be a no-op under `shared`).
+#
+# The honest trade-off: `shared` DROPS the egress allowlist — the agent (and any code it runs in
+# its integrated terminal) can reach any network your host can. What the cage still enforces, and
+# why it is far from pointless here: HERMETIC FILESYSTEM isolation (openfox sees only this project
+# + its own isolated $HOME — never your host $HOME, SSH keys, other projects, or secrets), the
+# SECCOMP denylist (no mount/ns/ptrace kernel-LPE surface), CGROUP limits (anti fork-bomb / OOM),
+# and a dedicated persistent $HOME. For an agent that executes arbitrary commands, that FS +
+# process containment is the primary win, and the model traffic is local (no cloud exfil to
+# filter). If your LLM instead runs on a REMOTE host, prefer the full Model-B posture — replace
+# the `network` line below with a `[network] mode = "deny"` + `allow = ["<llm-host>:<port>"]`
+# allowlist, and drop `shared`; then egress is filtered too.
+#
+# The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
+# `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
+# UI to your LAN); keep the 127.0.0.1 default. To change the port, set it in BOTH `cmd` (--port)
+# and, if you ever switch to a remote LLM + forward, the `forward` list.
+cmd = ["openfox", "--no-browser"]
+
+# Reach the host-local LLM AND expose the web UI on host loopback. See the header for the remote-LLM
+# alternative (an allowlist instead of shared).
+network = "shared"
+
+# Your host OpenFox config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `openfox` read and write these host files. Uncomment to share your host OpenFox setup with
+# the cage instead of the app's isolated home (the default). The exact config path is UNCONFIRMED
+# (verify with a real run before relying on it).
+#binds = [
+#    { path = "~/.config/openfox", mode = "rw" },
+#]
+
+[packages]
+# A node runtime (OpenFox needs it at runtime AND to install; `nix:nodejs` is v24.x, satisfying
+# OpenFox's Node >= 24 requirement) then OpenFox itself via mise's npm backend. Both are
+# trusted-only [packages]; this profile is trusted by location once imported.
+nodejs = "nix:nodejs"
+openfox = "mise:npm:openfox"
+# OpenFox's integrated terminal / sub-agents run shell commands. The hermetic cage ships a curated
+# base toolset (bash, coreutils, curl, git, less, grep, sed, awk, find, which) plus node. If your
+# agent needs more tools (a compiler, a language runtime, ripgrep, …), declare them here per app or
+# in the project's own `.ops.toml [packages]`.
+
+[env]
+# LLM BACKEND. On first run OpenFox auto-detects a local OpenAI-compatible backend by probing common
+# localhost ports (8000 vLLM, 11434 ollama, 8080 llama.cpp), which works under `network = "shared"`.
+# If auto-detection does not find yours, or you want to pin it, set these (uncomment + adjust):
+#OPENFOX_LLM_URL = "http://localhost:11434/v1"   # ollama; vLLM default is http://localhost:8000/v1
+#OPENFOX_MODEL_NAME = "qwen2.5-coder:32b"         # the model your backend serves
+#OPENFOX_REASONING_EFFORT = "medium"              # if your model supports it
+# The web UI port (must match --port in `cmd` if you change it):
+#OPENFOX_PORT = "10369"
+#
+# No [secret] block: the LLM is local and needs no cloud API key. If your local backend requires a
+# token, most OpenAI-compatible servers accept any non-empty value — set it in your backend and, if
+# OpenFox needs it, provide it here (your call; it then lives in the isolated cage) rather than via
+# the egress proxy (there is no proxy under `shared`).

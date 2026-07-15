@@ -27,7 +27,7 @@ use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
     NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
-    RawSecretDefaults, SecretFrom,
+    RawInlineFlake, RawSecretDefaults, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -168,6 +168,14 @@ pub(crate) enum Backend {
     /// (the same posture as the in-cage `mise:nix:` self-equip). On PATH at launch and
     /// later launches via a persistent out-link under the home.
     Flake(String),
+    /// A `[flakes.<name>]` inline flake — the full `flake.nix` source written directly in the
+    /// config, plus the output attribute to build. Unlike [`Backend::Flake`] (a reference to an
+    /// external flake) the source is ours: ops stages it, binds it read-only into the cage, and
+    /// builds `path:<dir>#<attr>` **in-cage**, so the same containment as `flake:` applies to
+    /// arbitrary inline build code. The out-link is keyed by the source's content hash, so editing
+    /// the flake in the config rebuilds at the next launch. It floats — no persisted lock, no
+    /// `ops upgrade` — so inputs are pinned inside the `flake.nix` for reproducibility.
+    FlakeInline { content: String, attr: String },
     /// `deb:<url>` — a prebuilt Debian package (a `.deb`) at an `https://` URL, provisioned
     /// **host-side** into ops's store (seeded, offline-reusable, like `nix:`): ops resolves the
     /// URL to a content hash, then builds a generated derivation that unpacks the `.deb` and
@@ -180,6 +188,18 @@ pub(crate) enum Backend {
     /// `ops upgrade`. The stored string is the raw locator (the URL or `github:<owner>/<repo>`);
     /// [`super::sandbox::deb`] dispatches on its shape.
     Deb(String),
+    /// `appimage:<url>` — a prebuilt AppImage at an `https://` URL, provisioned **host-side** into
+    /// ops's store exactly like `deb:` (seeded, offline-reusable): ops resolves the URL to a content
+    /// hash, then builds a generated derivation that extracts the AppImage's squashfs and
+    /// `autoPatchelfHook`s it against the same curated Electron/Chromium library set. Extraction runs
+    /// no build script (`dontBuild`) — and, crucially, the AppImage is unpacked at BUILD time rather
+    /// than self-mounted at runtime, since the runtime FUSE/namespace path is blocked by the cage's
+    /// seccomp denylist. Meant for a GUI/desktop app distributed only as an `.AppImage`. Two forms: a
+    /// direct `https://…/….AppImage` URL, or `github:<owner>/<repo>` — which queries the repo's
+    /// latest release and selects its linux `.AppImage` asset, so a project whose asset name embeds
+    /// the version still rolls forward on `ops upgrade`. The stored string is the raw locator (the URL
+    /// or `github:<owner>/<repo>`); [`super::sandbox::appimage`] dispatches on its shape.
+    AppImage(String),
 }
 
 impl Backend {
@@ -192,6 +212,10 @@ impl Backend {
             Backend::Mise(token) => token,
             Backend::Flake(reference) => reference,
             Backend::Deb(url) => url,
+            Backend::AppImage(url) => url,
+            // The output attribute — a short locator for display; the bulky flake source is not
+            // itself a one-line locator (rendered as `flake (inline) #<attr>` by the config view).
+            Backend::FlakeInline { attr, .. } => attr,
         }
     }
 
@@ -202,6 +226,8 @@ impl Backend {
             Backend::Mise(_) => "mise",
             Backend::Flake(_) => "flake",
             Backend::Deb(_) => "deb",
+            Backend::AppImage(_) => "appimage",
+            Backend::FlakeInline { .. } => "flake",
         }
     }
 }
@@ -871,10 +897,13 @@ impl Resolved {
             seccomp,
             devices,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
-            // launch-shaping and were noticed and dropped at collection time.
+            // launch-shaping and were noticed and dropped at collection time. An override's inline
+            // `[flakes]` is dropped (fail-closed): a one-shot `--config` blob is no place for a
+            // multiline `flake.nix`, so an inline flake is declared in a profile or project config.
             nixpkgs: _,
             net: _,
             app: _,
+            flakes: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -1201,11 +1230,12 @@ fn resolve(
         GLOBAL_CONFIG,
         global.binds,
     );
-    apply_packages(
+    apply_tools(
         &mut packages,
         &mut warnings,
         GLOBAL_CONFIG,
         global.packages,
+        global.flakes,
         TrustState::Trusted,
         false,
     );
@@ -1374,11 +1404,12 @@ fn resolve(
         // dropped here. Whether an untrusted project's tools are actually realised
         // is the launcher's call, the one place that can weigh it against the work
         // a tool would have to build.
-        apply_packages(
+        apply_tools(
             &mut packages,
             &mut warnings,
             PROJECT_CONFIG,
             proj.packages,
+            proj.flakes,
             state,
             false,
         );
@@ -2162,11 +2193,12 @@ fn resolve_app(
         let source = app_source(GLOBAL_CONFIG, name);
         apply_env(&mut env, None, &mut warnings, &source, app.env, false);
         apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
-        apply_packages(
+        apply_tools(
             &mut packages,
             &mut warnings,
             &source,
             app.packages,
+            app.flakes,
             TrustState::Trusted,
             false,
         );
@@ -2265,11 +2297,12 @@ fn resolve_app(
         }
         // An untrusted project may add its own app's packages but may not override a package a
         // trusted layer supplied (the `cmd`-integrity guard, applied to the tool).
-        apply_packages(
+        apply_tools(
             &mut packages,
             &mut warnings,
             &source,
             app.packages,
+            app.flakes,
             state,
             !trusted,
         );
@@ -2750,6 +2783,84 @@ fn apply_packages(
     }
 }
 
+/// Fold a layer's `[packages]` and `[flakes]` into `out` as one tool set, upserting by name.
+/// Packages are applied first, then inline flakes, so a name declared in both — a config mistake —
+/// resolves to the `[flakes]` inline source, and the collision is warned rather than silently
+/// last-winning. `state`/`protect_trusted` gate both exactly like [`apply_packages`], so an
+/// untrusted project's inline flake is stamped untrusted (withheld at launch) and cannot override
+/// a trusted app's tool. The collision check is per-layer, so a *legitimate* cross-layer override
+/// (a project flake replacing a global package of the same name) does not trip it — the two sit in
+/// different `apply_tools` calls.
+fn apply_tools(
+    out: &mut Vec<Package>,
+    warnings: &mut Vec<String>,
+    source: &str,
+    packages: BTreeMap<String, String>,
+    flakes: BTreeMap<String, RawInlineFlake>,
+    state: TrustState,
+    protect_trusted: bool,
+) {
+    for name in packages.keys() {
+        if flakes.contains_key(name) {
+            warnings.push(format!(
+                "{source}: `{name}` is declared as both a [packages] entry and a [flakes] table; \
+                 the [flakes] inline source is used"
+            ));
+        }
+    }
+    apply_packages(out, warnings, source, packages, state, protect_trusted);
+    apply_flakes(out, warnings, source, flakes, state, protect_trusted);
+}
+
+/// Fold a layer's inline flakes (`[flakes.<name>]`) into `out` as [`Backend::FlakeInline`] tools,
+/// stamping each with whether its source layer is trusted. Modelled on [`apply_packages`]: a
+/// malformed name, an empty `flake` body, or an invalid output attribute is dropped with a warning
+/// (fail-closed — a name keys an on-disk path and an empty flake could never build), and the
+/// `protect_trusted` guard refuses an untrusted override of a trusted app's tool. The default
+/// output attribute is `default`. Trust is *recorded*, not enforced here — the launcher withholds
+/// an untrusted inline flake, exactly as for `flake:`.
+fn apply_flakes(
+    out: &mut Vec<Package>,
+    warnings: &mut Vec<String>,
+    source: &str,
+    flakes: BTreeMap<String, RawInlineFlake>,
+    state: TrustState,
+    protect_trusted: bool,
+) {
+    for (name, raw) in flakes {
+        if !is_valid_package_name(&name) {
+            warnings.push(format!("{source}: ignoring malformed flake name `{name}`"));
+            continue;
+        }
+        if protect_trusted
+            && out
+                .iter()
+                .any(|p| p.name == name && p.state == TrustState::Trusted)
+        {
+            warnings.push(format!(
+                "{source}: ignoring inline flake `{name}` override of a trusted app ({})",
+                untrusted_reason(state)
+            ));
+            continue;
+        }
+        let content = raw.flake;
+        if content.trim().is_empty() {
+            warnings.push(format!(
+                "{source}: ignoring inline flake `{name}`: the `flake` field is empty"
+            ));
+            continue;
+        }
+        let attr = raw.attr.unwrap_or_else(|| "default".to_string());
+        if !is_valid_attr(&attr) {
+            warnings.push(format!(
+                "{source}: ignoring inline flake `{name}`: invalid output attribute `{attr}`"
+            ));
+            continue;
+        }
+        upsert_package(out, name, Backend::FlakeInline { content, attr }, state);
+    }
+}
+
 /// Parse a `[packages]` value into its [`Backend`] from the mandatory prefix. `nix:<attr>`
 /// routes to host-side nixpkgs provisioning, `mise:<token>` to the in-cage mise equip,
 /// `flake:<ref>` to an in-cage `nix build` of an arbitrary flake; a value with no recognized
@@ -2781,10 +2892,19 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             ));
         }
         Ok(Backend::Deb(rest.to_string()))
+    } else if let Some(rest) = value.strip_prefix("appimage:") {
+        if !is_valid_appimage_url(rest) && !is_valid_deb_github_locator(rest) {
+            return Err(format!(
+                "invalid appimage reference `{rest}` — use an `https://` URL ending in `.AppImage`, \
+                 or `github:<owner>/<repo>` to track the latest release's `.AppImage`"
+            ));
+        }
+        Ok(Backend::AppImage(rest.to_string()))
     } else {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
-             `flake:<ref>`, or `deb:<url>` / `deb:github:<owner>/<repo>`"
+             `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>`, or `appimage:<url>` / \
+             `appimage:github:<owner>/<repo>`"
         ))
     }
 }
@@ -2799,6 +2919,22 @@ pub(crate) fn is_valid_deb_url(url: &str) -> bool {
     url.strip_prefix("https://").is_some_and(|rest| {
         !rest.is_empty()
             && url.ends_with(".deb")
+            && url.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
+            })
+    })
+}
+
+/// An `appimage:` URL: an `https://` URL to a prebuilt `.AppImage`. The sibling of [`is_valid_deb_url`]
+/// — required to be HTTPS (the fetch is unauthenticated beyond TLS and the bundle is executed after
+/// autoPatchelf, so a plaintext source is refused) and to end in `.AppImage` (case-insensitively, so
+/// a `.appimage` spelling is accepted; a mistyped value is caught, not silently built). The character
+/// set is the same injection-free URL set, so the value carries no shell/nix metacharacter — it is
+/// interpolated into a generated nix expression and a `nix store prefetch-file` argument.
+pub(crate) fn is_valid_appimage_url(url: &str) -> bool {
+    url.strip_prefix("https://").is_some_and(|rest| {
+        !rest.is_empty()
+            && url.to_ascii_lowercase().ends_with(".appimage")
             && url.chars().all(|c| {
                 c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
             })
@@ -4665,6 +4801,7 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             binds: binds.iter().map(|s| RawBind::Path(s.to_string())).collect(),
             packages: BTreeMap::new(),
+            flakes: BTreeMap::new(),
             nixpkgs: None,
             network: None,
             gui: None,
@@ -5163,6 +5300,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            flakes: BTreeMap::new(),
             network,
             gui: None,
             gpu: None,
@@ -7741,6 +7879,166 @@ mod tests {
             .any(|w| w.contains("local") && w.contains("flake reference")));
     }
 
+    fn raw_flakes(flakes: &[(&str, &str, Option<&str>)]) -> RawConfig {
+        RawConfig {
+            flakes: flakes
+                .iter()
+                .map(|(name, content, attr)| {
+                    (
+                        name.to_string(),
+                        RawInlineFlake {
+                            flake: content.to_string(),
+                            attr: attr.map(str::to_string),
+                        },
+                    )
+                })
+                .collect(),
+            ..RawConfig::default()
+        }
+    }
+
+    const FLAKE_SRC: &str = "{ outputs = { self }: { packages.x86_64-linux.default = 1; }; }";
+
+    #[test]
+    fn an_inline_flake_folds_into_the_tool_set_with_the_right_attr() {
+        // A `[flakes.<name>]` becomes a `Backend::FlakeInline` tool: the `flake` body is the
+        // content, the `attr` defaults to `default` and is honored when set. The global layer is
+        // trusted by location, so it is stamped Trusted (the launcher builds it).
+        let r = resolve_no_plugins(
+            raw_flakes(&[
+                ("defaulted", FLAKE_SRC, None),
+                ("explicit", FLAKE_SRC, Some("packages.x86_64-linux.tui")),
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "defaulted").unwrap().backend,
+            Backend::FlakeInline {
+                content: FLAKE_SRC.into(),
+                attr: "default".into(),
+            }
+        );
+        assert_eq!(
+            pkg(&r.packages, "explicit").unwrap().backend,
+            Backend::FlakeInline {
+                content: FLAKE_SRC.into(),
+                attr: "packages.x86_64-linux.tui".into(),
+            }
+        );
+        assert!(r.packages.iter().all(|p| p.state == TrustState::Trusted));
+    }
+
+    #[test]
+    fn an_untrusted_projects_inline_flake_is_stamped_untrusted() {
+        // Trust is recorded, not enforced, at resolve: an untrusted project's inline flake is
+        // present but stamped Untrusted, so the launcher (`flake_inline_packages`, trusted-only)
+        // withholds it — exactly like a `flake:` package.
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((
+                raw_flakes(&[("tool", FLAKE_SRC, None)]),
+                TrustState::Untrusted,
+            )),
+        );
+        assert_eq!(
+            pkg(&r.packages, "tool").unwrap().state,
+            TrustState::Untrusted
+        );
+    }
+
+    #[test]
+    fn a_malformed_inline_flake_is_dropped_with_a_warning() {
+        // An empty `flake` body (could never build) and an invalid output attribute are both
+        // dropped fail-closed, each with a warning; a well-formed sibling survives.
+        let r = resolve_no_plugins(
+            raw_flakes(&[
+                ("empty", "   \n", None),
+                ("badattr", FLAKE_SRC, Some("has space")),
+                ("ok", FLAKE_SRC, None),
+            ]),
+            None,
+        );
+        assert!(pkg(&r.packages, "empty").is_none());
+        assert!(pkg(&r.packages, "badattr").is_none());
+        assert!(pkg(&r.packages, "ok").is_some());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("empty") && w.contains("flake")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("badattr") && w.contains("attribute")));
+    }
+
+    #[test]
+    fn a_name_in_both_packages_and_flakes_warns_and_the_inline_flake_wins() {
+        // Declaring one name in both `[packages]` and `[flakes]` is a mistake — warn, and resolve
+        // to the `[flakes]` inline source (applied last), never a silent drop.
+        let mut raw = raw_packages(&[("dup", "nix:jq")]);
+        raw.flakes.insert(
+            "dup".to_string(),
+            RawInlineFlake {
+                flake: FLAKE_SRC.to_string(),
+                attr: None,
+            },
+        );
+        let r = resolve_no_plugins(raw, None);
+        assert!(matches!(
+            pkg(&r.packages, "dup").unwrap().backend,
+            Backend::FlakeInline { .. }
+        ));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("dup") && w.contains("both")));
+    }
+
+    #[test]
+    fn apply_flakes_refuses_an_untrusted_override_of_a_trusted_tool() {
+        // The flagship integrity guard, at the tool granularity: with `protect_trusted`, an
+        // untrusted layer's inline flake may not replace a tool a trusted layer already supplied
+        // (else an untrusted project could swap a trusted app's tool for its own build), but it may
+        // add a new one.
+        let mut out = vec![Package {
+            name: "guarded".into(),
+            backend: Backend::Nix("jq".into()),
+            state: TrustState::Trusted,
+        }];
+        let mut warnings = Vec::new();
+        let flakes: BTreeMap<String, RawInlineFlake> =
+            [("guarded", FLAKE_SRC), ("fresh", FLAKE_SRC)]
+                .into_iter()
+                .map(|(n, c)| {
+                    (
+                        n.to_string(),
+                        RawInlineFlake {
+                            flake: c.to_string(),
+                            attr: None,
+                        },
+                    )
+                })
+                .collect();
+        apply_flakes(
+            &mut out,
+            &mut warnings,
+            "project",
+            flakes,
+            TrustState::Untrusted,
+            true,
+        );
+        // The trusted tool is untouched; the new one is added (untrusted, withheld at launch).
+        assert_eq!(
+            pkg(&out, "guarded").unwrap().backend,
+            Backend::Nix("jq".into())
+        );
+        assert!(matches!(
+            pkg(&out, "fresh").unwrap().backend,
+            Backend::FlakeInline { .. }
+        ));
+        assert!(warnings.iter().any(|w| w.contains("guarded")));
+    }
+
     #[test]
     fn a_deb_prefixed_package_parses_as_a_deb_backend_and_requires_https_dot_deb() {
         // `deb:<url>` routes to the host-side prebuilt-.deb provisioner. Must be an `https://` URL
@@ -7822,6 +8120,49 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn an_appimage_prefixed_package_parses_as_an_appimage_backend() {
+        // `appimage:<url>` / `appimage:github:<owner>/<repo>` routes to the host-side prebuilt-AppImage
+        // provisioner. A direct URL must be `https://` ending in `.AppImage` (case-insensitively) and
+        // carry no shell/nix metacharacter; the `github:` form reuses the shared locator validator.
+        let r = resolve_no_plugins(
+            raw_packages(&[
+                (
+                    "t3code",
+                    "appimage:https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage",
+                ),
+                ("t3repo", "appimage:github:pingdotgg/t3code"),
+                ("plain", "appimage:http://example.com/x.AppImage"), // not https: refused
+                ("notimg", "appimage:https://example.com/x.deb"),    // wrong extension: refused
+                ("spacey", "appimage:https://example.com/a b.AppImage"), // whitespace: refused
+                ("badrepo", "appimage:github:only"),                 // one segment: refused
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "t3code").unwrap().backend,
+            Backend::AppImage(
+                "https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage".into()
+            )
+        );
+        assert_eq!(
+            pkg(&r.packages, "t3repo").unwrap().backend,
+            Backend::AppImage("github:pingdotgg/t3code".into())
+        );
+        for refused in ["plain", "notimg", "spacey", "badrepo"] {
+            assert!(
+                pkg(&r.packages, refused).is_none(),
+                "{refused} should be refused"
+            );
+        }
+        // the validator directly: `.AppImage` and lowercase `.appimage` both accepted.
+        assert!(is_valid_appimage_url("https://e/App-1.0-x86_64.AppImage"));
+        assert!(is_valid_appimage_url("https://e/app.appimage"));
+        assert!(!is_valid_appimage_url("http://e/x.AppImage")); // not https
+        assert!(!is_valid_appimage_url("https://e/x.deb")); // wrong extension
+        assert!(!is_valid_appimage_url("https://e/a b.AppImage")); // whitespace
     }
 
     #[test]

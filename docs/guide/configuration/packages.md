@@ -27,6 +27,7 @@ nix.
 | `mise:<token>` | in-cage, via `mise use -g` | upstream-direct, fetched at launch | first launch needs network |
 | `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `ops upgrade flake` | after a warm build |
 | `deb:<url>` | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `ops upgrade deb` | yes (seeded, durable) |
+| `appimage:<url>` | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `ops upgrade appimage` | yes (seeded, durable) |
 
 ### `nix:` — a nixpkgs attribute
 
@@ -78,6 +79,41 @@ nix's fetcher is blocked under a filtering posture — prefer a release binary v
 `mise:github:` for such tools. Pins advance with
 [`ops upgrade flake`](../housekeeping/upgrade.md).
 
+## `[flakes]` — an inline nix flake
+
+When a tool ships **only** as a flake you author yourself — or you want to package a
+one-off build without hosting a separate repo — write the whole `flake.nix` **inline** in a
+`[flakes.<name>]` table instead of referencing an external `flake:<ref>`:
+
+```toml
+[flakes.mytool]
+attr = "default"          # optional, the output to build (defaults to "default")
+flake = '''
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  outputs = { self, nixpkgs }: {
+    packages.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.hello;
+  };
+}
+'''
+```
+
+ops stages the source to a directory, binds it **read-only** into the cage, and builds
+`path:<dir>#<attr>` **in-cage** — exactly the same containment as a `flake:` package, applied to
+arbitrary inline build source. The out-link's `bin/` is prepended to `PATH`, and the out-link is
+keyed by the source's **content hash**, so **editing the flake in the config rebuilds** at the next
+launch while an unchanged flake reuses the warm build. It is folded into the same tool set as
+`[packages]` (the name is the merge key), so a name declared in both `[packages]` and `[flakes]` is
+a mistake — ops warns and the inline flake wins.
+
+A dedicated section (not a `[packages]` value) because a full `flake.nix` is a bulky multiline
+string, and TOML forbids adding scalar keys to `[packages]` once one of its subtables is opened.
+
+An inline flake **floats**: it has no persisted lock and no `ops upgrade` path, so **pin the inputs
+inside the `flake.nix`** (e.g. `nixpkgs.url = "github:NixOS/nixpkgs/<rev>"`) for a reproducible
+build. Like `flake:`, the first build needs network **and** the build's own fetch hosts in the
+[egress allowlist](../networking/rules.md). A security field, honored only from a trusted source.
+
 ### `deb:` — a prebuilt Debian package
 
 ```toml
@@ -96,19 +132,38 @@ cage allowlist), and `ops upgrade deb` re-resolves it forward. Pairs with
 [`gui = "wayland"`](gui.md) for the display; ops seeds its MITM CA into the cage's NSS store so
 the Chromium app trusts a filtering posture's proxy.
 
-## Why all four are trusted-only
+### `appimage:` — a prebuilt AppImage
 
-Loosening `packages` to an untrusted project would let it override a trusted app's
-package and run attacker code under that app's posture — the same class of hole as
-overriding a trusted app's command. So all four backends are gated. A trusted app's
-package **survives an untrusted project's override attempt** (the flagship "agent on
-untrusted code" property). The open self-equip path stays [`ops mise`](../cli/mise.md)
+```toml
+[packages]
+t3code = "appimage:github:pingdotgg/t3code"
+```
+
+The sibling of `deb:`, for a GUI/desktop app distributed **only as an `.AppImage`**. ops resolves
+the URL to a content hash (pinned in a per-project `appimage-packages.lock`) and builds a generated
+derivation that **extracts the AppImage's squashfs at build time** and `autoPatchelfHook`s its
+Electron/Chromium binaries against the same curated library set — **host-side**, seeded and
+offline-reusable. The AppImage is **never self-mounted at runtime**: `appimage-run`/`wrapType2`/the
+raw AppImage all rely on a runtime FUSE/namespace mount that the cage's seccomp denylist blocks, so
+build-time extraction is the only mechanism that runs in-cage. Two forms: a direct `https://` URL
+ending in `.AppImage`, or `appimage:github:<owner>/<repo>` — which tracks the newest release's
+linux `.AppImage` asset (so a version-embedding asset name still rolls forward). `ops upgrade
+appimage` re-resolves it. Pairs with [`gui = "wayland"`](gui.md), [`gpu = true`](gpu.md), and
+[`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
+
+## Why the tool sources are trusted-only
+
+Loosening `packages` (or the inline `[flakes]`) to an untrusted project would let it override
+a trusted app's tool and run attacker code under that app's posture — the same class of hole as
+overriding a trusted app's command. So all five `[packages]` backends **and** inline `[flakes]`
+are gated. A trusted app's tool **survives an untrusted project's override attempt** (the flagship
+"agent on untrusted code" property). The open self-equip path stays [`ops mise`](../cli/mise.md)
 and a project's [`[tools]`](tools.md).
 
 ## `[packages]` vs `[tools]`
 
 - `[packages]` is a **global, durable declaration** (`mise use -g`, `nix:` into the
-  store, `flake:` build). It is trusted-only.
+  store, `flake:` build); `[flakes]` is its inline-source sibling. Both are trusted-only.
 - [`[tools]`](tools.md) (a project mise file) is the **local, project-scoped**
   self-equip path (`mise install`), auto-equipped at launch under an open posture.
 
@@ -130,6 +185,6 @@ OPS_PACKAGE_ripgrep=mise:aqua:BurntSushi/ripgrep ops shell
 ```
 
 The value carries the same mandatory backend prefix as the field
-(`nix:`/`mise:`/`flake:`/`deb:`). A one-shot package *adds* to whatever the config declares.
+(`nix:`/`mise:`/`flake:`/`deb:`/`appimage:`). A one-shot package *adds* to whatever the config declares.
 The command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides.md).

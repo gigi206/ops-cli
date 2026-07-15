@@ -3327,6 +3327,123 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
     );
 }
 
+#[test]
+fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
+    // The load-bearing proof of the `[flakes.<name>]` inline-flake backend, in two phases.
+    //
+    // PHASE 1 (cold build): an app whose tool is an inline `[flakes.hello]` — a full `flake.nix`
+    // written directly in the config — has that source staged, bound read-only into the cage, and
+    // built with `nix build path:<dir>#<attr>` **in-cage** at the `ops app` launch (the same
+    // containment as a `flake:` package, applied to arbitrary inline build source). The flake pins
+    // its nixpkgs input to a revision and builds `hello`; "Hello, world!" through the empty-netns
+    // MITM proves the parse → stage → bind → in-cage build → out-link-on-PATH → run chain.
+    //
+    // PHASE 2 (edit → rebuild): the *same* app is re-launched after EDITING the inline flake to
+    // produce a different `hello` (a script printing a marker). This is the property inline exists
+    // for — editing the flake right in the config — and the one the name-keyed out-link would have
+    // silently broken (the warm short-circuit would run the stale build). The out-link is keyed by
+    // the source's content hash, so the edit rebuilds: the NEW marker must print and the OLD
+    // "Hello, world!" must NOT. Same pinned nixpkgs input (cached from phase 1), so the rebuild
+    // only compiles a tiny script.
+    //
+    // Short tags keep the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or
+    // network.
+    let project = TmpDir::new("ifk-proj");
+    let data = TmpDir::new("ifk-data");
+    let state = TmpDir::new("ifk-state");
+    const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+    // `body` is the `default` output expression; the rest of the flake is fixed. A quoted heredoc
+    // delimiter is not needed — the whole file is an ops-owned literal here, no shell interpolation.
+    let toml = |body: &str| {
+        format!(
+            "[app.fk]\n\
+             cmd = [\"hello\"]\n\
+             [app.fk.flakes.hello]\n\
+             flake = '''\n\
+             {{\n\
+               inputs.nixpkgs.url = \"github:NixOS/nixpkgs/{REV}\";\n\
+               outputs = {{ self, nixpkgs }}:\n\
+                 let pkgs = nixpkgs.legacyPackages.x86_64-linux;\n\
+                 in {{ packages.x86_64-linux.default = {body}; }};\n\
+             }}\n\
+             '''\n\
+             [app.fk.network]\n\
+             mode = \"deny\"\n\
+             allow = [\"cache.nixos.org\"]\n"
+        )
+    };
+    let phase1 = toml("pkgs.hello");
+    let phase2 = toml("pkgs.writeShellScriptBin \"hello\" \"echo INLINE-REBUILD-OK\"");
+    std::fs::write(project.path().join(".ops.toml"), &phase1).unwrap();
+
+    // capability probe (untrusted → shared net); also seeds the project store once.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping inline-flake e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping inline-flake e2e: the network is unreachable");
+        return;
+    }
+
+    let trust = |project: &Path| {
+        // Trust so the app's inline `[flakes]` and its network posture (both security fields) are
+        // honored; editing the file re-arms the gate, hence trusting per phase.
+        let t = ops_in(project, data.path(), state.path(), &["trust", ".ops.toml"]);
+        assert!(
+            t.status.success(),
+            "ops trust failed: {}",
+            String::from_utf8_lossy(&t.stderr)
+        );
+    };
+    let launch = || ops_in(project.path(), data.path(), state.path(), &["app", "fk"]);
+
+    // PHASE 1 — cold in-cage build of the inline flake.
+    trust(project.path());
+    let cold = launch();
+    let cold_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&cold.stderr),
+        String::from_utf8_lossy(&cold.stdout)
+    );
+    if !cold.status.success() && transient_fetch_failure(&cold_log) {
+        eprintln!("skipping inline-flake e2e: transient nix download fault: {cold_log}");
+        return;
+    }
+    assert!(
+        cold.status.success() && String::from_utf8_lossy(&cold.stdout).contains("Hello, world!"),
+        "phase 1: an inline `[flakes]` app must stage the flake, bind it read-only, build it in-cage \
+         with `nix build path:<dir>#<attr>`, and run it: {cold_log}"
+    );
+
+    // PHASE 2 — edit the inline flake; the content-hash-keyed out-link must rebuild the NEW output.
+    std::fs::write(project.path().join(".ops.toml"), &phase2).unwrap();
+    trust(project.path());
+    let edited = launch();
+    let edited_out = String::from_utf8_lossy(&edited.stdout).into_owned();
+    let edited_log = format!("{}{edited_out}", String::from_utf8_lossy(&edited.stderr));
+    if !edited.status.success() && transient_fetch_failure(&edited_log) {
+        eprintln!(
+            "skipping inline-flake e2e: transient nix download fault on rebuild: {edited_log}"
+        );
+        return;
+    }
+    assert!(
+        edited.status.success() && edited_out.contains("INLINE-REBUILD-OK"),
+        "phase 2: editing the inline flake must rebuild (a fresh content hash → a new out-link the \
+         warm short-circuit misses), so the NEW output runs: {edited_log}"
+    );
+    assert!(
+        !edited_out.contains("Hello, world!"),
+        "phase 2: the stale build must NOT run — an edited inline flake reusing the old out-link is \
+         exactly the bug the content-hash keying prevents: {edited_log}"
+    );
+}
+
 /// The names under the (single) project default home's flake out-link directory, in `data`.
 /// `ops run` builds a `flake:` package's out-link here; the name reveals whether the launch chose
 /// the rev-keyed (locked) form or the floating one.
@@ -5348,14 +5465,13 @@ fn ops_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     touch_under(&ops_dir.join("apps/codex/home/state"));
     touch_under(&ops_dir.join("projects/testproj/store/nix/keepme"));
 
-    // `ops app list` shows the installed homes, so a user can see what there is to purge.
+    // `ops app list` shows one row per app with its installed home, so a user can see what there is
+    // to purge. The unified table carries the `HOME` column header and a row for each installed app.
     let listed = ops_data(data.path(), &["app", "list"]);
     assert!(listed.status.success(), "app list failed: {listed:?}");
     let list_out = String::from_utf8_lossy(&listed.stdout);
     assert!(
-        list_out.contains("installed app homes")
-            && list_out.contains("claude")
-            && list_out.contains("codex"),
+        list_out.contains("HOME") && list_out.contains("claude") && list_out.contains("codex"),
         "app list did not report the installed homes:\n{list_out}"
     );
 

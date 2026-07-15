@@ -1433,19 +1433,25 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     // this prunes those so the sweep reclaims them. The current set spans every runtime — the
     // baseline and each app's merged packages — so a flake package declared only in an app keeps
     // its root.
-    let mut flake_names: std::collections::BTreeSet<String> =
-        super::packages::flake_packages(&prep.cfg.packages)
+    // Inline `[flakes.<name>]` flakes register the same `ops-flake-<name>` gcroot as a `flake:`
+    // package, so their names belong in the keep-set too, or the sweep would prune a live inline
+    // flake's root.
+    let flake_root_names = |pkgs: &[crate::config::Package]| {
+        super::packages::flake_packages(pkgs)
             .into_iter()
             .map(|(name, _)| name)
-            .collect();
+            .chain(
+                super::packages::flake_inline_packages(pkgs)
+                    .into_iter()
+                    .map(|(name, _, _)| name),
+            )
+    };
+    let mut flake_names: std::collections::BTreeSet<String> =
+        flake_root_names(&prep.cfg.packages).collect();
     for app in prep.cfg.apps.values() {
         let mut merged = prep.cfg.clone();
         merged.merge_app(app.clone());
-        flake_names.extend(
-            super::packages::flake_packages(&merged.packages)
-                .into_iter()
-                .map(|(name, _)| name),
-        );
+        flake_names.extend(flake_root_names(&merged.packages));
     }
     let pruned = super::gc::prune_flake_roots(&store_dir, &flake_names, prune).len();
 
@@ -1527,6 +1533,24 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
                 eprintln!("ops gc: cannot provision deb package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // `appimage:` packages are host-side like `deb:`/`nix:`, so their roots join the gc seed too.
+    for (name, url) in super::packages::appimage_packages(&prep.cfg.packages) {
+        match super::appimage::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &url,
+        ) {
+            Ok((_, root)) => packages.roots.push(root),
+            Err(e) => {
+                eprintln!("ops gc: cannot provision appimage package `{name}` ({url}): {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2270,6 +2294,31 @@ fn build(
         }
     }
 
+    // `appimage:` packages are provisioned host-side too (the exact `deb:` shape — the AppImage's
+    // squashfs is extracted at build time, never self-mounted at runtime, which the seccomp cage
+    // forbids): resolve the URL to a hash (pinned in the per-project lock), build the generated
+    // extract+autoPatchelf derivation into ops's store, prepend its bin to PATH, and seed its
+    // closure. A declared package is a requirement — a provisioning failure aborts the launch.
+    for (name, url) in super::packages::appimage_packages(&prep.cfg.packages) {
+        match super::appimage::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &url,
+        ) {
+            Ok((bin, root)) => {
+                bin_paths.push(bin);
+                packages.roots.push(root);
+            }
+            Err(e) => {
+                eprintln!("ops: cannot provision appimage package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
     // `flake:` packages are built in-cage at launch (below), not host-provisioned, but their
     // out-link `bin` directories join PATH now — ahead of the base, like every other declared
     // tool. The out-link need not exist yet: the in-cage `nix build` creates it before the
@@ -2295,6 +2344,36 @@ fn build(
         let out_link = flake_out_link_for(name, reference, &flake_lock);
         bin_paths.push(out_link.join("bin"));
         flake_pairs.push((build_ref, out_link, name.clone()));
+    }
+
+    // Inline `[flakes.<name>]` flakes: stage each `flake.nix` to a content-keyed directory on disk,
+    // bind it read-only into the cage at `/opt/ops/flakes/<name>`, and build `path:<dir>#<attr>`
+    // through the *same* in-cage wrap as a `flake:` package (appended to `flake_pairs`). The out-link
+    // is keyed by the source's content hash, so editing the flake in the config rebuilds at the next
+    // launch — a fresh hash the warm short-circuit misses — while an unchanged flake reuses the warm
+    // build. Trusted-only, like `flake_packages`. Best-effort: a staging failure warns and skips that
+    // one flake rather than failing the launch.
+    let mut inline_flake_binds: Vec<binds::ExtraBind> = Vec::new();
+    for (name, content, attr) in super::packages::flake_inline_packages(&prep.cfg.packages) {
+        let (dir, hash) = match super::flake_inline::stage(prep.layout.data_dir(), &content) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "inline flake `{name}` could not be staged ({e}) — skipping it"
+                ));
+                continue;
+            }
+        };
+        let incage = binds::flake_inline_incage(&name);
+        let build_ref = format!("path:{}#{attr}", incage.display());
+        let out_link = binds::flake_out_link_hash(&name, &hash);
+        inline_flake_binds.push(binds::ExtraBind {
+            src: dir,
+            dest: incage,
+            writable: false,
+        });
+        bin_paths.push(out_link.join("bin"));
+        flake_pairs.push((build_ref, out_link, name));
     }
 
     // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
@@ -2898,6 +2977,7 @@ fn build(
     let mut extra_binds = egress_binds;
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
+    extra_binds.extend(inline_flake_binds);
 
     // Pin ops's own control plane in place whenever a read-write bind contains it: each root's host
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
@@ -3253,9 +3333,10 @@ fn wrap_mise_equip(
     out
 }
 
-/// Wrap `cmd` so the cage builds a set of `flake:` packages before running it: a static bash
-/// that, for each `(ref, out-link, key)` triple, runs `nix build <ref> --out-link <out-link>`
-/// unless the out-link is already realised, registers a host-resolvable gc root for the build,
+/// Wrap `cmd` so the cage builds a set of flake packages before running it: a static bash
+/// that, for each `(ref, out-link, key)` triple, runs `nix build <ref> --no-write-lock-file
+/// --out-link <out-link>` unless the out-link is already realised, registers a host-resolvable gc
+/// root for the build,
 /// then `exec`s the real command (which stays the cage's main process, leaving `ops shell`'s pty
 /// job control unchanged). Only the absolute `nix` path, the out-link parent directory, and the
 /// integer triple count are interpolated into the script — the refs, out-links, and keys ride
@@ -3289,7 +3370,7 @@ fn wrap_flake_equip(
          n={n}\n\
          while [ \"$n\" -gt 0 ]; do\n\
          out=\"$2\"\n\
-         [ -e \"$out/bin\" ] || '{nix}' build \"$1\" --out-link \"$out\" 1>&2\n\
+         [ -e \"$out/bin\" ] || '{nix}' build \"$1\" --no-write-lock-file --out-link \"$out\" 1>&2\n\
          sp=$(readlink -f \"$out\" 2>/dev/null)\n\
          [ -n \"$sp\" ] && mkdir -p /nix/var/nix/gcroots \
          && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/ops-flake-$3\"\n\
@@ -4596,7 +4677,8 @@ mod tests {
         // presence short-circuits the build; the command is exec'd after the triples are shifted.
         assert!(script.contains("n=2"));
         assert!(script.contains(
-            "[ -e \"$out/bin\" ] || '/nix/store/nix/bin/nix' build \"$1\" --out-link \"$out\""
+            "[ -e \"$out/bin\" ] || '/nix/store/nix/bin/nix' build \"$1\" \
+             --no-write-lock-file --out-link \"$out\""
         ));
         assert!(script.contains("mkdir -p '/home/sandbox/.local/state/ops/flake'"));
         // the gc root is keyed by the `$3` positional (the package name), targeting the build's

@@ -633,6 +633,29 @@ pub(crate) fn flake_out_link_rev(name: &str, rev: &str) -> PathBuf {
     flake_roots_dir().join(format!("{name}-{rev}"))
 }
 
+/// The content-hash-keyed in-cage out-link for the inline flake `name` whose source hashes to
+/// `hash` — the analogue of [`flake_out_link_rev`] for an inline `[flakes.<name>]`, which has no
+/// revision to key by. Editing the flake changes the hash, so the out-link path is absent and the
+/// warm short-circuit rebuilds (the stale build is left unrooted, so `ops gc` reclaims it). `name`
+/// is a validated package name and `hash` is hex, so neither escapes [`flake_roots_dir`].
+///
+/// Residual (the same class as the rev-keyed remote out-links, but accruing per *edit* rather than
+/// per `ops upgrade`): each edit leaves the old `<name>-<oldhash>` symlink dangling in the home. The
+/// store path it pointed at is reclaimed (its `ops-flake-<name>` gcroot was re-pointed to the new
+/// build), so only the dead symlink lingers; re-editing back to a prior source reuses its surviving
+/// out-link. Cleaning the dead symlinks is an `ops gc` concern, not a per-launch one.
+pub(crate) fn flake_out_link_hash(name: &str, hash: &str) -> PathBuf {
+    flake_roots_dir().join(format!("{name}-{hash}"))
+}
+
+/// Where an inline `[flakes.<name>]` flake's staged directory is bound read-only inside the cage,
+/// so the in-cage `nix build path:<this>#<attr>` reads exactly the trusted source. Under `/opt/ops`,
+/// beside the mise plugin and synthetic rc, colliding with no structural mount. `name` is a
+/// validated package name (no path separators), so this never escapes `/opt/ops/flakes`.
+pub(crate) fn flake_inline_incage(name: &str) -> PathBuf {
+    PathBuf::from(format!("/opt/ops/flakes/{name}"))
+}
+
 /// Where the synthetic interactive-shell rc is bound read-only. `ops shell` starts
 /// bash with `--rcfile` pointing here, so mise is activated in the interactive shell —
 /// mise's documented interactive mechanism (a prompt hook that manages PATH/env for the

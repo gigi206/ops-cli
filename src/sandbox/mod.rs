@@ -6,6 +6,7 @@
 //! function of the Spec. So whatever reaches bubblewrap was declared in one
 //! place — a security review has a single surface to audit.
 
+mod appimage;
 mod argv;
 mod attach;
 mod audio;
@@ -19,6 +20,7 @@ pub(crate) mod egress;
 pub(crate) mod egress_stats;
 mod fhs;
 mod flake;
+mod flake_inline;
 mod fonts;
 mod forward;
 mod gc;
@@ -33,6 +35,7 @@ mod nixhub;
 mod notify_relay;
 mod packages;
 mod portal;
+mod prebuilt;
 mod projectstore;
 mod proxy;
 mod resolver;
@@ -42,6 +45,10 @@ mod smoke;
 mod spec;
 mod theme_relay;
 
+pub(crate) use appimage::{
+    pinned_hashes as appimage_pinned_hashes, upgrade as upgrade_appimage,
+    withheld as withheld_appimage_packages, AppImageUpgrade,
+};
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use deb::{

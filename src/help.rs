@@ -567,7 +567,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "ops upgrade [all|nix|mise|flake|deb]",
+        synopsis: "ops upgrade [all|nix|mise|flake|deb|appimage]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             ("all", "roll every managed channel (the default)"),
@@ -581,6 +581,7 @@ const PAGES: &[Page] = &[
             ),
             ("flake", "the project's and apps' flake: packages"),
             ("deb", "the project's and apps' deb: packages"),
+            ("appimage", "the project's and apps' appimage: packages"),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
             versions advance only here, never on an ops binary update.",
@@ -747,13 +748,14 @@ const PAGES: &[Page] = &[
     Page {
         path: &["app", "list"],
         synopsis: "ops app list  (alias: ops app ls)",
-        summary: "list imported profiles and installed app homes",
+        summary: "list apps with their profile and installed home",
         options: &[],
         details:
-            "Two things, by name: the imported profiles `import`/`rm` manage, and the apps with an\n\
-            installed home on disk (their mise tools + login state, with disk size) — which\n\
-            `ops app rm <name> --purge` removes. An app can have a profile with no home yet, or a\n\
-            home with no profile. `ops app ls` is the same command. The full resolved app set —\n\
+            "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
+            whether it has an installed home on disk (its mise tools + login state, with disk size)\n\
+            — which `ops app rm <name> --purge` removes. An app can have a profile with no home yet\n\
+            (never launched), or a home with no profile (launched from an inline/project app, or a\n\
+            profile since removed). `ops app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `ops config show`.",
     },
     // ---- test subcommands ---------------------------------------------------------

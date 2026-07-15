@@ -20,52 +20,13 @@
 //! the pin offline — the launch hot path never touches GitHub. `ops upgrade` re-resolves each
 //! declared source forward (re-querying GitHub for the `github:` form) and rewrites the lock.
 
+use super::prebuilt::{self, ELECTRON_LIBS};
 use crate::store::{self, Layout};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 const DEB_LOCK: &str = "deb-packages.lock";
-
-/// The Electron/Chromium runtime library set the generated derivation autoPatchelfs a desktop
-/// `.deb` against — nixpkgs attribute paths, grounded on a working Electron app's dependency set.
-/// `musl` satisfies the musl-variant native node addons that ship beside the glibc ones; the
-/// derivation additionally ignores the musl *loader* reference (see [`derivation_expr`]).
-const ELECTRON_LIBS: &[&str] = &[
-    "alsa-lib",
-    "at-spi2-atk",
-    "at-spi2-core",
-    "atk",
-    "cairo",
-    "cups",
-    "dbus",
-    "expat",
-    "gdk-pixbuf",
-    "glib",
-    "gtk3",
-    "libcap_ng",
-    "libdrm",
-    "libGL",
-    "libnotify",
-    "libseccomp",
-    "libsecret",
-    "libxkbcommon",
-    "mesa",
-    "musl",
-    "ncurses",
-    "nspr",
-    "nss",
-    "pango",
-    "libx11",
-    "libxcb",
-    "libxcomposite",
-    "libxdamage",
-    "libxext",
-    "libxfixes",
-    "libxrandr",
-    "libxshmfence",
-];
 
 /// A locked `deb:` package, keyed in the lock by its declared *locator* (the `.deb` URL, or a
 /// `github:<owner>/<repo>`). `url` is the concrete `.deb` the pin resolved to (== the locator for a
@@ -122,15 +83,6 @@ pub(crate) enum DebUpgrade {
     },
 }
 
-/// An SRI SHA-256 hash string as `nix store prefetch-file` emits (`sha256-<base64>`).
-fn is_sri(s: &str) -> bool {
-    s.strip_prefix("sha256-").is_some_and(|b| {
-        !b.is_empty()
-            && b.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
-    })
-}
-
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
     layout
         .data_dir()
@@ -151,7 +103,7 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin
     for line in text.lines() {
         let mut it = line.splitn(3, '\t');
         if let (Some(key), Some(hash)) = (it.next(), it.next()) {
-            if !key.is_empty() && is_sri(hash) {
+            if !key.is_empty() && prebuilt::is_sri(hash) {
                 let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
                 map.insert(
                     key.to_string(),
@@ -251,7 +203,7 @@ pub(crate) fn resolve_source(
             let url = select_deb_asset(&json, system).ok_or_else(|| {
                 io::Error::other(format!(
                     "no linux {} `.deb` asset in the latest release of {owner}/{repo}",
-                    deb_arch_label(system)
+                    prebuilt::arch_label(system)
                 ))
             })?;
             if !crate::config::is_valid_deb_url(&url) {
@@ -263,7 +215,7 @@ pub(crate) fn resolve_source(
             url
         }
     };
-    let hash = prefetch_hash(nix, layout, &url)?;
+    let hash = prebuilt::prefetch_hash(nix, layout, &url)?;
     Ok((url, hash))
 }
 
@@ -273,7 +225,7 @@ pub(crate) fn resolve_source(
 /// (deterministic by name); a single unambiguous `.deb` with no arch token is the fallback for a
 /// single-arch repo. Pure, so selection is testable against captured release JSON.
 fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
-    let (accept, reject) = arch_tokens(system);
+    let (accept, reject) = prebuilt::arch_tokens(system);
     let mut native: Vec<(String, String)> = json
         .get("assets")?
         .as_array()?
@@ -291,60 +243,6 @@ fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
         .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
         .or_else(|| native.first().filter(|_| native.len() == 1))
         .map(|(_, url)| url.clone())
-}
-
-/// The architecture name tokens for `system`: `(accepted, rejected)`. An asset whose lowercased
-/// name contains an accepted token is a native build; one containing a rejected token is foreign.
-fn arch_tokens(system: &str) -> (Vec<&'static str>, Vec<&'static str>) {
-    let x86 = vec!["amd64", "x86_64", "x86-64", "x64"];
-    let arm = vec!["arm64", "aarch64"];
-    let other = vec![
-        "armhf", "armv7", "armv7l", "i386", "i686", "riscv64", "ppc64", "s390x",
-    ];
-    if system.starts_with("aarch64") {
-        (arm, [x86, other].concat())
-    } else {
-        (x86, [arm, other].concat())
-    }
-}
-
-/// The Debian architecture label for `system`, for the "no matching asset" error message.
-fn deb_arch_label(system: &str) -> &'static str {
-    if system.starts_with("aarch64") {
-        "arm64"
-    } else {
-        "amd64"
-    }
-}
-
-/// Resolve a concrete `.deb` URL to its SRI content hash via `nix store prefetch-file`, which
-/// follows redirects (so a `…/releases/latest/download/…` URL resolves to the current asset) and
-/// adds the file to ops's store. Pure fetch — no code runs.
-fn prefetch_hash(nix: &Path, layout: &Layout, url: &str) -> io::Result<String> {
-    let mut cmd = store::nix_command(nix, layout);
-    cmd.args(["--extra-experimental-features", "nix-command flakes"])
-        .args(["store", "prefetch-file", "--json"])
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let out = cmd.spawn()?.wait_with_output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nix store prefetch-file {url} failed"
-        )));
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| io::Error::other(format!("prefetch-file returned invalid JSON: {e}")))?;
-    let hash = v
-        .get("hash")
-        .and_then(|h| h.as_str())
-        .ok_or_else(|| io::Error::other("prefetch-file JSON has no `hash`"))?;
-    if !is_sri(hash) {
-        return Err(io::Error::other(format!(
-            "prefetch-file returned a non-SRI hash: {hash}"
-        )));
-    }
-    Ok(hash.to_string())
 }
 
 /// The generated nix expression building one `deb:` package: fetch the pinned `.deb`, unpack it, and
@@ -378,21 +276,17 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   installPhase = ''
     mkdir -p $out
     cp -r extracted/. "$out"
-    asar=$(find $out -type f -name app.asar -path '*/resources/*' | sort | head -1)
-    [ -n "$asar" ] || { echo "deb: no Electron resources/app.asar found in @NAME@" >&2; exit 1; }
-    appdir=$(dirname "$(dirname "$asar")")
-    main=$(find "$appdir" -maxdepth 1 -type f -executable \
-      ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
-      ! -name '*.so' ! -name '*.so.*' | sort | head -1)
-    [ -n "$main" ] || { echo "deb: no launcher binary found in $appdir" >&2; exit 1; }
-    mkdir -p $out/bin
-    makeWrapper "$main" "$out/bin/@NAME@" \
-      --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}"
+@WRAP@
   '';
   meta.mainProgram = "@NAME@";
 })
 "#;
+    // The `.deb` binary lives under its own prefix and finds its sibling `.so`s via RUNPATH, so the
+    // wrapper's `LD_LIBRARY_PATH` is just the buildInputs closure — no bundle-root prefix (unlike an
+    // AppImage, whose Chromium `.so`s sit loose beside the launcher).
+    let wrap = prebuilt::electron_wrap(name, "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}");
     TEMPLATE
+        .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
         .replace("@LIBS@", &ELECTRON_LIBS.join(" "))
@@ -574,14 +468,6 @@ mod tests {
     use crate::testutil::TmpDir;
 
     const HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
-
-    #[test]
-    fn is_sri_accepts_prefetch_output_and_rejects_junk() {
-        assert!(is_sri(HASH));
-        assert!(!is_sri("jBGtMS5l"));
-        assert!(!is_sri("sha256-"));
-        assert!(!is_sri("md5-abc"));
-    }
 
     #[test]
     fn the_generated_derivation_pins_the_source_and_wraps_the_electron_launcher() {

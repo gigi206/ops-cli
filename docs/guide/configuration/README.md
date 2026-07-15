@@ -39,6 +39,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `env` | free | [env](env.md) |
 | `binds` | security | [binds](binds.md) |
 | `packages` | security | [packages](packages.md) |
+| `[flakes.<name>]` | security | [packages](packages.md#flakes--an-inline-nix-flake) |
 | `nixpkgs` | security | [nixpkgs](nixpkgs.md) |
 | `[limits]` | security | [limits](limits.md) |
 | `[seccomp]` | security | [seccomp](seccomp.md) |

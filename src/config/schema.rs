@@ -30,6 +30,16 @@ pub(crate) struct RawConfig {
     /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, String>,
+    /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
+    /// written directly in the config (the `flake` field, a multiline string) plus an optional
+    /// output `attr` (default `"default"`); ops stages it, binds it read-only into the cage, and
+    /// builds `path:<dir>#<attr>` **in-cage** exactly like a `flake:` package, folding it into the
+    /// same tool set (the name is the merge key and the on-disk root name). A security field like
+    /// `packages` — arbitrary nix build source, honored only from a trusted source. Distinct from
+    /// `[packages]` so a bulky multiline flake reads clearly and never trips the TOML rule that
+    /// forbids adding scalar keys to a table after one of its subtables is opened.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
     /// Override the nixpkgs reference the tools resolve against: a branch/channel
     /// (`nixos-23.11`) or a 40-hex revision under `NixOS/nixpkgs`. A security field
     /// — honored from the global config or a trusted project, ignored from an
@@ -274,6 +284,12 @@ pub(crate) struct RawApp {
     /// same name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) packages: BTreeMap<String, String>,
+    /// Inline nix flakes for this app, declared as `[app.<name>.flakes.<tool>]` (or a top-level
+    /// `[flakes.<tool>]` in an imported profile). Same shape and gating as the baseline `flakes`
+    /// (see [`RawConfig::flakes`]); folded into the app's tool set beside its `packages`. Skipped
+    /// when empty on serialize, so an app with no inline flake carries no `[flakes]` table.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
     /// The app's GUI posture, overriding the baseline's when set. A security field, like the
@@ -345,6 +361,22 @@ impl RawCmd {
             RawCmd::Argv(argv) => argv,
         }
     }
+}
+
+/// An inline nix flake declared as a `[flakes.<name>]` table: the full `flake.nix` source plus
+/// an optional output attribute. Unlike a `flake:<ref>` package (a reference to an external
+/// flake), the flake source lives directly in the config — ops stages it to a directory, binds it
+/// read-only into the cage, and builds `path:<dir>#<attr>` in-cage. The flake floats: it has no
+/// persisted lock and no `ops upgrade` path, so pin the inputs inside the `flake.nix` itself
+/// (e.g. `nixpkgs.url = "github:NixOS/nixpkgs/<rev>"`) for a reproducible build.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawInlineFlake {
+    /// The `flake.nix` source, verbatim. A multiline TOML string (`'''…'''`) is the natural form.
+    pub(crate) flake: String,
+    /// The flake output attribute to build, the `#<attr>` fragment — e.g. `default` (the ops
+    /// default when unset) or a dotted path like `packages.x86_64-linux.hello`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attr: Option<String>,
 }
 
 /// The `[secret]` section: a reserved `defaults` table plus one entry per destination host.
@@ -774,6 +806,16 @@ mod tests {
             FOO = "bar"
             [packages]
             demo-tool = "mise:aqua:example/demo-tool"
+            [flakes.inline-tool]
+            attr = "default"
+            flake = '''
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  outputs = { self, nixpkgs }: {
+    packages.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.hello;
+  };
+}
+'''
             [network]
             mode = "deny"
             allow = ["api.example.com", "*.nixos.org"]
@@ -812,8 +854,17 @@ mod tests {
             Some("4096")
         );
         assert_eq!(limits.memory_high, None);
+        // The inline flake parses with its multiline `'''…'''` source and explicit attribute.
+        let flake = app
+            .flakes
+            .get("inline-tool")
+            .expect("the [flakes] table parses");
+        assert_eq!(flake.attr.as_deref(), Some("default"));
+        assert!(flake.flake.contains("packages.x86_64-linux.default"));
         let serialized = serialize_app(&app).unwrap();
         let reparsed = parse_app(serialized.as_bytes()).unwrap();
+        // A multiline flake source may re-emit escaped through `toml::to_string`; the round-trip is
+        // on the parsed value, so this proves export→import preserves the flake byte-for-byte.
         assert_eq!(app, reparsed, "export must round-trip losslessly");
     }
 

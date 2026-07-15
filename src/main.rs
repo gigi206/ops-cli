@@ -3556,18 +3556,22 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     }
 }
 
-/// `ops app list`: what is on disk to manage — the imported **profiles** (`import`/`rm` artifacts),
-/// and the apps with an **installed home** (their mise tools + login state, which `--purge` removes).
-/// The two are distinct: an app can have a profile with no home yet (never launched), or a home with
-/// no profile (launched from an inline/project app, or a profile since removed). The full resolved
-/// app set — inline, project, and profile apps with their gating — is `ops config show`.
+/// `ops app list`: what is on disk to manage, one row per app — whether it has an imported
+/// **profile** (`import`/`rm` artifacts) and whether it has an **installed home** (its mise tools +
+/// login state, with disk size, which `--purge` removes). The two are distinct: an app can have a
+/// profile with no home yet (never launched), or a home with no profile (launched from an
+/// inline/project app, or a profile since removed) — so a name may carry a profile, a home, or both.
+/// The full resolved app set — inline, project, and profile apps with their gating — is
+/// `ops config show`.
 fn app_list() -> ExitCode {
+    use std::collections::{BTreeMap, BTreeSet};
+
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
 
     // Imported profiles under <config>/ops/apps/*.toml.
     let profiles_dir = config::profiles_dir();
-    let mut profiles: Vec<String> = Vec::new();
+    let mut profiles: BTreeSet<String> = BTreeSet::new();
     if let Some(dir) = &profiles_dir {
         match std::fs::read_dir(dir) {
             Ok(entries) => {
@@ -3575,7 +3579,7 @@ fn app_list() -> ExitCode {
                     let path = entry.path();
                     if path.extension().and_then(|x| x.to_str()) == Some("toml") {
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            profiles.push(stem.to_string());
+                            profiles.insert(stem.to_string());
                         }
                     }
                 }
@@ -3587,12 +3591,13 @@ fn app_list() -> ExitCode {
             }
         }
     }
-    profiles.sort();
 
     // Installed homes under the data dir (an app can have one with no profile).
     let installed = store::Layout::from_env()
         .map(|l| sandbox::installed_app_homes(l.data_dir()))
         .unwrap_or_default();
+    let homes: BTreeMap<&str, &sandbox::InstalledApp> =
+        installed.iter().map(|a| (a.name.as_str(), a)).collect();
 
     if profiles.is_empty() && installed.is_empty() {
         println!(
@@ -3602,28 +3607,45 @@ fn app_list() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Some(dir) = &profiles_dir {
-        if profiles.is_empty() {
-            println!("{dim}no imported app profiles (in {}){r}", dir.display());
-        } else {
-            println!("{h}imported app profiles{r} (in {n}{}{r}):", dir.display());
-            for name in &profiles {
-                println!("  {n}{name}{r}");
-            }
-        }
+    // One row per app: the union of profile names and installed-home names.
+    let mut names: BTreeSet<&str> = profiles.iter().map(String::as_str).collect();
+    names.extend(homes.keys().copied());
+
+    match &profiles_dir {
+        Some(dir) => println!("{h}apps{r} {dim}(profiles in {}){r}:", dir.display()),
+        None => println!("{h}apps{r}:"),
     }
 
-    if !installed.is_empty() {
-        println!("{h}installed app homes{r} {dim}(remove with --purge){r}:");
-        let width = installed.iter().map(|a| a.name.len()).max().unwrap_or(0);
-        for app in &installed {
-            let padded = format!("{:<width$}", app.name);
-            println!(
-                "  {n}{padded}{r}  {dim}{}  ({}){r}",
+    // `NAME` and `PROFILE` are the padded columns; `HOME` is last, so it needs no trailing width.
+    let name_w = names
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
+    let prof_w = "PROFILE".len();
+    println!(
+        "  {dim}{:<name_w$}  {:<prof_w$}  HOME{r}",
+        "NAME", "PROFILE"
+    );
+
+    for name in &names {
+        let profile_cell = if profiles.contains(*name) {
+            "yes"
+        } else {
+            "—"
+        };
+        let home_cell = match homes.get(name) {
+            Some(app) => format!(
+                "{} ({})",
                 sandbox::human_bytes(app.total_bytes()),
                 describe_home_locations(app),
-            );
-        }
+            ),
+            None => "—".to_string(),
+        };
+        let name_pad = format!("{name:<name_w$}");
+        let prof_pad = format!("{profile_cell:<prof_w$}");
+        println!("  {n}{name_pad}{r}  {dim}{prof_pad}  {home_cell}{r}");
     }
 
     println!(
@@ -8159,10 +8181,10 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     let what = match args.first() {
         None => "all",
         Some(arg) => match arg.to_str() {
-            Some(w @ ("all" | "nix" | "mise" | "flake" | "deb")) => w,
+            Some(w @ ("all" | "nix" | "mise" | "flake" | "deb" | "appimage")) => w,
             _ => {
                 eprintln!(
-                    "ops: unknown upgrade target '{}' (known: all, nix, mise, flake, deb)",
+                    "ops: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage)",
                     arg.to_string_lossy()
                 );
                 return ExitCode::from(2);
@@ -8232,6 +8254,11 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // hash and the per-project deb lock is rewritten — a host-side lock rewrite (the new hash
         // builds host-side at the next launch), like the `nix:` tools and `flake:` packages.
         ok &= upgrade_deb_packages(&nix, &layout, &cwd, &cfg, &pal);
+    }
+    if matches!(what, "appimage" | "all") {
+        // The project's and apps' `appimage:` `[packages]` re-resolve their `.AppImage` URL to a new
+        // content hash and the per-project appimage lock is rewritten — the exact `deb:` shape.
+        ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
     if ok {
         ExitCode::SUCCESS
@@ -8684,6 +8711,85 @@ fn deb_upgrade_summary(
             }
             Failed { url, error } => {
                 format!("  {n}deb:{url}{r}: {err}re-resolve failed{r} — {error}")
+            }
+        });
+    }
+    if withheld > 0 {
+        lines.push(withheld_note());
+    }
+    lines
+}
+
+fn upgrade_appimage_packages(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+    pal: &style::Palette,
+) -> bool {
+    let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("ops: cannot roll the appimage packages: {e}");
+            return false;
+        }
+    };
+    for line in appimage_upgrade_summary(&outcomes, sandbox::withheld_appimage_packages(cfg), pal) {
+        println!("{line}");
+    }
+    !outcomes
+        .iter()
+        .any(|o| matches!(o, sandbox::AppImageUpgrade::Failed { .. }))
+}
+
+/// The human-readable summary of an appimage roll — the `deb:` twin (one line per declared URL:
+/// newly pinned, rolled, unchanged, or failed; plus the entries pruned and a withheld note). Pure,
+/// so every outcome is unit-tested without invoking nix.
+fn appimage_upgrade_summary(
+    outcomes: &[sandbox::AppImageUpgrade],
+    withheld: usize,
+    pal: &style::Palette,
+) -> Vec<String> {
+    use sandbox::AppImageUpgrade::*;
+    let (h, n, ok, warn, err, dim, r) = (
+        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
+    );
+    let mut lines = vec![format!("{h}ops upgrade — appimage packages{r}")];
+    let withheld_note = || {
+        format!(
+            "  {warn}{withheld} appimage: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
+        )
+    };
+    if outcomes.is_empty() {
+        lines.push(if withheld > 0 {
+            withheld_note()
+        } else {
+            format!("  {dim}no appimage: packages to roll.{r}")
+        });
+        return lines;
+    }
+    for outcome in outcomes {
+        lines.push(match outcome {
+            Unchanged { url, hash } => format!(
+                "  {n}appimage:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
+                short_hash(hash)
+            ),
+            Rolled { url, from, to } => format!(
+                "  {n}appimage:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
+                short_hash(from),
+                short_hash(to)
+            ),
+            Pinned { url, hash } => format!(
+                "  {n}appimage:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
+                short_hash(hash)
+            ),
+            Pruned { url } => {
+                format!(
+                    "  {n}appimage:{url}{r}: {dim}removed from the lock (no longer declared).{r}"
+                )
+            }
+            Failed { url, error } => {
+                format!("  {n}appimage:{url}{r}: {err}re-resolve failed{r} — {error}")
             }
         });
     }
@@ -10836,6 +10942,56 @@ mod tests {
         assert!(text.contains("deb:https://e/c.deb: XH0ykkcZ — newly pinned"));
         assert!(text.contains("deb:https://e/old.deb: removed from the lock"));
         assert!(text.contains("deb:https://e/d.deb: re-resolve failed — prefetch unreachable"));
+    }
+
+    #[test]
+    fn appimage_upgrade_summary_distinguishes_the_outcomes() {
+        use sandbox::AppImageUpgrade::*;
+
+        // an empty roll (no appimage: packages) says so plainly; an untrusted one names the withheld
+        let empty = appimage_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.contains("no appimage: packages"));
+        let withheld = appimage_upgrade_summary(&[], 1, &style::Palette::plain()).join("\n");
+        assert!(withheld.contains("1 appimage: package(s) withheld (untrusted)"));
+        assert!(!withheld.contains("no appimage: packages"));
+
+        let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
+        let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
+        let text = appimage_upgrade_summary(
+            &[
+                Unchanged {
+                    url: "https://e/a.AppImage".into(),
+                    hash: h_a.into(),
+                },
+                Rolled {
+                    url: "https://e/b.AppImage".into(),
+                    from: h_a.into(),
+                    to: h_b.into(),
+                },
+                Pinned {
+                    url: "https://e/c.AppImage".into(),
+                    hash: h_b.into(),
+                },
+                Pruned {
+                    url: "https://e/old.AppImage".into(),
+                },
+                Failed {
+                    url: "https://e/d.AppImage".into(),
+                    error: "prefetch unreachable".into(),
+                },
+            ],
+            0,
+            &style::Palette::plain(),
+        )
+        .join("\n");
+        assert!(text.contains("appimage:https://e/a.AppImage: jBGtMS5l — unchanged"));
+        assert!(
+            text.contains("appimage:https://e/b.AppImage: jBGtMS5l → XH0ykkcZ — rolled forward")
+        );
+        assert!(text.contains("appimage:https://e/c.AppImage: XH0ykkcZ — newly pinned"));
+        assert!(text.contains("appimage:https://e/old.AppImage: removed from the lock"));
+        assert!(text
+            .contains("appimage:https://e/d.AppImage: re-resolve failed — prefetch unreachable"));
     }
 
     #[test]

@@ -2898,15 +2898,39 @@ fn the_shipped_profiles_import_and_resolve() {
             })
         };
 
-        // Every shipped profile filters egress (each declares `[network] mode = "deny"`). A silently
-        // dropped `[network]` would revert to the baseline default `shared` — a fail-OPEN on the
-        // security field that matters most. Require the resolved posture to be the allowlist.
-        assert!(
-            doc["network"].get("Allowlist").is_some(),
-            "profile `{name}` must resolve to a filtering allowlist, not `{}` — a non-allowlist \
-             here means its `[network]` was silently dropped (fail-open):\n{doc:#}",
-            doc["network"]
-        );
+        // Whatever `network` the file declares must survive resolution — intent-anchored on the raw
+        // text, so this names no profile. A top-level scalar `network = "shared"|"none"` must resolve
+        // to that exact posture (a profile like `t3code`, whose proxy-blind Node backend cannot be
+        // filtered, ships `shared` on purpose — see its header); a `[network]` filtering table must
+        // resolve to an allowlist. The regression this guards is a silently dropped `[network]`, which
+        // would fail OPEN to the default `shared` — caught for every profile that declares a table.
+        let declared_scalar_net = text
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| {
+                l.strip_prefix("network")
+                    .and_then(|r| r.trim_start().strip_prefix('='))
+            })
+            .map(|v| v.trim().trim_matches('"').to_string());
+        match declared_scalar_net.as_deref() {
+            Some("shared") => assert_eq!(
+                doc["network"],
+                serde_json::json!("Shared"),
+                "profile `{name}` declares `network = \"shared\"` but did not resolve to Shared:\n{doc:#}"
+            ),
+            Some("none") => assert_eq!(
+                doc["network"],
+                serde_json::json!("Isolated"),
+                "profile `{name}` declares `network = \"none\"` but did not resolve to Isolated:\n{doc:#}"
+            ),
+            other => assert!(
+                doc["network"].get("Allowlist").is_some(),
+                "profile `{name}` (declared network {other:?}) must resolve to a filtering allowlist, \
+                 not `{}` — a silently dropped `[network]` is a fail-open:\n{doc:#}",
+                doc["network"]
+            ),
+        }
 
         // A `forward` the file declares must resolve to a non-empty port set. This is the class of
         // regression that motivated the check: a `forward` nested under `[network]` parses as
