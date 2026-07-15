@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -592,6 +593,154 @@ impl LogRing {
     }
 }
 
+// ── The live active-flow registry ─────────────────────────────────────────────────────────────
+//
+// The set of egress tunnels currently OPEN through the proxy, read live by `ops net live` over the
+// same per-session control socket. Unlike the event log (a *history* of decisions), this is volatile
+// state: a flow appears when its tunnel is established and vanishes when it closes. It is never
+// persisted and never crosses into the cage — it lives in the launch process's owner-only RAM for the
+// session's lifetime, at the same trust level as the log the proxy already holds.
+//
+// The two byte counters (`up` = client→upstream, `down` = upstream→client) are lock-free
+// `Arc<AtomicU64>` the relay increments per read/write; the registry mutex is taken only at
+// register / deregister / snapshot — never per byte — so the hot relay path stays unlocked.
+
+/// One open tunnel captured for `ops net live`: where it goes, how it is carried, when it opened, and
+/// how much has flowed each way so far. `up`/`down` are byte totals — application-plaintext bytes on
+/// an inspected L7/cleartext path, raw ciphertext bytes on a `tcp://` L4 splice (the proxy sees only
+/// the encrypted stream there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlowSnapshot {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) proto: Proto,
+    /// When the tunnel was established, epoch milliseconds. The CLI renders the age (now − start).
+    pub(crate) start_epoch_ms: u128,
+    pub(crate) up: u64,
+    pub(crate) down: u64,
+}
+
+struct FlowEntry {
+    host: String,
+    port: u16,
+    proto: Proto,
+    start_epoch_ms: u128,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+}
+
+/// The set of currently-open egress tunnels. Shared (via `Arc`) between the proxy serve threads
+/// (which [`register`](FlowRegistry::register) a flow for the tunnel's lifetime) and the control serve
+/// thread (which [`snapshot`](FlowRegistry::snapshot)s for `ops net live`). Ids start at 1 and never
+/// repeat within a session, so the snapshot order is stable (oldest-open first).
+pub(crate) struct FlowRegistry {
+    inner: Mutex<FlowInner>,
+}
+
+struct FlowInner {
+    next_id: u64,
+    flows: BTreeMap<u64, FlowEntry>,
+}
+
+/// RAII handle for one open flow: it is registered on [`register`](FlowRegistry::register) and
+/// deregistered when this guard drops (the tunnel closed). It always carries the two byte counters the
+/// relay increments — `up` (client→upstream) and `down` (upstream→client) — so the counting wrappers
+/// can bump them without touching the registry lock. A **detached** guard ([`detached`](Self::detached))
+/// carries live counters but is not in any registry (its `registry` is `None`), so the relay counts
+/// unconditionally without a branch and a session with no registry (tests) still works.
+pub(crate) struct FlowGuard {
+    registry: Option<Arc<FlowRegistry>>,
+    id: u64,
+    pub(crate) up: Arc<AtomicU64>,
+    pub(crate) down: Arc<AtomicU64>,
+}
+
+impl FlowGuard {
+    /// A guard not tied to any registry — it carries counters (so the relay's counting wrappers work
+    /// uniformly) but registers/deregisters nothing. Used when no flow registry is attached (tests).
+    pub(crate) fn detached() -> Self {
+        FlowGuard {
+            registry: None,
+            id: 0,
+            up: Arc::new(AtomicU64::new(0)),
+            down: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Drop for FlowGuard {
+    fn drop(&mut self) {
+        // Remove the flow from the live view the instant its tunnel closes (a detached guard has no
+        // registry and nothing to remove).
+        if let Some(registry) = &self.registry {
+            if let Ok(mut g) = registry.inner.lock() {
+                g.flows.remove(&self.id);
+            }
+        }
+    }
+}
+
+impl FlowRegistry {
+    pub(crate) fn new() -> Self {
+        FlowRegistry {
+            inner: Mutex::new(FlowInner {
+                next_id: 1,
+                flows: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Register an open tunnel and return its RAII guard, which deregisters it on drop. Call this only
+    /// after the request is permitted and the upstream connection is established — a flow is a live
+    /// *allowed* tunnel, never a refused request. The returned guard carries fresh zeroed `up`/`down`
+    /// counters for the relay to increment.
+    pub(crate) fn register(self: &Arc<Self>, host: &str, port: u16, proto: Proto) -> FlowGuard {
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let start_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut g = self.inner.lock().unwrap();
+        let id = g.next_id;
+        g.next_id += 1;
+        g.flows.insert(
+            id,
+            FlowEntry {
+                host: host.to_string(),
+                port,
+                proto,
+                start_epoch_ms,
+                up: up.clone(),
+                down: down.clone(),
+            },
+        );
+        FlowGuard {
+            registry: Some(self.clone()),
+            id,
+            up,
+            down,
+        }
+    }
+
+    /// A snapshot of every currently-open flow, oldest-open first (ascending id). Reads each flow's
+    /// live byte counters — a value climbing between two snapshots is a transfer in progress.
+    pub(crate) fn snapshot(&self) -> Vec<FlowSnapshot> {
+        let g = self.inner.lock().unwrap();
+        g.flows
+            .values()
+            .map(|e| FlowSnapshot {
+                host: e.host.clone(),
+                port: e.port,
+                proto: e.proto,
+                start_epoch_ms: e.start_epoch_ms,
+                up: e.up.load(Ordering::Relaxed),
+                down: e.down.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
 /// Serve the control socket: one short-lived thread per connection, each handling exactly one
 /// command. A per-connection error is that connection's problem, never the server's. The pending
 /// queue, the manual-rule overlay, and the event log are shared in (the same ones the proxy holds).
@@ -600,14 +749,16 @@ pub(crate) fn serve(
     state: Arc<PendingState>,
     manual: Arc<ManualRules>,
     log: Arc<LogRing>,
+    flows: Arc<FlowRegistry>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         let state = state.clone();
         let manual = manual.clone();
         let log = log.clone();
+        let flows = flows.clone();
         std::thread::spawn(move || {
-            let _ = handle(stream, &state, &manual, &log);
+            let _ = handle(stream, &state, &manual, &log, &flows);
         });
     }
     Ok(())
@@ -633,13 +784,14 @@ fn handle(
     state: &PendingState,
     manual: &ManualRules,
     log: &LogRing,
+    flows: &FlowRegistry,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), state, manual, log);
+    let response = dispatch(line.trim(), state, manual, log, flows);
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
@@ -658,7 +810,13 @@ fn handle(
 /// each) then `ok`; `LOG after=<seq>` returns only events past that cursor. `path` is emitted last on
 /// a `pending`/`event` line so a query string's `=` cannot be mistaken for a field separator (the
 /// reader splits each token on its first `=`).
-fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing) -> String {
+fn dispatch(
+    cmd: &str,
+    state: &PendingState,
+    manual: &ManualRules,
+    log: &LogRing,
+    flows: &FlowRegistry,
+) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("LIST") => {
@@ -791,8 +949,33 @@ fn dispatch(cmd: &str, state: &PendingState, manual: &ManualRules, log: &LogRing
             out.push_str("ok\n");
             out
         }
+        Some("FLOWS") => {
+            // The tunnels open right now (one `flow …` line each, then `ok`). `host` is emitted last
+            // so the reader can split every other field on its first `=`; a host carries no space.
+            let mut out = String::new();
+            for f in flows.snapshot() {
+                out.push_str(&format_flow_line(&f));
+            }
+            out.push_str("ok\n");
+            out
+        }
         _ => "err bad-request\n".to_string(),
     }
+}
+
+/// Format one open flow as a control-wire line, `host` last (the reader splits each token on its
+/// first `=`; a host has no space and no `=`). A flow has no method/path — it is a live tunnel, not a
+/// decided request.
+fn format_flow_line(f: &FlowSnapshot) -> String {
+    format!(
+        "flow proto={} port={} start={} up={} down={} host={}\n",
+        f.proto.as_str(),
+        f.port,
+        f.start_epoch_ms,
+        f.up,
+        f.down,
+        f.host,
+    )
 }
 
 /// Format one event as a control-wire line. Fields are `key=value` tokens split on their first `=`;
@@ -1023,6 +1206,84 @@ pub(crate) fn log_all(data_dir: &Path, include_muted: bool) -> Vec<SessionLog> {
         }
     }
     sessions
+}
+
+/// One reachable session's currently-open flows, for `ops net live`.
+pub(crate) struct SessionFlows {
+    pub(crate) pid: u32,
+    pub(crate) flows: Vec<FlowSnapshot>,
+}
+
+/// Query one session's control socket for the tunnels open right now (`FLOWS`). A session whose
+/// socket is gone (a dead/stale launch) fails the connect and the caller skips it.
+pub(crate) fn read_flows(socket: &Path) -> io::Result<Vec<FlowSnapshot>> {
+    let stream = UnixStream::connect(socket)?;
+    // A short timeout: `ops net live` polls every session sequentially on a ~1s redraw, so a single
+    // stuck session must not freeze the whole frame for long (a dead one is skipped on the connect).
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    (&stream).write_all(b"FLOWS\n")?;
+    (&stream).flush()?;
+    let mut flows = Vec::new();
+    for line in BufReader::new(&stream).lines() {
+        let line = line?;
+        if line == "ok" {
+            break;
+        }
+        if let Some(f) = parse_flow_line(&line) {
+            flows.push(f);
+        }
+    }
+    Ok(flows)
+}
+
+/// Discover every reachable session's open flows: glob the control sockets, parse each filename's
+/// pid, and query it. A dead/stale socket is skipped. Sessions are returned ordered by pid for stable
+/// output. An old session that predates the `FLOWS` verb replies `err bad-request`, which parses to no
+/// flow lines — so it simply contributes an empty list rather than failing the whole listing.
+pub(crate) fn flows_all(data_dir: &Path) -> Vec<SessionFlows> {
+    let mut sessions = Vec::new();
+    for pid in session_pids(data_dir) {
+        if let Ok(flows) = read_flows(&control_socket(data_dir, pid)) {
+            sessions.push(SessionFlows { pid, flows });
+        }
+    }
+    sessions
+}
+
+/// Parse one `flow proto=… port=… start=… up=… down=… host=…` line into a snapshot, or `None` if it
+/// is malformed. Each token is split on its first `=`; `host` is last (it carries no space or `=`).
+fn parse_flow_line(line: &str) -> Option<FlowSnapshot> {
+    let mut proto = Proto::Other;
+    let mut port = None;
+    let mut start = None;
+    let mut up = 0u64;
+    let mut down = 0u64;
+    let mut host = None;
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "flow" {
+        return None;
+    }
+    for token in tokens {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "proto" => proto = Proto::parse(value),
+            "port" => port = value.parse().ok(),
+            "start" => start = value.parse().ok(),
+            "up" => up = value.parse().unwrap_or(0),
+            "down" => down = value.parse().unwrap_or(0),
+            "host" => host = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(FlowSnapshot {
+        host: host?,
+        port: port?,
+        proto,
+        start_epoch_ms: start?,
+        up,
+        down,
+    })
 }
 
 /// Parse one `event seq=… at=… port=… verdict=… reason=… [method=…] host=… [path=…]` line into an
@@ -1482,13 +1743,14 @@ mod tests {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
 
         // A bare ALLOW answers but does not remember.
         let s = state.clone();
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
         assert_eq!(
-            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log),
+            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log, &flows),
             "ok host=api.test count=1\n"
         );
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
@@ -1501,12 +1763,19 @@ mod tests {
         let s = state.clone();
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
-        let _ = dispatch(&format!("ALLOW {seq} session"), &state, &manual, &log);
+        let _ = dispatch(
+            &format!("ALLOW {seq} session"),
+            &state,
+            &manual,
+            &log,
+            &flows,
+        );
         parked.join().unwrap();
         assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
         // And `RULES` reports the remembered rule with its exact port.
         assert!(
-            dispatch("RULES", &state, &manual, &log).contains("manual allow https://api.test:8080"),
+            dispatch("RULES", &state, &manual, &log, &flows)
+                .contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
         );
     }
@@ -1516,33 +1785,41 @@ mod tests {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
 
         // `REMEMBER ALLOW <rule>` loads an arbitrary (here wildcard) rule into the overlay and
         // `RULES` reports it — the proactive `--session` path. It is accepted in any posture (the
         // proxy folds the overlay into its effective policy for every filtering posture).
         assert_eq!(
-            dispatch("REMEMBER ALLOW *.foo.test", &state, &manual, &log),
+            dispatch("REMEMBER ALLOW *.foo.test", &state, &manual, &log, &flows),
             "ok\n"
         );
         assert!(
-            dispatch("RULES", &state, &manual, &log).contains("manual allow https://*.foo.test"),
+            dispatch("RULES", &state, &manual, &log, &flows)
+                .contains("manual allow https://*.foo.test"),
             "REMEMBER must load the rule"
         );
 
         // A malformed rule (a `*` catch-all) and a missing kind/rule are `err bad-request`.
         assert_eq!(
-            dispatch("REMEMBER ALLOW *", &state, &manual, &log),
+            dispatch("REMEMBER ALLOW *", &state, &manual, &log, &flows),
             "err bad-request\n"
         );
         assert_eq!(
-            dispatch("REMEMBER ALLOW", &state, &manual, &log),
+            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows),
             "err bad-request\n"
         );
 
         // `REMEMBER MUTE <rule>` loads into the dedicated mute overlay (a log filter, not a verdict),
         // so it lands in `mute_snapshot`, never the allow/deny verdict lists.
         assert_eq!(
-            dispatch("REMEMBER MUTE play.googleapis.com", &state, &manual, &log),
+            dispatch(
+                "REMEMBER MUTE play.googleapis.com",
+                &state,
+                &manual,
+                &log,
+                &flows
+            ),
             "ok\n"
         );
         let (allow, deny) = manual.snapshot();
@@ -1565,10 +1842,97 @@ mod tests {
         // …and `RULES` reports it as a `manual mute` line, so `ops net rules --source session` lists
         // a live mute (distinct from the allow/deny lines).
         assert!(
-            dispatch("RULES", &state, &manual, &log)
+            dispatch("RULES", &state, &manual, &log, &flows)
                 .contains("manual mute https://play.googleapis.com"),
             "RULES must list a live mute"
         );
+    }
+
+    #[test]
+    fn flow_registry_registers_counts_and_deregisters() {
+        let reg = Arc::new(FlowRegistry::new());
+        assert!(reg.snapshot().is_empty(), "a fresh registry has no flows");
+
+        let g1 = reg.register("api.test", 443, Proto::Https);
+        let g2 = reg.register("db.test", 5432, Proto::Tcp);
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 2, "two open tunnels are visible");
+        // Oldest-open first (ascending id).
+        assert_eq!(snap[0].host, "api.test");
+        assert_eq!(snap[0].port, 443);
+        assert_eq!(snap[0].proto, Proto::Https);
+        assert_eq!((snap[0].up, snap[0].down), (0, 0), "counters start at zero");
+        assert_eq!(snap[1].host, "db.test");
+        assert_eq!(snap[1].proto, Proto::Tcp);
+
+        // The snapshot reads the live shared atomics the relay's counting wrappers bump.
+        g1.up.fetch_add(1024, Ordering::Relaxed);
+        g1.down.fetch_add(2048, Ordering::Relaxed);
+        let snap = reg.snapshot();
+        assert_eq!((snap[0].up, snap[0].down), (1024, 2048));
+
+        drop(g1);
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1, "a closed tunnel drops off the view");
+        assert_eq!(snap[0].host, "db.test");
+        drop(g2);
+        assert!(
+            reg.snapshot().is_empty(),
+            "no flow remains once every guard is dropped"
+        );
+    }
+
+    #[test]
+    fn detached_flow_guard_counts_but_registers_nothing() {
+        // A detached guard (no registry) still carries usable counters, and dropping it is a no-op —
+        // the relay counts uniformly whether or not a registry is attached (tests).
+        let g = FlowGuard::detached();
+        g.up.fetch_add(10, Ordering::Relaxed);
+        assert_eq!(g.up.load(Ordering::Relaxed), 10);
+        drop(g); // must not panic: there is no registry to touch
+    }
+
+    #[test]
+    fn flows_verb_lists_open_tunnels_and_round_trips() {
+        // `FLOWS` returns one `flow …` line per open tunnel then `ok`, and the client parser reads each
+        // back — the server format and the client parser agree (not just by inspection).
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = Arc::new(FlowRegistry::new());
+
+        let g = flows.register("api.test", 8443, Proto::Https);
+        g.up.fetch_add(100, Ordering::Relaxed);
+        g.down.fetch_add(200, Ordering::Relaxed);
+
+        let resp = dispatch("FLOWS", &state, &manual, &log, &flows);
+        assert!(resp.ends_with("ok\n"), "the reply ends with ok: {resp:?}");
+        let parsed: Vec<FlowSnapshot> = resp.lines().filter_map(parse_flow_line).collect();
+        assert_eq!(parsed.len(), 1, "one open flow is listed");
+        let f = &parsed[0];
+        assert_eq!(f.host, "api.test");
+        assert_eq!(f.port, 8443);
+        assert_eq!(f.proto, Proto::Https);
+        assert_eq!((f.up, f.down), (100, 200));
+
+        // An empty registry lists no flow, just `ok`.
+        drop(g);
+        assert_eq!(dispatch("FLOWS", &state, &manual, &log, &flows), "ok\n");
+    }
+
+    #[test]
+    fn format_and_parse_flow_line_round_trip() {
+        let f = FlowSnapshot {
+            host: "example.test".into(),
+            port: 443,
+            proto: Proto::Tcp,
+            start_epoch_ms: 1_700_000_000_000,
+            up: 4096,
+            down: 8192,
+        };
+        let line = format_flow_line(&f);
+        let back = parse_flow_line(line.trim()).expect("a well-formed flow line parses");
+        assert_eq!(back, f);
     }
 
     #[test]
@@ -1585,8 +1949,9 @@ mod tests {
         let manual = Arc::new(ManualRules::new());
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
         let served_manual = manual.clone();
+        let flows = Arc::new(FlowRegistry::new());
         thread::spawn(move || {
-            let _ = serve(listener, pending, served_manual, log);
+            let _ = serve(listener, pending, served_manual, log, flows);
         });
 
         // A loaded rule reports `Loaded` and lands in the overlay the proxy folds into its policy.
@@ -1615,13 +1980,15 @@ mod tests {
         let pending = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
         let listener = UnixListener::bind(&socket).unwrap();
         {
             let pending = pending.clone();
             let manual = manual.clone();
             let log = log.clone();
+            let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log);
+                let _ = serve(listener, pending, manual, log, flows);
             });
         }
 
@@ -1777,12 +2144,13 @@ mod tests {
         let state = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
 
         // A bare `DENY *` drains every request but remembers nothing. Parked one at a time so the
         // response lines come back in a deterministic oldest-first order.
         let _ = park_next(&state, "x.test", 8080, 0);
         let _ = park_next(&state, "y.test", 8080, 1);
-        let response = dispatch("DENY *", &state, &manual, &log);
+        let response = dispatch("DENY *", &state, &manual, &log, &flows);
         assert_eq!(response, "answered host=x.test\nanswered host=y.test\nok\n");
         assert!(
             manual.snapshot().1.is_empty(),
@@ -1792,12 +2160,12 @@ mod tests {
         // `ALLOW * session` drains and remembers each host:port as a manual rule.
         let _ = park_next(&state, "p.test", 8080, 0);
         let _ = park_next(&state, "q.test", 8080, 1);
-        let _ = dispatch("ALLOW * session", &state, &manual, &log);
+        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows);
         let (allow, _) = manual.snapshot();
         assert_eq!(allow.len(), 2, "`* session` remembers each answered host");
 
         // An empty queue replies a clean `ok` with no `answered` lines.
-        assert_eq!(dispatch("ALLOW *", &state, &manual, &log), "ok\n");
+        assert_eq!(dispatch("ALLOW *", &state, &manual, &log, &flows), "ok\n");
     }
 
     #[test]
@@ -1812,13 +2180,15 @@ mod tests {
         let pending = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(FlowRegistry::new());
         let listener = UnixListener::bind(&socket).unwrap();
         {
             let pending = pending.clone();
             let manual = manual.clone();
             let log = log.clone();
+            let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log);
+                let _ = serve(listener, pending, manual, log, flows);
             });
         }
 
@@ -2170,13 +2540,15 @@ mod tests {
             Proto::Https,
         );
 
+        let flows = Arc::new(FlowRegistry::new());
         let listener = UnixListener::bind(&socket).unwrap();
         {
             let pending = pending.clone();
             let manual = manual.clone();
             let log = log.clone();
+            let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log);
+                let _ = serve(listener, pending, manual, log, flows);
             });
         }
 

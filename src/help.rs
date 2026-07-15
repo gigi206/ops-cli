@@ -279,8 +279,9 @@ const PAGES: &[Page] = &[
             `mute`/`unmute <rule>` add/remove a log-suppression (`dontaudit`) rule; `pending`\n\
             lists and answers requests parked by the `ask` posture; `stats` reports the per-host\n\
             allow/deny/blocked decision counters launches recorded; `logs` is the live, per-request\n\
-            egress log of a running session. Host-side — no launch, no nix. (Distinct from `ops test\n\
-            net <url>`, which tests one URL against the policy.)",
+            egress log of a running session; and `live` is a `top`-style view of the egress tunnels\n\
+            currently open. Host-side — no launch, no nix. (Distinct from `ops test net <url>`, which\n\
+            tests one URL against the policy.)",
     },
     Page {
         path: &["plugins"],
@@ -1139,6 +1140,39 @@ const PAGES: &[Page] = &[
             overflowed between polls the dropped count is announced, never silently skipped; a\n\
             session that ends is noted. The append shape is pipe-friendly, and `--json` streams one\n\
             event object per line. Host-side and read-only — no launch, no nix, no network.",
+    },
+    Page {
+        path: &["net", "live"],
+        synopsis: "ops net live [-a|--app <name>] [-i|--interval <secs>] [--json]",
+        summary: "a live view of the egress tunnels currently open (a `top` for connections)",
+        options: &[
+            ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
+            ("-i, --interval <secs>", "the redraw interval in seconds (default 1)"),
+            ("--json", "emit one snapshot object per tick (NDJSON) instead of the redraw; works in a \
+                        pipe and needs no terminal"),
+        ],
+        details:
+            "Shows the egress tunnels open RIGHT NOW — one line per flow: destination host:port, the\n\
+            transport (`https` inspected TLS, `http` inspected cleartext, `tcp` raw L4 splice), how\n\
+            long it has been open, and the bytes transferred each way (`↑` client→upstream,\n\
+            `↓` upstream→client). Rows are grouped by session (the PID `ops ls` shows) so several\n\
+            agents are told apart. Redrawn in place on the interval until Ctrl-C, like `top`.\n\
+            \n\
+            This is the OPEN CONNECTIONS, distinct from `ops net logs` (the history of decided\n\
+            requests). Because the proxy closes each inspected request after one response, short API\n\
+            calls flash by in well under a second; the durable rows are raw `tcp://` tunnels (SSH, a\n\
+            database wire), WebSockets, and large L7 transfers in progress (a download, a streamed\n\
+            completion). If nothing durable is open, the view is legitimately empty.\n\
+            \n\
+            Byte semantics: on an inspected `https`/`http` flow the counters are application bytes\n\
+            (the proxy sees the plaintext); on a raw `tcp` splice they are the encrypted bytes on the\n\
+            wire (the tunnel is opaque). Only a filtering posture (`deny`/`allow`/`ask`) runs a proxy,\n\
+            so only those sessions have flows.\n\
+            \n\
+            The redraw needs a terminal; use `--json` to script it (one snapshot object per tick,\n\
+            each flow carrying its session, destination, transport, age, and byte totals). Read live\n\
+            from the same control sockets `ops net logs` uses — host-side, no launch, no nix, no\n\
+            network.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {

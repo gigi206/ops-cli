@@ -20,6 +20,7 @@ See also: [Networking overview](../networking/README.md) · [Rule grammar](../ne
 | [`pending`](#ops-net-pending) | list and answer `ask`-mode parked requests |
 | [`stats`](#ops-net-stats) | per-host allow/deny/blocked decision counters |
 | [`logs`](#ops-net-logs) | the live, per-request egress log of a running session |
+| [`live`](#ops-net-live) | a live view of the egress tunnels currently open (a `top` for connections) |
 
 ## `ops net rules`
 
@@ -143,4 +144,24 @@ proxy made. **Live-only** — the log lives in the running session's memory and 
 superset of `stats`, adding `error` (allowed but did not complete). `--follow` tails
 it. `--all` also shows refusals a [`[network] mute`](../networking/observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit)
 rule suppressed (tagged `muted`; still counted in `stats`). See
+[Observability](../networking/observability.md).
+
+## `ops net live`
+
+```
+ops net live [-a|--app <name>] [-i|--interval <secs>] [--json]
+```
+
+A live view of the egress tunnels **currently open** — one line per flow: destination
+`host:port`, the transport (`https` inspected TLS, `http` inspected cleartext, `tcp` raw L4
+splice), how long it has been open, and the bytes each way (`↑` client→upstream, `↓`
+upstream→client) — grouped by session and redrawn in place like `top`. This is the *open
+connections*, distinct from [`logs`](#ops-net-logs) (the *history of decided requests*).
+
+Because the proxy closes each inspected request after one response, short API calls flash by
+in under a second; the durable rows are raw `tcp://` tunnels (SSH, a database wire),
+WebSockets, and large L7 transfers in progress. Byte counts are application bytes on an
+inspected `https`/`http` flow, encrypted bytes on a raw `tcp` splice. The redraw needs a
+terminal; `--json` emits one snapshot object per tick (NDJSON) for a pipe. Only a filtering
+posture (`deny`/`allow`/`ask`) runs a proxy, so only those sessions have flows. See
 [Observability](../networking/observability.md).

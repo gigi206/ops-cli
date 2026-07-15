@@ -86,7 +86,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [Rule grammar](networking/rules.md) — hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
 - [Egress groups](networking/groups.md) — reusable `[net.groups]` referenced by `@name`.
 - [Ask mode](networking/ask.md) — park-and-confirm requests with `ops net pending`.
-- [Observability](networking/observability.md) — `ops net rules` / `stats` / `logs`, `ops test net`.
+- [Observability](networking/observability.md) — `ops net rules` / `stats` / `logs` / `live`, `ops test net`.
 
 ## Secrets
 

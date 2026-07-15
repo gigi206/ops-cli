@@ -29,7 +29,8 @@ untrusted one.
 `deny`, `allow`, and `ask` are the three **filtering** postures — each runs the
 egress proxy and honors the [rule grammar](rules.md). `none` and `shared` run no
 proxy (there is nothing to filter), so they have no rules, no
-[stats](observability.md), and no [live log](observability.md#ops-net-logs).
+[stats](observability.md), no [live log](observability.md#ops-net-logs), and no
+[live flow view](observability.md#ops-net-live).
 
 Under a filtering posture, one **always-allowed self-equip set** is unioned into
 your rules regardless of trust so a project can still provision its toolchain (the
@@ -69,7 +70,8 @@ pasta NAT) are in [architecture](architecture.md) and the
 - **[Ask mode](ask.md)** — the park-and-confirm workflow end to end, with
   `ops net pending` and `ops net pending watch`.
 - **[Observability](observability.md)** — inspect and audit egress with
-  `ops net rules`, `ops net stats`, `ops net logs`, and `ops test net`.
+  `ops net rules`, `ops net stats`, `ops net logs`, `ops net live`, and
+  `ops test net`.
 - **[Architecture](architecture.md)** — how Model B works under the hood, and why
   it was chosen over the alternatives.
 - **[Inbound forwarding (`forward`)](forward.md)** — the reverse direction: forward a host

@@ -1,6 +1,6 @@
 # Observability
 
-Four host-side surfaces let you see the egress policy and what it decided. None of
+Five host-side surfaces let you see the egress policy and what it decided. None of
 them launches a sandbox or touches nix or the network — they read the resolved
 policy and the live/recorded state:
 
@@ -10,11 +10,12 @@ policy and the live/recorded state:
 | [`ops test net <url>`](#ops-test-net) | *would this exact request be allowed, and why?* | before a launch — a what-if against the policy |
 | [`ops net stats`](#ops-net-stats) | *how many requests did each host get allowed/denied/blocked?* | during and after — persisted counters |
 | [`ops net logs`](#ops-net-logs) | *what did the proxy decide, request by request, right now?* | **only while a session runs** — a live, zero-disk log |
+| [`ops net live`](#ops-net-live) | *what tunnels are open right now, and how much is flowing?* | **only while a session runs** — a live, `top`-style view |
 
 They form a natural progression: `rules`/`test net` are the *static* view (the
-policy as authored), `stats`/`logs` are the *dynamic* view (what actually happened).
-`stats` persists aggregate counters; `logs` is an ephemeral, per-request record you
-watch live.
+policy as authored), `stats`/`logs`/`live` are the *dynamic* view (what actually
+happened). `stats` persists aggregate counters; `logs` is an ephemeral, per-request
+record you watch live; `live` shows the connections open at this very instant.
 
 ---
 
@@ -255,14 +256,59 @@ append shape is pipe-friendly, and `--json` streams one event object per line.
 
 ---
 
+## `ops net live`
+
+The **live, `top`-style** view of the egress tunnels **currently open** — one line per
+flow, redrawn in place, watchable from another terminal:
+
+```bash
+ops net live               # every open tunnel, redrawn every 1s until Ctrl-C
+ops net live -a claude     # only one app's sessions
+ops net live -i 2          # redraw every 2 seconds
+ops net live --json        # one snapshot object per tick (NDJSON) — for a pipe
+```
+
+Each line is `host:port · transport · age · ↑up ↓down`, grouped by session (the PID
+`ops ls` shows):
+
+```
+open egress flows:
+  session 4242 [claude] /home/you/project
+    api.anthropic.com:443  https  8s  ↑1.2 KiB ↓380 KiB
+```
+
+This is the **open connections**, distinct from [`ops net logs`](#ops-net-logs) (the
+*history of decided requests*): `logs` records every decision, one line per request;
+`live` shows what is *carrying bytes right now*.
+
+- **Transport** — `https` (inspected TLS), `http` (inspected cleartext), or `tcp` (a raw
+  L4 [`tcp://`](rules.md) splice).
+- **Bytes** — `↑` client→upstream, `↓` upstream→client. **Application bytes** on an
+  inspected `https`/`http` flow (the proxy sees the plaintext); **encrypted bytes** on a
+  raw `tcp` splice (the tunnel is opaque). A value climbing between two frames is a
+  transfer in progress.
+- **What you'll see** — because the proxy closes each inspected request after one
+  response, short API calls flash by in under a second; the durable rows are raw `tcp://`
+  tunnels (SSH, a database wire), WebSockets, and large L7 transfers in progress (a
+  download, a streamed completion). An idle session shows an empty list — that is normal.
+
+Like the log, it is **live-only and never written to disk**, read from the same
+per-session control socket, and only a **filtering** posture (`deny`/`allow`/`ask`) runs a
+proxy — so only those sessions have flows. The redraw needs a terminal; `--json` works in
+a pipe (one snapshot per tick, since a live view is a *state*, not an event stream).
+
+---
+
 ## Which surface answers which question
 
 - *"What can this app reach?"* → `ops net rules -a <app>` (static, expanded).
 - *"Would this exact URL be allowed?"* → `ops test net <url>` (a what-if).
 - *"What has this project's egress looked like over time?"* → `ops net stats`
   (persisted aggregate).
-- *"Why did the agent's request just fail?"* / *"What is it trying to reach right
-  now?"* → `ops net logs --follow` (live, per-request, incl. `error`).
+- *"Why did the agent's request just fail?"* → `ops net logs --follow` (live,
+  per-request, incl. `error`).
+- *"What connections are open right now, and how much is flowing?"* → `ops net live`
+  (a `top` for the open tunnels).
 
 ---
 

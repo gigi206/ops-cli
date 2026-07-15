@@ -129,7 +129,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -561,6 +561,12 @@ pub(crate) struct ProxyCtx {
     /// [`super::control::LogRing`] via [`Self::with_log`]; a decision's outcome is both counted in
     /// `stats` and pushed here through the single [`Self::outcome`] chokepoint.
     log: Option<Arc<super::control::LogRing>>,
+    /// The live registry of egress tunnels currently open, read by `ops net live`, or `None` when
+    /// off (tests). The launch ([`super::egress::start`]) attaches the session's
+    /// [`super::control::FlowRegistry`] via [`Self::with_flows`]; each permitted tunnel registers a
+    /// flow for its lifetime through a [`super::control::FlowGuard`], and the relay increments the
+    /// guard's byte counters. Shared through the `Arc<ProxyCtx>`.
+    flows: Option<Arc<super::control::FlowRegistry>>,
     /// The number of raw L4 (`tcp://`) splices currently open. Each splice holds a host thread (and
     /// its fds) for the connection's lifetime, so this caps how many an in-cage agent can open at
     /// once (see [`MAX_CONCURRENT_SPLICES`]); the inspected L7 path never touches it. Shared across
@@ -603,6 +609,7 @@ impl ProxyCtx {
             notices: false,
             stats: None,
             log: None,
+            flows: None,
             splices: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
             app: None,
@@ -629,6 +636,31 @@ impl ProxyCtx {
     pub(crate) fn with_log(mut self, log: Arc<super::control::LogRing>) -> Self {
         self.log = Some(log);
         self
+    }
+
+    /// Attach the session's live flow registry, so each permitted tunnel registers itself for its
+    /// lifetime and `ops net live` can read the tunnels open right now. Set once by the launch
+    /// ([`super::egress::start`]) whenever the proxy runs.
+    pub(crate) fn with_flows(mut self, flows: Arc<super::control::FlowRegistry>) -> Self {
+        self.flows = Some(flows);
+        self
+    }
+
+    /// Register a permitted tunnel in the live flow registry, returning its RAII guard — hold it for
+    /// the tunnel's lifetime so the flow stays visible until it closes, then drops off the
+    /// `ops net live` view. Always returns a guard (a **detached** one, counting into throwaway
+    /// counters, when no registry is attached — tests), so the relay's counting wrappers work
+    /// uniformly with no branch. Call only after the request is permitted and the upstream is connected.
+    fn register_flow(
+        &self,
+        host: &str,
+        port: u16,
+        proto: super::control::Proto,
+    ) -> super::control::FlowGuard {
+        match &self.flows {
+            Some(f) => f.register(host, port, proto),
+            None => super::control::FlowGuard::detached(),
+        }
     }
 
     /// The single decision chokepoint every site in [`handle_client`] calls: it both counts the
@@ -1523,6 +1555,12 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         "allowed",
     );
 
+    // The tunnel is now open — register it for `ops net live` until this connection returns (the
+    // tunnel closes). One guard covers both the one-shot request/response below and a WebSocket
+    // upgrade: a WS over TLS is still inspected TLS, so its proto stays `https`. The relay increments
+    // the guard's byte counters as data flows (application-plaintext bytes on this inspected path).
+    let flow = ctx.register_flow(&connect_host, port, super::control::Proto::Https);
+
     // 8. Inject any matching host-scoped credentials. This runs *after* the verdict, so a
     //    denied request never receives a secret, and is keyed on the already-verified
     //    `connect_host` plus the decrypted path — so the credential reaches exactly the
@@ -1549,7 +1587,16 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //         the allowlist + the inspected handshake; frame-level redaction is out of scope (masked,
     //         framed binary that a byte scan cannot meaningfully cover).
     if ws_upgrade {
-        return relay_upgrade(br, upstream, &inner, &injected, ctx, allow_seq);
+        return relay_upgrade(
+            br,
+            upstream,
+            &inner,
+            &injected,
+            ctx,
+            allow_seq,
+            flow.up.clone(),
+            flow.down.clone(),
+        );
     }
 
     // 9. Forward this one request and stream the response back, then close — a pipelined second
@@ -1591,14 +1638,17 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 );
             }
         };
-        upstream.write_all(&reserialize_request(
-            &inner,
-            &injected,
-            Some(body.len() as u64),
-        ))?;
+        let reserialized = reserialize_request(&inner, &injected, Some(body.len() as u64));
+        upstream.write_all(&reserialized)?;
         upstream.write_all(&body)?;
+        // Count client→upstream (`up`) — the forwarded head plus the de-chunked body.
+        flow.up
+            .fetch_add((reserialized.len() + body.len()) as u64, Ordering::Relaxed);
     } else {
-        upstream.write_all(&reserialize_request(&inner, &injected, None))?;
+        let reserialized = reserialize_request(&inner, &injected, None);
+        upstream.write_all(&reserialized)?;
+        flow.up
+            .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
         // If the client announced `Expect: 100-continue` it withholds the body until it sees a 100.
         // The request is already permitted and the upstream is up, so answer the continue now — else
         // `copy_exact` below would block reading a body the client will not send, until the timeout.
@@ -1610,6 +1660,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             let _ = client.flush();
         }
         copy_exact(&mut br, &mut upstream, body_len)?;
+        // Count the forwarded body (`copy_exact` moved exactly `body_len` bytes upstream).
+        flow.up.fetch_add(body_len, Ordering::Relaxed);
     }
     upstream.flush().ok();
 
@@ -1630,7 +1682,12 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             ctx.set_status(allow_seq, code);
         }
     }
-    let mut response = io::Cursor::new(prefix).chain(&mut upstream);
+    // Count upstream→client (`down`) through the whole relayed response (the peeked prefix is chained
+    // back in, so it is counted too).
+    let mut response = CountingReader::new(
+        io::Cursor::new(prefix).chain(&mut upstream),
+        flow.down.clone(),
+    );
 
     // 10. Response-side leak backstop: a configured secret can only re-enter the cage by being
     //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
@@ -1848,7 +1905,11 @@ fn splice_l4(
         StatKind::Allow,
         "allowed",
     );
-    splice_copy(client, upstream)
+    // Register the raw tunnel for `ops net live` for its whole lifetime: `splice_copy` joins both
+    // directions before returning, so this guard (dropped after it) stays registered until the tunnel
+    // fully closes. A splice is uninspected, so the byte counters reflect raw ciphertext volume.
+    let flow = ctx.register_flow(connect_host, port, super::control::Proto::Tcp);
+    splice_copy(client, upstream, flow.up.clone(), flow.down.clone())
 }
 
 /// Splice a raw TCP tunnel: copy bytes both directions between the cage `client` and the `upstream`
@@ -1857,7 +1918,12 @@ fn splice_l4(
 /// say) is not killed mid-session. One direction runs in a spawned thread, the other in this thread;
 /// when the first ends, both sockets are shut down fully so the other's blocked read returns and the
 /// join always completes (no leaked host thread on a half-open or stalled peer).
-fn splice_copy(client: UnixStream, upstream: TcpStream) -> io::Result<()> {
+fn splice_copy(
+    client: UnixStream,
+    upstream: TcpStream,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+) -> io::Result<()> {
     // A raw tunnel may idle indefinitely between bursts, so drop the per-connection timeouts the
     // serve loop set (they exist to bound a slow HTTP head, not a long-lived stream). Set on the
     // originals before cloning, since the timeout is a socket-level option shared by the dups.
@@ -1876,11 +1942,15 @@ fn splice_copy(client: UnixStream, upstream: TcpStream) -> io::Result<()> {
     let mut up_wr = upstream;
 
     let t = std::thread::spawn(move || {
-        let _ = io::copy(&mut client_rd, &mut up_wr);
+        // Count client→upstream bytes (`up`). The counting writer is temporary, so `up_wr` is free to
+        // shut down after the copy. On a raw splice these are ciphertext bytes (the tunnel is opaque).
+        let _ = io::copy(&mut client_rd, &mut CountingWriter::new(&mut up_wr, up));
         // client → upstream finished: half-close the upstream's write so it observes EOF.
         let _ = up_wr.shutdown(std::net::Shutdown::Write);
     });
-    let _ = io::copy(&mut up_rd, &mut client_wr);
+    // Count upstream→client bytes (`down`) through the counting reader (temporary, so `up_rd` remains
+    // usable — though it is not needed after this copy).
+    let _ = io::copy(&mut CountingReader::new(&mut up_rd, down), &mut client_wr);
     // upstream → client finished: half-close the client's write, then force both sockets fully down
     // so the spawned thread's blocked read returns and the join below always completes.
     let _ = client_wr.shutdown(std::net::Shutdown::Write);
@@ -2178,6 +2248,10 @@ fn handle_cleartext(
         "allowed",
     );
 
+    // Register the open cleartext tunnel for `ops net live` until this function returns (the tunnel
+    // closes). This is inspected cleartext, so the byte counters reflect application data.
+    let flow = ctx.register_flow(&host, port, super::control::Proto::Http);
+
     // 8. Forward the request in **origin-form** (`GET /path HTTP/1.1`) with the client's `Host` — an
     //    origin server, unlike a proxy, expects the path, not the absolute-form URL. No credential is
     //    injected (a header secret never rides a cleartext request). `Connection: close` is forced so
@@ -2191,12 +2265,16 @@ fn handle_cleartext(
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),
     };
-    upstream.write_all(&reserialize_request(&origin, &[], None))?;
+    let reserialized = reserialize_request(&origin, &[], None);
+    upstream.write_all(&reserialized)?;
+    flow.up
+        .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
     if body_len > 0 && head_expects_continue(head) {
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
         let _ = client.flush();
     }
     copy_exact(&mut client, &mut upstream, body_len)?;
+    flow.up.fetch_add(body_len, Ordering::Relaxed);
     upstream.flush().ok();
 
     // The request is permitted and fully forwarded; the response may now idle between bursts, so
@@ -2213,7 +2291,11 @@ fn handle_cleartext(
             ctx.set_status(allow_seq, code);
         }
     }
-    let mut response = io::Cursor::new(prefix).chain(&mut upstream);
+    // Count upstream→client (`down`) through the whole relayed response (peeked prefix chained in).
+    let mut response = CountingReader::new(
+        io::Cursor::new(prefix).chain(&mut upstream),
+        flow.down.clone(),
+    );
     pump_to_eof(&mut response, &mut client)
 }
 
@@ -2472,6 +2554,7 @@ fn reserialize_upgrade(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
 ///
 /// Takes `br` and `upstream` by value: the response phase owns both streams, and on the `101` path the
 /// buffered bytes each `BufReader` read past its head are handed to [`relay_websocket`] to flush first.
+#[allow(clippy::too_many_arguments)]
 fn relay_upgrade(
     mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
     mut upstream: StreamOwned<ClientConnection, TcpStream>,
@@ -2479,9 +2562,13 @@ fn relay_upgrade(
     injected: &[(&str, &str)],
     ctx: &ProxyCtx,
     allow_seq: Option<u64>,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
 ) -> io::Result<()> {
     // Forward the handshake with its upgrade headers preserved (a handshake carries no body).
-    upstream.write_all(&reserialize_upgrade(inner, injected))?;
+    let handshake = reserialize_upgrade(inner, injected);
+    upstream.write_all(&handshake)?;
+    up.fetch_add(handshake.len() as u64, Ordering::Relaxed);
     upstream.flush().ok();
 
     // Read the upstream's response head. A BufReader may read past it into the server's first frames;
@@ -2499,7 +2586,12 @@ fn relay_upgrade(
             }
         }
         br.get_mut().write_all(&resp_head)?;
-        pump_to_eof(&mut up_br, br.get_mut())?;
+        down.fetch_add(resp_head.len() as u64, Ordering::Relaxed);
+        // Count the declined response body (`down`) as it streams back to the client.
+        pump_to_eof(
+            &mut CountingReader::new(&mut up_br, down.clone()),
+            br.get_mut(),
+        )?;
         finish_tls(br.get_mut());
         return Ok(());
     }
@@ -2508,12 +2600,20 @@ fn relay_upgrade(
     // Relay the `101` to the client so it completes the WebSocket handshake.
     br.get_mut().write_all(&resp_head)?;
     br.get_mut().flush()?;
+    down.fetch_add(resp_head.len() as u64, Ordering::Relaxed);
     // Drain what each BufReader already read past its head, then relay the raw TLS streams.
     let upstream_pending = up_br.buffer().to_vec();
     let upstream = up_br.into_inner();
     let client_pending = br.buffer().to_vec();
     let client = br.into_inner();
-    relay_websocket(client, &client_pending, upstream, &upstream_pending)
+    relay_websocket(
+        client,
+        &client_pending,
+        upstream,
+        &upstream_pending,
+        up,
+        down,
+    )
 }
 
 /// Flush a rustls connection's pending TLS output to its (non-blocking) socket, stopping when the
@@ -2582,10 +2682,15 @@ fn relay_websocket(
     client_pending: &[u8],
     mut upstream: StreamOwned<ClientConnection, TcpStream>,
     upstream_pending: &[u8],
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
 ) -> io::Result<()> {
-    // Seed the already-read bytes into the destination send buffers (the loop flushes them out).
+    // Seed the already-read bytes into the destination send buffers (the loop flushes them out), and
+    // count them (`up` = client→upstream, `down` = upstream→client) toward the live flow view.
     upstream.conn.writer().write_all(client_pending)?;
     client.conn.writer().write_all(upstream_pending)?;
+    up.fetch_add(client_pending.len() as u64, Ordering::Relaxed);
+    down.fetch_add(upstream_pending.len() as u64, Ordering::Relaxed);
     client.sock.set_nonblocking(true)?;
     upstream.sock.set_nonblocking(true)?;
 
@@ -2617,6 +2722,7 @@ fn relay_websocket(
                 }
                 Some(n) => {
                     upstream.conn.writer().write_all(&buf[..n])?;
+                    up.fetch_add(n as u64, Ordering::Relaxed);
                     progressed = true;
                 }
                 None => {}
@@ -2631,6 +2737,7 @@ fn relay_websocket(
                 }
                 Some(n) => {
                     client.conn.writer().write_all(&buf[..n])?;
+                    down.fetch_add(n as u64, Ordering::Relaxed);
                     progressed = true;
                 }
                 None => {}
@@ -2777,6 +2884,57 @@ fn strip_port(authority: &str) -> String {
     match authority.rsplit_once(':') {
         Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
         _ => authority.to_string(),
+    }
+}
+
+/// A `Read` adapter that adds every byte it yields to a shared counter — the live byte total the flow
+/// registry exposes for `ops net live`. Wrapping the *reader* (not the fd) is what lets one counter
+/// cover the inspected L7/cleartext plaintext streams and the raw L4 splice uniformly. On the splice
+/// path this means `io::copy` no longer sees two bare fds, so it cannot take the kernel `splice(2)`
+/// fast-path std uses for socket→socket copies (falling back to a userspace loop). This is a deliberate
+/// trade: continuous byte accounting is the whole point of the live view for exactly the durable
+/// `tcp://` tunnels — a count only at close would read zero for a whole active SSH/download. The
+/// inspected L7/cleartext/WebSocket pumps are already userspace, so they pay nothing extra.
+struct CountingReader<R> {
+    inner: R,
+    counter: Arc<AtomicU64>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, counter: Arc<AtomicU64>) -> Self {
+        CountingReader { inner, counter }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// A `Write` adapter that adds every byte it accepts to a shared counter (the write-side twin of
+/// [`CountingReader`]).
+struct CountingWriter<W> {
+    inner: W,
+    counter: Arc<AtomicU64>,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, counter: Arc<AtomicU64>) -> Self {
+        CountingWriter { inner, counter }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -3112,6 +3270,82 @@ mod tests {
     use std::thread;
 
     use rustls::{ClientConnection, ServerConfig, ServerConnection, StreamOwned};
+
+    #[test]
+    fn counting_reader_and_writer_tally_bytes() {
+        // The building block the relay uses to feed `ops net live`'s byte counters: every byte read
+        // or written is added to the shared atomic.
+        let up = Arc::new(AtomicU64::new(0));
+        let mut src = io::Cursor::new(vec![0u8; 5000]);
+        let mut sink = Vec::new();
+        io::copy(&mut CountingReader::new(&mut src, up.clone()), &mut sink).unwrap();
+        assert_eq!(up.load(Ordering::Relaxed), 5000, "reader counts every byte");
+
+        let down = Arc::new(AtomicU64::new(0));
+        let mut out = Vec::new();
+        {
+            let mut cw = CountingWriter::new(&mut out, down.clone());
+            cw.write_all(&[7u8; 300]).unwrap();
+            cw.flush().unwrap();
+        }
+        assert_eq!(
+            down.load(Ordering::Relaxed),
+            300,
+            "writer counts every byte"
+        );
+        assert_eq!(
+            out.len(),
+            300,
+            "the wrapped writer still passes bytes through"
+        );
+    }
+
+    #[test]
+    fn splice_copy_tallies_both_directions() {
+        // Drive the real `splice_copy` (the L4 path) through an echo upstream and assert both byte
+        // counters land — the wiring, not just the wrappers in isolation.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 || sock.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+        let upstream = TcpStream::connect(addr).unwrap();
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let (u, d) = (up.clone(), down.clone());
+        let splicer = thread::spawn(move || {
+            let _ = splice_copy(cage_end, upstream, u, d);
+        });
+
+        let payload = vec![42u8; 2000];
+        test_end.write_all(&payload).unwrap();
+        let mut got = vec![0u8; payload.len()];
+        test_end.read_exact(&mut got).unwrap();
+        assert_eq!(got, payload, "the echo round-trips the payload");
+        // Close the cage side so the splice observes EOF and tears down (its internal join completes).
+        test_end.shutdown(std::net::Shutdown::Both).unwrap();
+
+        splicer.join().unwrap();
+        echo.join().unwrap();
+        assert_eq!(
+            up.load(Ordering::Relaxed),
+            2000,
+            "client→upstream bytes counted (up)"
+        );
+        assert_eq!(
+            down.load(Ordering::Relaxed),
+            2000,
+            "upstream→client bytes counted (down)"
+        );
+    }
 
     /// A policy allowing exactly the given entries (no deny), for the proxy tests.
     fn policy(entries: &[&str]) -> EgressPolicy {
@@ -5483,10 +5717,12 @@ mod tests {
         let pending = Arc::new(PendingState::new());
         let manual = Arc::new(ManualRules::new());
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let flows = Arc::new(control::FlowRegistry::new());
         {
-            let (pending, served_manual, log) = (pending.clone(), manual.clone(), log.clone());
+            let (pending, served_manual, log, flows) =
+                (pending.clone(), manual.clone(), log.clone(), flows.clone());
             std::thread::spawn(move || {
-                let _ = control::serve(listener, pending, served_manual, log);
+                let _ = control::serve(listener, pending, served_manual, log, flows);
             });
         }
 

@@ -263,14 +263,18 @@ pub(crate) fn start(
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
+        // The live flow registry — the proxy and the control thread share the same `Arc` (the proxy
+        // registers a flow per open tunnel; `ops net live` reads them over the control socket).
+        let flows = Arc::new(super::control::FlowRegistry::new());
         ctx = ctx.with_control(pending.clone(), manual.clone());
         ctx = ctx.with_log(log.clone());
+        ctx = ctx.with_flows(flows.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
         // the launch is up — never a race with the first `ops net pending`/`ops net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
         let control_log = log.clone();
         std::thread::spawn(move || {
-            let _ = super::control::serve(control_listener, pending, manual, control_log);
+            let _ = super::control::serve(control_listener, pending, manual, control_log, flows);
         });
         Some(control_uds)
     };
