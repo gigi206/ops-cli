@@ -57,3 +57,13 @@ sha2 = "0.10"
 [profile.release]
 strip = true
 lto = true
+
+# Keep the debug build's disk footprint down. `line-tables-only` retains file+line for panic
+# backtraces (how the test suite is debugged) but drops the variable/type DWARF that only a
+# step-debugger uses — shrinking every debug binary ~2-3x. Third-party deps, never stepped
+# through, carry no debug info at all. Flip `[profile.dev].debug` back to 2 for a gdb session.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
