@@ -5,7 +5,7 @@
 #   ops app cursor-agent                               # interactive TUI
 #
 # This is the Cursor **CLI** (`cursor-agent`, a.k.a. `agent`), NOT the Cursor desktop editor
-# (that Electron app ships as an AppImage — see `profiles/cursor.toml`). The CLI runs the same
+# (that Electron app is packaged from Cursor's `.deb` — see `profiles/cursor.toml`). The CLI runs the same
 # Cursor agent from a terminal: `cursor-agent -p "…"` takes a prompt and returns a result, the
 # form used in CI, git hooks, and scripts — the ideal fit for ops's Mode-B sandbox.
 #

@@ -81,12 +81,22 @@
 # resort, fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the
 # minimal /dev, and lose only egress FILTERING).
 #
-# STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
-# test), but everything downstream is still to be proven with a real Cursor account and a live run:
-# the `.deb` autoPatchelf of a large VS Code-fork app, the display/GPU bring-up, whether the model
-# backend filters through the MITM, and — the biggest open item — the account LOGIN. Treat it as a
-# grounded starting point to validate, not a turnkey profile. If a request is blocked, the proxy
-# names the host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
+# STATUS — honest scope. PROVEN LIVE: the `.deb` builds (autoPatchelf of this large VS Code-fork app),
+# the window maps on Wayland, the editor reaches startup, and its API traffic filters through the MITM
+# (api2.cursor.sh allowed, telemetry/component hosts denied). STILL TO VALIDATE with a real Cursor
+# account: the account LOGIN and an end-to-end AI turn. If a request is blocked, the proxy names the
+# host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
+#
+# OBSERVED AT RUNTIME — all benign, all inherent to the Mode-B cage (do NOT "fix" by widening it):
+#   - `Failed to connect to /run/dbus/system_bus_socket` — the SYSTEM bus is privileged and never
+#     exposed; the SESSION bus + portal come from `dbus = true`. Harmless.
+#   - `pci id … 10de:… driver (null)` — mesa covers Intel/AMD/nouveau only, so on an Optimus laptop the
+#     editor renders on the Intel iGPU (or software), never the NVIDIA card. Harmless.
+#   - `Unable to retrieve mac address` / `hostname: command not found` — the empty netns has no real
+#     NIC and the cage ships no `hostname` binary, so the machine-id probe fails; the editor continues.
+#   - `'use-system-ca' is not in the list of known options` — inert on this Electron build (passed but
+#     unrecognized); HTTPS still trusts ops's MITM CA via the NSS seed + `NODE_EXTRA_CA_CERTS` (the
+#     working api2.cursor.sh traffic confirms it). Left in for forward-compatibility.
 cmd = [
     "cursor",
     "--no-sandbox",
@@ -121,16 +131,19 @@ mode = "deny"
 allow = [
     # Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
     # `*.cursor.sh` wildcard — it covers api2 (most API), api5 + `agent.*`/regional (agent
-    # requests), repo42 (indexing, HTTP/2-only — degrades under the MITM), and
+    # requests), repo42 (indexing, HTTP/2-only — handled via `[network] http2` below), and
     # authenticate / authenticator / authentication (login). Opened to all verbs (the editor POSTs
     # prompts and workspace context).
     "{*} https://*.cursor.sh",
-    # Client updates + the extension marketplace (VS Code-style). Uncomment whichever the editor
-    # actually needs — watch `ops net logs -a cursor` and add least-privilege.
+    # The VS Code-style extension marketplace (browse/install extensions). The gallery query is a
+    # CORS preflight `OPTIONS` + a `POST /_apis/public/gallery/extensionquery`, so it needs `{*}`, not
+    # `{GET}` (confirmed live via `ops net logs -a cursor`). Comment out if you do not use extensions.
+    "{*} https://marketplace.cursorapi.com",
+    # Other client update / CDN hosts — uncomment whichever the editor names in `ops net logs -a
+    # cursor` (least privilege; not needed for the editor's core edit/AI path).
     #"{GET} https://*.cursor-cdn.com",
-    #"{GET} https://*.cursorapi.com",
+    #"{*} https://*.cursorapi.com",
     #"{GET} https://downloads.cursor.com",
-    #"{GET} https://marketplace.cursorapi.com",
     #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
@@ -148,6 +161,10 @@ http2 = [
 # Keep denied telemetry out of the default `ops net logs` (still denied by construction, still
 # counted in `ops net stats`; see them with `--all`). Add hosts the proxy names as telemetry.
 mute = [
+    # Chrome's component/dictionary CDN — the spellcheck `.bdic` from `redirector.gvt1.com`, etc. Not
+    # model/agent traffic and not needed for editing/AI, so it stays denied by construction; muted so
+    # its refusals don't clutter `ops net logs` (still counted in `ops net stats`; see them with `--all`).
+    "*.gvt1.com",
     #"*.sentry.io",
 ]
 
