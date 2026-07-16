@@ -154,9 +154,23 @@ ops net logs --all                   # also show refusals a `mute` rule suppress
 ops net logs --json
 ```
 
-Each line carries the session id (the PID `ops session ls` shows), the local `hh:mm:ss`
-time, `host:port`, method, path, verdict, and a reason category. `log` is an
-accepted alias.
+Each line carries the session id (the PID `sbx session ls` shows), the local `hh:mm:ss`
+time, the **transport**, the `host:port`, method, path, an optional **RPC tag**, the
+verdict, and a reason category. `log` is an accepted alias.
+
+The **transport** column is `https` (inspected TLS), `http` (inspected cleartext), `tcp`
+(a raw `tcp://` splice), or `-` (refused before it was known). For an inspected request it
+is **suffixed with the HTTP version** — `https/h1` vs `https/h2` — so you can see whether a
+`[network] http2`-designated host is actually being carried as HTTP/2 (the security axis
+is never dropped: it stays `https`, never a bare `h2`).
+
+The **RPC tag** (`grpc`, `grpc-web`, or `connect`) appears when the request's `Content-Type`
+names a gRPC-family framing, so streaming/RPC traffic reads at a glance. It is **recognized
+from the header, never guessed from the path** — a request whose content-type does not name
+an RPC framing carries no tag, *including* **Connect *unary*** calls, which ride a bare
+`application/proto` that is byte-for-byte indistinguishable from a plain protobuf POST. So a
+missing tag means "not self-identified as RPC", not "not an RPC". Both the version and the
+tag are also in `--json` (`http_version`, `rpc`; `null` when absent).
 
 ### Muting noisy refusals — `[network] mute` (SELinux `dontaudit`)
 

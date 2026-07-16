@@ -5809,8 +5809,18 @@ fn render_log_line(
         .map(|p| display_log_path(p, view.with_query))
         .unwrap_or("");
     // The transport the request used (`https`/`http`/`tcp`, or `-` when refused before it was
-    // known) — shown because the port alone does not name it (a `tcp://` splice can ride 443).
-    let proto = e.proto.as_str();
+    // known) — shown because the port alone does not name it (a `tcp://` splice can ride 443) —
+    // suffixed with the HTTP version for an inspected request (`https/h1` vs `https/h2`), so the
+    // transport-security axis is preserved while the h1-vs-h2 axis is added beside it.
+    let proto = format!("{}{}", e.proto.as_str(), e.http_ver.suffix());
+    // The RPC framing recognized from the request `Content-Type` (`grpc`/`grpc-web`/`connect`), shown
+    // as a compact tag; empty for a plain request (Connect *unary* is byte-identical to plain protobuf
+    // and is deliberately not tagged).
+    let rpc = if e.rpc == sandbox::control::RpcKind::None {
+        String::new()
+    } else {
+        format!("  {n}{}{r}", e.rpc.as_str())
+    };
     let vc = verdict_color(e.verdict, pal);
     let reason = if e.verdict == sandbox::control::LogVerdict::Allow {
         String::new()
@@ -5871,6 +5881,10 @@ fn log_event_json(
         "path": e.path.as_deref().map(|p| display_log_path(p, view.with_query)),
         "verdict": e.verdict.as_str(),
         "proto": e.proto.as_str(),
+        // The HTTP version of an inspected request (`h1`/`h2`), or null for a refusal / raw splice.
+        "http_version": (e.http_ver != sandbox::control::HttpVer::Unknown).then(|| e.http_ver.as_wire()),
+        // The RPC framing from the `Content-Type` (`grpc`/`grpc-web`/`connect`), or null.
+        "rpc": (e.rpc != sandbox::control::RpcKind::None).then(|| e.rpc.as_str()),
         "reason": e.reason,
         "muted": e.muted,
     });
@@ -9630,6 +9644,8 @@ mod tests {
             verdict,
             reason: reason.into(),
             proto: sandbox::control::Proto::Https,
+            http_ver: sandbox::control::HttpVer::Unknown,
+            rpc: sandbox::control::RpcKind::None,
             muted: false,
             status: None,
             amend_seq: None,
@@ -9847,6 +9863,60 @@ mod tests {
             log_event_json(&other, 7, None, None, &view)["proto"],
             serde_json::json!("-")
         );
+    }
+
+    #[test]
+    fn the_proto_column_suffixes_the_http_version_and_tags_rpc_framing() {
+        use sandbox::control::LogVerdict::Allow;
+        use sandbox::control::{HttpVer, Proto, RpcKind};
+        let p = style::Palette::plain();
+        let view = LogView::default();
+
+        // An inspected HTTP/2 gRPC forward reads `https/h2` — transport AND version, so the "it was
+        // TLS" signal is never lost to a bare `h2` — with a `grpc` tag; both surface in the JSON too.
+        let mut h2 = log_event(
+            1,
+            "repo42.cursor.sh",
+            Some("POST"),
+            Some("/pkg.Service/Method"),
+            Allow,
+            "allowed",
+        );
+        h2.proto = Proto::Https;
+        h2.http_ver = HttpVer::H2;
+        h2.rpc = RpcKind::Grpc;
+        let line = render_log_line(&h2, 42, &view, &p);
+        assert!(
+            line.contains("https/h2"),
+            "version suffix in the line: {line}"
+        );
+        assert!(line.contains("grpc"), "rpc tag in the line: {line}");
+        let j = log_event_json(&h2, 7, None, None, &view);
+        assert_eq!(j["http_version"], serde_json::json!("h2"));
+        assert_eq!(j["rpc"], serde_json::json!("grpc"));
+
+        // An HTTP/1.1 Connect-streaming forward reads `https/h1` + `connect`.
+        let mut h1 = log_event(2, "api.test", Some("POST"), Some("/p"), Allow, "allowed");
+        h1.proto = Proto::Https;
+        h1.http_ver = HttpVer::H1;
+        h1.rpc = RpcKind::Connect;
+        let line = render_log_line(&h1, 42, &view, &p);
+        assert!(line.contains("https/h1"), "h1 suffix: {line}");
+        assert!(line.contains("connect"), "connect tag: {line}");
+
+        // A version-less / plain event keeps the bare proto, carries no rpc tag, and its two JSON
+        // fields are null — the backward-compatible default (a raw `tcp://` splice here).
+        let mut plain = log_event(3, "db.internal", None, None, Allow, "allowed");
+        plain.proto = Proto::Tcp; // http_ver = Unknown, rpc = None (log_event's defaults)
+        let line = render_log_line(&plain, 42, &view, &p);
+        assert!(line.contains("tcp"), "bare proto: {line}");
+        assert!(
+            !line.contains("/h1") && !line.contains("/h2"),
+            "no version suffix when unknown: {line}"
+        );
+        let j = log_event_json(&plain, 7, None, None, &view);
+        assert_eq!(j["http_version"], serde_json::Value::Null);
+        assert_eq!(j["rpc"], serde_json::Value::Null);
     }
 
     #[test]

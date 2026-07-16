@@ -309,6 +309,8 @@ mod tests {
             path: path.map(str::to_string),
             verdict: LogVerdict::Deny,
             proto: crate::sandbox::control::Proto::Https,
+            http_ver: crate::sandbox::control::HttpVer::Unknown,
+            rpc: crate::sandbox::control::RpcKind::None,
             reason: reason.to_string(),
             muted: false,
             status: None,

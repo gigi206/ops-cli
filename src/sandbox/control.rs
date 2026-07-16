@@ -388,6 +388,109 @@ impl Proto {
     }
 }
 
+/// The HTTP protocol version an **inspected** request used — a second axis beside [`Proto`] (which
+/// names the transport *security*: TLS-inspected / cleartext / raw splice). Kept separate so the
+/// display can carry both without conflating them: an inspected TLS request reads `https/h1` or
+/// `https/h2`, never a bare `h2` that would drop the "it was TLS" signal. Only a completed inspected
+/// request has a version; a refusal (no HTTP exchange) or a raw `tcp://` splice (no HTTP at all) is
+/// [`Unknown`](Self::Unknown), rendered without a suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpVer {
+    /// HTTP/1.1 — the default MITM path, and the only version cleartext (`http://`) ever uses.
+    H1,
+    /// HTTP/2 — a `[network] http2`-designated host, MITM'd with ALPN `h2` (for gRPC).
+    H2,
+    /// Not known: a refusal before any HTTP exchange, a raw `tcp://` splice, or an older persisted
+    /// log line that predates this field. Rendered without a version suffix.
+    Unknown,
+}
+
+impl HttpVer {
+    /// The wire token, or `""` when unknown (the field is then omitted from the line entirely).
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            HttpVer::H1 => "h1",
+            HttpVer::H2 => "h2",
+            HttpVer::Unknown => "",
+        }
+    }
+
+    /// The display suffix appended to the proto token (`https` → `https/h1`); empty when unknown, so
+    /// a refusal or a raw splice keeps its bare `https`/`tcp`/`-`.
+    pub(crate) fn suffix(self) -> &'static str {
+        match self {
+            HttpVer::H1 => "/h1",
+            HttpVer::H2 => "/h2",
+            HttpVer::Unknown => "",
+        }
+    }
+
+    /// Parse a version token back, defaulting to [`Unknown`](Self::Unknown) for an absent or unknown
+    /// token (an older persisted line carries no `ver=`).
+    fn parse(s: &str) -> Self {
+        match s {
+            "h1" => HttpVer::H1,
+            "h2" => HttpVer::H2,
+            _ => HttpVer::Unknown,
+        }
+    }
+}
+
+/// The RPC framing of an inspected request, recognized from its `Content-Type`. **Ground truth from
+/// the header, never inferred from the path** — a request whose content-type does not name an RPC
+/// framing is [`None`](Self::None) even if its path looks like `/pkg.Service/Method`. Consequence
+/// worth knowing: **Connect *unary*** rides bare `application/proto`/`application/json` (byte-for-byte
+/// indistinguishable from a plain protobuf POST), so it reads as `None`; only gRPC, gRPC-web, and
+/// Connect *streaming* (`application/connect+…`) carry a self-identifying content-type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcKind {
+    /// `application/grpc[+…]` — native gRPC (HTTP/2 framed).
+    Grpc,
+    /// `application/grpc-web[+…]` — gRPC-web (rides HTTP/1.1 or HTTP/2).
+    GrpcWeb,
+    /// `application/connect+…` — the Connect protocol's streaming framing.
+    Connect,
+    /// No RPC content-type recognized (a plain request, or Connect unary's ambiguous `application/proto`).
+    None,
+}
+
+impl RpcKind {
+    /// Classify from a request `Content-Type` value (case-insensitive; grpc-web is tested before grpc
+    /// since it shares the `application/grpc` prefix).
+    pub(crate) fn from_content_type(ct: &str) -> Self {
+        let ct = ct.trim().to_ascii_lowercase();
+        if ct.starts_with("application/grpc-web") {
+            RpcKind::GrpcWeb
+        } else if ct.starts_with("application/grpc") {
+            RpcKind::Grpc
+        } else if ct.starts_with("application/connect+") {
+            RpcKind::Connect
+        } else {
+            RpcKind::None
+        }
+    }
+
+    /// The wire/display token, or `""` when not an RPC framing (the field is then omitted).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RpcKind::Grpc => "grpc",
+            RpcKind::GrpcWeb => "grpc-web",
+            RpcKind::Connect => "connect",
+            RpcKind::None => "",
+        }
+    }
+
+    /// Parse an `l7` token back, defaulting to [`None`](Self::None) for an absent or unknown token.
+    fn parse(s: &str) -> Self {
+        match s {
+            "grpc" => RpcKind::Grpc,
+            "grpc-web" => RpcKind::GrpcWeb,
+            "connect" => RpcKind::Connect,
+            _ => RpcKind::None,
+        }
+    }
+}
+
 /// One decided egress request captured for the live view: when, where, how, and why. `method`/`path`
 /// are present only for the inspected L7 path (an early-CONNECT block or a raw `tcp://` splice has no
 /// HTTP head to read). The `path` is stored **already query-redacted** by the proxy, so the ring is
@@ -409,8 +512,16 @@ pub(crate) struct LogEvent {
     /// cleartext), `tcp` (raw L4 splice), or `-` when unknown at refusal time. Shown as a column
     /// because the port alone does not name the protocol (a `tcp://` splice can ride 443).
     pub(crate) proto: Proto,
-    /// Whether this refusal was suppressed from the default `ops net log` view by a `mute`
-    /// (SELinux `dontaudit`) rule. A muted event is still counted in `ops net stats` and lives in a
+    /// The HTTP version of an inspected request (`h1`/`h2`), or `Unknown` for a refusal / raw splice
+    /// / older line. A second axis beside `proto`: rendered as a suffix (`https/h2`) so the transport
+    /// security (`https` vs cleartext `http`) is never lost. Set only at the inspected-forward sites.
+    pub(crate) http_ver: HttpVer,
+    /// The RPC framing recognized from the request `Content-Type` (`grpc`/`grpc-web`/`connect`), or
+    /// `None`. Ground truth from the header — never inferred from the path — so Connect *unary*
+    /// (bare `application/proto`) reads as `None`. Set only at the inspected-forward sites.
+    pub(crate) rpc: RpcKind,
+    /// Whether this refusal was suppressed from the default `sbx net log` view by a `mute`
+    /// (SELinux `dontaudit`) rule. A muted event is still counted in `sbx net stats` and lives in a
     /// **separate** ring (so a muted flood never evicts a real event); it appears only under
     /// `ops net log --all`, tagged. Only ever `true` for a `deny` (mute suppresses refusals, never
     /// an allow, a security-guard `blocked`, or a downstream `error`).
@@ -491,6 +602,8 @@ impl LogRing {
         verdict: LogVerdict,
         reason: &str,
         proto: Proto,
+        http_ver: HttpVer,
+        rpc: RpcKind,
     ) -> u64 {
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -509,6 +622,8 @@ impl LogRing {
             verdict,
             reason: reason.to_string(),
             proto,
+            http_ver,
+            rpc,
             muted,
             status: None,
             amend_seq: None,
@@ -999,6 +1114,15 @@ fn format_event_line(ev: &LogEvent) -> String {
     if ev.muted {
         line.push_str(" muted=1");
     }
+    // Emitted only when known/non-default so an older reader ignores the unknown key and an older
+    // persisted line (without them) parses back to `Unknown`/`None` — a forward/backward-compatible
+    // extension of the line format.
+    if ev.http_ver != HttpVer::Unknown {
+        line.push_str(&format!(" ver={}", ev.http_ver.as_wire()));
+    }
+    if ev.rpc != RpcKind::None {
+        line.push_str(&format!(" l7={}", ev.rpc.as_str()));
+    }
     if let Some(method) = &ev.method {
         line.push_str(&format!(" method={method}"));
     }
@@ -1301,6 +1425,8 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut status = None;
     let mut muted = false;
     let mut proto = Proto::Other;
+    let mut http_ver = HttpVer::Unknown;
+    let mut rpc = RpcKind::None;
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "event" {
         return None;
@@ -1313,6 +1439,8 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
             "port" => port = value.parse().ok(),
             "verdict" => verdict = LogVerdict::parse(value),
             "proto" => proto = Proto::parse(value),
+            "ver" => http_ver = HttpVer::parse(value),
+            "l7" => rpc = RpcKind::parse(value),
             "reason" => reason = Some(value.to_string()),
             "method" => method = Some(value.to_string()),
             "host" => host = Some(value.to_string()),
@@ -1332,6 +1460,8 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         verdict: verdict?,
         reason: reason?,
         proto,
+        http_ver,
+        rpc,
         muted,
         status,
         // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
@@ -2263,6 +2393,8 @@ mod tests {
             verdict,
             reason,
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
     }
 
@@ -2326,6 +2458,8 @@ mod tests {
             LogVerdict::Allow,
             "allowed",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
         let s2 = ring.push(
             false,
@@ -2336,6 +2470,8 @@ mod tests {
             LogVerdict::Allow,
             "allowed",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
         // A status amends the matching still-resident event, and only it.
         ring.set_status(s2, 404);
@@ -2361,6 +2497,8 @@ mod tests {
             LogVerdict::Allow,
             "allowed",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
         ring.push(
             false,
@@ -2371,6 +2509,8 @@ mod tests {
             LogVerdict::Allow,
             "allowed",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
         ring.set_status(s1, 500);
         let after = ring.snapshot(None, None, false);
@@ -2396,6 +2536,8 @@ mod tests {
             LogVerdict::Allow,
             "allowed",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
         // A follow reader catches up: it has seen seq s1, with no amendment yet.
         let seen = ring.snapshot(Some(s1), Some(0), false);
@@ -2438,6 +2580,9 @@ mod tests {
             path: Some("/v1/x?a=1&b=2".into()),
             verdict: LogVerdict::Allow,
             proto: Proto::Https,
+            // Non-default version + RPC framing so the `ver=`/`l7=` tokens are exercised end to end.
+            http_ver: HttpVer::H2,
+            rpc: RpcKind::Grpc,
             reason: "allowed".into(),
             muted: false,
             // A captured upstream status round-trips on the wire alongside the query path.
@@ -2461,6 +2606,10 @@ mod tests {
             path: None,
             verdict: LogVerdict::Allow,
             proto: Proto::Https,
+            // A raw/early event carries no HTTP version or RPC framing — both stay default and their
+            // tokens are omitted from the line.
+            http_ver: HttpVer::Unknown,
+            rpc: RpcKind::None,
             reason: "allowed".into(),
             muted: false,
             status: None,
@@ -2491,6 +2640,9 @@ mod tests {
                 verdict,
                 reason: "dns-failure".into(),
                 proto: Proto::Https,
+                // HTTP/1.1 here exercises the `ver=h1` token alongside every verdict.
+                http_ver: HttpVer::H1,
+                rpc: RpcKind::None,
                 // A muted deny exercises the `muted=1` token on the wire (mute only ever applies to
                 // a deny), so its round-trip is covered here alongside every verdict token.
                 muted: verdict == LogVerdict::Deny,
@@ -2504,6 +2656,46 @@ mod tests {
             );
             assert_eq!(parsed, ev);
         }
+    }
+
+    #[test]
+    fn rpc_kind_classifies_by_content_type_family_never_the_path() {
+        use RpcKind::*;
+        // gRPC-web is matched before gRPC (it shares the `application/grpc` prefix).
+        assert_eq!(RpcKind::from_content_type("application/grpc"), Grpc);
+        assert_eq!(RpcKind::from_content_type("application/grpc+proto"), Grpc);
+        assert_eq!(RpcKind::from_content_type("APPLICATION/GRPC"), Grpc);
+        assert_eq!(RpcKind::from_content_type("application/grpc-web"), GrpcWeb);
+        assert_eq!(
+            RpcKind::from_content_type("application/grpc-web+proto"),
+            GrpcWeb
+        );
+        assert_eq!(
+            RpcKind::from_content_type("application/connect+proto"),
+            Connect
+        );
+        assert_eq!(
+            RpcKind::from_content_type("application/connect+json"),
+            Connect
+        );
+        // Connect *unary* and a plain protobuf/JSON POST are byte-identical on the wire, so they are
+        // deliberately NOT tagged — the classifier never guesses from the path.
+        assert_eq!(RpcKind::from_content_type("application/proto"), None);
+        assert_eq!(RpcKind::from_content_type("application/json"), None);
+        assert_eq!(RpcKind::from_content_type("text/plain"), None);
+        assert_eq!(RpcKind::from_content_type(""), None);
+    }
+
+    #[test]
+    fn a_line_without_ver_or_l7_parses_to_unknown_and_none() {
+        // Backward compatibility: a persisted line predating these two axes (no `ver=`/`l7=`) must
+        // still parse, defaulting them rather than failing the whole line.
+        let old = "event seq=1 at=1700000000000 port=443 verdict=allow proto=https \
+                   reason=allowed host=h.test path=/p";
+        let parsed = parse_event_line(old).expect("an older line still parses");
+        assert_eq!(parsed.http_ver, HttpVer::Unknown);
+        assert_eq!(parsed.rpc, RpcKind::None);
+        assert_eq!(parsed.proto, Proto::Https);
     }
 
     #[test]
@@ -2528,6 +2720,8 @@ mod tests {
             LogVerdict::Allow,
             "allowed",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
         log.push(
             false,
@@ -2538,6 +2732,8 @@ mod tests {
             LogVerdict::Deny,
             "denied-by-rule",
             Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
         );
 
         let flows = Arc::new(FlowRegistry::new());

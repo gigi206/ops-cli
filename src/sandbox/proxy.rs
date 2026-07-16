@@ -765,6 +765,39 @@ impl ProxyCtx {
         kind: StatKind,
         reason: &str,
     ) -> Option<u64> {
+        // The common case — a refusal, or any site with no inspected HTTP head — carries no HTTP
+        // version or RPC framing. The three inspected-forward sites call [`outcome_l7`] instead, with
+        // the real version + `Content-Type`-derived framing.
+        self.outcome_l7(
+            proto,
+            super::control::HttpVer::Unknown,
+            super::control::RpcKind::None,
+            host,
+            port,
+            method,
+            path,
+            kind,
+            reason,
+        )
+    }
+
+    /// [`outcome`](Self::outcome) with the inspected request's HTTP version and RPC framing attached
+    /// — called only where the head was read and the request is forwarded, so the live log can render
+    /// `https/h2` (transport + version) and a `grpc`/`grpc-web`/`connect` tag. Every other site funnels
+    /// through the version-less [`outcome`](Self::outcome).
+    #[allow(clippy::too_many_arguments)]
+    fn outcome_l7(
+        &self,
+        proto: super::control::Proto,
+        http_ver: super::control::HttpVer,
+        rpc: super::control::RpcKind,
+        host: &str,
+        port: u16,
+        method: Option<&str>,
+        path: Option<&str>,
+        kind: StatKind,
+        reason: &str,
+    ) -> Option<u64> {
         if let Some(stats) = &self.stats {
             stats.record(host, kind);
         }
@@ -780,7 +813,9 @@ impl ProxyCtx {
         // the same as a config one.
         let muted = matches!(kind, StatKind::Deny)
             && effective_policy(self).muted(host, port, path, method);
-        self.push_log_maybe_muted(muted, proto, host, port, method, path, verdict, reason)
+        self.push_log_maybe_muted(
+            muted, proto, http_ver, rpc, host, port, method, path, verdict, reason,
+        )
     }
 
     /// The copy-paste `ops net allow` command a `denied-default` refusal body suggests. When the
@@ -812,7 +847,18 @@ impl ProxyCtx {
         verdict: super::control::LogVerdict,
         reason: &str,
     ) -> Option<u64> {
-        self.push_log_maybe_muted(false, proto, host, port, method, path, verdict, reason)
+        self.push_log_maybe_muted(
+            false,
+            proto,
+            super::control::HttpVer::Unknown,
+            super::control::RpcKind::None,
+            host,
+            port,
+            method,
+            path,
+            verdict,
+            reason,
+        )
     }
 
     /// The muted-aware inner of [`Self::push_log`]: when `muted` (a denied request matched a `mute`
@@ -825,6 +871,8 @@ impl ProxyCtx {
         &self,
         muted: bool,
         proto: super::control::Proto,
+        http_ver: super::control::HttpVer,
+        rpc: super::control::RpcKind,
         host: &str,
         port: u16,
         method: Option<&str>,
@@ -843,6 +891,8 @@ impl ProxyCtx {
             verdict,
             reason,
             proto,
+            http_ver,
+            rpc,
         ))
     }
 
@@ -1644,8 +1694,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // The request is permitted and the upstream is up — it will now egress. Record the one `allow`
     // outcome here (a single count per request: a refusal above already returned, and the steps
     // below are I/O, not policy verdicts, so this is the sole place a forwarded request is counted).
-    let allow_seq = ctx.outcome(
+    let allow_seq = ctx.outcome_l7(
         super::control::Proto::Https,
+        super::control::HttpVer::H1,
+        // The RPC framing from the inspected inner request's `Content-Type` (gRPC/gRPC-web/Connect
+        // streaming); a plain or Connect-*unary* request classifies to `None`.
+        super::control::RpcKind::from_content_type(
+            inner.header("content-type").unwrap_or_default(),
+        ),
         &connect_host,
         port,
         Some(&imethod),
@@ -2337,8 +2393,12 @@ fn handle_cleartext(
     };
 
     // The request is permitted and the upstream is up — record the one `allow` outcome here.
-    let allow_seq = ctx.outcome(
+    let allow_seq = ctx.outcome_l7(
         super::control::Proto::Http,
+        super::control::HttpVer::H1,
+        // Cleartext is always HTTP/1.1; a gRPC/Connect-streaming content-type still tags (rare over
+        // cleartext, but honest if it occurs).
+        super::control::RpcKind::from_content_type(head.header("content-type").unwrap_or_default()),
         &host,
         port,
         Some(method),
@@ -2420,7 +2480,7 @@ mod h2mitm {
         upstream_server_name, ProxyCtx, SecretNeedle, StatKind,
     };
     use crate::allowlist::{self, Decision, Rule};
-    use crate::sandbox::control::{LogVerdict, Proto};
+    use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
     use bytes::Bytes;
     use futures_util::stream::{FuturesUnordered, StreamExt};
     use http::{Method, Request, Response, StatusCode};
@@ -2824,8 +2884,17 @@ mod h2mitm {
         // The upstream is connected and validated (this is the HTTP/1.1 path's `connect_upstream`
         // success point), so record the allow now — a verdict-passing request that failed to reach
         // here was logged but not counted as an allow. `seq` then carries the response status.
-        let seq = ctx.outcome(
+        let seq = ctx.outcome_l7(
             Proto::Https,
+            HttpVer::H2,
+            // A designated `[network] http2` host is MITM'd as HTTP/2 for gRPC; tag the framing from
+            // the request's `Content-Type` (`application/grpc` and friends).
+            RpcKind::from_content_type(
+                req.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default(),
+            ),
             host,
             port,
             Some(method),
@@ -4737,7 +4806,7 @@ mod tests {
             "upstream.test",
             "upstream.test",
             addr.port(),
-            b"GET /path HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+            b"GET /path HTTP/1.1\r\nHost: upstream.test\r\nContent-Type: application/connect+proto\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
         up.join().unwrap();
@@ -4768,6 +4837,19 @@ mod tests {
         assert_eq!(events[0].host, "upstream.test");
         assert_eq!(events[0].method.as_deref(), Some("GET"));
         assert_eq!(events[0].path.as_deref(), Some("/path"));
+        // The inspected HTTP/1.1 MITM forward is stamped `h1`, and its `Content-Type` is classified —
+        // the motivating case (the agent hosts ride HTTP/1.1, so their RPC framing must surface here,
+        // not only on the h2 path). A Connect-streaming content-type tags `connect`.
+        assert_eq!(
+            events[0].http_ver,
+            crate::sandbox::control::HttpVer::H1,
+            "an inspected h1 MITM forward is stamped h1"
+        );
+        assert_eq!(
+            events[0].rpc,
+            crate::sandbox::control::RpcKind::Connect,
+            "the request's connect content-type is recognized and tagged"
+        );
     }
 
     /// A muted refusal (`dontaudit`) is routed away from the default log view yet still counted — the
