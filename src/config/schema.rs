@@ -534,12 +534,17 @@ pub(crate) struct NetworkTable {
     #[serde(default)]
     pub(crate) mute: Vec<String>,
     /// Hosts the egress proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of the
-    /// default HTTP/1.1. Each entry is a hostname with an optional port (`grpc.example.com` for any
-    /// port, `grpc.example.com:443` for that port only). Selecting HTTP/2 is orthogonal to the
-    /// verdict — a host must still be permitted by an `allow` rule, and every gRPC stream is
-    /// inspected and verdict-checked (method + `:path` = `/pkg.Service/Method`) exactly like the
-    /// HTTP/1.1 path. Trusted/global-only like the rest of the table; a malformed entry is dropped
-    /// with a warning (fail-closed — that host keeps HTTP/1.1).
+    /// default HTTP/1.1. Each entry is an exact hostname or a `*.domain` subdomain wildcard, with an
+    /// optional port (`grpc.example.com` for any port, `grpc.example.com:443` for that port only,
+    /// `*.example.com` for the apex and every subdomain — the same spoof-safe rule as an `allow`
+    /// `*.domain`). Selecting HTTP/2 is orthogonal to the verdict — a host must still be permitted by
+    /// an `allow` rule, and every gRPC stream is inspected and verdict-checked (method + `:path` =
+    /// `/pkg.Service/Method`) exactly like the HTTP/1.1 path. Transport selection happens at
+    /// CONNECT/ALPN time (host:port only, no path), so there is no `re:`/`host/path` form here; and
+    /// because the designation is ALPN-h2-only, a wildcard covering a host the client speaks HTTP/1.1
+    /// to will fail that host's handshake — prefer exact hosts unless every subdomain is gRPC/h2.
+    /// Trusted/global-only like the rest of the table; a malformed entry is dropped with a warning
+    /// (fail-closed — that host keeps HTTP/1.1).
     #[serde(default)]
     pub(crate) http2: Vec<String>,
     /// DNS cache TTL in seconds for the egress proxy's host-side resolver. The proxy resolves an

@@ -675,53 +675,82 @@ pub(crate) enum DefaultAction {
 /// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
 /// (`None` = wait indefinitely until answered); it is inert under the other defaults. The `ask`
 /// park notice is printed to stderr by default; a policy may suppress it (the request still parks).
-/// A `[network] http2` entry: a canonicalized host and an optional port. The egress proxy speaks
-/// HTTP/2 (ALPN `h2`, for gRPC) to a CONNECT target matching one of these; a `None` port matches
-/// any port, a `Some(port)` only that port. It selects the transport only — the host must still be
-/// permitted by an `allow` rule, and every stream is verdict-checked like the HTTP/1.1 path.
+/// A `[network] http2` entry: an exact host or a `*.domain` subdomain wildcard, plus an optional
+/// port. The egress proxy speaks HTTP/2 (ALPN `h2`, for gRPC) to a CONNECT target matching one of
+/// these; a `None` port matches any port, a `Some(port)` only that port. It selects the transport
+/// only — the host must still be permitted by an `allow` rule, and every stream is verdict-checked
+/// like the HTTP/1.1 path.
+///
+/// A `*.domain` entry matches the apex `domain` and any subdomain of it, the same spoof-safe rule as
+/// an `allow`/`deny` `*.domain` (`api.domain` matches, `domain` matches, `domain.evil.com` does not).
+/// The transport selection happens at CONNECT/ALPN time, which sees only `host:port` — so host and
+/// `*.domain` are the only meaningful granularities (no path/URL exists yet to match, which is why
+/// the `re:` and `host/path` rule kinds have no http2 analogue). Caution: the designated transport is
+/// ALPN-h2-**only**, so a wildcard that also covers a host the client speaks HTTP/1.1 to will fail
+/// that host's TLS handshake (no common ALPN) — prefer exact hosts unless every subdomain is gRPC/h2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Http2Host {
+    /// The exact host, or — when `subdomain` is set — the wildcard's apex domain (the part after `*.`).
     host: String,
+    /// A `*.domain` wildcard: match the apex `host` and any subdomain of it, not `host` alone.
+    subdomain: bool,
     port: Option<u16>,
 }
 
 impl Http2Host {
-    /// Parse a config entry `host` or `host:port`. Returns `None` for a malformed entry (empty host,
-    /// or a `:suffix` that is not a valid port) — the caller drops it with a warning, fail-closed
-    /// (that host simply keeps HTTP/1.1). A hostname is expected: an h2 target needs an SNI, and the
-    /// proxy refuses IP-literal CONNECT targets, so the `:port` split (rightmost colon, numeric
-    /// suffix) does not attempt to parse a bracketed IPv6 literal.
+    /// Parse a config entry `host`, `*.domain`, `host:port`, or `*.domain:port`. Returns `None` for a
+    /// malformed entry (empty host, a bare `*.`, or a `:suffix` that is not a valid port) — the caller
+    /// drops it with a warning, fail-closed (that host simply keeps HTTP/1.1). A hostname is expected:
+    /// an h2 target needs an SNI, and the proxy refuses IP-literal CONNECT targets, so the `:port`
+    /// split (rightmost colon, numeric suffix) does not attempt to parse a bracketed IPv6 literal.
     pub(crate) fn parse(entry: &str) -> Option<Self> {
         let entry = entry.trim();
         if entry.is_empty() {
             return None;
         }
-        if let Some((h, p)) = entry.rsplit_once(':') {
-            if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
-                let port: u16 = p.parse().ok()?;
-                return Some(Self {
-                    host: canonical_host(h),
-                    port: Some(port),
-                });
+        let (hostpart, port) = match entry.rsplit_once(':') {
+            Some((h, p))
+                if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                (h, Some(p.parse::<u16>().ok()?))
             }
-        }
+            _ => (entry, None),
+        };
+        let (domain, subdomain) = match hostpart.strip_prefix("*.") {
+            Some("") => return None, // a bare `*.` with no domain is malformed
+            Some(d) => (d, true),
+            None => (hostpart, false),
+        };
         Some(Self {
-            host: canonical_host(entry),
-            port: None,
+            host: canonical_host(domain),
+            subdomain,
+            port,
         })
     }
 
-    /// The canonical entry text (for `ops config show`): `host` or `host:port`.
+    /// The canonical entry text (for `ops config show`): `host`, `*.domain`, or the `:port` form.
     pub(crate) fn display(&self) -> String {
+        let host = if self.subdomain {
+            format!("*.{}", self.host)
+        } else {
+            self.host.clone()
+        };
         match self.port {
-            Some(p) => format!("{}:{}", self.host, p),
-            None => self.host.clone(),
+            Some(p) => format!("{host}:{p}"),
+            None => host,
         }
     }
 
-    /// Whether a CONNECT to `host:port` (host already canonicalized) matches this entry.
+    /// Whether a CONNECT to `host:port` (host already canonicalized) matches this entry. An exact
+    /// entry matches only `host`; a `*.domain` entry matches the apex and any subdomain (suffix-safe:
+    /// a leading `.` is required, so `domain.evil.com` never matches `*.domain`).
     fn matches(&self, host: &str, port: u16) -> bool {
-        self.host == host && self.port.map(|p| p == port).unwrap_or(true)
+        let host_ok = if self.subdomain {
+            host == self.host || host.ends_with(&format!(".{}", self.host))
+        } else {
+            host == self.host
+        };
+        host_ok && self.port.map(|p| p == port).unwrap_or(true)
     }
 }
 
@@ -3422,10 +3451,20 @@ mod tests {
             Http2Host::parse("grpc.example.com.:443").unwrap().display(),
             "grpc.example.com:443"
         );
+        // A `*.domain` wildcard round-trips through display, with and without a port.
+        assert_eq!(
+            Http2Host::parse("*.example.com").unwrap().display(),
+            "*.example.com"
+        );
+        assert_eq!(
+            Http2Host::parse("*.example.com:443").unwrap().display(),
+            "*.example.com:443"
+        );
         // Malformed → None (dropped with a warning by the config layer, fail-closed): an empty
-        // entry, or a port that is not a valid u16.
+        // entry, a bare `*.` with no domain, or a port that is not a valid u16.
         assert!(Http2Host::parse("").is_none());
         assert!(Http2Host::parse("   ").is_none());
+        assert!(Http2Host::parse("*.").is_none());
         assert!(Http2Host::parse("host:99999").is_none());
     }
 
@@ -3440,6 +3479,19 @@ mod tests {
         let pinned = Http2Host::parse("h.example.com:9001").unwrap();
         assert!(pinned.matches("h.example.com", 9001));
         assert!(!pinned.matches("h.example.com", 443));
+
+        // A `*.domain` wildcard matches the apex and any subdomain, spoof-safe (a leading `.` is
+        // required), and still honours the optional port. This is the same suffix-safe rule the
+        // `allow`/`deny` `*.domain` kind uses.
+        let wild = Http2Host::parse("*.cursor.sh").unwrap();
+        assert!(wild.matches("cursor.sh", 443)); // apex
+        assert!(wild.matches("api5.cursor.sh", 443)); // subdomain
+        assert!(wild.matches("agent.api5.cursor.sh", 443)); // nested subdomain
+        assert!(!wild.matches("cursor.sh.evil.com", 443)); // lookalike suffix → no match
+        assert!(!wild.matches("notcursor.sh", 443)); // must break on a dot, not a substring
+        let wild_pinned = Http2Host::parse("*.cursor.sh:443").unwrap();
+        assert!(wild_pinned.matches("api5.cursor.sh", 443));
+        assert!(!wild_pinned.matches("api5.cursor.sh", 8443)); // wrong port
     }
 
     #[test]
