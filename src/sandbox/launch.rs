@@ -1737,14 +1737,18 @@ fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> St
     )
 }
 
-/// `ops session attach <id>`: join a *running* session's cage and open an interactive shell **inside** it —
-/// the agent's live processes, its real `/tmp`, its network — the way `docker exec -it` works.
-/// `<id>` is the PID `ops session ls` shows. Unlike a launch, this enters namespaces bubblewrap already
+/// `ops session attach <id> [-- command [args...]]`: join a *running* session's cage and either
+/// open an interactive shell **inside** it or run one command there — the agent's live processes,
+/// its real `/tmp`, its network — the way `docker exec` / `docker exec -it` works. `<id>` is the
+/// PID `ops session ls` shows. With no command it opens the interactive rc shell (needs a terminal);
+/// with `-- command` it runs that command, driven through a pty when stdin is a terminal (so an
+/// interactive tool keeps job control) or through inherited stdio when it is a pipe/script (so bytes
+/// pass through clean for scripting). Unlike a launch, this enters namespaces bubblewrap already
 /// built (via `setns`), so it provisions nothing and re-resolves no config; it re-applies the cage's
-/// confinement to the joined shell (seccomp denylist + `no_new_privs` + capability drop) so the
-/// shell is confined at least as tightly as the agent. See [`super::attach`] for the mechanism and
-/// its one inherent residual (the shell binary comes from the agent's own mount namespace).
-pub(crate) fn attach(id: &str) -> ExitCode {
+/// confinement (seccomp denylist + `no_new_privs` + capability drop) so the joined process is
+/// confined at least as tightly as the agent. See [`super::attach`] for the mechanism and its one
+/// inherent residual (the command binary comes from the agent's own mount namespace).
+pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let Some(layout) = Layout::from_env() else {
         eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
@@ -1764,9 +1768,12 @@ pub(crate) fn attach(id: &str) -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    // SAFETY: `isatty` only inspects fd 0. The attached shell needs a real terminal, like `shell`.
-    if unsafe { libc::isatty(0) } != 1 {
-        eprintln!("ops: `ops session attach` needs a terminal on stdin.");
+    // SAFETY: `isatty` only inspects fd 0. A bare attach opens an interactive shell, which needs a
+    // real terminal (like `shell`); a command drives its terminal setup from this — a pty when it
+    // has one, inherited stdio otherwise — so it imposes no terminal requirement.
+    let stdin_tty = unsafe { libc::isatty(0) } == 1;
+    if cmd.is_empty() && !stdin_tty {
+        eprintln!("ops: `ops session attach` needs a terminal on stdin (or pass `-- command`).");
         return ExitCode::from(2);
     }
 
@@ -1789,10 +1796,32 @@ pub(crate) fn attach(id: &str) -> ExitCode {
     };
     let environ = super::attach::read_environ(cage_pid);
 
-    let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
-    eprintln!("{}", render_attaching(target.pid, &target.label(), &epal));
+    // The in-cage argv: the interactive rc shell for a bare attach, or the command run through
+    // `bash -c 'exec "$@"'` so bash resolves it on the cage PATH and execs it in place.
+    let argv_owned = match attach_argv(&cmd) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("ops session attach: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match supervise_attach(cage, &environ) {
+    // Only the interactive shell announces itself ("type `exit` to leave"); a command is silent
+    // like `ops run`, so its stdout/stderr are exactly the command's.
+    if cmd.is_empty() {
+        let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
+        eprintln!("{}", render_attaching(target.pid, &target.label(), &epal));
+    }
+
+    // A terminal on stdin drives the command through a pty (interactive, job control); a pipe or
+    // script through inherited stdio (clean bytes). A bare shell always takes the pty path — it is
+    // gated to a terminal above, so `stdin_tty` holds here.
+    let result = if stdin_tty {
+        supervise_attach(cage, &environ, &argv_owned)
+    } else {
+        run_attach_direct(cage, &environ, &argv_owned)
+    };
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("ops: attach session failed: {e}");
@@ -1801,24 +1830,50 @@ pub(crate) fn attach(id: &str) -> ExitCode {
     }
 }
 
-/// Supervise a real attach: open a pty, fork a child that joins the cage's namespaces and execs a
-/// confined interactive shell inside it, and relay the terminal — the same pty machinery as
+/// Build the in-cage argv for an attach. With no command this is the interactive shell reading the
+/// in-cage rc (mise activation + the `(ops-<slug>)` prompt), exactly like `ops shell`. With a
+/// command it is `bash -c 'exec "$@"' bash <cmd> [args…]`: bash resolves `<cmd>` on the cage PATH
+/// (from the cage environment passed as its `envp`) and execs it **in place**, so the command's
+/// exit status propagates; the command is passed **positionally** (`"$@"`), so no argument is ever
+/// interpreted as shell syntax — zero injection surface. `/bin/bash` and the rc are absolute cage
+/// paths that resolve in the cage's own mount namespace once the child has entered it.
+fn attach_argv(cmd: &[OsString]) -> io::Result<Vec<CString>> {
+    if cmd.is_empty() {
+        return Ok(vec![
+            cstring(binds::SANDBOX_BASH.as_bytes())?,
+            cstring(b"--rcfile")?,
+            cstring(binds::SHELL_RC_INCAGE.as_bytes())?,
+        ]);
+    }
+    let mut argv = vec![
+        cstring(binds::SANDBOX_BASH.as_bytes())?,
+        cstring(b"-c")?,
+        cstring(b"exec \"$@\"")?,
+        cstring(b"bash")?,
+    ];
+    for arg in cmd {
+        argv.push(cstring(arg.as_bytes())?);
+    }
+    Ok(argv)
+}
+
+/// Supervise a real attach: open a pty, fork a child that joins the cage's namespaces and execs the
+/// confined `argv_owned` inside it, and relay the terminal — the same pty machinery as
 /// [`supervise`], but the child enters an *existing* cage rather than launching a new one, so there
-/// is no bwrap argv, no cgroup scope, and no session record (the attach shell is a transient guest
-/// of the agent's cage, not a session of its own).
-fn supervise_attach(cage: super::attach::CageHandle, environ: &[u8]) -> io::Result<i32> {
+/// is no bwrap argv, no cgroup scope, and no session record (the attach guest is a transient guest
+/// of the agent's cage, not a session of its own). Used for a bare interactive shell and for a
+/// command run from a terminal (so an interactive tool keeps job control).
+fn supervise_attach(
+    cage: super::attach::CageHandle,
+    environ: &[u8],
+    argv_owned: &[CString],
+) -> io::Result<i32> {
     // The baseline mandatory denylist — never a project's `[seccomp] allow` relaxation — so the
-    // joined shell is confined at least as tightly as the agent. Compiled before the fork.
+    // joined process is confined at least as tightly as the agent. Compiled before the fork.
     let filters = super::seccomp::filter_bytes(&super::seccomp::SeccompPolicy::default());
 
-    // argv: an interactive bash reading the in-cage rc (mise activation + the `(ops-<slug>)` prompt),
-    // exactly like `ops shell`. `/bin/bash` and the rc are absolute cage paths that resolve in the
-    // cage's own mount namespace once the child has entered it. Built as C strings before the fork.
-    let argv_owned = [
-        cstring(binds::SANDBOX_BASH.as_bytes())?,
-        cstring(b"--rcfile")?,
-        cstring(binds::SHELL_RC_INCAGE.as_bytes())?,
-    ];
+    // argv: prebuilt by `attach_argv` (the interactive rc shell, or `bash -c 'exec "$@"' …`),
+    // resolving in the cage's own mount namespace once the child has entered it.
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
     argv.push(std::ptr::null());
 
@@ -1872,7 +1927,13 @@ fn supervise_attach(cage: super::attach::CageHandle, environ: &[u8]) -> io::Resu
     if child == 0 {
         unsafe {
             libc::close(master);
-            super::attach::enter_and_exec(&cage, &filters, slave, argv.as_ptr(), envp.as_ptr());
+            super::attach::enter_and_exec(
+                &cage,
+                &filters,
+                super::attach::TtyMode::Pty(slave),
+                argv.as_ptr(),
+                envp.as_ptr(),
+            );
         }
     }
 
@@ -1890,6 +1951,74 @@ fn supervise_attach(cage: super::attach::CageHandle, environ: &[u8]) -> io::Resu
     drop(winch);
     unsafe { libc::close(master) };
     status
+}
+
+/// Run an attach command with **inherited** stdio (no pty): fork a child that joins the cage's
+/// namespaces and execs the confined `argv_owned` inside it, keeping ops's own stdin/stdout/stderr,
+/// then wait and mirror its exit status. This is the pipe/script path — bytes pass through clean
+/// (no pty `\n`→`\r\n` translation), so `ops session attach <id> -- cmd` composes with pipes and
+/// redirection. Only reached when stdin is not a terminal (a command from a terminal takes the pty
+/// path in [`supervise_attach`] for interactive job control).
+fn run_attach_direct(
+    cage: super::attach::CageHandle,
+    environ: &[u8],
+    argv_owned: &[CString],
+) -> io::Result<i32> {
+    // The same baseline denylist the pty path installs — the command is confined at least as
+    // tightly as the agent, never a project's `[seccomp] allow` relaxation. Compiled before the fork.
+    let filters = super::seccomp::filter_bytes(&super::seccomp::SeccompPolicy::default());
+
+    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // envp: the agent's own cage environment (PATH/proxy/CA), TERM carried through from ops.
+    let term = std::env::var("TERM").ok();
+    let envp_owned = super::attach::build_env(environ, term.as_deref());
+    let mut envp: Vec<*const libc::c_char> = envp_owned.iter().map(|c| c.as_ptr()).collect();
+    envp.push(std::ptr::null());
+
+    // SAFETY: between fork and exec the child touches only async-signal-safe code
+    // (`attach::enter_and_exec` — raw syscalls only) with the prebuilt argv/envp/filters/pidfd. The
+    // parent is single-threaded here (attach starts no egress proxy thread). The child inherits
+    // ops's stdin/stdout/stderr (`TtyMode::Inherit`), so the command's I/O passes through clean.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if child == 0 {
+        unsafe {
+            super::attach::enter_and_exec(
+                &cage,
+                &filters,
+                super::attach::TtyMode::Inherit,
+                argv.as_ptr(),
+                envp.as_ptr(),
+            );
+        }
+    }
+
+    // Parent: the child holds its own copy of the cage handle across the fork, so drop ours.
+    drop(cage);
+    // Reap the child (the `enter_and_exec` intermediary), which has already normalized its
+    // grandchild's exit into a plain status (`128 + signo` for a signal death, `126`/`127` on a
+    // setup failure), so `WEXITSTATUS` alone carries the command's exit code.
+    let mut status: libc::c_int = 0;
+    loop {
+        if unsafe { libc::waitpid(child, &mut status, 0) } >= 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e);
+        }
+    }
+    if libc::WIFEXITED(status) {
+        Ok(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Ok(128 + libc::WTERMSIG(status))
+    } else {
+        Ok(126)
+    }
 }
 
 /// Render the `ops session stop --all` line for an empty registry (stdout): nothing to stop is a no-op
@@ -4800,5 +4929,63 @@ mod tests {
         // the session pid, so this is the single source of that name.
         let path = detach_log_path(Path::new("/var/lib/ops"), 4242);
         assert_eq!(path, PathBuf::from("/var/lib/ops/logs/4242.log"));
+    }
+
+    /// The C strings an `attach_argv` result carries, as UTF-8 for assertion.
+    fn argv_strings(argv: &[CString]) -> Vec<String> {
+        argv.iter()
+            .map(|c| c.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn attach_argv_with_no_command_is_the_interactive_rc_shell() {
+        // A bare attach reuses the same rc shell as `ops shell`, so the joined shell gets mise
+        // activation and the `(ops-<slug>)` prompt.
+        let argv = attach_argv(&[]).expect("shell argv builds");
+        assert_eq!(
+            argv_strings(&argv),
+            vec![
+                binds::SANDBOX_BASH.to_string(),
+                "--rcfile".to_string(),
+                binds::SHELL_RC_INCAGE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_argv_with_a_command_runs_it_positionally_through_bash() {
+        // The command is passed positionally after `bash -c 'exec "$@"' bash`, so bash resolves it
+        // on the cage PATH and execs it in place — and no argument is ever interpreted as shell
+        // syntax (the injection guard: a value like `; rm -rf /` is one literal argv element).
+        let cmd = vec![
+            OsString::from("grep"),
+            OsString::from("-n"),
+            OsString::from("; rm -rf /"),
+        ];
+        let argv = attach_argv(&cmd).expect("command argv builds");
+        assert_eq!(
+            argv_strings(&argv),
+            vec![
+                binds::SANDBOX_BASH.to_string(),
+                "-c".to_string(),
+                "exec \"$@\"".to_string(),
+                "bash".to_string(),
+                "grep".to_string(),
+                "-n".to_string(),
+                "; rm -rf /".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_argv_rejects_a_command_argument_with_an_interior_nul() {
+        // A NUL cannot be a C-string argument; it must fail closed rather than truncate the argv.
+        use std::os::unix::ffi::OsStrExt;
+        let cmd = vec![
+            OsString::from("echo"),
+            std::ffi::OsStr::from_bytes(b"a\0b").to_os_string(),
+        ];
+        assert!(attach_argv(&cmd).is_err());
     }
 }

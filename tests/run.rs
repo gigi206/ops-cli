@@ -5272,6 +5272,146 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     );
 }
 
+/// `ops session attach <id> -- command` runs one command in the live cage instead of an interactive
+/// shell. With no terminal on stdin it takes the **inherited-stdio** path (no pty), so it composes
+/// with pipes and its exit status propagates — the value of the feature over an interactive shell.
+/// Three teeth, all through the real binary against a live background session:
+///  - **live cage + clean bytes:** `-- cat /tmp/<marker>` prints the marker the agent wrote to the
+///    cage's own tmpfs on a captured (piped, non-tty) stdout — a fresh cage's tmpfs would be empty,
+///    and a pty would have translated the bytes.
+///  - **status propagation:** `-- sh -c 'exit 7'` makes ops exit 7 (a plain command's status is ops's).
+///  - **confinement re-applied on the direct path (the security ship-gate):** `-- awk …/proc/self/status`
+///    reads `Seccomp: 2` with both filters, `NoNewPrivs: 1`, empty `CapEff` — the same `CONFINE` the
+///    pty attach asserts, proving the non-pty path re-applies the cage's confinement just as tightly.
+///
+/// Skips (never fails) where the host cannot sandbox or the cage does not come up.
+#[test]
+fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    const MARKER: &str = "ATTACH-CMD-4b81de20";
+    // Assembled at runtime from /proc inside the joined command, so it cannot leak in from the argv.
+    const CONFINE: &str = "CONFINE=2-1-0000000000000000-2";
+
+    let project = TmpDir::new("attachcmd-proj");
+    let data = TmpDir::new("attachcmd-data");
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping attach-cmd e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // A background agent writes the marker into the cage's own /tmp, then sleeps so the cage stays
+    // alive to be attached. `child.id()` is the session pid `ops session attach` uses.
+    let mut agent = ops()
+        .args(["run", "--"])
+        .args([
+            "sh",
+            "-c",
+            &format!("echo {MARKER} > /tmp/attach-cmd-marker; exec sleep 120"),
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the background ops run");
+    let session_pid = agent.id();
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !cage_userns_ready(session_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    if !cage_userns_ready(session_pid) {
+        let _ = agent.kill();
+        let _ = agent.wait();
+        eprintln!(
+            "skipping attach-cmd e2e: the background cage never came up (userns not created)"
+        );
+        return;
+    }
+    // The marker command runs before `exec sleep`; give it a beat to land in the cage /tmp.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Every attach below sets stdin to a non-terminal (`Stdio::null()`), so all take the direct
+    // inherited-stdio path — the one an interactive shell could not reach.
+
+    // A) Live cage + clean piped bytes: read the agent's own /tmp marker and print it.
+    let cat = ops()
+        .args([
+            "session",
+            "attach",
+            &session_pid.to_string(),
+            "--",
+            "cat",
+            "/tmp/attach-cmd-marker",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach -- cat");
+    let cat_out = String::from_utf8_lossy(&cat.stdout).into_owned();
+
+    // B) The command's exit status becomes ops's.
+    let seven = ops()
+        .args([
+            "session",
+            "attach",
+            &session_pid.to_string(),
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .status()
+        .expect("run attach -- 'exit 7'");
+
+    // C) Confinement re-applied on the direct path — the same triple the pty attach asserts.
+    let confine = ops()
+        .args([
+            "session", "attach", &session_pid.to_string(), "--",
+            "awk",
+            "/^Seccomp:/{s=$2}/^Seccomp_filters:/{f=$2}/^NoNewPrivs:/{n=$2}/^CapEff:/{c=$2}END{print \"CONFINE=\" s \"-\" n \"-\" c \"-\" f}",
+            "/proc/self/status",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach -- awk status");
+    let confine_out = String::from_utf8_lossy(&confine.stdout).into_owned();
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+
+    assert!(
+        cat.status.success() && cat_out.contains(MARKER),
+        "attach -- cat did not print the agent's live /tmp marker on a clean stdout (exit {:?}) — it \
+         is not inside the running cage, or the direct path is broken:\nstdout: {cat_out}\nstderr: {}",
+        cat.status.code(),
+        String::from_utf8_lossy(&cat.stderr)
+    );
+    assert_eq!(
+        seven.code(),
+        Some(7),
+        "attach -- 'exit 7' must propagate the command's exit status as ops's"
+    );
+    assert!(
+        confine_out.contains(CONFINE),
+        "the command's confinement was not re-applied on the direct (non-pty) path — want Seccomp 2 \
+         (both filters) / NoNewPrivs 1 / empty CapEff ({CONFINE}):\n{confine_out}"
+    );
+}
+
 /// Ending a session tears down every shell attached to it. `ops session attach` runs the shell **inside**
 /// the cage's pid namespace, so when the cage's init (bubblewrap, pid 1 of that namespace) dies —
 /// here via `ops session stop` — the kernel SIGKILLs every process in the namespace, the attached shell

@@ -441,7 +441,8 @@ fn classify_namespace_failure(
 }
 
 /// `ops session <subcommand>` (alias `ops sessions`): the namespace grouping every operation on a
-/// live sandbox session — `ls` lists them, `attach` opens a shell inside one, `stop` ends them.
+/// live sandbox session — `ls` lists them, `attach` runs a shell or a command inside one, `stop`
+/// ends them.
 /// A leading `--help` (at any depth) is intercepted by [`help::maybe_help`], which also covers the
 /// `sessions` alias that the top-level help interception does not reach. A bare `ops session` prints
 /// the namespace page; an unknown subcommand is a usage error.
@@ -540,19 +541,34 @@ fn list_sessions() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops session attach <id>`: open a shell in a running session's environment. Exactly one operand
-/// — the PID `ops session ls` shows. A missing, extra, or non-UTF-8 operand is a usage error; a
-/// well-formed id
-/// that matches no live session is reported by `attach` itself.
+/// `ops session attach <id> [-- command [args...]]`: enter a running session's live cage. With no
+/// command it opens an interactive shell; with `-- command` it runs that command inside the cage
+/// (through a pty when stdin is a terminal, inherited stdio otherwise). The operand before any `--`
+/// is the PID `ops session ls` shows — exactly one; a missing, extra, or non-UTF-8 operand, or a
+/// bare `--` with no command, is a usage error; a well-formed id that matches no live session is
+/// reported by `attach` itself.
 fn attach_cmd(args: Vec<OsString>) -> ExitCode {
-    let Some(id) = (args.len() == 1).then(|| args[0].to_str()).flatten() else {
+    // Everything after the first `--` is the command to run in the cage; before it is the id alone.
+    let dashdash = args.iter().position(|a| a == "--");
+    let (head, cmd): (&[OsString], Vec<OsString>) = match dashdash {
+        Some(i) => (&args[..i], args[i + 1..].to_vec()),
+        None => (&args[..], Vec::new()),
+    };
+    let usage = || {
         eprintln!(
             "ops: usage: {}   (the PID shown by `ops session ls`)",
             help::synopsis_of(&["session", "attach"])
         );
-        return ExitCode::from(2);
+        ExitCode::from(2)
     };
-    sandbox::attach(id)
+    // A `--` with nothing after it is a mistake (attach either takes a command or opens a shell).
+    if dashdash.is_some() && cmd.is_empty() {
+        return usage();
+    }
+    let Some(id) = (head.len() == 1).then(|| head[0].to_str()).flatten() else {
+        return usage();
+    };
+    sandbox::attach(id, cmd)
 }
 
 /// The default grace period between SIGTERM and SIGKILL for `ops session stop`: long enough for an agent to

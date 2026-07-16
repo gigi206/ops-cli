@@ -1,6 +1,8 @@
-//! Real `ops session attach`: join a *running* cage's namespaces and open an interactive
-//! shell inside it — the agent's live processes, its real `/tmp`, its network — the
-//! way `docker exec -it` works, not a fresh cage that only shares the home on disk.
+//! Real `ops session attach`: join a *running* cage's namespaces and either open an interactive
+//! shell or run one command inside it — the agent's live processes, its real `/tmp`, its network —
+//! the way `docker exec` / `docker exec -it` works, not a fresh cage that only shares the home on
+//! disk. A command from a terminal takes the pty path ([`TtyMode::Pty`], job control); a command
+//! with no terminal takes the inherited-stdio path ([`TtyMode::Inherit`], clean piped bytes).
 //!
 //! ## A second namespace-entry path, kept honest
 //!
@@ -8,14 +10,14 @@
 //! ([`super::spec::SandboxSpec`] → [`super::argv::to_argv`]) and bubblewrap builds it.
 //! `attach` cannot: it must enter namespaces bubblewrap already created, which no
 //! `SandboxSpec` can express. So it is a deliberate *second* path — and the risk it
-//! must not introduce is a shell **less** confined than the agent, because none of the
+//! must not introduce is a joined process **less** confined than the agent, because none of the
 //! cage's confinement is inherited across [`setns`](libc::setns):
 //!
 //! - **seccomp** is per-thread, not per-namespace, so a joined process starts with the
 //!   whole syscall surface open. [`enter_and_exec`] re-installs the mandatory denylist
-//!   ([`super::seccomp`]) before exec. It always installs the *baseline* policy, never a
-//!   project's `[seccomp] allow` relaxation, so the joined shell is confined **at least**
-//!   as tightly as the agent.
+//!   ([`super::seccomp`]) before exec, on **both** the pty and inherited-stdio paths. It always
+//!   installs the *baseline* policy, never a project's `[seccomp] allow` relaxation, so the joined
+//!   shell or command is confined **at least** as tightly as the agent.
 //! - **no_new_privs + capabilities** are likewise re-applied: `PR_SET_NO_NEW_PRIVS`, the
 //!   ambient set cleared, the bounding set dropped. With an empty permitted set and
 //!   `no_new_privs`, no bounded capability can ever become effective, so a full bounding
@@ -24,14 +26,14 @@
 //! Two residuals, both named and accepted:
 //! - **cgroup resource limits are not shared.** `setns(CLONE_NEWCGROUP)` joins the cgroup
 //!   *namespace* (the `/proc/self/cgroup` view) but not the cage's cgroup *membership*, so the
-//!   attached shell runs in `ops session attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
+//!   attached process runs in `ops session attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
 //!   This is deliberate — an interactive inspection shell should not share the agent's OOM
 //!   ceiling — and it is not a confinement hole (a runaway there is bounded by the host, and the
 //!   security controls above are all re-applied).
-//! - **the shell binary comes from the agent's own mount namespace** (writable in Mode B), so an
-//!   agent that has tampered with its `/bin/bash` runs that — inherent to any `exec`-into-a-
+//! - **the shell or command binary comes from the agent's own mount namespace** (writable in Mode B),
+//!   so an agent that has tampered with its `/bin/bash` runs that — inherent to any `exec`-into-a-
 //!   container. Entering an agent's environment to inspect it is the whole point; the confinement
-//!   above bounds what the entered shell can do, and the operation is host-initiated by the
+//!   above bounds what the entered process can do, and the operation is host-initiated by the
 //!   trusted user — the caged agent cannot trigger it.
 
 use std::collections::BTreeMap;
@@ -51,6 +53,19 @@ pub(super) struct CageHandle {
     pidfd: OwnedFd,
     /// The `CLONE_NEW*` flags to join: only the namespaces the cage does *not* share with us.
     mask: libc::c_int,
+}
+
+/// How the entered command connects to a terminal. A bare `ops session attach` (interactive
+/// shell) and a command run from a terminal take [`Pty`](TtyMode::Pty) — the shell owns the pty
+/// slave as its controlling terminal, so job control and resize work. A command run with no
+/// terminal on stdin (a pipe or a script) takes [`Inherit`](TtyMode::Inherit) — it keeps ops's own
+/// stdin/stdout/stderr, so bytes pass through clean (no pty `\n`→`\r\n` translation) for scripting.
+#[derive(Clone, Copy)]
+pub(super) enum TtyMode {
+    /// Take this pty slave fd as the controlling terminal via `login_tty`.
+    Pty(libc::c_int),
+    /// Inherit ops's own stdin/stdout/stderr descriptors unchanged.
+    Inherit,
 }
 
 /// The seven namespace types, paired with their `setns` flag. Order is not significant — the
@@ -252,12 +267,13 @@ fn descendants(root: u32, parents: &BTreeMap<u32, u32>) -> Vec<u32> {
 /// # Safety
 ///
 /// Async-signal-safe: after the `fork` inside, only raw syscalls and the prebuilt
-/// `filters`/`argv`/`envp` are touched — no allocation, no locks. `slave` is the pty
-/// slave fd; `argv`/`envp` are NUL-terminated C string arrays that outlive the call.
+/// `filters`/`argv`/`envp` are touched — no allocation, no locks. `tty` selects the
+/// controlling-terminal setup ([`TtyMode`]); `argv`/`envp` are NUL-terminated C string
+/// arrays that outlive the call.
 pub(super) unsafe fn enter_and_exec(
     cage: &CageHandle,
     filters: &[Vec<u8>],
-    slave: libc::c_int,
+    tty: TtyMode,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> ! {
@@ -282,7 +298,7 @@ pub(super) unsafe fn enter_and_exec(
         libc::_exit(126);
     }
     if child == 0 {
-        confine_and_exec(filters, slave, argv, envp);
+        confine_and_exec(filters, tty, argv, envp);
     }
     // Parent of the shell: reap it and mirror its exit status up to the pty supervisor.
     let mut status: libc::c_int = 0;
@@ -303,23 +319,30 @@ pub(super) unsafe fn enter_and_exec(
     libc::_exit(126);
 }
 
-/// The grandchild: take the pty as a controlling terminal, re-apply the cage's
-/// confinement, and exec the shell. Never returns.
+/// The grandchild: set up the terminal per [`TtyMode`], re-apply the cage's confinement,
+/// and exec the command. Never returns.
 ///
 /// # Safety
 ///
 /// Async-signal-safe (raw syscalls only). Must run in the process that will `exec` the
-/// shell — i.e. after the pid-namespace fork in [`enter_and_exec`].
+/// command — i.e. after the pid-namespace fork in [`enter_and_exec`].
 unsafe fn confine_and_exec(
     filters: &[Vec<u8>],
-    slave: libc::c_int,
+    tty: TtyMode,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> ! {
-    // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
-    // same `login_tty` the `ops shell` supervisor uses, so job control works inside.
-    if libc::login_tty(slave) != 0 {
-        libc::_exit(127);
+    match tty {
+        // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
+        // same `login_tty` the `ops shell` supervisor uses, so job control works inside.
+        TtyMode::Pty(slave) => {
+            if libc::login_tty(slave) != 0 {
+                libc::_exit(127);
+            }
+        }
+        // A non-interactive command: keep ops's own stdin/stdout/stderr so bytes pass
+        // through unmodified (no controlling terminal, no pty line translation).
+        TtyMode::Inherit => {}
     }
     // Re-apply the cage confinement — NONE of it survived `setns`. `no_new_privs`
     // before seccomp: an unprivileged filter install requires it.

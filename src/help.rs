@@ -299,8 +299,9 @@ const PAGES: &[Page] = &[
         options: &[],
         details:
             "A session is a live sandbox cage. `ops session ls` lists them, `ops session attach`\n\
-            opens a shell inside one, and `ops session stop` ends them. Host-side — reads the\n\
-            on-disk session registry (daemonless), launches nothing. `ops sessions` is an alias.\n\
+            runs a shell or a command inside one, and `ops session stop` ends them. Host-side —\n\
+            reads the on-disk session registry (daemonless), launches nothing. `ops sessions` is\n\
+            an alias.\n\
             \n\
             Run one of the subcommands below.",
     },
@@ -317,16 +318,26 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["session", "attach"],
-        synopsis: "ops session attach <id>",
-        summary: "open a shell inside a running session's live cage",
-        options: &[("<id>", "the PID `ops session ls` shows for the session")],
+        synopsis: "ops session attach <id> [-- command [args...]]",
+        summary: "run a shell or a command inside a running session's live cage",
+        options: &[
+            ("<id>", "the PID `ops session ls` shows for the session"),
+            (
+                "-- command [args...]",
+                "run this command in the cage instead of an interactive shell",
+            ),
+        ],
         details:
-            "Joins the running cage and opens an interactive shell inside it — the agent's live\n\
-            processes, its real /tmp, and its network, the way `docker exec -it` does. The shell\n\
-            re-applies the cage's confinement — the same seccomp denylist, no_new_privs, and\n\
-            dropped capabilities — so it is never a wider hole than the agent. Provisions nothing\n\
-            and reads no config; needs a live session (run `ops session ls`). Type `exit` to\n\
-            leave — the agent keeps running.",
+            "Joins the running cage the way `docker exec` does — the agent's live processes, its\n\
+            real /tmp, and its network. With no command it opens an interactive shell (needs a\n\
+            terminal); with `-- command` it runs that command: through a pty when stdin is a\n\
+            terminal (interactive, job control), through inherited stdio when it is a pipe or\n\
+            script (clean bytes, so it composes with pipes and redirection). The command's exit\n\
+            status becomes ops's. Either way it re-applies the cage's confinement — the same\n\
+            seccomp denylist, no_new_privs, and dropped capabilities — so it is never a wider\n\
+            hole than the agent. Provisions nothing and reads no config; needs a live session\n\
+            (run `ops session ls`). A bare shell keeps running until you type `exit`; the agent\n\
+            keeps running either way.",
     },
     Page {
         path: &["session", "stop"],
