@@ -151,7 +151,7 @@ fn provision_locale_archive(
 /// Provision the base hermetic userland into ops's store and report its paths.
 /// The launcher resolves the userland before assembling a spec; on a project's
 /// first launch this fetches the base closure from the binary cache. `nixpkgs` is
-/// the pinned reference for the OS substrate (glibc, gcc, bash, coreutils, nix-ld,
+/// the pinned reference for the OS substrate (glibc, stdcpp, bash, coreutils, nix-ld,
 /// nix, socat, cacert, and a curated CLI toolset), resolved once by the caller so it is
 /// shared with the project's own
 /// package provisioning (and so a future channel override is plumbed in a single
@@ -176,10 +176,17 @@ pub(crate) fn resolve_userland(
         crate::store::provision(nix, layout, &roots.join(name), nixpkgs, attr, marker)
     };
 
-    // glibc supplies the loader (for foreign binaries) and libc; the gcc runtime
-    // supplies libstdc++/libgcc that heavier foreign binaries need.
+    // glibc supplies the loader (for foreign binaries) and libc; the C++ runtime
+    // (libstdc++/libgcc_s, from stdenv's compiler `.lib` output — NOT the compiler
+    // itself: no gcc/g++/headers ship in the cage) is what heavier foreign binaries
+    // (Electron/Chromium, Node with C++ native addons) dlopen.
     let glibc = realise("glibc.out", LOADER, "glibc")?;
-    let gcc = realise("stdenv.cc.cc.lib", "lib/libstdc++.so.6", "gcc")?;
+    let stdcpp = realise("stdenv.cc.cc.lib", "lib/libstdc++.so.6", "stdcpp")?;
+    // zlib supplies `libz.so.1`, a near-universal dependency a foreign dynamic binary
+    // dlopens (Node native addons, the Cursor CLI, many bundled tools) that is absent
+    // from glibc/stdcpp. It joins the nix-ld foreign library path so a binary the cage
+    // loads through the shim resolves it without a per-profile override.
+    let zlib = realise("zlib", "lib/libz.so.1", "zlib")?;
     // the interactive shell and coreutils make the sandbox a usable shell; a
     // fuller toolset is project provisioning, not a bootstrap concern.
     let bash = realise("bashInteractive", "bin/bash", "bash")?;
@@ -279,7 +286,8 @@ pub(crate) fn resolve_userland(
     // in the store the cage reads.
     let mut base_roots = vec![
         glibc.clone(),
-        gcc.clone(),
+        stdcpp.clone(),
+        zlib.clone(),
         bash.clone(),
         coreutils.clone(),
         nix_ld.clone(),
@@ -316,7 +324,7 @@ pub(crate) fn resolve_userland(
         interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
         // The real base loader the shim re-execs is an in-sandbox path, so logical.
         base_loader: glibc.join(LOADER),
-        foreign_lib_paths: vec![glibc.join("lib"), gcc.join("lib")],
+        foreign_lib_paths: vec![glibc.join("lib"), stdcpp.join("lib"), zlib.join("lib")],
         bin_paths,
         shell_bin: bash.join("bin/bash"),
         // The coreutils `env` `/usr/bin/env` links to, so an interpreted tool's
@@ -443,11 +451,11 @@ mod resolve_tests {
         // the base roots are logical store paths, each backed by ops's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure
         // roots the per-project store is seeded from. The expected base set is present:
-        // the ten core provisions plus one root per curated CLI tool.
+        // the eleven core provisions plus one root per curated CLI tool.
         assert_eq!(
             u.base_roots.len(),
-            10 + BASE_TOOLS.len(),
-            "glibc, gcc, bash, coreutils, nix-ld, nix, mise, socat, cacert, locales + the curated tools"
+            11 + BASE_TOOLS.len(),
+            "glibc, stdcpp, zlib, bash, coreutils, nix-ld, nix, mise, socat, cacert, locales + the curated tools"
         );
         // every curated tool is reachable by name: its marker binary physically exists in
         // one of the base PATH directories (so it is both realised and on PATH).
@@ -520,6 +528,20 @@ mod resolve_tests {
                 p.display()
             );
         }
+
+        // nix-ld exposes `libz.so.1` to foreign binaries: zlib's lib dir is on the
+        // foreign library path and the library file is backed by ops's store. A binary
+        // the cage loads through the shim (the Cursor CLI, Node native addons) dlopens it.
+        let zlib_lib = u
+            .foreign_lib_paths
+            .iter()
+            .find(|p| physical_path(&layout, &p.join("libz.so.1")).exists())
+            .unwrap_or_else(|| panic!("no foreign lib path carries libz.so.1"));
+        assert!(
+            zlib_lib.starts_with("/nix/store"),
+            "zlib lib path is not a logical store path: {}",
+            zlib_lib.display()
+        );
 
         // the base gcroots were created under the channel revision (so GC cannot
         // collect the userland, and a different channel roots its own base beside it)

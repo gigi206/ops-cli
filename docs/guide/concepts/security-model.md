@@ -40,6 +40,15 @@ synthetic `/etc/passwd` and `/etc/group` generated **outside** every writable mo
 so the identity's integrity holds even when the agent can write elsewhere. The host
 home and the rest of the host filesystem are not present.
 
+The cage also carries a synthetic `/etc/machine-id` (and its `/var/lib/dbus/machine-id`
+alias), **deterministic per app-home and unique per home**, never the host's real one.
+It costs nothing for a CLI, but a desktop app that fingerprints the machine (an Electron
+editor deriving a device id from the machine-id or MAC) would otherwise find neither in a
+hermetic cage and fall back to hashing an empty string — the *same* id in every cage,
+which some apps' server-side anti-abuse reads as one machine running many accounts. A
+distinct per-home id gives each app its own persistent machine identity while leaking no
+host identifier.
+
 ## The bind zones
 
 The cage's filesystem is assembled from a small, explicit set of binds, layered so a

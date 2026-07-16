@@ -213,6 +213,9 @@ struct SandboxPaths<'a> {
     xdg_open_src: &'a Path,
     /// Synthetic `/etc/hosts`; bound read-only at `/etc/hosts`.
     hosts_src: &'a Path,
+    /// Synthetic `/etc/machine-id`; bound read-only at `/etc/machine-id` and
+    /// `/var/lib/dbus/machine-id`.
+    machine_id_src: &'a Path,
 }
 
 /// Assemble a [`SandboxSpec`] from already-resolved host paths. Pure: no I/O, no
@@ -348,6 +351,22 @@ fn assemble(
         Mount::RoBind {
             src: paths.hosts_src.to_path_buf(),
             dest: PathBuf::from("/etc/hosts"),
+        },
+        // Zone 1 — a synthetic `/etc/machine-id` (and its dbus alias), stable per app-home and
+        // unique per home, never the host's. A hermetic cage carries neither file nor a MAC, so a
+        // desktop app that derives a device id from them (VS Code / Cursor run
+        // `cat /var/lib/dbus/machine-id /etc/machine-id || hostname`) otherwise hashes an empty
+        // string — the same id in every cage, which the app's anti-abuse reads as one machine
+        // running countless accounts. A distinct per-home id gives each app its own persistent
+        // machine identity. Synthetic and bound read-only from outside every writable mount, like
+        // the identity files — it leaks no host data (never the host's real machine-id).
+        Mount::RoBind {
+            src: paths.machine_id_src.to_path_buf(),
+            dest: PathBuf::from("/etc/machine-id"),
+        },
+        Mount::RoBind {
+            src: paths.machine_id_src.to_path_buf(),
+            dest: PathBuf::from("/var/lib/dbus/machine-id"),
         },
         // Zone 1 — TLS: ops's own CA bundle from its store rather than the host, so HTTPS
         // trust is hermetic. Bound at the two standard certificate paths a Linux toolchain
@@ -506,6 +525,8 @@ const STRUCTURAL_DESTS: &[&str] = &[
     "/etc/passwd",
     "/etc/group",
     "/etc/hosts",
+    "/etc/machine-id",
+    "/var/lib/dbus/machine-id",
     "/etc/resolv.conf",
     "/etc/ssl/certs/ca-certificates.crt",
     "/lib64/ld-linux-x86-64.so.2",
@@ -785,6 +806,30 @@ fn hosts_contents(hostname: &str) -> String {
     )
 }
 
+/// A synthetic `/etc/machine-id` (systemd format: 32 lowercase hex digits, newline-terminated),
+/// deterministically derived from the cage's own home path so it is **stable across launches of the
+/// same app-home and unique per home** — never the host's real machine-id (which the hermetic cage
+/// does not carry, and which would leak a host identifier). A hermetic cage otherwise has no
+/// `/etc/machine-id`, `/var/lib/dbus/machine-id`, or MAC, so a desktop app that fingerprints the
+/// machine (VS Code / Cursor read `cat /var/lib/dbus/machine-id /etc/machine-id || hostname` to build
+/// a device id) falls back to hashing an empty string — producing the *same* id in every such cage,
+/// which the app's server-side anti-abus then reads as one machine running countless accounts. A
+/// per-home synthetic id gives each app a distinct, persistent machine identity instead. The input is
+/// domain-separated so the raw home path is not recoverable from the id.
+fn machine_id_contents(home_src: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"ops-cage-machine-id\0");
+    h.update(home_src.as_os_str().as_encoded_bytes());
+    let digest = h.finalize();
+    let mut id = String::with_capacity(33);
+    for byte in &digest[..16] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id.push('\n');
+    id
+}
+
 /// Which persistent runtime a launch uses — the writable `$HOME` and its sibling synthetic
 /// `/etc`. `ops run`/`ops shell` use the project's shared default; an app gets a dedicated,
 /// persistent home so its config, login state, and history never bleed into the project shell
@@ -1020,6 +1065,14 @@ pub(crate) fn build_spec(
         hosts_contents(&super::naming::cage_hostname(&slug)).as_bytes(),
     )?;
 
+    // A synthetic `/etc/machine-id`, stable per app-home and unique per home, materialized beside
+    // the other synthetic `/etc` files (outside every writable mount, so the agent has no writable
+    // alias to forge its own machine identity). Bound read-only at both conventional paths so a
+    // desktop app's fingerprinting reads a distinct, persistent id instead of hashing an empty
+    // string (identical in every hermetic cage).
+    let machine_id = rt.etc_dir.join("machine-id");
+    write_atomic(&machine_id, machine_id_contents(&rt.home_src).as_bytes())?;
+
     let paths = SandboxPaths {
         project: &project,
         home_src: &rt.home_src,
@@ -1030,6 +1083,7 @@ pub(crate) fn build_spec(
         contract_src: &contract,
         xdg_open_src: &xdg_open,
         hosts_src: &hosts,
+        machine_id_src: &machine_id,
     };
     assemble(
         &paths,
@@ -1143,6 +1197,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -1228,6 +1283,51 @@ mod tests {
                 line.starts_with("127.0.0.1") || line.starts_with("::1"),
                 "every /etc/hosts entry maps to loopback: {line:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_synthetic_machine_id_is_systemd_shaped_deterministic_and_per_home() {
+        let a1 = machine_id_contents(Path::new("/data/ops/apps/cursor/home"));
+        let a2 = machine_id_contents(Path::new("/data/ops/apps/cursor/home"));
+        let b = machine_id_contents(Path::new("/data/ops/apps/codex/home"));
+        // systemd format: exactly 32 lowercase hex digits + a trailing newline.
+        let body = a1.strip_suffix('\n').expect("newline-terminated");
+        assert_eq!(body.len(), 32, "32 hex digits: {a1:?}");
+        assert!(
+            body.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lowercase hex only: {a1:?}"
+        );
+        // Never the degenerate all-cages id (sha256 of an empty string, truncated) a fingerprinting
+        // app produces when the file is absent — the whole reason this exists.
+        assert_ne!(body, "e3b0c44298fc1c149afbf4c8996fb9242");
+        // Deterministic per home (stable across launches) and unique across homes.
+        assert_eq!(a1, a2, "same home → same id across launches");
+        assert_ne!(a1, b, "a different home → a different id");
+    }
+
+    #[test]
+    fn assemble_binds_a_read_only_machine_id_at_both_conventional_paths() {
+        // A hermetic cage carries no `/etc/machine-id`, `/var/lib/dbus/machine-id`, or MAC, so a
+        // desktop app fingerprinting the machine hashes an empty string — the same id in every cage.
+        // Both conventional paths are bound read-only from the one synthetic source, so the agent
+        // cannot forge its own machine identity.
+        let spec = assembled();
+        for dest in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            let m = spec
+                .mounts
+                .iter()
+                .find(|m| m.dest() == Path::new(dest))
+                .unwrap_or_else(|| panic!("a {dest} mount is emitted"));
+            match m {
+                Mount::RoBind { src, .. } => assert_eq!(
+                    src.as_path(),
+                    Path::new("/data/ops/projects/abc/etc/machine-id"),
+                    "{dest} bound from the synthetic source"
+                ),
+                other => panic!("{dest} must be a read-only bind, got {other:?}"),
+            }
         }
     }
 
@@ -1343,6 +1443,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1526,6 +1627,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1599,6 +1701,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
             env: extra_env,
@@ -1894,6 +1997,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
         };
         let nix = NixMount {
             src: PathBuf::from("/data/ops/projects/abc/store/nix"),
