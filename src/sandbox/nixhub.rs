@@ -608,6 +608,34 @@ pub(crate) fn fetch_url_json(
     url: &str,
     fresh: bool,
 ) -> io::Result<serde_json::Value> {
+    let body = fetch_url_bytes(nix, layout, url, fresh)?;
+    serde_json::from_slice(&body)
+        .map_err(|e| io::Error::other(format!("parsing JSON from {url}: {e}")))
+}
+
+/// Fetch a URL's body as raw UTF-8 text (the sibling of [`fetch_url_json`], sharing the same nix
+/// `fetchurl` + `readFile` fetch). Used for a plain-text index — an apt `Packages` file — rather
+/// than JSON. The same injection constraint applies: `url` must already be safe in a nix string
+/// literal (callers charset-validate it first).
+pub(crate) fn fetch_url_text(
+    nix: &Path,
+    layout: &Layout,
+    url: &str,
+    fresh: bool,
+) -> io::Result<String> {
+    let body = fetch_url_bytes(nix, layout, url, fresh)?;
+    String::from_utf8(body)
+        .map_err(|e| io::Error::other(format!("body of {url} is not valid UTF-8: {e}")))
+}
+
+/// Fetch a URL's body via nix's `fetchurl` + `readFile`, so the request rides nix's own HTTP+TLS
+/// fetcher (no added HTTP dependency) and the body lands in ops's own store, never the host's
+/// `/nix`. The `{ url; name; }` form gives the store path a fixed name, so a URL carrying a query
+/// string — including percent-encoding, whose `%` is illegal in a derived store-path name — fetches
+/// cleanly. `url` must already be safe to place in a nix string literal: callers build it from a
+/// validated package name, a percent-encoded query, or a charset-validated URL, so it carries no
+/// quote, `$`, or backslash to escape the expression.
+fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::Result<Vec<u8>> {
     let expr = format!(
         "builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"ops-nixhub\"; }})"
     );
@@ -628,8 +656,7 @@ pub(crate) fn fetch_url_json(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| io::Error::other(format!("parsing JSON from {url}: {e}")))
+    Ok(out.stdout)
 }
 
 /// Select the nixpkgs pin for `version_req` on `system` from a package's nixhub

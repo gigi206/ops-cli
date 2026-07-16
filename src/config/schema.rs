@@ -533,6 +533,13 @@ pub(crate) struct NetworkTable {
     /// table.
     #[serde(default)]
     pub(crate) mute: Vec<String>,
+    /// DNS cache TTL in seconds for the egress proxy's host-side resolver. The proxy resolves an
+    /// allowed host once and reuses the address for this long, so a long build that fetches from one
+    /// host (e.g. `cache.nixos.org`) thousands of times resolves it once instead of per request —
+    /// robust against a transient resolver hiccup. Absent means the default (60); `0` disables the
+    /// cache (resolve every request). Trusted/global-only like the rest of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dns_cache_ttl: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ask_timeout: Option<String>,
     /// Whether to print the `ask`-mode park notice to stderr when a request parks. On by default; a
@@ -1040,6 +1047,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             }))
         );
     }
@@ -1058,6 +1066,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             }))
         );
     }
@@ -1078,6 +1087,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             }))
         );
     }

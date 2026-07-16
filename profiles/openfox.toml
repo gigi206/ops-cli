@@ -8,10 +8,7 @@
 # terminal, and sub-agents — but instead of a cloud provider it drives a LOCAL, OpenAI-compatible
 # LLM backend (vLLM / sglang / ollama / llama.cpp). It ships as the npm package `openfox` (Node
 # >= 24) and, unlike a TUI CLI, serves a WEB dashboard: it starts a local HTTP server (default
-# 127.0.0.1:10369) and you drive it from your browser. So ops equips it in-cage with a node
-# runtime (pure-Node CLI — the cage synthesises `/usr/bin/env`, so its `#!/usr/bin/env node`
-# shebang resolves; node is needed at RUNTIME, not only to install) plus mise's npm backend. The
-# install fetches from registry.npmjs.org, so the first launch needs the network.
+# 127.0.0.1:10369) and you drive it from your browser.
 #
 # WHY `network = "shared"` (AND WHAT IT COSTS). OpenFox talks to a LLM on your machine's
 # `localhost` (OPENFOX_LLM_URL default `http://localhost:8000/v1`; ollama is usually :11434,
@@ -35,11 +32,37 @@
 # the `network` line below with a `[network] mode = "deny"` + `allow = ["<llm-host>:<port>"]`
 # allowlist, and drop `shared`; then egress is filtered too.
 #
+# NATIVE ADDONS — why `cmd` is a wrapper, not a bare `openfox`. OpenFox depends on two NATIVE
+# node addons — `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal). Their
+# compiled `.node` binary is fetched by a package *install script* (`prebuild-install`). mise's
+# npm backend installs with `--ignore-scripts=true` (a deliberate security default — it will not
+# run arbitrary package scripts), so `mise use -g` places openfox WITHOUT those binaries and it
+# crashes at startup with "Could not locate the bindings file … better_sqlite3.node". The wrapper
+# below heals that: on first launch (and again after `ops upgrade mise` rolls openfox to a new
+# version, whose fresh install dir has no `.node` yet) it runs `npm rebuild better-sqlite3 node-pty`
+# inside openfox's install tree, which DOWNLOADS the prebuilt binaries (no compiler needed — they
+# are published for Node 24 / this platform) and then execs openfox. The rebuild fetches from the
+# network, which `shared` provides; it is idempotent (the guard skips it once the binary exists).
+# Keeping openfox as a `mise:npm:` `[packages]` entry means `ops upgrade mise` still rolls it.
+#
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
 # `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
-# UI to your LAN); keep the 127.0.0.1 default. To change the port, set it in BOTH `cmd` (--port)
-# and, if you ever switch to a remote LLM + forward, the `forward` list.
-cmd = ["openfox", "--no-browser"]
+# UI to your LAN); keep the 127.0.0.1 default.
+cmd = [
+    "bash",
+    "-c",
+    """
+set -eu
+of="$(mise where 'npm:openfox')/lib/node_modules/openfox"
+marker="$of/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+if [ ! -e "$marker" ]; then
+  echo "openfox: building native addons (better-sqlite3, node-pty) that mise's --ignore-scripts skips …" >&2
+  ( cd "$of" && npm rebuild better-sqlite3 node-pty )
+fi
+exec openfox --no-browser "$@"
+""",
+    "openfox",
+]
 
 # Reach the host-local LLM AND expose the web UI on host loopback. See the header for the remote-LLM
 # alternative (an allowlist instead of shared).
@@ -55,9 +78,11 @@ network = "shared"
 #]
 
 [packages]
-# A node runtime (OpenFox needs it at runtime AND to install; `nix:nodejs` is v24.x, satisfying
-# OpenFox's Node >= 24 requirement) then OpenFox itself via mise's npm backend. Both are
-# trusted-only [packages]; this profile is trusted by location once imported.
+# A node runtime (OpenFox needs it at runtime AND to install/rebuild; `nix:nodejs` is v24.x,
+# satisfying OpenFox's Node >= 24 requirement — and matching the ABI the prebuilt native addons
+# target) then OpenFox itself via mise's npm backend, so `ops upgrade mise` can roll it forward.
+# Both are trusted-only [packages]; this profile is trusted by location once imported. The native
+# addons are healed at launch by the `cmd` wrapper above (mise installs them --ignore-scripts).
 nodejs = "nix:nodejs"
 openfox = "mise:npm:openfox"
 # OpenFox's integrated terminal / sub-agents run shell commands. The hermetic cage ships a curated
@@ -72,7 +97,7 @@ openfox = "mise:npm:openfox"
 #OPENFOX_LLM_URL = "http://localhost:11434/v1"   # ollama; vLLM default is http://localhost:8000/v1
 #OPENFOX_MODEL_NAME = "qwen2.5-coder:32b"         # the model your backend serves
 #OPENFOX_REASONING_EFFORT = "medium"              # if your model supports it
-# The web UI port (must match --port in `cmd` if you change it):
+# The web UI port (must match --port if you add one to `cmd`):
 #OPENFOX_PORT = "10369"
 #
 # No [secret] block: the LLM is local and needs no cloud API key. If your local backend requires a

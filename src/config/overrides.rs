@@ -710,6 +710,7 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
         ask_notice: None,
         stats: None,
         default_methods: None,
+        dns_cache_ttl: None,
     })
 }
 

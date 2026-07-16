@@ -55,12 +55,31 @@ for the full semantics.
 | `ask_timeout` | a duration (`"90s"`, `"5m"`) bounding a parked `ask` request; absent = indefinite |
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`ops net stats`](../networking/observability.md)) |
+| `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules.md): a host,
 `*.domain`, `host/path`, an IP, `re:<regex>`, `http://host` (inspected cleartext),
 `tcp://host:port` (raw), an optional `{GET,POST}` verb prefix, or `@<group>`
 referencing a [`[net.groups]`](net-groups.md).
+
+## DNS resolution (`dns_cache_ttl`)
+
+Because the cage runs in an empty network namespace, the host-side proxy resolves each allowed
+host's name. A long build (a `nix`/flake build fetching from `cache.nixos.org` thousands of times)
+would otherwise re-resolve the same host on every request. The proxy therefore **caches** each host's
+address for `dns_cache_ttl` seconds (default 60; `0` disables it, resolving every request). The
+per-request SSRF address check still runs on the cached address — the cache only skips re-resolving,
+never the security check. It is trusted/global-only like the rest of the table. (There is no
+proxy-level retry: the client — `nix`/`git`/`curl` — already retries the whole request, which
+re-triggers resolution, so a retry here would be redundant.)
+
+```toml
+[network]
+mode = "deny"
+allow = ["cache.nixos.org"]
+dns_cache_ttl = 60   # seconds (0 = resolve every request)
+```
 
 ## When a host is refused
 

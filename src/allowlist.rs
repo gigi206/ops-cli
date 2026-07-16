@@ -689,6 +689,9 @@ pub(crate) struct EgressPolicy {
     /// Stored inverted so the derived `Default` (and [`Self::new`]) both mean "notice shown".
     /// Read via [`Self::ask_notice`].
     suppress_ask_notice: bool,
+    /// DNS cache TTL for the proxy's host-side resolver. `None` means the default (60s) is applied at
+    /// the resolver build site; `Some(0)` disables the cache. Read via [`Self::dns_cache_ttl`].
+    dns_cache_ttl: Option<std::time::Duration>,
 }
 
 impl EgressPolicy {
@@ -702,6 +705,7 @@ impl EgressPolicy {
             default_action: DefaultAction::Deny,
             ask_timeout: None,
             suppress_ask_notice: false,
+            dns_cache_ttl: None,
         }
     }
 
@@ -749,6 +753,19 @@ impl EgressPolicy {
     /// indefinitely. The proxy reads this only under [`DefaultAction::Ask`].
     pub(crate) fn ask_timeout(&self) -> Option<std::time::Duration> {
         self.ask_timeout
+    }
+
+    /// The DNS cache TTL for the proxy's resolver — `None` means "apply the default at build time"
+    /// (the resolver treats it as 60s), `Some(0)` disables the cache. Set from `[network]
+    /// dns_cache_ttl`.
+    pub(crate) fn with_dns_cache_ttl(mut self, ttl: Option<std::time::Duration>) -> Self {
+        self.dns_cache_ttl = ttl;
+        self
+    }
+
+    /// The configured DNS cache TTL (raw `Option` — the resolver applies the 60s default for `None`).
+    pub(crate) fn dns_cache_ttl(&self) -> Option<std::time::Duration> {
+        self.dns_cache_ttl
     }
 
     pub(crate) fn allow_rules(&self) -> &[Rule] {

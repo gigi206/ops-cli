@@ -10,16 +10,15 @@
 # you reach the same agent in a real browser UI on the host: chat with streaming tool output,
 # side-by-side previews, a file browser, settings — no terminal.
 #
-# The dashboard and several agent features need optional Python extras that are NOT in the base
-# `hermes-agent` wheel — `[web]` (fastapi + uvicorn + starlette) for the server, `[voice]`
-# (sounddevice + faster-whisper) for `/voice on`, and more (the curated set in [packages] below).
-# mise's pipx backend STRIPS PEP 508 extras from an install token (`mise:pipx:hermes-agent[web]`
-# installs only the bare wheel), so ops cannot equip the extras that way. Instead the launch `cmd`
-# below creates a uv venv in the app's persistent home and runs `uv pip install
-# 'hermes-agent[<extras>]'` into it once — idempotent, re-installing only when the extras list
-# changes (a stamp file) — then execs the venv's `hermes`. `nix:uv` supplies the installer and
-# `nix:python312` the interpreter (both on PATH before the cmd runs). The first launch resolves the
-# wheels from PyPI in a few tens of MiB and seconds; later launches reuse the warm venv.
+# ops equips Hermes via the flake's `#default` output —
+# `flake:github:NousResearch/hermes-agent#default` in [packages] — so `ops upgrade flake` rolls it
+# forward. That one package bundles the Python agent (uv2nix, its own interpreter), the node
+# front-ends, the web dashboard assets (`web_dist`), and every optional extra (web/voice/edge-tts/
+# mcp/…), all wired by the derivation's own wrapper (it sets HERMES_WEB_DIST / HERMES_TUI_DIR /
+# HERMES_NODE) — so the dashboard's server AND its `/chat` node terminal work with no manual
+# `nix:nodejs`/`HERMES_TUI_DIR` plumbing. ops builds the flake IN-CAGE with `nix build`: the FIRST
+# launch is a multi-minute, ~2 GiB build (its PyPI + npm source fetches ride the allowlist below,
+# through nix's fetcher); later launches reuse the warm build offline.
 #
 # CREDENTIAL POSTURE — identical to the CLI profile. Hermes is BYOK and multi-provider; this
 # template keys it to OpenRouter (Hermes' default — one key, hundreds of models, OpenAI-
@@ -33,7 +32,7 @@
 # step in the browser (the same provider login, or a local dashboard password); that traffic
 # rides the allowlist below. If a request is blocked, the proxy reports the host it refused —
 # add it to `allow` (or check ahead with `ops test net <url>`).
-cmd = ["bash", "-c", "set -e; VENV=\"$HOME/.hermes-venv\"; EXTRAS=\"web,pty,cli,voice,vision,cron,mcp,exa,firecrawl,youtube,edge-tts,acp\"; if [ ! -x \"$VENV/bin/hermes\" ] || ! grep -qxF \"$EXTRAS\" \"$VENV/.ops-extras\" 2>/dev/null; then uv venv --clear --python 3.12 \"$VENV\"; . \"$VENV/bin/activate\"; uv pip install \"hermes-agent[$EXTRAS]\"; echo \"$EXTRAS\" > \"$VENV/.ops-extras\"; fi; exec \"$VENV/bin/hermes\" dashboard --no-open"]
+cmd = ["hermes", "dashboard", "--no-open"]
 
 # Forward the host's localhost:9119 into the cage so your host browser reaches the dashboard.
 # `hermes dashboard` binds 127.0.0.1:9119 inside the cage; this hole bridges it to the host. A
@@ -59,39 +58,21 @@ forward = [9119]
 audio = true
 
 [packages]
-# uv (the installer) and a supported Python, both from nixpkgs and on PATH before the launch cmd
-# runs its `uv pip install`. Hermes itself is installed by that cmd (see the top note), not here —
-# mise's pipx backend cannot carry the extras. All are trusted-only [packages]; this profile is
-# trusted by location once imported.
+# Hermes via the flake's `#default` output, built in-cage — so `ops upgrade flake` rolls it forward.
+# One package supplies the interpreter, the node runtime, the web dashboard assets, the `/chat` tab's
+# embedded TUI, and every optional extra — so there is no separate `nix:uv`/`nix:python`/`nix:nodejs`
+# and no launch-time `pip install`, and the `/chat` node terminal that used to need a manual
+# `nix:nodejs` + `HERMES_TUI_DIR` sentinel now works natively (the derivation's wrapper sets both).
+# Trusted-only [packages]; this profile is trusted by location once imported. First launch builds it
+# (~2 GiB, minutes); the build's PyPI + npm source fetches ride the allowlist below.
 #
-# `nix:nodejs` is required by the dashboard's `/chat` tab: chat is served as an embedded
-# terminal (WebSocket → PTY) that runs Hermes' Node.js TUI. The TUI is prebuilt and bundled in
-# the wheel (`hermes_cli/tui_dist/entry.js`), so only the `node` runtime is needed — no
-# `npm install`, no npmjs network. Without node the tab fails with "Chat unavailable: 1"
-# (the TUI launcher does `sys.exit(1)` when node is absent). Hermes is a Python package, hence the
-# explicit node here. Node alone is necessary but not sufficient — see HERMES_TUI_DIR in [env] below.
-#
-# Curated Hermes feature set — installed by the launch cmd above (edit the EXTRAS list there to add
-# or drop one). Most extras are a single small SDK; the one heavyweight is `voice` (`faster-whisper`
-# → ctranslate2/onnxruntime + `sounddevice` + `numpy`). Chosen for a personal agent driven from the
-# web dashboard:
-#   web    dashboard server (fastapi/uvicorn)      pty   the chat tab's embedded terminal
-#   cli    TUI menus                                voice `/voice on` — STT deps (needs audio=true)
-#   vision image understanding                     cron  scheduled tasks
-#   mcp    Model Context Protocol tools            exa firecrawl  web search / scraping
-#   youtube video transcripts                      edge-tts  text-to-speech (voice replies)
-#   acp    Agent Client Protocol (editor/agent-to-agent)
-# Deliberately OMITTED (add to EXTRAS on demand): provider SDKs (anthropic/mistral/bedrock/vertex/
-# azure — this profile routes via OpenRouter/NousResearch, OpenAI-compatible), `parallel-web` and
-# `computer-use`, chat-platform bridges (slack/matrix/teams/wecom/dingtalk/feishu/homeassistant/sms),
-# cloud memory SaaS (mem0/supermemory/honcho/hindsight), infra (modal/daytona/fal/nemo-relay),
-# google-workspace tools, and `dev` tooling. Some extras fetch runtime assets on FIRST USE — `voice`'s
-# Whisper model from Hugging Face, `edge-tts` from a Microsoft endpoint — which are NOT in the
-# allowlist below: the first `/voice on` will show the refused host in `ops net log -a hermes-web`;
-# add it with `ops net allow -a hermes-web <url>` (installing the extra ≠ the feature works offline).
-uv     = "nix:uv"
-python = "nix:python312"
-nodejs = "nix:nodejs"
+# The `#default` build bundles the `full` extra set (voice, edge-tts, exa, firecrawl, mcp, and the
+# chat-platform / cloud SDKs), so every dashboard feature is available — heavier than the old curated
+# venv, but upgradeable and self-wiring. Some extras fetch runtime assets on FIRST USE — `voice`'s
+# Whisper model from Hugging Face, `edge-tts` from a Microsoft endpoint — which ARE in the allowlist
+# below (see the voice entries); a host the proxy refuses shows in `ops net log -a hermes-web`, add
+# it with `ops net allow -a hermes-web <url>`.
+hermes = "flake:github:NousResearch/hermes-agent#default"
 
 [network]
 mode = "deny"
@@ -130,11 +111,19 @@ allow = [
     # and it would connect directly and fail DNS in the empty netns); and the audio hole's Python shim
     # points certifi at ops's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
     "{GET,WS} https://speech.platform.bing.com",
-    # Install-time (the launch cmd's `uv pip install`): the Python wheels and the package index.
+    # Build-time (the in-cage `nix build` of the flake): the Python wheels + index for uv2nix, and
+    # the npm registry for the node TUI/web front-ends — all fetched through nix's fetcher.
     "{GET} https://files.pythonhosted.org",
     "{GET} https://pypi.org",
-    # (cache.nixos.org + github.com — the nix binary cache for uv and Python — are already in
-    # ops's built-in nix-cache allow-set, so they need no entry here.)
+    "{GET} https://registry.npmjs.org",
+    # The flake build fetches the hermes-agent repo over git smart-HTTP. Its ref-discovery GET
+    # (`…/info/refs`) already rides the built-in `{GET,HEAD} github.com`; only the fetch negotiation
+    # is a POST, so open EXACTLY that one endpoint — POST-only, this repo only (never a push, never
+    # another repo, never the rest of github). If the build ever git-fetches another path the proxy
+    # names it; add it the same scoped way.
+    "{POST} https://github.com/NousResearch/hermes-agent.git/git-upload-pack",
+    # (cache.nixos.org + codeload/*.githubusercontent — the nix binary cache + tarball hosts — are
+    # already in ops's built-in nix-cache allow-set, so they need no entry here.)
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.
@@ -142,16 +131,8 @@ allow = [
 # placeholder lets Hermes start and issue the request, and the proxy substitutes the real key
 # on the wire to openrouter.ai.
 [env]
-# The `/chat` tab spawns Hermes' Node.js TUI. In a git checkout the launcher runs the TUI from
-# a source workspace (`ui-tui/` + `npm install`); a pipx/pip install has no such workspace, so
-# without this the launcher aborts in `_ensure_tui_workspace` with "Chat unavailable: 1" (a
-# `sys.exit(1)` — it can't `git restore` a missing `ui-tui/`). Setting HERMES_TUI_DIR makes the
-# launcher skip the source-workspace check and fall through to the prebuilt TUI bundled in the
-# wheel (`hermes_cli/tui_dist/entry.js`, run by `node`). The value is a sentinel that need not
-# exist — any path without a `dist/entry.js` selects the wheel-bundled TUI; a non-existent path
-# is used so it can never be hijacked to point at a rogue bundle.
-HERMES_TUI_DIR = "/opt/ops/hermes-tui-prebuilt"
-
+# No HERMES_TUI_DIR needed — the flake's `#default` wrapper sets it (and HERMES_NODE / HERMES_WEB_DIST)
+# to the bundled TUI/web assets, so the `/chat` node terminal works out of the box.
 #OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]

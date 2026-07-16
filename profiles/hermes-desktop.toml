@@ -6,36 +6,22 @@
 # A third way to run Hermes alongside `ops app hermes` (the terminal CLI) and `ops app hermes-web`
 # (the browser dashboard). Hermes Desktop is the native Electron app — a real window with chat,
 # streaming tool output, side-by-side previews, a file browser, voice, and settings. Unlike
-# opencode-desktop (a prebuilt .deb), Hermes Desktop has NO prebuilt binary: not on the GitHub
-# releases (only the Python tarball), not on the website. The renderer is built from source.
+# opencode-desktop (a prebuilt .deb), Hermes Desktop has NO prebuilt binary — but it IS a nix flake
+# output (`#desktop`), so ops builds it in-cage rather than from a downloaded foreign binary.
 #
-# HOW IT RUNS — nix's own Electron, NOT a stock Electron binary. The canonical NixOS way to run an
-# Electron app is to run it on nix's `electron` package (already patchelf'd for the store), NOT the
-# stock Electron that `npm`/electron-builder downloads. A stock/foreign Electron binary is linked
-# against ~95 system libraries (glib/gtk/nss/cups/mesa/…) that the hermetic cage deliberately lacks,
-# so it fails at `libglib-2.0.so.0`. So this profile:
-#   1. clones the repo into the app's persistent home and installs Hermes EDITABLE into a venv
-#      (`uv pip install -e '.[<extras>]'`), so `hermes desktop` finds `apps/desktop` at the repo root;
-#   2. runs `hermes desktop --build-only --source` — this builds ONLY the renderer + main dist (vite),
-#      NOT an electron-builder package, so there is no 193 MB stock-Electron download and no foreign
-#      binary to feed system libs;
-#   3. execs nix's Electron (`nix:electron_40` = 40.10.x, matching Hermes' pinned 40.10.2 so the
-#      node-pty native module and the renderer's Chromium APIs line up) on the built dist.
-# This deletes the entire foreign-binary problem class (no autoPatchelf, no lib provisioning) instead
-# of managing it. LIVE-PROVEN end-to-end: the window renders, the venv Python backend comes up
-# (`HERMES_BACKEND_READY`), and a Google/Privy sign-in completed the login.
+# HOW IT RUNS — the flake's `#desktop` output, rolled by `ops upgrade flake`. `#desktop` is nixpkgs'
+# own Electron (already patchelf'd for the store — so none of the ~95 system libs a stock/foreign
+# Electron needs, which the hermetic cage lacks) wrapped around the from-source-built renderer, with
+# the Python backend WIRED IN: the derivation sets `HERMES_DESKTOP_HERMES` to the flake's own
+# fully-equipped `hermes`, so the desktop app spawns that as its backend (no venv, no repo clone, no
+# `HERMES_DESKTOP_HERMES_ROOT`). The `cmd` therefore just sets up the in-cage OAuth browser and execs
+# the `hermes-desktop` launcher with the cage's Electron flags.
 #
-# WHY WE EXEC ELECTRON OURSELVES (not `hermes desktop` to launch). `hermes desktop`'s launch step
-# hard-exits in the cage: on Linux it configures Electron's setuid chrome-sandbox helper (needs
-# root:root + mode 4755) and only falls back to `--no-sandbox` when the host's
-# `apparmor_restrict_unprivileged_userns` sysctl is 1 — otherwise `sys.exit(1)` ("requires sudo to
-# configure Electron's Linux sandbox helper"). That fixup can never succeed here (no setuid without
-# privilege, no sudo) AND Electron's own Chromium sandbox can never work regardless (seccomp blocks
-# the userns clone it needs) — so `--no-sandbox` is mandatory. `--build-only` skips the launch (and
-# its sandbox check); we then exec nix's Electron with the cage flags. `HERMES_DESKTOP_HERMES_ROOT`
-# pins the app's spawned Python backend to this venv so it does NOT re-bootstrap a second Hermes
-# install under ~/.hermes/hermes-agent; in `--source` mode the app also resolves this checkout as its
-# dev-source backend.
+# WHY `--no-sandbox`. Electron's own Chromium sandbox can never work in the cage (seccomp blocks the
+# userns clone it needs), and there is no privilege to configure its setuid chrome-sandbox helper — so
+# `--no-sandbox` is mandatory. (The old venv build ran `hermes desktop --build-only` to dodge that
+# launcher's setuid-helper hard-exit; the flake's `hermes-desktop` bin is the Electron app directly,
+# so there is no such launcher to appease — just pass the flag.)
 #
 # LOGIN NEEDS AN IN-CAGE BROWSER. Sign-in is a Privy device-code grant: the app shows a code and opens
 # `portal.nousresearch.com/…?user_code=…` in a browser for you to authorize, then polls the token
@@ -59,37 +45,13 @@ cmd = [
     "-c",
     '''
 set -e
-SRC="$HOME/hermes-src"
-EXTRAS="web,pty,cli,voice,vision,cron,mcp,exa,firecrawl,youtube,edge-tts,acp"
-
-# 1. Clone the repo once — the desktop app has no prebuilt binary, so it is built from this checkout.
-if [ ! -d "$SRC/.git" ]; then git clone --depth 1 https://github.com/NousResearch/hermes-agent "$SRC"; fi
-cd "$SRC"
-
-# 2. Editable install into a venv, idempotent: re-run only when the venv is fresh or the extras set
-#    changes (a stamp file), so later launches skip the multi-tens-of-MiB PyPI resolve.
-if [ ! -x ".venv/bin/hermes" ] || ! grep -qxF "$EXTRAS" .venv/.ops-extras 2>/dev/null; then
-    uv venv --clear --python 3.12 .venv
-    . .venv/bin/activate
-    uv pip install -e ".[$EXTRAS]"
-    echo "$EXTRAS" > .venv/.ops-extras
-else
-    . .venv/bin/activate
-fi
-
-# 3. Build only the renderer + main dist (vite), NOT an electron-builder package: `--source` skips
-#    the 193 MB stock-Electron download and packaging entirely. We run the app on nix's own Electron
-#    (see [packages]) rather than a downloaded foreign binary, so nothing needs the full system
-#    GTK/NSS stack a hermetic cage lacks.
-hermes desktop --build-only --source
-
-# 4. In-cage browser for the OAuth login. Sign-in is a device-code grant: the app shows a code and
-#    opens `portal.nousresearch.com/...?user_code=...` in a browser (via shell.openExternal →
-#    xdg-open, or the portal's OpenURI under dbus=true) for you to authorize; it then polls the
-#    token endpoint. The hermetic cage has no host browser, so route those opens to an in-cage
-#    Chromium (see [packages]). Prepend an xdg-open wrapper AND register it as the portal's default
-#    http/https handler (under dbus=true Electron uses OpenURI, not xdg-open directly — without
-#    the handler the portal shows "no apps available" and the login link goes nowhere).
+# In-cage browser for the OAuth login. Sign-in is a Privy device-code grant: the app shows a code and
+# opens `portal.nousresearch.com/...?user_code=...` in a browser (via shell.openExternal → xdg-open,
+# or the portal's OpenURI under dbus=true) for you to authorize; it then polls the token endpoint. The
+# hermetic cage has no host browser, so route those opens to an in-cage Chromium (see [packages]).
+# Install an xdg-open wrapper AND register it as the portal's default http/https handler (under
+# dbus=true Electron uses OpenURI, not xdg-open directly — without the handler the portal shows "no
+# apps available" and the login link goes nowhere).
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.config"
 cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
 #!/bin/sh
@@ -117,14 +79,12 @@ x-scheme-handler/http=ops-open-uri.desktop
 x-scheme-handler/https=ops-open-uri.desktop
 MIMEAPPS
 
-# 5. Launch the built dist with nix's Electron (matches Hermes' pinned 40.10.2 and is already
-#    patchelf'd to run in the cage). We do NOT use `hermes desktop` to launch: its launcher hard-exits
-#    configuring a setuid chrome-sandbox helper that can never work here, and Electron's own Chromium
-#    sandbox is unavailable in the cage (seccomp blocks its userns clone) — so --no-sandbox is
-#    mandatory. HERMES_DESKTOP_HERMES_ROOT pins the spawned Python backend to this venv (no
-#    re-bootstrap); in `--source` mode the app also resolves this checkout as its dev-source backend.
-export HERMES_DESKTOP_HERMES_ROOT="$SRC"
-exec electron "$SRC/apps/desktop" --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage
+# Launch the flake-built Electron app. `hermes-desktop` (from flake:#desktop) is nixpkgs' Electron
+# wrapped around the built renderer, with HERMES_DESKTOP_HERMES already pointing at the flake's own
+# fully-equipped `hermes` — so the Python backend is wired natively (no venv, no
+# HERMES_DESKTOP_HERMES_ROOT). --no-sandbox is mandatory (Electron's own Chromium sandbox needs a
+# userns clone that seccomp blocks in the cage); the Wayland flags map the window through the gui hole.
+exec hermes-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage
 '''
 ]
 
@@ -139,56 +99,47 @@ dbus = true
 audio = true
 
 [packages]
-# The Python toolchain (uv + a supported Python) and the native-build toolchain Hermes Desktop
-# needs (nodejs for npm/electron, git to clone the repo, gnumake + gcc for node-pty's C++ compile).
-# All are trusted-only [packages]; this profile is trusted by location once imported.
-uv       = "nix:uv"
-python   = "nix:python312"
-nodejs   = "nix:nodejs"
-git      = "nix:git"
-make     = "nix:gnumake"
-gcc      = "nix:gcc"
-# nix's own Electron, patchelf'd to run in the hermetic cage — this is what runs the app (the built
-# dist), instead of a stock foreign Electron binary that would need the full system GTK/NSS stack.
-# electron_40 tracks the 40.10.x line, matching Hermes' pinned 40.10.2 (so the node-pty native module
-# and the renderer's Chromium APIs line up).
-electron = "nix:electron_40"
+# Hermes Desktop via the flake's `#desktop` output, built in-cage — so `ops upgrade flake` rolls it
+# forward. That output is nixpkgs' Electron (patchelf'd for the store — no foreign binary needing the
+# system GTK/NSS stack) wrapped around the built renderer, with the Python backend wired IN
+# (the derivation sets `HERMES_DESKTOP_HERMES` to the flake's own fully-equipped `hermes`), so there
+# is no separate uv/python/nodejs/git/make/gcc/electron and no launch-time clone + venv + vite build.
+# Trusted-only [packages]; this profile is trusted by location once imported. First launch builds it
+# (~2 GiB+, minutes — the renderer + its native addons against Electron's headers; source fetches ride
+# the allowlist below, through nix's fetcher).
+hermes-desktop = "flake:github:NousResearch/hermes-agent#desktop"
 # An in-cage Chromium for the OAuth device-code login (see the `cmd` wrapper): Nous Portal sign-in
 # opens a verification URL in a browser, and the hermetic cage has no host browser. HEAVY — pulls a
 # large nixpkgs closure into the project store on the first launch. It trusts the egress MITM CA via
 # the NSS db ops seeds (catrust, part of the GUI hole under an allowlist).
 chromium = "nix:chromium"
 
-# Electron's binary downloader (@electron/get) ignores the proxy env by default and does direct
-# DNS, which the empty netns has no resolver for. `ELECTRON_GET_USE_PROXY` makes it read the
-# HTTPS_PROXY ops sets. The OPENROUTER_API_KEY line is the BYOK placeholder (commented) — uncomment
-# it together with the [secret] block below to enable BYOK.
+# The BYOK placeholder (commented) — uncomment it together with the [secret] block below to enable
+# BYOK. (No ELECTRON_GET_USE_PROXY needed: the flake builds against nixpkgs' Electron, so there is no
+# @electron/get binary download at build or run time.)
 [env]
-ELECTRON_GET_USE_PROXY = "true"
 #OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
 
 [network]
 mode = "deny"
 allow = [
-    # --- Build-time ---
-    # The editable `uv pip install -e '.[<extras>]'` — Hermes + its Python deps (including the
-    # curated feature extras: voice, vision, cron, mcp, web search, youtube, edge-tts, acp) from
-    # PyPI. Edit the extras list in `cmd` above to add or drop a feature. Note: `voice`'s Whisper
-    # model and `edge-tts` fetch runtime assets on first use from hosts NOT listed here — the first
-    # use will show the refused host in `ops net log -a hermes-desktop`; add it with `ops net allow`.
+    # --- Build-time (the in-cage `nix build` of the flake `#desktop`) ---
+    # The renderer's npm deps, the Python backend's PyPI wheels (uv2nix), and Electron's headers (to
+    # compile the renderer's native addons against) — all fetched through nix's fetcher. github /
+    # codeload / githubusercontent (the flake source + any npm-from-github deps) and cache.nixos.org
+    # (the Electron + toolchain binaries) ride ops's built-in nix-cache allow-set, so they need no
+    # entry here. (`voice`'s Whisper model and `edge-tts` fetch RUNTIME assets on first use — those
+    # hosts are in the runtime section below.)
+    "{GET} https://registry.npmjs.org",
     "{GET} https://pypi.org",
     "{GET} https://files.pythonhosted.org",
-    # The git clone of the repo (smart-HTTP).
-    "{*} https://github.com",
-    "{*} https://codeload.github.com",
-    # `npm install` for the desktop workspace (vite, node-pty, and the electron dev-dep npm reads to
-    # rebuild node-pty against — we run nix's Electron, not this one) from npmjs + the GitHub-releases
-    # CDN. The cage trusts the MITM CA via NODE_EXTRA_CA_CERTS, and npm honors https_proxy;
-    # ELECTRON_GET_USE_PROXY ([env]) makes @electron/get's download do the same.
-    "{GET} https://registry.npmjs.org",
-    "{*} https://*.githubusercontent.com",
-    # node-gyp fetches the Node headers (to compile the node-pty native module) from nodejs.org.
-    "{GET} https://nodejs.org/download/release/*",
+    "{GET} https://artifacts.electronjs.org",
+    # The flake build fetches the hermes-agent repo over git smart-HTTP. Its ref-discovery GET
+    # (`…/info/refs`) already rides the built-in `{GET,HEAD} github.com`; only the fetch negotiation
+    # is a POST, so open EXACTLY that one endpoint — POST-only, this repo only (never a push, never
+    # another repo, never the rest of github). If the build ever git-fetches another path the proxy
+    # names it; add it the same scoped way.
+    "{POST} https://github.com/NousResearch/hermes-agent.git/git-upload-pack",
     # --- Runtime ---
     # The LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter; with the
     # NousResearch account login instead (no BYOK key set — the shipped default), model traffic goes

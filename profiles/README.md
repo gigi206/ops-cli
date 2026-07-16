@@ -26,7 +26,7 @@ with `ops app export <name>`.
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
 | `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
-| `hermes`          | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | `openrouter.ai` (BYOK)  |
+| `hermes`          | `flake:…/hermes-agent#default` (built in-cage) | `openrouter.ai` (BYOK) / Nous account |
 | `vibe`            | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, `nix:chromium`, `gui = "wayland"`) | `console.mistral.ai` (Mistral account SSO, in-cage browser) / `api.mistral.ai` (BYOK) |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
@@ -112,10 +112,15 @@ can only reach the provider you listed.
 > (unlike the native-binary `cline`/`droid`), so it needs the `nix:nodejs` runtime at run time, not
 > only to install.
 >
-> `hermes` installs its published PyPI wheel with **uv** (mise's `pipx` backend over a `nix:uv`
-> installer and `nix:python312`) — proven live in-cage under the profile's own allowlist
-> (`hermes --version` → v0.18.0, ~60 wheels resolved in seconds; only the live-auth above is
-> still pending). The `flake:` backend itself is proven separately on a reference flake.
+> The three `hermes` profiles (`hermes` CLI, `hermes-web`, `hermes-desktop`) build the tool from its
+> **nix flake** — `flake:github:NousResearch/hermes-agent#default` for the CLI and web dashboard,
+> `#desktop` for the Electron app — so `ops upgrade flake` rolls them. The flake output bundles the
+> Python agent (uv2nix), the node TUI/web front-ends, and every extra in one self-wiring package
+> (it sets `HERMES_NODE`/`HERMES_TUI_DIR`/`HERMES_WEB_DIST`, and `#desktop` wires the Python backend
+> via `HERMES_DESKTOP_HERMES`). Cost: a multi-minute, ~2 GiB in-cage `nix build` on the first launch
+> (its PyPI + npm source fetches ride each profile's allowlist), warm and offline after. **These
+> flake migrations are live-pending** — the config resolves (covered by the shipped-profiles test),
+> but the heavy in-cage build + a real dashboard/desktop run are the standing live validation.
 >
 > `opencode-web` and `opencode-desktop` are the two **graphical** ways to run opencode under ops,
 > both proven live. `opencode-web` runs opencode's `web` server headless in the cage and exposes it
@@ -147,9 +152,9 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
 | `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
 | `opencode-desktop` | `deb:…/releases/latest/download/opencode-desktop-linux-amd64.deb` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
-| `claude-desktop` | `deb:…/apt/stable/pool/main/c/claude-desktop/claude-desktop_<ver>_amd64.deb` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — version-pinned |
+| `claude-desktop` | `deb:apt:…/apt/stable/dists/stable/main/binary-amd64/Packages` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the apt index's newest version (`ops upgrade deb`) |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
-| `hermes`      | `mise:pipx:hermes-agent` (+ `nix:uv`, `nix:python312`) | NousResearch PyPI wheel (via uv) |
+| `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix + node front-ends), built in-cage |
 | `vibe`        | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`) | Mistral PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |

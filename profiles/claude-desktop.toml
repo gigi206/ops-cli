@@ -19,15 +19,14 @@
 # closure — a couple of minutes, over your host network, NOT the cage allowlist). Later launches
 # reuse the pinned build offline.
 #
-# VERSION PINNING — read this before `ops upgrade deb`. Unlike opencode-desktop's GitHub
-# `…/releases/latest/…` redirect, Anthropic's apt pool has **no "latest" URL** — each `.deb` is
-# version-stamped (`claude-desktop_<ver>_amd64.deb`). So the URL below pins ONE version, and
-# `ops upgrade deb` re-resolves that same immutable URL and reports `unchanged` (there is nothing to
-# roll). To update, bump the version in the URL by hand: the current versions are listed in the apt
-# index at
-#   https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages
-# (take the newest `Filename:` and prepend `https://downloads.claude.ai/claude-desktop/apt/stable/`).
-# ARCH: the URL is `_amd64` (x86_64). On arm64 swap it for the `_arm64` `.deb` in the same pool.
+# VERSIONS — tracked automatically. Anthropic's apt pool has **no "latest" URL** (each `.deb` is
+# version-stamped `claude-desktop_<ver>_amd64.deb`), so instead of hand-pinning one version this
+# profile uses the `deb:apt:` backend pointed at the pool's `Packages` index: ops reads the index,
+# picks the **newest** version's `.deb`, and pins it per project on first launch. `ops upgrade deb`
+# re-reads the index and **rolls forward** to the newest — no manual URL bump. (ops does no GPG/
+# InRelease signature check and expects this single-application pool — the same TLS-plus-unpack trust
+# level as a direct `deb:` URL.) ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it
+# at `.../binary-arm64/Packages` instead.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars ops sets and trusts its own NSS
@@ -82,7 +81,7 @@
 #     only ever use email, drop the `cmd` wrapper + the `chromium` package for a bare argv.
 #   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT) and closing the
 #     window does NOT quit (Claude Desktop is a tray/background app and the cage exposes no tray). Press
-#     **Ctrl+C twice within 2s** to force-quit the session (ops terminates the cage), or `ops stop <id>`
+#     **Ctrl+C twice within 2s** to force-quit the session (ops terminates the cage), or `ops session stop <id>`
 #     from another terminal. The launch prints the hint.
 #   * Credential persistence — the app may want the system keyring (Secret Service / dbus), which the
 #     hermetic cage does not provide, and should fall back to a file under the isolated home. Confirm
@@ -194,9 +193,12 @@ dbus = true
 
 [packages]
 # Anthropic's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build).
-# Trusted-only [packages]; this profile is trusted by location once imported. Version-pinned — see
-# the VERSION PINNING note in the header to bump it.
-claude-desktop = "deb:https://downloads.claude.ai/claude-desktop/apt/stable/pool/main/c/claude-desktop/claude-desktop_1.18286.2_amd64.deb"
+# Trusted-only [packages]; this profile is trusted by location once imported. The `deb:apt:` backend
+# points at Anthropic's apt `Packages` index (Anthropic's pool publishes versioned filenames with no
+# `latest` alias): ops fetches the index, picks the newest version's `.deb`, and pins it per project
+# on first launch. `ops upgrade deb` re-reads the index and rolls to the newest — so the version is
+# tracked automatically, not hand-pinned.
+claude-desktop = "deb:apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages"
 # An in-cage Chromium for the Google Sign-In flow (see the `cmd` wrapper above). HEAVY — this pulls a
 # large nixpkgs closure into the project store on the first launch. If you only ever sign in with
 # EMAIL, you can delete this line and the `cmd` wrapper and go back to a bare `claude-desktop` argv.

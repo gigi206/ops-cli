@@ -477,6 +477,52 @@ fn default_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
         .collect())
 }
 
+/// A [`Resolver`] wrapping [`default_resolve`] with a short-TTL cache — the resolution resilience a
+/// proxy fronting a long `nix`/flake build needs. A build fetches from one host (`cache.nixos.org`)
+/// thousands of times; re-resolving per request wastes lookups and turns any single resolver hiccup
+/// into a failed fetch. The cache resolves each host **once** and reuses the address for `ttl` (a
+/// `Duration::ZERO` ttl disables it, resolving every request). Only successful, non-empty resolutions
+/// are cached (a failure is never cached, so the client's own retry re-resolves). A transient failure
+/// is not retried here: the client (nix/git/curl) already retries the whole request, which re-triggers
+/// this resolution, so a proxy-level retry would be redundant. The cache is unbounded but a proxy
+/// fronts a handful of hosts and dies with its launch.
+fn caching_resolver(ttl: Duration) -> Resolver {
+    cached_resolver(ttl, default_resolve)
+}
+
+/// The cache core of [`caching_resolver`], parameterised by the inner resolver so its behaviour is
+/// unit-testable without real DNS. Only a successful, non-empty resolution is cached; `ttl == 0`
+/// disables the cache (resolve every request); any error propagates unchanged.
+fn cached_resolver<F>(ttl: Duration, inner: F) -> Resolver
+where
+    F: Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync + 'static,
+{
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    // host name -> (resolved addresses, when they were resolved)
+    type DnsCache = Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>;
+    let cache: Arc<DnsCache> = Arc::new(Mutex::new(HashMap::new()));
+    Box::new(move |host: &str| {
+        if !ttl.is_zero() {
+            if let Ok(map) = cache.lock() {
+                if let Some((ips, at)) = map.get(host) {
+                    if at.elapsed() < ttl {
+                        return Ok(ips.clone());
+                    }
+                }
+            }
+        }
+        let ips = inner(host)?;
+        if !ips.is_empty() && !ttl.is_zero() {
+            if let Ok(mut map) = cache.lock() {
+                map.insert(host.to_string(), (ips.clone(), Instant::now()));
+            }
+        }
+        Ok(ips)
+    })
+}
+
 /// A resolved credential the proxy injects into requests matching its host/path rule. The
 /// value is the **fully-formed header value** — the plaintext was read host-side and shaped
 /// before this was built, so the proxy never touches the source. Injection happens only
@@ -595,12 +641,18 @@ impl ProxyCtx {
                 .with_no_client_auth()
                 .with_cert_resolver(Arc::new(CertResolver::new(ca.clone()))),
         );
+        let policy = union_with_builtin(user_policy);
+        // The proxy re-resolves per request; a long build fetching one host thousands of times would
+        // re-hit the resolver each time (and any hiccup fails a fetch). A short-TTL cache resolves
+        // each host once and reuses it — tunable via `[network] dns_cache_ttl` (default 60s, `0`
+        // disables the cache).
+        let resolve = caching_resolver(policy.dns_cache_ttl().unwrap_or(Duration::from_secs(60)));
         Ok(ProxyCtx {
             ca,
             server_config,
             upstream: upstream_config(),
-            policy: union_with_builtin(user_policy),
-            resolve: Box::new(default_resolve),
+            policy,
+            resolve,
             timeout: Duration::from_secs(30),
             injections: Vec::new(),
             redactions: Vec::new(),
@@ -877,6 +929,9 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
         // Carry the mute (`dontaudit`) set through — it is log-only, so the built-in allow union
         // does not touch it, but a rebuild that dropped it would silently un-suppress the refusals.
         .with_mute(user.mute_rules().to_vec())
+        // Carry the DNS cache TTL through — a rebuild that dropped it would silently revert the
+        // configured value to the default.
+        .with_dns_cache_ttl(user.dns_cache_ttl())
 }
 
 /// The policy the proxy evaluates for a request: the immutable config policy, or — when a live
@@ -908,7 +963,8 @@ fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
             .with_default(ctx.policy.default_action())
             .with_ask_timeout(ctx.policy.ask_timeout())
             .with_ask_notice(ctx.policy.ask_notice())
-            .with_mute(mute),
+            .with_mute(mute)
+            .with_dns_cache_ttl(ctx.policy.dns_cache_ttl()),
     )
 }
 
@@ -5988,6 +6044,51 @@ mod tests {
             crate::sandbox::control::LogVerdict::Error
         );
         assert_eq!(events[0].reason, "upstream-cert-rejected");
+    }
+
+    #[test]
+    fn the_dns_cache_resolves_a_host_once_and_reuses_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r = cached_resolver(Duration::from_secs(60), move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![IpAddr::from([1, 2, 3, 4])])
+        });
+        assert_eq!(
+            r("cache.nixos.org").unwrap(),
+            vec![IpAddr::from([1, 2, 3, 4])]
+        );
+        assert_eq!(
+            r("cache.nixos.org").unwrap(),
+            vec![IpAddr::from([1, 2, 3, 4])]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second resolve of the same host is a cache hit"
+        );
+        // a different host is a separate cache entry
+        r("pypi.org").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_zero_ttl_disables_the_dns_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r = cached_resolver(Duration::ZERO, move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![IpAddr::from([1, 2, 3, 4])])
+        });
+        r("h").unwrap();
+        r("h").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "ttl = 0 resolves on every request (no cache)"
+        );
     }
 
     /// A name that does not resolve, for an *allowed* host, must be a clean 502 with a

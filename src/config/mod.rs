@@ -2885,10 +2885,14 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
         }
         Ok(Backend::Flake(reference.to_string()))
     } else if let Some(rest) = value.strip_prefix("deb:") {
-        if !is_valid_deb_url(rest) && !is_valid_deb_github_locator(rest) {
+        if !is_valid_deb_url(rest)
+            && !is_valid_deb_github_locator(rest)
+            && !is_valid_deb_apt_locator(rest)
+        {
             return Err(format!(
                 "invalid deb reference `{rest}` — use an `https://` URL ending in `.deb`, \
-                 or `github:<owner>/<repo>` to track the latest release's `.deb`"
+                 `github:<owner>/<repo>` to track the latest release's `.deb`, \
+                 or `apt:<https-Packages-index-url>` to track an apt repo's latest `.deb`"
             ));
         }
         Ok(Backend::Deb(rest.to_string()))
@@ -2963,6 +2967,29 @@ pub(crate) fn is_valid_deb_github_locator(s: &str) -> bool {
             && seg
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
+}
+
+/// A `deb:apt:<packages-url>` locator: track the newest `.deb` in an apt repository's uncompressed
+/// `Packages` index, for a vendor apt pool that publishes versioned filenames with no `latest` alias
+/// (so a hand-pinned URL goes stale). The `<packages-url>` is an `https://` URL restricted to the
+/// same injection-free character set as [`is_valid_deb_url`] (it is interpolated into a
+/// `builtins.fetchurl`), but it points at the index, not a `.deb`, so the `.deb` suffix is **not**
+/// required. ops fetches the index, selects the highest version's `.deb`, and **re-validates that
+/// derived URL through [`is_valid_deb_url`]** before it is fetched or built — so the remote index
+/// cannot inject a bad URL. Scope (documented, not a gap): the index must be the **uncompressed**
+/// `Packages` (no `.gz`/`.xz` decompression), ops does **no** `InRelease`/GPG signature check, and it
+/// expects a **single-application** repo — the same TLS-plus-unpack trust level as a direct `deb:`
+/// URL, not a general Debian mirror.
+pub(crate) fn is_valid_deb_apt_locator(s: &str) -> bool {
+    let Some(url) = s.strip_prefix("apt:") else {
+        return false;
+    };
+    url.strip_prefix("https://").is_some_and(|rest| {
+        !rest.is_empty()
+            && url.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
+            })
     })
 }
 
@@ -3167,6 +3194,13 @@ fn validate_network_table(
                 "{source_label}: `ask_notice` is only meaningful under `mode = \"ask\"` — ignored"
             ));
         }
+    }
+    // DNS cache TTL for the proxy's resolver (every filtering posture runs one). The proxy resolves
+    // each allowed host once and reuses the address for this long, so a long build fetching from one
+    // host thousands of times does not re-hit the resolver each request. Optional; default 60s, `0`
+    // disables the cache.
+    if let Some(secs) = table.dns_cache_ttl {
+        policy = policy.with_dns_cache_ttl(Some(std::time::Duration::from_secs(secs)));
     }
     Some(NetworkPolicy::Allowlist(policy))
 }
@@ -4829,6 +4863,7 @@ mod tests {
             ask_notice: None,
             stats: None,
             default_methods: None,
+            dns_cache_ttl: None,
         })
     }
 
@@ -4897,6 +4932,7 @@ mod tests {
             ask_notice: None,
             stats: None,
             default_methods: None,
+            dns_cache_ttl: None,
         });
         let policy =
             super::validate_network(&mut w, GLOBAL_CONFIG, field, &g, &NetworkPolicy::default())
@@ -5212,6 +5248,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })),
             ..RawConfig::default()
         }
@@ -5415,6 +5452,7 @@ mod tests {
             ask_notice: None,
             stats: None,
             default_methods: Some(vec!["*".into()]),
+            dns_cache_ttl: None,
         });
         let project = raw_with_app("probe", raw_app(&["id"], &[], &[], &[], Some(net)));
         let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
@@ -5556,6 +5594,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })
         };
 
@@ -5629,6 +5668,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })
         };
         let filtering =
@@ -5689,6 +5729,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })),
             ..RawConfig::default()
         };
@@ -5723,6 +5764,7 @@ mod tests {
                     ask_notice: None,
                     stats: None,
                     default_methods: None,
+                    dns_cache_ttl: None,
                 })),
                 ..RawApp::default()
             },
@@ -5742,6 +5784,37 @@ mod tests {
     }
 
     #[test]
+    fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
+        let dns_table = |ttl: Option<u64>| {
+            NetworkField::Table(NetworkTable {
+                mute: vec![],
+                mode: Some("deny".into()),
+                allow: vec!["cache.nixos.org".into()],
+                deny: vec![],
+                ask_timeout: None,
+                ask_notice: None,
+                stats: None,
+                default_methods: None,
+                dns_cache_ttl: ttl,
+            })
+        };
+        let mut w = Vec::new();
+
+        // Unset → the policy carries None (the resolver applies its 60s default).
+        let def = validate_network(&mut w, GLOBAL_CONFIG, dns_table(None)).unwrap();
+        assert!(matches!(&def, NetworkPolicy::Allowlist(p) if p.dns_cache_ttl().is_none()));
+
+        // An explicit TTL flows through; `0` disables the cache — a distinct value, not "unset".
+        let set = validate_network(&mut w, GLOBAL_CONFIG, dns_table(Some(30))).unwrap();
+        assert!(matches!(&set, NetworkPolicy::Allowlist(p)
+            if p.dns_cache_ttl() == Some(std::time::Duration::from_secs(30))));
+        let off = validate_network(&mut w, GLOBAL_CONFIG, dns_table(Some(0))).unwrap();
+        assert!(matches!(&off, NetworkPolicy::Allowlist(p)
+            if p.dns_cache_ttl() == Some(std::time::Duration::ZERO)));
+        assert!(w.is_empty(), "valid values warn nothing: {w:?}");
+    }
+
+    #[test]
     fn ask_mode_parses_and_carries_an_optional_timeout() {
         use crate::allowlist::DefaultAction;
         let ask_table = |timeout: Option<&str>| {
@@ -5754,6 +5827,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })
         };
         let mut w = Vec::new();
@@ -5791,6 +5865,7 @@ mod tests {
             ask_notice: None,
             stats: None,
             default_methods: None,
+            dns_cache_ttl: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
@@ -5812,6 +5887,7 @@ mod tests {
                 ask_notice: notice,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })
         };
         let mut w = Vec::new();
@@ -5841,6 +5917,7 @@ mod tests {
             ask_notice: Some(false),
             stats: None,
             default_methods: None,
+            dns_cache_ttl: None,
         });
         let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
         assert!(
@@ -6934,6 +7011,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: Some(vec!["GET".into()]),
+                dns_cache_ttl: None,
             })),
             ..RawConfig::default()
         };
@@ -8123,6 +8201,46 @@ mod tests {
     }
 
     #[test]
+    fn a_deb_apt_locator_parses_as_a_deb_backend_and_is_charset_validated() {
+        // `deb:apt:<https-Packages-url>` routes to the same host-side deb provisioner, tracking an
+        // apt repo's highest-version `.deb` (for a vendor pool with no `latest` alias). The locator is
+        // stored verbatim in `Backend::Deb`; the index URL points at the Packages index, not a `.deb`,
+        // so the `.deb` suffix is not required.
+        let idx = "apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages";
+        let r = resolve_no_plugins(
+            raw_packages(&[
+                ("claude-desktop", &format!("deb:{idx}")),
+                ("plain", "deb:http://h/x/Packages"), // not https: refused
+                ("meta", "deb:apt:https://h/x$y/Packages"), // metacharacter: refused
+                ("bare", "deb:apt:"),                 // empty url: refused
+            ]),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "claude-desktop").unwrap().backend,
+            Backend::Deb(idx.into())
+        );
+        for refused in ["plain", "meta", "bare"] {
+            assert!(
+                pkg(&r.packages, refused).is_none(),
+                "{refused} should be refused"
+            );
+        }
+        // the validator directly: an https Packages URL (no `.deb` suffix) is accepted; a plaintext,
+        // metacharacter-bearing, non-`apt:`, or empty value is rejected.
+        assert!(is_valid_deb_apt_locator(idx));
+        for bad in [
+            "https://h/x/Packages",    // no apt: prefix
+            "apt:http://h/x/Packages", // plaintext
+            "apt:https://h/x$y",       // metacharacter
+            "apt:",                    // empty url
+            "apt:https://",            // empty host
+        ] {
+            assert!(!is_valid_deb_apt_locator(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
     fn an_appimage_prefixed_package_parses_as_an_appimage_backend() {
         // `appimage:<url>` / `appimage:github:<owner>/<repo>` routes to the host-side prebuilt-AppImage
         // provisioner. A direct URL must be `https://` ending in `.AppImage` (case-insensitively) and
@@ -8642,6 +8760,7 @@ mod tests {
                     ask_notice: None,
                     stats: None,
                     default_methods: None,
+                    dns_cache_ttl: None,
                 })),
                 ..RawConfig::default()
             },
@@ -8744,6 +8863,7 @@ mod tests {
                 ask_notice: None,
                 stats: None,
                 default_methods: None,
+                dns_cache_ttl: None,
             })),
             secret: Some(raw_secret_section(secrets)),
             ..RawConfig::default()
@@ -9092,6 +9212,7 @@ mod tests {
                 ask_notice: None,
                 stats,
                 default_methods: None,
+                dns_cache_ttl: None,
             })),
             ..RawConfig::default()
         };
@@ -9148,6 +9269,7 @@ mod tests {
                 ask_notice: None,
                 stats: Some(false),
                 default_methods: None,
+                dns_cache_ttl: None,
             })),
         );
         let r = resolve_no_plugins(raw_with_app("demo", app), None);
@@ -9222,6 +9344,7 @@ mod tests {
             ask_notice: None,
             stats: None,
             default_methods: None,
+            dns_cache_ttl: None,
         }))
     }
 
