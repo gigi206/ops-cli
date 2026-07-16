@@ -50,24 +50,25 @@
 # `--password-store=basic` forces the file cookie/token store (no keyring in the cage) so a login
 # survives a relaunch.
 #
-# CREDENTIAL POSTURE — a Cursor ACCOUNT login, NOT a header-injectable key, and the OPEN question.
-# Unlike the `cursor-agent` CLI (which accepts a `CURSOR_API_KEY` env), the desktop editor signs in
-# to your Cursor account through a WEB flow that ends in a `cursor://` deep-link handed back to the
-# app (the same shape as `claude-desktop`'s `claude://`). Under the cage the external-browser step
-# has no host browser, so the login does NOT complete out of the box. Two paths, NEITHER yet proven
-# for Cursor (its exact sign-in deep-link is not captured here — this profile does not fabricate it):
+# CREDENTIAL POSTURE — a Cursor ACCOUNT login (NOT a header-injectable key), wired via an in-cage
+# browser. Unlike the `cursor-agent` CLI (which accepts a `CURSOR_API_KEY` env), the desktop editor
+# signs in to your Cursor account through a WEB flow that ends in a `cursor://` deep-link handed back
+# to the app (confirmed from the `.deb`: `cursor-url-handler.desktop` runs `cursor --open-url %U` for
+# `x-scheme-handler/cursor`). The hermetic cage has no host browser and no `xdg-open`, so clicking
+# "login" out of the box does NOTHING. The `cmd` wrapper below closes the loop IN-CAGE (the
+# `claude-desktop` recipe): it opens http(s) in an in-cage Chromium for the web auth and routes the
+# `cursor://` callback to `cursor --open-url`, and registers a scheme handler so the portal (under
+# `dbus = true`) routes those links too. It needs `nix:chromium` (a large closure — see `[packages]`).
 #
-#   1. ONE-TIME login under a relaxed posture — launch once with the host network so the sign-in can
-#      reach your host browser, let the credential persist in the isolated home, then run filtered:
-#          ops app cursor --net shared          # first run: complete the sign-in
-#          ops app cursor                        # subsequent runs: filtered by the allowlist below
-#      (Whether the session token survives the relaunch under `--password-store=basic` is the thing
-#      to verify.)
-#   2. IN-CAGE browser wrapper — the `claude-desktop` / `t3code` recipe: provision `nix:chromium`,
-#      wrap `cmd` in a bash script that installs an `xdg-open` launching an in-cage Chromium for
-#      http(s) and registers a `cursor://` scheme handler, so the whole flow closes in-cage. This is
-#      HEAVY (a large Chromium closure) and needs Cursor's exact deep-link flow captured live first —
-#      adapt from `profiles/claude-desktop.toml` once you have it. Left out here rather than guessed.
+# FIRST LOGIN — run it once under `--net shared` (host network, no allowlist whack-a-mole while you
+# discover which SSO hosts the flow touches), let the session persist in the isolated home, then run
+# filtered:
+#     ops app cursor --net shared     # first run: complete the sign-in, watch `ops net logs -a cursor`
+#     ops app cursor                  # later runs: filtered by the allowlist below
+# If you sign in with Google/GitHub SSO, add the provider's host chain to `allow` (for Google the
+# repo-standard bounded regex — see `profiles/claude-desktop.toml`; the `accounts.google.<ccTLD>/…/SetSID`
+# redirect is load-bearing). A plain EMAIL sign-in stays on Cursor's own domain and needs no SSO hosts.
+# Whether the session token survives a relaunch under `--password-store=basic` is the thing to confirm.
 #
 # EGRESS AND HTTP/2 (gRPC). ops's MITM proxy speaks HTTP/1.1 by default; a host listed in
 # `[network] http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still
@@ -84,8 +85,9 @@
 # STATUS — honest scope. PROVEN LIVE: the `.deb` builds (autoPatchelf of this large VS Code-fork app),
 # the window maps on Wayland, the editor reaches startup, and its API traffic filters through the MITM
 # (api2.cursor.sh allowed, telemetry/component hosts denied). STILL TO VALIDATE with a real Cursor
-# account: the account LOGIN and an end-to-end AI turn. If a request is blocked, the proxy names the
-# host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
+# account: the account LOGIN (now WIRED via the in-cage browser below — validate it on the first
+# `--net shared` run) and an end-to-end AI turn. If a request is blocked, the proxy names the host it
+# refused — add it to `allow` (or check ahead with `ops test net <url>`).
 #
 # OBSERVED AT RUNTIME — all benign, all inherent to the Mode-B cage (do NOT "fix" by widening it):
 #   - `Failed to connect to /run/dbus/system_bus_socket` — the SYSTEM bus is privileged and never
@@ -98,12 +100,68 @@
 #     unrecognized); HTTPS still trusts ops's MITM CA via the NSS seed + `NODE_EXTRA_CA_CERTS` (the
 #     working api2.cursor.sh traffic confirms it). Left in for forward-compatibility.
 cmd = [
-    "cursor",
-    "--no-sandbox",
-    "--ozone-platform=wayland",
-    "--disable-dev-shm-usage",
-    "--use-system-ca",
-    "--password-store=basic",
+    "bash",
+    "-c",
+    '''
+# IN-CAGE BROWSER LOGIN (adapted from claude-desktop). Cursor's account sign-in opens an external
+# browser for the web auth, then hands the result back as a `cursor://` deep-link. The hermetic cage
+# has no browser and no `xdg-open`, so out of the box clicking "login" does nothing. This preamble
+# wires an in-cage Chromium for the http(s) auth and routes the `cursor://` callback to the editor,
+# so the whole flow closes inside the cage. (A plain EMAIL sign-in stays in the app webview and needs
+# none of this.)
+
+# Chromium managed policy: auto-launch the `cursor://` deep-link with no confirmation dialog, else the
+# callback never reaches the editor and login silently fails. /etc is a writable cage tmpfs; Chromium
+# reads /etc/chromium/policies/managed/.
+mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/policies/managed/ops-cursor-protocol.json <<'POLICY'
+{"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"cursor"}]}
+POLICY
+
+# xdg-open routing by scheme: http(s) -> the in-cage Chromium (the web auth); else (the `cursor://`
+# deep-link) -> `cursor --open-url` so the callback reaches the running editor (the `.deb`'s own
+# handler is `cursor --open-url %U`). `--no-sandbox` on the cursor branch too: it only hands the
+# deep-link to the single-instance app and quits, but still boots far enough to hit Chromium's SUID
+# sandbox (ops's build strips the setuid bit off chrome-sandbox), which aborts FATAL without it — the
+# callback would never arrive.
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
+#!/bin/sh
+case "$1" in
+  http://*|https://*)
+    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
+      --no-first-run --no-default-browser-check "$@" ;;
+  *)
+    exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --open-url "$@" ;;
+esac
+WRAP
+chmod +x "$HOME/.local/bin/xdg-open"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Under `dbus = true` the cage has a real portal, so Electron opens external URLs via
+# `org.freedesktop.portal.OpenURI` instead of calling `xdg-open` — and the portal shows "no apps
+# available" unless a default handler is registered, silently breaking the auth links. Register the
+# wrapper as the default handler for the web + `cursor` schemes. The Exec path is ABSOLUTE ($HOME
+# expanded here) because the portal-launched handler does not inherit this shell's PATH.
+mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
+cat > "$HOME/.local/share/applications/ops-open-uri.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=ops URL handler
+Exec=$HOME/.local/bin/xdg-open %U
+MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/cursor;
+NoDisplay=true
+Terminal=false
+EOF
+cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
+[Default Applications]
+x-scheme-handler/http=ops-open-uri.desktop
+x-scheme-handler/https=ops-open-uri.desktop
+x-scheme-handler/cursor=ops-open-uri.desktop
+MIMEAPPS
+
+exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+    --use-system-ca --password-store=basic
+''',
 ]
 
 gui = "wayland"
@@ -123,6 +181,11 @@ dbus = true
 # Cursor's prebuilt `.deb`, version-pinned (see the VERSION PIN note in the header — bump via the
 # download API). Trusted-only, like every backend; this profile is trusted by location once imported.
 cursor = "deb:https://downloads.cursor.com/production/fc2563ec93d793fc275eef734405a4fdf8b47b26/linux/x64/deb/amd64/deb/cursor_3.11.25_amd64.deb"
+# In-cage Chromium for the account sign-in flow (the `cmd` wrapper opens http(s) auth URLs in it and
+# routes the `cursor://` callback back to the editor). A large closure (a couple hundred MB the first
+# launch, seeded + offline-reusable after). Drop this and the `cmd` wrapper if you only ever sign in
+# with EMAIL (that stays in the app webview and needs no external browser).
+chromium = "nix:chromium"
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
 # opened to all verbs with `{*}`. See the EGRESS note in the header for the HTTP/2 caveat.
@@ -135,16 +198,32 @@ allow = [
     # authenticate / authenticator / authentication (login). Opened to all verbs (the editor POSTs
     # prompts and workspace context).
     "{*} https://*.cursor.sh",
+    # The LOGIN root: clicking sign-in opens `cursor.com/loginDeepControl` (confirmed live via
+    # `ops net logs -a cursor` — a deny here is exactly why "login does nothing" under the filter).
+    # `cursor.com` is a SEPARATE domain from `*.cursor.sh`, so the wildcard above does NOT cover it.
+    "{*} https://cursor.com",
     # The VS Code-style extension marketplace (browse/install extensions). The gallery query is a
     # CORS preflight `OPTIONS` + a `POST /_apis/public/gallery/extensionquery`, so it needs `{*}`, not
     # `{GET}` (confirmed live via `ops net logs -a cursor`). Comment out if you do not use extensions.
     "{*} https://marketplace.cursorapi.com",
+    # The extension asset host — the manifest/`.vsix` an extension install fetches (an `OPTIONS`
+    # preflight + a download; confirmed live via `ops net logs -a cursor`). Also Cursor's own
+    # `.deb`/update host, but that is fetched HOST-SIDE at build time, not through the cage. Comment
+    # out if you do not use extensions.
+    "{*} https://downloads.cursor.com",
     # Other client update / CDN hosts — uncomment whichever the editor names in `ops net logs -a
     # cursor` (least privilege; not needed for the editor's core edit/AI path).
     #"{GET} https://*.cursor-cdn.com",
     #"{*} https://*.cursorapi.com",
-    #"{GET} https://downloads.cursor.com",
     #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
+    # SSO host chain — ONLY if you sign in with a third-party IdP (Google/GitHub) instead of email.
+    # Discover the exact hosts on the first `--net shared` login (watch `ops net logs -a cursor`), then
+    # bake them in. For Google use the repo-standard bounded regex (see `profiles/claude-desktop.toml`);
+    # the `accounts.google.<ccTLD>/…/SetSID` redirect is the load-bearing one.
+    #'{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    #"{GET} https://*.gstatic.com",
+    #"{GET} https://*.googleusercontent.com",
+    #"{*} https://github.com",
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
 # `allow` verdict above — a host here must ALSO be in `allow`, every stream still verdict-checked).
@@ -165,6 +244,14 @@ mute = [
     # model/agent traffic and not needed for editing/AI, so it stays denied by construction; muted so
     # its refusals don't clutter `ops net logs` (still counted in `ops net stats`; see them with `--all`).
     "*.gvt1.com",
+    # The in-cage Chromium's OWN telemetry/component-update noise (not Cursor traffic) — safebrowsing,
+    # optimization-guide, component update, "checkin", the time server. Denied by construction; muted so
+    # they don't drown the actionable Cursor denials. None is the Google SSO flow (that lives on
+    # `accounts.google.<ccTLD>`, a different host — see the SSO block in `allow`).
+    "*.googleapis.com",
+    "clients2.google.com",
+    "android.clients.google.com",
+    "www.google.com",
     #"*.sentry.io",
 ]
 
