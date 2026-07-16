@@ -36,13 +36,18 @@
 # Cursor's own Node backend (the extension host that makes model calls) additionally honours
 # `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`, which ops also sets — so both halves trust the proxy.
 #
-# DISPLAY + GPU + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
+# DISPLAY + GPU + AUDIO + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
 # Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never
 # offered; isolation is compositor-dependent (Mutter safe; wlroots exposes screen-capture/input —
 # see docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in
 # ops's own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
 # Chromium/Electron app on Wayland often maps no window; mesa covers Intel/AMD/nouveau, NVIDIA-only
-# falls back to software. `dbus = true` gives the cage its OWN private desktop portal so Cursor's
+# falls back to software. `audio = true` provisions the PulseAudio client library (`libpulse.so.0`,
+# absent from the app's own closure, which carries only ALSA) and binds the host PulseAudio socket
+# into the cage, so sound and the microphone reach Cursor (notification/accessibility sounds, any
+# voice input). It is trusted-only because the PulseAudio bus exposes the microphone AND every
+# system-audio `.monitor` source (recording all host output) — see docs/guide/configuration/audio.md.
+# `dbus = true` gives the cage its OWN private desktop portal so Cursor's
 # file chooser (open folder / attach file) opens IN-CAGE and lists the cage filesystem, relays
 # notifications, and follows your host light/dark theme. The Electron flags: `--no-sandbox` is
 # mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=
@@ -81,6 +86,17 @@
 # gRPC/h2-only, to `http2`; an `EAI_AGAIN`/0-deny → the request bypassed the proxy) and, as a last
 # resort, fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the
 # minimal /dev, and lose only egress FILTERING).
+#
+# VOICE / DICTATION needs a Cursor PRO plan — NOT an sbx problem. `audio = true` above captures the
+# microphone in the cage (proven: the audio streams up fine as `aiserver.v1.BidiService/BidiAppend`
+# → HTTP 200), but Cursor's backend REJECTS the final `aiserver.v1.AiService/TranscribeAudio` with
+# HTTP 401 on non-Pro accounts — voice transcription is Pro-and-above (confirmed by Cursor staff on
+# the community forum; the app UI hides the rejection, so it merely looks broken — no text appears).
+# Diagnosed live under sbx: the 401 SURVIVES `--net shared` (so the MITM is NOT the cause) and every
+# OTHER account call authenticates (HTTP 200), so the token is valid — only this endpoint is gated.
+# If your transcript never appears: confirm the account signed in INSIDE the cage is your Pro one. No
+# profile/allowlist/`http2` change can fix a server 401 — inspect with
+# `sbx net logs -a cursor --all --with-status | grep Transcribe`.
 #
 # STATUS — honest scope. PROVEN LIVE: the `.deb` builds (autoPatchelf of this large VS Code-fork app),
 # the window maps on Wayland, the editor reaches startup, and its API traffic filters through the MITM
@@ -166,6 +182,7 @@ exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
 
 gui = "wayland"
 gpu = true
+audio = true
 dbus = true
 
 # Your host Cursor config/auth, mounted read-write at its real absolute path (so the caged editor
