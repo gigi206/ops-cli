@@ -198,10 +198,15 @@ allow = [
     # authenticate / authenticator / authentication (login). Opened to all verbs (the editor POSTs
     # prompts and workspace context).
     "{*} https://*.cursor.sh",
-    # The LOGIN root: clicking sign-in opens `cursor.com/loginDeepControl` (confirmed live via
-    # `ops net logs -a cursor` — a deny here is exactly why "login does nothing" under the filter).
-    # `cursor.com` is a SEPARATE domain from `*.cursor.sh`, so the wildcard above does NOT cover it.
-    "{*} https://cursor.com",
+    # The LOGIN + billing root. `cursor.com` is a SEPARATE domain from `*.cursor.sh`, so the wildcard
+    # above does NOT cover it. The sign-in opens `cursor.com/loginDeepControl`, then the flow touches
+    # `www.cursor.com` (dashboard/billing) — all first-party Cursor, so a `*.cursor.com` wildcard
+    # covers the apex and every subdomain (confirmed live via `ops net logs -a cursor`).
+    "{*} https://*.cursor.com",
+    # WorkOS — Cursor's identity provider. The sign-in redirects here for
+    # `/user_management/authorize` (OAuth) and the token exchange (POST), so all verbs (confirmed
+    # live via `ops net logs -a cursor`). The login cannot complete without it.
+    "{*} https://api.workos.com",
     # The VS Code-style extension marketplace (browse/install extensions). The gallery query is a
     # CORS preflight `OPTIONS` + a `POST /_apis/public/gallery/extensionquery`, so it needs `{*}`, not
     # `{GET}` (confirmed live via `ops net logs -a cursor`). Comment out if you do not use extensions.
@@ -216,14 +221,26 @@ allow = [
     #"{GET} https://*.cursor-cdn.com",
     #"{*} https://*.cursorapi.com",
     #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
-    # SSO host chain — ONLY if you sign in with a third-party IdP (Google/GitHub) instead of email.
-    # Discover the exact hosts on the first `--net shared` login (watch `ops net logs -a cursor`), then
-    # bake them in. For Google use the repo-standard bounded regex (see `profiles/claude-desktop.toml`);
-    # the `accounts.google.<ccTLD>/…/SetSID` redirect is the load-bearing one.
-    #'{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    #"{GET} https://*.gstatic.com",
-    #"{GET} https://*.googleusercontent.com",
-    #"{*} https://github.com",
+    # WorkOS auth-page assets (the sign-in page CSS/logos). Needed for the page to render so the form
+    # submits (confirmed live via `ops net logs -a cursor`). `{GET}` — both are asset downloads.
+    "{GET} https://cdn.workos.com",
+    "{GET} https://workos.imgix.net",
+    # Google SSO chain (you sign in with Google). The bounded regex covers `accounts.google.com` AND
+    # the country domain (`accounts.google.<ccTLD>/…/SetSID`) the OAuth flow redirects to — the SetSID
+    # redirect is load-bearing (deny it and the chain never completes). `gstatic`/`googleusercontent`
+    # are the consent-page assets/avatar.
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{GET} https://*.gstatic.com",
+    "{GET} https://*.googleusercontent.com",
+    # A git fetch of the `makenotion/cursor-notion-plugin` repo (Cursor pulls it as a dependency via
+    # the git smart-HTTP protocol). github.com is already allowed for {GET} by ops's built-in
+    # nix-cache set (so the `GET /info/refs` discovery passes); only the `POST /git-upload-pack` was
+    # denied by method-scope. Authorized as the EXACT upload-pack URL (least privilege — not a host
+    # wildcard, not the whole repo).
+    "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
+    # Billing — a paid plan checkout after login (Stripe). Not needed to log in or use the free tier.
+    "{GET} https://js.stripe.com",
+    "{*} https://checkout.stripe.com",
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
 # `allow` verdict above — a host here must ALSO be in `allow`, every stream still verdict-checked).
@@ -252,7 +269,27 @@ mute = [
     "clients2.google.com",
     "android.clients.google.com",
     "www.google.com",
-    #"*.sentry.io",
+    # Analytics on the WorkOS/Cursor login page (not auth traffic). Denied by construction; muted.
+    "www.googletagmanager.com",
+    # Google post-consent extras (the SSO completes without them; the desktop profiles mute these).
+    "accounts.youtube.com",
+    "play.google.com",
+    # Auth-page + app telemetry (not auth-completion traffic). Denied by construction; muted.
+    "*.sentry.io",
+    "browser-intake-datadoghq.com",
+    "forwarder.workos.com",
+    # Third-party marketing/tracking pixels Cursor embeds on its www.cursor.com pages (dashboard,
+    # billing, marketing). Pure noise — none is Cursor or auth traffic. Denied by construction; muted.
+    "ad.doubleclick.net",
+    "snap.licdn.com",
+    "px.ads.linkedin.com",
+    "connect.facebook.net",
+    "www.redditstatic.com",
+    "sc-static.net",
+    "analytics.tiktok.com",
+    "analytics.roadwayai.com",
+    "ip.conceptualhq.com",
+    "ptht05hbb1ssoooe.public.blob.vercel-storage.com",
 ]
 
 [env]

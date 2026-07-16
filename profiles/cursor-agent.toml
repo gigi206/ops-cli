@@ -20,7 +20,8 @@
 # `tar` + `gzip` (absent from the base toolset), so `[packages]` provisions them via nix (host-side,
 # seeded, offline-reusable). The downloaded `cursor-agent` binary is not autoPatchelf'd, so it runs
 # against the cage's `nix-ld` loader shim (the standard mechanism for a foreign dynamic binary; the
-# base userland supplies glibc + libstdc++). The download needs the network AND `cursor.com` /
+# base userland supplies glibc + libstdc++ + zlib, the runtime a Node CLI dlopens — without `libz.so.1`
+# it dies `node-loader: libz.so.1: cannot open shared object file`). The download needs the network AND `cursor.com` /
 # `downloads.cursor.com` in `allow` on the first launch of each project; later launches skip it.
 #
 # CREDENTIAL POSTURE — a Cursor ACCOUNT key, NOT a header-injectable provider key. `cursor-agent`
@@ -51,24 +52,27 @@
 # EGRESS AND HTTP/2 (gRPC). Under `mode = "deny"` ops runs a TLS-terminating MITM proxy. By default
 # it speaks HTTP/1.1 to a host; a host listed in `[network] http2` is instead man-in-the-middled as
 # HTTP/2 (ALPN h2) for gRPC, with every stream still inspected and verdict-checked (so `allow` still
-# governs the verdict — `http2` only picks the transport). Cursor's client uses HTTP/2/gRPC and falls
-# back to HTTP/1.1 SSE when h2 is unavailable, so its dual-stack agent hosts (api2 / api5) work either
-# way; its codebase-indexing host `repo42.cursor.sh` is HTTP/2-ONLY, so it is designated in
-# `[network] http2` below (without it, indexing fails). Cursor's own doc still notes some proxies
-# "can cause issues with streaming responses" and recommends against SSL inspection on its domains, so
-# if the agent misbehaves under `deny`, diagnose with `ops net logs -a cursor-agent` (a named deny →
-# add the host to `allow`, and if it is gRPC/h2-only, to `http2`; an `EAI_AGAIN`/0-deny → the request
-# bypassed the proxy, i.e. `NODE_USE_ENV_PROXY` is not taking effect) and, as a last resort, fall back
-# to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the minimal /dev,
-# losing only egress FILTERING).
+# governs the verdict — `http2` only picks the transport). Cursor's own doc still notes some proxies
+# "can cause issues with streaming responses" and recommends against SSL inspection on its domains,
+# so if the agent misbehaves under `deny`, diagnose with `ops net logs -a cursor-agent` (a named
+# deny → add the host to `allow`, and `http2-required`/`bad-request` → the `[network] http2`
+# designation does not match the client's transport for that host; an `EAI_AGAIN`/0-deny → the
+# request bypassed the proxy, i.e. `NODE_USE_ENV_PROXY` is not taking effect) and, as a last resort,
+# fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the minimal
+# /dev, losing only egress FILTERING).
+#
+# TRANSPORT — proven live (Node CLI client). The CLI speaks HTTP/2/gRPC to the `*.api5.cursor.sh`
+# agent hosts (designated in `http2` below), and HTTP/1.1 to `repo42.cursor.sh` (NOT designated —
+# designating it h2 blocked it `http2-required`). This is the OPPOSITE of the Cursor desktop profile
+# (a Chromium client) — do not copy one transport set to the other.
 #
 # STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
-# test), but — unlike the CLI profiles proven live — its PACKAGING (the bootstrap download + the
-# un-patchelf'd binary under nix-ld), its PROXY-HONORING (does every request route through ops's
-# proxy?), its TRANSPORT (the h2/gRPC MITM for `repo42`, and whether the agent hosts need it too), and its AUTH are ALL
-# still to be proven with a real Cursor account. Treat it as a grounded starting point to validate,
-# not a turnkey profile. If a request is blocked, the proxy names the host it refused — add it to
-# `allow` (or check ahead with `ops test net <url>`).
+# test). PROVEN LIVE: the bootstrap download + the un-patchelf'd binary under nix-ld runs (after
+# ops's base userland supplies `libz.so.1`), the CLI routes through ops's proxy, and the api5 agent
+# hosts + repo42 reach their transport. Still to be proven with a real Cursor account: the AUTH
+# (`CURSOR_API_KEY` via `--env`, or `cursor-agent login`) and a full prompt round-trip. Treat it as
+# a grounded starting point to validate, not a turnkey profile. If a request is blocked, the proxy
+# names the host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
 cmd = [
     "bash",
     "-c",
@@ -110,6 +114,16 @@ allow = [
     # authenticate / authenticator / authentication (login). Opened to all verbs because the agent
     # POSTs prompts and workspace context.
     "{*} https://*.cursor.sh",
+    # A git fetch of the `makenotion/cursor-notion-plugin` repo (the CLI pulls it as a dependency
+    # via the git smart-HTTP protocol). github.com is already allowed for {GET} by ops's built-in
+    # nix-cache set (so `GET /info/refs` passes); only the `POST /git-upload-pack` was denied by
+    # method-scope. Authorized as the EXACT upload-pack URL (least privilege — not a host wildcard).
+    "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
+    # The `makenotion/cursor-notion-plugin` (cloned above) runtime backend — Notion's MCP server
+    # (Model Context Protocol over Streamable HTTP: POST JSON-RPC + a GET SSE stream). `mcp.notion.com`
+    # is a dedicated single-purpose host (Notion's MCP endpoint), so the whole host is opened, not an
+    # exact URL. Lets the plugin read/write your Notion pages from inside the cage.
+    "{*} https://mcp.notion.com",
     # If the CLI fetches client updates / extensions, these are the documented hosts — uncomment the
     # one the proxy names in `ops net logs -a cursor-agent` (least privilege; not needed for the
     # agent's core prompt/response path).
@@ -119,17 +133,21 @@ allow = [
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; this is the
 # TRANSPORT, orthogonal to the `allow` verdict above — a host here must ALSO be in `allow`, and every
-# gRPC stream is still inspected + verdict-checked). `repo42.cursor.sh` (codebase indexing) is
-# HTTP/2-ONLY, so the proxy must speak h2 to it or indexing fails — designated by default. The
-# api2/api5 agent hosts are dual-stack and work over the HTTP/1.1 SSE fallback, so they are left off;
-# uncomment them (native gRPC) if the agent's model traffic misbehaves under the allowlist, watching
-# `ops net logs -a cursor-agent`. NOTE the designation is ALPN-h2-ONLY: a broad `*.cursor.sh` would
-# also force h2 on the auth hosts (authenticate/authenticator.cursor.sh), which may speak HTTP/1.1 —
-# its handshake would then fail. So keep it targeted (exact hosts or `*.api5.cursor.sh`), not a blanket
-# `*.cursor.sh`.
+# gRPC stream is still inspected + verdict-checked). NOTE the designation is ALPN-h2-ONLY: a host the
+# client speaks HTTP/1.1 to (no h2 ALPN offered) will be REFUSED with `http2-required` if listed here,
+# and a host the client speaks h2 to (sends the `PRI *` connection preface) will be REFUSED with
+# `bad-request` if NOT listed here. So the designation must match the client's actual transport per
+# host — keep it targeted (exact hosts or `*.api5.cursor.sh`), never a blanket `*.cursor.sh` (which
+# would also force h2 on the auth hosts authenticate/authenticator.cursor.sh that speak HTTP/1.1).
+#
+# PROVEN LIVE (Node CLI client, `ops net logs -a cursor-agent`) — the transport is the OPPOSITE of
+# the desktop (Chromium) client: the CLI speaks HTTP/1.1 to `repo42.cursor.sh` (so designating it h2
+# blocked it `http2-required`), and speaks HTTP/2/gRPC to the `*.api5.cursor.sh` agent hosts (so NOT
+# designating them sent `PRI *` → `bad-request`). The Cursor desktop profile inverts this — a
+# different client, do not copy one to the other.
 http2 = [
-    "repo42.cursor.sh",
-    #"*.api5.cursor.sh",   # all agent hosts (agent.api5, agentn.api5, agent.us.api5, …) as native gRPC
+    "*.api5.cursor.sh",   # agent hosts (agentn.global.api5, agent.api5, …) — the CLI speaks gRPC/h2 here
+    # repo42.cursor.sh is HTTP/1.1 from the CLI client — left OFF; designating it h2 blocks it.
     #"api2.cursor.sh",
 ]
 
