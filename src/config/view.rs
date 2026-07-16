@@ -261,6 +261,10 @@ pub(crate) enum NetworkView {
         /// counted in `ops net stats`, shown by `ops net log --all`). Surfaced so the suppression is
         /// never silent. Empty for a policy that mutes nothing.
         mute: Vec<String>,
+        /// `http2` hosts: CONNECT targets the proxy man-in-the-middles as HTTP/2 (ALPN `h2`, for
+        /// gRPC) instead of HTTP/1.1. A transport choice, orthogonal to the verdict — the host must
+        /// still be permitted by an `allow` rule. Empty for a policy that designates no h2 host.
+        http2: Vec<String>,
         builtin: Vec<String>,
     },
 }
@@ -878,6 +882,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             allow: a.allow_rules().iter().map(|r| r.to_string()).collect(),
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             mute: a.mute_rules().iter().map(|r| r.to_string()).collect(),
+            http2: a.http2_hosts().iter().map(|h| h.display()).collect(),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
                 .map(|r| r.to_string())
@@ -1408,6 +1413,7 @@ mod tests {
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 mute: vec![],
+                http2: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,

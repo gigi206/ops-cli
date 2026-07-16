@@ -675,6 +675,56 @@ pub(crate) enum DefaultAction {
 /// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
 /// (`None` = wait indefinitely until answered); it is inert under the other defaults. The `ask`
 /// park notice is printed to stderr by default; a policy may suppress it (the request still parks).
+/// A `[network] http2` entry: a canonicalized host and an optional port. The egress proxy speaks
+/// HTTP/2 (ALPN `h2`, for gRPC) to a CONNECT target matching one of these; a `None` port matches
+/// any port, a `Some(port)` only that port. It selects the transport only — the host must still be
+/// permitted by an `allow` rule, and every stream is verdict-checked like the HTTP/1.1 path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Http2Host {
+    host: String,
+    port: Option<u16>,
+}
+
+impl Http2Host {
+    /// Parse a config entry `host` or `host:port`. Returns `None` for a malformed entry (empty host,
+    /// or a `:suffix` that is not a valid port) — the caller drops it with a warning, fail-closed
+    /// (that host simply keeps HTTP/1.1). A hostname is expected: an h2 target needs an SNI, and the
+    /// proxy refuses IP-literal CONNECT targets, so the `:port` split (rightmost colon, numeric
+    /// suffix) does not attempt to parse a bracketed IPv6 literal.
+    pub(crate) fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        if let Some((h, p)) = entry.rsplit_once(':') {
+            if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                let port: u16 = p.parse().ok()?;
+                return Some(Self {
+                    host: canonical_host(h),
+                    port: Some(port),
+                });
+            }
+        }
+        Some(Self {
+            host: canonical_host(entry),
+            port: None,
+        })
+    }
+
+    /// The canonical entry text (for `ops config show`): `host` or `host:port`.
+    pub(crate) fn display(&self) -> String {
+        match self.port {
+            Some(p) => format!("{}:{}", self.host, p),
+            None => self.host.clone(),
+        }
+    }
+
+    /// Whether a CONNECT to `host:port` (host already canonicalized) matches this entry.
+    fn matches(&self, host: &str, port: u16) -> bool {
+        self.host == host && self.port.map(|p| p == port).unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
@@ -692,6 +742,11 @@ pub(crate) struct EgressPolicy {
     /// DNS cache TTL for the proxy's host-side resolver. `None` means the default (60s) is applied at
     /// the resolver build site; `Some(0)` disables the cache. Read via [`Self::dns_cache_ttl`].
     dns_cache_ttl: Option<std::time::Duration>,
+    /// The `[network] http2` hosts: CONNECT targets the proxy man-in-the-middles as **HTTP/2**
+    /// (ALPN `h2`, for gRPC) instead of the default HTTP/1.1. Consulted only at connection time via
+    /// [`Self::speaks_http2`] to pick the TLS ALPN — never a verdict (a host must still be allowed by
+    /// an `allow` rule). Read via [`Self::http2_hosts`].
+    http2: Vec<Http2Host>,
 }
 
 impl EgressPolicy {
@@ -706,6 +761,7 @@ impl EgressPolicy {
             ask_timeout: None,
             suppress_ask_notice: false,
             dns_cache_ttl: None,
+            http2: Vec::new(),
         }
     }
 
@@ -766,6 +822,26 @@ impl EgressPolicy {
     /// The configured DNS cache TTL (raw `Option` — the resolver applies the 60s default for `None`).
     pub(crate) fn dns_cache_ttl(&self) -> Option<std::time::Duration> {
         self.dns_cache_ttl
+    }
+
+    /// Attach the `[network] http2` host set, returning the policy (builder style). Each entry names
+    /// a CONNECT target the proxy speaks HTTP/2 to (ALPN `h2`, for gRPC) — never a verdict.
+    pub(crate) fn with_http2(mut self, http2: Vec<Http2Host>) -> Self {
+        self.http2 = http2;
+        self
+    }
+
+    /// The configured HTTP/2 hosts (for `ops config show`).
+    pub(crate) fn http2_hosts(&self) -> &[Http2Host] {
+        &self.http2
+    }
+
+    /// Whether the proxy should man-in-the-middle a CONNECT to `host:port` as HTTP/2 (ALPN `h2`)
+    /// rather than the default HTTP/1.1. `host` must already be canonicalized (as the proxy's
+    /// `connect_host` is). This only selects the transport; the request is still verdict-checked per
+    /// stream exactly like the HTTP/1.1 path.
+    pub(crate) fn speaks_http2(&self, host: &str, port: u16) -> bool {
+        self.http2.iter().any(|h| h.matches(host, port))
     }
 
     pub(crate) fn allow_rules(&self) -> &[Rule] {
@@ -3332,5 +3408,50 @@ mod tests {
         // both feed paths that must never be raw-spliced credential targets. (The secret `to`
         // validator rejecting a tcp:// `to` is covered in the config tests; here just pin the layer.)
         assert_eq!(host_port_rule("h", 443).layer, Layer::L7);
+    }
+
+    #[test]
+    fn http2_host_parses_bare_host_and_host_port() {
+        // A bare host matches any port; a `host:port` pins that port. The host is canonicalized (the
+        // trailing FQDN dot is stripped, matching the proxy's `connect_host`).
+        let bare = Http2Host::parse("grpc.example.com").unwrap();
+        assert_eq!(bare.display(), "grpc.example.com");
+        let scoped = Http2Host::parse("grpc.example.com:9001").unwrap();
+        assert_eq!(scoped.display(), "grpc.example.com:9001");
+        assert_eq!(
+            Http2Host::parse("grpc.example.com.:443").unwrap().display(),
+            "grpc.example.com:443"
+        );
+        // Malformed → None (dropped with a warning by the config layer, fail-closed): an empty
+        // entry, or a port that is not a valid u16.
+        assert!(Http2Host::parse("").is_none());
+        assert!(Http2Host::parse("   ").is_none());
+        assert!(Http2Host::parse("host:99999").is_none());
+    }
+
+    #[test]
+    fn http2_host_matches_by_optional_port() {
+        // A `None` port matches any port; a `Some(port)` matches only that port.
+        let any = Http2Host::parse("h.example.com").unwrap();
+        assert!(any.matches("h.example.com", 443));
+        assert!(any.matches("h.example.com", 9001));
+        assert!(!any.matches("other.example.com", 443));
+
+        let pinned = Http2Host::parse("h.example.com:9001").unwrap();
+        assert!(pinned.matches("h.example.com", 9001));
+        assert!(!pinned.matches("h.example.com", 443));
+    }
+
+    #[test]
+    fn speaks_http2_only_for_designated_hosts() {
+        // `speaks_http2` is orthogonal to the verdict — it just selects the transport for a CONNECT
+        // target. It survives the built-in union and carries the port granularity.
+        let policy = EgressPolicy::new(vec![rule("grpc.example.com:9001")], vec![])
+            .with_http2(vec![Http2Host::parse("grpc.example.com:9001").unwrap()]);
+        assert!(policy.speaks_http2("grpc.example.com", 9001));
+        assert!(!policy.speaks_http2("grpc.example.com", 443));
+        assert!(!policy.speaks_http2("rest.example.com", 443));
+        // A policy with no http2 entry never selects h2.
+        assert!(!EgressPolicy::new(vec![], vec![]).speaks_http2("grpc.example.com", 9001));
     }
 }

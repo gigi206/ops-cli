@@ -556,6 +556,56 @@ fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
 }
 
 #[test]
+fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
+    // `[network] http2` names the hosts the proxy speaks HTTP/2 to (for gRPC). It is a
+    // security-relevant network sub-field, so it rides the whole-`[network]` trust gate; it must be
+    // dropped for an untrusted project and *visible* (never a silent transport switch) once trusted.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"deny\"\nallow = [\"{POST} grpc.example.com:9001\"]\n\
+         http2 = [\"grpc.example.com:9001\"]\n",
+    );
+
+    // Untrusted: the whole `[network]` (http2 included) is dropped, so the host appears nowhere.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("http2"),
+        "an untrusted project's network (http2 included) must be dropped:\n{stdout}"
+    );
+
+    // Trust it → the allowlist applies and the http2 host is surfaced in `config show`.
+    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("http2") && stdout.contains("grpc.example.com:9001"),
+        "a trusted http2 host must be visible in `config show`:\n{stdout}"
+    );
+
+    // A malformed http2 entry is dropped with a warning (fail-closed — that host keeps HTTP/1.1),
+    // while the valid one is kept.
+    let fx2 = Fixture::new();
+    fx2.write_project(
+        "[network]\nmode = \"deny\"\nallow = [\"{POST} grpc.example.com:9001\"]\n\
+         http2 = [\"grpc.example.com:9001\", \"grpc.example.com:99999\"]\n",
+    );
+    assert!(fx2.run(&["trust", ".ops.toml"]).status.success());
+    let out = fx2.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("grpc.example.com:9001"),
+        "the valid http2 host must be kept:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("http2") && stderr.contains("99999"),
+        "a malformed http2 entry (port out of range) must be warned:\n{stderr}"
+    );
+}
+
+#[test]
 fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     // A trusted bind of `/etc` is an ancestor of the cage's synthetic `/etc/passwd`, so the cage
     // layers its own files over part of it — the bind will not behave as a naive reading suggests.

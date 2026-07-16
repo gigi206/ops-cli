@@ -533,6 +533,15 @@ pub(crate) struct NetworkTable {
     /// table.
     #[serde(default)]
     pub(crate) mute: Vec<String>,
+    /// Hosts the egress proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of the
+    /// default HTTP/1.1. Each entry is a hostname with an optional port (`grpc.example.com` for any
+    /// port, `grpc.example.com:443` for that port only). Selecting HTTP/2 is orthogonal to the
+    /// verdict — a host must still be permitted by an `allow` rule, and every gRPC stream is
+    /// inspected and verdict-checked (method + `:path` = `/pkg.Service/Method`) exactly like the
+    /// HTTP/1.1 path. Trusted/global-only like the rest of the table; a malformed entry is dropped
+    /// with a warning (fail-closed — that host keeps HTTP/1.1).
+    #[serde(default)]
+    pub(crate) http2: Vec<String>,
     /// DNS cache TTL in seconds for the egress proxy's host-side resolver. The proxy resolves an
     /// allowed host once and reuses the address for this long, so a long build that fetches from one
     /// host (e.g. `cache.nixos.org`) thousands of times resolves it once instead of per request —
@@ -1035,6 +1044,7 @@ mod tests {
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: vec![
                     "github.com".into(),
@@ -1059,6 +1069,7 @@ mod tests {
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: vec![],
                 deny: vec![],
@@ -1080,6 +1091,7 @@ mod tests {
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: None,
                 allow: vec!["api.foo.com".into()],
                 deny: vec![],

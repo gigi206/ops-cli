@@ -1208,6 +1208,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             allow,
             deny,
             mute,
+            http2,
             builtin,
         } => {
             let _ = writeln!(
@@ -1311,6 +1312,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 );
                 for rule in mute {
                     let _ = writeln!(o, "      {dim}mute{r}  {n}{rule}{r}");
+                }
+            }
+            // http2 hosts: spoken to as HTTP/2 (gRPC) instead of HTTP/1.1. A transport choice —
+            // orthogonal to the verdict (the host is still allow-gated and every stream inspected) —
+            // so surfaced under the filtering posture whenever any is declared.
+            if !http2.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "    {dim}http2 (gRPC over HTTP/2; still allow-gated and inspected):{r}"
+                );
+                for host in http2 {
+                    let _ = writeln!(o, "      http2 {n}{host}{r}");
                 }
             }
             // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
@@ -1763,6 +1776,7 @@ fn render_app_detail(
             allow,
             deny,
             mute,
+            http2,
             builtin,
         } => {
             let _ = writeln!(
@@ -1790,6 +1804,9 @@ fn render_app_detail(
                 for rule in mute {
                     let _ = writeln!(o, "    {dim}mute{r}  {n}{rule}{r}");
                 }
+                for host in http2 {
+                    let _ = writeln!(o, "    {dim}http2{r} {n}{host}{r}");
+                }
                 let _ = writeln!(
                     o,
                     "    {dim}built-in (always allowed, so self-equip works):{r}"
@@ -1799,16 +1816,18 @@ fn render_app_detail(
                 }
                 let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
             } else {
-                // The mute count rides the summary only when non-zero, so a mute-free app reads
-                // exactly as before.
-                let mute_note = if mute.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {} mute", mute.len())
-                };
+                // The mute / http2 counts ride the summary only when non-zero, so an app that uses
+                // neither reads exactly as before.
+                let mut extra = String::new();
+                if !mute.is_empty() {
+                    extra.push_str(&format!(", {} mute", mute.len()));
+                }
+                if !http2.is_empty() {
+                    extra.push_str(&format!(", {} http2", http2.len()));
+                }
                 let _ = writeln!(
                     o,
-                    "    {dim}({} allow, {} deny{mute_note} — see --details){r}",
+                    "    {dim}({} allow, {} deny{extra} — see --details){r}",
                     allow.len(),
                     deny.len()
                 );
@@ -11232,6 +11251,7 @@ mod tests {
                 allow: vec!["github.com".into()],
                 deny: vec!["evil.com".into()],
                 mute: vec![],
+                http2: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -11421,6 +11441,7 @@ mod tests {
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
                 mute: vec![],
+                http2: vec![],
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,

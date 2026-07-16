@@ -56,6 +56,7 @@ for the full semantics.
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`ops net stats`](../networking/observability.md)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
+| `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1 — see below |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules.md): a host,
@@ -80,6 +81,47 @@ mode = "deny"
 allow = ["cache.nixos.org"]
 dns_cache_ttl = 60   # seconds (0 = resolve every request)
 ```
+
+## HTTP/2 and gRPC
+
+By default the filtering proxy speaks **HTTP/1.1** to every host. A **gRPC** service needs
+**HTTP/2**, so list its host in `http2` and the proxy man-in-the-middles that host as HTTP/2
+(ALPN `h2`) instead — decrypting and inspecting every gRPC stream, exactly like the HTTP/1.1 path:
+the request's method and `:path` (`/package.Service/Method`) are matched against your `allow`/`deny`
+rules, so you can allow a gRPC endpoint whole **or method by method**.
+
+```toml
+[network]
+mode  = "deny"
+allow = [
+  "{POST} grpc.example.com:443/helloworld.Greeter/SayHello",  # one RPC…
+  "{POST} grpc.example.com:443/health.Health/*",              # …or a whole service
+]
+http2 = ["grpc.example.com:443"]                              # speak HTTP/2 to this host
+```
+
+Notes:
+
+- **`{POST}` is required.** gRPC uses `POST`, but a bare `allow = ["grpc.example.com"]` is
+  read-by-default (`{GET,HEAD}`) for an **app**, so every RPC would be refused. Prefix the rule with
+  `{POST}` (or `{*}`). (`ops run`/`ops shell` are all-verbs, so the baseline is less strict — but be
+  explicit.)
+- **`http2` selects the transport, not the verdict.** A host must still be permitted by an `allow`
+  rule; `http2` only decides HTTP/2-vs-HTTP/1.1. It is `host` or `host:port` (a bare host matches any
+  port). HTTP/2 is negotiated per `host:port` at the TLS handshake, so it is always whole-endpoint —
+  there is no per-path HTTP/2.
+- **Designated hosts are HTTP/2-only.** The proxy offers only `h2` to an `http2` host, so an
+  HTTP/1.1-only client reaching it fails the handshake (deliberate — designate only gRPC endpoints).
+- **Secrets work on HTTP/2 too.** A [`[secret]`](secret.md) scoped to a gRPC host is injected into the
+  request (host-side, never in the cage), the outbound tripwire refuses a request that carries a secret
+  value verbatim, and a reflected secret is masked out of the response — exactly like the HTTP/1.1 path.
+  One honest limit: response masking is a byte scan, so a secret inside a **gzip-compressed** gRPC
+  message (gRPC compresses more often than plain HTTP) is not masked — the same limit gzip already
+  imposes on the HTTP/1.1 path.
+- **mTLS / certificate-pinned** gRPC cannot be man-in-the-middled; those need a raw
+  [`tcp://`](../networking/rules.md) passthrough (a separate capability).
+- Trusted/global-only like the rest of the table; a malformed entry is dropped with a warning
+  (that host keeps HTTP/1.1).
 
 ## When a host is refused
 

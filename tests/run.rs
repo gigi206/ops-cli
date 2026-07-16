@@ -949,6 +949,18 @@ fn cache_reachable() -> bool {
     })
 }
 
+/// Whether the public `grpcb.in` gRPC test server is reachable — the HTTP/2 secret e2e depends on it
+/// (an external service), so an outage skips that test rather than reddening the suite.
+fn grpcb_in_reachable() -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = ("grpcb.in", 9001).to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|addr| {
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)).is_ok()
+    })
+}
+
 /// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,
 /// a reset connection, an upstream stall — rather than a real failure of the code under test. The
 /// heavy `flake:` e2es fetch tens of megabytes of nixpkgs per fresh run, so an occasional
@@ -1627,6 +1639,318 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
         count("example.com", "deny") >= 1,
         "the denied host must show a deny in the stats:\n{}",
         String::from_utf8_lossy(&stats.stdout)
+    );
+}
+
+#[test]
+fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
+    // The HTTP/2 (gRPC) MITM path end to end through the real binary. A trusted `deny` allowlist
+    // designates `cache.nixos.org` as `http2`, so the proxy speaks HTTP/2 to it; an in-cage
+    // `curl --http2` GET reports the negotiated version. Teeth on two properties:
+    //   * TRANSPORT: `http_version = 2` can only happen because ops advertised ALPN `h2` on the
+    //     h2 branch — the default HTTP/1.1 MITM advertises no ALPN, so a regression that routed the
+    //     designated host through the sync path would report `1.1` and fail this assertion.
+    //   * VERDICT on the h2 path: `example.com` is also designated `http2` but is NOT allowed, so
+    //     its stream is refused with a `403` by the same `explain` chokepoint the HTTP/1.1 path uses
+    //     — proving the policy fires on h2, not just the transport. (It is refused before any
+    //     upstream contact, so example.com's reachability does not matter.)
+    // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("h2-proj");
+    let data = TmpDir::new("h2-data");
+    let state = TmpDir::new("h2-state");
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
+         http2 = [\"cache.nixos.org\", \"example.com\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (untrusted → shared net): seeds the project store and skips a cage-less host.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping http2 e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping http2 e2e: the binary cache is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // ALLOWED + h2: a real GET through the h2 MITM to the designated host. The base `curl` carries
+    // nghttp2, `--http2` offers ALPN `h2`, and the proxy speaks it → `http_version = 2`, `200`.
+    // Runs via `ops_in` (with the test state dir) so the trust marker is honored — otherwise the
+    // untrusted policy is dropped and the cage runs `shared`, which would negotiate h2 *directly*
+    // with the upstream (no proxy) and pass this assertion for the wrong reason.
+    let allowed = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "curl",
+            "--http2",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "V=%{http_version} C=%{http_code}",
+            "https://cache.nixos.org/nix-cache-info",
+        ],
+    );
+    let out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        out.contains("V=2") && out.contains("C=200"),
+        "the designated host must be MITM'd as HTTP/2 and return 200 (got {out:?}); stderr: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    // DENIED on the h2 path (teeth): example.com is http2-designated but not allowed, so the h2
+    // branch refuses its stream with a 403 — the verdict fires on h2, not just the transport.
+    let denied = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "curl",
+            "--http2",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "C=%{http_code}",
+            "https://example.com/",
+        ],
+    );
+    let dout = String::from_utf8_lossy(&denied.stdout);
+    assert!(
+        dout.contains("C=403"),
+        "a designated-but-unallowed h2 host must be refused with 403 on the h2 path (got {dout:?}); \
+         stderr: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+}
+
+#[test]
+fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
+    // Increment 2: credential injection + the outbound tripwire + response redaction now work on the
+    // HTTP/2 path, so a configured `[secret]` no longer fail-closes h2 — it is handled exactly like
+    // the HTTP/1.1 path. Two teeth against `cache.nixos.org` (a designated h2 host with a secret):
+    //   A. NOT fail-closed + the redaction relay delivers the body intact: a normal request is
+    //      injected + forwarded and returns `200` with the real `nix-cache-info` body (`StoreDir`) —
+    //      cache.nixos.org is an injection target, so this response streams through the *masking*
+    //      relay, proving it does not corrupt an ordinary body. (A regression to the increment-1
+    //      fail-closed gate would refuse this and fail the assertion.)
+    //   B. The outbound tripwire fires: a request that itself carries the secret value verbatim (in a
+    //      client header) is refused `outbound-secret` — a secret must not leave the cage, whatever
+    //      the verdict.
+    let project = TmpDir::new("h2-secret-proj");
+    let data = TmpDir::new("h2-secret-data");
+    let state = TmpDir::new("h2-secret-state");
+    let secret = "s3cr3t-h2-inject-9q2z7w1k";
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
+         http2 = [\"cache.nixos.org\"]\n\n\
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
+         header = \"X-Ops-Test\"\ntype = \"raw\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping http2 secret e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping http2 secret e2e: the binary cache is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // A. A normal request: injected + forwarded (not fail-closed), body delivered intact through the
+    //    masking relay. The secret is set in ops's env so the launch resolves it host-side.
+    let a = ops()
+        .args([
+            "run",
+            "--",
+            "curl",
+            "--http2",
+            "-sS",
+            "-w",
+            "\nC=%{http_code}",
+            "https://cache.nixos.org/nix-cache-info",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("OPS_E2E_SECRET", secret)
+        .output()
+        .expect("spawn ops run");
+    let aout = String::from_utf8_lossy(&a.stdout);
+    assert!(
+        aout.contains("C=200") && aout.contains("StoreDir"),
+        "a secret-configured h2 request must be injected + forwarded (no fail-close) and its body \
+         delivered intact through the masking relay (expected 200 + `StoreDir`); got:\n{aout}\n\
+         stderr: {}",
+        String::from_utf8_lossy(&a.stderr)
+    );
+
+    // B. A request that carries the secret value verbatim must be refused by the outbound tripwire.
+    let b = ops()
+        .args([
+            "run",
+            "--",
+            "curl",
+            "--http2",
+            "-sS",
+            "-D",
+            "-",
+            "-o",
+            "/dev/null",
+            "-H",
+            &format!("X-Leak: {secret}"),
+            "https://cache.nixos.org/nix-cache-info",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("OPS_E2E_SECRET", secret)
+        .output()
+        .expect("spawn ops run");
+    let bout = String::from_utf8_lossy(&b.stdout);
+    assert!(
+        bout.contains("outbound-secret"),
+        "a request carrying the secret verbatim must be refused `outbound-secret` on the h2 path; \
+         got:\n{bout}\nstderr: {}",
+        String::from_utf8_lossy(&b.stderr)
+    );
+}
+
+#[test]
+fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
+    // Increment 2's two headline behaviors, guarded through a real gRPC round-trip (the hand-run
+    // grpcb.in proof, promoted to committed teeth — the tripwire e2e above cannot cover these because
+    // cache.nixos.org does not echo the request):
+    //   * INJECTION reaches the upstream: a host-scoped credential is injected host-side (never in the
+    //     cage) and arrives at the server.
+    //   * RESPONSE MASKING: a reflected secret is masked out of the response DATA.
+    //   * STRIP-AND-REPLACE (6.3a): the client also sends a DECOY `x-ops-test` header; it must be
+    //     dropped and only ops's value forwarded, so the decoy must be absent from the echo.
+    // `grpcbin.GRPCBin/HeadersUnary` echoes the request metadata into the response body, so a masked
+    // `x-ops-test` value (an equal-length `*` run) that is neither the real secret nor the decoy
+    // proves injection-reached + masking + no-leak + strip in one shot. Skips (never fails) when the
+    // host cannot sandbox, the cache is unreachable (grpcurl won't provision), or grpcb.in is down.
+    let project = TmpDir::new("h2-grpc-proj");
+    let data = TmpDir::new("h2-grpc-data");
+    let state = TmpDir::new("h2-grpc-state");
+    let secret = "s3cr3t-grpc-inject-7w1k9q2z";
+    let decoy = "DECOY-CLIENT-VALUE-must-be-stripped";
+    std::fs::write(
+        project.path().join(".ops.toml"),
+        "[packages]\ngrpcurl = \"nix:grpcurl\"\n\n\
+         [network]\nmode = \"deny\"\nallow = [\"{POST} grpcb.in:9001\"]\n\
+         http2 = [\"grpcb.in:9001\"]\n\n\
+         [secret.\"grpcb.in:9001\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
+         header = \"x-ops-test\"\ntype = \"raw\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping h2 grpc secret e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping h2 grpc secret e2e: the binary cache is unreachable");
+        return;
+    }
+    if !grpcb_in_reachable() {
+        eprintln!("skipping h2 grpc secret e2e: grpcb.in is unreachable");
+        return;
+    }
+
+    let trusted = ops_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".ops.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "ops trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = ops()
+        .args([
+            "run",
+            "--",
+            "grpcurl",
+            "-H",
+            &format!("x-ops-test: {decoy}"),
+            "grpcb.in:9001",
+            "grpcbin.GRPCBin/HeadersUnary",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("OPS_E2E_SECRET", secret)
+        .output()
+        .expect("spawn ops run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Injection reached the upstream (the header is echoed) and its value is masked (a `*` run at
+    // least as long as our 10-char floor — the real value is 27 chars, so this can only be masking).
+    assert!(
+        stdout.contains("x-ops-test") && stdout.contains("**********"),
+        "the injected header must reach the upstream and its echoed value be masked; got:\n{stdout}\n\
+         stderr: {stderr}"
+    );
+    // No leak: the real secret value must never appear anywhere in the response.
+    assert!(
+        !stdout.contains(secret),
+        "the secret value must never appear in the response:\n{stdout}"
+    );
+    // Strip-and-replace: the client's decoy value must have been dropped, not forwarded upstream.
+    assert!(
+        !stdout.contains(decoy),
+        "strip-and-replace failed — the client's decoy header value reached the upstream:\n{stdout}"
     );
 }
 

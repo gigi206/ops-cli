@@ -3123,6 +3123,28 @@ fn mode_from_parent(parent: &NetworkPolicy) -> crate::allowlist::DefaultAction {
     }
 }
 
+/// Parse the `[network] http2` entries into the proxy's host matchers. Each is a `host` or
+/// `host:port`; a malformed entry is dropped with a warning (fail-closed — that host keeps
+/// HTTP/1.1). Unlike `allow`/`deny`, these are not egress rules and carry no `@group`/path/method
+/// grammar — HTTP/2 is a transport choice, orthogonal to the verdict.
+fn parse_http2_hosts(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    entries: Vec<String>,
+) -> Vec<crate::allowlist::Http2Host> {
+    let mut hosts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match crate::allowlist::Http2Host::parse(&entry) {
+            Some(h) => hosts.push(h),
+            None => warnings.push(format!(
+                "{source_label}: ignoring malformed `http2` entry `{entry}` \
+                 (expected a host or host:port); that host keeps HTTP/1.1"
+            )),
+        }
+    }
+    hosts
+}
+
 /// Validate the table form of `network`: `none`/`shared` behave as the string form; `deny`/`allow`/
 /// `ask` classify each declared entry (a malformed one is dropped with a warning, fail-closed —
 /// that host simply stays unreachable, never silently allowed); and an **omitted** `mode` inherits
@@ -3161,9 +3183,14 @@ fn validate_network_table(
     // it classifies with the same grammar as `allow`/`deny` (including `@group` expansion) and is
     // carried on the policy for the proxy to consult at logging time.
     let mute = classify_entries(warnings, source_label, "mute", table.mute, groups);
+    // `http2` names the hosts the proxy speaks HTTP/2 to (ALPN `h2`, for gRPC). It is not an egress
+    // rule (no path/method/verdict) — just a host[:port] the proxy MITMs as h2 — so it parses on its
+    // own, dropping a malformed entry with a warning (fail-closed: that host keeps HTTP/1.1).
+    let http2 = parse_http2_hosts(warnings, source_label, table.http2);
     let mut policy = crate::allowlist::EgressPolicy::new(allow, deny)
         .with_default(action)
-        .with_mute(mute);
+        .with_mute(mute)
+        .with_http2(http2);
     if action == DefaultAction::Ask {
         // A configured `ask_timeout` bounds the parked wait; a malformed value falls back to
         // indefinite (warned), never a hard config failure.
@@ -4856,6 +4883,7 @@ mod tests {
     fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
         NetworkField::Table(NetworkTable {
             mute: vec![],
+            http2: vec![],
             mode: Some(mode.into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -4928,6 +4956,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             mute: vec!["@telemetry".into(), "antigravity-unleash.goog".into()],
+            http2: vec![],
             ask_timeout: None,
             ask_notice: None,
             stats: None,
@@ -5241,6 +5270,7 @@ mod tests {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".to_string()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -5445,6 +5475,7 @@ mod tests {
         // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
         let net = NetworkField::Table(NetworkTable {
             mute: vec![],
+            http2: vec![],
             mode: Some("deny".into()),
             allow: vec!["x.com".into()],
             deny: vec![],
@@ -5587,6 +5618,7 @@ mod tests {
         let tbl = |mode: &str, allow: &[&str], deny: &[&str]| {
             NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some(mode.into()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -5661,6 +5693,7 @@ mod tests {
         let no_mode = || {
             NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: None,
                 allow: vec!["api.foo.com".to_string()],
                 deny: vec![],
@@ -5722,6 +5755,7 @@ mod tests {
         let project = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: None,
                 allow: vec!["api.proj.com".to_string()],
                 deny: vec![],
@@ -5757,6 +5791,7 @@ mod tests {
                 cmd: Some(schema::RawCmd::Line("demo".to_string())),
                 network: Some(NetworkField::Table(NetworkTable {
                     mute: vec![],
+                    http2: vec![],
                     mode: None,
                     allow: vec!["api.app.com".to_string()],
                     deny: vec![],
@@ -5788,6 +5823,7 @@ mod tests {
         let dns_table = |ttl: Option<u64>| {
             NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["cache.nixos.org".into()],
                 deny: vec![],
@@ -5820,6 +5856,7 @@ mod tests {
         let ask_table = |timeout: Option<&str>| {
             NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("ask".into()),
                 allow: vec![],
                 deny: vec![],
@@ -5858,6 +5895,7 @@ mod tests {
         // An `ask_timeout` under a non-ask mode is moot — warned and ignored.
         let moot = NetworkField::Table(NetworkTable {
             mute: vec![],
+            http2: vec![],
             mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
@@ -5880,6 +5918,7 @@ mod tests {
         let ask = |notice: Option<bool>| {
             NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("ask".into()),
                 allow: vec![],
                 deny: vec![],
@@ -5910,6 +5949,7 @@ mod tests {
         // An `ask_notice` under a non-ask mode is moot — warned and ignored.
         let moot = NetworkField::Table(NetworkTable {
             mute: vec![],
+            http2: vec![],
             mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
@@ -7004,6 +7044,7 @@ mod tests {
         let global = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["h.test".into()],
                 deny: vec![],
@@ -8753,6 +8794,7 @@ mod tests {
             RawConfig {
                 network: Some(NetworkField::Table(NetworkTable {
                     mute: vec![],
+                    http2: vec![],
                     mode: Some("bogus".into()),
                     allow: vec![],
                     deny: vec![],
@@ -8856,6 +8898,7 @@ mod tests {
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: vec![],
@@ -9205,6 +9248,7 @@ mod tests {
         let net = |stats: Option<bool>| RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["github.com".into()],
                 deny: vec![],
@@ -9262,6 +9306,7 @@ mod tests {
             &[],
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
+                http2: vec![],
                 mode: Some("deny".into()),
                 allow: vec!["api.example.com".into()],
                 deny: vec![],
@@ -9337,6 +9382,7 @@ mod tests {
     fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         Some(NetworkField::Table(NetworkTable {
             mute: vec![],
+            http2: vec![],
             mode: Some("deny".into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],

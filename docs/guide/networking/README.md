@@ -4,7 +4,9 @@
 *confidentiality-and-integrity* half of running an untrusted agent: the cage
 already cannot read your host filesystem (secrets are absent, not merely
 read-only), and the egress control decides which hosts — and, for HTTP, which
-paths and methods — an in-cage tool may talk to.
+paths and methods — an in-cage tool may talk to. A **gRPC** service (HTTP/2) is
+supported too: list its host under [`http2`](../configuration/network.md#http2-and-grpc)
+and each RPC is inspected and filtered by `:path` (`/package.Service/Method`) like any HTTP request.
 
 The default posture is **`shared`** (the host network, unfiltered). Everything on
 this page is about the *filtering* postures you opt into for an agent you do not

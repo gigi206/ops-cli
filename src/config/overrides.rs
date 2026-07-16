@@ -703,6 +703,7 @@ fn split_hosts(hosts: &str, label: &str, kind: &str) -> Result<Vec<String>, Stri
 fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField {
     NetworkField::Table(NetworkTable {
         mute: vec![],
+        http2: vec![],
         mode: Some(mode.to_string()),
         allow,
         deny,
