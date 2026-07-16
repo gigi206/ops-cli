@@ -376,7 +376,8 @@ fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
 
 /// The generated nix expression building one `deb:` package: fetch the pinned `.deb`, unpack it, and
 /// autoPatchelf it against [`ELECTRON_LIBS`] from the pinned `nixpkgs`. The install phase is generic
-/// for an Electron layout — it locates the app directory by its `resources/app.asar` signature and
+/// for an Electron layout — it locates the app directory by its `resources/` signature (a packed
+/// `resources/app.asar` or, for an asar-less VS Code fork, the `resources/app/` directory) and
 /// wraps the app's own launcher (the executable beside it that is not a `.so` or a Chromium helper),
 /// so no per-app path is hardcoded. Every interpolated value is ops-controlled and charset-validated
 /// (`name`, `url`, `hash`, the pinned `nixpkgs`, the `system`), so the expression carries nothing to

@@ -44,6 +44,7 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
     "libseccomp",
     "libsecret",
     "libxkbcommon",
+    "libxkbfile",
     "mesa",
     "musl",
     "ncurses",
@@ -62,15 +63,19 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 
 /// The generic Electron install phase (a shell snippet), embedded by each backend's generated
 /// derivation into its `installPhase` after the bundle has been copied into `$out`. It locates the
-/// app directory by its `resources/app.asar` signature and wraps the launcher — the executable beside
-/// it that is not a `.so`, a Chromium helper, or the AppImage `AppRun` script. Excluding `AppRun` is
-/// load-bearing for an AppImage (its squashfs carries an `AppRun` launcher that sorts *before* the
-/// real binary) and harmless for a `.deb` (which has no `AppRun`), so one snippet serves both. Two
-/// placeholders: `@NAME@` (the wrapped launcher name) and `@LDPREFIX@` (the `LD_LIBRARY_PATH` prefix
-/// value — a backend chooses whether to prepend the bundle root for sibling `.so`s).
-pub(crate) const ELECTRON_WRAP: &str = r#"    asar=$(find $out -type f -name app.asar -path '*/resources/*' | sort | head -1)
-    [ -n "$asar" ] || { echo "@NAME@: no Electron resources/app.asar found" >&2; exit 1; }
-    appdir=$(dirname "$(dirname "$asar")")
+/// app directory by its `resources/` signature — either a packed `resources/app.asar` file or, for an
+/// asar-less build (modern VS Code forks such as Cursor ship the app as a loose `resources/app/`
+/// directory), the `resources/app` directory itself; both resolve to the same bundle root — and wraps
+/// the launcher, the executable beside it that is not a `.so`, a Chromium helper, or the AppImage
+/// `AppRun` script. Excluding `AppRun` is load-bearing for an AppImage (its squashfs carries an
+/// `AppRun` launcher that sorts *before* the real binary) and harmless for a `.deb` (which has no
+/// `AppRun`), so one snippet serves both. Two placeholders: `@NAME@` (the wrapped launcher name) and
+/// `@LDPREFIX@` (the `LD_LIBRARY_PATH` prefix value — a backend chooses whether to prepend the bundle
+/// root for sibling `.so`s).
+pub(crate) const ELECTRON_WRAP: &str = r#"    app=$(find $out -type f -path '*/resources/app.asar' | sort | head -1)
+    [ -n "$app" ] || app=$(find $out -type d -path '*/resources/app' | sort | head -1)
+    [ -n "$app" ] || { echo "@NAME@: no Electron resources/app(.asar) found" >&2; exit 1; }
+    appdir=$(dirname "$(dirname "$app")")
     main=$(find "$appdir" -maxdepth 1 -type f -executable \
       ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
       ! -name '*.so' ! -name '*.so.*' | sort | head -1)
@@ -173,7 +178,10 @@ mod tests {
         assert!(wrap.contains("--prefix LD_LIBRARY_PATH : \"$out:/lib\""));
         // AppRun exclusion is what makes one snippet serve both backends.
         assert!(wrap.contains("! -name 'AppRun'"));
-        assert!(wrap.contains("app.asar"));
+        // The app is located by a packed `resources/app.asar` OR, for an asar-less VS Code fork
+        // (Cursor ships `resources/app/` as a loose directory), the `resources/app` directory.
+        assert!(wrap.contains("resources/app.asar"));
+        assert!(wrap.contains("-type d -path '*/resources/app'"));
         assert!(!wrap.contains('@'), "unfilled placeholder in:\n{wrap}");
     }
 
