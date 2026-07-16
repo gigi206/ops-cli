@@ -160,8 +160,9 @@ chromium = "nix:chromium"
 claude-code = "mise:aqua:anthropics/claude-code"   # → `claude`   (Claude Code)
 #codex      = "mise:aqua:openai/codex"              # → `codex`    (Codex CLI)
 #opencode   = "mise:opencode"                       # → `opencode` (OpenCode)
-# Cursor's `cursor-agent` has no groundable public package here — install path unconfirmed, so it is
-# left out rather than guessed; add it under its own backend if you have a source.
+# Cursor's `cursor-agent` is now shipped as its own profile (`profiles/cursor-agent.toml`, a
+# bootstrap download of Cursor's CLI tarball). To let T3 drive it, install it the same way here —
+# see that profile for the mechanism and the `*.cursor.sh` egress hosts.
 
 # ── ASPIRATIONAL ALLOWLIST (inert — `network = "shared"` is set above; there is NO `[network]` table).
 # Kept as documentation for the day t3code CAN be filtered — i.e. when ops grows a Chromium-safe

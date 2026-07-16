@@ -34,6 +34,8 @@ with `ops app export <name>`.
 | `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
 | `agy`             | `mise:aqua:google-antigravity/antigravity-cli`  | `accounts.google.com` (Google OAuth) |
 | `auggie`          | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | `*.api.augmentcode.com` (Augment account) |
+| `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
+| `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
 | `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | **`network = "shared"`** (host-local LLM, see note ‡) |
 
@@ -100,6 +102,38 @@ can only reach the provider you listed.
 > (not captured without auth; the profile leaves a commented `*.googleapis.com` to narrow via
 > `ops net logs -a agy`).
 >
+> `cursor-agent` (Cursor's headless terminal agent — **not** the Cursor desktop editor, which is a
+> separate GUI increment) is the one profile packaged by a **bootstrap download** rather than a clean
+> backend: Cursor ships the CLI only as a versioned tarball from `downloads.cursor.com` (no nixpkgs
+> attr, no GitHub release, and the npm `cursor-agent` is an unrelated third-party package), so the
+> `cmd` runs Cursor's own `curl cursor.com/install | bash` **inside the cage** on first launch (the
+> installer needs `tar`+`gzip`, provisioned as `nix:` packages; the un-patchelf'd binary runs under
+> the cage's `nix-ld` shim). It is an **account** profile — a Cursor account API key (from
+> cursor.com/dashboard/api), injected per launch with `ops app cursor-agent --env CURSOR_API_KEY=…`
+> (never baked in), or the interactive `cursor-agent login`. Egress is a least-privilege allowlist
+> on `*.cursor.sh` (Cursor's own recommended wildcard). **Its unverified set is unusually large** —
+> import + resolve are covered by the shipped-profiles test, but the packaging (bootstrap + nix-ld
+> binary), the proxy-honoring, the transport through ops's MITM, and the auth are **all** still to be
+> proven with a real Cursor account. On transport: the profile designates Cursor's HTTP/2-only
+> indexing host `repo42.cursor.sh` in `[network] http2` (so the proxy speaks h2/gRPC to it rather than
+> failing it), and the dual-stack agent hosts fall back to HTTP/1.1 SSE — but this rides ops's own
+> brand-new h2/gRPC MITM, itself unproven for Cursor, and Cursor recommends against SSL inspection on
+> its domains, so it is a live-pending claim, not a proven one. If the agent misbehaves under the
+> allowlist, the profile header documents the `network = "shared"` fallback (like `t3code`) and the
+> exact failure signatures to read from `ops net logs -a cursor-agent`.
+>
+> `cursor` (the Cursor desktop **editor** — the GUI sibling of `cursor-agent`) is an Electron
+> profile in the `opencode-desktop` / `claude-desktop` mould: packaged from Cursor's prebuilt `.deb`
+> via the `deb:` backend (autoPatchelf'd host-side), displayed with `gui = "wayland"` + `gpu` +
+> `dbus`, egress on `*.cursor.sh`. Two caveats specific to it: the `.deb` URL is **version-pinned**
+> (Cursor has no `…/latest/…` URL or apt index — bump it from the download API, see the profile
+> header), and the **account login** is the open question — the editor signs in through a web flow +
+> a `cursor://` deep-link that does not complete in the cage out of the box (the header documents a
+> one-time `--net shared` login and the heavier in-cage-browser recipe, but Cursor's exact flow is
+> not fabricated here). Like every desktop profile it imports + resolves (test-covered); the
+> autoPatchelf of a large VS Code-fork app, the display bring-up, the filtered model traffic, and the
+> login are all still to be proven live.
+>
 > `auggie` (Augment Code's CLI, `@augmentcode/auggie`) is an **account** profile like the above:
 > it routes model traffic through Augment's per-user tenant backend (`<tenant>.api.augmentcode.com`,
 > covered by the `*.api.augmentcode.com` subdomain wildcard) and authenticates to your Augment
@@ -162,6 +196,8 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
 | `auggie`      | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | Augment Code npm package (pure-node CLI, node at runtime) |
+| `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package |
+| `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**

@@ -1,0 +1,146 @@
+# Cursor CLI — Cursor's headless terminal coding agent (`cursor-agent`), sandboxed by ops.
+#
+#   ops app import profiles/cursor-agent.toml
+#   ops app cursor-agent -- -p "your task here"        # headless: prompt in, result out
+#   ops app cursor-agent                               # interactive TUI
+#
+# This is the Cursor **CLI** (`cursor-agent`, a.k.a. `agent`), NOT the Cursor desktop editor
+# (that Electron app ships as an AppImage — see `profiles/cursor.toml`). The CLI runs the same
+# Cursor agent from a terminal: `cursor-agent -p "…"` takes a prompt and returns a result, the
+# form used in CI, git hooks, and scripts — the ideal fit for ops's Mode-B sandbox.
+#
+# PACKAGING — a bootstrap download, NOT a clean ops backend (and NOT the npm "cursor-agent").
+# Cursor distributes the CLI ONLY as a versioned tarball from `downloads.cursor.com` (its own
+# `curl https://cursor.com/install | bash` installer) — there is no nixpkgs attribute, no GitHub
+# release, and no genuine npm/mise package (the npm package literally named `cursor-agent` is an
+# UNRELATED third-party package by another author — using it would install the wrong thing). So
+# none of ops's `nix:`/`mise:`/`flake:`/`deb:`/`appimage:` backends fit. Instead the `cmd` below
+# runs Cursor's OWN installer INSIDE the cage on the first launch, into the app's isolated home —
+# contained by bubblewrap + seccomp + the empty netns + the egress allowlist. The installer needs
+# `tar` + `gzip` (absent from the base toolset), so `[packages]` provisions them via nix (host-side,
+# seeded, offline-reusable). The downloaded `cursor-agent` binary is not autoPatchelf'd, so it runs
+# against the cage's `nix-ld` loader shim (the standard mechanism for a foreign dynamic binary; the
+# base userland supplies glibc + libstdc++). The download needs the network AND `cursor.com` /
+# `downloads.cursor.com` in `allow` on the first launch of each project; later launches skip it.
+#
+# CREDENTIAL POSTURE — a Cursor ACCOUNT key, NOT a header-injectable provider key. `cursor-agent`
+# authenticates to YOUR Cursor account (which pays for the models) and routes model traffic through
+# Cursor's own backend, so there is no per-provider HTTP header for ops's `[secret]` broker to
+# strip-and-inject, and this profile ships **no `[secret]` block** (contrast the BYOK profiles like
+# `cline`/`opencode`). Two ways in:
+#
+#   1. API KEY (recommended for the cage) — generate one at cursor.com/dashboard/api, then inject it
+#      for a single caged launch WITHOUT baking it into this file:
+#          ops app cursor-agent --env CURSOR_API_KEY=… -- -p "your task"
+#      (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage
+#      env for that launch only, so the key never lands in the committed profile. `$OPS_ENV_CURSOR_API_KEY`
+#      works too. The CLI also accepts a `--api-key` flag.) Do NOT put `CURSOR_API_KEY` in `[env]`
+#      below: profile `[env]` is highest-precedence, so a placeholder value would BLANK the key the
+#      `--env` override supplies.
+#
+#   2. INTERACTIVE `cursor-agent login` — CAVEAT, may not complete inside the cage. Login opens a
+#      browser (or, with NO_OPEN_BROWSER=1, prints the URL); whether it then polls Cursor's backend
+#      (which the allowlist permits → works in-cage) or waits on a `localhost` OAuth callback (which
+#      binds the CAGE's empty-netns loopback, unreachable from the host browser → does NOT complete,
+#      the auggie wall) is UNVERIFIED. Prefer path 1. If you try it, the auth hosts are already under
+#      `*.cursor.sh` in `allow`; run `cursor-agent status` to check whether you are authenticated.
+#
+# When you do log in, the credential persists in the app's dedicated, persistent, isolated home,
+# never bleeding into the project shell or another app.
+#
+# EGRESS AND HTTP/2 (gRPC). Under `mode = "deny"` ops runs a TLS-terminating MITM proxy. By default
+# it speaks HTTP/1.1 to a host; a host listed in `[network] http2` is instead man-in-the-middled as
+# HTTP/2 (ALPN h2) for gRPC, with every stream still inspected and verdict-checked (so `allow` still
+# governs the verdict — `http2` only picks the transport). Cursor's client uses HTTP/2/gRPC and falls
+# back to HTTP/1.1 SSE when h2 is unavailable, so its dual-stack agent hosts (api2 / api5) work either
+# way; its codebase-indexing host `repo42.cursor.sh` is HTTP/2-ONLY, so it is designated in
+# `[network] http2` below (without it, indexing fails). Cursor's own doc still notes some proxies
+# "can cause issues with streaming responses" and recommends against SSL inspection on its domains, so
+# if the agent misbehaves under `deny`, diagnose with `ops net logs -a cursor-agent` (a named deny →
+# add the host to `allow`, and if it is gRPC/h2-only, to `http2`; an `EAI_AGAIN`/0-deny → the request
+# bypassed the proxy, i.e. `NODE_USE_ENV_PROXY` is not taking effect) and, as a last resort, fall back
+# to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the minimal /dev,
+# losing only egress FILTERING).
+#
+# STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
+# test), but — unlike the CLI profiles proven live — its PACKAGING (the bootstrap download + the
+# un-patchelf'd binary under nix-ld), its PROXY-HONORING (does every request route through ops's
+# proxy?), its TRANSPORT (the h2/gRPC MITM for `repo42`, and whether the agent hosts need it too), and its AUTH are ALL
+# still to be proven with a real Cursor account. Treat it as a grounded starting point to validate,
+# not a turnkey profile. If a request is blocked, the proxy names the host it refused — add it to
+# `allow` (or check ahead with `ops test net <url>`).
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+# First launch only: run Cursor's official installer into the isolated home (contained by the
+# sandbox + the egress allowlist). Later launches reuse the installed binary. `pipefail` makes a
+# failed `curl … | bash` surface here (a clean install error), not later as `cursor-agent: not found`.
+if [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+  curl https://cursor.com/install -fsS | bash
+fi
+export PATH="$HOME/.local/bin:$PATH"
+exec cursor-agent "$@"
+''',
+    # `$0` placeholder: `ops app cursor-agent -- <args>` appends <args> to this cmd array, so they
+    # arrive as `$1 $2 …` (this element fills `$0`) and reach the agent verbatim via `exec … "$@"`.
+    "cursor-agent",
+]
+
+[packages]
+# The Cursor installer extracts a `.tar.gz` with `tar -xzf`, so the cage needs `tar` + `gzip` (the
+# base toolset has `curl` but not these). Both are trusted-only `nix:` packages — provisioned
+# host-side, seeded, offline-reusable — and this profile is trusted by location once imported.
+gnutar = "nix:gnutar"
+gzip = "nix:gzip"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts/context) is
+# opened to all verbs with a `{*}` prefix. See the EGRESS note in the header for the HTTP/2 caveat.
+[network]
+mode = "deny"
+allow = [
+    # Bootstrap (first launch): Cursor's installer script and the CLI tarball it downloads.
+    # `{GET}` — both are plain downloads. Needed only until the binary is installed in the home.
+    "{GET} https://cursor.com",
+    "{GET} https://downloads.cursor.com",
+    # Runtime: Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
+    # `*.cursor.sh` wildcard, which covers api2 (most API requests), api5 + `agent.*`/regional
+    # (the agent requests), repo42 (indexing, HTTP/2-only — degrades under the MITM), and
+    # authenticate / authenticator / authentication (login). Opened to all verbs because the agent
+    # POSTs prompts and workspace context.
+    "{*} https://*.cursor.sh",
+    # If the CLI fetches client updates / extensions, these are the documented hosts — uncomment the
+    # one the proxy names in `ops net logs -a cursor-agent` (least privilege; not needed for the
+    # agent's core prompt/response path).
+    #"{GET} https://*.cursor-cdn.com",
+    #"{GET} https://*.cursorapi.com",
+    #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
+]
+# HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; this is the
+# TRANSPORT, orthogonal to the `allow` verdict above — a host here must ALSO be in `allow`, and every
+# gRPC stream is still inspected + verdict-checked). `repo42.cursor.sh` (codebase indexing) is
+# HTTP/2-ONLY, so the proxy must speak h2 to it or indexing fails — designated by default. The
+# api2/api5 agent hosts are dual-stack and work over the HTTP/1.1 SSE fallback, so they are left off;
+# uncomment them (native gRPC) if the agent's model traffic misbehaves under the allowlist, watching
+# `ops net logs -a cursor-agent`. NOTE the designation is ALPN-h2-ONLY: a broad `*.cursor.sh` would
+# also force h2 on the auth hosts (authenticate/authenticator.cursor.sh), which may speak HTTP/1.1 —
+# its handshake would then fail. So keep it targeted (exact hosts or `*.api5.cursor.sh`), not a blanket
+# `*.cursor.sh`.
+http2 = [
+    "repo42.cursor.sh",
+    #"*.api5.cursor.sh",   # all agent hosts (agent.api5, agentn.api5, agent.us.api5, …) as native gRPC
+    #"api2.cursor.sh",
+]
+
+[env]
+# REQUIRED if `cursor-agent` reaches its backend through Node's built-in fetch (undici) — Cursor's
+# proxy support is documented as "inherited from Node.js", and undici does NOT honour the
+# http_proxy/https_proxy variables ops injects unless this is set. In the Model-B cage (empty netns,
+# no DNS resolver) a fetch that bypasses the proxy dies with `EAI_AGAIN: getaddrinfo <host>` and
+# never reaches the proxy (0 denies in `ops net stats`). NODE_USE_ENV_PROXY (Node 24+) routes fetch
+# through the proxy so every request is subject to the allowlist above. Harmless if the binary uses a
+# proxy-aware client instead. (Do NOT add `CURSOR_API_KEY` here — see the credential note in the
+# header; a placeholder in `[env]` would blank the `--env` key. ops injects its MITM CA into the cage
+# automatically under a filtering posture via NODE_EXTRA_CA_CERTS / SSL_CERT_FILE, which Cursor honours.)
+NODE_USE_ENV_PROXY = "1"

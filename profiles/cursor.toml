@@ -1,0 +1,164 @@
+# Cursor — the Cursor AI code editor (desktop, Electron / VS Code fork), sandboxed by ops.
+#
+#   ops app import profiles/cursor.toml
+#   ops app cursor
+#
+# This is the Cursor **desktop editor** (the full GUI IDE). For the headless terminal agent, use
+# `profiles/cursor-agent.toml` instead (a CLI that fits Mode-B far more cleanly). Confined by ops,
+# the editor sees only the cage filesystem (the project directory you launch it from + its own
+# persistent isolated home), reaches only the hosts you allow, and its powers stop at the sandbox
+# boundary (bubblewrap + seccomp + an empty netns + the egress allowlist).
+#
+# THE `deb:` BACKEND (no third party, prebuilt). Cursor distributes a Linux `.deb` (and an
+# `.AppImage`) from `downloads.cursor.com`. This profile uses the `.deb` via ops's `deb:` backend
+# — the same clean path as `opencode-desktop` / `claude-desktop`: ops fetches the `.deb`, resolves
+# it to a content hash (pinned in the per-project deb lock), and builds a generated derivation that
+# `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the Electron binaries against a curated library
+# set. The build is HOST-SIDE (a `.deb` runs no build script, so evaluating it host-side is safe),
+# seeded into the store, offline-reusable after the first launch.
+#
+# VERSION PIN — MANUAL bump (no `…/latest/…` URL). Cursor's `.deb` URL embeds a version + build
+# hash, so it pins the version below (3.11.25 at authoring time). Cursor has no `…/releases/latest/…`
+# URL and no apt index to track, so `ops upgrade deb` re-resolves the SAME pinned URL (it does not
+# roll forward). To update, get the current URL from Cursor's download API and replace the `deb:`
+# line:  curl -sL 'https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable'
+# (returns {"downloadUrl":…, "debUrl":…, "version":…}) — use its `debUrl`.
+#
+# FIRST LAUNCH resolves + builds the `.deb` host-side, pulling the Electron closure (hundreds of
+# MiB — a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse
+# the pinned build offline.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium trusts its own NSS database, not the CA-file env vars ops sets,
+# so a Chromium app would otherwise fail every HTTPS with `ERR_CERT_AUTHORITY_INVALID`. For a
+# `gui = "wayland"` cage under a filtering posture, ops seeds its MITM CA into the cage's NSS db
+# automatically (part of the GUI hole, like fonts); `--use-system-ca` tells Electron to consult it.
+# Cursor's own Node backend (the extension host that makes model calls) additionally honours
+# `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`, which ops also sets — so both halves trust the proxy.
+#
+# DISPLAY + GPU + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
+# Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never
+# offered; isolation is compositor-dependent (Mutter safe; wlroots exposes screen-capture/input —
+# see docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in
+# ops's own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
+# Chromium/Electron app on Wayland often maps no window; mesa covers Intel/AMD/nouveau, NVIDIA-only
+# falls back to software. `dbus = true` gives the cage its OWN private desktop portal so Cursor's
+# file chooser (open folder / attach file) opens IN-CAGE and lists the cage filesystem, relays
+# notifications, and follows your host light/dark theme. The Electron flags: `--no-sandbox` is
+# mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=
+# wayland` selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`;
+# `--password-store=basic` forces the file cookie/token store (no keyring in the cage) so a login
+# survives a relaunch.
+#
+# CREDENTIAL POSTURE — a Cursor ACCOUNT login, NOT a header-injectable key, and the OPEN question.
+# Unlike the `cursor-agent` CLI (which accepts a `CURSOR_API_KEY` env), the desktop editor signs in
+# to your Cursor account through a WEB flow that ends in a `cursor://` deep-link handed back to the
+# app (the same shape as `claude-desktop`'s `claude://`). Under the cage the external-browser step
+# has no host browser, so the login does NOT complete out of the box. Two paths, NEITHER yet proven
+# for Cursor (its exact sign-in deep-link is not captured here — this profile does not fabricate it):
+#
+#   1. ONE-TIME login under a relaxed posture — launch once with the host network so the sign-in can
+#      reach your host browser, let the credential persist in the isolated home, then run filtered:
+#          ops app cursor --net shared          # first run: complete the sign-in
+#          ops app cursor                        # subsequent runs: filtered by the allowlist below
+#      (Whether the session token survives the relaunch under `--password-store=basic` is the thing
+#      to verify.)
+#   2. IN-CAGE browser wrapper — the `claude-desktop` / `t3code` recipe: provision `nix:chromium`,
+#      wrap `cmd` in a bash script that installs an `xdg-open` launching an in-cage Chromium for
+#      http(s) and registers a `cursor://` scheme handler, so the whole flow closes in-cage. This is
+#      HEAVY (a large Chromium closure) and needs Cursor's exact deep-link flow captured live first —
+#      adapt from `profiles/claude-desktop.toml` once you have it. Left out here rather than guessed.
+#
+# EGRESS AND HTTP/2 (gRPC). ops's MITM proxy speaks HTTP/1.1 by default; a host listed in
+# `[network] http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still
+# inspected + verdict-checked (`allow` governs the verdict, `http2` only the transport). Cursor's
+# client uses HTTP/2/gRPC and falls back to HTTP/1.1 SSE when h2 is unavailable, so its dual-stack
+# agent hosts (api2 / api5) work either way; its codebase-indexing host `repo42.cursor.sh` is
+# HTTP/2-ONLY, designated in `[network] http2` below. Cursor's own doc still recommends against SSL
+# inspection on its domains (streaming can be affected), so if the editor misbehaves under `deny`,
+# diagnose with `ops net logs -a cursor` (a named deny → add the host to `allow`, and if it is
+# gRPC/h2-only, to `http2`; an `EAI_AGAIN`/0-deny → the request bypassed the proxy) and, as a last
+# resort, fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the
+# minimal /dev, and lose only egress FILTERING).
+#
+# STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
+# test), but everything downstream is still to be proven with a real Cursor account and a live run:
+# the `.deb` autoPatchelf of a large VS Code-fork app, the display/GPU bring-up, whether the model
+# backend filters through the MITM, and — the biggest open item — the account LOGIN. Treat it as a
+# grounded starting point to validate, not a turnkey profile. If a request is blocked, the proxy
+# names the host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
+cmd = [
+    "cursor",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+    "--password-store=basic",
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+# Your host Cursor config/auth, mounted read-write at its real absolute path (so the caged editor
+# shares your host Cursor login/settings/extensions). `binds` is a security field, honored only
+# because this profile lives in your trusted config dir. Uncomment to share your host setup with the
+# cage instead of the app's isolated home (the default). Paths UNCONFIRMED — verify before relying.
+#binds = [
+#    { path = "~/.config/Cursor", mode = "rw" },     # settings, sign-in state
+#    { path = "~/.cursor", mode = "rw" },            # extensions / CLI state
+#]
+
+[packages]
+# Cursor's prebuilt `.deb`, version-pinned (see the VERSION PIN note in the header — bump via the
+# download API). Trusted-only, like every backend; this profile is trusted by location once imported.
+cursor = "deb:https://downloads.cursor.com/production/fc2563ec93d793fc275eef734405a4fdf8b47b26/linux/x64/deb/amd64/deb/cursor_3.11.25_amd64.deb"
+
+# An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
+# opened to all verbs with `{*}`. See the EGRESS note in the header for the HTTP/2 caveat.
+[network]
+mode = "deny"
+allow = [
+    # Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
+    # `*.cursor.sh` wildcard — it covers api2 (most API), api5 + `agent.*`/regional (agent
+    # requests), repo42 (indexing, HTTP/2-only — degrades under the MITM), and
+    # authenticate / authenticator / authentication (login). Opened to all verbs (the editor POSTs
+    # prompts and workspace context).
+    "{*} https://*.cursor.sh",
+    # Client updates + the extension marketplace (VS Code-style). Uncomment whichever the editor
+    # actually needs — watch `ops net logs -a cursor` and add least-privilege.
+    #"{GET} https://*.cursor-cdn.com",
+    #"{GET} https://*.cursorapi.com",
+    #"{GET} https://downloads.cursor.com",
+    #"{GET} https://marketplace.cursorapi.com",
+    #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
+]
+# HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
+# `allow` verdict above — a host here must ALSO be in `allow`, every stream still verdict-checked).
+# `repo42.cursor.sh` (codebase indexing) is HTTP/2-ONLY, designated by default. The api2/api5 agent
+# hosts are dual-stack (HTTP/1.1 SSE fallback works), so they are off; uncomment for native gRPC if
+# model traffic misbehaves, watching `ops net logs -a cursor`. The designation is ALPN-h2-ONLY, so
+# avoid a blanket `*.cursor.sh` (it would force h2 on the auth hosts, which may speak HTTP/1.1 → their
+# handshake fails); keep it targeted.
+http2 = [
+    "repo42.cursor.sh",
+    #"*.api5.cursor.sh",
+    #"api2.cursor.sh",
+]
+# Keep denied telemetry out of the default `ops net logs` (still denied by construction, still
+# counted in `ops net stats`; see them with `--all`). Add hosts the proxy names as telemetry.
+mute = [
+    #"*.sentry.io",
+]
+
+[env]
+# If Cursor's Node backend (the extension host that makes model calls) reaches its endpoints through
+# Node's built-in fetch (undici) — its proxy support is documented as "inherited from Node.js" —
+# undici ignores http_proxy/https_proxy unless this is set, and in the Model-B empty netns a bypassed
+# fetch dies with `EAI_AGAIN` before the proxy is ever consulted (0 denies in `ops net stats`).
+# NODE_USE_ENV_PROXY (Node 24+) routes fetch through the proxy so every request is subject to the
+# allowlist. Harmless if the backend uses a proxy-aware client instead.
+NODE_USE_ENV_PROXY = "1"
+
+# No [secret] block: the desktop editor logs in to a Cursor account (see the credential note in the
+# header), not a header-injectable provider key — there is nothing for ops to inject host-side.
