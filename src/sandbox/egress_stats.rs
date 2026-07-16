@@ -10,7 +10,7 @@
 //!   failures (a malformed request, a DNS or upstream error) are not a policy verdict and are not
 //!   counted, so the numbers mean "what the policy did", not "what the network did".
 //! - **Flush per decision, not on exit.** A long-running agent session most often ends by being
-//!   killed (`ops stop` sends SIGTERM→SIGKILL), and a Rust `Drop` does not run on a signal — so a
+//!   killed (`ops session stop` sends SIGTERM→SIGKILL), and a Rust `Drop` does not run on a signal — so a
 //!   flush-on-drop would silently persist nothing for exactly the sessions worth auditing. Each
 //!   recorded decision rewrites the (tiny — one line per distinct host) session file atomically, so
 //!   the file is current as of the last completed request regardless of how the session dies.

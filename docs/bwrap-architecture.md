@@ -75,7 +75,7 @@ runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** mo
 >   (dynamic `SIGWINCH` is a follow-up). Implemented in raw `libc`
 >   (`openpty`/`login_tty`/`termios`/`poll`) — no new dependency.
 
-> **As built — `session/` is the daemonless registry; `ops ls` lists it.**
+> **As built — `session/` is the daemonless registry; `ops session ls` lists it.**
 > Shipped as a single file (`src/session.rs`) for now; it grows into the dir when
 > GC lands. Each sandbox writes a record under `<data>/sessions/`. With no daemon,
 > a record is a **liveness-validated hint** — never trusted to be removed:
@@ -94,7 +94,7 @@ runtime wrapping; `clean.rs` + `status.rs` → merged into the **`session/`** mo
 > would require a long-lived holder = a daemon): the per-project runtime is
 > deterministic, so a second sandbox in the same project shares its persistent
 > `$HOME` — multi-session is free. **Deferred to M5:** GC of per-project `$HOME` +
-> stale store generations, and an `ops attach <id>` ergonomic.
+> stale store generations, and an `ops session attach <id>` ergonomic.
 
 > **As built — `doctor` decides the boundary by a real launch, not a stand-in.**
 > The userns check is now a live `bwrap` smoke (`src/sandbox/smoke.rs`): it feeds

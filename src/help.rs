@@ -84,7 +84,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "--detach",
-                "run in the background as a session `ops ls`/`attach`/`stop` can see",
+                "run in the background as a session `ops session ls` can see",
             ),
             (
                 "--config <toml|@file>",
@@ -188,7 +188,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "--detach",
-                "launch the app in the background as a session `ops ls`/`attach`/`stop` can see",
+                "launch the app in the background as a session `ops session ls` can see",
             ),
             (
                 "--net-learn[=domain|path|exact]",
@@ -293,8 +293,20 @@ const PAGES: &[Page] = &[
             declares a `scheme://` ops can route a secret `from` reference to.",
     },
     Page {
-        path: &["ls"],
-        synopsis: "ops ls",
+        path: &["session"],
+        synopsis: "ops session <subcommand> [args...]",
+        summary: "inspect and control the live sandbox sessions",
+        options: &[],
+        details:
+            "A session is a live sandbox cage. `ops session ls` lists them, `ops session attach`\n\
+            opens a shell inside one, and `ops session stop` ends them. Host-side — reads the\n\
+            on-disk session registry (daemonless), launches nothing. `ops sessions` is an alias.\n\
+            \n\
+            Run one of the subcommands below.",
+    },
+    Page {
+        path: &["session", "ls"],
+        synopsis: "ops session ls",
         summary: "list the live sandbox sessions",
         options: &[],
         details:
@@ -304,26 +316,26 @@ const PAGES: &[Page] = &[
             agents.",
     },
     Page {
-        path: &["attach"],
-        synopsis: "ops attach <id>",
+        path: &["session", "attach"],
+        synopsis: "ops session attach <id>",
         summary: "open a shell inside a running session's live cage",
-        options: &[("<id>", "the PID `ops ls` shows for the session")],
+        options: &[("<id>", "the PID `ops session ls` shows for the session")],
         details:
             "Joins the running cage and opens an interactive shell inside it — the agent's live\n\
             processes, its real /tmp, and its network, the way `docker exec -it` does. The shell\n\
             re-applies the cage's confinement — the same seccomp denylist, no_new_privs, and\n\
             dropped capabilities — so it is never a wider hole than the agent. Provisions nothing\n\
-            and reads no config; needs a live session (run `ops ls`). Type `exit` to leave — the\n\
-            agent keeps running.",
+            and reads no config; needs a live session (run `ops session ls`). Type `exit` to\n\
+            leave — the agent keeps running.",
     },
     Page {
-        path: &["stop"],
-        synopsis: "ops stop <id>...|--all [--delay <secs>]",
+        path: &["session", "stop"],
+        synopsis: "ops session stop <id>...|--all [--delay <secs>]",
         summary: "stop running sessions",
         options: &[
             (
                 "<id>...",
-                "the PIDs `ops ls` shows for the sessions to stop",
+                "the PIDs `ops session ls` shows for the sessions to stop",
             ),
             (
                 "--all",
@@ -626,7 +638,7 @@ const PAGES: &[Page] = &[
             (
                 "rm <id>...",
                 "remove one or more named trees; the id is what `ops projects` lists. Immediate —\n\
-                 naming it is consent. A live-held tree is refused (run `ops stop` first); the\n\
+                 naming it is consent. A live-held tree is refused (run `ops session stop` first); the\n\
                  current project is refused without --force.",
             ),
             (
@@ -657,7 +669,7 @@ const PAGES: &[Page] = &[
             A named `rm <id>` removes immediately (you named it, so it is not an accident); pass\n\
             `--dry-run` to preview first. The bulk selectors `--dead` and `--markerless` preview\n\
             by default and require `--yes` to apply, since they act on more than one tree. A tree\n\
-            a live session holds is always refused — stop it with `ops stop` first — and the\n\
+            a live session holds is always refused — stop it with `ops session stop` first — and the\n\
             current project is refused without `--force`.\n\
             \n\
             Removing a tree is host-side only and leaves its store closures for `ops gc` to\n\
@@ -1099,7 +1111,7 @@ const PAGES: &[Page] = &[
         ],
         details:
             "A chronological, per-request record of every egress decision the proxy made this\n\
-            session — the session id (the PID `ops ls` shows), the local `hh:mm:ss` time, host:port,\n\
+            session — the session id (the PID `ops session ls` shows), the local `hh:mm:ss` time, host:port,\n\
             method, path, verdict, and the reason category. It is read from the same control sockets\n\
             `ops net pending` uses, and `log` is an accepted alias.\n\
             \n\
@@ -1157,7 +1169,7 @@ const PAGES: &[Page] = &[
             "Shows the egress tunnels open RIGHT NOW — one line per flow: destination host:port, the\n\
             transport (`https` inspected TLS, `http` inspected cleartext, `tcp` raw L4 splice), how\n\
             long it has been open, and the bytes transferred each way (`↑` client→upstream,\n\
-            `↓` upstream→client). Rows are grouped by session (the PID `ops ls` shows) so several\n\
+            `↓` upstream→client). Rows are grouped by session (the PID `ops session ls` shows) so several\n\
             agents are told apart. Redrawn in place on the interval until Ctrl-C, like `top`.\n\
             \n\
             This is the OPEN CONNECTIONS, distinct from `ops net logs` (the history of decided\n\
@@ -1344,7 +1356,7 @@ pub fn synopsis_of(path: &[&str]) -> &'static str {
     find(path).map_or("ops <command>", |p| p.synopsis)
 }
 
-/// The argument grammar for a top-level command, e.g. `synopsis("stop")`.
+/// The argument grammar for a top-level command, e.g. `synopsis("shell")`.
 pub fn synopsis(name: &str) -> &'static str {
     synopsis_of(&[name])
 }
@@ -1356,11 +1368,18 @@ pub fn is_command(name: &str) -> bool {
 }
 
 /// For an unknown top-level command that is really a subcommand verb, the full path to
-/// suggest. Only verbs with a *single* parent are listed — an ambiguous verb (`rm`,
+/// suggest. Verbs with a *single* parent are listed; a genuinely ambiguous verb (`rm`,
 /// `list`, `info`, `install` each belong to more than one parent) would misdirect, so it
-/// falls through to the generic `ops --help` pointer instead.
+/// falls through to the generic `ops --help` pointer instead. `ls` is a deliberate
+/// exception: it is an alias of both `session` and `projects`, but `ops ls` historically
+/// meant the session list, so pointing its old spelling at `ops session ls` is the least
+/// surprising migration aid.
 pub fn subcommand_hint(name: &str) -> Option<&'static str> {
     Some(match name {
+        // The session verbs used to be top-level; point their old spellings at the namespace.
+        "ls" => "ops session ls",
+        "attach" => "ops session attach",
+        "stop" => "ops session stop",
         "import" => "ops app import",
         "export" => "ops app export",
         "publish" => "ops plugins store publish",
@@ -1407,6 +1426,37 @@ fn paint_synopsis(syn: &str, pal: &Palette) -> String {
     out
 }
 
+/// Paint the backtick-quoted inline-code spans in prose (summaries, option descriptions, the
+/// `details` body, the reminder lines). Each `` `…` `` span has its backticks dropped and its
+/// content wrapped in the palette's code style. With color off the style span is empty, so the
+/// backticks are *kept* and the string is returned byte-for-byte — the delimiters stay useful in
+/// piped/plain output, and the non-terminal-is-plain invariant holds. An unterminated backtick is
+/// emitted verbatim (never a dangling open span), so malformed input can only under-style.
+fn paint_inline_code(text: &str, pal: &Palette) -> String {
+    if pal.code.is_empty() {
+        return text.to_string(); // color off: keep the backticks, unchanged
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&rest[..start]);
+        match rest[start + 1..].find('`') {
+            Some(end) => {
+                out.push_str(pal.code);
+                out.push_str(&rest[start + 1..start + 1 + end]); // inner text, backticks dropped
+                out.push_str(pal.reset);
+                rest = &rest[start + 1 + end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]); // lone backtick: emit the remainder as-is
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Render the top-level command list — the body of `ops --help` and the no-command usage.
 /// Top-level commands are sorted alphabetically, like each subcommand listing.
 fn top_level(pal: &Palette) -> String {
@@ -1422,9 +1472,19 @@ fn top_level(pal: &Palette) -> String {
     tops.sort_by_key(|p| p.path[0]);
     let width = tops.iter().map(|p| p.path[0].len()).max().unwrap_or(0);
     for p in tops {
-        item(&mut out, pal.name, pal.reset, p.path[0], width, p.summary);
+        item(
+            &mut out,
+            pal.name,
+            pal.reset,
+            p.path[0],
+            width,
+            &paint_inline_code(p.summary, pal),
+        );
     }
-    out.push_str("\nRun `ops help <command>` (or `ops <command> --help`) for usage and details.\n");
+    out.push_str(&paint_inline_code(
+        "\nRun `ops help <command>` (or `ops <command> --help`) for usage and details.\n",
+        pal,
+    ));
     out
 }
 
@@ -1433,7 +1493,10 @@ fn render(page: &Page, pal: &Palette) -> String {
     let joined = page.path.join(" ");
     let mut out = format!(
         "{}ops {}{} — {}\n\n",
-        pal.name, joined, pal.reset, page.summary
+        pal.name,
+        joined,
+        pal.reset,
+        paint_inline_code(page.summary, pal)
     );
     out.push_str(&format!(
         "{}Usage:{}\n  {}\n",
@@ -1446,7 +1509,14 @@ fn render(page: &Page, pal: &Palette) -> String {
         out.push_str(&format!("\n{}Options:{}\n", pal.head, pal.reset));
         let width = page.options.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
         for (flag, desc) in page.options {
-            item(&mut out, pal.flag, pal.reset, flag, width, desc);
+            item(
+                &mut out,
+                pal.flag,
+                pal.reset,
+                flag,
+                width,
+                &paint_inline_code(desc, pal),
+            );
         }
     }
 
@@ -1465,16 +1535,17 @@ fn render(page: &Page, pal: &Palette) -> String {
                 pal.reset,
                 k.path.last().unwrap(),
                 width,
-                k.summary,
+                &paint_inline_code(k.summary, pal),
             );
         }
-        out.push_str(&format!(
-            "\nRun `ops help {joined} <subcommand>` for a subcommand's options.\n"
+        out.push_str(&paint_inline_code(
+            &format!("\nRun `ops help {joined} <subcommand>` for a subcommand's options.\n"),
+            pal,
         ));
     }
 
     if !page.details.is_empty() {
-        out.push_str(&format!("\n{}\n", page.details));
+        out.push_str(&format!("\n{}\n", paint_inline_code(page.details, pal)));
     }
     out
 }
@@ -1500,7 +1571,7 @@ pub fn show(path: &[&str]) -> ExitCode {
 
 /// The deepest command path a help request is about: the command, then each following
 /// non-flag token that extends it to a known subcommand. `ops plugins store add --help`
-/// resolves to `["plugins","store","add"]`; `ops stop --all --help` to `["stop"]`.
+/// resolves to `["plugins","store","add"]`; `ops session stop --all --help` to `["session","stop"]`.
 fn resolve_path<'a>(cmd: &'a str, rest: &'a [OsString]) -> Vec<&'a str> {
     let mut path = vec![cmd];
     for arg in rest {
@@ -1636,7 +1707,7 @@ mod tests {
     #[test]
     fn paint_synopsis_wraps_only_metavariables() {
         let pal = Palette::colored();
-        let painted = paint_synopsis("ops stop <id>...|--all [--delay <secs>]", &pal);
+        let painted = paint_synopsis("ops session stop <id>...|--all [--delay <secs>]", &pal);
         // Each `<…>` span (angle brackets included) is wrapped; literals stay untouched.
         assert!(painted.contains("\x1b[1m<id>\x1b[0m"));
         assert!(painted.contains("\x1b[1m<secs>\x1b[0m"));
@@ -1645,13 +1716,41 @@ mod tests {
 
         // A plain palette returns the input byte-for-byte.
         assert_eq!(
-            paint_synopsis("ops stop <id>...|--all", &Palette::plain()),
-            "ops stop <id>...|--all"
+            paint_synopsis("ops session stop <id>...|--all", &Palette::plain()),
+            "ops session stop <id>...|--all"
         );
 
         // An unterminated `<` is emitted verbatim — never a dangling open span.
         let weird = paint_synopsis("ops x <unterminated", &pal);
         assert!(weird.ends_with("<unterminated"));
+        assert!(!weird.trim_end().ends_with("\x1b["));
+    }
+
+    #[test]
+    fn paint_inline_code_strips_backticks_and_wraps_the_content() {
+        let pal = Palette::colored();
+        let painted = paint_inline_code("run `ops help run` for the `--config` reference", &pal);
+        // Backticks are dropped; the inner token is wrapped in the code style + reset.
+        assert!(painted.contains("\x1b[36mops help run\x1b[0m"));
+        assert!(painted.contains("\x1b[36m--config\x1b[0m"));
+        assert!(
+            !painted.contains('`'),
+            "backticks must be dropped when styled"
+        );
+
+        // A metavariable inside a code span stays literal text (only the whole span is styled).
+        let meta = paint_inline_code("Run `ops help <command>` for details", &pal);
+        assert!(meta.contains("\x1b[36mops help <command>\x1b[0m"));
+
+        // Color off: the string is returned byte-for-byte, backticks kept.
+        assert_eq!(
+            paint_inline_code("run `ops help run`", &Palette::plain()),
+            "run `ops help run`"
+        );
+
+        // A lone backtick is emitted verbatim — never a dangling open span.
+        let weird = paint_inline_code("an `unterminated span", &pal);
+        assert!(weird.ends_with("`unterminated span"));
         assert!(!weird.trim_end().ends_with("\x1b["));
     }
 

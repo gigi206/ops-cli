@@ -18,7 +18,7 @@ See also: [The app framework](../apps/README.md) · [`[app.<name>]`](../configur
 
 | Option | Meaning |
 |---|---|
-| `--detach` | launch in the background as a session [`ops ls`](ls.md)/[`attach`](attach.md)/[`stop`](stop.md) can see |
+| `--detach` | launch in the background as a session [`ops session`](session.md) can see |
 | `--config` / `--env` / `--net` / `--gui` / `--nixpkgs` / `--bind` / `--limit` / `--package` | one-shot [overrides](../configuration/overrides.md), applied **after** the app's overlay (the final word) |
 | `-- <args>...` | appended to the app's declared command |
 
@@ -54,7 +54,7 @@ inert until `ops app <name>`. See [Portable profiles](../apps/profiles.md).
 disk, add `--purge`: it removes the app's [isolated home(s)](../apps/home.md) — the
 global one and any per-project ones — which hold the tools installed by the app's
 `mise:` backends, its config, and its login/session state, freed immediately. A running
-session of the app is a hard stop (stop it first with [`ops stop`](stop.md)).
+session of the app is a hard stop (stop it first with [`ops session stop`](session.md#stop)).
 
 `--purge` on its own does **not** touch the shared per-project nix store, which backs
 every app in a project. Add **`--gc`** (which requires `--purge`) to sweep the **current

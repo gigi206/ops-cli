@@ -73,7 +73,7 @@ const DATA_ENTRIES: &[Entry] = &[
     Entry {
         label: "sessions/",
         rel: "sessions",
-        desc: "session registry read by `ops ls`",
+        desc: "session registry read by `ops session ls`",
         enumerate: Enumerate::None,
     },
     Entry {
@@ -210,7 +210,7 @@ fn view_with_roots(
 ) -> PathView {
     // The live project ids — the set a running session holds — for the data base's per-project
     // liveness annotation. Computed once from the session registry at the data root (the same
-    // self-healing housekeep `ops ls` runs); empty when there is no data root or no sessions. Only
+    // self-healing housekeep `ops session ls` runs); empty when there is no data root or no sessions. Only
     // the data base's `projects/` entry consumes it; config and state ignore it.
     let live_ids: BTreeSet<String> = data_root
         .as_ref()
@@ -269,7 +269,7 @@ fn current_project_id() -> Option<String> {
 }
 
 /// The set of project ids a running session holds, for the per-project `live` annotation. Reads
-/// the session registry and prunes dead records (the same self-healing `ops ls` performs — a
+/// the session registry and prunes dead records (the same self-healing `ops session ls` performs — a
 /// benign side effect, not a violation of `ops path`'s read-only stance, which is about no
 /// sandbox launch / no trust gate / no network, not no filesystem housekeeping). Each live
 /// session's recorded canonical path is hashed the way [`sandbox::project_id`] hashes a launch's

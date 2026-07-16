@@ -1,6 +1,6 @@
 //! The on-disk session registry (no daemon).
 //!
-//! Each running sandbox writes a small record under `<data>/sessions/`; `ops ls`
+//! Each running sandbox writes a small record under `<data>/sessions/`; `ops session ls`
 //! reads them back. Without a daemon nothing guarantees a record is removed when
 //! its sandbox dies, so a record is a **liveness-validated hint**, never trusted
 //! to be cleaned up: [`Registry::list`] re-checks every record and prunes the
@@ -57,7 +57,7 @@ impl Kind {
     }
 }
 
-/// Which persistent home a session runs in — the bit `ops attach` needs to reproduce the same
+/// Which persistent home a session runs in — the bit `ops session attach` needs to reproduce the same
 /// environment. A plain `ops run`/`ops shell` uses the project's default home (`Project`); an
 /// `ops app` uses its own isolated home, keyed by the app name and its scope (`GlobalApp` shared
 /// across projects, `ProjectApp` per project). Owned (unlike the borrowing launch-side `Runtime`),
@@ -109,7 +109,7 @@ pub(crate) enum StopOutcome {
 
 /// One registered sandbox. The `(pid, start_ticks)` pair identifies the live
 /// process; `project` is the canonical project root (display and identity); `runtime` is the home
-/// it runs in, so `ops attach` can reproduce it.
+/// it runs in, so `ops session attach` can reproduce it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Session {
     pub(crate) project: PathBuf,
@@ -394,8 +394,8 @@ impl Registry {
     /// Re-validate every record against its running process: return the live sessions (sorted for
     /// stable display) and the count of dead or unparseable records reaped. Pruning happens only
     /// here, so the directory is bounded by how often this runs: `ops shell` self-cleans on exit via
-    /// [`RecordGuard`], an `ops run` record (no post-exec hook) lingers until the next `ops ls` or
-    /// `ops gc` reaps it. `ops gc` calls this directly to report the prune; `ops ls` and the gc
+    /// [`RecordGuard`], an `ops run` record (no post-exec hook) lingers until the next `ops session ls` or
+    /// `ops gc` reaps it. `ops gc` calls this directly to report the prune; `ops session ls` and the gc
     /// reaper take the live half through [`list`](Self::list).
     pub(crate) fn housekeep(&self) -> io::Result<(Vec<Session>, usize)> {
         let entries = match std::fs::read_dir(&self.dir) {
@@ -438,7 +438,7 @@ impl Registry {
     }
 
     /// Remove a specific session's record (best-effort), so a session just stopped disappears from
-    /// `ops ls` at once rather than lingering until liveness pruning catches it — which it would
+    /// `ops session ls` at once rather than lingering until liveness pruning catches it — which it would
     /// not do immediately anyway while the killed process is still a zombie reading as alive. A
     /// missing record is fine; liveness pruning remains the real cleanup.
     pub(crate) fn reap(&self, session: &Session) {

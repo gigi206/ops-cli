@@ -66,7 +66,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`test`](cli/test.md) | check whether an access would be allowed |
 | [`net`](cli/net.md) | inspect and manage the egress policy |
 | [`plugins`](cli/plugins.md) | manage resolver plugins and plugin stores |
-| [`ls` / `attach` / `stop`](cli/ls.md) | the session registry |
+| [`session`](cli/session.md) | list, attach to, and stop the live sessions |
 | [`trust` / `untrust`](cli/trust.md) | vouch for a project config |
 | [`config`](cli/config.md) | inspect and edit the configuration |
 | [`upgrade`](cli/upgrade.md) | roll managed toolchains forward |

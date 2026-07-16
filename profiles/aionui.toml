@@ -164,10 +164,18 @@ allow = [
     # bucket (github registry is covered by the built-in allow-set). `api.anthropic.com` above
     # already covers its runtime. Remove this if you disable the claude-code package.
     "{GET} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
-    # "Login with Google" for Gemini (instead of an API key) needs the Google OAuth hosts:
-    #"{*} https://accounts.google.com",
+    # "Login with Google" for Gemini (instead of an API key) needs the Google OAuth hosts. Because the
+    # login runs in the IN-CAGE browser, use the locale-bounded accounts regex — it covers the whole
+    # cross-domain flow (accounts.google.com auth → accounts.google.<cctld>/SetSID on your country
+    # domain), works in any locale, and is anchored so a look-alike (accounts.google.com.evil.com) is
+    # refused — the same pattern claude-desktop / hermes-desktop / vibe use — plus Google's asset/avatar
+    # hosts. (accounts.youtube.com's CheckConnection is non-essential; add it to `mute` if it is noisy.)
+    #'{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
     #"{*} https://oauth2.googleapis.com",
     #"{*} https://apis.google.com",
+    #"{GET} https://ssl.gstatic.com",
+    #"{GET} https://www.gstatic.com",
+    #"{GET} https://lh3.googleusercontent.com",
     # A provider that uses a realtime/streaming WebSocket (some voice/live modes) needs `{WS}` on its
     # host, e.g. change its line above to `{*,WS} https://api.openai.com`.
     #

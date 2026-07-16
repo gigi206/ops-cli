@@ -63,9 +63,9 @@ data and store both per-project, aligned).
 ops attach <id>     # join the running app's cage and open a shell inside it
 ```
 
-`ops attach` enters the live cage (its processes, its real `/tmp`, its network, and the
+`ops session attach` enters the live cage (its processes, its real `/tmp`, its network, and the
 app's isolated home as the agent currently sees it) — not a fresh cage. See
-[`ops attach`](../cli/attach.md) and [Sessions](../housekeeping/sessions.md).
+[`ops session attach`](../cli/session.md#attach) and [Sessions](../housekeeping/sessions.md).
 
 ## Removing an app's home
 

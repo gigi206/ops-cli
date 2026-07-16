@@ -1,4 +1,4 @@
-//! Integration tests for `ops attach`.
+//! Integration tests for `ops session attach`.
 //!
 //! The headline property: attaching to a running **app** (agent) session drops a new interactive
 //! shell into the agent's *isolated* home — not the project's shared home — so "attach to a running
@@ -69,16 +69,17 @@ fn force_remove(path: &Path) {
 #[test]
 fn attach_to_an_unknown_id_reports_and_exits_two() {
     // No tty needed: `attach` resolves the target before the terminal check, so an unknown id is a
-    // clean exit-2 with a pointer to `ops ls` — never a panic or a misparse of garbage.
+    // clean exit-2 with a pointer to `ops session ls` — never a panic or a misparse of garbage.
     let data = TmpDir::new("noid");
     for id in ["999999", "not-a-pid"] {
         let out = ops()
+            .arg("session")
             .arg("attach")
             .arg(id)
             .env("XDG_DATA_HOME", data.path())
             .stdin(Stdio::null())
             .output()
-            .expect("spawn ops attach");
+            .expect("spawn ops session attach");
         assert_eq!(
             out.status.code(),
             Some(2),
@@ -124,7 +125,7 @@ fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf>
     None
 }
 
-/// Drive an interactive `ops attach <pid>` through a pty: wait for the shell's prompt, send
+/// Drive an interactive `ops session attach <pid>` through a pty: wait for the shell's prompt, send
 /// `script`, and read until the session ends or the deadline. Returns the captured output.
 fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
     let mut master: libc::c_int = -1;
@@ -142,6 +143,7 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
 
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdio.
     let mut child = ops()
+        .arg("session")
         .arg("attach")
         .arg(pid.to_string())
         .env("XDG_DATA_HOME", data)
@@ -149,7 +151,7 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops attach");
+        .expect("spawn ops session attach");
     unsafe { libc::close(slave) };
 
     let mut out = Vec::new();
@@ -186,7 +188,7 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
 
 #[test]
 fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
-    // A running `ops app` agent uses its own isolated home. `ops attach <pid>` must drop the new
+    // A running `ops app` agent uses its own isolated home. `ops session attach <pid>` must drop the new
     // shell into THAT home, not the project's shared one — the property that makes attaching to a
     // running agent mean "the same environment". Teeth: a marker the attached shell writes to
     // `$HOME` must land in the app's home (`<data>/apps/probe/home`) and NOT in the project's

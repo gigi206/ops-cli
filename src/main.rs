@@ -61,9 +61,7 @@ fn main() -> ExitCode {
     match name {
         "doctor" => doctor(),
         "shell" => shell_cmd(rest),
-        "ls" => list_sessions(),
-        "attach" => attach_cmd(rest),
-        "stop" => stop_cmd(rest),
+        "session" | "sessions" => session_cmd(rest),
         "trust" => trust_cmd(rest),
         "untrust" => untrust_cmd(rest.into_iter().next()),
         "config" => config_cmd(rest),
@@ -442,7 +440,32 @@ fn classify_namespace_failure(
     remediation.push(USERNS_REMEDIATION);
 }
 
-/// `ops ls`: list the live sandbox sessions from the on-disk registry. Reading
+/// `ops session <subcommand>` (alias `ops sessions`): the namespace grouping every operation on a
+/// live sandbox session — `ls` lists them, `attach` opens a shell inside one, `stop` ends them.
+/// A leading `--help` (at any depth) is intercepted by [`help::maybe_help`], which also covers the
+/// `sessions` alias that the top-level help interception does not reach. A bare `ops session` prints
+/// the namespace page; an unknown subcommand is a usage error.
+fn session_cmd(args: Vec<OsString>) -> ExitCode {
+    if let Some(code) = help::maybe_help("session", &args) {
+        return code;
+    }
+    match args.first().and_then(|a| a.to_str()) {
+        Some("ls") | Some("list") => list_sessions(),
+        Some("attach") => attach_cmd(args[1..].to_vec()),
+        Some("stop") => stop_cmd(args[1..].to_vec()),
+        None => {
+            eprint!("{}", help::page_usage(&["session"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
+        Some(other) => {
+            eprintln!("ops: session: unknown subcommand `{other}`");
+            eprintln!("       run `ops help session` for usage.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `ops session ls`: list the live sandbox sessions from the on-disk registry. Reading
 /// the registry re-validates and prunes dead records as a side effect, so the
 /// list is always current without a daemon.
 fn list_sessions() -> ExitCode {
@@ -508,7 +531,8 @@ fn list_sessions() -> ExitCode {
         // NAME is the cage's own name — the same `ops-<slug>` its systemd scope and in-cage
         // hostname show — so a session cross-references with the host tooling. An app session's
         // KIND is `app:<name>`, so the user can tell which sessions are agents (and that
-        // `ops attach`/`ops stop` act on that app's isolated environment). NAME is padded before
+        // `ops session attach`/`ops session stop` act on that app's isolated environment). NAME is
+        // padded before
         // coloring so the color span does not disturb the width.
         let name = format!("{name:<name_w$}");
         println!("{n}{name}{r}  {label:<kind_w$}  {pid:>pid_w$}  {age:>age_w$}  {project}");
@@ -516,26 +540,28 @@ fn list_sessions() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops attach <id>`: open a shell in a running session's environment. Exactly one operand — the
-/// PID `ops ls` shows. A missing, extra, or non-UTF-8 operand is a usage error; a well-formed id
+/// `ops session attach <id>`: open a shell in a running session's environment. Exactly one operand
+/// — the PID `ops session ls` shows. A missing, extra, or non-UTF-8 operand is a usage error; a
+/// well-formed id
 /// that matches no live session is reported by `attach` itself.
 fn attach_cmd(args: Vec<OsString>) -> ExitCode {
     let Some(id) = (args.len() == 1).then(|| args[0].to_str()).flatten() else {
         eprintln!(
-            "ops: usage: {}   (the PID shown by `ops ls`)",
-            help::synopsis("attach")
+            "ops: usage: {}   (the PID shown by `ops session ls`)",
+            help::synopsis_of(&["session", "attach"])
         );
         return ExitCode::from(2);
     };
     sandbox::attach(id)
 }
 
-/// The default grace period between SIGTERM and SIGKILL for `ops stop`: long enough for an agent to
+/// The default grace period between SIGTERM and SIGKILL for `ops session stop`: long enough for an agent to
 /// finish writing and shut down cleanly, short enough not to hang. `--delay` overrides it.
 const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
 
-/// `ops stop <id>... [--delay <secs>]` / `ops stop --all [--delay <secs>]`: stop running sessions.
-/// With ids, stop the named ones (the pids `ops ls` shows); with `--all`, stop every live session.
+/// `ops session stop <id>... [--delay <secs>]` / `ops session stop --all [--delay <secs>]`: stop
+/// running sessions. With ids, stop the named ones (the pids `ops session ls` shows); with `--all`,
+/// stop every live session.
 /// Sends SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once).
 /// Either ids or `--all` is required (not both); a non-UTF-8 operand or a malformed `--delay` value
 /// is a usage error.
@@ -565,7 +591,7 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
             Some("--all") => all = true,
             Some(id) => ids.push(id.to_string()),
             None => {
-                eprintln!("ops: stop ids must be valid text (the PID shown by `ops ls`).");
+                eprintln!("ops: stop ids must be valid text (the PID shown by `ops session ls`).");
                 return ExitCode::from(2);
             }
         }
@@ -576,8 +602,8 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
     }
     if !all && ids.is_empty() {
         eprintln!(
-            "ops: usage: {}\n   (ids are the PIDs shown by `ops ls`)",
-            help::synopsis("stop")
+            "ops: usage: {}\n   (ids are the PIDs shown by `ops session ls`)",
+            help::synopsis_of(&["session", "stop"])
         );
         return ExitCode::from(2);
     }
@@ -2805,7 +2831,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("rm") => app_rm(&args[1..]),
         Some("list" | "ls") => app_list(),
         // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
-        // background as a session `ops ls`/`attach`/`stop` can see. Tokens after a `--` are passed
+        // background as a session `ops session ls` can see. Tokens after a `--` are passed
         // through to the app's command (see `parse_app_launch`).
         _ => match parse_app_launch(&args) {
             Ok(launch) => {
@@ -3459,7 +3485,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
             if !pids.is_empty() {
                 eprintln!(
                     "ops: app '{name}' has a running session (pid {}); stop it first \
-                     (see `ops ls`; then `ops stop {}`).",
+                     (see `ops session ls`; then `ops session stop {}`).",
                     pids.join(", "),
                     pids.join(" ")
                 );
@@ -5720,7 +5746,7 @@ fn render_logs(
 }
 
 /// One event's display line (indented, no trailing newline): `session-id · time · host:port ·
-/// method path · verdict · reason`. The `pid` is the session id (the one `ops ls`/`attach`/`stop`
+/// method path · verdict · reason`. The `pid` is the session id (the one `ops session ls`/`attach`/`stop`
 /// use), led so a line is self-contained when scanned or piped. The `reason` is dropped for a plain
 /// `allow` (it would just repeat "allowed"); a blank host (a malformed handshake) shows `-`. Shared
 /// by the one-shot render and the `--follow` stream so a line looks identical in both.

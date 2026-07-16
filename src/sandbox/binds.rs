@@ -34,7 +34,7 @@ const SANDBOX_SHELL: &str = "/bin/sh";
 /// path a hermetic cage lacks), so the kernel cannot exec them without this name.
 /// It is the *same* binary `/bin/sh` already exposes — a second name for an
 /// interpreter already present, not a new mount — so it adds no exposure, only the
-/// name a `#!/bin/bash` shebang assumes. Also the shell `ops attach` execs inside a
+/// name a `#!/bin/bash` shebang assumes. Also the shell `ops session attach` execs inside a
 /// running cage (an absolute path that resolves in the cage's own mount namespace).
 pub(crate) const SANDBOX_BASH: &str = "/bin/bash";
 

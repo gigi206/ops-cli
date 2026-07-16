@@ -12,6 +12,10 @@ pub(crate) struct Palette {
     pub(crate) flag: &'static str,
     /// Placeholder metavariables in a usage synopsis (`<name>`, `<file>`).
     pub(crate) arg: &'static str,
+    /// Inline code spans in prose — the backtick-quoted tokens of help text
+    /// (`--flag`, `ops help run`, `.ops.toml`). The backticks themselves are
+    /// dropped when this style is active; kept verbatim when color is off.
+    pub(crate) code: &'static str,
     /// Section headers (`Usage:`, `Options:`, `env:`, …).
     pub(crate) head: &'static str,
     /// A success status (`[ ok ]`, `ALLOWED`).
@@ -27,13 +31,14 @@ pub(crate) struct Palette {
 
 impl Palette {
     /// The active ANSI styling — names in bold cyan, flags in bold green, usage placeholders and
-    /// headers in bold, and the conventional status hues (green ok, yellow warn, red fail) with
-    /// dim secondary text.
+    /// headers in bold, inline code in cyan, and the conventional status hues (green ok, yellow
+    /// warn, red fail) with dim secondary text.
     pub(crate) fn colored() -> Self {
         Palette {
             name: "\x1b[1;36m",
             flag: "\x1b[1;32m",
             arg: "\x1b[1m",
+            code: "\x1b[36m",
             head: "\x1b[1m",
             ok: "\x1b[32m",
             warn: "\x1b[33m",
@@ -50,6 +55,7 @@ impl Palette {
             name: "",
             flag: "",
             arg: "",
+            code: "",
             head: "",
             ok: "",
             warn: "",
@@ -82,7 +88,7 @@ mod tests {
     fn plain_spans_are_all_empty_so_captured_output_is_byte_for_byte_plain() {
         let p = Palette::plain();
         for span in [
-            p.name, p.flag, p.arg, p.head, p.ok, p.warn, p.err, p.dim, p.reset,
+            p.name, p.flag, p.arg, p.code, p.head, p.ok, p.warn, p.err, p.dim, p.reset,
         ] {
             assert!(span.is_empty(), "a plain span must be empty");
         }
@@ -91,7 +97,9 @@ mod tests {
     #[test]
     fn colored_spans_are_all_non_empty_escapes_with_a_reset() {
         let p = Palette::colored();
-        for span in [p.name, p.flag, p.arg, p.head, p.ok, p.warn, p.err, p.dim] {
+        for span in [
+            p.name, p.flag, p.arg, p.code, p.head, p.ok, p.warn, p.err, p.dim,
+        ] {
             assert!(
                 span.starts_with('\x1b'),
                 "a colored span must be an ANSI escape"

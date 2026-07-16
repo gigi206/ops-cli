@@ -18,8 +18,8 @@ fn ops(args: &[&str]) -> Output {
 
 /// Every top-level command `main` dispatches.
 const TOP_LEVEL: &[&str] = &[
-    "doctor", "shell", "run", "mise", "app", "search", "test", "net", "plugins", "ls", "attach",
-    "stop", "trust", "untrust", "config", "upgrade", "gc", "projects",
+    "doctor", "shell", "run", "mise", "app", "search", "test", "net", "plugins", "session",
+    "trust", "untrust", "config", "upgrade", "gc", "projects",
 ];
 
 /// Every command path the dispatchers accept (top-level commands and their subcommands). Keep
@@ -34,9 +34,10 @@ const PATHS: &[&[&str]] = &[
     &["test"],
     &["net"],
     &["plugins"],
-    &["ls"],
-    &["attach"],
-    &["stop"],
+    &["session"],
+    &["session", "ls"],
+    &["session", "attach"],
+    &["session", "stop"],
     &["trust"],
     &["untrust"],
     &["config"],
@@ -186,10 +187,11 @@ fn subcommands_are_listed_alphabetically() {
 
 #[test]
 fn a_help_flag_after_a_subcommand_path_does_not_run_the_command() {
-    // `ops stop --all --help` is help for stop, not an attempt to stop a session called --help.
-    let out = ops(&["stop", "--all", "--help"]);
+    // `ops session stop --all --help` is help for stop, not an attempt to stop a session
+    // called --help.
+    let out = ops(&["session", "stop", "--all", "--help"]);
     assert!(out.status.success(), "should be the stop page, exit 0");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("ops stop —"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ops session stop —"));
 }
 
 #[test]

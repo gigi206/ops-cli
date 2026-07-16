@@ -40,9 +40,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 
 | Command | Purpose |
 |---|---|
-| [`ops ls`](ls.md) | list the live sandbox sessions |
-| [`ops attach <id>`](attach.md) | open a shell in a running session's environment |
-| [`ops stop`](stop.md) | stop running sessions |
+| [`ops session`](session.md) | list, attach to, and stop the live sandbox sessions |
 | [`ops projects`](projects.md) | list and remove per-project runtime trees |
 | [`ops gc`](gc.md) | reclaim nix store space |
 | [`ops upgrade`](upgrade.md) | roll managed toolchains forward |

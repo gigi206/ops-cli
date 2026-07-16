@@ -1,4 +1,4 @@
-//! Integration tests for `ops stop`.
+//! Integration tests for `ops session stop`.
 //!
 //! The headline property: stopping a **supervised** session (the `network = "deny"` path,
 //! where the registered pid is the ops supervisor rather than bubblewrap itself) tears the whole
@@ -123,21 +123,22 @@ fn stop_with_no_or_bad_arguments_is_a_usage_error() {
     let data = TmpDir::new("usage");
     // No id: usage error, exit 2.
     let no_id = ops()
+        .arg("session")
         .arg("stop")
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops stop");
+        .expect("spawn ops session stop");
     assert_eq!(no_id.status.code(), Some(2), "no-id stop must exit 2");
     assert!(String::from_utf8_lossy(&no_id.stderr).contains("usage"));
 
     // A non-numeric --delay: usage error, exit 2 (caught before any signalling).
     let bad_delay = ops()
-        .args(["stop", "--delay", "soon", "123"])
+        .args(["session", "stop", "--delay", "soon", "123"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops stop");
+        .expect("spawn ops session stop");
     assert_eq!(bad_delay.status.code(), Some(2), "bad --delay must exit 2");
     assert!(String::from_utf8_lossy(&bad_delay.stderr).contains("whole number"));
 }
@@ -146,11 +147,11 @@ fn stop_with_no_or_bad_arguments_is_a_usage_error() {
 fn stop_an_unknown_id_reports_and_exits_two() {
     let data = TmpDir::new("noid");
     let out = ops()
-        .args(["stop", "999999"])
+        .args(["session", "stop", "999999"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops stop");
+        .expect("spawn ops session stop");
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -169,11 +170,11 @@ fn stop_all_together_with_an_id_is_a_usage_error() {
     // before any signalling (exit 2), not silently resolved one way.
     let data = TmpDir::new("all-and-id");
     let out = ops()
-        .args(["stop", "--all", "123"])
+        .args(["session", "stop", "--all", "123"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops stop");
+        .expect("spawn ops session stop");
     assert_eq!(out.status.code(), Some(2), "--all with an id must exit 2");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("either explicit ids or --all"),
@@ -188,11 +189,11 @@ fn stop_all_with_no_sessions_is_a_no_op_success() {
     // like `ops gc` with nothing to reclaim. No sandbox is needed (the registry is just empty).
     let data = TmpDir::new("all-empty");
     let out = ops()
-        .args(["stop", "--all"])
+        .args(["session", "stop", "--all"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops stop");
+        .expect("spawn ops session stop");
     assert!(
         out.status.success(),
         "stop --all with no sessions must exit 0: {}",
@@ -289,7 +290,7 @@ fn wait_until(deadline: Instant, mut cond: impl FnMut() -> bool) -> bool {
 fn stop_tears_down_a_supervised_app_session() {
     // A trusted app with a network allowlist runs supervised: the registered pid is the ops
     // supervisor, and the cage (bubblewrap + the `sleep`) is its child, kept alive only by
-    // `--die-with-parent`. `ops stop` of that pid must take the whole thing down. Teeth: the
+    // `--die-with-parent`. `ops session stop` of that pid must take the whole thing down. Teeth: the
     // in-cage `sleep 31337` is running before the stop and gone after — an orphan would survive
     // only if the supervisor were killed without the cage following, the failure mode this path
     // alone can exhibit. The unusual sleep duration is a unique fingerprint in the host's process
@@ -368,11 +369,11 @@ fn stop_tears_down_a_supervised_app_session() {
         project.path(),
         data.path(),
         state.path(),
-        &["stop", &pid.to_string()],
+        &["session", "stop", &pid.to_string()],
     );
     assert!(
         stopped.status.success(),
-        "ops stop must exit 0: {}",
+        "ops session stop must exit 0: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
 
@@ -386,19 +387,24 @@ fn stop_tears_down_a_supervised_app_session() {
         "the cage's `sleep` was orphaned — stopping the supervisor did not tear the cage down"
     );
 
-    // The stopped session no longer appears in `ops ls` (its record was reaped).
-    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
+    // The stopped session no longer appears in `ops session ls` (its record was reaped).
+    let ls = ops_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "ls"],
+    );
     assert!(
         !String::from_utf8_lossy(&ls.stdout).contains(&pid.to_string()),
-        "the stopped session still shows in `ops ls`"
+        "the stopped session still shows in `ops session ls`"
     );
 }
 
 #[test]
 fn stop_all_stops_every_session() {
-    // `ops stop --all` must tear down *every* live session at once, not just one. Two background
+    // `ops session stop --all` must tear down *every* live session at once, not just one. Two background
     // agents are started with `--detach` (so each is a first-class registry session); a single
-    // `ops stop --all` must leave neither running. The unusual sleep durations are unique
+    // `ops session stop --all` must leave neither running. The unusual sleep durations are unique
     // fingerprints in the host's process table. Both apps use the default posture (the exec path),
     // which keeps the fixture to one provisioning and is enough to prove the fan-out — the
     // supervised teardown itself is covered by `stop_tears_down_a_supervised_app_session`.
@@ -430,7 +436,7 @@ fn stop_all_stops_every_session() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // Backstop: SIGKILL either agent if an assertion panics before `ops stop --all` runs (a detached
+    // Backstop: SIGKILL either agent if an assertion panics before `ops session stop --all` runs (a detached
     // daemon is reparented to init and cannot be reaped by the test).
     let _cleanup = FingerprintCleanup(vec!["31341", "31342"]);
 
@@ -463,11 +469,16 @@ fn stop_all_stops_every_session() {
         wait_until(Instant::now() + Duration::from_secs(30), || {
             process_with_arg("31341") && process_with_arg("31342")
         }),
-        "both detached agents should be running before `ops stop --all`"
+        "both detached agents should be running before `ops session stop --all`"
     );
 
-    // `ops ls` lists both sessions.
-    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
+    // `ops session ls` lists both sessions.
+    let ls = ops_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "ls"],
+    );
     let listing = String::from_utf8_lossy(&ls.stdout);
     for pid in &pids {
         assert!(
@@ -481,11 +492,11 @@ fn stop_all_stops_every_session() {
         project.path(),
         data.path(),
         state.path(),
-        &["stop", "--all"],
+        &["session", "stop", "--all"],
     );
     assert!(
         stopped.status.success(),
-        "ops stop --all must exit 0: {}",
+        "ops session stop --all must exit 0: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
 
@@ -494,16 +505,21 @@ fn stop_all_stops_every_session() {
         wait_until(Instant::now() + Duration::from_secs(10), || {
             !process_with_arg("31341") && !process_with_arg("31342")
         }),
-        "`ops stop --all` left an agent running"
+        "`ops session stop --all` left an agent running"
     );
 
-    // And `ops ls` no longer lists either (records reaped).
-    let ls = ops_run(project.path(), data.path(), state.path(), &["ls"]);
+    // And `ops session ls` no longer lists either (records reaped).
+    let ls = ops_run(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "ls"],
+    );
     let listing = String::from_utf8_lossy(&ls.stdout);
     for pid in &pids {
         assert!(
             !listing.contains(&pid.to_string()),
-            "session {pid} still shows in `ops ls` after stop --all:\n{listing}"
+            "session {pid} still shows in `ops session ls` after stop --all:\n{listing}"
         );
     }
 }

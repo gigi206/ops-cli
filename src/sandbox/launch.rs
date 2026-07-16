@@ -349,8 +349,8 @@ fn detach_parent(
             log.display()
         );
         eprintln!(
-            "ops: `ops ls` lists it, `ops attach {child}` opens a shell inside its live cage, \
-             `ops stop {child}` ends it."
+            "ops: `ops session ls` lists it, `ops session attach {child}` opens a shell inside its live cage, \
+             `ops session stop {child}` ends it."
         );
         ExitCode::SUCCESS
     } else {
@@ -870,7 +870,7 @@ pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCod
 }
 
 /// Prune dead session records and report it (the dedicated housekeeping pass the registry deferred:
-/// an `ops run` record with no post-exec hook lingered until the next `ops ls`). Returns the ids of
+/// an `ops run` record with no post-exec hook lingered until the next `ops session ls`). Returns the ids of
 /// projects with a *live* session — hashing each recorded canonical path — so the dead-tree reap
 /// can skip a tree a session still holds without scanning the registry a second time.
 fn session_housekeeping(
@@ -1030,7 +1030,7 @@ fn current_tree_id() -> Option<String> {
 
 /// Gather the per-project runtime trees under `<data>/projects/`, classified and sized, sorted by
 /// id — the shared core of `ops projects [list]` (text or JSON). Live ids come from the session
-/// registry (the same self-healing housekeep `ops ls` runs), so a tree in use reads `live`. Pure
+/// registry (the same self-healing housekeep `ops session ls` runs), so a tree in use reads `live`. Pure
 /// host-side filesystem work — no sandbox, no nix.
 fn collect_project_trees(
     layout: &crate::store::Layout,
@@ -1411,7 +1411,7 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
         if sessions.iter().any(|s| s.project == project) {
             eprintln!(
-                "ops gc: a sandbox is running in this project — stop it first (see `ops ls`)."
+                "ops gc: a sandbox is running in this project — stop it first (see `ops session ls`)."
             );
             return Err(ExitCode::FAILURE);
         }
@@ -1629,7 +1629,7 @@ pub(crate) fn shell(ov: crate::config::Override) -> ExitCode {
 }
 
 /// Launch an interactive shell in the cage for `runtime`, under a pty supervisor so job control
-/// works — the shared body of `ops shell` (the project's default home) and `ops attach` (which
+/// works — the shared body of `ops shell` (the project's default home) and `ops session attach` (which
 /// reproduces a session's home, including an app's isolated one). The command is the resolved
 /// interactive shell started with `--rcfile` at the synthetic in-cage rc, which activates mise so
 /// the project's activated tools (`mise use`) manage PATH/env in the interactive shell — mise's
@@ -1646,7 +1646,7 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
 
 /// Launch `cmd` under the pty supervisor: the cage gets a *private* controlling terminal (so job
 /// control and terminal-resize propagation work inside), while the real launching terminal stays
-/// unreachable — ops holds the pty master and never execs. Shared by `ops shell`, `ops attach`,
+/// unreachable — ops holds the pty master and never execs. Shared by `ops shell`, `ops session attach`,
 /// and interactive `ops app`.
 ///
 /// The session is registered and its record held by a [`RecordGuard`] that unlinks it when the
@@ -1662,7 +1662,7 @@ fn launch_pty_supervised(
 ) -> ExitCode {
     // A graphical app's real interface is its window, not this terminal — Ctrl+C is forwarded
     // faithfully but a GUI app may ignore it — so note how to stop it. Only for a foreground app
-    // launch (`Kind::Run`) with a display; a shell (`ops shell`/`ops attach`, `Kind::Shell`) uses
+    // launch (`Kind::Run`) with a display; a shell (`ops shell`/`ops session attach`, `Kind::Shell`) uses
     // Ctrl+C normally and needs no hint. Computed before `cmd`/`runtime` move into `build`.
     let stop_hint = (matches!(kind, Kind::Run)
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland))
@@ -1678,7 +1678,7 @@ fn launch_pty_supervised(
     let _guard = guard;
 
     // The registered pid is this supervisor's own (`Session::current` records `std::process::id()`),
-    // which is exactly what `ops ls` shows and `ops stop` accepts, so the hint names the real id.
+    // which is exactly what `ops session ls` shows and `ops session stop` accepts, so the hint names the real id.
     if let Some(name) = stop_hint {
         let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
         eprintln!("{}", render_gui_stop_hint(&name, std::process::id(), &epal));
@@ -1694,7 +1694,7 @@ fn launch_pty_supervised(
     }
 }
 
-/// Render the line `ops attach` prints before entering a live cage (stderr). Attaching is an
+/// Render the line `ops session attach` prints before entering a live cage (stderr). Attaching is an
 /// announcement, not a completed change, so the verb stays plain; the session pid and label are the
 /// identifier (cyan) and the parenthetical is secondary detail (dim).
 fn render_attaching(pid: u32, label: &str, pal: &crate::style::Palette) -> String {
@@ -1727,19 +1727,19 @@ fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) -> String {
 /// The line a foreground graphical launch prints (stderr) so the user knows how to stop it: its UI
 /// is the window, and a single Ctrl+C — though forwarded — is ignored by a GUI app (and a tray-backed
 /// window may not quit on close), so the escape hatches are named: a double Ctrl+C force-quits the
-/// session, and `ops stop <pid>` works from any other terminal. The app name is the identifier
+/// session, and `ops session stop <pid>` works from any other terminal. The app name is the identifier
 /// (cyan); the rest is plain, matching the restraint of the attach announcements.
 fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> String {
     let (n, r) = (pal.name, pal.reset);
     format!(
         "ops: {n}{name}{r} is graphical — press Ctrl+C twice here to quit (closing its window may only \
-         hide it — a tray app keeps running); `ops stop {pid}` also stops it."
+         hide it — a tray app keeps running); `ops session stop {pid}` also stops it."
     )
 }
 
-/// `ops attach <id>`: join a *running* session's cage and open an interactive shell **inside** it —
+/// `ops session attach <id>`: join a *running* session's cage and open an interactive shell **inside** it —
 /// the agent's live processes, its real `/tmp`, its network — the way `docker exec -it` works.
-/// `<id>` is the PID `ops ls` shows. Unlike a launch, this enters namespaces bubblewrap already
+/// `<id>` is the PID `ops session ls` shows. Unlike a launch, this enters namespaces bubblewrap already
 /// built (via `setns`), so it provisions nothing and re-resolves no config; it re-applies the cage's
 /// confinement to the joined shell (seccomp denylist + `no_new_privs` + capability drop) so the
 /// shell is confined at least as tightly as the agent. See [`super::attach`] for the mechanism and
@@ -1752,36 +1752,38 @@ pub(crate) fn attach(id: &str) -> ExitCode {
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ops attach: cannot read the session registry: {e}");
+            eprintln!("ops session attach: cannot read the session registry: {e}");
             return ExitCode::FAILURE;
         }
     };
     // A pid is unique among live processes, so this is a 0-or-1 match. Resolve the target before
     // the terminal check, so an unknown id is reported even without a tty.
     let Some(target) = sessions.into_iter().find(|s| s.pid.to_string() == id) else {
-        eprintln!("ops attach: no live session '{id}' — run `ops ls` to list them.");
+        eprintln!(
+            "ops session attach: no live session '{id}' — run `ops session ls` to list them."
+        );
         return ExitCode::from(2);
     };
     // SAFETY: `isatty` only inspects fd 0. The attached shell needs a real terminal, like `shell`.
     if unsafe { libc::isatty(0) } != 1 {
-        eprintln!("ops: `ops attach` needs a terminal on stdin.");
+        eprintln!("ops: `ops session attach` needs a terminal on stdin.");
         return ExitCode::from(2);
     }
 
     // Locate a live process inside the cage (the session pid is the cage's host-side anchor). A
-    // `None` here means the cage has no in-namespace process left — it exited between `ops ls` and
+    // `None` here means the cage has no in-namespace process left — it exited between `ops session ls` and
     // now, or the host has no user namespaces (then it never had a cage).
     let Some(cage_pid) = super::attach::find_cage_pid(target.pid) else {
         eprintln!(
-            "ops attach: session '{id}' has no live process to enter — it may have just exited \
-             (run `ops ls`)."
+            "ops session attach: session '{id}' has no live process to enter — it may have just exited \
+             (run `ops session ls`)."
         );
         return ExitCode::FAILURE;
     };
     let cage = match super::attach::open_cage_handle(cage_pid) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("ops attach: cannot open a handle to session '{id}''s cage: {e}");
+            eprintln!("ops session attach: cannot open a handle to session '{id}''s cage: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1890,15 +1892,15 @@ fn supervise_attach(cage: super::attach::CageHandle, environ: &[u8]) -> io::Resu
     status
 }
 
-/// Render the `ops stop --all` line for an empty registry (stdout): nothing to stop is a no-op
+/// Render the `ops session stop --all` line for an empty registry (stdout): nothing to stop is a no-op
 /// success, so the message is secondary detail (dim).
 fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
     let (dim, r) = (pal.dim, pal.reset);
-    format!("ops stop: {dim}no active sessions to stop.{r}")
+    format!("ops session stop: {dim}no active sessions to stop.{r}")
 }
 
-/// `ops stop <id>...` / `ops stop --all`: stop running sessions. With ids, stop the named ones (the
-/// pids `ops ls` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
+/// `ops session stop <id>...` / `ops session stop --all`: stop running sessions. With ids, stop the named ones (the
+/// pids `ops session ls` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
 /// SIGKILL if it has not exited within `grace`. Targets are resolved through the same
 /// liveness-validated registry `attach` uses, so a stale or reused pid is never signalled. For ids,
 /// reports each and exits 2 if any matched no live session, else 0; for `--all`, stopping nothing is
@@ -1915,7 +1917,7 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///   and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is unaffected; this
 ///   only bites the unusual case of stopping an interactive shell from another terminal. `--all`
 ///   targets *every* session, interactive shells included (a deliberate choice — "all" means all,
-///   matching how `ops stop <id>` already treats a shell), so it can trip this residual on a shell
+///   matching how `ops session stop <id>` already treats a shell), so it can trip this residual on a shell
 ///   open elsewhere; stop a single agent by pid to avoid it.
 pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
@@ -1926,7 +1928,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let sessions = match registry.list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ops stop: cannot read the session registry: {e}");
+            eprintln!("ops session stop: cannot read the session registry: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1953,7 +1955,9 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let mut any_missing = false;
     for id in ids {
         let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
-            eprintln!("ops stop: no live session '{id}' — run `ops ls` to list them.");
+            eprintln!(
+                "ops session stop: no live session '{id}' — run `ops session ls` to list them."
+            );
             any_missing = true;
             continue;
         };
@@ -1980,14 +1984,16 @@ fn render_stop_outcome(
     let (n, ok, warn, dim, r) = (pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     match outcome {
         session::StopOutcome::AlreadyGone => {
-            format!("ops stop: session {n}{pid}{r} ({n}{label}{r}) {dim}had already exited{r}.")
+            format!(
+                "ops session stop: session {n}{pid}{r} ({n}{label}{r}) {dim}had already exited{r}."
+            )
         }
         session::StopOutcome::Terminated => {
-            format!("ops stop: {ok}stopped{r} session {n}{pid}{r} ({n}{label}{r}).")
+            format!("ops session stop: {ok}stopped{r} session {n}{pid}{r} ({n}{label}{r}).")
         }
         session::StopOutcome::Killed => {
             format!(
-                "ops stop: session {n}{pid}{r} ({n}{label}{r}) did not exit within {}s — \
+                "ops session stop: session {n}{pid}{r} ({n}{label}{r}) did not exit within {}s — \
                  {warn}sent SIGKILL{r}.",
                 grace.as_secs()
             )
@@ -1996,7 +2002,7 @@ fn render_stop_outcome(
 }
 
 /// Stop one resolved session and reap its record: SIGTERM, then SIGKILL after `grace`, report the
-/// outcome by pid and label, and drop the record so `ops ls` is clean at once rather than waiting
+/// outcome by pid and label, and drop the record so `ops session ls` is clean at once rather than waiting
 /// for the killed process to stop reading as a zombie.
 fn stop_session(
     registry: &session::Registry,
@@ -3397,7 +3403,7 @@ fn wrap_flake_equip(
     out
 }
 
-/// Record this sandbox in the on-disk registry so `ops ls` can list it. Best
+/// Record this sandbox in the on-disk registry so `ops session ls` can list it. Best
 /// effort: the registry is observability, not a security control, so a failure to
 /// register degrades visibility but never blocks the sandbox. The session is keyed
 /// on `spec.workdir` — the canonical project root, the same identity the runtime
@@ -3414,7 +3420,7 @@ fn register(
 }
 
 /// The owned [`session::SessionRuntime`] for a launch's borrowing [`binds::Runtime`], so the
-/// record can outlive the launch and let `ops attach` reproduce the same home.
+/// record can outlive the launch and let `ops session attach` reproduce the same home.
 fn session_runtime(runtime: binds::Runtime) -> session::SessionRuntime {
     match runtime {
         binds::Runtime::ProjectDefault => session::SessionRuntime::Project,
@@ -3764,7 +3770,7 @@ fn exit_code(status: libc::c_int) -> i32 {
 }
 
 /// Force-terminate a supervised cage and reap it, returning its exit-status code — `SIGTERM`, a
-/// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `ops stop` uses. Invoked
+/// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `ops session stop` uses. Invoked
 /// from the pty relay when a graphical session is force-quit with a double Ctrl+C.
 fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
     unsafe { libc::kill(child, libc::SIGTERM) };
@@ -4062,7 +4068,7 @@ mod tests {
 
     #[test]
     fn session_runtime_maps_each_launch_runtime_to_its_owned_form() {
-        // The owned record runtime `ops attach` reads back must mirror the launch-side runtime, so
+        // The owned record runtime `ops session attach` reads back must mirror the launch-side runtime, so
         // an app session is reproduced in the app's home rather than the project's default.
         assert_eq!(
             session_runtime(binds::Runtime::ProjectDefault),
@@ -4081,7 +4087,7 @@ mod tests {
     #[test]
     fn session_verb_confirmations_are_plain_text_when_uncolored() {
         // A plain palette must leave every confirmation byte-for-byte plain, so a captured stream
-        // (and the existing `ops stop --all` substring assertion) stays unchanged.
+        // (and the existing `ops session stop --all` substring assertion) stays unchanged.
         let p = crate::style::Palette::plain();
         let grace = Duration::from_secs(10);
         assert_eq!(
@@ -4091,16 +4097,16 @@ mod tests {
         );
         assert_eq!(
             render_no_active_sessions(&p),
-            "ops stop: no active sessions to stop."
+            "ops session stop: no active sessions to stop."
         );
         assert_eq!(
             render_gui_stop_hint("opencode-desktop", 4242, &p),
             "ops: opencode-desktop is graphical — press Ctrl+C twice here to quit (closing its window may only \
-             hide it — a tray app keeps running); `ops stop 4242` also stops it."
+             hide it — a tray app keeps running); `ops session stop 4242` also stops it."
         );
         assert_eq!(
             render_stop_outcome(4242, "run", &session::StopOutcome::Terminated, grace, &p),
-            "ops stop: stopped session 4242 (run)."
+            "ops session stop: stopped session 4242 (run)."
         );
         assert_eq!(
             render_stop_outcome(
@@ -4110,11 +4116,11 @@ mod tests {
                 grace,
                 &p
             ),
-            "ops stop: session 7 (app:agent) had already exited."
+            "ops session stop: session 7 (app:agent) had already exited."
         );
         assert_eq!(
             render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p),
-            "ops stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
+            "ops session stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
         );
     }
 
@@ -4178,7 +4184,7 @@ mod tests {
         // The graphical stop hint colors only its app-name identifier (cyan) and names the pid.
         let hint = render_gui_stop_hint("demo-app", 4242, &p);
         assert!(hint.contains(&format!("{}demo-app{}", p.name, p.reset)));
-        assert!(hint.contains("ops stop 4242"));
+        assert!(hint.contains("ops session stop 4242"));
 
         assert!(render_no_active_sessions(&p).contains(p.dim));
     }

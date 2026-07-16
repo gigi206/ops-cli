@@ -154,7 +154,7 @@ ops net logs --all                   # also show refusals a `mute` rule suppress
 ops net logs --json
 ```
 
-Each line carries the session id (the PID `ops ls` shows), the local `hh:mm:ss`
+Each line carries the session id (the PID `ops session ls` shows), the local `hh:mm:ss`
 time, `host:port`, method, path, verdict, and a reason category. `log` is an
 accepted alias.
 
@@ -269,7 +269,7 @@ ops net live --json        # one snapshot object per tick (NDJSON) — for a pip
 ```
 
 Each line is `host:port · transport · age · ↑up ↓down`, grouped by session (the PID
-`ops ls` shows):
+`ops session ls` shows):
 
 ```
 open egress flows:

@@ -1,7 +1,7 @@
 //! A cage's human-readable name, derived once and shown consistently on every face
 //! it surfaces through: the systemd scope (`systemctl --user`, `ps`, `systemd-cgls`),
 //! the in-cage hostname (a shell prompt, `hostname`, `uname -n`), and the session
-//! listing (`ops ls`, `ops net … --session`). All three read the same slug so a cage
+//! listing (`ops session ls`, `ops net … --session`). All three read the same slug so a cage
 //! reads the same everywhere, instead of the opaque `run-p<pid>-i<pid>.scope` systemd
 //! picks and the fixed `sandbox` hostname every cage otherwise shares.
 //!
@@ -105,7 +105,7 @@ pub(crate) fn cage_hostname(slug: &str) -> String {
 }
 
 /// The full display name for a cage — `ops-<slug>` — straight from its app/project identity.
-/// The one function a session listing (`ops ls`, `ops net … --session`) renders from, so the
+/// The one function a session listing (`ops session ls`, `ops net … --session`) renders from, so the
 /// name it shows is *identical* to the cage's hostname and systemd scope (they share this
 /// slug), and cannot drift from them.
 pub(crate) fn cage_name(app: Option<&str>, project: &Path) -> String {

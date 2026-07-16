@@ -1,6 +1,6 @@
-//! Integration tests for the session registry and `ops ls`.
+//! Integration tests for the session registry and `ops session ls`.
 //!
-//! Two properties: `ops ls` reports cleanly when there is nothing to show
+//! Two properties: `ops session ls` reports cleanly when there is nothing to show
 //! (no sandbox needed), and — the M1.4 headline — a second sandbox launched in
 //! the same project shares the first's persistent `$HOME`, i.e. "a 2nd terminal
 //! in the same env". The shared-env test is skipped, not failed, where the host
@@ -84,14 +84,15 @@ fn run(args: &[&str], project: &Path, data: &Path) -> (bool, String) {
 
 #[test]
 fn ls_reports_no_sessions_on_an_empty_registry() {
-    // A fresh data dir holds no records; `ops ls` must succeed and say so. Needs
+    // A fresh data dir holds no records; `ops session ls` must succeed and say so. Needs
     // no sandbox, so it always runs.
     let data = TmpDir::new("data");
     let out = ops()
+        .arg("session")
         .arg("ls")
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops ls");
+        .expect("spawn ops session ls");
     assert!(
         out.status.success(),
         "ops ls should succeed on an empty registry"

@@ -5085,7 +5085,7 @@ fn host_cgroup_path(pid: u32) -> Option<String> {
 }
 
 /// True once `session_pid` has a descendant process in a *child* user namespace — i.e. the cage's
-/// bubblewrap has created its namespaces, so `ops attach` will find a live process to enter. Used to
+/// bubblewrap has created its namespaces, so `ops session attach` will find a live process to enter. Used to
 /// wait deterministically for the background cage to come up, rather than sleeping a fixed guess.
 fn cage_userns_ready(session_pid: u32) -> bool {
     let host = std::fs::read_link("/proc/self/ns/user").ok();
@@ -5119,7 +5119,7 @@ fn cage_userns_ready(session_pid: u32) -> bool {
     false
 }
 
-/// `ops attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
+/// `ops session attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
 /// fresh cage that merely shares the home. Driven through a pty against a live background session,
 /// with two teeth:
 ///  - **live cage, not a reopened one:** the joined shell reads a unique marker the agent wrote to
@@ -5167,7 +5167,7 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     }
 
     // A background agent: write the marker into the cage's own /tmp, then sleep so the cage stays
-    // alive to be attached. `child.id()` is the session pid `ops ls`/`ops attach` use.
+    // alive to be attached. `child.id()` is the session pid `ops session ls`/`ops session attach` use.
     let mut agent = ops()
         .args(["run", "--"])
         .args([
@@ -5195,7 +5195,7 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
         return;
     }
 
-    // Drive `ops attach` through a pty (it needs a real terminal on stdin), exactly like the
+    // Drive `ops session attach` through a pty (it needs a real terminal on stdin), exactly like the
     // `ops shell` supervisor test.
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -5212,14 +5212,14 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
 
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
     let mut attach = ops()
-        .args(["attach", &session_pid.to_string()])
+        .args(["session", "attach", &session_pid.to_string()])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops attach");
+        .expect("spawn ops session attach");
     unsafe { libc::close(slave) };
 
     // Read the agent's live marker; assemble the confinement triple from /proc (so it cannot come
@@ -5272,14 +5272,14 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     );
 }
 
-/// Ending a session tears down every shell attached to it. `ops attach` runs the shell **inside**
+/// Ending a session tears down every shell attached to it. `ops session attach` runs the shell **inside**
 /// the cage's pid namespace, so when the cage's init (bubblewrap, pid 1 of that namespace) dies —
-/// here via `ops stop` — the kernel SIGKILLs every process in the namespace, the attached shell
+/// here via `ops session stop` — the kernel SIGKILLs every process in the namespace, the attached shell
 /// included. So an attached shell can neither outlive nor keep alive the agent it joined. (The same
-/// pid-namespace-collapse mechanism fires when the agent exits on its own; `ops stop` is the
+/// pid-namespace-collapse mechanism fires when the agent exits on its own; `ops session stop` is the
 /// deterministic trigger to assert on.)
 ///
-/// Teeth: with a shell attached and confirmed live, `ops stop <session>` must make the `ops attach`
+/// Teeth: with a shell attached and confirmed live, `ops session stop <session>` must make the `ops session attach`
 /// process exit **on its own** (the SIGKILL of its in-cage shell ends its pty relay) — the test polls
 /// `try_wait` and never kills it, so a survivor is a real failure (a regression where the attached
 /// shell escaped the cage's pid namespace). Skips where the host cannot sandbox.
@@ -5339,14 +5339,14 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     assert_eq!(rc, 0, "openpty failed");
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
     let mut attach = ops()
-        .args(["attach", &session_pid.to_string()])
+        .args(["session", "attach", &session_pid.to_string()])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops attach");
+        .expect("spawn ops session attach");
     unsafe { libc::close(slave) };
 
     // Confirm the attached shell is really live before killing the session — a runtime-assembled
@@ -5393,15 +5393,15 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["stop", &session_pid.to_string()],
+        &["session", "stop", &session_pid.to_string()],
     );
     assert!(
         stop.status.success(),
-        "ops stop failed: {}",
+        "ops session stop failed: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
 
-    // The `ops attach` process must now exit on its own: the pid-namespace collapse SIGKILLs its
+    // The `ops session attach` process must now exit on its own: the pid-namespace collapse SIGKILLs its
     // in-cage shell, ending the pty relay. Poll `try_wait` (master still open, so it is the session's
     // death — not our cleanup — that ends it); never `kill()`, so a survivor is a real failure.
     let kill_deadline = Instant::now() + Duration::from_secs(15);
@@ -5431,7 +5431,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     let _ = agent.wait();
     assert!(
         attach_exited,
-        "`ops attach` outlived the session it joined — the attached shell escaped the cage's pid \
+        "`ops session attach` outlived the session it joined — the attached shell escaped the cage's pid \
          namespace instead of being killed with it"
     );
 }

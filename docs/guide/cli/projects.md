@@ -49,7 +49,7 @@ default** and require `--yes` to apply, since they act on more than one tree at 
 
 Two trees are always protected:
 
-- a tree a **live session** holds is refused — stop it with [`ops stop`](stop.md) first;
+- a tree a **live session** holds is refused — stop it with [`ops session stop`](session.md#stop) first;
 - the **current project's** own tree is refused without `--force`.
 
 ## Examples

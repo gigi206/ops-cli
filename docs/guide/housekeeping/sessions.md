@@ -4,13 +4,13 @@
 background process — a session writes a record, and reading the registry validates and
 prunes it.
 
-See also: [`ops ls`](../cli/ls.md) · [`ops attach`](../cli/attach.md) · [`ops stop`](../cli/stop.md) · [Directory layout](../concepts/directory-layout.md).
+See also: [`ops session`](../cli/session.md) · [Directory layout](../concepts/directory-layout.md).
 
 ## The registry
 
 Each sandbox writes a record under [`<data>/sessions/`](../concepts/directory-layout.md).
 A record is a **liveness-validated hint**, never trusted to be cleaned up:
-[`ops ls`](../cli/ls.md) prunes by liveness, so a crash or `SIGKILL` self-heals rather
+[`ops session ls`](../cli/session.md#ls) prunes by liveness, so a crash or `SIGKILL` self-heals rather
 than leaving a stale entry.
 
 Liveness is `(pid, start_time)` — the process start time from `/proc/<pid>/stat`, which
@@ -38,14 +38,14 @@ ops stop <id>          # SIGTERM, then SIGKILL after the grace delay
 ops stop --all         # every session
 ```
 
-- [`ops attach <id>`](../cli/attach.md) joins the running cage and opens a shell **inside**
+- [`ops session attach <id>`](../cli/session.md#attach) joins the running cage and opens a shell **inside**
   it (the agent's live processes, its real `/tmp`, its network) — like `docker exec -it`. The
   shell re-applies the cage's confinement (seccomp denylist, `no_new_privs`, dropped
   capabilities), so it is never a wider hole than the agent.
-- [`ops stop`](../cli/stop.md) tears down the whole cage subtree (SIGTERM → SIGKILL after
+- [`ops session stop`](../cli/session.md#stop) tears down the whole cage subtree (SIGTERM → SIGKILL after
   `--delay`, default 10s).
 
-The `<id>` is the PID `ops ls` shows.
+The `<id>` is the PID `ops session ls` shows.
 
 ## Background agents
 

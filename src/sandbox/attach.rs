@@ -1,4 +1,4 @@
-//! Real `ops attach`: join a *running* cage's namespaces and open an interactive
+//! Real `ops session attach`: join a *running* cage's namespaces and open an interactive
 //! shell inside it — the agent's live processes, its real `/tmp`, its network — the
 //! way `docker exec -it` works, not a fresh cage that only shares the home on disk.
 //!
@@ -24,7 +24,7 @@
 //! Two residuals, both named and accepted:
 //! - **cgroup resource limits are not shared.** `setns(CLONE_NEWCGROUP)` joins the cgroup
 //!   *namespace* (the `/proc/self/cgroup` view) but not the cage's cgroup *membership*, so the
-//!   attached shell runs in `ops attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
+//!   attached shell runs in `ops session attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
 //!   This is deliberate — an interactive inspection shell should not share the agent's OOM
 //!   ceiling — and it is not a confinement hole (a runaway there is bounded by the host, and the
 //!   security controls above are all re-applied).

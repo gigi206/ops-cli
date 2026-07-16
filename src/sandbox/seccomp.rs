@@ -333,7 +333,7 @@ pub(crate) fn argv_prefix(memfds: &[File]) -> Vec<OsString> {
 
 /// The compiled denylist filters (serialized cBPF) for `policy`, in load order — the
 /// same bytes [`memfds`] hands to bwrap, exposed for direct in-process installation
-/// by [`install_filters`]. `ops attach` needs this because, entering an existing
+/// by [`install_filters`]. `ops session attach` needs this because, entering an existing
 /// cage's namespaces, there is no bwrap to load the filters for it.
 pub(crate) fn filter_bytes(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
     programs(policy)
@@ -347,7 +347,7 @@ const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
 /// exactly as bwrap's two `--add-seccomp-fd` do (a non-matching filter yields
 /// *allow*, an `errno` action outranks it). Returns `false` on the first failure.
 ///
-/// Async-signal-safe: called between `fork` and `exec` (in `ops attach`'s cage-entry
+/// Async-signal-safe: called between `fork` and `exec` (in `ops session attach`'s cage-entry
 /// child), it only reads the prebuilt bytes and builds a `sock_fprog` on the stack —
 /// no allocation. The caller MUST have set `PR_SET_NO_NEW_PRIVS` first, or an
 /// unprivileged install is refused with `EACCES`.

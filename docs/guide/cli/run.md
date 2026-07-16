@@ -14,7 +14,7 @@ See also: [Quick start](../getting-started/quickstart.md) · [`ops shell`](shell
 
 | Option | Meaning |
 |---|---|
-| `--detach` | run in the background as a session [`ops ls`](ls.md)/[`attach`](attach.md)/[`stop`](stop.md) can see |
+| `--detach` | run in the background as a session [`ops session`](session.md) can see |
 | `--config <toml\|@file>` | one-shot config override (any field); repeatable, later wins |
 | `--env KEY=VALUE` | one-shot override of a single cage environment variable; repeatable |
 | `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow=h1,h2` \| `deny=h1,h2` |
@@ -44,5 +44,5 @@ ops run -- id                          # a synthetic identity
 ops run -- cargo test
 ops run --net none -- ./offline-build.sh
 ops run --bind /opt/data:rw -- ./process.sh
-ops run --detach -- ./long-task.sh     # background; see `ops ls`
+ops run --detach -- ./long-task.sh     # background; see `ops session ls`
 ```

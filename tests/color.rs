@@ -85,7 +85,7 @@ fn captured_output_carries_no_ansi_escapes() {
         // Bare `config` prints its page to stderr (a no-subcommand usage error) — captured, so it
         // too must be plain.
         &["config"],
-        &["ls"],
+        &["session", "ls"],
         &["app", "list"],
         &["plugins", "list"],
         &["plugins", "store", "list"],
@@ -205,7 +205,7 @@ fn transactional_confirmations_are_plain_when_captured() {
     // one session-verb confirmation reachable end to end (the stop-outcome and attach lines need a
     // live cage, so they stay presenter-unit-tested). This proves `stop` built its palette from the
     // captured stream rather than hardcoding `colored()`.
-    let stop_all = run(&["stop", "--all"], home.path(), cwd.path());
+    let stop_all = run(&["session", "stop", "--all"], home.path(), cwd.path());
     assert!(
         stop_all.status.success(),
         "stop --all on an empty registry must exit 0:\n{}",

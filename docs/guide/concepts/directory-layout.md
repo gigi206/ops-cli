@@ -31,7 +31,7 @@ subtrees:
 | `gcroots/` | gcroots keeping provisioned closures alive (base, mise, gui, per-project) |
 | `projects/<id>/` | the **per-project** writable store and its locks |
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
-| `sessions/` | the daemonless session registry ([`ops ls`](../housekeeping/sessions.md)) |
+| `sessions/` | the daemonless session registry ([`ops session ls`](../housekeeping/sessions.md)) |
 | `egress/` | per-launch egress proxy sockets and CA material |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
 | `plugins/` | installed [resolver plugins](../secrets/plugins.md) |

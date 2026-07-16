@@ -34,7 +34,7 @@ blocks inside the cage while it waits for your live decision.
    ```
 
    This lists every request parked across every live `ask`-mode session, each with a
-   `<pid>.<seq>` id (the PID is the one [`ops ls`](../housekeeping/sessions.md)
+   `<pid>.<seq>` id (the PID is the one [`ops session ls`](../housekeeping/sessions.md)
    shows). Identical retries of one URL collapse to a single `×N` line, so a tool
    that retries does not flood the list. Add `--json` for scripts, `-a <app>` to
    scope to one app's session(s).
