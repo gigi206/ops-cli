@@ -31,9 +31,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// What kind of sandbox a record describes. Both are tracked: `sbx run` is the
-/// autonomous-agent path (the sandboxes the registry most needs to surface) and
-/// `sbx shell` the interactive one.
+/// What kind of sandbox a record describes. Both are tracked: a command launch (`sbx run
+/// <cmd>`) is the autonomous-agent path (the sandboxes the registry most needs to surface)
+/// and a shell (`sbx run` with no command) the interactive one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Run,
@@ -58,7 +58,7 @@ impl Kind {
 }
 
 /// Which persistent home a session runs in — the bit `sbx session attach` needs to reproduce the same
-/// environment. A plain `sbx run`/`sbx shell` uses the project's default home (`Project`); an
+/// environment. A plain `sbx run` uses the project's default home (`Project`); an
 /// `sbx app` uses its own isolated home, keyed by the app name and its scope (`GlobalApp` shared
 /// across projects, `ProjectApp` per project). Owned (unlike the borrowing launch-side `Runtime`),
 /// so a record outlives the launch that wrote it.
@@ -195,13 +195,81 @@ impl Session {
             close_fd(pidfd);
             return StopOutcome::AlreadyGone;
         }
-        // Snapshot the cage subtree now, while the parent links still hold — once the recorded
-        // process dies its children reparent to init and the links are lost.
-        let cage = descendants(self.pid);
+        // Snapshot the cage members now, while the recorded process is still pinned. Two sources,
+        // unioned: the ppid subtree of the recorded process, and — the reliable one — the members of
+        // the cage's transient systemd scope, read from its cgroup. The subtree alone is racy: the
+        // resource-limit scope can reparent the cage out of the launcher's subtree (onto the systemd
+        // user manager), so `descendants` may miss it and leave the agent running after the launcher
+        // is signalled. The scope's cgroup lists exactly the cage's processes regardless of parentage.
+        let cage = union_cage_members(descendants(self.pid), scope_members(self.pid));
         let outcome = stop_pinned(pidfd, &cage, grace);
         close_fd(pidfd);
         outcome
     }
+}
+
+/// Merge the two cage-member sources — the launcher's ppid subtree and the scope cgroup — into one
+/// list, dropping a pid that appears in both. The scope members are the load-bearing half: when the
+/// resource-limit scope has reparented the cage off the launcher, the ppid subtree is empty or
+/// partial and only the scope cgroup still names the cage, so a teardown that dropped them would
+/// leave the agent running.
+fn union_cage_members(mut subtree: Vec<(u32, u64)>, scope: Vec<(u32, u64)>) -> Vec<(u32, u64)> {
+    for member in scope {
+        if !subtree.iter().any(|&(p, _)| p == member.0) {
+            subtree.push(member);
+        }
+    }
+    subtree
+}
+
+/// The members of the cage's transient resource-limit scope, as `(pid, start_ticks)`.
+///
+/// The launch wraps the cage in a systemd user scope whose unit name embeds the launcher's pid —
+/// `sbx-<slug>-<pid>.scope`, the same pid the session record pins — and the scope's cgroup lists
+/// exactly the cage's processes. Reading it gives a teardown a reliable member set even when the
+/// ppid subtree does not (a scope can reparent the cage off the launcher). Empty when no scope was
+/// created (the best-effort degraded launch on a host without a usable systemd user manager), in
+/// which case the ppid subtree is the only source and covers that case.
+fn scope_members(pid: u32) -> Vec<(u32, u64)> {
+    let Some(procs) = scope_cgroup_procs(pid) else {
+        return Vec::new();
+    };
+    procs
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .filter_map(|p| read_start_ticks(p).map(|start| (p, start)))
+        .collect()
+}
+
+/// Whether a cgroup directory name is the cage scope for `pid` — `sbx-<slug>-<pid>.scope`. The
+/// `-<pid>` segment is dash-delimited, so a longer pid ending in the same digits (or a slug ending
+/// in digits) cannot match by accident.
+fn is_cage_scope(name: &str, pid: u32) -> bool {
+    name.starts_with("sbx-") && name.ends_with(&format!("-{pid}.scope"))
+}
+
+/// Find the cage scope's `cgroup.procs` contents. The scopes live under the user manager's cgroup;
+/// a bounded walk from the user slice locates `sbx-<slug>-<pid>.scope`. `None` if no such scope
+/// exists (a launch degraded to no scope) or the cgroup is unreadable.
+fn scope_cgroup_procs(pid: u32) -> Option<String> {
+    let mut stack = vec![PathBuf::from("/sys/fs/cgroup/user.slice")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if is_cage_scope(name, pid) {
+                return std::fs::read_to_string(path.join("cgroup.procs")).ok();
+            }
+            stack.push(path);
+        }
+    }
+    None
 }
 
 /// Open a pidfd for `pid`, or `None` if the process is already gone.
@@ -393,7 +461,7 @@ impl Registry {
 
     /// Re-validate every record against its running process: return the live sessions (sorted for
     /// stable display) and the count of dead or unparseable records reaped. Pruning happens only
-    /// here, so the directory is bounded by how often this runs: `sbx shell` self-cleans on exit via
+    /// here, so the directory is bounded by how often this runs: an interactive `sbx run` self-cleans on exit via
     /// [`RecordGuard`], an `sbx run` record (no post-exec hook) lingers until the next `sbx session ls` or
     /// `sbx gc` reaps it. `sbx gc` calls this directly to report the prune; `sbx session ls` and the gc
     /// reaper take the live half through [`list`](Self::list).
@@ -447,7 +515,7 @@ impl Registry {
 }
 
 /// Removes a session record when dropped — the eager, best-effort cleanup for a
-/// supervised session (`sbx shell`). It covers normal/error/panic exits; a
+/// supervised session (an interactive `sbx run`). It covers normal/error/panic exits; a
 /// `SIGKILL` skips it, which is exactly why [`Registry::list`] does not rely on
 /// it and prunes by liveness instead.
 pub(crate) struct RecordGuard {
@@ -592,6 +660,47 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    #[test]
+    fn union_cage_members_keeps_scope_members_when_the_ppid_subtree_misses_them() {
+        // The exact regression the fix guards: the resource-limit scope reparented the cage off the
+        // launcher, so the ppid subtree is empty — the scope cgroup's members are the only ones that
+        // reach the teardown sweep. A revert to descendants-only would return `[]` and fail here.
+        assert_eq!(
+            union_cage_members(vec![], vec![(10, 1), (11, 2)]),
+            vec![(10, 1), (11, 2)]
+        );
+        // Both sources name the same process: no duplicate (a double SIGKILL is harmless, but the
+        // dedup keeps the sweep list honest).
+        assert_eq!(
+            union_cage_members(vec![(10, 1)], vec![(10, 1)]),
+            vec![(10, 1)]
+        );
+        // Disjoint sources are combined.
+        assert_eq!(
+            union_cage_members(vec![(10, 1)], vec![(11, 2)]),
+            vec![(10, 1), (11, 2)]
+        );
+        // No scope (degraded launch, no systemd): the ppid subtree is used unchanged.
+        assert_eq!(union_cage_members(vec![(10, 1)], vec![]), vec![(10, 1)]);
+    }
+
+    #[test]
+    fn is_cage_scope_matches_the_pid_at_a_dash_boundary() {
+        // The exact cage scope for pid 42.
+        assert!(is_cage_scope("sbx-probe-42.scope", 42));
+        // A slug that itself contains digits/dashes still matches on the pid segment.
+        assert!(is_cage_scope("sbx-my-app-2-42.scope", 42));
+        // A longer pid ending in the same digits must NOT match (no dash boundary).
+        assert!(!is_cage_scope("sbx-probe-342.scope", 42));
+        // A shorter pid that is a suffix of the real one must NOT match.
+        assert!(!is_cage_scope("sbx-probe-342.scope", 2));
+        // Not a cage scope / not a scope / wrong pid.
+        assert!(!is_cage_scope("user-1000.slice", 42));
+        assert!(!is_cage_scope("sbx-probe-42.service", 42));
+        assert!(!is_cage_scope("other-probe-42.scope", 42));
+        assert!(!is_cage_scope("sbx-probe-99.scope", 42));
+    }
 
     fn session_at(project: &str, pid: u32, start: u64, kind: Kind) -> Session {
         Session {

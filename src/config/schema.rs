@@ -571,8 +571,8 @@ pub(crate) struct NetworkTable {
     /// posture. Only meaningful on an `[app.<name>.network]` (or an imported profile's `[network]`):
     /// every Mode-B app defaults to `["GET","HEAD"]` so an agent reads but does not write unless a
     /// rule opts a host out with `{*}`/`{VERB}`; this field overrides that default for the app (e.g.
-    /// `["GET","POST"]`, or `["*"]` for all verbs). Ignored on the baseline `[network]` — `sbx run`/
-    /// `sbx shell` (Mode A) stay all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
+    /// `["GET","POST"]`, or `["*"]` for all verbs). Ignored on the baseline `[network]` — `sbx run`
+    /// (Mode A) stays all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_methods: Option<Vec<String>>,
 }

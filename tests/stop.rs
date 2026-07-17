@@ -332,7 +332,7 @@ fn stop_tears_down_a_supervised_app_session() {
     // supervisor and supervises the cage running `sleep`.
     let mut agent = KillOnDrop(
         sbx()
-            .args(["app", "probe"])
+            .args(["app", "run", "probe"])
             .current_dir(project.path())
             .env("XDG_DATA_HOME", data.path())
             .env("XDG_STATE_HOME", state.path())
@@ -448,11 +448,11 @@ fn stop_all_stops_every_session() {
             project.path(),
             data.path(),
             state.path(),
-            &["app", app, "--detach"],
+            &["app", "run", app, "--detach"],
         );
         assert!(
             started.status.success(),
-            "sbx app {app} --detach must exit 0: {}",
+            "sbx app run {app} --detach must exit 0: {}",
             String::from_utf8_lossy(&started.stderr)
         );
         let pid = parse_detach_pid(&started.stderr).unwrap_or_else(|| {

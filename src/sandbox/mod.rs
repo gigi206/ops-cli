@@ -66,7 +66,7 @@ pub(crate) use gc::{
 };
 pub(crate) use launch::{
     app, attach, effective_lock_target, gc, projects_list, projects_rm, projects_show,
-    rm_apply as projects_rm_apply, run, run_mise, shell, stop, superseded_reclaimable_hint,
+    rm_apply as projects_rm_apply, run, run_mise, stop, superseded_reclaimable_hint,
     upgrade_mise_packages,
 };
 pub(crate) use naming::cage_name;

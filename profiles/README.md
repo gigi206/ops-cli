@@ -272,7 +272,7 @@ completions to, an account it logs into, a package registry it installs from) mu
 all verbs with a `{*}` prefix — e.g. `"{*} https://api.anthropic.com"`. Pure download/catalog
 hosts stay `"{GET,HEAD} https://models.dev"` (least privilege). This is why the shipped profiles
 prefix their API/install hosts with `{*}` and their catalog hosts with `{GET,HEAD}`. (The bare
-interactive `sbx run`/`sbx shell` — Mode A — is unaffected; it stays all-verbs.)
+interactive `sbx run` — Mode A — is unaffected; it stays all-verbs.)
 
 To change an app's default for *unscoped* rules, set `[network] default_methods` in the profile
 (`["GET", "HEAD"]` is the built-in; `["*"]` opts the app out, back to all verbs; or a custom set

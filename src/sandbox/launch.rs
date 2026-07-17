@@ -2,10 +2,11 @@
 //! process.
 //!
 //! Two launch models, by terminal policy:
-//! - `sbx run` is non-interactive: it execs bwrap and lets it *replace* the sbx
-//!   process, so the command inherits the real stdio and its exit status becomes
-//!   sbx's. The spec uses [`TerminalPolicy::NewSession`].
-//! - `sbx shell` is interactive: sbx stays alive as a **pty supervisor**. It
+//! - **non-interactive** (`sbx run` with a piped/non-tty stdin, or `--detach`): it execs
+//!   bwrap and lets it *replace* the sbx process, so the command inherits the real stdio
+//!   and its exit status becomes sbx's. The spec uses [`TerminalPolicy::NewSession`].
+//! - **interactive** (`sbx run` on a real terminal — a shell when no command is given, or
+//!   an interactive command): sbx stays alive as a **pty supervisor**. It
 //!   gives the sandbox a private controlling terminal (so job control works
 //!   inside) and relays bytes to and from the real terminal (which the sandbox
 //!   therefore cannot reach). The spec uses [`TerminalPolicy::PrivateTty`], which
@@ -77,30 +78,62 @@ struct Prepared {
     userland: Userland,
 }
 
-/// `sbx run [--] <cmd>`: run a command inside the project sandbox, replacing the
-/// sbx process so the command's exit status becomes sbx's.
+/// `sbx run [--] [<cmd>]`: run a command inside the project sandbox, or — with no command — open
+/// the project shell. The launch mode follows stdin: a real terminal (and not `--detach`) runs
+/// interactively under the pty supervisor, so a shell or a TUI gets a private controlling terminal
+/// with job control; a piped/non-tty stdin, or `--detach`, keeps the exec-replace / supervised path
+/// (stdio inherited, exit status propagated).
 pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override) -> ExitCode {
-    if cmd.is_empty() {
-        eprintln!("sbx: usage: {}", crate::help::synopsis("run"));
+    // With no command, `sbx run` opens the project shell — which needs a terminal, so a detached
+    // no-command launch is refused rather than started into the void.
+    if cmd.is_empty() && detach {
+        eprintln!("sbx: `sbx run --detach` needs a command (a detached shell has no terminal).");
         return ExitCode::from(2);
     }
     let mut prep = match prepare_with(&ov) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    // The override is the authoritative final word over the resolved baseline (`sbx run`/`sbx
-    // shell` have no app overlay, so here is that final point).
+    // The override is the authoritative final word over the resolved baseline (`sbx run` has no app
+    // overlay, so here is that final point).
     if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
         return code;
     }
-    launch(
-        prep,
-        binds::Runtime::ProjectDefault,
-        Kind::Run,
-        cmd,
-        detach,
-        "run",
-    )
+
+    // SAFETY: `isatty` only inspects fd 0.
+    let interactive = !detach && unsafe { libc::isatty(0) } == 1;
+
+    if cmd.is_empty() {
+        // No command: open the project shell. Interactive gets the full pty shell (mise activation
+        // and the `(sbx-<slug>)` prompt via the synthetic rc); a piped stdin runs a non-interactive
+        // shell reading its script from stdin, reaching activated tools through the shims on PATH.
+        return if interactive {
+            launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
+        } else {
+            let shell = vec![prep.userland.shell_bin.clone().into_os_string()];
+            launch(
+                prep,
+                binds::Runtime::ProjectDefault,
+                Kind::Shell,
+                shell,
+                false,
+                "run",
+            )
+        };
+    }
+
+    if interactive {
+        launch_pty_supervised(&prep, binds::Runtime::ProjectDefault, Kind::Run, cmd)
+    } else {
+        launch(
+            prep,
+            binds::Runtime::ProjectDefault,
+            Kind::Run,
+            cmd,
+            detach,
+            "run",
+        )
+    }
 }
 
 /// Apply the (non-channel) part of a one-shot override to a prepared config, aborting the launch
@@ -531,7 +564,7 @@ pub(crate) fn app(
 
     // An interactive foreground launch (a real terminal on stdin) runs under the pty supervisor:
     // the agent's TUI gets a private controlling terminal and live terminal-resize propagation
-    // (the same isolation `sbx shell` uses — the real terminal stays unreachable). A detached
+    // (the same isolation an interactive `sbx run` uses — the real terminal stays unreachable). A detached
     // agent has no terminal, and a piped/non-tty invocation must not be handed one, so both keep
     // the exec-replace / supervised `NewSession` path.
     let code = if interactive {
@@ -553,7 +586,7 @@ fn network_posture_name(network: &crate::config::NetworkPolicy) -> &'static str 
 }
 
 /// Run an `sbx app` launch in the foreground and return the egress it logged, for `--net-learn`.
-/// Interactive launches use the pty supervisor (a private controlling terminal, like `sbx shell`);
+/// Interactive launches use the pty supervisor (a private controlling terminal, like an interactive `sbx run`);
 /// a non-tty one supervises directly. Either way the egress guard is held for the whole run, then
 /// its log is snapshotted before the guard is dropped — so the returned events are the run's full
 /// record. A `build()` failure is `Err(code)`, distinct from a clean run with no denials (`Ok` with
@@ -617,7 +650,7 @@ fn available_apps(cfg: &crate::config::Resolved) -> String {
 ///
 /// A tool the agent *activates* (`mise use [-g] nix:<pkg>`) is on PATH in later
 /// launches — through the shims dir on PATH for `sbx run`, and `mise activate` for the
-/// `sbx shell` — and persists in the project's store. A bare `mise install` (not
+/// an interactive `sbx run` — and persists in the project's store. A bare `mise install` (not
 /// activated) persists too and `mise exec`/`mise which` resolve it, but it is not on
 /// PATH, matching mise's own install-vs-use split. This path is intentionally open — it
 /// works whether or not the project is trusted, the agent-self-equip posture — unlike
@@ -634,7 +667,7 @@ pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
 /// group can outlive the config it was derived from. Mirrors [`binds::Runtime`], which borrows
 /// the name; [`GroupHome::runtime`] rebuilds the borrowing form at launch.
 enum GroupHome {
-    /// The project's default shell home — where `sbx run`/`sbx shell` equip baseline tools.
+    /// The project's default shell home — where `sbx run` equip baseline tools.
     ProjectDefault,
     /// An app's home shared across projects (`home_scope = "global"`).
     GlobalApp(String),
@@ -668,7 +701,7 @@ struct MiseGroup {
 }
 
 /// The `mise:` `[packages]` groups to roll forward — generic over every declared group: the
-/// project baseline (equipped in its default home by `sbx run`/`sbx shell`) and each app
+/// project baseline (equipped in its default home by `sbx run`) and each app
 /// (equipped in its own home, keyed by `home_scope`), each with its merged trusted `mise:`
 /// token set. A group with no trusted `mise:` token — and an app with no command — is omitted,
 /// so a project or app without any produces no cage, and no app is special-cased. Trusted-only
@@ -2007,34 +2040,14 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
     })
 }
 
-/// `sbx shell`: an interactive shell inside the project sandbox, under a pty
-/// supervisor so job control works.
-pub(crate) fn shell(ov: crate::config::Override) -> ExitCode {
-    // SAFETY: `isatty` only inspects fd 0. An interactive shell needs a real
-    // terminal to make raw; refuse cleanly rather than corrupt a pipe.
-    if unsafe { libc::isatty(0) } != 1 {
-        eprintln!(
-            "sbx: `sbx shell` needs a terminal on stdin (use `sbx run` for non-interactive use)."
-        );
-        return ExitCode::from(2);
-    }
-    let mut prep = match prepare_with(&ov) {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
-    if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
-        return code;
-    }
-    launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
-}
-
 /// Launch an interactive shell in the cage for `runtime`, under a pty supervisor so job control
-/// works — the shared body of `sbx shell` (the project's default home) and `sbx session attach` (which
-/// reproduces a session's home, including an app's isolated one). The command is the resolved
-/// interactive shell started with `--rcfile` at the synthetic in-cage rc, which activates mise so
-/// the project's activated tools (`mise use`) manage PATH/env in the interactive shell — mise's
-/// documented interactive mechanism. (`sbx run` instead reaches activated tools through the shims
-/// dir on PATH, with no shell to hook.) Assumes stdin is a terminal (the callers check).
+/// works — the shared body of `sbx run` with no command (the project's default home) and `sbx
+/// session attach` (which reproduces a session's home, including an app's isolated one). The command
+/// is the resolved interactive shell started with `--rcfile` at the synthetic in-cage rc, which
+/// activates mise so the project's activated tools (`mise use`) manage PATH/env in the interactive
+/// shell — mise's documented interactive mechanism. (A non-interactive `sbx run` instead reaches
+/// activated tools through the shims dir on PATH, with no shell to hook.) Assumes stdin is a terminal
+/// (the callers check).
 fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCode {
     let cmd = vec![
         prep.userland.shell_bin.clone().into_os_string(),
@@ -2046,7 +2059,7 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
 
 /// Launch `cmd` under the pty supervisor: the cage gets a *private* controlling terminal (so job
 /// control and terminal-resize propagation work inside), while the real launching terminal stays
-/// unreachable — sbx holds the pty master and never execs. Shared by `sbx shell`, `sbx session attach`,
+/// unreachable — sbx holds the pty master and never execs. Shared by an interactive `sbx run`, `sbx session attach`,
 /// and interactive `sbx app`.
 ///
 /// The session is registered and its record held by a [`RecordGuard`] that unlinks it when the
@@ -2062,7 +2075,7 @@ fn launch_pty_supervised(
 ) -> ExitCode {
     // A graphical app's real interface is its window, not this terminal — Ctrl+C is forwarded
     // faithfully but a GUI app may ignore it — so note how to stop it. Only for a foreground app
-    // launch (`Kind::Run`) with a display; a shell (`sbx shell`/`sbx session attach`, `Kind::Shell`) uses
+    // launch (`Kind::Run`) with a display; a shell (an interactive `sbx run`/`sbx session attach`, `Kind::Shell`) uses
     // Ctrl+C normally and needs no hint. Computed before `cmd`/`runtime` move into `build`.
     let stop_hint = (matches!(kind, Kind::Run)
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland))
@@ -2231,7 +2244,7 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
 }
 
 /// Build the in-cage argv for an attach. With no command this is the interactive shell reading the
-/// in-cage rc (mise activation + the `(sbx-<slug>)` prompt), exactly like `sbx shell`. With a
+/// in-cage rc (mise activation + the `(sbx-<slug>)` prompt), exactly like an interactive `sbx run`. With a
 /// command it is `bash -c 'exec "$@"' bash <cmd> [args…]`: bash resolves `<cmd>` on the cage PATH
 /// (from the cage environment passed as its `envp`) and execs it **in place**, so the command's
 /// exit status propagates; the command is passed **positionally** (`"$@"`), so no argument is ever
@@ -2441,8 +2454,8 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///   `<data>/egress/` on disk — the same leak any crash or `SIGKILL` of that process already
 ///   produces; a future sweep of stale egress artefacts (alongside the session housekeeping) is the
 ///   clean fix.
-/// - stopping an `sbx shell` session signals its pty supervisor, whose terminal-state restore is
-///   also a RAII guard, so the owner's terminal (where that `sbx shell` runs) is left in raw mode
+/// - stopping an interactive `sbx run` session signals its pty supervisor, whose terminal-state restore is
+///   also a RAII guard, so the owner's terminal (where that an interactive `sbx run` runs) is left in raw mode
 ///   and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is unaffected; this
 ///   only bites the unusual case of stopping an interactive shell from another terminal. `--all`
 ///   targets *every* session, interactive shells included (a deliberate choice — "all" means all,
@@ -3837,7 +3850,7 @@ fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// Wrap `cmd` so the cage equips a set of mise tools before running it: a static bash that runs
 /// `mise <verb> <tokens>` (its stdout redirected to stderr so a piped command's stdout stays
 /// clean) and then `exec`s the real command — which therefore stays the cage's main process,
-/// leaving `sbx shell`'s pty job control unchanged. The `verb` is an sbx-chosen literal
+/// leaving an interactive `sbx run`'s pty job control unchanged. The `verb` is an sbx-chosen literal
 /// (`install` for the project's local `.mise.toml` tools, `use -g` for the app's `[packages]
 /// mise:` ones); the tokens and the command ride `"$@"` positionally, so only the absolute mise
 /// path, the sbx-chosen verb, and the integer token count are interpolated into the script — a
@@ -3872,7 +3885,7 @@ fn wrap_mise_equip(
 /// that, for each `(ref, out-link, key)` triple, runs `nix build <ref> --no-write-lock-file
 /// --out-link <out-link>` unless the out-link is already realised, registers a host-resolvable gc
 /// root for the build,
-/// then `exec`s the real command (which stays the cage's main process, leaving `sbx shell`'s pty
+/// then `exec`s the real command (which stays the cage's main process, leaving an interactive `sbx run`'s pty
 /// job control unchanged). Only the absolute `nix` path, the out-link parent directory, and the
 /// integer triple count are interpolated into the script — the refs, out-links, and keys ride
 /// `"$@"` positionally, so a value from config can never inject shell. The short-circuit
@@ -5340,7 +5353,7 @@ mod tests {
 
     #[test]
     fn attach_argv_with_no_command_is_the_interactive_rc_shell() {
-        // A bare attach reuses the same rc shell as `sbx shell`, so the joined shell gets mise
+        // A bare attach reuses the same rc shell as an interactive `sbx run`, so the joined shell gets mise
         // activation and the `(sbx-<slug>)` prompt.
         let argv = attach_argv(&[]).expect("shell argv builds");
         assert_eq!(

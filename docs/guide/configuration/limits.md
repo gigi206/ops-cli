@@ -87,7 +87,7 @@ To tune a single limit for one launch without editing the file, use `--limit
 
 ```sh
 sbx run --limit tasks_max=8192 -- ./build.sh
-SBX_LIMIT_MEMORY_MAX=16G sbx shell
+SBX_LIMIT_MEMORY_MAX=16G sbx run
 ```
 
 The key is one of `memory_high` / `memory_max` / `tasks_max` (the `SBX_LIMIT_` suffix

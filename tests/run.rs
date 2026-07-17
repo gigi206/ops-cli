@@ -132,11 +132,18 @@ fn sbx_in(project: &Path, data: &Path, state: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn run_without_a_command_is_a_usage_error() {
-    // fails before any sandbox work, so it needs no capable host
-    let out = sbx().arg("run").output().expect("spawn sbx run");
+fn run_detach_without_a_command_is_a_usage_error() {
+    // `sbx run` with no command opens the project shell, which needs a terminal — so a detached
+    // no-command launch is refused. Fails before any sandbox work, so it needs no capable host.
+    // (A plain `sbx run` with no command opens a shell instead; that path is covered by the pty
+    // test in tests/shell.rs.)
+    let out = sbx()
+        .args(["run", "--detach"])
+        .output()
+        .expect("spawn sbx run");
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("needs a command"), "got: {stderr}");
 }
 
 #[test]
@@ -5589,7 +5596,7 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     }
 
     // Drive `sbx session attach` through a pty (it needs a real terminal on stdin), exactly like the
-    // `sbx shell` supervisor test.
+    // interactive `sbx run` supervisor test.
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     let rc = unsafe {

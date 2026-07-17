@@ -32,7 +32,7 @@ A project's `nix:` tools are host-provisioned and **trusted-only** (like
 ## Non-`nix:` backends — auto-equipped in-cage
 
 A project's non-`nix:` mise tools (`aqua:`, `github:`, `npm:`, `cargo:`, a plain
-registry token, …) are **auto-installed in-cage at launch**, so `sbx run` / `sbx shell`
+registry token, …) are **auto-installed in-cage at launch**, so `sbx run`
 / `sbx app` start with them on `PATH` without a manual `sbx mise install`:
 
 ```toml

@@ -53,7 +53,7 @@ sbx run --net none --limit tasks_max=8192 -- ./build.sh
 sbx app run claude-code --net none        # cut the app's network for one run
 sbx run --seccomp ptrace -- gdb ./a.out   # relax the denylist for one debug session
 sbx run --device /dev/kvm -- ./vm.sh      # grant a device for one run
-SBX_NET=none SBX_BIND=/opt/data:ro sbx shell
+SBX_NET=none SBX_BIND=/opt/data:ro sbx run
 ```
 
 #### `--seccomp` / `--device` — relaxing the cage for one launch

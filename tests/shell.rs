@@ -1,7 +1,7 @@
-//! Integration test for `sbx shell`: drive the interactive shell through a pty
-//! and assert the *property* that separates it from `sbx run` — the sandbox gets
-//! a controlling terminal, so job control works (not merely "a command ran").
-//! Skipped, not failed, where the host cannot sandbox.
+//! Integration test for the interactive `sbx run` (no command): drive the shell it
+//! opens through a pty and assert the *property* that separates it from a plain command
+//! launch — the sandbox gets a controlling terminal, so job control works (not merely
+//! "a command ran"). Skipped, not failed, where the host cannot sandbox.
 //!
 //! On a host with a systemd user session this also exercises the *wrapped* launch
 //! chain: the pty supervisor's child becomes the resource-limit scope launcher,
@@ -84,18 +84,18 @@ fn host_can_sandbox(project: &Path, data: &Path) -> bool {
 }
 
 #[test]
-fn shell_gives_the_sandbox_a_controlling_terminal() {
+fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal() {
     let project = TmpDir::new("proj");
     let data = TmpDir::new("data");
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping sbx shell smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!("skipping interactive sbx run smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
-    // `sbx shell` needs a tty on stdin; give it a pty and drive it through the
-    // master end.
+    // A no-command `sbx run` opens an interactive shell when stdin is a terminal; give it a
+    // pty and drive it through the master end.
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     let rc = unsafe {
@@ -112,14 +112,14 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them
     // as stdin/out/err.
     let mut child = sbx()
-        .arg("shell")
+        .arg("run")
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn sbx shell");
+        .expect("spawn sbx run");
     unsafe { libc::close(slave) };
 
     // The script. `( : < /dev/tty )` succeeds only when the shell has a

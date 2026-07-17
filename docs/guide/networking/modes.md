@@ -47,7 +47,7 @@ in the per-project store.
 
 The host network, unfiltered — the cage shares your network namespace and reaches
 whatever your host can. This is the **default** when `network` is unset. It is the
-right posture for your own interactive shell (`sbx shell`) and for trusted work
+right posture for your own interactive shell (`sbx run`) and for trusted work
 where filtering would only get in the way. There is no proxy, so no rules, stats,
 or log apply.
 
@@ -190,7 +190,7 @@ default_methods = ["GET", "POST"]   # this app may also POST to unscoped hosts
 # default_methods = ["*"]           # all verbs (opt the whole app back to Mode A behavior)
 ```
 
-This field is **ignored on the baseline** `[network]` — `sbx run` and `sbx shell`
+This field is **ignored on the baseline** `[network]` — `sbx run`
 (Mode A) stay all-verbs. It only changes an app's unscoped (`{...}`-less) allow
 rules; an explicit `{VERB}` or `{*}` on a rule always keeps its own verbs. See the
 [rule grammar](rules.md#method-scoping) for how a per-rule prefix interacts with

@@ -26,7 +26,7 @@ derives its runtime id from — so the registry and the runtime never disagree.
 |---|---|
 | [`sbx run --detach`](../cli/run.md) | a background session |
 | [`sbx app run --detach`](../cli/app.md) | a background agent session |
-| [`sbx shell`](../cli/shell.md) | while the shell runs (unlinked on exit) |
+| [`sbx run`](../cli/run.md) | while the shell runs (unlinked on exit) |
 | interactive [`sbx app`](../cli/app.md) | while the app runs |
 
 ## Listing, attaching, stopping
@@ -64,4 +64,4 @@ sbx stop <id>         # done
 
 Because a project's runtime is deterministic (derived from the canonical project path),
 a second sandbox launched in the same project shares its persistent `$HOME` — so opening
-a second `sbx shell` in the same project "just works" without any session coordination.
+a second `sbx run` in the same project "just works" without any session coordination.

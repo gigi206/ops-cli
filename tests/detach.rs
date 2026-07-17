@@ -224,7 +224,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     };
 
     // --- The supervised path -------------------------------------------------------------------
-    // `sbx app sup --detach` must RETURN (the teeth: a foreground launch would block until the
+    // `sbx app run sup --detach` must RETURN (the teeth: a foreground launch would block until the
     // agent exits, ~8.7h from now — so the mere fact this call completes proves detachment). It
     // returns only once the cage is ready, so the session is real by the time we get the pid.
     let started = sbx_run(
@@ -235,7 +235,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     );
     assert!(
         started.status.success(),
-        "sbx app sup --detach must exit 0: {}",
+        "sbx app run sup --detach must exit 0: {}",
         String::from_utf8_lossy(&started.stderr)
     );
     let sup_pid = parse_detach_pid(&started.stderr).unwrap_or_else(|| {
@@ -303,7 +303,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     );
     assert!(
         started.status.success(),
-        "sbx app plain --detach must exit 0: {}",
+        "sbx app run plain --detach must exit 0: {}",
         String::from_utf8_lossy(&started.stderr)
     );
     let plain_pid = parse_detach_pid(&started.stderr).unwrap_or_else(|| {

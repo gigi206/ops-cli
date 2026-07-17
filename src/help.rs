@@ -54,33 +54,9 @@ const PAGES: &[Page] = &[
             channel revision.",
     },
     Page {
-        path: &["shell"],
-        synopsis: "sbx shell [override flags]",
-        summary: "open an interactive sandboxed shell in the current project",
-        options: &[
-            (
-                "--config <toml|@file>",
-                "one-shot config override for this launch: inline TOML (or @file) shaped like an \
-                 sbx.toml; repeatable, later wins",
-            ),
-            (
-                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
-                 --seccomp / --device / --gpu / --audio / --dbus",
-                "typed one-shot overrides for a single field each; see `sbx help run`",
-            ),
-        ],
-        details:
-            "Launches an interactive shell inside the project sandbox, with job control and a\n\
-            synthetic identity. The project's trusted config drives the environment; the\n\
-            host home and the rest of the host filesystem are absent (confidentiality by\n\
-            absence).\n\n\
-            A one-shot override (`--config` or the typed flags, and their `SBX_*` environment\n\
-            equivalents) is the final word for this launch — see `sbx help run` for the rules.",
-    },
-    Page {
         path: &["run"],
-        synopsis: "sbx run [--detach] [override flags] [--] <command> [args...]",
-        summary: "run a command inside the project sandbox",
+        synopsis: "sbx run [--detach] [override flags] [--] [command [args...]]",
+        summary: "run a command inside the project sandbox, or open its shell",
         options: &[
             (
                 "--detach",
@@ -144,6 +120,12 @@ const PAGES: &[Page] = &[
             "Runs <command> inside the project sandbox and propagates its exit status. A `--`\n\
             separates sbx's flags from the command's, so `sbx run -- --detach` runs the\n\
             literal `--detach`.\n\n\
+            With no command, `sbx run` opens the project shell: on a terminal, an interactive\n\
+            shell with job control and a synthetic identity (the host home and the rest of the\n\
+            host filesystem are absent — confidentiality by absence); on a pipe, a\n\
+            non-interactive shell reading its script from stdin. An interactive command (a real\n\
+            terminal on stdin, not `--detach`) runs under a private controlling terminal too, so\n\
+            a TUI gets job control; a non-tty or detached launch keeps inherited stdio.\n\n\
             One-shot overrides let you change any configuration field for a single launch without\n\
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
             exactly like an `sbx.toml`, so it can set any field; the typed flags\n\
@@ -1466,7 +1448,7 @@ pub fn synopsis_of(path: &[&str]) -> &'static str {
     find(path).map_or("sbx <command>", |p| p.synopsis)
 }
 
-/// The argument grammar for a top-level command, e.g. `synopsis("shell")`.
+/// The argument grammar for a top-level command, e.g. `synopsis("run")`.
 pub fn synopsis(name: &str) -> &'static str {
     synopsis_of(&[name])
 }
@@ -1475,29 +1457,6 @@ pub fn synopsis(name: &str) -> &'static str {
 /// interception from swallowing an unknown command (which has its own diagnosis).
 pub fn is_command(name: &str) -> bool {
     find(&[name]).is_some()
-}
-
-/// For an unknown top-level command that is really a subcommand verb, the full path to
-/// suggest. Verbs with a *single* parent are listed; a genuinely ambiguous verb (`rm`,
-/// `list`, `info`, `install` each belong to more than one parent) would misdirect, so it
-/// falls through to the generic `sbx --help` pointer instead. `ls` is a deliberate
-/// exception: it is an alias of both `session` and `projects`, but `sbx ls` historically
-/// meant the session list, so pointing its old spelling at `sbx session ls` is the least
-/// surprising migration aid.
-pub fn subcommand_hint(name: &str) -> Option<&'static str> {
-    Some(match name {
-        // The session verbs used to be top-level; point their old spellings at the namespace.
-        "ls" => "sbx session ls",
-        "attach" => "sbx session attach",
-        "stop" => "sbx session stop",
-        "import" => "sbx app import",
-        "export" => "sbx app export",
-        "publish" => "sbx plugins store publish",
-        "add" => "sbx plugins store add",
-        "update" => "sbx plugins store update",
-        "store" => "sbx plugins store",
-        _ => return None,
-    })
 }
 
 /// One aligned `  flag    description` line, the flag painted in `color`.

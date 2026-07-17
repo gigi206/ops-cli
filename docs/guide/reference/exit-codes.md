@@ -15,7 +15,7 @@ See also: [`sbx run`](../cli/run.md) · [One-shot overrides](../configuration/ov
 
 ## Launch verbs propagate the command's status
 
-[`sbx run`](../cli/run.md), [`sbx shell`](../cli/shell.md), and [`sbx app`](../cli/app.md)
+[`sbx run`](../cli/run.md) and [`sbx app`](../cli/app.md)
 propagate the status of the program they launched:
 
 ```sh

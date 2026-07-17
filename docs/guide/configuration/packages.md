@@ -196,7 +196,7 @@ To add a package for a single launch without editing the file, use `--package
 
 ```sh
 sbx run --package jq=nix:jq -- ./tool
-SBX_PACKAGE_ripgrep=mise:aqua:BurntSushi/ripgrep sbx shell
+SBX_PACKAGE_ripgrep=mise:aqua:BurntSushi/ripgrep sbx run
 ```
 
 The value carries the same mandatory backend prefix as the field

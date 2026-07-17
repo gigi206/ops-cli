@@ -58,8 +58,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | Command | Purpose |
 |---|---|
 | [`doctor`](cli/doctor.md) | verify the runtime prerequisites |
-| [`run`](cli/run.md) | run a command in the sandbox |
-| [`shell`](cli/shell.md) | an interactive sandboxed shell |
+| [`run`](cli/run.md) | run a command in the sandbox, or open its shell |
 | [`app`](cli/app.md) | launch or manage named application profiles |
 | [`mise`](cli/mise.md) | run the in-cage mise to self-equip a toolchain |
 | [`search`](cli/search.md) | discover `nix:` tools via nixhub |

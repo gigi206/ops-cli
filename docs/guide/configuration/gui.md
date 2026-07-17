@@ -76,7 +76,7 @@ or `SBX_GUI`:
 
 ```sh
 sbx run --gui wayland -- some-electron-app
-SBX_GUI=none sbx shell
+SBX_GUI=none sbx run
 ```
 
 `--gui` takes `none | wayland`. The command line beats the environment, and both beat

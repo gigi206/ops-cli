@@ -100,7 +100,7 @@ fn is_reserved_env_key(key: &str) -> bool {
                 | "ENV"
                 // Interactive-shell code-exec hooks: bash runs `PROMPT_COMMAND` before each prompt
                 // and evaluates `$(...)` in `PS1`, so an untrusted `[env]` setting them would run
-                // code in the user's later Mode-A `sbx shell`, exactly like `BASH_ENV`/`ENV`.
+                // code in the user's later Mode-A interactive `sbx run`, exactly like `BASH_ENV`/`ENV`.
                 | "PROMPT_COMMAND"
                 | "PS1"
                 | "IFS"
@@ -619,7 +619,7 @@ pub(crate) struct Resolved {
     pub(crate) declared_secrets: Vec<HeaderSecret>,
     /// Named application launch profiles, each a gated overlay over this baseline. Keyed
     /// by name; `sbx app <name>` looks one up and folds it on with [`Resolved::merge_app`].
-    /// `sbx run`/`sbx shell` ignore them.
+    /// `sbx run` ignore them.
     pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
     pub(crate) warnings: Vec<String>,
@@ -700,7 +700,7 @@ pub(crate) struct ResolvedApp {
     /// The verbs this app's unscoped (`{...}`-less) allow rules default to — its read-by-default
     /// posture. Every Mode-B app defaults to `Only(["GET","HEAD"])`; an `[app.<name>.network]
     /// default_methods` override sets a different set (or `Any` for `["*"]`, all verbs). Applied to
-    /// the app's effective allowlist at [`merge_app`]; the baseline `sbx run`/`sbx shell` never gets
+    /// the app's effective allowlist at [`merge_app`]; the baseline `sbx run` never gets
     /// it (Mode A stays all-verbs).
     pub(crate) default_methods: crate::allowlist::Methods,
     /// Per-field provenance of this app's *scalar* overlay fields, for the per-app `sbx config`
@@ -763,7 +763,7 @@ impl Resolved {
         }
         // Apply the app's read-by-default verb posture to its *effective* allowlist — the app's own
         // (just merged) or, when the app set none, the inherited baseline. Only Mode-B `sbx app`
-        // launches reach `merge_app`; `sbx run`/`sbx shell` (Mode A) never do, so they stay all-verbs.
+        // launches reach `merge_app`; `sbx run` (Mode A) never do, so they stay all-verbs.
         if let NetworkPolicy::Allowlist(policy) = &mut self.network {
             policy.apply_default_methods(&app.default_methods);
         }
@@ -842,7 +842,7 @@ impl Resolved {
     }
 
     /// Apply a one-shot override as the authoritative **final word** on this resolved configuration
-    /// — after the project layer (for `sbx run`/`sbx shell`) or after a named app's overlay (for
+    /// — after the project layer (for `sbx run`) or after a named app's overlay (for
     /// `sbx app`), so it beats both. Consumes the override. The nixpkgs channel is handled earlier
     /// by [`Resolved::apply_override_channel`] (the lock is already chosen by now), so it is skipped.
     ///
@@ -1675,7 +1675,7 @@ fn network_default_methods_of(field: &NetworkField) -> Option<&Vec<String>> {
 
 /// The built-in app default: a Mode-B agent's unscoped allow rules default to `{GET,HEAD}` (read by
 /// default; declare `{*}`/`{POST}` per host, or `default_methods` per app, to write). The baseline
-/// `sbx run`/`sbx shell` (Mode A) never gets this — it stays all-verbs.
+/// `sbx run` (Mode A) never gets this — it stays all-verbs.
 fn builtin_app_default_methods() -> crate::allowlist::Methods {
     crate::allowlist::Methods::Only(vec!["GET".to_string(), "HEAD".to_string()])
 }
@@ -1703,7 +1703,7 @@ fn resolve_app_default_methods(
 }
 
 /// Warn when the **baseline** `[network]` carries a `default_methods`: it is an app-only posture
-/// (Mode-B agents read by default), and `sbx run`/`sbx shell` (Mode A) deliberately stay all-verbs,
+/// (Mode-B agents read by default), and `sbx run` (Mode A) deliberately stay all-verbs,
 /// so a baseline value is parsed but ignored. Surfacing it keeps a user from believing they made
 /// their interactive shell read-only when they did not.
 fn warn_if_baseline_sets_default_methods(
@@ -1714,7 +1714,7 @@ fn warn_if_baseline_sets_default_methods(
     if network_default_methods_of(field).is_some() {
         warnings.push(format!(
             "{source}: ignoring `default_methods` under the baseline `[network]` — it is an app-only \
-             posture; `sbx run`/`sbx shell` stay all-verbs. Set it on an `[app.<name>.network]`"
+             posture; `sbx run` stay all-verbs. Set it on an `[app.<name>.network]`"
         ));
     }
 }
@@ -6620,25 +6620,32 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("review.toml"), b"cmd = [\"review\"]\n").unwrap();
-        // A non-.toml file is ignored; a profile whose stem is a reserved verb or an unsafe name
-        // is dropped with a warning, never keyed.
-        std::fs::write(dir.path().join("notes.txt"), b"ignore me\n").unwrap();
+        // A profile whose stem coincides with a `sbx app` subcommand verb is a usable app now that
+        // launching goes through `sbx app run <name>` — it is keyed, not dropped.
         std::fs::write(dir.path().join("import.toml"), b"cmd = \"x\"\n").unwrap();
+        // A non-.toml file is ignored; a profile whose stem is an unsafe name (here, a space) is
+        // dropped with a warning, never keyed.
+        std::fs::write(dir.path().join("notes.txt"), b"ignore me\n").unwrap();
+        std::fs::write(dir.path().join("bad name.toml"), b"cmd = \"x\"\n").unwrap();
 
         let mut warnings = Vec::new();
         let apps = read_profile_apps_from(dir.path(), &mut warnings);
         assert!(apps.contains_key("demo-app") && apps.contains_key("review"));
         assert!(
-            !apps.contains_key("import"),
-            "a reserved-verb profile is dropped"
+            apps.contains_key("import"),
+            "a profile named like a subcommand verb is a usable app (run via `sbx app run import`)"
         );
         assert!(
             !apps.contains_key("notes"),
             "a non-.toml file is not a profile"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("import.toml")),
-            "a dropped reserved-verb profile must warn: {warnings:?}"
+            !apps.contains_key("bad name"),
+            "an unsafe-name profile is dropped"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("bad name.toml")),
+            "a dropped unsafe-name profile must warn: {warnings:?}"
         );
     }
 
@@ -7018,7 +7025,7 @@ mod tests {
     fn a_baseline_default_methods_is_ignored_with_a_warning() {
         use crate::allowlist::{Decision, Methods};
         // `default_methods` is an app-only posture; on the baseline `[network]` it is parsed but
-        // ignored (Mode-A `sbx run`/`sbx shell` stays all-verbs), with a warning so it is not silent.
+        // ignored (Mode-A `sbx run` stays all-verbs), with a warning so it is not silent.
         let global = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],

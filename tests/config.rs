@@ -2808,7 +2808,7 @@ fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
 }
 
 #[test]
-fn sbx_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
+fn sbx_app_import_refuses_a_wrapped_profile_and_an_invalid_name() {
     let fx = Fixture::new();
     // A file mistakenly wrapped in `[app.<name>]` has no top-level cmd → refused with a hint.
     std::fs::write(
@@ -2823,14 +2823,19 @@ fn sbx_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
     );
     assert!(String::from_utf8_lossy(&wrapped.stderr).contains("cmd"));
 
-    // A reserved subcommand verb cannot be an app name.
+    // A name that coincides with a subcommand verb is a usable app name now that launching goes
+    // through `sbx app run <name>` — the import succeeds (reached later as `sbx app run rm`).
     std::fs::write(fx.proj.path().join("ok.toml"), "cmd = \"x\"\n").unwrap();
-    let reserved = fx.run(&["app", "import", "ok.toml", "--as", "rm"]);
+    let as_verb = fx.run(&["app", "import", "ok.toml", "--as", "rm"]);
     assert!(
-        !reserved.status.success(),
-        "a reserved name must be refused"
+        as_verb.status.success(),
+        "importing an app named like a subcommand verb must succeed: {}",
+        String::from_utf8_lossy(&as_verb.stderr)
     );
-    assert!(String::from_utf8_lossy(&reserved.stderr).contains("reserved"));
+
+    // An invalid app name (it keys an on-disk file) is still refused.
+    let bad = fx.run(&["app", "import", "ok.toml", "--as", "bad/name"]);
+    assert!(!bad.status.success(), "an invalid app name must be refused");
 }
 
 #[test]

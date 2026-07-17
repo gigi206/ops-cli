@@ -98,7 +98,7 @@ To add a host bind for a single launch without editing the file, use `--bind`
 ```sh
 sbx run --bind /opt/data -- ./tool          # read-only (the default)
 sbx run --bind /work/scratch:rw -- ./tool   # read-write
-SBX_BIND=/etc/ssl/custom:ro sbx shell
+SBX_BIND=/etc/ssl/custom:ro sbx run
 ```
 
 The mode is the suffix after the **last** `:`, and only when it is exactly `ro` or

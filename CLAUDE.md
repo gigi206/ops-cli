@@ -96,6 +96,131 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Supervised-session teardown — sweep the cage's scope cgroup, not just the ppid subtree (DONE
+  2026-07-17)** (`src/session.rs`): `sbx session stop` (and every teardown) could leave a supervised
+  cage's process running — an orphaned agent/`sleep` — surfacing as an **intermittent** failure of
+  `stop_tears_down_a_supervised_app_session` under heavy parallel load (and, live, as accumulated
+  orphaned `sbx-*.scope` units). **Root cause, traced live not assumed:** a supervised/detached cage
+  runs inside a transient systemd resource-limit scope (`sbx-<slug>-<pid>.scope`), and the stop tore
+  it down by SIGTERM/SIGKILL-ing `descendants(session_pid)` — the **ppid subtree** of the launcher.
+  But the scope can reparent the cage off the launcher's subtree (onto the systemd **user manager**),
+  so `descendants` intermittently returns a set that misses the cage and the cage outlives the
+  launcher's signal. Proven by instrumenting `Session::stop`: on a passing run `descendants(pid)` and
+  the scope's `cgroup.procs` both listed the full cage (`[…,bwrap,sleep,socat]`), confirming the scope
+  unit-name embeds the **launcher pid = the session pid**; and a teardown driven by the scope
+  **cgroup alone** tore the cage down reliably in a controlled repro (`cage sleep gone`), so the
+  cgroup membership is the stable identity the racy ppid link is not. **Fix:** `Session::stop` now
+  **unions** `descendants(pid)` with the members of the cage's scope cgroup — the scope found by the
+  unit-name suffix `-<pid>.scope` under `/sys/fs/cgroup/user.slice`, its `cgroup.procs` read to
+  `(pid, start_ticks)` — so the sweep reaches every cage process regardless of reparenting.
+  **Degrades cleanly:** a launch with no scope (no usable systemd user manager, the best-effort M4.2
+  path) yields no scope members and the ppid subtree covers it exactly as before. **Not a regression
+  from the run/shell merge or the app-run verb** — a pre-existing latent race in the teardown that the
+  `--no-fail-fast` load surfaced; it affects any supervised session (an `ops run`/`ops app` under a
+  filtering network, or a `--detach`). Also fixes the sibling `detach_runs_an_agent…stop_ends_it` flake
+  (same `Session::stop`). **Verified:** with `/tmp`'s tmpfs inode budget freed (my own repro store
+  seeds had exhausted it, which is what made the e2e *skip* — the store belongs on disk, [[nix-store-inode-budget]]),
+  the real `stop_tears_down_a_supervised_app_session` runs fully (≈29.5s, not skipped) and passes
+  **3/3**; the cgroup-only teardown proven live; `is_cage_scope` unit test pins the pid-boundary match;
+  fmt/clippy `-D warnings` clean, std-only (no new dep). **Honest scope:** the *failure* under the fix
+  was not re-reproduced at low load (the race needs the heavy parallel contention), but the cgroup set
+  is authoritative by construction (systemd guarantees the scope holds exactly the cage) and the
+  cgroup-only sweep was shown to tear the cage down. See [[m5-gc]], [[m4-cgroup-resource-limits]],
+  [[cage-naming]].
+  **`sbx run`/`sbx shell` merged — one docker-style verb (BREAKING, DONE 2026-07-17)**
+  (`src/sandbox/{launch,mod}.rs` + `src/{main,help}.rs` + `src/session.rs` + comment sweeps across
+  `config/{mod,schema}.rs` + `sandbox/{binds,egress,forward,spec,attach}.rs` + `docs/guide/**` (incl.
+  `cli/shell.md` DELETED, folded into `cli/run.md`) + `README.md` + `profiles/README.md` +
+  `tests/{help,shell}.rs`): `sbx shell` is **removed** and folded into `sbx run` (one verb, like
+  `docker run`). **Dispatch** (`sandbox::run`): `interactive = !detach && isatty(0)`. With **no
+  command** → the project shell: a tty opens the interactive pty shell (the old `sbx shell` body —
+  bash `--rcfile` synthetic rc, `mise activate`, the `(sbx-<slug>)` prompt, job control, via
+  `launch_interactive_shell`), a pipe runs a non-interactive `[shell_bin]` reading stdin (via the exec
+  `launch`, tools through the shims on PATH), and `--detach` with no command is **refused** (a detached
+  shell has no terminal). With a **command** → the launch mode follows stdin: a tty runs it under the
+  pty supervisor (`launch_pty_supervised`, job control + resize — *new* vs the old `sbx run`, and
+  exactly what `app_run`/`session attach` already did), a non-tty/`--detach` keeps the exec-replace /
+  supervised path (`launch`, inherited stdio, exit status propagated — the old `sbx run`, unchanged).
+  **No new low-level code** — the dispatch reuses proven machinery; the security posture is identical
+  either way (`Runtime::ProjectDefault`, same resolved config, same network/seccomp/cgroup gating);
+  only the exec-vs-pty *mechanism* differs. `Kind::Shell` is kept (labels the no-command session in
+  `sbx session ls`). **The breaking change was the user's explicit call** ("run de préférence comme
+  docker"): `run`/`shell` were only ever exec-vs-pty siblings on the same posture, so a single verb
+  that dispatches on stdin is the cleaner surface. **Purged in the same commit (the user's standing
+  no-migration-messages rule):** `help::subcommand_hint` (its 9 old-spelling→namespace mappings
+  ls/attach/stop/import/export/publish/add/update/store) **and** the `sbx app <name>` verbless
+  suggestion arm — a removed/renamed verb now yields a **plain** "unknown command" + the generic
+  `sbx --help` pointer, never a "did you mean" nudge (`sbx shell`/`sbx ls` → unknown command; a bare
+  `sbx app` still names the launch verb as *usage*, not migration — `to launch an app, use sbx app
+  run <name>`, kept at the user's direction). Every code/doc reference to `sbx shell` was reworded so
+  nothing dangles at a removed verb. **Help:** the `["shell"]` page is gone; `["run"]` documents the
+  no-command shell + the stdin-follows launch mode. **Tests:** the pty integration test was rebranded
+  from `sbx shell` to a no-command `sbx run`
+  (`an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal`); the help guard's
+  `TOP_LEVEL`/`PATHS` dropped `shell`; the subcommand-hint tests collapsed into one asserting *no*
+  hint. **Verified:** exit-3 propagation on the exec path and a piped `echo … | sbx run` both proven
+  live; **unit 1106/0** and every integration suite green for this change — config 98/0, help 13/0,
+  net 56/0, app 10/0, attach 2/0, sessions 2/0, proc 6/0, projects 19/0, doctor 6/0, trust 6/0,
+  upgrade 3/0, color 4/0, path 4/0, and the **pty suite 2/0** — plus the one test that encoded the
+  old no-command contract flipped to the new one (`run_without_a_command_is_a_usage_error` →
+  `run_detach_without_a_command_is_a_usage_error`, since a no-command `sbx run` now opens a shell,
+  not a usage error). fmt/clippy `-D warnings` clean. **Full-suite honesty:** the `cargo test
+  --no-fail-fast` failures were pre-existing and unrelated to this merge — the `detach_runs_an_agent…`
+  / `run.rs::sbx_net_logs_*` timing/contention flakes, and `stop_tears_down_a_supervised_app_session`.
+  The last was first mis-attributed here as a deterministic WIP regression; a live investigation showed
+  it is an **intermittent teardown race** (the ppid-subtree teardown can miss a cage the systemd scope
+  reparents off the launcher), pre-existing and independent of both this merge and the app-run verb,
+  surfaced only under the heavy parallel load — and it is now **fixed in a follow-up increment** (see
+  the entry above: teardown via the cage's scope cgroup). This diff itself provably does not touch the
+  app-supervised launch or the stop path (`git diff HEAD -- launch.rs` is confined to `run()`, the
+  `shell()` removal, and comment rewords). This increment also **removed the `sbx app <name>` migration
+  hint** the entry below added (superseding its "migration hint" description). See [[run-shell-merged]],
+  [[no-migration-messages]], [[session-namespace]], [[app-interactive-pty]].
+  **`sbx app run <name>` — the launch verb is now mandatory (BREAKING, DONE 2026-07-17)**
+  (`src/main.rs` `app_cmd`/`app_run`/`parse_app_launch` + `src/config/mod.rs` + `src/help.rs`
+  + `docs/guide/**` (18 files) + `tests/{config,help,run,attach,shell,detach,stop}.rs`): launching a
+  named app now requires the explicit `run` verb — `sbx app run <name>` — mirroring the other
+  `sbx app` subcommands (`import`/`export`/`rm`/`list`/`show`/`prune`), which each already carried a
+  verb. The **verbless `sbx app <name>` form is removed**: `app_cmd`'s catch-all no longer routes a
+  bare token to a launch; a former-launch token (`sbx app claude`) now gets the **generic "needs a
+  subcommand" usage + the app overview page** (no migration hint — the once-present
+  `to launch an app, use sbx app run …` suggestion was removed in the run/shell-merge increment, per
+  the user's no-migration-messages rule). The launch body moved into a new `app_run(&args[1..])` (strips
+  the `run` token, then the unchanged pure `parse_app_launch` reads the name/`--detach`/`--net-learn`
+  /overrides/`-- passthrough`); its usage messages now point at the `["app","run"]` synopsis. **The
+  breaking change was the user's explicit call** (over a docker-style `run`-plus-shortcut option) —
+  chosen precisely because requiring `run` **frees the app namespace**: the first `sbx app` token is
+  always a subcommand, so an app name can never collide with one → `RESERVED_APP_VERBS` /
+  `is_reserved_app_verb` **deleted** (the 8 `main.rs` + 2 `config/mod.rs` call sites keep only the
+  `is_valid_app_name` anti-traversal check — the load-bearing security control), and an app may now be
+  named `run`/`show`/`import`/etc., reached as `sbx app run <name>`. This also fixes a latent
+  inconsistency (`prune` was dispatched but absent from the old reserved set) and is future-proof (a
+  future `sbx app <newverb>` can never shadow an app's launch). **Help** split: `["app"]` slimmed to an
+  overview + a new `["app","run"]` page carrying all launch options/details (`resolve_path` handles
+  `sbx app run <name> --help` for free once the page exists; `-- --help` still passes through). **Docs:**
+  a `docs/guide/**` sweep converted every launch-form `sbx app <name>` to `sbx app run <name>`,
+  leaving management usages untouched. **Tests:** three tests that asserted the old reserved-verb
+  rejection were **flipped to assert the opposite** (a verb-named app is now a usable name) rather than
+  deleted — `config` `a_subcommand_verb_is_a_usable_app_name`, `reading_profiles_keys_each_app_by_its_file_stem`
+  (an `import.toml` profile now resolves; an unsafe-name profile with a space still drops), `main.rs`
+  `resolve_key_target_routes_by_scope_and_app`, and the `config` integration
+  `sbx_app_import_refuses_a_wrapped_profile_and_an_invalid_name` (renamed; `--as rm` now succeeds); plus
+  a **teeth test** `run.rs::app_run_treats_a_subcommand_verb_as_an_app_name` (`sbx app run list` reaches
+  the launch path treating `list` as an app name, while bare `sbx app list` still runs the subcommand).
+  **Shipped alongside the WIP `sbx app prune` / `sbx proc ls`** (all committed together in `0ca8e25`; the
+  test flips + a follow-up regression fix were a later pass). **Verify caught a real miss:** the first
+  test-invocation survey truncated (`head -40`), so `tests/stop.rs`'s `&["app", app, "--detach"]` (the
+  app name a **loop variable**, not a string literal) was not converted → it hit the new migration-hint
+  path and failed; an exhaustive re-sweep (variable forms included) + running the actual modified e2e
+  suites caught and fixed it. Verified: fmt/clippy `-D warnings` clean; **UNIT 1106 + config 98 + help
+  14 + app 10 + attach 2 + shell 2 + stop 6 (after the fix) + a `run.rs` teeth test** green; the two
+  `run.rs` `sbx_net_logs_*` failures were **contention flakes** (empty egress log under the full-suite
+  parallel load — green 2/0 in isolation; they launch via `sbx run`, not `sbx app`). **Honest residual:**
+  the `detach_runs_an_agent_then_stop_ends_it` e2e fails on a **pre-existing 10s-teardown timing flake**
+  (the failing assertion varies between runs — the supervised path at :288 vs the exec path at :334 —
+  non-deterministic; all launch asserts pass; `session stop`/teardown is untouched by this change, and
+  `stop_tears_down_a_supervised_app_session` passes), unrelated to `app run`. See [[ops-app-framework]],
+  [[global-apps-are-profile-files]], [[app-rm-purge]].
   **`audio = true` — microphone + playback in the cage via PulseAudio (DONE 2026-07-13)**
   (`src/sandbox/audio.rs` [new] + `mod.rs` + `config/{schema,mod,view,overrides}.rs` + `src/{main,help}.rs`
   + `sandbox/launch.rs` + `profiles/claude-desktop.toml` + `docs/guide/configuration/{audio,README}.md`

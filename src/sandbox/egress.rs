@@ -126,7 +126,7 @@ pub(crate) struct Wiring {
 /// Wrap `cmd` so the cage starts the forwarder before running it: a static bash that
 /// backgrounds `socat` (stdio detached so it never touches the terminal) and then
 /// `exec`s the real command — which therefore stays the cage's main process, leaving
-/// `sbx shell`'s pty job control unchanged. The command rides `"$@"` positionally, so
+/// an interactive `sbx run`'s pty job control unchanged. The command rides `"$@"` positionally, so
 /// nothing the agent controls is ever interpolated into the script (no shell injection,
 /// non-UTF-8 argv preserved); only sbx-owned ASCII store paths and the fixed port/socket
 /// go into the script string.
@@ -145,7 +145,7 @@ pub(crate) fn wrap_command(socat: &Path, bash: &Path, cmd: Vec<OsString>) -> Vec
 /// the host→cage forward ([`super::forward`]) socat bridges: `preamble` backgrounds the socat(s) (it must end
 /// with a trailing `& `), `label` is the `$0`, and `cmd` rides `"$@"` **positionally** so nothing
 /// the agent controls is ever interpolated into the script (no shell injection, non-UTF-8 argv
-/// preserved). `exec` keeps the inner command the cage's main process, leaving `sbx shell`'s pty
+/// preserved). `exec` keeps the inner command the cage's main process, leaving an interactive `sbx run`'s pty
 /// job control unchanged.
 pub(super) fn wrap_background(
     bash: &Path,

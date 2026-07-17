@@ -315,7 +315,7 @@ fn assemble(
             src: paths.mise_plugin_src.to_path_buf(),
             dest: PathBuf::from(super::miseplugin::INCAGE_DIR),
         },
-        // Zone 1 — the synthetic interactive-shell rc, read-only: `sbx shell` points
+        // Zone 1 — the synthetic interactive-shell rc, read-only: an interactive `sbx run` points
         // bash's `--rcfile` at it to activate mise. Sourced from outside every writable
         // mount, so the agent cannot rewrite its own shell init.
         Mount::RoBind {
@@ -677,7 +677,7 @@ pub(crate) fn flake_inline_incage(name: &str) -> PathBuf {
     PathBuf::from(format!("/opt/sbx/flakes/{name}"))
 }
 
-/// Where the synthetic interactive-shell rc is bound read-only. `sbx shell` starts
+/// Where the synthetic interactive-shell rc is bound read-only. an interactive `sbx run` starts
 /// bash with `--rcfile` pointing here, so mise is activated in the interactive shell —
 /// mise's documented interactive mechanism (a prompt hook that manages PATH/env for the
 /// project's activated tools). `sbx run` does not use it; its tools come from the shims
@@ -690,7 +690,7 @@ pub(crate) const SHELL_RC_INCAGE: &str = "/opt/sbx/bashrc";
 /// `.bashrc` if the agent has written one, then activate mise so its activated tools manage
 /// PATH/env. Static (no per-project data, so the same bytes back every cage), bound read-only
 /// from outside every writable mount, so the agent cannot rewrite what its own shell sources.
-/// The prompt uses `\h`, which resolves to the cage's `sbx-<slug>` hostname, so `sbx shell`
+/// The prompt uses `\h`, which resolves to the cage's `sbx-<slug>` hostname, so an interactive `sbx run`
 /// reads `(sbx-<slug>) <cwd>$` instead of the bare `bash-<v>$` default — set *before* the
 /// `.bashrc` source so a home's own `PS1` still wins. The contract `cat` is guarded on the
 /// variable being set and readable, so it is a no-op where the handle is absent.
@@ -831,13 +831,13 @@ fn machine_id_contents(home_src: &Path) -> String {
 }
 
 /// Which persistent runtime a launch uses — the writable `$HOME` and its sibling synthetic
-/// `/etc`. `sbx run`/`sbx shell` use the project's shared default; an app gets a dedicated,
+/// `/etc`. `sbx run` use the project's shared default; an app gets a dedicated,
 /// persistent home so its config, login state, and history never bleed into the project shell
 /// or another app. An app's home is either shared across projects (`GlobalApp`, one identity
 /// everywhere) or keyed per-project (`ProjectApp`, isolated per project).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Runtime<'a> {
-    /// The project's default shared home — `sbx run` and `sbx shell`.
+    /// The project's default shared home — `sbx run`.
     ProjectDefault,
     /// `sbx app <name>` with one home per app, shared across every project.
     GlobalApp(&'a str),
@@ -1019,7 +1019,7 @@ pub(crate) fn build_spec(
 
     // Materialize the synthetic interactive-shell rc beside the synthetic identity
     // (outside every writable mount, so it has no writable alias the agent could use to
-    // rewrite it); `sbx shell` binds it read-only and points bash's `--rcfile` at it.
+    // rewrite it); an interactive `sbx run` binds it read-only and points bash's `--rcfile` at it.
     let shell_rc = rt.etc_dir.join("bashrc");
     write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
 
@@ -1857,7 +1857,7 @@ mod tests {
 
     #[test]
     fn the_shell_rc_is_bound_read_only_for_mise_activation() {
-        // `sbx shell` points bash's `--rcfile` at this path; it must be a read-only bind
+        // an interactive `sbx run` points bash's `--rcfile` at this path; it must be a read-only bind
         // so the agent cannot rewrite the init its own interactive shell sources.
         let argv = argv_strings(&assembled());
         let rc = argv
@@ -3116,7 +3116,7 @@ mod smoke {
             marker("SHIM_VER")
         );
 
-        // `sbx shell` (interactive): mise activate (via `--rcfile`) puts the *real* tool
+        // an interactive `sbx run`: mise activate (via `--rcfile`) puts the *real* tool
         // bin on PATH — ending in `/bin/rg`, not `/shims/rg`, so this proves activation
         // engaged rather than the shim doing the work again.
         assert!(

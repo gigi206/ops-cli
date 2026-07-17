@@ -10,7 +10,7 @@ layer is not the whole boundary.
 
 See also: [Security model](security-model.md) · [`limits`](../configuration/limits.md) · [Networking](../networking/README.md).
 
-Every launch — `sbx run`, `sbx shell`, `sbx app`, and even the `sbx doctor`
+Every launch — `sbx run`, `sbx app`, and even the `sbx doctor`
 smoke — goes through the same three always-on layers:
 
 1. **bubblewrap** — namespaces, `no_new_privs`, all capabilities dropped.
@@ -35,10 +35,11 @@ there is no setuid binary to attack. The hardening flags below are emitted
 - **`--new-session`** — a fresh session, which blocks terminal-input injection
   (`TIOCSTI`) at the source.
 
-> **The `--new-session` nuance.** `--new-session` is the default and is used by
-> `sbx run`. `sbx shell` omits it because an interactive shell needs a controlling
-> terminal for job control: the pty supervisor establishes the session itself and
-> keeps the pty master, so the launching terminal stays unreachable either way.
+> **The `--new-session` nuance.** `--new-session` is the default and is used by a
+> non-interactive `sbx run`. An interactive `sbx run` (a shell, or an interactive
+> command) omits it because it needs a controlling terminal for job control: the pty
+> supervisor establishes the session itself and keeps the pty master, so the launching
+> terminal stays unreachable either way.
 
 The cage's `/dev` is also **minimal and hostless** — `null`/`zero`/`urandom`/`tty` and the
 standard descriptor symlinks, never a real host device. A tool that genuinely needs the GPU,

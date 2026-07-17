@@ -186,7 +186,7 @@ impl SandboxSpec {
 
     /// Switch to a private-pty terminal (see [`TerminalPolicy::PrivateTty`]).
     /// The caller **must** then launch through the pty supervisor; otherwise the
-    /// sandbox would inherit the launching terminal. The interactive `sbx shell`
+    /// sandbox would inherit the launching terminal. An interactive `sbx run`
     /// path opts in through this.
     pub(crate) fn with_private_tty(mut self) -> Self {
         self.terminal = TerminalPolicy::PrivateTty;

@@ -24,7 +24,7 @@ See also: [`[tools]` (mise)](../configuration/tools.md) · [`packages`](../confi
   activated) stays reachable via `mise exec`/`mise which`; with shims on `PATH` it
   reports `No version is set`, pointing you to `mise use`.
 - `sbx mise use -g <token>` — **activates** the tool, so it is auto-on-`PATH` in later
-  launches (via shims for `sbx run`, `mise activate` for `sbx shell`).
+  launches (via shims for `sbx run`, `mise activate` for an interactive `sbx run`).
 
 ## Examples
 

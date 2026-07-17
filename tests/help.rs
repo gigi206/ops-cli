@@ -18,15 +18,14 @@ fn sbx(args: &[&str]) -> Output {
 
 /// Every top-level command `main` dispatches.
 const TOP_LEVEL: &[&str] = &[
-    "doctor", "shell", "run", "mise", "app", "search", "test", "net", "proc", "plugins", "session",
-    "trust", "untrust", "config", "upgrade", "gc", "projects",
+    "doctor", "run", "mise", "app", "search", "test", "net", "proc", "plugins", "session", "trust",
+    "untrust", "config", "upgrade", "gc", "projects",
 ];
 
 /// Every command path the dispatchers accept (top-level commands and their subcommands). Keep
 /// in lockstep with the dispatch in `main.rs` — that lockstep is the point of the guard test.
 const PATHS: &[&[&str]] = &[
     &["doctor"],
-    &["shell"],
     &["run"],
     &["mise"],
     &["app"],
@@ -256,9 +255,9 @@ fn no_command_is_a_usage_error_that_lists_commands() {
 }
 
 #[test]
-fn unknown_command_hints_an_unambiguous_subcommand_parent() {
-    // The reported bug: `sbx import --help` said only "unknown command". Now it points at the
-    // real path. `import` has a single parent, so the hint is unambiguous.
+fn an_unknown_command_gets_only_the_generic_pointer_no_hint() {
+    // An unknown command — including a bare subcommand verb like `import` (which lives under
+    // `sbx app`) — names itself and points at `sbx --help`, with no "did you mean" suggestion.
     let out = sbx(&["import", "--help"]);
     assert_eq!(
         out.status.code(),
@@ -271,22 +270,8 @@ fn unknown_command_hints_an_unambiguous_subcommand_parent() {
         "should name the unknown command"
     );
     assert!(
-        stderr.contains("sbx app import"),
-        "should hint the subcommand parent"
-    );
-}
-
-#[test]
-fn an_ambiguous_subcommand_verb_gets_no_misleading_hint() {
-    // `rm` is both `app rm` and `plugins rm` (and `list`/`info`/`install` are multi-parent too):
-    // pointing at one parent would misdirect, so there is only the generic pointer.
-    let out = sbx(&["rm"]);
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("unknown command 'rm'"));
-    assert!(
         !stderr.contains("did you mean"),
-        "an ambiguous verb must get no single-parent hint"
+        "no migration hint: an unknown command gets no single-parent suggestion"
     );
     assert!(
         stderr.contains("sbx --help"),

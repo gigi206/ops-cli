@@ -33,7 +33,7 @@ runs the literal `--version`.
 ## 3. Open an interactive shell
 
 ```sh
-sbx shell
+sbx run
 ```
 
 A real interactive shell with job control, inside the same sandbox. Useful for

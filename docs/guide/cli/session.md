@@ -25,7 +25,7 @@ killed session self-heals rather than lingering. An app session shows its app na
 can tell which sessions are agents.
 
 Sessions are created by [`sbx run --detach`](run.md), [`sbx app run --detach`](app.md), and
-interactive [`sbx shell`](shell.md) / [`sbx app`](app.md) launches. The registry is
+interactive [`sbx run`](run.md) / [`sbx app`](app.md) launches. The registry is
 liveness-validated by `(pid, start_time)` to defeat pid reuse. See
 [Sessions](../housekeeping/sessions.md).
 

@@ -40,7 +40,7 @@ toolchain but isolate nothing. `sbx` does both: it provisions a project's toolch
 `sbx` distinguishes two ways a sandbox is used, and the *default* is the locked-down
 one:
 
-- **Mode A — interactive shell** (`sbx shell`, `sbx run`): a semi-trusted user at a
+- **Mode A — interactive shell** (`sbx run`): a semi-trusted user at a
   keyboard. Network egress rules stay all-verbs; the human is the trust anchor.
 - **Mode B — autonomous agent** (`sbx app run <name>`): actions are untrusted. **This is
   the default posture.** An app's egress allowlist defaults to read-only verbs

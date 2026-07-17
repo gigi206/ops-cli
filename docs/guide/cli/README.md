@@ -9,8 +9,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 
 | Command | Purpose |
 |---|---|
-| [`sbx run`](run.md) | run a command inside the project sandbox |
-| [`sbx shell`](shell.md) | open an interactive sandboxed shell |
+| [`sbx run`](run.md) | run a command inside the project sandbox, or open its shell |
 | [`sbx app`](app.md) | launch (`sbx app run <name>`) or manage named application profiles |
 | [`sbx mise`](mise.md) | run the in-cage mise to self-equip a toolchain |
 

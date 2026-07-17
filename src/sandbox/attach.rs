@@ -334,7 +334,7 @@ unsafe fn confine_and_exec(
 ) -> ! {
     match tty {
         // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
-        // same `login_tty` the `sbx shell` supervisor uses, so job control works inside.
+        // same `login_tty` the an interactive `sbx run` supervisor uses, so job control works inside.
         TtyMode::Pty(slave) => {
             if libc::login_tty(slave) != 0 {
                 libc::_exit(127);

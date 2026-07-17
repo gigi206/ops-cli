@@ -76,7 +76,7 @@ the file, use `--nixpkgs` or `SBX_NIXPKGS`:
 
 ```sh
 sbx run --nixpkgs nixos-23.11 -- ./build.sh
-SBX_NIXPKGS=nixos-unstable sbx shell
+SBX_NIXPKGS=nixos-unstable sbx run
 ```
 
 `--nixpkgs` takes a branch/channel name or a 40-hex revision (same as the field). The

@@ -96,7 +96,7 @@ socat TCP-LISTEN:18043,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/…/proxy.soc
 
 It is provisioned by **nix** into the base userland (so its glibc matches the cage's
 by construction) and launched by absolute store path. The launched command runs as
-the cage's main process, so `sbx shell`'s job control is unchanged, and no forwarder
+the cage's main process, so `sbx run`'s job control is unchanged, and no forwarder
 lingers after the command exits (the cage's PID-1 reaper tears the netns down).
 
 Security does **not** depend on the forwarder's integrity — it is pure ergonomics.

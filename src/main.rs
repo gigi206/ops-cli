@@ -51,8 +51,7 @@ fn main() -> ExitCode {
     // A known command carrying a help flag shows the page for the deepest command path it
     // names (so `sbx plugins store add --help` lands on that page). `run` (which forwards
     // `--help` after a `--`) and `mise` (a passthrough) handle a leading help flag
-    // themselves; an *unknown* command is left to the dispatch below, which names it and may
-    // hint a subcommand parent.
+    // themselves; an *unknown* command is left to the dispatch below, which names it.
     if help::is_command(name) && !matches!(name, "run" | "mise") {
         if let Some(code) = help::maybe_help(name, &rest) {
             return code;
@@ -61,7 +60,6 @@ fn main() -> ExitCode {
 
     match name {
         "doctor" => doctor(),
-        "shell" => shell_cmd(rest),
         "session" | "sessions" => session_cmd(rest),
         "trust" => trust_cmd(rest),
         "untrust" => untrust_cmd(rest.into_iter().next()),
@@ -122,9 +120,6 @@ fn main() -> ExitCode {
         "plugins" => plugins_cmd(rest),
         other => {
             eprintln!("sbx: unknown command '{other}'");
-            if let Some(path) = help::subcommand_hint(other) {
-                eprintln!("       did you mean `{path}`?");
-            }
             eprintln!("Run `sbx --help` for the list of commands.");
             ExitCode::from(2)
         }
@@ -2953,33 +2948,6 @@ fn build_override(cli: config::CliOverrides) -> Result<config::Override, ExitCod
     }
 }
 
-/// `sbx shell`: an interactive shell in the project sandbox. Takes no command, only the leading
-/// override flags (`--config`/`--env`) and `--help`; any other argument is a usage error (a stray
-/// token would otherwise be silently dropped, since a shell launch has no positional).
-fn shell_cmd(mut args: Vec<OsString>) -> ExitCode {
-    let mut cli = config::CliOverrides::default();
-    while let Some(raw) = args.first().and_then(|a| a.to_str()) {
-        match flag_name(raw) {
-            "--help" | "-h" => return help::show(&["shell"]),
-            // A one-shot override flag, or a stray argument (a shell takes no command).
-            _ => match take_override_flag(&mut args, &mut cli, "shell") {
-                Some(Ok(())) => {}
-                Some(Err(c)) => return c,
-                None => {
-                    let tok = args.first().and_then(|a| a.to_str()).unwrap_or_default();
-                    eprintln!("sbx: shell: unexpected argument `{tok}` (it takes no command)");
-                    return ExitCode::from(2);
-                }
-            },
-        }
-    }
-    let ov = match build_override(cli) {
-        Ok(ov) => ov,
-        Err(c) => return c,
-    };
-    sandbox::shell(ov)
-}
-
 /// `sbx app <subcommand>`: launch or manage named application profiles. `run <name>` launches an
 /// app (an `[app.<name>]` table from the global or project config, or an imported `<name>.toml`
 /// profile) inside the project sandbox; `import`/`export`/`rm`/`list`/`show`/`prune` manage them.
@@ -2995,14 +2963,8 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("list" | "ls") => app_list(),
         Some("show") => app_show(&args[1..]),
         Some("prune") => app_prune(&args[1..]),
-        // A former verbless launch (`sbx app <name>`) now needs the explicit `run` verb — point a
-        // bare app-name token at it so the migration is obvious.
-        Some(tok) if !tok.starts_with('-') => {
-            eprintln!("sbx: app: unknown subcommand `{tok}`.");
-            eprintln!("       to launch an app, use `sbx app run {tok}`.");
-            ExitCode::from(2)
-        }
-        // Bare `sbx app`, a leading flag, or a non-UTF-8 token: no subcommand to act on.
+        // No valid subcommand: a bare `sbx app`, an unknown token, a leading flag, or a non-UTF-8
+        // token. There is no launch to act on — name the launch verb and print the usage page.
         _ => {
             eprintln!("sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.");
             eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
@@ -3333,7 +3295,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let src_path = Path::new(source);
 
     // The app name: `--as`, else the source file stem. It keys an on-disk file, so it is validated
-    // (charset/length) and refused if it is a reserved subcommand verb — fail-closed.
+    // for charset/length and refused otherwise — fail-closed.
     let name = match as_name {
         Some(n) => n,
         None => match src_path.file_stem().and_then(|s| s.to_str()) {
@@ -3348,10 +3310,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
         },
     };
     if !config::is_valid_app_name(&name) {
-        eprintln!(
-            "sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`, and not \
-             a reserved subcommand)"
-        );
+        eprintln!("sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`)");
         return ExitCode::from(2);
     }
 
@@ -3472,8 +3431,7 @@ fn app_export(args: &[OsString]) -> ExitCode {
         eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "export"]));
         return ExitCode::from(2);
     };
-    // The name reaches a filesystem lookup, so validate it (and a reserved verb can never be an
-    // app name anyway).
+    // The name reaches a filesystem lookup, so validate it (charset/length, no traversal).
     if !config::is_valid_app_name(name) {
         eprintln!("sbx: '{name}' is not a valid app name");
         return ExitCode::from(2);
@@ -3567,8 +3525,7 @@ fn app_rm(args: &[OsString]) -> ExitCode {
 
 /// The structural parse of `sbx app rm` arguments (before name validation). Kept pure so the flag/
 /// positional handling — `--purge`, `--gc`, and the single app name in any order — is unit-tested.
-/// The name's charset/reserved-verb validation and the `--gc`-requires-`--purge` rule are the
-/// caller's next steps.
+/// The name's charset validation and the `--gc`-requires-`--purge` rule are the caller's next steps.
 enum AppRmArgs<'a> {
     Ok {
         purge: bool,
@@ -3986,7 +3943,8 @@ struct AppHomeShow {
 /// removed profile, or a tool a `mise:` backend pulled in as a dependency).
 #[derive(serde::Serialize)]
 struct OrphanTool {
-    /// The on-disk (munged) tool directory name, e.g. `aqua-openai-codex`.
+    /// The tool as a `[packages]` value would name it: the `mise:` backend prefix plus its real
+    /// token (`mise:pipx:hermes-agent`), or the munged directory name when mise recorded no token.
     name: String,
     versions: Vec<String>,
 }
@@ -4132,8 +4090,10 @@ fn build_app_show(
         if declared_mise.iter().any(|d| tool.is(d)) {
             continue;
         }
+        // Prefix the mise backend so the name reads like the `packages:` section and is the exact
+        // `[packages]` value that would adopt it (`mise:pipx:hermes-agent`, not a bare `pipx:…`).
         orphan_versions
-            .entry(tool.label().to_string())
+            .entry(format!("mise:{}", tool.label()))
             .or_default()
             .extend(sandbox::inspect::concrete_versions(tool));
     }
@@ -4250,7 +4210,8 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
         }
     }
     // Installed mise tools no declared package accounts for — a leftover profile or a mise-pulled
-    // dependency. Named by their on-disk (munged) directory, since there is no declaration to map back.
+    // dependency. Each `name` already carries the `mise:` backend prefix (see `build_app_show`), so
+    // the provider reads like the `packages:` section above (`mise:pipx:hermes-agent`).
     if !v.orphans.is_empty() {
         let _ = writeln!(s, "  installed (undeclared):");
         for t in &v.orphans {
@@ -11029,12 +10990,10 @@ mod tests {
             "a dotted app name is rejected inline"
         );
 
-        // A reserved verb / an invalid charset can never key a profile filename (validated before
-        // the config home is even resolved, so this arm stays env-independent).
-        assert!(
-            resolve_key_target("set", &Scope::Global, Some("import"), "network", cwd).is_err(),
-            "a reserved app verb cannot name a global-app profile"
-        );
+        // An invalid charset can never key a profile filename (validated before the config home is
+        // even resolved, so this arm stays env-independent). A name that merely coincides with a
+        // subcommand verb (`import`, `show`, …) is valid — launching goes through `sbx app run` —
+        // so that arm resolves the config home and is covered by the profile integration tests.
         assert!(
             resolve_key_target("set", &Scope::Global, Some("bad/name"), "network", cwd).is_err(),
             "an invalid app name cannot name a global-app profile"

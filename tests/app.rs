@@ -263,8 +263,9 @@ fn show_lists_installed_tools_no_declaration_accounts_for() {
     // The declared tool is installed…
     fx.install_mise_tool("demo-app", "aqua-demo-tool", "1.2.3");
     // …and a second tool sits in the home that the profile does not declare (a leftover or a
-    // dependency mise pulled in).
+    // dependency mise pulled in), with its real backend token recorded.
     fx.install_mise_tool("demo-app", "npm-extra-thing", "9.9.9");
+    fx.set_tool_token("demo-app", "npm-extra-thing", "npm:extra-thing");
 
     let out = fx.sbx(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
@@ -273,23 +274,24 @@ fn show_lists_installed_tools_no_declaration_accounts_for() {
         s.contains("installed (undeclared):"),
         "the undeclared section should appear:\n{s}"
     );
+    // Shown with the `mise:` backend prefix and its real provider token, like the packages section.
     assert!(
-        s.contains("npm-extra-thing") && s.contains("9.9.9"),
-        "the undeclared tool + version should be listed:\n{s}"
+        s.contains("mise:npm:extra-thing") && s.contains("9.9.9"),
+        "the undeclared tool should read `mise:<token>` with its version:\n{s}"
     );
     // The declared tool stays in the packages section, not repeated as undeclared.
     let undeclared = s.split("installed (undeclared):").nth(1).unwrap_or("");
     assert!(
-        !undeclared.contains("aqua-demo-tool"),
+        !undeclared.contains("aqua:demo/tool"),
         "a declared tool must not appear as undeclared:\n{s}"
     );
 
-    // --json carries the orphan.
+    // --json carries the orphan by the same `mise:`-prefixed name.
     let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let orphans = v["orphans"].as_array().expect("orphans array");
     assert_eq!(orphans.len(), 1, "one orphan: {v}");
-    assert_eq!(orphans[0]["name"], "npm-extra-thing");
+    assert_eq!(orphans[0]["name"], "mise:npm:extra-thing");
 }
 
 #[test]

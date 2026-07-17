@@ -74,8 +74,8 @@ cargo run -- doctor   # preflight: user namespaces, bwrap, …
 ```sh
 sbx doctor                       # check the sandbox prerequisites
 sbx run -- <cmd> [args…]         # run a command in the sandbox
-sbx shell                        # an interactive shell in the sandbox
-sbx app <name>                   # launch a named agent profile (its own isolated $HOME)
+sbx run                          # an interactive shell in the sandbox (no command)
+sbx app run <name>               # launch a named agent profile (its own isolated $HOME)
 sbx config show [--details]      # the resolved configuration for the current project
 sbx search <query>               # discover Nix tools to declare
 sbx upgrade [nix|mise|flake]     # roll managed toolchains forward

@@ -254,7 +254,7 @@ fn bridge(mut client: TcpStream, sock: &Path) -> io::Result<()> {
 /// Wrap `cmd` so the cage starts the in-cage forwarders before running it: a static bash that
 /// backgrounds one `socat UNIX-LISTEN → TCP-CONNECT` per declared port (stdio detached so it
 /// never touches the terminal), then `exec`s the real command — which therefore stays the cage's
-/// main process, leaving `sbx shell`'s pty job control unchanged. The command rides `"$@"`
+/// main process, leaving an interactive `sbx run`'s pty job control unchanged. The command rides `"$@"`
 /// positionally, so nothing the agent controls is ever interpolated into the script (no shell
 /// injection, non-UTF-8 argv preserved); only sbx-owned ASCII — the socat store path, the
 /// `/tmp/sbx-forward` socket paths, and the port numbers — goes into the script string. Mirrors

@@ -104,7 +104,7 @@ Notes:
 
 - **`{POST}` is required.** gRPC uses `POST`, but a bare `allow = ["grpc.example.com"]` is
   read-by-default (`{GET,HEAD}`) for an **app**, so every RPC would be refused. Prefix the rule with
-  `{POST}` (or `{*}`). (`sbx run`/`sbx shell` are all-verbs, so the baseline is less strict — but be
+  `{POST}` (or `{*}`). (`sbx run` are all-verbs, so the baseline is less strict — but be
   explicit.)
 - **`http2` selects the transport, not the verdict.** A host must still be permitted by an `allow`
   rule; `http2` only decides HTTP/2-vs-HTTP/1.1. It is `host` or `host:port` (a bare host matches any
@@ -153,7 +153,7 @@ profile add rules without re-declaring the mode.
 A Mode-B app's unscoped (`{...}`-less) `allow` rules default to `["GET", "HEAD"]` — an
 agent reads but does not write unless a rule opts a host out with `{*}`/`{VERB}`. This
 field overrides that default for the app (e.g. `["GET", "POST"]`, or `["*"]` for all
-verbs). It is **ignored on the baseline `[network]`** — `sbx run`/`sbx shell` (Mode A)
+verbs). It is **ignored on the baseline `[network]`** — `sbx run` (Mode A)
 stay all-verbs.
 
 ## Editing
@@ -175,7 +175,7 @@ To set the posture for a single launch without editing the file, use `--net` or
 ```sh
 sbx run --net none -- ./build.sh                # cut the network for one run
 sbx run --net allow=api.github.com -- ./ci.sh   # a one-shot allowlist
-SBX_NET=shared sbx shell
+SBX_NET=shared sbx run
 ```
 
 `--net` takes `none | shared | ask | allow=h1,h2 | deny=h1,h2` (a bare `allow`/`deny`

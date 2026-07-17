@@ -30,7 +30,7 @@ opposite of a [security field](#security-field). See [The trust gate](../concept
 `/usr/bin/env`, `/nix`, a synthetic `/etc`), with no host `/usr` or ambient libraries.
 
 **Mode A / Mode B** — the two actor modes. Mode A is an interactive user shell
-([`sbx run`/`shell`](../cli/run.md)); Mode B is an autonomous agent
+([`sbx run`](../cli/run.md)); Mode B is an autonomous agent
 ([`sbx app`](../cli/app.md)) and is the default posture. See [Overview](../concepts/overview.md#the-two-actor-modes).
 
 **Model B** — the egress architecture: an empty network namespace whose only exit is an
