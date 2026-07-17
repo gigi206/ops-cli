@@ -69,7 +69,7 @@ network allowlist, and host-side credential injection. The repository ships
 
 ```sh
 sbx app import profiles/claude-code.toml
-sbx app claude-code
+sbx app run claude-code
 ```
 
 The agent runs in the cage with a persistent identity that never bleeds into your

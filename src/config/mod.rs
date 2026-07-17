@@ -47,18 +47,6 @@ const OVERRIDE_SOURCE: &str = "override";
 /// *data* root an `apps` directory holds each app's persistent home — two distinct trees.)
 const PROFILES_DIR: &str = "apps";
 
-/// The subcommand verbs of `sbx app` (`sbx app import`, `… export`, `… rm`, `… list`). They are
-/// reserved so they can never also be an app name: otherwise `sbx app import` would be ambiguous
-/// between the subcommand and launching an app literally named `import`, and such an app could be
-/// neither launched nor managed. Reserving them removes the ambiguity at the source — they are
-/// rejected as app names wherever one is resolved.
-pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list", "ls", "show"];
-
-/// Whether `name` is a reserved `sbx app` subcommand verb, and so may not be an app name.
-pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
-    RESERVED_APP_VERBS.contains(&name)
-}
-
 /// Environment keys an *untrusted or changed* project may not set. The point is
 /// not to contain the agent — in Mode B it already runs arbitrary code inside the
 /// cage, so a config-set `LD_PRELOAD` grants it nothing new. It is to stop an
@@ -2073,12 +2061,6 @@ fn resolve_apps(
         .collect();
     let mut out = BTreeMap::new();
     for name in names {
-        if is_reserved_app_verb(&name) {
-            warnings.push(format!(
-                "ignoring app `{name}`: the name is a reserved `sbx app` subcommand (rename it)"
-            ));
-            continue;
-        }
         if !is_valid_app_name(&name) {
             warnings.push(format!(
                 "ignoring app `{name}`: a name must be 1–64 of [A-Za-z0-9._-] and not `.`/`..` \
@@ -2106,8 +2088,9 @@ fn resolve_apps(
 /// Whether an app name is safe to use as a single on-disk path component (it keys the app's
 /// persistent home directory and, for an imported profile, its file). Restricted to a conservative
 /// charset and length, and `.`/`..` are rejected outright so a name can never traverse out of a
-/// directory. Reserved subcommand verbs are a *separate* check ([`is_reserved_app_verb`]) — a verb
-/// like `rm` is otherwise a perfectly valid path component.
+/// directory. A name that coincides with a `sbx app` subcommand verb (`run`, `show`, …) is
+/// perfectly valid: launching always goes through `sbx app run <name>`, so the name never collides
+/// with the subcommand.
 pub(crate) fn is_valid_app_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -4720,7 +4703,7 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
             ));
             continue;
         };
-        if is_reserved_app_verb(&name) || !is_valid_app_name(&name) {
+        if !is_valid_app_name(&name) {
             warnings.push(format!(
                 "ignoring profile {}: `{name}` is not a usable app name",
                 path.display()
@@ -6608,12 +6591,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_subcommand_verb_is_rejected_as_an_app_name() {
-        // `import`/`export`/`rm`/`list` are `sbx app` subcommands; an app of that name would be
-        // unreachable and unmanageable, so it is dropped at resolve time (the charset check would
-        // otherwise pass — `rm` is a valid path component, hence the separate reserved check).
-        for verb in RESERVED_APP_VERBS {
-            assert!(is_reserved_app_verb(verb));
+    fn a_subcommand_verb_is_a_usable_app_name() {
+        // Launching an app goes through `sbx app run <name>`, so the first `sbx app` token is always
+        // a subcommand and an app name can never collide with one. A name that coincides with a verb
+        // (`run`, `show`, `import`, …) is therefore a perfectly usable app — reachable as
+        // `sbx app run <verb>` — and must resolve rather than be dropped.
+        for verb in ["run", "show", "import", "export", "rm", "list", "prune"] {
             assert!(
                 is_valid_app_name(verb),
                 "`{verb}` is a valid path component"
@@ -6621,15 +6604,10 @@ mod tests {
             let global = raw_with_app(verb, raw_app(&["x"], &[], &[], &[], None));
             let r = resolve_no_plugins(global, None);
             assert!(
-                !r.apps.contains_key(*verb),
-                "a reserved-verb app `{verb}` must be dropped"
-            );
-            assert!(
-                r.warnings.iter().any(|w| w.contains("reserved")),
-                "a dropped reserved-verb app `{verb}` must say so"
+                r.apps.contains_key(verb),
+                "an app named `{verb}` must resolve now that launch requires `run`"
             );
         }
-        assert!(!is_reserved_app_verb("demo-app"));
     }
 
     #[test]

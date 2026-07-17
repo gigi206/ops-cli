@@ -31,7 +31,7 @@ sbx net rules [-a|--app <name>] [-s|--source config|builtin|session] [-f|--filte
 Lists the allow/deny rules of the effective filtering posture, each tagged `config` or
 `built-in`, reflecting the trust gate. An inspected L7 rule shows `https://`, a raw L4
 rule shows `tcp://`; a `[net.groups]` group shows as one `@<name>` row (`--expand`
-unfolds it). `--app <name>` shows what `sbx app <name>` would launch with. `--source
+unfolds it). `--app <name>` shows what `sbx app run <name>` would launch with. `--source
 session` queries live `ask`-session rules remembered from `--session` answers (`manual`
 is accepted as an alias). Under
 `shared`/`none` there are no rules. See [Observability](../networking/observability.md).

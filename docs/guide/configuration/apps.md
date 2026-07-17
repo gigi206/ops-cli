@@ -1,7 +1,7 @@
 # `[app.<name>]` — named launch profiles
 
 A `[app.<name>]` table declares a named, reusable launcher — a command plus a
-security/tooling overlay over the sandbox baseline. `sbx app <name>` launches it. This
+security/tooling overlay over the sandbox baseline. `sbx app run <name>` launches it. This
 page documents the **config shape**; for the framework (isolated homes, profiles,
 credential injection) see the [Apps](../apps/README.md) section.
 

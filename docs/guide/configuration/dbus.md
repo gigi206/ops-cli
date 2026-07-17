@@ -94,7 +94,7 @@ dbus = true
 To set the D-Bus posture for a single launch without editing the file, use `--dbus` or `SBX_DBUS`:
 
 ```sh
-sbx app opencode-desktop --dbus=false   # no portal for this launch
+sbx app run opencode-desktop --dbus=false   # no portal for this launch
 sbx run --dbus -- some-gtk-app          # bare --dbus means true (the in-cage portal)
 ```
 

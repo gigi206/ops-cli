@@ -18,7 +18,7 @@ fn sbx(args: &[&str]) -> Output {
 
 /// Every top-level command `main` dispatches.
 const TOP_LEVEL: &[&str] = &[
-    "doctor", "shell", "run", "mise", "app", "search", "test", "net", "plugins", "session",
+    "doctor", "shell", "run", "mise", "app", "search", "test", "net", "proc", "plugins", "session",
     "trust", "untrust", "config", "upgrade", "gc", "projects",
 ];
 
@@ -51,11 +51,13 @@ const PATHS: &[&[&str]] = &[
     &["gc"],
     &["projects"],
     &["projects", "show"],
+    &["app", "run"],
     &["app", "import"],
     &["app", "export"],
     &["app", "rm"],
     &["app", "list"],
     &["app", "show"],
+    &["app", "prune"],
     &["test", "net"],
     &["net", "rules"],
     &["net", "allow"],
@@ -63,6 +65,8 @@ const PATHS: &[&[&str]] = &[
     &["net", "pending"],
     &["net", "pending", "allow"],
     &["net", "pending", "deny"],
+    &["proc"],
+    &["proc", "ls"],
     &["plugins", "list"],
     &["plugins", "info"],
     &["plugins", "install"],
@@ -198,14 +202,14 @@ fn a_help_flag_after_a_subcommand_path_does_not_run_the_command() {
 
 #[test]
 fn a_double_dash_passes_help_flags_through_to_the_app_command() {
-    // The converse of the test above: `sbx app <name> -- --help` must NOT show sbx's app page —
-    // the `--help` after `--` belongs to the launched command (a program's own `--help`, or a
+    // The converse of the test above: `sbx app run <name> -- --help` must NOT show sbx's app-run
+    // page — the `--help` after `--` belongs to the launched command (a program's own `--help`, or a
     // resume flag like `-- -c`), not to sbx. The launch path is short-circuited without a sandbox
     // by removing the data-dir env, so it fails fast *after* routing; the point is only that sbx
     // did not intercept the help flag. (The routing itself is unit-tested in help.rs by
     // `maybe_help_stops_at_a_double_dash`.)
     let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(["app", "demo", "--", "--help"])
+        .args(["app", "run", "demo", "--", "--help"])
         .env_remove("HOME")
         .env_remove("XDG_DATA_HOME")
         .output()
@@ -213,8 +217,8 @@ fn a_double_dash_passes_help_flags_through_to_the_app_command() {
     let text =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(
-        !text.contains("launch or manage named application profiles"),
-        "`sbx app <name> -- --help` was intercepted as sbx's help page instead of passing \
+        !text.contains("sbx app run —"),
+        "`sbx app run <name> -- --help` was intercepted as sbx's help page instead of passing \
          `--help` through to the command: {text}"
     );
 }

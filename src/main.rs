@@ -11,6 +11,7 @@ mod allowlist;
 mod config;
 mod diag;
 mod help;
+mod observe;
 mod pathfind;
 mod paths;
 mod plugin_store;
@@ -117,6 +118,7 @@ fn main() -> ExitCode {
         "search" => search_cmd(rest),
         "test" => test_cmd(rest),
         "net" => net_cmd(rest),
+        "proc" => proc_cmd(rest),
         "plugins" => plugins_cmd(rest),
         other => {
             eprintln!("sbx: unknown command '{other}'");
@@ -538,6 +540,129 @@ fn list_sessions() -> ExitCode {
         let name = format!("{name:<name_w$}");
         println!("{n}{name}{r}  {label:<kind_w$}  {pid:>pid_w$}  {age:>age_w$}  {project}");
     }
+    ExitCode::SUCCESS
+}
+
+/// `sbx proc <subcommand>`: observe what a running sandbox is doing inside its cage. `ls` snapshots
+/// a session's process tree. Read-only and host-side — the observability sibling of `sbx net`.
+fn proc_cmd(args: Vec<OsString>) -> ExitCode {
+    if let Some(code) = help::maybe_help("proc", &args) {
+        return code;
+    }
+    match args.first().and_then(|a| a.to_str()) {
+        Some("ls") | Some("list") => proc_ls(&args[1..]),
+        None => {
+            eprint!("{}", help::page_usage(&["proc"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
+        Some(other) => {
+            eprintln!("sbx: proc: unknown subcommand `{other}`");
+            eprintln!("       run `sbx help proc` for usage.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `sbx proc ls [<id>] [--json]`: snapshot the process tree of a running session — what the agent
+/// has spawned inside the cage, read host-side from `/proc` (no privilege, no cage cooperation).
+/// `<id>` is the PID `sbx session ls` shows; with no id the sole live session is used, otherwise the
+/// live sessions are listed so one can be named.
+fn proc_ls(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    let mut id: Option<&str> = None;
+    for a in args {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some(s) if !s.starts_with('-') => {
+                if id.is_some() {
+                    eprintln!("sbx: proc ls: at most one session id");
+                    return ExitCode::from(2);
+                }
+                id = Some(s);
+            }
+            other => {
+                eprintln!(
+                    "sbx: proc ls: unexpected argument {:?}",
+                    other.unwrap_or_default()
+                );
+                eprint!("{}", help::page_usage(&["proc", "ls"]).unwrap_or_default());
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sbx: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Resolve the target: an explicit PID (0-or-1 match among the live set), or the sole session.
+    let target = match id {
+        Some(id) => match sessions.iter().find(|s| s.pid.to_string() == id) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "sbx: proc ls: no live session '{id}' — run `sbx session ls` to list them."
+                );
+                return ExitCode::from(2);
+            }
+        },
+        None => match sessions.as_slice() {
+            [one] => one,
+            [] => {
+                eprintln!("sbx: no active sandbox sessions.");
+                return ExitCode::from(2);
+            }
+            many => {
+                eprintln!(
+                    "sbx: proc ls: {} live sessions — name one by its PID:",
+                    many.len()
+                );
+                for s in many {
+                    eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+                }
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let Some(tree) = observe::tree(target.pid) else {
+        eprintln!(
+            "sbx: proc ls: session {} has no readable process tree (it may have just exited).",
+            target.pid
+        );
+        return ExitCode::from(2);
+    };
+
+    if json {
+        let obj = serde_json::json!({
+            "session": {
+                "pid": target.pid,
+                "label": target.label(),
+                "project": target.project.display().to_string(),
+            },
+            "tree": observe::to_json(&tree),
+        });
+        println!("{obj}");
+        return ExitCode::SUCCESS;
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, r) = (pal.head, pal.reset);
+    println!(
+        "{h}process tree — session {} [{}] {}{r}",
+        target.pid,
+        target.label(),
+        target.project.display()
+    );
+    print!("{}", observe::render_human(&tree));
     ExitCode::SUCCESS
 }
 
@@ -2258,7 +2383,7 @@ fn resolve_key_target(
         (Some(name), Scope::Global) => {
             // A global app is its own profile file with top-level keys. The name keys that
             // filename, so validate it (anti-traversal) the way `sbx net … -a <name> -g` does.
-            if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+            if !config::is_valid_app_name(name) {
                 eprintln!("sbx: config {verb}: invalid app name `{name}`");
                 return Err(config_usage(verb));
             }
@@ -2855,40 +2980,61 @@ fn shell_cmd(mut args: Vec<OsString>) -> ExitCode {
     sandbox::shell(ov)
 }
 
-/// `sbx app <name>`: launch a named application profile (an `[app.<name>]` table from the global
-/// or project config, or an imported `<name>.toml` profile) inside the project sandbox. The
-/// management verbs `import`/`export`/`rm`/`list` are reserved (and so can never be an app name),
-/// so the first token disambiguates a subcommand from an app to launch with no overlap.
+/// `sbx app <subcommand>`: launch or manage named application profiles. `run <name>` launches an
+/// app (an `[app.<name>]` table from the global or project config, or an imported `<name>.toml`
+/// profile) inside the project sandbox; `import`/`export`/`rm`/`list`/`show`/`prune` manage them.
+/// Launching goes through the explicit `run` verb, so the first token is always a subcommand and an
+/// app name can never collide with one — an app may be named `run`, `show`, etc., and is reached as
+/// `sbx app run <name>`.
 fn app_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
+        Some("run") => app_run(&args[1..]),
         Some("import") => app_import(&args[1..]),
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(&args[1..]),
         Some("list" | "ls") => app_list(),
         Some("show") => app_show(&args[1..]),
-        // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
-        // background as a session `sbx session ls` can see. Tokens after a `--` are passed
-        // through to the app's command (see `parse_app_launch`).
-        _ => match parse_app_launch(&args) {
-            Ok(launch) => {
-                let ov = match build_override(launch.cli) {
-                    Ok(ov) => ov,
-                    Err(code) => return code,
-                };
-                let outcome = sandbox::app(
-                    &launch.name,
-                    launch.detach,
-                    launch.tail,
-                    ov,
-                    launch.net_learn.as_ref().map(|nl| nl.gran),
-                );
-                match (outcome.learned, launch.net_learn) {
-                    (Some(synth), Some(nl)) => finish_net_learn(&launch.name, synth, &nl),
-                    _ => outcome.code,
-                }
+        Some("prune") => app_prune(&args[1..]),
+        // A former verbless launch (`sbx app <name>`) now needs the explicit `run` verb — point a
+        // bare app-name token at it so the migration is obvious.
+        Some(tok) if !tok.starts_with('-') => {
+            eprintln!("sbx: app: unknown subcommand `{tok}`.");
+            eprintln!("       to launch an app, use `sbx app run {tok}`.");
+            ExitCode::from(2)
+        }
+        // Bare `sbx app`, a leading flag, or a non-UTF-8 token: no subcommand to act on.
+        _ => {
+            eprintln!("sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.");
+            eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `sbx app run <name> [--detach] [--net-learn…] [override flags] [-- <args>…]`: launch a named
+/// application profile inside the project sandbox. The name, `--detach`, `--net-learn`, and the
+/// one-shot overrides are read from the head (see [`parse_app_launch`]); tokens after a `--` are
+/// appended verbatim to the app's declared command.
+fn app_run(args: &[OsString]) -> ExitCode {
+    match parse_app_launch(args) {
+        Ok(launch) => {
+            let ov = match build_override(launch.cli) {
+                Ok(ov) => ov,
+                Err(code) => return code,
+            };
+            let outcome = sandbox::app(
+                &launch.name,
+                launch.detach,
+                launch.tail,
+                ov,
+                launch.net_learn.as_ref().map(|nl| nl.gran),
+            );
+            match (outcome.learned, launch.net_learn) {
+                (Some(synth), Some(nl)) => finish_net_learn(&launch.name, synth, &nl),
+                _ => outcome.code,
             }
-            Err(code) => code,
-        },
+        }
+        Err(code) => code,
     }
 }
 
@@ -2952,10 +3098,10 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     }
 }
 
-/// Parse the launch form of `sbx app`: split sbx's own arguments from the app command's trailing
+/// Parse the launch form of `sbx app run`: split sbx's own arguments from the app command's trailing
 /// arguments at the first `--`, then read the app name and `--detach` from the head. Tokens after
-/// `--` are appended verbatim to the app's declared `cmd` (e.g. `sbx app claude -- -c` passes `-c`
-/// to the launched command, so an agent can resume a session or tweak a flag without editing the
+/// `--` are appended verbatim to the app's declared `cmd` (e.g. `sbx app run claude -- -c` passes
+/// `-c` to the launched command, so an agent can resume a session or tweak a flag without editing the
 /// profile). An unknown flag or a second name in the head is a usage error, so a typo cannot
 /// silently launch a different posture (a mistyped `--detach` running attached, or extra tokens
 /// dropped without a word). The passthrough arguments are host-user input at invocation time, so
@@ -2990,7 +3136,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         let Some(raw) = head[0].to_str().map(str::to_string) else {
             eprintln!(
                 "sbx: app name must be valid text — usage: {}",
-                help::synopsis("app")
+                help::synopsis_of(&["app", "run"])
             );
             return Err(ExitCode::from(2));
         };
@@ -3034,13 +3180,16 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                 Some(res) => res?,
                 None => {
                     if raw.starts_with('-') {
-                        eprintln!("sbx: unknown flag {raw} — usage: {}", help::synopsis("app"));
+                        eprintln!(
+                            "sbx: unknown flag {raw} — usage: {}",
+                            help::synopsis_of(&["app", "run"])
+                        );
                         return Err(ExitCode::from(2));
                     }
                     if name.is_some() {
                         eprintln!(
                             "sbx: app takes a single name — usage: {}",
-                            help::synopsis("app")
+                            help::synopsis_of(&["app", "run"])
                         );
                         return Err(ExitCode::from(2));
                     }
@@ -3051,9 +3200,9 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         }
     }
     let Some(name) = name else {
-        // No app name and no subcommand (bare `sbx app`, or only flags): print the full page so
-        // its Subcommands list and launch synopsis guide, like bare `sbx net`/`sbx config`.
-        eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
+        // `sbx app run` with no name (or only flags): print the run page so its synopsis and
+        // options guide, like bare `sbx net`/`sbx config`.
+        eprint!("{}", help::page_usage(&["app", "run"]).unwrap_or_default());
         return Err(ExitCode::from(2));
     };
     // `--net-learn` reviews and writes rules in the foreground; `--detach` has no session to observe.
@@ -3198,7 +3347,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
             }
         },
     };
-    if config::is_reserved_app_verb(&name) || !config::is_valid_app_name(&name) {
+    if !config::is_valid_app_name(&name) {
         eprintln!(
             "sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`, and not \
              a reserved subcommand)"
@@ -3325,7 +3474,7 @@ fn app_export(args: &[OsString]) -> ExitCode {
     };
     // The name reaches a filesystem lookup, so validate it (and a reserved verb can never be an
     // app name anyway).
-    if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+    if !config::is_valid_app_name(name) {
         eprintln!("sbx: '{name}' is not a valid app name");
         return ExitCode::from(2);
     }
@@ -3397,7 +3546,7 @@ fn app_rm(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+    if !config::is_valid_app_name(name) {
         eprintln!("sbx: '{name}' is not a valid app name");
         return ExitCode::from(2);
     }
@@ -3910,8 +4059,7 @@ fn build_app_show(
                     let installed = if pkg.state != trust::TrustState::Trusted {
                         PackageInstalled::Withheld
                     } else if let Backend::Mise(token) = &pkg.backend {
-                        let munged = sandbox::inspect::mise_munge(token);
-                        match installed_tools.iter().find(|t| t.name == munged) {
+                        match installed_tools.iter().find(|t| t.is(token)) {
                             Some(t) => {
                                 let versions = sandbox::inspect::concrete_versions(t).join(", ");
                                 PackageInstalled::Installed {
@@ -3961,15 +4109,16 @@ fn build_app_show(
         })
         .unwrap_or_default();
 
-    // Orphans: installed mise tools no declared `mise:` package accounts for (matched through the
-    // same munge). A home-only app (nothing declared) surfaces its whole installed set here — the
-    // literal "everything actually installed". Deduped by name across homes, versions unioned.
-    let declared_munged: std::collections::HashSet<String> = app
+    // Orphans: installed mise tools no declared `mise:` package accounts for. A home-only app
+    // (nothing declared) surfaces its whole installed set here — the literal "everything actually
+    // installed". Named by their real backend token (recovered from mise's metadata), deduped
+    // across homes, versions unioned.
+    let declared_mise: Vec<&str> = app
         .map(|a| {
             a.packages
                 .iter()
                 .filter_map(|p| match &p.backend {
-                    Backend::Mise(token) => Some(sandbox::inspect::mise_munge(token)),
+                    Backend::Mise(token) => Some(token.as_str()),
                     _ => None,
                 })
                 .collect()
@@ -3980,11 +4129,11 @@ fn build_app_show(
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
     for tool in &installed_tools {
-        if declared_munged.contains(&tool.name) {
+        if declared_mise.iter().any(|d| tool.is(d)) {
             continue;
         }
         orphan_versions
-            .entry(tool.name.clone())
+            .entry(tool.label().to_string())
             .or_default()
             .extend(sandbox::inspect::concrete_versions(tool));
     }
@@ -4115,6 +4264,115 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
         }
     }
     s
+}
+
+/// `sbx app prune <name> [--yes]`: remove the mise tools an app's home(s) carry that the app's
+/// config does **not** declare — the `installed (undeclared)` leftovers `sbx app show` surfaces (a
+/// former profile's tool, or one added by hand). Each is deleted from the home's mise `installs/`
+/// and dropped from its `config.toml` `[tools]` so it does not re-equip. Previews by default; `--yes`
+/// applies. Declared tools, login/session state, and any `nix:`/`deb:`/`flake:` build are untouched.
+fn app_prune(args: &[OsString]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut apply = false;
+    for a in args {
+        match a.to_str() {
+            Some("-y") | Some("--yes") => apply = true,
+            Some("--help") | Some("-h") => return help::show(&["app", "prune"]),
+            Some(flag) if flag.starts_with('-') => {
+                eprintln!("sbx: app prune: unknown flag `{flag}`");
+                eprintln!("       run `sbx help app prune` for usage.");
+                return ExitCode::from(2);
+            }
+            Some(other) if name.is_none() => name = Some(other),
+            Some(extra) => {
+                eprintln!("sbx: app prune: unexpected extra argument `{extra}`");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("sbx: app prune: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!(
+            "sbx: app prune: name an app — usage: {}",
+            help::synopsis_of(&["app", "prune"])
+        );
+        return ExitCode::from(2);
+    };
+    let cwd = match config_cwd() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: app prune: cannot locate sbx's data directory.");
+        return ExitCode::FAILURE;
+    };
+
+    let resolved = config::load(&cwd);
+    let app = resolved.apps.get(name);
+    let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
+    if app.is_none() && homes.is_empty() {
+        eprintln!("sbx: app prune: no app named {name:?}");
+        let declared: Vec<String> = resolved.apps.keys().cloned().collect();
+        if !declared.is_empty() {
+            eprintln!("sbx: declared apps: {}", declared.join(", "));
+        }
+        return ExitCode::FAILURE;
+    }
+    // The app's declared `mise:` tokens; a tool matching none of them is undeclared. A home-only app
+    // (no config) declares nothing, so every mise tool in its home is prunable.
+    let declared: Vec<&str> = app
+        .map(|a| {
+            a.packages
+                .iter()
+                .filter_map(|p| match &p.backend {
+                    config::Backend::Mise(token) => Some(token.as_str()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let mut total_bytes = 0u64;
+    let mut count = 0usize;
+    for home in &homes {
+        let pruned = sandbox::prune_app_tools(&home.dir, &declared, apply);
+        if pruned.is_empty() {
+            continue;
+        }
+        let location = if home.global {
+            "global home".to_string()
+        } else {
+            format!("project {} home", home.project_id.as_deref().unwrap_or("?"))
+        };
+        println!("{dim}{location}:{r}");
+        for p in &pruned {
+            count += 1;
+            total_bytes += p.bytes;
+            println!(
+                "  {n}{}{r}  {dim}{}{r}",
+                p.token,
+                sandbox::human_bytes(p.bytes)
+            );
+        }
+    }
+    if count == 0 {
+        println!("{h}sbx app prune{r} {dim}— {name}: no undeclared mise tools to prune.{r}");
+        return ExitCode::SUCCESS;
+    }
+    let size = sandbox::human_bytes(total_bytes);
+    if apply {
+        println!("{ok}pruned {count} undeclared tool(s), freeing {size}.{r}");
+    } else {
+        println!(
+            "{dim}would prune {count} undeclared tool(s) ({size}) — re-run with `--yes` to apply.{r}"
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// A compact description of where an app's installed homes live — `global`, `N project home(s)`, or
@@ -7048,7 +7306,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         }
     };
     if let Some(name) = &parsed.app {
-        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+        if !config::is_valid_app_name(name) {
             eprintln!("sbx: invalid app name '{name}'");
             return ExitCode::from(2);
         }
@@ -7166,7 +7424,7 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
         }
     };
     if let Some(name) = &parsed.app {
-        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+        if !config::is_valid_app_name(name) {
             eprintln!("sbx: invalid app name '{name}'");
             return ExitCode::from(2);
         }
@@ -7637,7 +7895,7 @@ fn persist_egress_rule(
     // pre-check the name. An invalid or reserved name keys a table `resolve_apps` drops at load,
     // so the rule would be silently inert; refuse it rather than report a durable restriction.
     if let Some(name) = app {
-        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+        if !config::is_valid_app_name(name) {
             return Err((2, format!("`{name}` is not a valid app name")));
         }
     }
@@ -7745,7 +8003,7 @@ fn persist_egress_removal(
         ));
     }
     if let Some(name) = app {
-        if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
+        if !config::is_valid_app_name(name) {
             return Err((2, format!("`{name}` is not a valid app name")));
         }
     }

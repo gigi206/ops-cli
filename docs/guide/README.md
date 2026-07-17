@@ -65,6 +65,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`search`](cli/search.md) | discover `nix:` tools via nixhub |
 | [`test`](cli/test.md) | check whether an access would be allowed |
 | [`net`](cli/net.md) | inspect and manage the egress policy |
+| [`proc`](cli/proc.md) | observe a running sandbox's process tree |
 | [`plugins`](cli/plugins.md) | manage resolver plugins and plugin stores |
 | [`session`](cli/session.md) | list, attach to, and stop the live sessions |
 | [`trust` / `untrust`](cli/trust.md) | vouch for a project config |

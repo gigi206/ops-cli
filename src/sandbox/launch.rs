@@ -1163,8 +1163,6 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     let gcroot_set: std::collections::BTreeSet<&str> = gcroots.iter().map(String::as_str).collect();
     let tools_locked = super::inspect::nix_tools_locked(&dir);
     let home_tools = super::inspect::mise_installed(&dir.join("home"));
-    let home_munged: std::collections::BTreeSet<&str> =
-        home_tools.iter().map(|t| t.name.as_str()).collect();
     let nixpkgs =
         super::inspect::nixpkgs_pin(&dir, data).map(|(source, rev, per_project)| NixpkgsView {
             source,
@@ -1188,7 +1186,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     let mise_tools: Vec<ProjToolView> = home_tools
         .iter()
         .map(|t| ProjToolView {
-            name: t.name.clone(),
+            name: t.label().to_string(),
             versions: super::inspect::concrete_versions(t),
         })
         .collect();
@@ -1207,9 +1205,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         let resolved = crate::config::load(ppath);
         for pkg in &resolved.packages {
             let realized = match &pkg.backend {
-                Backend::Mise(token) => {
-                    home_munged.contains(super::inspect::mise_munge(token).as_str())
-                }
+                Backend::Mise(token) => home_tools.iter().any(|t| t.is(token)),
                 Backend::Nix(_) => gcroot_set.contains(pkg.name.as_str()),
                 Backend::Deb(_) => gcroot_set.contains(format!("deb-{}", pkg.name).as_str()),
                 Backend::AppImage(_) => {
@@ -1246,7 +1242,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 }
             }
             for tool in &declared.non_nix {
-                if !home_munged.contains(super::inspect::mise_munge(&tool.token).as_str()) {
+                if !home_tools.iter().any(|t| t.is(&tool.token)) {
                     unbuilt.push(UnbuiltView {
                         kind: "mise tool".to_string(),
                         locator: format!("{} = {}", tool.token, tool.version),

@@ -211,6 +211,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     // cage running `sleep`, so the spawned pid is the session's pid throughout.
     let mut agent = sbx()
         .arg("app")
+        .arg("run")
         .arg("probe")
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())

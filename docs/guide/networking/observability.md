@@ -26,7 +26,7 @@ source, reflecting the trust gate (an untrusted project's rules are dropped):
 
 ```bash
 sbx net rules                        # the baseline effective rules
-sbx net rules -a claude              # what `sbx app claude` would launch with
+sbx net rules -a claude              # what `sbx app run claude` would launch with
 sbx net rules --source config        # only the .sbx.toml/global rules
 sbx net rules --source builtin       # only the always-allowed self-equip set
 sbx net rules --source session        # rules a live ask-session remembered (--session)

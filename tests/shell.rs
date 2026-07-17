@@ -227,6 +227,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     let mut command = sbx();
     command
         .arg("app")
+        .arg("run")
         .arg("term")
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())

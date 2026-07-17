@@ -58,7 +58,7 @@ forward = [1455]
 - **Collision = fail-closed.** A port already in use on the host (another login, a host
   service) aborts the launch with a clear message. sbx does not pick an ephemeral substitute
   — the tool's redirect URL is fixed, so a different port would silently break the callback.
-  Two simultaneous `sbx app codex` logins collide on 1455; the second fails (login is a
+  Two simultaneous `sbx app run codex` logins collide on 1455; the second fails (login is a
   one-shot, acceptable).
 - **Orthogonal to egress.** Inbound is a new, declared *inbound* hole; the empty netns and the
   egress allowlist are unchanged. An OAuth flow needs **both**: `forward` for the callback,
@@ -73,14 +73,14 @@ invocation). It is a collection — it **unions** onto the config-declared ports
 replaces them.
 
 ```
-sbx app codex --forward 1455
+sbx app run codex --forward 1455
 SBX_FORWARD=1455,8080 sbx run -- ./dev-server
 ```
 
 ## The first consumer: codex's ChatGPT login
 
 `profiles/codex.toml` declares `forward = [1455]` and opens the OAuth runtime hosts in its
-allowlist, so `sbx app codex` → `codex login` completes end-to-end: codex opens the auth URL
+allowlist, so `sbx app run codex` → `codex login` completes end-to-end: codex opens the auth URL
 in your browser, you authenticate, the provider redirects to `localhost:1455`, the forwarder
 bridges it into the cage, codex receives the code, exchanges it (egress, allowlisted), and the
 token persists in the app's isolated `$HOME`. Login is a one-time step; later launches reuse

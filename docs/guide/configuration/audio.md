@@ -88,8 +88,8 @@ To set the audio posture for a single launch without editing the file, use `--au
 `SBX_AUDIO`:
 
 ```sh
-sbx app claude-desktop --audio        # bare --audio means true
-sbx app claude-desktop --audio=false  # disable the profile's audio for this launch
+sbx app run claude-desktop --audio        # bare --audio means true
+sbx app run claude-desktop --audio=false  # disable the profile's audio for this launch
 ```
 
 `--audio` is a boolean: bare `--audio` means `true`, or write `--audio=true` / `--audio=false`

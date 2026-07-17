@@ -95,6 +95,7 @@ fn run_in(project: &Path, data: &Path, args: &[&str]) -> Output {
 fn app_in(project: &Path, data: &Path, name: &str) -> Output {
     sbx()
         .arg("app")
+        .arg("run")
         .arg(name)
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
@@ -107,6 +108,7 @@ fn app_in(project: &Path, data: &Path, name: &str) -> Output {
 fn app_in_args(project: &Path, data: &Path, name: &str, extra: &[&str]) -> Output {
     sbx()
         .arg("app")
+        .arg("run")
         .arg(name)
         .arg("--")
         .args(extra)
@@ -363,7 +365,7 @@ fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
 
     // With `--env`, the override is the final word — it beats the app overlay.
     let overridden = sbx()
-        .args(["app", "greet", "--env", "APPVAR=from-override"])
+        .args(["app", "run", "greet", "--env", "APPVAR=from-override"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .output()
@@ -749,6 +751,43 @@ fn sbx_app_launches_the_apps_command_with_its_overlay() {
 }
 
 #[test]
+fn app_run_treats_a_subcommand_verb_as_an_app_name() {
+    // Requiring the explicit `run` verb frees the app namespace: `sbx app run list` must reach the
+    // launch path with `list` as the *app name* (none declared → the clean "no app named" error),
+    // while the bare `sbx app list` still runs the list subcommand. Same token, disambiguated only
+    // by its position after `run` — proof that an app may be named like a subcommand and is reached
+    // as `sbx app run <name>`. Host-side (config resolution), no sandbox needed.
+    let project = TmpDir::new("apprun-verb-proj");
+    let data = TmpDir::new("apprun-verb-data");
+    let state = TmpDir::new("apprun-verb-state");
+
+    // `sbx app run list` — `list` is the app name here, not the subcommand.
+    let launched = app_in(project.path(), data.path(), "list");
+    assert_eq!(
+        launched.status.code(),
+        Some(2),
+        "`sbx app run list` must reach the launch path, not the list subcommand"
+    );
+    assert!(
+        String::from_utf8_lossy(&launched.stderr).contains("no app named"),
+        "`sbx app run list` must treat `list` as an app name: {}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+
+    // The bare `sbx app list` still runs the list subcommand (exit 0, never a launch attempt).
+    let listed = sbx_in(project.path(), data.path(), state.path(), &["app", "list"]);
+    assert!(
+        listed.status.success(),
+        "`sbx app list` must run the list subcommand: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&listed.stderr).contains("no app named"),
+        "`sbx app list` must not be treated as a launch"
+    );
+}
+
+#[test]
 fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell() {
     let project = TmpDir::new("apphome-proj");
     let data = TmpDir::new("apphome-data");
@@ -850,7 +889,7 @@ fn an_imported_profile_launches_trusted_by_location() {
     // Launch it by name: the profile's command runs in the cage and its free env reaches it —
     // proving the imported profile was discovered and launched end to end.
     let greet = sbx()
-        .args(["app", "greet"])
+        .args(["app", "run", "greet"])
         .current_dir(project.path())
         .env("XDG_CONFIG_HOME", config.path())
         .env("XDG_DATA_HOME", data.path())
@@ -1468,7 +1507,12 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     );
 
     // Launch 1: imports the first session's CA (db now holds one sbx-mitm entry).
-    let first = sbx_in(project.path(), data.path(), state.path(), &["app", "probe"]);
+    let first = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "probe"],
+    );
     assert!(
         first.status.success(),
         "first launch failed: {}",
@@ -1477,7 +1521,12 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
 
     // Launch 2: a NEW session CA. Without the purge the shared home's db would now hold TWO
     // same-subject CAs; with it, the count stays 1.
-    let second = sbx_in(project.path(), data.path(), state.path(), &["app", "probe"]);
+    let second = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "probe"],
+    );
     let out = String::from_utf8_lossy(&second.stdout);
     let log = format!("{}{}", String::from_utf8_lossy(&second.stderr), out);
     assert!(second.status.success(), "second launch failed: {log}");
@@ -2006,7 +2055,7 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["app", "probe", "--net-learn=domain", "--dry-run"],
+        &["app", "run", "probe", "--net-learn=domain", "--dry-run"],
     );
     let dry_out = format!(
         "{}{}",
@@ -2036,7 +2085,7 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["app", "probe", "--net-learn=domain", "--local"],
+        &["app", "run", "probe", "--net-learn=domain", "--local"],
     );
     let write_out = format!(
         "{}{}",
@@ -3435,7 +3484,12 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = sbx_in(project.path(), data.path(), state.path(), &["app", "cc"]);
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "cc"],
+    );
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -3614,7 +3668,14 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
             String::from_utf8_lossy(&t.stderr)
         );
     };
-    let launch = || sbx_in(project.path(), data.path(), state.path(), &["app", "fk"]);
+    let launch = || {
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["app", "run", "fk"],
+        )
+    };
 
     // PHASE 1 — cold build under the allowlist.
     trust(project.path());
@@ -3724,7 +3785,14 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
             String::from_utf8_lossy(&t.stderr)
         );
     };
-    let launch = || sbx_in(project.path(), data.path(), state.path(), &["app", "fk"]);
+    let launch = || {
+        sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["app", "run", "fk"],
+        )
+    };
 
     // PHASE 1 — cold in-cage build of the inline flake.
     trust(project.path());
@@ -5288,6 +5356,7 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
 
     let mut child = sbx()
         .arg("app")
+        .arg("run")
         .arg("cap")
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())

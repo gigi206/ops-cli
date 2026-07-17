@@ -11,7 +11,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 |---|---|
 | [`sbx run`](run.md) | run a command inside the project sandbox |
 | [`sbx shell`](shell.md) | open an interactive sandboxed shell |
-| [`sbx app <name>`](app.md) | launch or manage named application profiles |
+| [`sbx app`](app.md) | launch (`sbx app run <name>`) or manage named application profiles |
 | [`sbx mise`](mise.md) | run the in-cage mise to self-equip a toolchain |
 
 ## Configuration and discovery
@@ -41,6 +41,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 | Command | Purpose |
 |---|---|
 | [`sbx session`](session.md) | list, attach to, and stop the live sandbox sessions |
+| [`sbx proc`](proc.md) | observe a running session's process tree |
 | [`sbx projects`](projects.md) | list and remove per-project runtime trees |
 | [`sbx gc`](gc.md) | reclaim nix store space |
 | [`sbx upgrade`](upgrade.md) | roll managed toolchains forward |
@@ -56,5 +57,5 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 - `sbx help` / `sbx --help` — the top-level command list.
 - `sbx help <command> [subcommand...]` — the page for a command path.
 - `sbx <command> --help` — the same page.
-- A `--` ends `sbx`'s own flags, so `sbx app <name> -- --help` passes `--help` to the
+- A `--` ends `sbx`'s own flags, so `sbx app run <name> -- --help` passes `--help` to the
   launched command.

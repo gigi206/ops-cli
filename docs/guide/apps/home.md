@@ -1,6 +1,6 @@
 # Per-app isolated `$HOME`
 
-Each `sbx app <name>` gets a **dedicated, persistent, isolated `$HOME`**, so the app's
+Each `sbx app run <name>` gets a **dedicated, persistent, isolated `$HOME`**, so the app's
 config, login state, and history never bleed into your project shell or another app.
 The `home_scope` field chooses whether that home is also per-project.
 

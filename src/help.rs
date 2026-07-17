@@ -182,9 +182,23 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app"],
-        synopsis: "sbx app <name> [--detach] [--net-learn[=level] [-g|--local] [--dry-run]] \
-                   [override flags] [-- <args>...]",
+        synopsis: "sbx app <subcommand> [args...]",
         summary: "launch or manage named application profiles",
+        options: &[],
+        details:
+            "A named application profile (a project [app.<name>] overlay, or an imported\n\
+            apps/<name>.toml profile — a global app lives as a profile file, not inline in\n\
+            sbx.toml) runs inside the project sandbox, each with its own persistent isolated home.\n\n\
+            `sbx app run <name>` launches one; `import`/`export`/`rm`/`list`/`show`/`prune` manage\n\
+            them. Run one of the subcommands below. Launching always goes through `run`, so an app\n\
+            name is never a subcommand — an app may be named `run`, `show`, etc. and is still\n\
+            launched as `sbx app run <name>`.",
+    },
+    Page {
+        path: &["app", "run"],
+        synopsis: "sbx app run <name> [--detach] [--net-learn[=level] [-g|--local] [--dry-run]] \
+                   [override flags] [-- <args>...]",
+        summary: "launch a named application profile in the project sandbox",
         options: &[
             (
                 "--detach",
@@ -217,18 +231,18 @@ const PAGES: &[Page] = &[
             ),
         ],
         details:
-            "`sbx app <name>` launches a named application profile (a project [app.<name>] overlay,\n\
-            or an imported apps/<name>.toml profile — a global app lives as a profile file, not\n\
-            inline in sbx.toml) inside the project sandbox, each with its own persistent isolated\n\
+            "`sbx app run <name>` launches a named application profile (a project [app.<name>]\n\
+            overlay, or an imported apps/<name>.toml profile — a global app lives as a profile file,\n\
+            not inline in sbx.toml) inside the project sandbox, each with its own persistent isolated\n\
             home.\n\n\
             Arguments after a `--` are appended to the app's declared command, so you can pass a\n\
-            flag to the launched program without editing the profile — e.g. `sbx app claude-code\n\
-            -- -c` runs the profile's `claude` command with `-c` (resume the previous session).\n\
-            They are ordinary launch-time arguments; the app's posture (network, binds, secrets,\n\
-            home) is fixed by the profile and unchanged.\n\n\
+            flag to the launched program without editing the profile — e.g. `sbx app run\n\
+            claude-code -- -c` runs the profile's `claude` command with `-c` (resume the previous\n\
+            session). They are ordinary launch-time arguments; the app's posture (network, binds,\n\
+            secrets, home) is fixed by the profile and unchanged.\n\n\
             A one-shot override (`--config` or a typed flag, and their `SBX_*` environment\n\
             equivalents) is applied *after* the app's overlay, so it is the final word — e.g.\n\
-            `sbx app claude-code --net none` cuts the app's network for one run. Note that\n\
+            `sbx app run claude-code --net none` cuts the app's network for one run. Note that\n\
             overriding an app's network drops its read-by-default verb filter (an override posture is\n\
             all-verbs, like a Mode-A launch); scope it with `{GET,HEAD}` rules in a `--config`\n\
             `[network]` if you need to keep it. See `sbx help run` for the full precedence rules.\n\n\
@@ -282,6 +296,35 @@ const PAGES: &[Page] = &[
             egress log of a running session; and `live` is a `top`-style view of the egress tunnels\n\
             currently open. Host-side — no launch, no nix. (Distinct from `sbx test net <url>`, which\n\
             tests one URL against the policy.)",
+    },
+    Page {
+        path: &["proc"],
+        synopsis: "sbx proc <subcommand> [args...]",
+        summary: "observe what a running sandbox is doing inside its cage",
+        options: &[],
+        details:
+            "The in-cage observability surface, sibling of `sbx net`. `sbx proc ls` snapshots a\n\
+            session's process tree — what the agent has spawned. Read-only and host-side: it reads\n\
+            `/proc` with no privilege and no cooperation from the cage, and launches nothing.\n\
+            \n\
+            Run one of the subcommands below.",
+    },
+    Page {
+        path: &["proc", "ls"],
+        synopsis: "sbx proc ls [<id>] [--json]",
+        summary: "snapshot a running session's process tree",
+        options: &[
+            (
+                "<id>",
+                "the PID `sbx session ls` shows; omit it when only one session is live",
+            ),
+            ("--json", "emit the tree as JSON instead of the indented view"),
+        ],
+        details:
+            "Shows the tree of processes the agent has spawned inside the cage, read host-side from\n\
+            `/proc` — the launcher (or bubblewrap on the exec path) is the root, and every cage\n\
+            process is one of its descendants. No privilege, no cage cooperation, no launch. With no\n\
+            id the sole live session is used; otherwise name one by its PID.",
     },
     Page {
         path: &["plugins"],
@@ -799,6 +842,24 @@ const PAGES: &[Page] = &[
             and every app launched in it, so the roots include app packages. A dead tree (its project\n\
             directory gone) shows realized state only. Read-only: no sandbox, no nix, no network. For\n\
             an app rather than a tree, see `sbx app show <name>`.",
+    },
+    Page {
+        path: &["app", "prune"],
+        synopsis: "sbx app prune <name> [--yes]",
+        summary: "remove an app home's mise tools that its config does not declare",
+        options: &[
+            ("<name>", "the app whose home(s) to prune"),
+            ("-y, --yes", "apply the removal (previews by default)"),
+        ],
+        details:
+            "Removes the mise tools an app's home(s) carry that the app's config does not declare —\n\
+            the `installed (undeclared)` leftovers `sbx app show` surfaces (a tool from a former\n\
+            profile, or one added by hand). Each is deleted from the home's `mise/installs/` and\n\
+            dropped from that home's `mise/config.toml` `[tools]` so a later launch does not\n\
+            re-equip it. It previews by default — listing what would go, with sizes — and applies\n\
+            only with `--yes`. Every home the app has (the global one and any per-project ones) is\n\
+            covered. Declared tools, the app's login/session state, and any `nix:`/`deb:`/`flake:`\n\
+            build are left untouched. To remove the whole home instead, see `sbx app rm --purge`.",
     },
     Page {
         path: &["app", "show"],
@@ -1734,15 +1795,16 @@ mod tests {
         assert!(maybe_help("app", &v(&["--help"])).is_some());
         assert!(maybe_help("app", &v(&["-h"])).is_some());
         assert!(maybe_help("app", &v(&["import", "--help"])).is_some());
+        assert!(maybe_help("app", &v(&["run", "--help"])).is_some());
         assert!(maybe_help("stop", &v(&["--all", "--help"])).is_some());
 
-        // A help flag *after* a `--` belongs to the launched command — `sbx app <name> -- --help`
+        // A help flag *after* a `--` belongs to the launched command — `sbx app run <name> -- --help`
         // passes `--help` through, so sbx does not intercept it.
-        assert!(maybe_help("app", &v(&["claude", "--", "--help"])).is_none());
-        assert!(maybe_help("app", &v(&["claude", "--", "-h"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "claude", "--", "--help"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "claude", "--", "-h"])).is_none());
         // No help flag at all runs the command.
-        assert!(maybe_help("app", &v(&["claude", "--", "-c"])).is_none());
-        assert!(maybe_help("app", &v(&["claude"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "claude", "--", "-c"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "claude"])).is_none());
     }
 
     #[test]

@@ -61,7 +61,8 @@ pub(crate) use flake::{
     withheld as withheld_flake_packages, FlakeUpgrade,
 };
 pub(crate) use gc::{
-    classify_tree, human_bytes, installed_app_homes, purge_app_homes, tree_size, InstalledApp,
+    classify_tree, human_bytes, installed_app_homes, prune_app_tools, purge_app_homes, tree_size,
+    InstalledApp,
 };
 pub(crate) use launch::{
     app, attach, effective_lock_target, gc, projects_list, projects_rm, projects_show,

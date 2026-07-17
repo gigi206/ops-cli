@@ -14,7 +14,7 @@ A launch resolves the configuration by overlaying, low to high:
 built-in defaults  <  global sbx.toml  <  project .sbx.toml
 ```
 
-Plus, for [`sbx app <name>`](../apps/README.md), the app's own overlay on top, and
+Plus, for [`sbx app run <name>`](../apps/README.md), the app's own overlay on top, and
 then a [one-shot override](overrides.md) as the final word. Use
 [`sbx config show`](../cli/config.md) to see the resolved result, with each value
 tagged by the layer it came from.
@@ -91,7 +91,7 @@ network = { mode = "deny", allow = ["api.anthropic.com"] }
 sbx trust                 # bless the security fields
 sbx config show           # verify the resolved result
 sbx run -- jq --version   # jq is on PATH
-sbx app review            # launch the agent with its own posture
+sbx app run review        # launch the agent with its own posture
 ```
 
 ## Editing the config

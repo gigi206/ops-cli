@@ -6,7 +6,7 @@ deliberately:
 
 ```sh
 sbx app import profiles/claude-code.toml
-sbx app claude-code
+sbx app run claude-code
 ```
 
 See also: [Portable profiles](profiles.md) · [The app framework](README.md) · [Secrets](../secrets/README.md) · the repository [`profiles/README.md`](../../../profiles/README.md).

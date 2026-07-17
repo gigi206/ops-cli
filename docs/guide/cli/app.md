@@ -1,15 +1,16 @@
 # `sbx app`
 
 ```
-sbx app <name> [--detach] [override flags] [-- <args>...]
+sbx app run <name> [--detach] [override flags] [-- <args>...]
 sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
 sbx app rm <name> [--purge] [--gc]
 sbx app list
 sbx app show <name> [--json]
+sbx app prune <name> [--yes]
 ```
 
-`sbx app <name>` launches a named application profile — a project `[app.<name>]`
+`sbx app run <name>` launches a named application profile — a project `[app.<name>]`
 overlay, or an imported `apps/<name>.toml` profile — inside the project sandbox, each
 with its own persistent isolated home.
 
@@ -24,12 +25,12 @@ See also: [The app framework](../apps/README.md) · [`[app.<name>]`](../configur
 | `-- <args>...` | appended to the app's declared command |
 
 Arguments after a `--` are appended to the app's `cmd`, so you can pass a flag to the
-launched program without editing the profile — e.g. `sbx app claude-code -- -c` runs
+launched program without editing the profile — e.g. `sbx app run claude-code -- -c` runs
 the profile's `claude` with `-c`. They are ordinary launch-time arguments; the app's
 posture (network, binds, secrets, home) is fixed by the profile.
 
 A one-shot override is applied after the app's overlay, so it is the final word — e.g.
-`sbx app claude-code --net none` cuts the app's network for one run. Note: overriding
+`sbx app run claude-code --net none` cuts the app's network for one run. Note: overriding
 an app's network drops its read-by-default verb filter (an override posture is
 all-verbs); scope it with `{GET,HEAD}` rules in a `--config` `[network]` if you need to
 keep it.
@@ -45,9 +46,11 @@ keep it.
 | `rm <name> --purge --gc` | after the purge, sweep the **current project's** nix store too (one command; requires `--purge`) |
 | `list` | list the imported profiles **and** the apps with an installed home (with disk size) |
 
-`import`/`export`/`rm`/`list` are reserved verbs and cannot be app names. `import` is a
-deliberate consent act — an agent in the cage cannot run it, and the profile stays
-inert until `sbx app <name>`. See [Portable profiles](../apps/profiles.md).
+`run`/`import`/`export`/`rm`/`list`/`show`/`prune` are subcommands. Launching always goes
+through `run`, so an app is never confused with a subcommand and **may be named like one**
+(reached as `sbx app run <name>`). `import` is a deliberate consent act — an agent in the
+cage cannot run it, and the profile stays inert until `sbx app run <name>`. See
+[Portable profiles](../apps/profiles.md).
 
 ### Removing an app
 
@@ -82,20 +85,33 @@ A package a launch would not provision because an untrusted layer declared it re
 
 If the home holds mise tools that **no declared package accounts for** — a leftover from a
 removed profile, or a dependency a `mise:` backend pulled in — they are listed under
-`installed (undeclared)`, so the report shows everything that is actually installed, not only
-what the profile names.
+`installed (undeclared)`, named by their real backend token (its provider, e.g.
+`pipx:hermes-agent`, recovered from mise's metadata rather than the munged directory name), so
+the report shows everything that is actually installed, not only what the profile names.
 
 Read-only: no trust gate, no launch, no network. `--json` emits the same model for scripting.
+
+## Pruning undeclared tools
+
+`sbx app prune <name>` removes the `installed (undeclared)` mise tools `show` surfaces — a
+tool from a former profile, or one added by hand — from every home the app has. Each is
+deleted from the home's `mise/installs/` and dropped from that home's `mise/config.toml`
+`[tools]` so a later launch does not re-equip it. It **previews by default** (listing what
+would go, with sizes) and applies only with `--yes`. The app's declared tools, its
+login/session state, and any `nix:`/`deb:`/`flake:` build are left untouched — to remove the
+whole home instead, use [`sbx app rm --purge`](#removing-an-app).
 
 ## Examples
 
 ```sh
 sbx app import profiles/claude-code.toml
-sbx app claude-code                    # launch with its own isolated home
-sbx app claude-code -- -c              # resume the previous session
-sbx app claude-code --net none         # one run with no network
+sbx app run claude-code                # launch with its own isolated home
+sbx app run claude-code -- -c          # resume the previous session
+sbx app run claude-code --net none     # one run with no network
 sbx app list                           # imported profiles + installed homes
 sbx app show claude-code               # what this app has actually installed on disk
+sbx app prune hermes                    # preview undeclared mise tools in hermes' home
+sbx app prune hermes --yes              # …and remove them
 sbx app export claude-code > my-claude.toml
 sbx app rm claude-code --purge         # remove the profile, home, and tools
 sbx app rm claude-code --purge --gc    # …and sweep this project's nix store too

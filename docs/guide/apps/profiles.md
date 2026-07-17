@@ -41,7 +41,7 @@ sbx app import <file> [--as <name>] [--force]
 ```
 
 - The **deliberate command is the consent** — an agent in the cage cannot run it, and
-  the profile stays **inert until `sbx app <name>`** launches it.
+  the profile stays **inert until `sbx app run <name>`** launches it.
 - The **granted posture is printed** (command, home scope, packages, binds, network,
   and each credential by destination + source — never a plaintext value).
 - The file must have a `cmd` (an empty parse is the tell-tale of a wrongly

@@ -12,9 +12,27 @@ pub(crate) struct InstalledTool {
     /// The directory name mise gives the tool under `installs/` — the *munged* form of its declared
     /// token (see [`mise_munge`]), e.g. `aqua-anthropics-claude-code`.
     pub(crate) name: String,
+    /// The real backend token mise recorded for this tool (`pipx:hermes-agent`, `aqua:openai/codex`,
+    /// …), read from its `.mise.backend.toml`. `None` when that metadata is absent. Preferred over
+    /// the munged directory name for display *and* for an exact match against a declared token.
+    pub(crate) token: Option<String>,
     /// The version subdirectories realized for the tool. Includes mise's `latest` alias directory
     /// alongside the concrete version it points at; [`concrete_versions`] filters the alias out.
     pub(crate) versions: Vec<String>,
+}
+
+impl InstalledTool {
+    /// The tool's real backend token when known, else its munged directory name — for display.
+    pub(crate) fn label(&self) -> &str {
+        self.token.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether this installed tool is the one a declared mise `locator` refers to. Prefers an exact
+    /// match on the recorded backend token; falls back to comparing the munged directory name when
+    /// the token metadata is absent.
+    pub(crate) fn is(&self, locator: &str) -> bool {
+        self.token.as_deref() == Some(locator) || self.name == mise_munge(locator)
+    }
 }
 
 /// Map a declared mise locator to the directory name mise gives it under `installs/`: `:` and `/`
@@ -62,6 +80,7 @@ pub(crate) fn mise_installed(home: &Path) -> Vec<InstalledTool> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
+        let token = backend_token(&entry.path());
         let mut versions: Vec<String> = match std::fs::read_dir(entry.path()) {
             Ok(vs) => vs
                 .flatten()
@@ -71,10 +90,31 @@ pub(crate) fn mise_installed(home: &Path) -> Vec<InstalledTool> {
             Err(_) => Vec::new(),
         };
         versions.sort();
-        tools.push(InstalledTool { name, versions });
+        tools.push(InstalledTool {
+            name,
+            token,
+            versions,
+        });
     }
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     tools
+}
+
+/// The real backend token mise recorded for the tool installed at `tool_dir` — the `short` (or
+/// `full`) key of its `.mise.backend.toml` (`short = "pipx:hermes-agent"`). This recovers the
+/// provider the munged directory name hides. Parsed line-wise (the file is a tiny flat table), so no
+/// TOML dependency. `None` when the metadata is absent or unparsable.
+fn backend_token(tool_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(tool_dir.join(".mise.backend.toml")).ok()?;
+    let value = |key: &str| {
+        body.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix(key)?.trim_start();
+            let rest = rest.strip_prefix('=')?.trim();
+            let quoted = rest.strip_prefix('"')?.strip_suffix('"')?;
+            (!quoted.is_empty()).then(|| quoted.to_string())
+        })
+    };
+    value("short").or_else(|| value("full"))
 }
 
 /// One isolated home an app has on disk. An app's mise-installed tools are per-home, so `sbx app
@@ -295,11 +335,13 @@ mod tests {
     fn concrete_versions_drops_the_latest_alias_but_keeps_it_when_alone() {
         let with_concrete = InstalledTool {
             name: "t".into(),
+            token: None,
             versions: vec!["latest".into(), "2.1.209".into()],
         };
         assert_eq!(concrete_versions(&with_concrete), vec!["2.1.209"]);
         let alias_only = InstalledTool {
             name: "t".into(),
+            token: None,
             versions: vec!["latest".into()],
         };
         assert_eq!(concrete_versions(&alias_only), vec!["latest"]);
@@ -314,13 +356,32 @@ mod tests {
         std::fs::create_dir_all(installs.join("opencode/1.17.9")).unwrap();
         // mise's own metadata file must be ignored (it is a file, not a tool dir).
         std::fs::write(installs.join(".mise-installs.toml"), b"x").unwrap();
+        // The backend metadata recovers the real token behind the munged directory name.
+        std::fs::write(
+            installs.join("aqua-anthropics-claude-code/.mise.backend.toml"),
+            "short = \"aqua:anthropics/claude-code\"\nfull = \"aqua:anthropics/claude-code\"\n",
+        )
+        .unwrap();
 
         let tools = mise_installed(&tmp);
         assert_eq!(tools.len(), 2, "two tools, metadata skipped");
         assert_eq!(tools[0].name, "aqua-anthropics-claude-code");
+        assert_eq!(
+            tools[0].token.as_deref(),
+            Some("aqua:anthropics/claude-code")
+        );
+        assert_eq!(tools[0].label(), "aqua:anthropics/claude-code");
+        assert!(
+            tools[0].is("aqua:anthropics/claude-code"),
+            "exact token match"
+        );
         assert_eq!(tools[0].versions, vec!["2.1.209", "latest"]);
         assert_eq!(concrete_versions(&tools[0]), vec!["2.1.209"]);
+        // No metadata → token None, label falls back to the munged dir, match via munge still works.
         assert_eq!(tools[1].name, "opencode");
+        assert_eq!(tools[1].token, None);
+        assert_eq!(tools[1].label(), "opencode");
+        assert!(tools[1].is("opencode"));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

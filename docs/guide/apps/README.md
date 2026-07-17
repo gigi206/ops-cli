@@ -6,7 +6,7 @@ agent *on* untrusted code, safely and repeatably.
 
 ```sh
 sbx app import profiles/claude-code.toml   # a deliberate trust act
-sbx app claude-code                        # launch it, sandboxed
+sbx app run claude-code                    # launch it, sandboxed
 ```
 
 See also: [`[app.<name>]` config](../configuration/apps.md) · [Per-app home](home.md) · [Portable profiles](profiles.md) · [Profile catalog](catalog.md) · [`sbx app`](../cli/app.md).
@@ -16,7 +16,7 @@ See also: [`[app.<name>]` config](../configuration/apps.md) · [Per-app home](ho
 An app is an **overlay** over the sandbox baseline:
 
 ```
-sandbox baseline  +  [app.<name>] overlay  →  what `sbx app <name>` launches
+sandbox baseline  +  [app.<name>] overlay  →  what `sbx app run <name>` launches
 ```
 
 The baseline is your project's resolved config (global + project). The overlay adds the

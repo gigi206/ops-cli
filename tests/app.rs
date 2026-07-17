@@ -76,6 +76,34 @@ impl Fixture {
         std::fs::write(ver.join("bin"), vec![b'x'; 2048]).unwrap();
     }
 
+    /// The global app home's mise installs dir.
+    fn installs_dir(&self, app: &str) -> PathBuf {
+        self.data_home
+            .path()
+            .join(format!("sbx/apps/{app}/home/.local/share/mise/installs"))
+    }
+
+    /// Record a tool's real backend token in its `.mise.backend.toml` (what mise writes).
+    fn set_tool_token(&self, app: &str, munged: &str, token: &str) {
+        let dir = self.installs_dir(app).join(munged);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".mise.backend.toml"),
+            format!("short = \"{token}\"\nfull = \"{token}\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// Write the app home's mise `config.toml` (the `mise use` record).
+    fn write_home_mise_config(&self, app: &str, body: &str) {
+        let dir = self
+            .data_home
+            .path()
+            .join(format!("sbx/apps/{app}/home/.config/mise"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
     /// Fabricate a project tree whose `deb-packages.lock` pins `url`.
     fn pin_deb(&self, tree_id: &str, url: &str, hash: &str) {
         let dir = self.data_home.path().join("sbx/projects").join(tree_id);
@@ -304,6 +332,103 @@ fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
     assert!(
         s.contains("demo-app"),
         "should list the declared apps:\n{s}"
+    );
+}
+
+/// A demo-app fixture with one declared mise tool installed and one undeclared leftover, plus a home
+/// mise config listing both — the shape `sbx app prune` acts on.
+fn fixture_with_a_leftover() -> Fixture {
+    let fx = Fixture::new();
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\nkeep = \"mise:aqua:demo/keep\"\n",
+    );
+    // The declared tool (aqua:demo/keep munges to aqua-demo-keep) and an undeclared leftover.
+    fx.install_mise_tool("demo-app", "aqua-demo-keep", "1.0.0");
+    fx.set_tool_token("demo-app", "aqua-demo-keep", "aqua:demo/keep");
+    fx.install_mise_tool("demo-app", "pipx-orphan", "0.9.0");
+    fx.set_tool_token("demo-app", "pipx-orphan", "pipx:orphan");
+    fx.write_home_mise_config(
+        "demo-app",
+        "[tools]\n\"aqua:demo/keep\" = \"latest\"\n\"pipx:orphan\" = \"latest\"\n",
+    );
+    fx
+}
+
+#[test]
+fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
+    let fx = fixture_with_a_leftover();
+    let out = fx.sbx(&["app", "prune", "demo-app"]);
+    assert!(out.status.success(), "prune preview failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    // The undeclared tool is named by its real provider token, not the munged dir.
+    assert!(
+        s.contains("pipx:orphan") && s.contains("would prune"),
+        "preview should list the undeclared tool: {s}"
+    );
+    assert!(
+        !s.contains("aqua:demo/keep"),
+        "the declared tool must not be pruned: {s}"
+    );
+    // Nothing was removed by the preview.
+    assert!(
+        fx.installs_dir("demo-app").join("pipx-orphan").is_dir(),
+        "preview must not delete the install"
+    );
+}
+
+#[test]
+fn prune_yes_removes_the_undeclared_tool_and_its_config_entry_only() {
+    let fx = fixture_with_a_leftover();
+    let out = fx.sbx(&["app", "prune", "demo-app", "--yes"]);
+    assert!(out.status.success(), "prune --yes failed: {}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("pruned 1"),
+        "should report the removal: {}",
+        text(&out)
+    );
+    // The undeclared install is gone; the declared one stays.
+    assert!(
+        !fx.installs_dir("demo-app").join("pipx-orphan").exists(),
+        "the undeclared install should be removed"
+    );
+    assert!(
+        fx.installs_dir("demo-app").join("aqua-demo-keep").is_dir(),
+        "the declared install must be kept"
+    );
+    // The config `[tools]` dropped the undeclared token, kept the declared one.
+    let config = std::fs::read_to_string(
+        fx.data_home
+            .path()
+            .join("sbx/apps/demo-app/home/.config/mise/config.toml"),
+    )
+    .unwrap();
+    assert!(
+        !config.contains("pipx:orphan"),
+        "the undeclared token should be dropped from config:\n{config}"
+    );
+    assert!(
+        config.contains("aqua:demo/keep"),
+        "the declared token must remain in config:\n{config}"
+    );
+}
+
+#[test]
+fn prune_reports_nothing_when_all_installed_tools_are_declared() {
+    let fx = Fixture::new();
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\nkeep = \"mise:aqua:demo/keep\"\n",
+    );
+    fx.install_mise_tool("demo-app", "aqua-demo-keep", "1.0.0");
+    fx.set_tool_token("demo-app", "aqua-demo-keep", "aqua:demo/keep");
+
+    let out = fx.sbx(&["app", "prune", "demo-app"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no undeclared mise tools"),
+        "should report nothing to prune: {}",
+        text(&out)
     );
 }
 

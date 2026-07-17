@@ -25,7 +25,7 @@ derives its runtime id from — so the registry and the runtime never disagree.
 | Launch | Registers |
 |---|---|
 | [`sbx run --detach`](../cli/run.md) | a background session |
-| [`sbx app --detach`](../cli/app.md) | a background agent session |
+| [`sbx app run --detach`](../cli/app.md) | a background agent session |
 | [`sbx shell`](../cli/shell.md) | while the shell runs (unlinked on exit) |
 | interactive [`sbx app`](../cli/app.md) | while the app runs |
 
@@ -54,7 +54,7 @@ The `<id>` is the PID `sbx session ls` shows.
 another terminal:
 
 ```sh
-sbx app claude-code --detach
+sbx app run claude-code --detach
 sbx ls
 sbx attach <id>       # look in
 sbx stop <id>         # done

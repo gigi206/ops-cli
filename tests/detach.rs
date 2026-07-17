@@ -231,7 +231,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["app", "sup", "--detach"],
+        &["app", "run", "sup", "--detach"],
     );
     assert!(
         started.status.success(),
@@ -299,7 +299,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
         project.path(),
         data.path(),
         state.path(),
-        &["app", "plain", "--detach"],
+        &["app", "run", "plain", "--detach"],
     );
     assert!(
         started.status.success(),

@@ -75,7 +75,7 @@ gpu = true
 To set the GPU posture for a single launch without editing the file, use `--gpu` or `SBX_GPU`:
 
 ```sh
-sbx app opencode-desktop --gpu=false   # disable the profile's gpu for this launch
+sbx app run opencode-desktop --gpu=false   # disable the profile's gpu for this launch
 sbx run --gpu -- some-gl-app           # bare --gpu means true
 ```
 
