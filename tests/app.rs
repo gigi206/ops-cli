@@ -82,6 +82,18 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("deb-packages.lock"), format!("{url}\t{hash}\n")).unwrap();
     }
+
+    /// Fabricate a warm flake out-link in a global app home — `home/.local/state/ops/flake/<name>`
+    /// pointing at a store path — the realized signal for a `flake:` package (which builds into the
+    /// home, not the per-project store).
+    fn build_flake(&self, app: &str, name: &str, store_leaf: &str) {
+        let dir = self
+            .data_home
+            .path()
+            .join(format!("sbx/apps/{app}/home/.local/state/ops/flake"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(format!("/nix/store/{store_leaf}"), dir.join(name)).unwrap();
+    }
 }
 
 fn text(out: &std::process::Output) -> String {
@@ -172,6 +184,48 @@ fn show_json_carries_each_packages_installed_state() {
         v["orphans"].as_array().expect("orphans array").is_empty(),
         "a declared installed tool must not be an orphan: {v}"
     );
+}
+
+#[test]
+fn show_detects_a_flake_built_into_the_home_even_when_floating() {
+    let fx = Fixture::new();
+    // A profile whose only package is a flake — built into the home, not the per-project store, and
+    // floating (no lock), which a lock scan would miss.
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[packages]\nagent = \"flake:github:foo/bar#default\"\n",
+    );
+    fx.build_flake(
+        "demo-app",
+        "agent",
+        "abcd1234abcd1234abcd1234abcd1234abcd1234-bar-1.0",
+    );
+
+    let out = fx.sbx(&["app", "show", "demo-app"]);
+    assert!(out.status.success(), "sbx app show failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("flake:github:foo/bar#default") && s.contains("built bar-1.0"),
+        "a warm flake out-link should read `built <pname-version>`:\n{s}"
+    );
+    assert!(
+        !s.contains("not installed"),
+        "the flake must not read `not installed`:\n{s}"
+    );
+
+    let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let flake = v["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["backend"] == "flake")
+        .expect("the flake package");
+    assert_eq!(flake["installed"]["state"], "installed");
+    assert!(flake["installed"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("bar-1.0"));
 }
 
 #[test]

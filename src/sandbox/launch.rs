@@ -1215,9 +1215,10 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 Backend::AppImage(_) => {
                     gcroot_set.contains(format!("appimage-{}", pkg.name).as_str())
                 }
-                Backend::Flake(reference) => {
-                    super::inspect::prebuilt_pin_in(&dir, "flake-packages.lock", reference)
-                        .is_some()
+                // A `flake:` build lands in the project home (like mise), not the store — and a
+                // floating flake has no lock — so the warm out-link is its realized signal.
+                Backend::Flake(_) => {
+                    super::inspect::flake_built(&dir.join("home"), &pkg.name).is_some()
                 }
                 Backend::FlakeInline { .. } => gcroot_set.contains(pkg.name.as_str()),
             };

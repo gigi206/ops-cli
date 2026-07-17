@@ -3924,6 +3924,19 @@ fn build_app_show(
                             }
                             None => PackageInstalled::NotInstalled,
                         }
+                    } else if matches!(pkg.backend, Backend::Flake(_)) {
+                        // A `flake:` build lands in the cage home (like mise), not the per-project
+                        // store — and a *floating* flake has no lock at all, so its realized signal
+                        // is the warm out-link in the app's home(s), not a lock scan.
+                        match homes
+                            .iter()
+                            .find_map(|h| sandbox::inspect::flake_built(&h.dir, &pkg.name))
+                        {
+                            Some(detail) => PackageInstalled::Installed {
+                                detail: format!("built {detail}"),
+                            },
+                            None => PackageInstalled::NotInstalled,
+                        }
                     } else if let Some(lockfile) = sandbox::inspect::prebuilt_lockfile(&pkg.backend)
                     {
                         let hits =

@@ -176,15 +176,41 @@ pub(crate) fn prebuilt_pin_in(tree_dir: &Path, lockfile: &str, locator: &str) ->
 }
 
 /// The lock filename a prebuilt backend records its pins in, or `None` for a backend that is not a
-/// per-tree prebuilt (mise is per-home, nix has no lock of this shape). Drives [`prebuilt_pin_trees`].
+/// per-tree prebuilt. Only `deb:`/`appimage:` qualify: their build output lands in the **per-project
+/// store**, so a per-tree lock (and the store gcroot) is their realized signal. `flake:` builds into
+/// the cage **home** instead (see [`flake_built`]); mise is per-home; nix has no lock of this shape.
 pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<&'static str> {
     use crate::config::Backend;
     match backend {
         Backend::Deb(_) => Some("deb-packages.lock"),
         Backend::AppImage(_) => Some("appimage-packages.lock"),
-        Backend::Flake(_) => Some("flake-packages.lock"),
         _ => None,
     }
+}
+
+/// Whether a `flake:` package named `name` (its free label) has a warm build out-link in `home` —
+/// `<home>/.local/state/ops/flake/<name>` (a floating build) or `<name>-<rev>` (a pinned one). A
+/// `flake:` build lives in the cage **home**, not the per-project store, so this — not a lock scan —
+/// is its realized signal (a *floating* flake has an out-link but no lock entry at all, which a lock
+/// scan would miss). Returns the out-link target's store-path label (e.g. `hermes-agent-0.18.2`, the
+/// basename minus the store hash) for display, or `None` when no out-link exists. Read-only.
+pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
+    let dir = home.join(".local/state/ops/flake");
+    let prefix = format!("{name}-");
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if fname != name && !fname.starts_with(&prefix) {
+            continue;
+        }
+        // The out-link target's basename, minus the store hash, is a friendly `<pname>-<version>`.
+        let detail = std::fs::read_link(entry.path())
+            .ok()
+            .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .and_then(|base| base.split_once('-').map(|(_, rest)| rest.to_string()))
+            .unwrap_or_else(|| "built".to_string());
+        return Some(detail);
+    }
+    None
 }
 
 /// The nix store roots a project tree has realized — the gcroot names under
@@ -378,6 +404,33 @@ mod tests {
         assert_eq!(locked.get("jq"), Some(&"1.7.1".to_string()));
         assert_eq!(locked.get("rg"), Some(&"14.1.0".to_string()));
         std::fs::remove_dir_all(&tree).ok();
+    }
+
+    #[test]
+    fn flake_built_finds_a_warm_out_link_floating_or_pinned() {
+        let home = std::env::temp_dir().join(format!("sbx-inspect-flk-{}", std::process::id()));
+        let flake = home.join(".local/state/ops/flake");
+        std::fs::create_dir_all(&flake).unwrap();
+        // A floating out-link keyed by name, pointing at a store path.
+        std::os::unix::fs::symlink(
+            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-hermes-agent-0.18.2",
+            flake.join("hermes"),
+        )
+        .unwrap();
+        assert_eq!(
+            flake_built(&home, "hermes"),
+            Some("hermes-agent-0.18.2".to_string()),
+            "the store-path label, hash stripped"
+        );
+        // A pinned out-link is keyed `<name>-<rev>`; still matched by the name.
+        assert!(flake_built(&home, "other").is_none());
+        std::os::unix::fs::symlink(
+            "/nix/store/abcd1234abcd1234abcd1234abcd1234abcd1234-other-1.0",
+            flake.join("other-deadbeef"),
+        )
+        .unwrap();
+        assert!(flake_built(&home, "other").is_some());
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

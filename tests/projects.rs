@@ -95,6 +95,17 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), b"x").unwrap();
     }
+
+    /// Fabricate a warm flake out-link in a tree's own home — `<tree>/home/.local/state/ops/flake/
+    /// <name>` — the realized signal for a `flake:` package (which builds into the home, not the store).
+    fn build_flake(&self, tree_id: &str, name: &str, store_leaf: &str) {
+        let dir = self
+            .projects_dir()
+            .join(tree_id)
+            .join("home/.local/state/ops/flake");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(format!("/nix/store/{store_leaf}"), dir.join(name)).unwrap();
+    }
 }
 
 fn text(out: &std::process::Output) -> String {
@@ -183,6 +194,36 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     assert_eq!(unbuilt.len(), 1, "one unbuilt package: {v}");
     assert!(unbuilt[0]["locator"].as_str().unwrap().contains("absent"));
     assert_eq!(unbuilt[0]["withheld"], false);
+}
+
+#[test]
+fn show_counts_a_flake_built_into_the_home_as_realized() {
+    let fx = Fixture::new();
+    let proj = fx.proj.path().canonicalize().unwrap();
+    let tree = "4444444444444444";
+    fx.make_tree(tree, Some(&proj));
+    // The project declares a flake; it is built into the tree's home (floating — no lock).
+    std::fs::write(
+        proj.join(".sbx.toml"),
+        "[packages]\nagent = \"flake:github:foo/bar#default\"\n",
+    )
+    .unwrap();
+    fx.build_flake(
+        tree,
+        "agent",
+        "abcd1234abcd1234abcd1234abcd1234abcd1234-bar-1.0",
+    );
+    let out = fx.sbx(&["trust"]);
+    assert!(out.status.success(), "trust failed: {}", text(&out));
+
+    let out = fx.sbx(&["projects", "show", tree, "--json"]);
+    assert!(out.status.success(), "projects show failed: {}", text(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    // The flake is realized (warm out-link), so it is NOT in the "declared but not built" set.
+    assert!(
+        v["unbuilt"].as_array().unwrap().is_empty(),
+        "a flake built into the home must not read as unbuilt: {v}"
+    );
 }
 
 #[test]
