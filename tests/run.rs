@@ -6042,3 +6042,153 @@ fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
         "purge removed the home despite the live session"
     );
 }
+
+/// `sbx gc --prune` reconciles the per-project store's accumulated seed roots: a superseded build —
+/// one no current out-link references — has its direct root dropped so the sweep reclaims it, while a
+/// current build (the base userland, whose out-link is live) is kept. Proves the wiring a unit test
+/// cannot: `sweep_current` deriving the keep-set from the real out-link families and driving
+/// `prune_superseded_roots` over a real seeded store. Skips (never fails) where the host cannot
+/// sandbox or the binary cache is unreachable.
+#[test]
+fn gc_prune_drops_a_superseded_seed_root_and_keeps_the_current_base() {
+    let project = TmpDir::new("gcsup-proj");
+    let data = TmpDir::new("gcsup-data");
+
+    // Seed the project store (capability probe): a successful `true` provisions and roots the base
+    // userland — creating both the store's direct seed roots and the `<data>/gcroots/base/<rev>`
+    // out-links the keep-set reads.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        if !cache_reachable() {
+            eprintln!("skipping gc-superseded e2e: the binary cache is unreachable");
+            return;
+        }
+        eprintln!(
+            "skipping gc-superseded e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+        );
+        return;
+    }
+
+    // Locate the project's store gcroots (exactly one project in this fresh data dir; sbx's data
+    // lives under the `sbx/` subdirectory of `$XDG_DATA_HOME`).
+    let id_dir = std::fs::read_dir(data.path().join("sbx").join("projects"))
+        .expect("projects dir")
+        .flatten()
+        .next()
+        .expect("one seeded project")
+        .path();
+    let store_gcroots = id_dir.join("store/nix/var/nix/gcroots");
+
+    // A real, current base root that must survive: its `base/<rev>` out-link keeps it in the keep-set.
+    let base_root = std::fs::read_dir(&store_gcroots)
+        .expect("store gcroots")
+        .flatten()
+        .map(|e| e.file_name())
+        .find(|n| n.to_string_lossy().contains("-glibc-"))
+        .expect("a seeded glibc root");
+    assert!(store_gcroots.join(&base_root).symlink_metadata().is_ok());
+
+    // Inject a superseded seed root: a direct root nothing current points at (its build was rolled
+    // away). The keep-set will not contain its basename, so the prune must drop it.
+    let obsolete = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-obsolete-e2e";
+    std::os::unix::fs::symlink(
+        format!("/nix/store/{obsolete}"),
+        store_gcroots.join(obsolete),
+    )
+    .expect("inject superseded root");
+
+    let out = sbx()
+        .args(["gc", "--prune"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx gc");
+    assert!(
+        out.status.success(),
+        "gc --prune failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The superseded root is gone; the current base root is untouched.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        store_gcroots.join(obsolete).symlink_metadata().is_err(),
+        "the superseded seed root was not dropped: {stdout}"
+    );
+    assert!(
+        store_gcroots.join(&base_root).symlink_metadata().is_ok(),
+        "gc dropped a current base root ({}): the keep-set missed it",
+        base_root.to_string_lossy()
+    );
+    // The report must own up to the reconciliation — at least the one injected root — so a future
+    // refactor that silently stops pruning the seed roots reddens this test, not just the symlink check.
+    assert!(
+        stdout.contains("superseded build(s)") && !stdout.contains(", 0 superseded build(s)"),
+        "gc did not report the superseded build(s) it dropped: {stdout}"
+    );
+}
+
+/// `sbx upgrade` ends by hinting how many superseded builds the project's store is holding, pointing
+/// at `sbx gc --prune`. Uses `upgrade flake` on a package-less project so the roll is a no-op (no
+/// network, the current revision's base stays built so the keep-set guard is met) and only the hint
+/// is exercised. Skips (never fails) where the host cannot sandbox or the cache is unreachable.
+#[test]
+fn upgrade_hints_at_reclaimable_superseded_builds() {
+    let project = TmpDir::new("uphint-proj");
+    let data = TmpDir::new("uphint-data");
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        if !cache_reachable() {
+            eprintln!("skipping upgrade-hint e2e: the binary cache is unreachable");
+            return;
+        }
+        eprintln!(
+            "skipping upgrade-hint e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+        );
+        return;
+    }
+
+    // Inject a superseded seed root the keep-set will not cover.
+    let id_dir = std::fs::read_dir(data.path().join("sbx").join("projects"))
+        .expect("projects dir")
+        .flatten()
+        .next()
+        .expect("one seeded project")
+        .path();
+    let store_gcroots = id_dir.join("store/nix/var/nix/gcroots");
+    let obsolete = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy-obsolete-hint";
+    std::os::unix::fs::symlink(
+        format!("/nix/store/{obsolete}"),
+        store_gcroots.join(obsolete),
+    )
+    .expect("inject superseded root");
+
+    // `upgrade flake` on a project with no `flake:` packages rolls nothing (offline, lock untouched),
+    // so the current revision's base stays built and the end-of-upgrade hint runs against it.
+    let out = sbx()
+        .args(["upgrade", "flake"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx upgrade");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("superseded build(s)") && stdout.contains("reclaimable"),
+        "upgrade did not hint at the reclaimable superseded build: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The hint is a dry-run pointer only — it must not have removed anything.
+    assert!(
+        store_gcroots.join(obsolete).symlink_metadata().is_ok(),
+        "the upgrade hint removed a root instead of only reporting it"
+    );
+}

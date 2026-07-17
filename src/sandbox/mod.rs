@@ -64,7 +64,8 @@ pub(crate) use gc::{
 };
 pub(crate) use launch::{
     app, attach, effective_lock_target, gc, projects_list, projects_rm,
-    rm_apply as projects_rm_apply, run, run_mise, shell, stop, upgrade_mise_packages,
+    rm_apply as projects_rm_apply, run, run_mise, shell, stop, superseded_reclaimable_hint,
+    upgrade_mise_packages,
 };
 pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};

@@ -135,3 +135,18 @@ sbx upgrade flake        # re-pin flake: packages
 
 After a `flake:` upgrade, run [`sbx gc`](gc.md) to reclaim the superseded rev-keyed
 out-links.
+
+## Reclaiming superseded builds
+
+A roll is what eventually supersedes a build (an old base revision, a rebuilt tool, a
+rolled-forward app), and those accumulate in the project's store. `sbx upgrade` therefore
+ends by reporting how many superseded builds the current project's store is holding, when
+any are:
+
+```
+3 superseded build(s) in this project's store are reclaimable — run `sbx gc --prune`.
+```
+
+The check is a cheap filesystem read (no provisioning, no nix) and stays silent when there
+is nothing to reclaim. It only reports — reclaiming is always the explicit, irreversible
+[`sbx gc --prune`](gc.md).

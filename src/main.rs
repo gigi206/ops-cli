@@ -8335,6 +8335,11 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // content hash and the per-project appimage lock is rewritten — the exact `deb:` shape.
         ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
+    // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
+    // project's store is already holding superseded builds — cheap, filesystem-only, and silent
+    // when there is nothing to reclaim (see the function).
+    sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, &pal);
+
     if ok {
         ExitCode::SUCCESS
     } else {

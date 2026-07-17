@@ -104,7 +104,7 @@ pub(crate) fn project_dir(layout: &Layout, project_id: &str) -> PathBuf {
 /// The per-project store directory for `project_id`, keyed on the same identity as
 /// the rest of the project's runtime (home, synthetic identity, gcroots), so
 /// housekeeping can reclaim it alongside them.
-fn store_dir_for(layout: &Layout, project_id: &str) -> PathBuf {
+pub(crate) fn store_dir_for(layout: &Layout, project_id: &str) -> PathBuf {
     project_dir(layout, project_id).join("store")
 }
 

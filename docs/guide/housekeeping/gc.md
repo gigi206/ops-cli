@@ -29,6 +29,15 @@ sbx gc --prune            # reclaim this project's store
 - The per-project sweep reclaims a project's own store residue, including the **stale
   rev-keyed `flake:` out-links** an [`sbx upgrade flake`](upgrade.md) leaves behind
   (each roll `A → B` leaves the old `<name>-A` out-link and its closure).
+- It also reclaims **superseded builds** the store accumulated. `sbx` roots every version it
+  provisions into a project's store, and a newer build's root never displaces the older one —
+  so old base-channel revisions, rebuilt tools, and rolled-forward GUI app builds (multiple
+  `chromium`/`electron`/desktop versions) pile up and a plain sweep, seeing them all rooted,
+  frees nothing. The sweep now reconciles those seed roots against what the project's
+  **current** out-links reference — keeping the current version of each and collecting the
+  superseded ones. It is conservative: if the base or mise out-links for the current revision
+  are missing it skips rather than risk dropping a live build, so an over-eager prune only ever
+  costs a re-provision on the next launch.
 - `--all` collects the shared nix store — the closures no live project or locked channel
   revision still roots — under an exclusive lock so a concurrent launch cannot race it.
 - Removing a whole per-project runtime **tree** is [`sbx projects rm`](../cli/projects.md);

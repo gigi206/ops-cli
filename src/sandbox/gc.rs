@@ -17,6 +17,7 @@
 //! when the caller asks.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,6 +70,100 @@ pub(crate) fn prune_flake_roots(
         }
     }
     stale
+}
+
+/// The store-path basenames every *current* out-link of a project still points at — the keep-set a
+/// per-project store gc reconciles its accumulated seed roots against. `data_gcroots` is
+/// `<data>/gcroots`; the six root families that can seed a per-project store are all covered so the
+/// keep-set is complete by construction: the project's own `projects/<id>/*` (its provisioned
+/// `nix:`/`deb:` tools and the GUI app builds an `sbx app` run from here left), the base userland and
+/// the gui/gpu/audio holes for the project's channel revision `base_rev` (`{base,gui,gpu,audio}/<base_rev>/*`),
+/// and the in-cage mise engine for each live engine revision (`mise/<mise_rev>/*` — mise is rooted on
+/// its *own* revision, not the base one, so omitting it would drop the current mise). Each out-link
+/// points at a `…/nix/store/<hash-name>` build; its basename is the key, matching a seed root's own
+/// file name. A broken or absent out-link simply contributes nothing.
+pub(crate) fn project_keep_roots(
+    data_gcroots: &Path,
+    id: &str,
+    base_rev: &str,
+    mise_revs: &BTreeSet<String>,
+) -> BTreeSet<OsString> {
+    let mut keep = BTreeSet::new();
+    let mut add_targets = |dir: PathBuf| {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                if let Some(base) = target.file_name() {
+                    keep.insert(base.to_os_string());
+                }
+            }
+        }
+    };
+    add_targets(data_gcroots.join("projects").join(id));
+    for family in ["base", "gui", "gpu", "audio"] {
+        add_targets(data_gcroots.join(family).join(base_rev));
+    }
+    for rev in mise_revs {
+        add_targets(data_gcroots.join("mise").join(rev));
+    }
+    keep
+}
+
+/// Prune — or, in a dry run, list — the per-project store's accumulated **seed** gc roots for
+/// superseded builds, returning the roots dropped. [`super::projectstore::gcroot_roots`] is
+/// add-only: every seeded or provisioned path gets a permanent `gcroots/<hash-name>` root and a
+/// newer build's root never displaces the older one, so each version a project ever provisioned
+/// stays rooted and a plain `nix-store --gc` reports zero dead however many are superseded (its mark
+/// phase honours every root). This reconciles those direct roots against `keep` — the store-path
+/// basenames a current out-link still references (see [`project_keep_roots`]). A root whose file name
+/// (which *is* the store-path basename it roots) is not in `keep` roots a build nothing current points
+/// at; dropping it lets the following [`collect`] reclaim that build. nix recomputes reachability
+/// during the sweep, so a shared dependency still reachable from a kept build survives even though its
+/// own direct root was dropped. nix's own `auto/` indirect-root directory and the `sbx-flake-*` roots
+/// [`prune_flake_roots`] owns are never touched. Destructive only when `prune`.
+///
+/// Deriving the keep-set at gc time — from the *union* of every out-link family a project ever
+/// accumulated — is deliberate: a single launch's seed sees only its own subset (a base-only `sbx run`
+/// would omit every app build), so this must never move to seed time.
+pub(crate) fn prune_superseded_roots(
+    store_dir: &Path,
+    keep: &BTreeSet<OsString>,
+    prune: bool,
+) -> Vec<PathBuf> {
+    let dir = super::projectstore::gcroots_dir(store_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // nix's own indirect-root directory, and the flake roots `prune_flake_roots` owns, are
+        // off-limits — this pass reconciles only the seed roots.
+        if name == "auto" || name.to_str().is_some_and(|n| n.starts_with("sbx-flake-")) {
+            continue;
+        }
+        // A seed root's file name is the store-path basename it roots; keep it while a current
+        // out-link still points at that build.
+        if keep.contains(&name) {
+            continue;
+        }
+        // A seed root is a symlink; never remove a stray directory or regular file that landed here.
+        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
+        let path = entry.path();
+        if prune {
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(path);
+            }
+        } else {
+            removed.push(path);
+        }
+    }
+    removed
 }
 
 /// Garbage-collect `store_dir`'s store: compute the dead paths and their size, and delete them
@@ -760,6 +855,112 @@ mod tests {
         assert!(gcroots.join("sbx-flake-hello").symlink_metadata().is_ok());
         assert!(gcroots.join("abcd-coreutils").symlink_metadata().is_ok());
         assert!(gcroots.join("auto").is_dir());
+    }
+
+    #[test]
+    fn prune_superseded_roots_drops_only_roots_no_current_out_link_keeps() {
+        let store = TmpDir::new();
+        let gcroots = store.path().join("nix/var/nix/gcroots");
+        std::fs::create_dir_all(&gcroots).unwrap();
+        // Seed roots: two current (a keep out-link points at them) and two superseded (nothing does).
+        for name in [
+            "aaa-glibc-2.42-67",
+            "bbb-mise-2026.7.5",
+            "ccc-mise-2026.6.0", // an older engine — superseded
+            "ddd-chromium-old",  // a rolled-away app build — superseded
+        ] {
+            std::os::unix::fs::symlink(format!("/nix/store/{name}"), gcroots.join(name)).unwrap();
+        }
+        // Off-limits: nix's own indirect-root dir and a flake root owned by `prune_flake_roots`.
+        std::fs::create_dir(gcroots.join("auto")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/x", gcroots.join("sbx-flake-hello")).unwrap();
+
+        let keep = BTreeSet::from([
+            OsString::from("aaa-glibc-2.42-67"),
+            OsString::from("bbb-mise-2026.7.5"),
+        ]);
+
+        // A dry run lists the superseded roots without removing anything.
+        let listed = prune_superseded_roots(store.path(), &keep, false);
+        assert_eq!(listed.len(), 2);
+        assert!(gcroots.join("ccc-mise-2026.6.0").symlink_metadata().is_ok());
+
+        // A prune drops exactly the two superseded roots.
+        let removed = prune_superseded_roots(store.path(), &keep, true);
+        assert_eq!(removed.len(), 2);
+        assert!(gcroots
+            .join("ccc-mise-2026.6.0")
+            .symlink_metadata()
+            .is_err());
+        assert!(gcroots.join("ddd-chromium-old").symlink_metadata().is_err());
+        // The current builds, the flake root, and nix's auto dir are untouched.
+        assert!(gcroots.join("aaa-glibc-2.42-67").symlink_metadata().is_ok());
+        assert!(gcroots.join("bbb-mise-2026.7.5").symlink_metadata().is_ok());
+        assert!(gcroots.join("sbx-flake-hello").symlink_metadata().is_ok());
+        assert!(gcroots.join("auto").is_dir());
+    }
+
+    #[test]
+    fn project_keep_roots_unions_every_out_link_family_including_mise_on_its_own_rev() {
+        let data = TmpDir::new();
+        let gcroots = data.path().join("gcroots");
+        let (id, base_rev, mise_rev) = ("proj1", "baserev", "miserev");
+
+        // One out-link per family, each pointing at a distinct `/nix/store/<hash>-<name>` build. The
+        // out-link *file name* (name-keyed) differs from the target basename — the keep-set keys on
+        // the target's basename, which is what a seed root's own file name is.
+        let link = |dir: std::path::PathBuf, link_name: &str, target_base: &str| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(format!("/nix/store/{target_base}"), dir.join(link_name))
+                .unwrap();
+        };
+        link(
+            gcroots.join("projects").join(id),
+            "deb-app",
+            "h1-app-desktop",
+        );
+        link(
+            gcroots.join("base").join(base_rev),
+            "glibc",
+            "h2-glibc-2.42",
+        );
+        link(
+            gcroots.join("gui").join(base_rev),
+            "fonts",
+            "h3-dejavu-fonts",
+        );
+        link(gcroots.join("gpu").join(base_rev), "mesa", "h4-mesa-26.1");
+        link(gcroots.join("audio").join(base_rev), "pa", "h5-portaudio");
+        // mise is rooted on the *engine* revision, distinct from the base one.
+        link(
+            gcroots.join("mise").join(mise_rev),
+            "mise",
+            "h6-mise-2026.7.5",
+        );
+        // A revision NOT in the keep set (a stale base rev) must not contribute — its build is exactly
+        // what a prune should reclaim.
+        link(
+            gcroots.join("base").join("oldrev"),
+            "glibc",
+            "old-glibc-2.41",
+        );
+
+        let mise_revs = BTreeSet::from([mise_rev.to_string()]);
+        let keep = project_keep_roots(&gcroots, id, base_rev, &mise_revs);
+
+        for base in [
+            "h1-app-desktop",
+            "h2-glibc-2.42",
+            "h3-dejavu-fonts",
+            "h4-mesa-26.1",
+            "h5-portaudio",
+            "h6-mise-2026.7.5",
+        ] {
+            assert!(keep.contains(&OsString::from(base)), "missing {base}");
+        }
+        // The stale-rev build is excluded, so a later prune can reclaim it.
+        assert!(!keep.contains(&OsString::from("old-glibc-2.41")));
+        assert_eq!(keep.len(), 6);
     }
 
     #[test]

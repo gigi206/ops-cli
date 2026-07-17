@@ -1455,6 +1455,38 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     }
     let pruned = super::gc::prune_flake_roots(&store_dir, &flake_names, prune).len();
 
+    // Reconcile the seed roots too. `gcroot_roots` is add-only, so a superseded build — an old base
+    // revision, a rebuilt tool, an app version rolled forward — keeps a permanent direct root and
+    // `nix-store --gc` never collects it: the store otherwise accumulates every version ever
+    // provisioned. Drop the seed roots whose build no current out-link references so the sweep
+    // reclaims them. The keep-set is the union of every out-link family, which only gc (never a
+    // single launch's seed) sees.
+    let data_gcroots = prep.layout.data_dir().join("gcroots");
+    let base_rev = effective_lock_target(&prep.cwd, &prep.layout, &prep.cfg)
+        .ok()
+        .and_then(|t| t.locked_revision());
+    let mise_revs = crate::store::live_mise_revisions(&prep.layout);
+    let superseded = match &base_rev {
+        // Prune only when the base *and* mise out-links for the current revisions are present: those
+        // two families root the irreducible userland (mise on its own revision, not the base one), so
+        // without them the keep-set could omit a current core build and the sweep would delete it. A
+        // missing family means we cannot safely tell superseded from sole-current, so skip — a
+        // re-provision on the next launch is cheap, a wrongful wipe is not.
+        Some(rev)
+            if data_gcroots.join("base").join(rev).is_dir()
+                && mise_revs
+                    .iter()
+                    .any(|m| data_gcroots.join("mise").join(m).is_dir()) =>
+        {
+            // `id` is `project_identity(cwd).0` — the very value `project_runtime_id` returns and the
+            // provisioning path keys `<data>/gcroots/projects/<id>/` on — so the projects family of the
+            // keep-set cannot drift from where a project's app builds are actually rooted.
+            let keep = super::gc::project_keep_roots(&data_gcroots, &id, rev, &mise_revs);
+            super::gc::prune_superseded_roots(&store_dir, &keep, prune).len()
+        }
+        _ => 0,
+    };
+
     println!("{h}sbx gc{r} — {n}{}{r}", project.display());
     let report = match super::gc::collect(&prep.nix_store, &store_dir, prune) {
         Ok(r) => r,
@@ -1464,31 +1496,80 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
         }
     };
     if prune {
-        // The pruned roots' builds were unrooted before the sweep, so they are already counted in
-        // `report.paths`; name how many removed-package builds that included.
+        // The dropped roots' builds were unrooted before the sweep, so they are already counted in
+        // `report.paths`; name how many roots this pass dropped — removed-package flakes plus
+        // superseded seed builds — to explain where the collection came from.
         println!(
-            "  {}collected{} {} store path(s) ({} from removed package(s)), freed {}.",
+            "  {}collected{} {} store path(s) ({} from removed package(s), {} superseded build(s)), freed {}.",
             pal.ok,
             r,
             report.paths,
             pruned,
+            superseded,
             super::gc::human_bytes(report.bytes)
         );
     } else {
-        // A dry run cannot size the removed-package builds (their roots still hold them, so they are
-        // not yet in the dead set), so report their count separately from the currently-dead total.
+        // A dry run cannot size the roots it would drop (their builds are still held, so not yet in
+        // the dead set), so report their counts separately from the currently-dead total.
         println!(
             "  {dim}{} store path(s) collectable now, {} would be freed — run `sbx gc --prune` to reclaim.{r}",
             report.paths,
             super::gc::human_bytes(report.bytes)
         );
-        if pruned > 0 {
+        if pruned > 0 || superseded > 0 {
             println!(
-                "  {dim}and {pruned} removed-package flake build(s) would also be reclaimed.{r}"
+                "  {dim}and {pruned} removed-package flake build(s) + {superseded} superseded build(s) would also be reclaimed.{r}"
             );
         }
     }
     Ok(())
+}
+
+/// After an `sbx upgrade` roll, surface — cheaply and best-effort — how many superseded builds the
+/// current project's store already holds, pointing at `sbx gc --prune` to reclaim them. A roll is
+/// what eventually supersedes a build, so upgrade is the natural moment to remind. Pure filesystem
+/// reads: it reuses the gc keep-set derivation over the existing store without provisioning or
+/// invoking nix, so it adds no weight to upgrade. Silent when there is no store, when the keep-set
+/// guard (the base and mise out-links for the current revisions) cannot be met, or when nothing is
+/// superseded — the same guard [`sweep_current`] prunes under, so the count never over-reports (a
+/// just-rolled revision whose build is still deferred to the next launch fails the guard, so the
+/// hint waits until the superseded state is real).
+pub(crate) fn superseded_reclaimable_hint(
+    layout: &Layout,
+    cwd: &Path,
+    cfg: &crate::config::Resolved,
+    pal: &crate::style::Palette,
+) {
+    let Ok(id) = binds::project_runtime_id(cwd) else {
+        return;
+    };
+    if !super::projectstore::store_exists(layout, &id) {
+        return;
+    }
+    let Some(rev) = effective_lock_target(cwd, layout, cfg)
+        .ok()
+        .and_then(|t| t.locked_revision())
+    else {
+        return;
+    };
+    let data_gcroots = layout.data_dir().join("gcroots");
+    let mise_revs = crate::store::live_mise_revisions(layout);
+    if !data_gcroots.join("base").join(&rev).is_dir()
+        || !mise_revs
+            .iter()
+            .any(|m| data_gcroots.join("mise").join(m).is_dir())
+    {
+        return;
+    }
+    let store_dir = super::projectstore::store_dir_for(layout, &id);
+    let keep = super::gc::project_keep_roots(&data_gcroots, &id, &rev, &mise_revs);
+    let n = super::gc::prune_superseded_roots(&store_dir, &keep, false).len();
+    if n > 0 {
+        println!(
+            "  {}{} superseded build(s) in this project's store are reclaimable — run `sbx gc --prune`.{}",
+            pal.dim, n, pal.reset,
+        );
+    }
 }
 
 /// Provision the project's declared tools and seed its store, returning the store. Mirrors
