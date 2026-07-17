@@ -2,12 +2,12 @@
 
 The terms this guide uses.
 
-See also: [What ops is](../concepts/overview.md) · [Security model](../concepts/security-model.md).
+See also: [What sbx is](../concepts/overview.md) · [Security model](../concepts/security-model.md).
 
 **Bind** — a host path exposed inside the cage, read-only by default. The set of binds
 *is* the security control. See [`binds`](../configuration/binds.md).
 
-**bubblewrap (`bwrap`)** — the unprivileged sandboxing engine `ops` launches the cage
+**bubblewrap (`bwrap`)** — the unprivileged sandboxing engine `sbx` launches the cage
 with (all namespaces, `no_new_privs`, all capabilities dropped). See
 [Enforcement](../concepts/enforcement.md).
 
@@ -18,7 +18,7 @@ FHS, a synthetic identity, and the enforcement stack.
 **absent** from the cage, not merely read-only — a consequence of the
 [same-uid](#same-uid) model. See [Security model](../concepts/security-model.md).
 
-**Control plane** — `ops`'s own state (its config, data, and trust directories). Pinned
+**Control plane** — `sbx`'s own state (its config, data, and trust directories). Pinned
 read-only even inside a broad read-write bind. See [Security model](../concepts/security-model.md#the-control-plane-is-pinned).
 
 **Egress** — outbound network traffic. Filtered by the [network posture](../networking/modes.md).
@@ -30,15 +30,15 @@ opposite of a [security field](#security-field). See [The trust gate](../concept
 `/usr/bin/env`, `/nix`, a synthetic `/etc`), with no host `/usr` or ambient libraries.
 
 **Mode A / Mode B** — the two actor modes. Mode A is an interactive user shell
-([`ops run`/`shell`](../cli/run.md)); Mode B is an autonomous agent
-([`ops app`](../cli/app.md)) and is the default posture. See [Overview](../concepts/overview.md#the-two-actor-modes).
+([`sbx run`/`shell`](../cli/run.md)); Mode B is an autonomous agent
+([`sbx app`](../cli/app.md)) and is the default posture. See [Overview](../concepts/overview.md#the-two-actor-modes).
 
 **Model B** — the egress architecture: an empty network namespace whose only exit is an
 in-cage forwarder bridging to a host-side allowlisting proxy. See
 [Networking architecture](../networking/architecture.md).
 
-**nixhub** — the index `ops` queries to resolve a `nix:` tool to a pinned nixpkgs
-revision. See [`ops search`](../cli/search.md).
+**nixhub** — the index `sbx` queries to resolve a `nix:` tool to a pinned nixpkgs
+revision. See [`sbx search`](../cli/search.md).
 
 **Per-project store** — each project's own writable nix store, seeded from the shared
 store, so an agent that self-equips writes only there. See [Provisioning](../concepts/provisioning.md).
@@ -59,7 +59,7 @@ trusted source (binds, network, secrets, packages, nixpkgs, gui, limits, apps, n
 groups). See [The trust gate](../concepts/trust.md).
 
 **Self-equip** — an agent installing its own toolchain from inside the cage, into the
-per-project store. See [`ops mise`](../cli/mise.md).
+per-project store. See [`sbx mise`](../cli/mise.md).
 
 **Synthetic identity** — the `uid=1000(sandbox)` user (and synthetic `/etc/passwd`) the
 cage presents, generated outside every writable mount.
@@ -68,5 +68,5 @@ cage presents, generated outside every writable mount.
 to a content hash, on the direnv model. See [The trust gate](../concepts/trust.md).
 
 **Trusted by location / by content** — the global config and app profiles are trusted
-because you placed them (location); a project `.ops.toml` is trusted by
-[`ops trust`](../cli/trust.md) recording its content hash.
+because you placed them (location); a project `.sbx.toml` is trusted by
+[`sbx trust`](../cli/trust.md) recording its content hash.

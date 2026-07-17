@@ -1,8 +1,8 @@
 //! The user-owned, daemonless nix store.
 //!
-//! ops provisions a project's tools into a store it owns under its own data
+//! sbx provisions a project's tools into a store it owns under its own data
 //! directory, never the host's `/nix`. The shared store is a single flat tree —
-//! deduplicated across projects, written only while ops itself provisions into it
+//! deduplicated across projects, written only while sbx itself provisions into it
 //! on the host side; a sandbox then consumes a per-project copy seeded from it,
 //! bound read-write so an agent can self-equip, while the shared tree stays
 //! read-only. This module computes the
@@ -16,10 +16,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The default nixpkgs source ops tracks — a rolling-release branch, like a
+/// The default nixpkgs source sbx tracks — a rolling-release branch, like a
 /// rolling-distro base. The *source* is a constant; the concrete *revision* it
 /// resolves to is recorded as state (see [`resolve_ref`]) so it stays fixed across
-/// ops binary updates and only advances on an explicit upgrade.
+/// sbx binary updates and only advances on an explicit upgrade.
 const DEFAULT_SOURCE: &str = "nixos-unstable";
 
 /// The flake-reference prefix every nixpkgs source expands under. A source is the
@@ -30,17 +30,17 @@ const NIXPKGS_FLAKE_PREFIX: &str = "github:NixOS/nixpkgs/";
 /// The file (under the data directory, or a project's runtime tree) recording a
 /// resolved nixpkgs source + revision — the "installed snapshot". Seeded on first
 /// use, then reused; refreshing it (an explicit upgrade) is what rolls tool versions
-/// forward, never an ops binary update.
+/// forward, never an sbx binary update.
 const NIXPKGS_LOCK: &str = "nixpkgs.lock";
 
 /// The file (under the data directory) recording the mise engine's resolved source +
-/// revision — a dedicated lock so an explicit `ops upgrade mise` advances the engine
+/// revision — a dedicated lock so an explicit `sbx upgrade mise` advances the engine
 /// independently of the base channel (`nixpkgs.lock`). The engine tracks the global
 /// channel source, but pinning it here on its own means rolling the base never bumps the
 /// engine, and rolling the engine never bumps the base.
 const MISE_ENGINE_LOCK: &str = "mise-engine.lock";
 
-/// On-disk layout of the user-owned store, rooted at ops's private data
+/// On-disk layout of the user-owned store, rooted at sbx's private data
 /// directory. Pure path derivation — holds no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Layout {
@@ -48,8 +48,8 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    /// Resolve the layout from the environment: `$XDG_DATA_HOME/ops` when that
-    /// is set to an absolute path, otherwise `$HOME/.local/share/ops`. `None`
+    /// Resolve the layout from the environment: `$XDG_DATA_HOME/sbx` when that
+    /// is set to an absolute path, otherwise `$HOME/.local/share/sbx`. `None`
     /// only when neither variable yields a usable base.
     pub(crate) fn from_env() -> Option<Self> {
         let data_dir = data_dir_from(
@@ -75,13 +75,13 @@ impl Layout {
         self.data_dir.join("store")
     }
 
-    /// The root of ops's private data directory — the parent of the store and of
+    /// The root of sbx's private data directory — the parent of the store and of
     /// the per-project sandbox runtime trees.
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    /// Where ops places a nix engine it owns — the store-driving `nix`/`nix-store`
+    /// Where sbx places a nix engine it owns — the store-driving `nix`/`nix-store`
     /// binary, as opposed to the host's. Distinct from the in-cage nix an agent
     /// self-equips with: this one runs on the host to provision the store. The
     /// engine resolver consults it ahead of the host `PATH`.
@@ -111,23 +111,23 @@ impl Layout {
 }
 
 /// Pure core of [`Layout::from_env`]: prefer an absolute `XDG_DATA_HOME`, else
-/// fall back to `HOME/.local/share`, with `ops` appended. A relative
+/// fall back to `HOME/.local/share`, with `sbx` appended. A relative
 /// `XDG_DATA_HOME` is ignored, as the base-directory specification requires.
 fn data_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     if let Some(xdg) = xdg {
         let p = PathBuf::from(xdg);
         if p.is_absolute() {
-            return Some(p.join("ops"));
+            return Some(p.join("sbx"));
         }
     }
-    Some(PathBuf::from(home?).join(".local/share/ops"))
+    Some(PathBuf::from(home?).join(".local/share/sbx"))
 }
 
 /// Create the store's directory skeleton if absent and tighten its permissions
 /// to owner-only. Idempotent, and fail-closed: a directory that already existed
 /// with looser permissions is tightened, never left group/world-accessible.
 /// Never touches the host `/nix`. Called lazily, the first time a sandbox
-/// consumes the store or ops provisions into it.
+/// consumes the store or sbx provisions into it.
 pub(crate) fn ensure(layout: &Layout) -> io::Result<()> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -141,28 +141,28 @@ pub(crate) fn ensure(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
-/// Environment override naming an explicit `nix` binary for ops to drive, ahead of
-/// every other source. Lets a power user — or a test — point ops at a chosen engine.
+/// Environment override naming an explicit `nix` binary for sbx to drive, ahead of
+/// every other source. Lets a power user — or a test — point sbx at a chosen engine.
 /// It names `nix` itself; the sibling commands (`nix-store`, …) are found beside it,
 /// since one multi-call binary backs them all in every nix distribution.
 ///
 /// A value that does not point at an existing `nix` is ignored (resolution falls
-/// through), so a stale override never strands ops. But once it *does* resolve, it is
+/// through), so a stale override never strands sbx. But once it *does* resolve, it is
 /// **authoritative**: every engine binary is taken from beside it, never mixed with
 /// the host's — a missing sibling there fails closed rather than silently driving the
 /// store with two different engines.
-const ENGINE_OVERRIDE_ENV: &str = "OPS_NIX_BIN";
+const ENGINE_OVERRIDE_ENV: &str = "SBX_NIX_BIN";
 
 /// Locate the `nix` binary that drives the store.
 ///
-/// Resolution precedence: the [`ENGINE_OVERRIDE_ENV`] override, then a nix engine ops
+/// Resolution precedence: the [`ENGINE_OVERRIDE_ENV`] override, then a nix engine sbx
 /// owns under the data directory (`<data>/engine/`), then the host `PATH`. The
-/// data-directory tier is where ops will place an engine it ships itself; consulting
-/// it here puts the seam in place, while the `PATH` fallback keeps ops working until
+/// data-directory tier is where sbx will place an engine it ships itself; consulting
+/// it here puts the seam in place, while the `PATH` fallback keeps sbx working until
 /// then. `layout` is `None` only when the data directory cannot be resolved (no
 /// `$HOME`), in which case that middle tier is skipped.
 ///
-/// Pure resolution — it never writes — so a read-only caller (`ops doctor`) is safe.
+/// Pure resolution — it never writes — so a read-only caller (`sbx doctor`) is safe.
 pub(crate) fn resolve_nix(layout: Option<&Layout>) -> Option<PathBuf> {
     resolve_engine_bin("nix", layout)
 }
@@ -176,7 +176,7 @@ pub(crate) fn resolve_nix_store(layout: Option<&Layout>) -> Option<PathBuf> {
     resolve_engine_bin("nix-store", layout)
 }
 
-/// The static nix engine ops ships inside its own binary, embedded by `build.rs` when the
+/// The static nix engine sbx ships inside its own binary, embedded by `build.rs` when the
 /// `bundled-nix` feature is on. `NIX_BIN` is the raw bytes of the statically-linked `nix`;
 /// `NIX_SHA256` is their hash, baked at build time so a launch compares the on-disk marker
 /// without re-hashing tens of megabytes. Materialized into the owned engine directory by
@@ -197,7 +197,7 @@ fn absolute_override(env_key: &str) -> Option<PathBuf> {
         Some(path)
     } else {
         eprintln!(
-            "ops: ignoring {env_key}={} — an engine override must be an absolute path",
+            "sbx: ignoring {env_key}={} — an engine override must be an absolute path",
             path.display()
         );
         None
@@ -210,10 +210,10 @@ fn absolute_override(env_key: &str) -> Option<PathBuf> {
 fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
     let override_nix = absolute_override(ENGINE_OVERRIDE_ENV);
     let owned_dir = layout.map(Layout::engine_dir);
-    // When ops ships its own static nix, lay it into the owned engine directory (once;
+    // When sbx ships its own static nix, lay it into the owned engine directory (once;
     // idempotent thereafter) so the owned tier below resolves it. Best-effort: a failure
     // leaves that tier empty and resolution falls through to `PATH`, exactly as it would
-    // without the feature. The explicit `OPS_NIX_BIN` override still wins over it.
+    // without the feature. The explicit `SBX_NIX_BIN` override still wins over it.
     #[cfg(feature = "bundled-nix")]
     if let Some(dir) = owned_dir.as_deref() {
         let _ = ensure_owned_engine(dir, bundled::NIX_BIN, bundled::NIX_SHA256);
@@ -227,12 +227,12 @@ fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
     )
 }
 
-/// Materialize ops's bundled static nix into the owned engine directory, idempotently.
+/// Materialize sbx's bundled static nix into the owned engine directory, idempotently.
 ///
 /// Lays down `<dir>/nix` (the real binary, executable) plus the multi-call sibling
 /// `<dir>/nix-store -> nix` (one binary dispatches both off argv0). A `<dir>/.sha256`
 /// marker records the embedded hash so a launch re-materializes only when the engine
-/// changed (a new ops binary), not on every resolution. The binary lands atomically — a
+/// changed (a new sbx binary), not on every resolution. The binary lands atomically — a
 /// unique temp sibling written, made executable, then renamed over `nix` — so a
 /// concurrent or interrupted launch never leaves a partial engine at the resolved path,
 /// and a running engine keeps its old inode across a replacement.
@@ -321,7 +321,7 @@ fn engine_verdict(file_uid: u32, mode: u32, euid: u32) -> Result<(), String> {
 /// the case worth surfacing); the caller then decides refuse-vs-fall-through.
 ///
 /// This is a static-posture check (`stat` then `execve`), not a TOCTOU-proof gate: against a
-/// same-uid attacker — who already owns the account and could replace ops itself — nothing at
+/// same-uid attacker — who already owns the account and could replace sbx itself — nothing at
 /// this layer is a boundary. Its value is defense-in-depth: a foreign-owned or world-writable
 /// engine (a loosely-permissioned data dir, a world-writable match on `PATH`) is refused
 /// rather than run. The `PATH` tier scans every match (`find_all_on_path`) and skips an
@@ -339,7 +339,7 @@ fn engine_probe(path: &Path) -> EngineProbe {
         Ok(()) => EngineProbe::Trusted,
         Err(why) => {
             eprintln!(
-                "ops: ignoring untrusted engine binary {}: {why}",
+                "sbx: ignoring untrusted engine binary {}: {why}",
                 path.display()
             );
             EngineProbe::Untrusted
@@ -348,7 +348,7 @@ fn engine_probe(path: &Path) -> EngineProbe {
 }
 
 /// Pick the engine binary `name` from the three sources, in precedence order: the override,
-/// then an ops-owned engine directory, then `PATH`. The trust probe and the `PATH` lookup are
+/// then an sbx-owned engine directory, then `PATH`. The trust probe and the `PATH` lookup are
 /// injected so the precedence — including the untrusted branches — is testable in isolation.
 ///
 /// A *resolved* override (one whose `nix` is present and trusted) is authoritative: `name` is
@@ -412,7 +412,7 @@ fn engine_sibling(nix: &Path, name: &str) -> PathBuf {
 /// A value that does not point at an existing file is ignored. Once it resolves it wins
 /// unconditionally: the user (or a test) has taken responsibility for the chosen engine,
 /// including that it is AppArmor-profiled where that matters (see [`resolve_bwrap`]).
-const BWRAP_OVERRIDE_ENV: &str = "OPS_BWRAP_BIN";
+const BWRAP_OVERRIDE_ENV: &str = "SBX_BWRAP_BIN";
 
 /// The kernel sysctl that, when non-zero, restricts unprivileged user-namespace creation to
 /// binaries carrying an AppArmor profile that grants `userns` (Ubuntu 24.04+). The shipped
@@ -421,7 +421,7 @@ const BWRAP_OVERRIDE_ENV: &str = "OPS_BWRAP_BIN";
 /// [`resolve_bwrap`] prefers the host engine when it is in force.
 const APPARMOR_USERNS_RESTRICT: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 
-/// The static bwrap (bubblewrap) engine ops ships inside its own binary, embedded by
+/// The static bwrap (bubblewrap) engine sbx ships inside its own binary, embedded by
 /// `build.rs` when the `bundled-bwrap` feature is on. `BWRAP_BIN` is the raw bytes of the
 /// statically-linked `bwrap`; `BWRAP_SHA256` is their hash, baked at build time so a launch
 /// compares the on-disk marker without re-hashing. Materialized by [`ensure_owned_bwrap`].
@@ -430,12 +430,12 @@ mod bundled_bwrap {
     include!(concat!(env!("OUT_DIR"), "/bundled_bwrap.rs"));
 }
 
-/// Which source supplied the resolved `bwrap`, for an honest `ops doctor` line.
+/// Which source supplied the resolved `bwrap`, for an honest `sbx doctor` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BwrapSource {
     /// The [`BWRAP_OVERRIDE_ENV`] override.
     Override,
-    /// A bwrap ops owns under `<data>/engine/` (the embedded static engine).
+    /// A bwrap sbx owns under `<data>/engine/` (the embedded static engine).
     Bundled,
     /// The host's bwrap on `PATH`.
     HostPath,
@@ -445,7 +445,7 @@ impl BwrapSource {
     /// A short label naming the source.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            BwrapSource::Override => "override (OPS_BWRAP_BIN)",
+            BwrapSource::Override => "override (SBX_BWRAP_BIN)",
             BwrapSource::Bundled => "bundled engine",
             BwrapSource::HostPath => "host PATH",
         }
@@ -455,7 +455,7 @@ impl BwrapSource {
 /// A resolved sandbox engine: its path, where it came from, and whether the host is
 /// enforcing the AppArmor unprivileged-userns restriction (which is *why* the host engine
 /// may have been chosen over the bundled one). Callers that only launch use [`Self::path`];
-/// `ops doctor` reports all three so the user is never surprised which `bwrap` ran.
+/// `sbx doctor` reports all three so the user is never surprised which `bwrap` ran.
 #[derive(Debug, Clone)]
 pub(crate) struct BwrapChoice {
     pub(crate) path: PathBuf,
@@ -467,11 +467,11 @@ pub(crate) struct BwrapChoice {
 ///
 /// Resolution precedence: the [`BWRAP_OVERRIDE_ENV`] override always wins; otherwise the
 /// order depends on the host. Where unprivileged user namespaces are **not** AppArmor-path-
-/// restricted (the common case, and every non-Ubuntu distro), the bundled engine ops owns
+/// restricted (the common case, and every non-Ubuntu distro), the bundled engine sbx owns
 /// under `<data>/engine/` leads — self-contained and a known-good pinned version — falling
 /// back to the host `PATH`. Where the restriction **is** in force, only the path-profiled
 /// `/usr/bin/bwrap` can create a namespace, so the host engine leads and the bundled one is
-/// the fallback; ops is **non-regressive by construction** there — it uses exactly the host
+/// the fallback; sbx is **non-regressive by construction** there — it uses exactly the host
 /// bwrap it always has. `layout` is `None` only when the data directory cannot be resolved,
 /// in which case the owned tier is skipped.
 ///
@@ -510,7 +510,7 @@ fn apparmor_userns_restricted() -> bool {
     }
 }
 
-/// Materialize ops's bundled static bwrap into the owned engine directory, idempotently.
+/// Materialize sbx's bundled static bwrap into the owned engine directory, idempotently.
 ///
 /// Lays down `<dir>/bwrap` (the real binary, executable) atomically — a unique temp sibling
 /// written, made executable, then renamed over `bwrap` — so a concurrent or interrupted
@@ -544,7 +544,7 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
     Ok(())
 }
 
-/// Pick the `bwrap` binary and its source from the override, the ops-owned engine directory,
+/// Pick the `bwrap` binary and its source from the override, the sbx-owned engine directory,
 /// and `PATH`, in an order that depends on `restricted` (the AppArmor userns restriction). The
 /// trust probe and the `PATH` lookup are injected so the precedence — including the AppArmor
 /// branch (which a host without the restriction cannot exercise live) and the untrusted
@@ -553,7 +553,7 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
 /// The override, when present and trusted, is authoritative; present-but-untrusted is refused
 /// outright (`None`), absent yields to the host-dependent order. Otherwise: not restricted ⇒
 /// the owned engine leads, then `PATH`; restricted ⇒ the host `PATH` engine leads (the same
-/// bwrap ops uses today — on a standard host the path-profiled `/usr/bin/bwrap`, the only one
+/// bwrap sbx uses today — on a standard host the path-profiled `/usr/bin/bwrap`, the only one
 /// able to create a namespace under the restriction), then the owned engine as a last resort.
 /// An untrusted owned or `PATH` engine is skipped (with a warning) in favour of the next tier.
 fn pick_bwrap(
@@ -593,7 +593,7 @@ fn pick_bwrap(
 }
 
 /// Locate the `git` binary that fetches a remote plugin store. Resolved from `PATH`;
-/// needed only by `ops plugins store` (a remote store is a git repository), not by a
+/// needed only by `sbx plugins store` (a remote store is a git repository), not by a
 /// launch — so its absence is a feature gap, never a boundary failure.
 pub(crate) fn resolve_git() -> Option<PathBuf> {
     crate::pathfind::find_on_path("git")
@@ -611,7 +611,7 @@ pub(crate) fn nix_command(nix: &Path, layout: &Layout) -> Command {
 }
 
 /// Where a `nixpkgs` source was chosen — carried so the same wording reaches the
-/// user from `ops config`, `ops upgrade`, and `ops doctor`.
+/// user from `sbx config`, `sbx upgrade`, and `sbx doctor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     /// The default rolling channel (no override anywhere).
@@ -638,7 +638,7 @@ impl Origin {
 /// exactly one of these for the **whole** sandbox — base userland and tools alike.
 ///
 /// This is the one place the "which source, which lock" decision is represented, so
-/// the launch (resolve), `ops upgrade` (refresh), and `ops config` (display) all act
+/// the launch (resolve), `sbx upgrade` (refresh), and `sbx config` (display) all act
 /// on the same lock and can never drift. A per-project lock is reachable **only**
 /// through [`LockTarget::project`], which the caller builds only for a current
 /// trusted pin — so a dropped or now-untrusted pin can never resurface a stale
@@ -665,8 +665,8 @@ impl LockTarget {
     /// The mise engine target: it tracks the **global** channel source (a global override
     /// applies; a project pin never does — the engine runs in its own relocated-store view,
     /// free of the one-channel rule that binds the base to its pin), but pins it in a
-    /// dedicated lock so `ops upgrade mise` advances the engine independently of the base
-    /// channel that `ops upgrade nix` rolls.
+    /// dedicated lock so `sbx upgrade mise` advances the engine independently of the base
+    /// channel that `sbx upgrade nix` rolls.
     pub(crate) fn engine(layout: &Layout, override_source: Option<&str>) -> Self {
         let (source, origin) = global_source(override_source);
         Self {
@@ -710,7 +710,7 @@ impl LockTarget {
     }
 
     /// Force a fresh resolution of this source and rewrite the lock — the explicit
-    /// roll-forward `ops upgrade` performs. Reports the previous revision (for this
+    /// roll-forward `sbx upgrade` performs. Reports the previous revision (for this
     /// source) so the caller can show what changed.
     pub(crate) fn refresh(&self, nix: &Path, layout: &Layout) -> io::Result<Upgrade> {
         refresh_ref(nix, layout, &self.source, &self.lock_path)
@@ -748,7 +748,7 @@ fn project_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
 }
 
 /// The global channel's recorded `(source, revision)`, read straight from the shared
-/// lock — what `ops doctor` shows as the host-level channel state, independent of any
+/// lock — what `sbx doctor` shows as the host-level channel state, independent of any
 /// project. `None` when nothing has been resolved yet. Pure file read.
 pub(crate) fn read_global_lock(layout: &Layout) -> Option<(String, String)> {
     read_lock(&global_lock_path(layout))
@@ -810,7 +810,7 @@ pub(crate) fn live_mise_revisions(layout: &Layout) -> BTreeSet<String> {
 /// when that records the same source — no nix, the engine starting on exactly the
 /// revision the base is already on. The launcher resolves the base before the engine, so
 /// even a fresh install has `nixpkgs.lock` written by then and base == engine from the
-/// start; they diverge only on an explicit `ops upgrade mise`. Only when neither lock has
+/// start; they diverge only on an explicit `sbx upgrade mise`. Only when neither lock has
 /// the source (a pinned-only user who has never resolved the global channel) does it
 /// resolve fresh, which then needs nix.
 pub(crate) fn resolve_engine_ref(
@@ -867,7 +867,7 @@ pub(crate) fn revision_of(flake_ref: &str) -> &str {
 /// Resolve `source` (a branch/channel or a 40-hex revision under `NixOS/nixpkgs`) to
 /// a pinned `github:NixOS/nixpkgs/<rev>`, using `lock_path` as a source-aware cache:
 /// the locked revision is reused **only** when the lock records the same source, so
-/// changing the source re-resolves while an unchanged one stays fixed (an ops binary
+/// changing the source re-resolves while an unchanged one stays fixed (an sbx binary
 /// update never moves it; an explicit upgrade rewrites the lock). Pinning a concrete
 /// revision is also the security floor — names resolve against one fixed,
 /// signed-cache-built catalogue.
@@ -930,7 +930,7 @@ fn read_lock(lock_path: &Path) -> Option<(String, String)> {
 ///
 /// The write is atomic: a per-pid temp beside the target is written then renamed
 /// over it (`rename` is atomic on a POSIX filesystem). So a concurrent reader —
-/// another launch resolving, or a second `ops upgrade` — sees either the old lock
+/// another launch resolving, or a second `sbx upgrade` — sees either the old lock
 /// or the new one, never a half-written file. Two upgrades racing settle on a
 /// last-writer-wins of two valid revisions, which the next upgrade reconciles.
 fn write_lock(lock_path: &Path, source: &str, rev: &str) -> io::Result<()> {
@@ -1073,7 +1073,7 @@ pub(crate) fn provision(
 /// records the SHA-256 of the expression that produced the current out-link, and when a launch's
 /// expression hashes the same *and* the out-link still carries `marker`, the built output is
 /// returned without spawning nix. Keying on the expression (not just the gcroot path) is
-/// load-bearing: the expression is ops-controlled and changes across ops releases — a rev/system
+/// load-bearing: the expression is sbx-controlled and changes across sbx releases — a rev/system
 /// change is in it too — so a changed expression mismatches and falls through to a rebuild, which
 /// re-points the same out-link (no stale-serve, no accumulation). The one residual is that skipping
 /// nix forfeits its self-heal of an out-of-band-corrupted store closure; that degrades to a loud
@@ -1142,7 +1142,7 @@ fn expr_stamp_path(gcroot: &Path) -> PathBuf {
 }
 
 /// The SHA-256 (hex) of a provisioning expression — the key deciding whether a prior build can be
-/// reused. The expression carries the nixpkgs revision, system, and every ops-controlled input
+/// reused. The expression carries the nixpkgs revision, system, and every sbx-controlled input
 /// verbatim, so an equal hash means an identical derivation and output.
 fn expr_digest(expr: &str) -> String {
     Sha256::digest(expr.as_bytes())
@@ -1230,25 +1230,25 @@ mod tests {
 
     #[test]
     fn layout_derives_store_paths_from_data_dir() {
-        let layout = Layout::under(Path::new("/data/ops"));
-        assert_eq!(layout.data_dir.as_path(), Path::new("/data/ops"));
-        assert_eq!(layout.store_dir(), Path::new("/data/ops/store"));
+        let layout = Layout::under(Path::new("/data/sbx"));
+        assert_eq!(layout.data_dir.as_path(), Path::new("/data/sbx"));
+        assert_eq!(layout.store_dir(), Path::new("/data/sbx/store"));
     }
 
     #[test]
     fn data_dir_prefers_absolute_xdg_else_falls_back_to_home() {
         assert_eq!(
             data_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/xdg/ops"))
+            Some(PathBuf::from("/xdg/sbx"))
         );
         // a relative XDG_DATA_HOME is ignored; HOME is used instead
         assert_eq!(
             data_dir_from(Some(OsStr::new("rel/xdg")), Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.local/share/ops"))
+            Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
         assert_eq!(
             data_dir_from(None, Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.local/share/ops"))
+            Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
         assert_eq!(data_dir_from(None, None), None);
     }
@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn ensure_creates_dirs_owner_only_and_is_idempotent() {
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
 
         ensure(&layout).unwrap();
         for dir in [layout.data_dir.clone(), layout.store_dir()] {
@@ -1277,7 +1277,7 @@ mod tests {
     #[test]
     fn ensure_tightens_a_preexisting_loose_store_root() {
         let base = TmpDir::new();
-        let data = base.join("ops");
+        let data = base.join("sbx");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
 
@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn nix_command_is_daemonless_and_targets_the_store() {
-        let layout = Layout::under(Path::new("/data/ops"));
+        let layout = Layout::under(Path::new("/data/sbx"));
         let cmd = nix_command(Path::new("/usr/bin/nix"), &layout);
 
         // the daemon is disabled
@@ -1302,20 +1302,20 @@ mod tests {
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec![OsStr::new("--store"), OsStr::new("/data/ops/store")]
+            vec![OsStr::new("--store"), OsStr::new("/data/sbx/store")]
         );
     }
 
     #[test]
     fn physical_path_maps_a_logical_store_path_under_the_store_root() {
-        let layout = Layout::under(Path::new("/data/ops"));
+        let layout = Layout::under(Path::new("/data/sbx"));
         assert_eq!(
             physical_path(&layout, Path::new("/nix/store/abc-hello")),
-            PathBuf::from("/data/ops/store/nix/store/abc-hello")
+            PathBuf::from("/data/sbx/store/nix/store/abc-hello")
         );
         assert_eq!(
             physical_path(&layout, Path::new("/nix")),
-            PathBuf::from("/data/ops/store/nix")
+            PathBuf::from("/data/sbx/store/nix")
         );
     }
 
@@ -1386,12 +1386,12 @@ mod tests {
     #[test]
     fn a_seeded_lock_is_reused_without_invoking_nix() {
         // The headline guarantee: with the revision already recorded for the same
-        // source, an ops binary update (or any later run) reuses it and never
+        // source, an sbx binary update (or any later run) reuses it and never
         // re-resolves. Proven with a bogus nix path — if the early return ever
         // regressed, resolution would invoke it and the call would fail. Uses a
         // legacy single-line lock, which also proves backward compatibility.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(layout.data_dir().join(NIXPKGS_LOCK), format!("{REV}\n")).unwrap();
 
@@ -1407,7 +1407,7 @@ mod tests {
         // reference; with a bogus nix that resolution fails, proving we did not
         // early-return on a garbage revision.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(layout.data_dir().join(NIXPKGS_LOCK), "garbage\n").unwrap();
 
@@ -1420,7 +1420,7 @@ mod tests {
     fn live_base_revisions_collects_the_global_and_each_project_pin() {
         const REV_B: &str = "0123456789abcdef0123456789abcdef01234567";
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         // the global channel revision
         write_lock(&layout.data_dir().join(NIXPKGS_LOCK), "nixos-unstable", REV).unwrap();
@@ -1445,7 +1445,7 @@ mod tests {
     fn live_mise_revisions_falls_back_to_the_global_lock_when_the_engine_lock_is_absent() {
         const ENGINE_REV: &str = "fedcba9876543210fedcba9876543210fedcba98";
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         write_lock(&layout.data_dir().join(NIXPKGS_LOCK), "nixos-unstable", REV).unwrap();
 
@@ -1468,7 +1468,7 @@ mod tests {
         // The atomic write renames a temp over the target, so after it returns only
         // the final lock remains — no stray temp beside it for a reader to trip on.
         let base = TmpDir::new();
-        let dir = base.join("ops");
+        let dir = base.join("sbx");
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join(NIXPKGS_LOCK);
         write_lock(&lock, "nixos-unstable", REV).unwrap();
@@ -1514,7 +1514,7 @@ mod tests {
         // source: the catalogue moved, so it re-resolves (here, against a bogus nix,
         // so the attempt fails — proving the early return did not fire).
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(
             layout.data_dir().join(NIXPKGS_LOCK),
@@ -1532,7 +1532,7 @@ mod tests {
         // A 40-hex source is already a revision: it pins directly, with no nix call,
         // and is recorded so later runs reuse it.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
 
         let got = LockTarget::global(&layout, Some(REV))
             .resolve(Path::new(BOGUS_NIX), &layout)
@@ -1546,24 +1546,24 @@ mod tests {
 
     #[test]
     fn lock_target_construction_sets_source_path_and_origin() {
-        let layout = Layout::under(Path::new("/data/ops"));
+        let layout = Layout::under(Path::new("/data/sbx"));
 
         let default = LockTarget::global(&layout, None);
         assert_eq!(default.source(), DEFAULT_SOURCE);
         assert_eq!(default.origin(), Origin::Default);
-        assert_eq!(default.lock_path, PathBuf::from("/data/ops/nixpkgs.lock"));
+        assert_eq!(default.lock_path, PathBuf::from("/data/sbx/nixpkgs.lock"));
 
         let over = LockTarget::global(&layout, Some("nixos-23.11"));
         assert_eq!(over.source(), "nixos-23.11");
         assert_eq!(over.origin(), Origin::Global);
-        assert_eq!(over.lock_path, PathBuf::from("/data/ops/nixpkgs.lock"));
+        assert_eq!(over.lock_path, PathBuf::from("/data/sbx/nixpkgs.lock"));
 
         let proj = LockTarget::project(&layout, "abc", "nixos-23.11");
         assert_eq!(proj.source(), "nixos-23.11");
         assert_eq!(proj.origin(), Origin::ProjectPin);
         assert_eq!(
             proj.lock_path,
-            PathBuf::from("/data/ops/projects/abc/nixpkgs.lock")
+            PathBuf::from("/data/sbx/projects/abc/nixpkgs.lock")
         );
 
         // the engine tracks the same source as the global channel (default, or a global
@@ -1574,21 +1574,21 @@ mod tests {
         assert_eq!(engine.origin(), Origin::Default);
         assert_eq!(
             engine.lock_path,
-            PathBuf::from("/data/ops/mise-engine.lock")
+            PathBuf::from("/data/sbx/mise-engine.lock")
         );
         let engine_over = LockTarget::engine(&layout, Some("nixos-23.11"));
         assert_eq!(engine_over.source(), "nixos-23.11");
         assert_eq!(engine_over.origin(), Origin::Global);
         assert_eq!(
             engine_over.lock_path,
-            PathBuf::from("/data/ops/mise-engine.lock")
+            PathBuf::from("/data/sbx/mise-engine.lock")
         );
     }
 
     #[test]
     fn a_project_target_pins_its_source_in_a_per_project_lock() {
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
 
         // a revision source pins without nix, into the project's own lock
         let got = LockTarget::project(&layout, "abc", REV)
@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn locked_revision_honors_the_source() {
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         let lock = global_lock_path(&layout);
 
@@ -1631,7 +1631,7 @@ mod tests {
         // with a bogus nix: a channel source must invoke it (and so fail), where a
         // plain resolve would have early-returned the locked revision.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(
             global_lock_path(&layout),
@@ -1655,7 +1655,7 @@ mod tests {
         // A 40-hex source resolves to itself with no nix call, so refreshing a fixed
         // pin reports the same revision as previous and new — an explicit no-op.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(global_lock_path(&layout), format!("{REV}\n{REV}\n")).unwrap();
 
@@ -1674,7 +1674,7 @@ mod tests {
         // prior revision belongs to another channel, so it is not reported as this
         // source's previous (a switch reads as a first pin).
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         let old = "0".repeat(40);
         std::fs::write(global_lock_path(&layout), format!("nixos-23.11\n{old}\n")).unwrap();
@@ -1698,7 +1698,7 @@ mod tests {
         // launch still works offline. Proven with a bogus nix: if the engine resolved
         // fresh instead of seeding, it would invoke nix and the call would fail.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(
             layout.data_dir().join(NIXPKGS_LOCK),
@@ -1729,7 +1729,7 @@ mod tests {
         // this source: the engine has nothing to seed from, so it resolves fresh — which
         // needs nix (here a bogus one, so it fails, proving no spurious seed happened).
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         assert!(resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None).is_err());
     }
@@ -1831,7 +1831,7 @@ mod tests {
         );
 
         // An override whose `nix` is absent is treated as unset: the next tier (here
-        // the ops-owned engine directory) applies.
+        // the sbx-owned engine directory) applies.
         let only_owned = |p: &Path| {
             if p.starts_with("/data/engine") {
                 EngineProbe::Trusted
@@ -2019,7 +2019,7 @@ mod tests {
             PathBuf::from("nix")
         );
 
-        // A different hash (a new ops binary carrying a newer engine) re-materializes.
+        // A different hash (a new sbx binary carrying a newer engine) re-materializes.
         ensure_owned_engine(&dir, b"v2-bytes", "hash-v2").expect("re-materialize on change");
         assert_eq!(std::fs::read(dir.join("nix")).unwrap(), b"v2-bytes");
         assert_eq!(
@@ -2234,7 +2234,7 @@ mod tests {
         // reuse a build only when the expression is unchanged AND the marked output is still there,
         // and must fall through to a rebuild (None) on any change — above all a changed expression.
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
 
         // A fabricated built output: a logical /nix/store path whose physical copy carries the marker.
         let logical = PathBuf::from("/nix/store/00000000000000000000000000000000-probe");
@@ -2290,7 +2290,7 @@ mod provision_tests {
             return;
         };
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         let nixpkgs = LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve pinned nixpkgs");
@@ -2305,10 +2305,10 @@ mod provision_tests {
             "not logical: {}",
             logical.display()
         );
-        // it physically exists in ops's store, never the host
+        // it physically exists in sbx's store, never the host
         assert!(
             physical_path(&layout, &logical).join("bin/hello").exists(),
-            "hello missing from ops's store"
+            "hello missing from sbx's store"
         );
         // a gcroot symlink was created to keep it alive across GC
         assert!(
@@ -2316,7 +2316,7 @@ mod provision_tests {
             "no gcroot created at {}",
             gcroot.display()
         );
-        // the channel revision was recorded so it stays fixed across ops updates
+        // the channel revision was recorded so it stays fixed across sbx updates
         assert!(
             layout.data_dir().join(NIXPKGS_LOCK).is_file(),
             "channel lock not seeded"
@@ -2330,7 +2330,7 @@ mod provision_tests {
             return;
         };
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         let Ok(nixpkgs) = LockTarget::global(&layout, None).resolve(&nix, &layout) else {
             eprintln!("skipping provision_expr: cannot resolve nixpkgs (offline?)");
             return;
@@ -2342,7 +2342,7 @@ mod provision_tests {
         let expr = |tag: &str| {
             format!(
                 "let pkgs = (builtins.getFlake \"{nixpkgs}\").legacyPackages.{system}; \
-                 in pkgs.runCommand \"ops-scprobe\" {{}} ''mkdir -p $out; echo {tag} > $out/tag''"
+                 in pkgs.runCommand \"sbx-scprobe\" {{}} ''mkdir -p $out; echo {tag} > $out/tag''"
             )
         };
         let read_tag = |p: &Path| {
@@ -2367,7 +2367,7 @@ mod provision_tests {
         // nonexistent nix binary: reaching the build would error, so returning the same output is
         // proof the reuse path was taken.
         let out_a2 = provision_expr(
-            Path::new("/nonexistent/ops-nix"),
+            Path::new("/nonexistent/sbx-nix"),
             &layout,
             &gcroot,
             &expr("AAA"),

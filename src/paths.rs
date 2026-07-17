@@ -1,10 +1,10 @@
-//! `ops path` — the on-disk locations ops uses, grouped by XDG base (data,
+//! `sbx path` — the on-disk locations sbx uses, grouped by XDG base (data,
 //! config, state). A read-only, no-trust-gate, network-free overview: it lists
-//! every directory ops owns plus the two config anchor files, marks which exist,
+//! every directory sbx owns plus the two config anchor files, marks which exist,
 //! and enumerates the per-project / per-app / per-profile entries actually on
-//! disk so the layout reads at a glance. The counterpart of `ops config path`
+//! disk so the layout reads at a glance. The counterpart of `sbx config path`
 //! (which covers the config *files* in resolution order) for the rest of the
-//! filesystem — a single place to answer "where on disk does ops put things?".
+//! filesystem — a single place to answer "where on disk does sbx put things?".
 //!
 //! The model is one [`PathView`] built by [`view`]: a small set of bases, each
 //! with a root and a fixed list of known entries, optionally carrying the
@@ -24,7 +24,7 @@ use crate::{config, sandbox, session, store::Layout, trust};
 /// What to list under an entry when it exists. `None` lists nothing; `Dirs` lists
 /// the child directories (a global app home); `Profiles` lists the `*.toml` profile
 /// files (an imported app profile); `Projects` lists each project's runtime tree
-/// classified by liveness and dated, so `ops path` answers "is this project still
+/// classified by liveness and dated, so `sbx path` answers "is this project still
 /// used, and when was it last touched?" alongside the layout.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Enumerate {
@@ -36,7 +36,7 @@ enum Enumerate {
 
 /// One known location under a base, as a static spec — label, relative path,
 /// one-line description, and whether to enumerate its on-disk children. The label
-/// carries a trailing `/` when the entry is a directory (and `ops.toml` when it is
+/// carries a trailing `/` when the entry is a directory (and `sbx.toml` when it is
 /// the config anchor file), so the kind reads from the label with no separate field.
 struct Entry {
     label: &'static str,
@@ -55,7 +55,7 @@ const DATA_ENTRIES: &[Entry] = &[
     Entry {
         label: "engine/",
         rel: "engine",
-        desc: "embedded nix + bwrap engines ops materializes",
+        desc: "embedded nix + bwrap engines sbx materializes",
         enumerate: Enumerate::None,
     },
     Entry {
@@ -73,7 +73,7 @@ const DATA_ENTRIES: &[Entry] = &[
     Entry {
         label: "sessions/",
         rel: "sessions",
-        desc: "session registry read by `ops session ls`",
+        desc: "session registry read by `sbx session ls`",
         enumerate: Enumerate::None,
     },
     Entry {
@@ -110,8 +110,8 @@ const DATA_ENTRIES: &[Entry] = &[
 
 const CONFIG_ENTRIES: &[Entry] = &[
     Entry {
-        label: "ops.toml",
-        rel: "ops.toml",
+        label: "sbx.toml",
+        rel: "sbx.toml",
         desc: "global config (trusted by location)",
         enumerate: Enumerate::None,
     },
@@ -130,7 +130,7 @@ const STATE_ENTRIES: &[Entry] = &[Entry {
     enumerate: Enumerate::None,
 }];
 
-/// The complete on-disk layout view: one [`BaseView`] per XDG base ops uses.
+/// The complete on-disk layout view: one [`BaseView`] per XDG base sbx uses.
 #[derive(Serialize)]
 pub(crate) struct PathView {
     bases: Vec<BaseView>,
@@ -140,9 +140,9 @@ pub(crate) struct PathView {
 struct BaseView {
     /// `"data"` / `"config"` / `"state"` — the XDG base's short name.
     label: &'static str,
-    /// The env-var contract for the base, e.g. `"$XDG_DATA_HOME/ops (else ~/.local/share/ops)"`.
+    /// The env-var contract for the base, e.g. `"$XDG_DATA_HOME/sbx (else ~/.local/share/sbx)"`.
     env_hint: &'static str,
-    /// The resolved base directory (`<xdg>/ops`). `None` only when no `$HOME`/XDG base resolves.
+    /// The resolved base directory (`<xdg>/sbx`). `None` only when no `$HOME`/XDG base resolves.
     root: Option<PathBuf>,
     /// Whether the base directory itself exists on disk.
     exists: bool,
@@ -189,9 +189,9 @@ struct ChildView {
 /// `layout` is `None` only when the data directory cannot be resolved (no `$HOME`),
 /// in which case the data base reports no root and its entries are all absent.
 pub(crate) fn view(layout: Option<&Layout>) -> PathView {
-    // The three `<xdg>/ops` roots ops owns. The data root comes from the store
+    // The three `<xdg>/sbx` roots sbx owns. The data root comes from the store
     // layout; the config root is the parent of the profiles directory (sibling of
-    // `ops.toml`); the state root is the parent of the trust marker directory.
+    // `sbx.toml`); the state root is the parent of the trust marker directory.
     // Each is `None` only when its XDG base + `$HOME` yield no absolute path.
     let data_root = layout.map(|l| l.data_dir().to_path_buf());
     let config_root = config::profiles_dir().and_then(|d| d.parent().map(Path::to_path_buf));
@@ -210,7 +210,7 @@ fn view_with_roots(
 ) -> PathView {
     // The live project ids — the set a running session holds — for the data base's per-project
     // liveness annotation. Computed once from the session registry at the data root (the same
-    // self-healing housekeep `ops session ls` runs); empty when there is no data root or no sessions. Only
+    // self-healing housekeep `sbx session ls` runs); empty when there is no data root or no sessions. Only
     // the data base's `projects/` entry consumes it; config and state ignore it.
     let live_ids: BTreeSet<String> = data_root
         .as_ref()
@@ -224,19 +224,19 @@ fn view_with_roots(
     let bases = [
         (
             "data",
-            "$XDG_DATA_HOME/ops (else ~/.local/share/ops)",
+            "$XDG_DATA_HOME/sbx (else ~/.local/share/sbx)",
             DATA_ENTRIES,
             data_root,
         ),
         (
             "config",
-            "$XDG_CONFIG_HOME/ops (else ~/.config/ops)",
+            "$XDG_CONFIG_HOME/sbx (else ~/.config/sbx)",
             CONFIG_ENTRIES,
             config_root,
         ),
         (
             "state",
-            "$XDG_STATE_HOME/ops (else ~/.local/state/ops)",
+            "$XDG_STATE_HOME/sbx (else ~/.local/state/sbx)",
             STATE_ENTRIES,
             state_root,
         ),
@@ -259,7 +259,7 @@ fn view_with_roots(
     }
 }
 
-/// The project id of the current working directory, so `ops path` can mark the tree you're in.
+/// The project id of the current working directory, so `sbx path` can mark the tree you're in.
 /// Best-effort: returns `None` when the cwd cannot be read or canonicalized (deleted mid-run, or
 /// no cwd), in which case no tree is marked `current`.
 fn current_project_id() -> Option<String> {
@@ -269,8 +269,8 @@ fn current_project_id() -> Option<String> {
 }
 
 /// The set of project ids a running session holds, for the per-project `live` annotation. Reads
-/// the session registry and prunes dead records (the same self-healing `ops session ls` performs — a
-/// benign side effect, not a violation of `ops path`'s read-only stance, which is about no
+/// the session registry and prunes dead records (the same self-healing `sbx session ls` performs — a
+/// benign side effect, not a violation of `sbx path`'s read-only stance, which is about no
 /// sandbox launch / no trust gate / no network, not no filesystem housekeeping). Each live
 /// session's recorded canonical path is hashed the way [`sandbox::project_id`] hashes a launch's
 /// cwd, so the id matches the runtime tree's directory name.
@@ -286,7 +286,7 @@ fn live_project_ids(data_dir: &Path) -> BTreeSet<String> {
 /// Probe one base: its root's existence, then each entry's existence and (for
 /// enumerated entries) the children found on disk. Best-effort throughout — a
 /// `read_dir` that fails (a race, a permission wall) yields no children rather
-/// than failing the whole overview, since `ops path` is read-only and advisory.
+/// than failing the whole overview, since `sbx path` is read-only and advisory.
 /// `live_ids` is the live-session project-id set, consulted only by the `projects/`
 /// enumeration. `current_id` is the cwd's project id, so the matching tree is marked
 /// `current`. Both are ignored by bases that carry no project trees.
@@ -394,7 +394,7 @@ fn enumerate(
     out
 }
 
-/// Format a `SystemTime` as a stable `YYYY-MM-DD` (UTC) — the column `ops path` shows beside each
+/// Format a `SystemTime` as a stable `YYYY-MM-DD` (UTC) — the column `sbx path` shows beside each
 /// project's liveness state. Civil-from-days-since-epoch via the Howard Hinnant algorithm, so no
 /// `chrono` dependency; UTC is the right choice for a date-only column (a local day would shift by
 /// your timezone and mislead across a midnight boundary). `UNIX_EPOCH` falls back to `-`.
@@ -422,7 +422,7 @@ pub(crate) fn civil_date(t: SystemTime) -> String {
 }
 
 /// Render the layout as aligned, optionally colored text. Mirrors the shape of
-/// `ops config path`'s resolution overview: a header per base, then each entry
+/// `sbx config path`'s resolution overview: a header per base, then each entry
 /// with its path and a `(present)`/`(absent)`/`(no base)` tag, and enumerated
 /// children indented under their parent. Color spans are empty when the palette
 /// is plain, so a captured test stream is byte-for-byte plain text.
@@ -432,7 +432,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "{h}ops on-disk locations{r} {dim}(grouped by XDG base){r}"
+        "{h}sbx on-disk locations{r} {dim}(grouped by XDG base){r}"
     );
 
     for base in &view.bases {
@@ -502,7 +502,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
                             };
                             // The project tree line: id, tree path, (state), date, recorded
                             // project path (or "(unknown)" for markerless), and a `*` when it is
-                            // the tree of the cwd ops path was launched from.
+                            // the tree of the cwd sbx path was launched from.
                             let proj = c
                                 .project_path
                                 .as_deref()
@@ -530,7 +530,7 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
     let _ = writeln!(o);
     let _ = writeln!(
         o,
-        "{dim}for the config files in resolution order, see `ops config path`.{r}"
+        "{dim}for the config files in resolution order, see `sbx config path`.{r}"
     );
     o
 }
@@ -550,8 +550,8 @@ mod tests {
         // A data root with a project and a global app home.
         std::fs::create_dir_all(data.path().join("projects").join("abc123")).unwrap();
         std::fs::create_dir_all(data.path().join("apps").join("claude")).unwrap();
-        // A config root with `ops.toml` and an imported profile.
-        std::fs::write(cfg.path().join("ops.toml"), "").unwrap();
+        // A config root with `sbx.toml` and an imported profile.
+        std::fs::write(cfg.path().join("sbx.toml"), "").unwrap();
         std::fs::create_dir_all(cfg.path().join("apps")).unwrap();
         std::fs::write(cfg.path().join("apps").join("codex.toml"), "").unwrap();
         // A state root with a `trusted/` dir.
@@ -614,13 +614,13 @@ mod tests {
         );
 
         let config_v = &bases[1];
-        let ops_toml = config_v["entries"]
+        let sbx_toml = config_v["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["label"] == "ops.toml")
-            .expect("ops.toml entry");
-        assert_eq!(ops_toml["exists"], true, "ops.toml exists");
+            .find(|e| e["label"] == "sbx.toml")
+            .expect("sbx.toml entry");
+        assert_eq!(sbx_toml["exists"], true, "sbx.toml exists");
         let profiles = config_v["entries"]
             .as_array()
             .unwrap()
@@ -647,7 +647,7 @@ mod tests {
     }
 
     /// When no data root resolves, the data base reports no root and every entry
-    /// is absent — `ops path` still succeeds and stays useful as a map of intent.
+    /// is absent — `sbx path` still succeeds and stays useful as a map of intent.
     #[test]
     fn view_with_no_data_root_lists_entries_absent() {
         let v = view_with_roots(None, None, None);
@@ -662,16 +662,16 @@ mod tests {
     }
 
     /// The text render is plain (no ANSI) when the palette is plain — the
-    /// captured-stream contract every render in ops honors.
+    /// captured-stream contract every render in sbx honors.
     #[test]
     fn render_plain_has_no_escapes() {
         let pal = crate::style::Palette::plain();
         let v = view_with_roots(None, None, None);
         let s = render(&v, &pal);
         assert!(!s.contains('\x1b'), "plain render must not emit ANSI");
-        assert!(s.contains("ops on-disk locations"), "header present");
+        assert!(s.contains("sbx on-disk locations"), "header present");
         assert!(s.contains("data"), "data base listed");
-        assert!(s.contains("ops config path"), "cross-reference note");
+        assert!(s.contains("sbx config path"), "cross-reference note");
     }
 
     /// Enumerated children render indented under their parent, and a directory
@@ -770,7 +770,7 @@ mod tests {
             Some("markerless"),
             "markerless"
         );
-        // The marker carries the canonical project path, so `ops path` answers "which project
+        // The marker carries the canonical project path, so `sbx path` answers "which project
         // does this id belong to?" for every identified tree — and honestly cannot for a markerless
         // one (`project_path` is `None`).
         assert_eq!(
@@ -802,7 +802,7 @@ mod tests {
         }
     }
 
-    /// The project tree matching the current working directory is marked `current` — so `ops path`
+    /// The project tree matching the current working directory is marked `current` — so `sbx path`
     /// answers "which of these am I in right now?". A tree whose id is not the cwd's hash is not
     /// marked. Drives the `*` marker in the text render and the `current` boolean in JSON.
     #[test]
@@ -825,7 +825,7 @@ mod tests {
 
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&here).expect("chdir into the project");
-        // Compute the id ops will derive for `here`, so the tree's directory name matches it —
+        // Compute the id sbx will derive for `here`, so the tree's directory name matches it —
         // otherwise `current` would never fire. Rename the tree to that id.
         let id = crate::sandbox::project_id(&here.canonicalize().unwrap());
         std::fs::rename(projects.join("hereid"), projects.join(&id))

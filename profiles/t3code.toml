@@ -1,13 +1,13 @@
-# T3 Code — the open-source control plane for coding agents (pingdotgg/t3code), sandboxed by ops.
+# T3 Code — the open-source control plane for coding agents (pingdotgg/t3code), sandboxed by sbx.
 #
-#   ops app import profiles/t3code.toml
-#   ops app t3code
+#   sbx app import profiles/t3code.toml
+#   sbx app t3code
 #
 # T3 Code is a free, open-source Electron desktop app: ONE interface that drives OTHER coding agents
 # — Claude Code, Codex, OpenCode, Cursor — spawning each as a CLI subprocess, switching models
 # mid-conversation, and generating PRs with one-button commit/push to your GitHub. It does NOT ship
 # its own model backend and does NOT resell tokens: it orchestrates the agent CLIs you install, each
-# using ITS OWN credentials. Under ops it runs CONFINED: it sees only the cage filesystem (the project
+# using ITS OWN credentials. Under sbx it runs CONFINED: it sees only the cage filesystem (the project
 # directory you launch it from, plus its own persistent isolated home and any `binds` below), reaches
 # only the hosts you allow, and its git/agent powers stop at the sandbox boundary (bubblewrap +
 # seccomp + an empty netns + the egress allowlist).
@@ -21,7 +21,7 @@
 # THE `appimage:` BACKEND (no third party, tracks upstream automatically). Upstream distributes T3
 # Code for Linux ONLY as an `.AppImage` (no `.deb`, no nixpkgs attr, no buildable flake), and the
 # release asset name embeds the version, so there is no stable `…/latest/download/…` URL to hard-code.
-# This profile names the GitHub repo — `appimage:github:pingdotgg/t3code` — and ops queries the repo's
+# This profile names the GitHub repo — `appimage:github:pingdotgg/t3code` — and sbx queries the repo's
 # LATEST release, selects its linux-x86_64 `.AppImage`, resolves it to a content hash (both pinned in
 # the per-project appimage lock), and builds a generated derivation that EXTRACTS THE SQUASHFS AT
 # BUILD TIME and `autoPatchelfHook`s the Electron binaries. It is **never self-mounted at runtime**:
@@ -30,13 +30,13 @@
 # is HOST-SIDE (an AppImage runs no maintainer script, so evaluating it host-side is safe), seeded into
 # the store, and offline-reusable after the first launch.
 #
-# UPGRADES — automatic, like the `deb:` apps. `ops upgrade appimage` re-queries GitHub and rolls the
+# UPGRADES — automatic, like the `deb:` apps. `sbx upgrade appimage` re-queries GitHub and rolls the
 # pin forward to the newest release (the rebuilt app lands at the next launch); the launch hot path
 # never touches GitHub. No manual version bump.
 #
-# CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
-# per-session CA. Electron/Chromium ignores the CA-file env vars ops sets and trusts its own NSS
-# database (`~/.pki/nssdb`); for a `gui = "wayland"` cage under a filtering posture, ops seeds its MITM
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`); for a `gui = "wayland"` cage under a filtering posture, sbx seeds its MITM
 # CA into that NSS db automatically (part of the GUI hole, like fonts), so HTTPS to the allowed hosts
 # succeeds. `--use-system-ca` tells Electron to consult that store.
 #
@@ -44,7 +44,7 @@
 # provisions fonts, so the Electron window maps. X11 is never offered. Isolation is compositor-dependent
 # — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose screen-capture/input-injection
 # to ordinary clients (see docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated
-# rendering (mesa provisioned into ops's own store, the render node under `/dev/dri`, the minimal
+# rendering (mesa provisioned into sbx's own store, the render node under `/dev/dri`, the minimal
 # `/sys` DRM subtree the driver needs) — without it a Chromium/Electron app on Wayland often produces
 # no buffer and no window maps, so it is on. mesa covers Intel/AMD/nouveau; an NVIDIA-only machine
 # falls back to software (renders, slower). `dbus = true` gives the cage its OWN private desktop portal
@@ -63,7 +63,7 @@
 # the loopback callback both resolve inside the sandbox, no host browser, no `forward`. Same pattern as
 # aionui / claude-desktop. HEAVY: it pulls the Chromium closure into the store on first launch (see
 # [packages]). Each provider's OWN login hosts must be in [network] — add them from
-# `ops net logs -a t3code` on your first login attempt. `--password-store=basic` forces the file cookie
+# `sbx net logs -a t3code` on your first login attempt. `--password-store=basic` forces the file cookie
 # store (no keyring in the cage) so a login survives a relaunch. If every agent you use is configured
 # with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you can
 # drop this wrapper + the chromium package for a bare `t3code` argv.
@@ -90,10 +90,10 @@ export PATH="$HOME/.local/bin:$PATH"
 # Register the wrapper as that handler. The Exec path is ABSOLUTE ($HOME expanded here) because the
 # portal-launched handler does not inherit this shell's PATH.
 mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/ops-open-uri.desktop" <<EOF
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=ops URL handler
+Name=sbx URL handler
 Exec=$HOME/.local/bin/xdg-open %U
 MimeType=x-scheme-handler/http;x-scheme-handler/https;
 NoDisplay=true
@@ -101,8 +101,8 @@ Terminal=false
 EOF
 cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
 [Default Applications]
-x-scheme-handler/http=ops-open-uri.desktop
-x-scheme-handler/https=ops-open-uri.desktop
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
 MIMEAPPS
 
 # GPU note: on an NVIDIA/Optimus machine Chromium may pick the discrete card, which has no in-cage
@@ -125,8 +125,8 @@ dbus = true
 # at DNS → an empty model list + an Offline environment. Only the Chromium UI honours the proxy, and
 # every clean way to route the backend hits a hard wall (proxychains breaks Chromium's renderer; Electron
 # strips NODE_OPTIONS so a preload can't reach the backend; a cap-free transparent interceptor is an
-# ops-sized feature, not a profile knob — full reasoning in the commented "aspirational allowlist" below
-# and in `profiles/README.md`). So t3code ships `shared` so `ops app t3code` just works. What you KEEP
+# sbx-sized feature, not a profile knob — full reasoning in the commented "aspirational allowlist" below
+# and in `profiles/README.md`). So t3code ships `shared` so `sbx app t3code` just works. What you KEEP
 # under shared: bubblewrap + seccomp + the isolated home + the minimal /dev — only egress FILTERING is
 # off (the app reaches any host, but still cannot see your real $HOME or other processes).
 network = "shared"
@@ -141,7 +141,7 @@ network = "shared"
 
 [packages]
 # The T3 Code desktop app, tracked from the latest GitHub release's linux `.AppImage` automatically
-# (see "THE `appimage:` BACKEND" above). `ops upgrade appimage` rolls it forward; no manual version.
+# (see "THE `appimage:` BACKEND" above). `sbx upgrade appimage` rolls it forward; no manual version.
 t3code = "appimage:github:pingdotgg/t3code"
 
 # In-cage Chromium for the sub-agents' OAuth login flow (see "IN-CAGE BROWSER" above). HEAVY — pulls a
@@ -165,7 +165,7 @@ claude-code = "mise:aqua:anthropics/claude-code"   # → `claude`   (Claude Code
 # see that profile for the mechanism and the `*.cursor.sh` egress hosts.
 
 # ── ASPIRATIONAL ALLOWLIST (inert — `network = "shared"` is set above; there is NO `[network]` table).
-# Kept as documentation for the day t3code CAN be filtered — i.e. when ops grows a Chromium-safe
+# Kept as documentation for the day t3code CAN be filtered — i.e. when sbx grows a Chromium-safe
 # interceptor for the proxy-blind Node backend (a self-disabling LD_PRELOAD connect-shim, or a cap-free
 # loopback DNS responder + SNI-reading TLS relay tunnelling to the forwarder). Until then these lines do
 # nothing; do not uncomment them into a `[network] mode = "deny"` table expecting it to work — it won't
@@ -183,5 +183,5 @@ claude-code = "mise:aqua:anthropics/claude-code"   # → `claude`   (Claude Code
 # AUTHENTICATION — no [secret] block. T3 does not hold model credentials itself: each sub-agent
 # authenticates with ITS OWN account/key, stored by that CLI in the app's PERSISTENT ISOLATED HOME
 # (OAuth session via the in-cage browser, or an API key you place in the CLI's own config). So there is
-# nothing for ops to inject host-side — unlike the header-injecting CLI profiles. Keep your keys/logins
+# nothing for sbx to inject host-side — unlike the header-injecting CLI profiles. Keep your keys/logins
 # out of the project you launch from; they live only in this app's isolated home.

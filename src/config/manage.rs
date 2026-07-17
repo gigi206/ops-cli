@@ -1,7 +1,7 @@
 //! The presentation-agnostic management engine for the on-disk config files.
 //!
 //! Where [`super::view`] projects the *resolved* configuration for reading, this edits the *raw*
-//! layer files — a single `.ops.toml` (the project or global file, or an explicit path) — by
+//! layer files — a single `.sbx.toml` (the project or global file, or an explicit path) — by
 //! dotted key, preserving comments and formatting (`toml_edit`). It returns plain data and typed
 //! [`ManageError`]s; the CLI maps those to messages, exit codes, and the trust interaction, and a
 //! future management front-end maps them to its own surface. It deliberately does no trust work
@@ -18,9 +18,9 @@ use toml_edit::{value, Array, DocumentMut, Item, Table, TableLike, Value};
 
 /// Which config file an operation targets.
 pub(crate) enum Scope {
-    /// The project's `.ops.toml` in the working directory — the default.
+    /// The project's `.sbx.toml` in the working directory — the default.
     Local,
-    /// The user's global `ops.toml`.
+    /// The user's global `sbx.toml`.
     Global,
     /// An explicit file path.
     File(PathBuf),
@@ -69,7 +69,7 @@ pub(crate) enum EgressList {
     Allow,
     Deny,
     /// The `mute` list — a `dontaudit` log filter (a denied request's line is suppressed from the
-    /// default `ops net log`), never a verdict. Same on-disk shape and grammar as `allow`/`deny`.
+    /// default `sbx net log`), never a verdict. Same on-disk shape and grammar as `allow`/`deny`.
     Mute,
 }
 
@@ -106,31 +106,31 @@ impl std::fmt::Display for ManageError {
             ManageError::BadKey(k) => write!(f, "invalid key {k:?}"),
             ManageError::NotScalar(k) => write!(
                 f,
-                "{k} is not a single value (it is an array or table) — edit it with `ops config edit`"
+                "{k} is not a single value (it is an array or table) — edit it with `sbx config edit`"
             ),
             ManageError::InvalidValue(k, detail) => write!(
                 f,
                 "the value for {k} is not valid there ({detail}) — nothing was written; \
-                 check the expected type with `ops config edit`"
+                 check the expected type with `sbx config edit`"
             ),
             ManageError::DenyNeedsPosture => write!(
                 f,
                 "no filtering network posture is set, and a `deny` rule must not open one — set a \
-                 posture first: `ops config set network allow` (a denylist) then `ops trust`"
+                 posture first: `sbx config set network allow` (a denylist) then `sbx trust`"
             ),
             ManageError::MuteNeedsPosture => write!(
                 f,
                 "no filtering network posture is set, so a `mute` rule would be inert (there is no \
                  proxy to suppress a refusal from) — set a posture first \
-                 (`ops config set network deny|allow`), then `ops net mute`"
+                 (`sbx config set network deny|allow`), then `sbx net mute`"
             ),
             ManageError::NonFilteringPosture(p) => write!(
                 f,
                 "the network is explicitly `{p}`; change the posture first \
-                 (`ops config set network deny|allow`) before adding rules"
+                 (`sbx config set network deny|allow`) before adding rules"
             ),
             ManageError::MalformedNetwork(s) => {
-                write!(f, "the `network` field is malformed ({s}) — edit it with `ops config edit`")
+                write!(f, "the `network` field is malformed ({s}) — edit it with `sbx config edit`")
             }
             ManageError::GroupCollision(names) => write!(
                 f,
@@ -154,9 +154,9 @@ pub(crate) fn scope_path(scope: &Scope, cwd: &Path) -> Result<PathBuf, ManageErr
 
 /// Resolve a scope to the file an **app-scoped** operation targets. This diverges from
 /// [`scope_path`] only for [`Scope::Global`]: a global app lives as a profile file under
-/// `apps/<name>.toml` (an inline `[app.<name>]` in `ops.toml` is forbidden), so an app-scoped
+/// `apps/<name>.toml` (an inline `[app.<name>]` in `sbx.toml` is forbidden), so an app-scoped
 /// global write reaches the profile, not the global config. [`Scope::Local`] still targets the
-/// project `.ops.toml` (a project-scoped `[app.<name>]` overlay is allowed), and [`Scope::File`]
+/// project `.sbx.toml` (a project-scoped `[app.<name>]` overlay is allowed), and [`Scope::File`]
 /// targets the explicit path unchanged. The file need not exist yet — an app-scoped global write
 /// creates the profile.
 pub(crate) fn scope_app_path(scope: &Scope, cwd: &Path, app: &str) -> Result<PathBuf, ManageError> {
@@ -167,7 +167,7 @@ pub(crate) fn scope_app_path(scope: &Scope, cwd: &Path, app: &str) -> Result<Pat
     }
 }
 
-/// One config file in resolution order, for `ops config path`'s overview. `path` is `None` only
+/// One config file in resolution order, for `sbx config path`'s overview. `path` is `None` only
 /// for the global layer when no config directory resolves (no `$XDG_CONFIG_HOME`/`$HOME`).
 pub(crate) struct Layer {
     /// A short label (`"global"` / `"project"`).
@@ -177,8 +177,8 @@ pub(crate) struct Layer {
     pub(crate) path: Option<PathBuf>,
 }
 
-/// The config files a launch resolves, in order: the global `ops.toml` (the base layer) then the
-/// project `.ops.toml`, which overlays it (so the project wins). Each path comes through
+/// The config files a launch resolves, in order: the global `sbx.toml` (the base layer) then the
+/// project `.sbx.toml`, which overlays it (so the project wins). Each path comes through
 /// [`scope_path`] — the same primitive `--global`/`--local` target — so this overview and those
 /// single-path forms stay byte-identical.
 pub(crate) fn resolution_layers(cwd: &Path) -> Vec<Layer> {
@@ -289,7 +289,7 @@ fn put_scalar(doc: &mut DocumentMut, key: &str, v: Value) -> Result<bool, Manage
 /// The TOML value for a raw command-line string: a bare `true`/`false` becomes a boolean and a bare
 /// integer becomes an integer, so a typed schema key round-trips; anything else stays a string. The
 /// caller validates the result and falls back to a string, so an over-eager guess is never
-/// committed — the point is only to let `ops config set network.stats false` write a real boolean.
+/// committed — the point is only to let `sbx config set network.stats false` write a real boolean.
 fn scalar_value(val: &str) -> Value {
     match val {
         "true" => Value::from(true),
@@ -455,7 +455,7 @@ pub(crate) enum RemoveOutcome {
 /// Remove an egress `rule` from the `list` of the target's `[network]` table — the inverse of
 /// [`add_egress_rule`]. An absent file, an absent `[network]`, a bare-string posture (which carries
 /// no lists), or a rule simply not in the list are all a clean [`RemoveOutcome::NotPresent`], never
-/// an error, so `ops net unmute` of something already gone is idempotent. Unlike the add path it
+/// an error, so `sbx net unmute` of something already gone is idempotent. Unlike the add path it
 /// **never creates** the app/network scaffolding — there is nothing to remove from a table that does
 /// not exist. Preserves comments/formatting and writes atomically only when it actually removed
 /// something.
@@ -640,7 +640,7 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
 /// the global config dir (or an explicit `-c dir/file.toml` whose directory does not exist yet)
 /// may be absent on a first write.
 ///
-/// A fresh file is written owner-only (`0600`), independent of the caller's umask, so ops's own
+/// A fresh file is written owner-only (`0600`), independent of the caller's umask, so sbx's own
 /// write always passes its safety gate (a world-writable config is later refused); an existing
 /// file keeps its mode. The temp name carries the pid so two concurrent writers do not collide.
 fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
@@ -651,11 +651,11 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("ops.toml");
+        .unwrap_or("sbx.toml");
     let mode = std::fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0o600);
-    let tmp = dir.join(format!(".{name}.ops-tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.sbx-tmp.{}", std::process::id()));
     std::fs::write(&tmp, doc.to_string()).map_err(err)?;
     if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
         let _ = std::fs::remove_file(&tmp);
@@ -676,7 +676,7 @@ pub(crate) struct ImportGroupsOutcome {
 }
 
 /// Serialize a set of egress groups as a portable `[net.groups]` TOML fragment — the value
-/// `ops net groups export` writes. Fresh formatting (source comments are not carried); each name
+/// `sbx net groups export` writes. Fresh formatting (source comments are not carried); each name
 /// maps to its entries as a string array, in the map's (sorted) order. The inverse merge is
 /// [`import_net_groups`], and the fragment round-trips through [`super::read_net_groups_fragment`].
 pub(crate) fn export_net_groups(
@@ -758,7 +758,7 @@ mod tests {
     use super::*;
 
     fn doc_at(dir: &Path, body: &str) -> PathBuf {
-        let p = dir.join(".ops.toml");
+        let p = dir.join(".sbx.toml");
         std::fs::write(&p, body).unwrap();
         p
     }
@@ -776,7 +776,7 @@ mod tests {
             layers[1].path,
             Some(scope_path(&Scope::Local, cwd).unwrap())
         );
-        assert_eq!(layers[1].path, Some(cwd.join(".ops.toml")));
+        assert_eq!(layers[1].path, Some(cwd.join(".sbx.toml")));
     }
 
     #[test]
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn set_creates_a_missing_file_and_its_tables() {
         let tmp = crate::testutil::TmpDir::new();
-        let p = tmp.path().join(".ops.toml");
+        let p = tmp.path().join(".sbx.toml");
         assert!(set(&p, "env.A", "1").unwrap(), "created in a new file");
         assert_eq!(get(&p, "env.A").unwrap().as_deref(), Some("1"));
     }
@@ -839,7 +839,7 @@ mod tests {
         // The global config dir, or an explicit `-c nested/dir/file.toml`, may not exist on a
         // first write — the atomic placement must create the directory, not fail on it.
         let tmp = crate::testutil::TmpDir::new();
-        let p = tmp.path().join("nested").join("dir").join("ops.toml");
+        let p = tmp.path().join("nested").join("dir").join("sbx.toml");
         assert!(set(&p, "env.A", "1").unwrap(), "created under a new dir");
         assert_eq!(get(&p, "env.A").unwrap().as_deref(), Some("1"));
     }
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn add_egress_rule_bootstraps_an_allowlist_for_allow_on_a_fresh_config() {
         let tmp = crate::testutil::TmpDir::new();
-        let p = tmp.path().join(".ops.toml");
+        let p = tmp.path().join(".sbx.toml");
         let out = add_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap();
         assert_eq!(
             out,
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn mute_rule_add_and_remove_round_trip_on_a_table() {
         let tmp = crate::testutil::TmpDir::new();
-        // A filtering posture already exists (the common `ops net mute -a <app>` case).
+        // A filtering posture already exists (the common `sbx net mute -a <app>` case).
         let p = doc_at(
             tmp.path(),
             "[network]\nmode = \"deny\"\nallow = [\"api.test\"]\n",
@@ -1022,7 +1022,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         // No `[network]` at all → a mute would be inert, so it is refused (like a posture-less deny),
         // and nothing is written.
-        let p = tmp.path().join(".ops.toml");
+        let p = tmp.path().join(".sbx.toml");
         assert!(matches!(
             add_egress_rule(&p, None, EgressList::Mute, "x.test"),
             Err(ManageError::MuteNeedsPosture)
@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn add_egress_rule_on_a_mode_less_table_keeps_it_mode_less() {
         // A `[network]` table that inherits its mode (no `mode` key) must stay mode-less after
-        // `ops net allow` appends a rule — materializing a `mode` would silently pin it and break
+        // `sbx net allow` appends a rule — materializing a `mode` would silently pin it and break
         // the inheritance the author chose.
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[network]\nallow = [\"a.test\"]\n");
@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     fn add_egress_rule_refuses_a_deny_with_no_posture_without_writing() {
         let tmp = crate::testutil::TmpDir::new();
-        let p = tmp.path().join(".ops.toml");
+        let p = tmp.path().join(".sbx.toml");
         assert!(matches!(
             add_egress_rule(&p, None, EgressList::Deny, "evil.com"),
             Err(ManageError::DenyNeedsPosture)
@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn add_egress_rule_writes_the_apps_own_network_table_with_implicit_parents() {
         let tmp = crate::testutil::TmpDir::new();
-        let p = tmp.path().join(".ops.toml");
+        let p = tmp.path().join(".sbx.toml");
         add_egress_rule(&p, Some("claude"), EgressList::Allow, "api.anthropic.com").unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn scope_app_path_local_targets_the_project_config_and_file_the_explicit_path() {
-        // `Local` targets the project `.ops.toml` (a project-scoped `[app.<name>]` overlay is still
+        // `Local` targets the project `.sbx.toml` (a project-scoped `[app.<name>]` overlay is still
         // allowed); `File` targets the explicit path unchanged. The `Global` arm depends on the
         // config-home env, so it is covered hermetically by the integration test
         // `net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields` instead.
@@ -1171,7 +1171,7 @@ mod tests {
             scope_app_path(&Scope::Local, cwd, "claude").unwrap(),
             cwd.join(crate::config::PROJECT_CONFIG)
         );
-        let explicit = std::path::PathBuf::from("/etc/ops.toml");
+        let explicit = std::path::PathBuf::from("/etc/sbx.toml");
         assert_eq!(
             scope_app_path(&Scope::File(explicit.clone()), cwd, "x").unwrap(),
             explicit

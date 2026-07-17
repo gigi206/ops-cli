@@ -1,17 +1,17 @@
-# Cursor — the Cursor AI code editor (desktop, Electron / VS Code fork), sandboxed by ops.
+# Cursor — the Cursor AI code editor (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
-#   ops app import profiles/cursor.toml
-#   ops app cursor
+#   sbx app import profiles/cursor.toml
+#   sbx app cursor
 #
 # This is the Cursor **desktop editor** (the full GUI IDE). For the headless terminal agent, use
-# `profiles/cursor-agent.toml` instead (a CLI that fits Mode-B far more cleanly). Confined by ops,
+# `profiles/cursor-agent.toml` instead (a CLI that fits Mode-B far more cleanly). Confined by sbx,
 # the editor sees only the cage filesystem (the project directory you launch it from + its own
 # persistent isolated home), reaches only the hosts you allow, and its powers stop at the sandbox
 # boundary (bubblewrap + seccomp + an empty netns + the egress allowlist).
 #
 # THE `deb:` BACKEND (no third party, prebuilt). Cursor distributes a Linux `.deb` (and an
-# `.AppImage`) from `downloads.cursor.com`. This profile uses the `.deb` via ops's `deb:` backend
-# — the same clean path as `opencode-desktop` / `claude-desktop`: ops fetches the `.deb`, resolves
+# `.AppImage`) from `downloads.cursor.com`. This profile uses the `.deb` via sbx's `deb:` backend
+# — the same clean path as `opencode-desktop` / `claude-desktop`: sbx fetches the `.deb`, resolves
 # it to a content hash (pinned in the per-project deb lock), and builds a generated derivation that
 # `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the Electron binaries against a curated library
 # set. The build is HOST-SIDE (a `.deb` runs no build script, so evaluating it host-side is safe),
@@ -19,7 +19,7 @@
 #
 # VERSION PIN — MANUAL bump (no `…/latest/…` URL). Cursor's `.deb` URL embeds a version + build
 # hash, so it pins the version below (3.11.25 at authoring time). Cursor has no `…/releases/latest/…`
-# URL and no apt index to track, so `ops upgrade deb` re-resolves the SAME pinned URL (it does not
+# URL and no apt index to track, so `sbx upgrade deb` re-resolves the SAME pinned URL (it does not
 # roll forward). To update, get the current URL from Cursor's download API and replace the `deb:`
 # line:  curl -sL 'https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable'
 # (returns {"downloadUrl":…, "debUrl":…, "version":…}) — use its `debUrl`.
@@ -28,19 +28,19 @@
 # MiB — a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse
 # the pinned build offline.
 #
-# CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
-# per-session CA. Electron/Chromium trusts its own NSS database, not the CA-file env vars ops sets,
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium trusts its own NSS database, not the CA-file env vars sbx sets,
 # so a Chromium app would otherwise fail every HTTPS with `ERR_CERT_AUTHORITY_INVALID`. For a
-# `gui = "wayland"` cage under a filtering posture, ops seeds its MITM CA into the cage's NSS db
+# `gui = "wayland"` cage under a filtering posture, sbx seeds its MITM CA into the cage's NSS db
 # automatically (part of the GUI hole, like fonts); `--use-system-ca` tells Electron to consult it.
 # Cursor's own Node backend (the extension host that makes model calls) additionally honours
-# `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`, which ops also sets — so both halves trust the proxy.
+# `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`, which sbx also sets — so both halves trust the proxy.
 #
 # DISPLAY + GPU + AUDIO + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
 # Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never
 # offered; isolation is compositor-dependent (Mutter safe; wlroots exposes screen-capture/input —
 # see docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in
-# ops's own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
+# sbx's own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
 # Chromium/Electron app on Wayland often maps no window; mesa covers Intel/AMD/nouveau, NVIDIA-only
 # falls back to software. `audio = true` provisions the PulseAudio client library (`libpulse.so.0`,
 # absent from the app's own closure, which carries only ALSA) and binds the host PulseAudio socket
@@ -68,21 +68,21 @@
 # FIRST LOGIN — run it once under `--net shared` (host network, no allowlist whack-a-mole while you
 # discover which SSO hosts the flow touches), let the session persist in the isolated home, then run
 # filtered:
-#     ops app cursor --net shared     # first run: complete the sign-in, watch `ops net logs -a cursor`
-#     ops app cursor                  # later runs: filtered by the allowlist below
+#     sbx app cursor --net shared     # first run: complete the sign-in, watch `sbx net logs -a cursor`
+#     sbx app cursor                  # later runs: filtered by the allowlist below
 # If you sign in with Google/GitHub SSO, add the provider's host chain to `allow` (for Google the
 # repo-standard bounded regex — see `profiles/claude-desktop.toml`; the `accounts.google.<ccTLD>/…/SetSID`
 # redirect is load-bearing). A plain EMAIL sign-in stays on Cursor's own domain and needs no SSO hosts.
 # Whether the session token survives a relaunch under `--password-store=basic` is the thing to confirm.
 #
-# EGRESS AND HTTP/2 (gRPC). ops's MITM proxy speaks HTTP/1.1 by default; a host listed in
+# EGRESS AND HTTP/2 (gRPC). sbx's MITM proxy speaks HTTP/1.1 by default; a host listed in
 # `[network] http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still
 # inspected + verdict-checked (`allow` governs the verdict, `http2` only the transport). Cursor's
 # client uses HTTP/2/gRPC and falls back to HTTP/1.1 SSE when h2 is unavailable, so its dual-stack
 # agent hosts (api2 / api5) work either way; its codebase-indexing host `repo42.cursor.sh` is
 # HTTP/2-ONLY, designated in `[network] http2` below. Cursor's own doc still recommends against SSL
 # inspection on its domains (streaming can be affected), so if the editor misbehaves under `deny`,
-# diagnose with `ops net logs -a cursor` (a named deny → add the host to `allow`, and if it is
+# diagnose with `sbx net logs -a cursor` (a named deny → add the host to `allow`, and if it is
 # gRPC/h2-only, to `http2`; an `EAI_AGAIN`/0-deny → the request bypassed the proxy) and, as a last
 # resort, fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the
 # minimal /dev, and lose only egress FILTERING).
@@ -103,7 +103,7 @@
 # (api2.cursor.sh allowed, telemetry/component hosts denied). STILL TO VALIDATE with a real Cursor
 # account: the account LOGIN (now WIRED via the in-cage browser below — validate it on the first
 # `--net shared` run) and an end-to-end AI turn. If a request is blocked, the proxy names the host it
-# refused — add it to `allow` (or check ahead with `ops test net <url>`).
+# refused — add it to `allow` (or check ahead with `sbx test net <url>`).
 #
 # OBSERVED AT RUNTIME — all benign, all inherent to the Mode-B cage (do NOT "fix" by widening it):
 #   - `Failed to connect to /run/dbus/system_bus_socket` — the SYSTEM bus is privileged and never
@@ -113,7 +113,7 @@
 #   - `Unable to retrieve mac address` / `hostname: command not found` — the empty netns has no real
 #     NIC and the cage ships no `hostname` binary, so the machine-id probe fails; the editor continues.
 #   - `'use-system-ca' is not in the list of known options` — inert on this Electron build (passed but
-#     unrecognized); HTTPS still trusts ops's MITM CA via the NSS seed + `NODE_EXTRA_CA_CERTS` (the
+#     unrecognized); HTTPS still trusts sbx's MITM CA via the NSS seed + `NODE_EXTRA_CA_CERTS` (the
 #     working api2.cursor.sh traffic confirms it). Left in for forward-compatibility.
 cmd = [
     "bash",
@@ -129,7 +129,7 @@ cmd = [
 # Chromium managed policy: auto-launch the `cursor://` deep-link with no confirmation dialog, else the
 # callback never reaches the editor and login silently fails. /etc is a writable cage tmpfs; Chromium
 # reads /etc/chromium/policies/managed/.
-mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/policies/managed/ops-cursor-protocol.json <<'POLICY'
+mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/policies/managed/sbx-cursor-protocol.json <<'POLICY'
 {"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"cursor"}]}
 POLICY
 
@@ -137,7 +137,7 @@ POLICY
 # deep-link) -> `cursor --open-url` so the callback reaches the running editor (the `.deb`'s own
 # handler is `cursor --open-url %U`). `--no-sandbox` on the cursor branch too: it only hands the
 # deep-link to the single-instance app and quits, but still boots far enough to hit Chromium's SUID
-# sandbox (ops's build strips the setuid bit off chrome-sandbox), which aborts FATAL without it — the
+# sandbox (sbx's build strips the setuid bit off chrome-sandbox), which aborts FATAL without it — the
 # callback would never arrive.
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
@@ -159,10 +159,10 @@ export PATH="$HOME/.local/bin:$PATH"
 # wrapper as the default handler for the web + `cursor` schemes. The Exec path is ABSOLUTE ($HOME
 # expanded here) because the portal-launched handler does not inherit this shell's PATH.
 mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/ops-open-uri.desktop" <<EOF
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=ops URL handler
+Name=sbx URL handler
 Exec=$HOME/.local/bin/xdg-open %U
 MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/cursor;
 NoDisplay=true
@@ -170,9 +170,9 @@ Terminal=false
 EOF
 cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
 [Default Applications]
-x-scheme-handler/http=ops-open-uri.desktop
-x-scheme-handler/https=ops-open-uri.desktop
-x-scheme-handler/cursor=ops-open-uri.desktop
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
+x-scheme-handler/cursor=sbx-open-uri.desktop
 MIMEAPPS
 
 exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
@@ -218,28 +218,28 @@ allow = [
     # The LOGIN + billing root. `cursor.com` is a SEPARATE domain from `*.cursor.sh`, so the wildcard
     # above does NOT cover it. The sign-in opens `cursor.com/loginDeepControl`, then the flow touches
     # `www.cursor.com` (dashboard/billing) — all first-party Cursor, so a `*.cursor.com` wildcard
-    # covers the apex and every subdomain (confirmed live via `ops net logs -a cursor`).
+    # covers the apex and every subdomain (confirmed live via `sbx net logs -a cursor`).
     "{*} https://*.cursor.com",
     # WorkOS — Cursor's identity provider. The sign-in redirects here for
     # `/user_management/authorize` (OAuth) and the token exchange (POST), so all verbs (confirmed
-    # live via `ops net logs -a cursor`). The login cannot complete without it.
+    # live via `sbx net logs -a cursor`). The login cannot complete without it.
     "{*} https://api.workos.com",
     # The VS Code-style extension marketplace (browse/install extensions). The gallery query is a
     # CORS preflight `OPTIONS` + a `POST /_apis/public/gallery/extensionquery`, so it needs `{*}`, not
-    # `{GET}` (confirmed live via `ops net logs -a cursor`). Comment out if you do not use extensions.
+    # `{GET}` (confirmed live via `sbx net logs -a cursor`). Comment out if you do not use extensions.
     "{*} https://marketplace.cursorapi.com",
     # The extension asset host — the manifest/`.vsix` an extension install fetches (an `OPTIONS`
-    # preflight + a download; confirmed live via `ops net logs -a cursor`). Also Cursor's own
+    # preflight + a download; confirmed live via `sbx net logs -a cursor`). Also Cursor's own
     # `.deb`/update host, but that is fetched HOST-SIDE at build time, not through the cage. Comment
     # out if you do not use extensions.
     "{*} https://downloads.cursor.com",
-    # Other client update / CDN hosts — uncomment whichever the editor names in `ops net logs -a
+    # Other client update / CDN hosts — uncomment whichever the editor names in `sbx net logs -a
     # cursor` (least privilege; not needed for the editor's core edit/AI path).
     #"{GET} https://*.cursor-cdn.com",
     #"{*} https://*.cursorapi.com",
     #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
     # WorkOS auth-page assets (the sign-in page CSS/logos). Needed for the page to render so the form
-    # submits (confirmed live via `ops net logs -a cursor`). `{GET}` — both are asset downloads.
+    # submits (confirmed live via `sbx net logs -a cursor`). `{GET}` — both are asset downloads.
     "{GET} https://cdn.workos.com",
     "{GET} https://workos.imgix.net",
     # Google SSO chain (you sign in with Google). The bounded regex covers `accounts.google.com` AND
@@ -250,7 +250,7 @@ allow = [
     "{GET} https://*.gstatic.com",
     "{GET} https://*.googleusercontent.com",
     # A git fetch of the `makenotion/cursor-notion-plugin` repo (Cursor pulls it as a dependency via
-    # the git smart-HTTP protocol). github.com is already allowed for {GET} by ops's built-in
+    # the git smart-HTTP protocol). github.com is already allowed for {GET} by sbx's built-in
     # nix-cache set (so the `GET /info/refs` discovery passes); only the `POST /git-upload-pack` was
     # denied by method-scope. Authorized as the EXACT upload-pack URL (least privilege — not a host
     # wildcard, not the whole repo).
@@ -263,7 +263,7 @@ allow = [
 # `allow` verdict above — a host here must ALSO be in `allow`, every stream still verdict-checked).
 # `repo42.cursor.sh` (codebase indexing) is HTTP/2-ONLY, designated by default. The api2/api5 agent
 # hosts are dual-stack (HTTP/1.1 SSE fallback works), so they are off; uncomment for native gRPC if
-# model traffic misbehaves, watching `ops net logs -a cursor`. The designation is ALPN-h2-ONLY, so
+# model traffic misbehaves, watching `sbx net logs -a cursor`. The designation is ALPN-h2-ONLY, so
 # avoid a blanket `*.cursor.sh` (it would force h2 on the auth hosts, which may speak HTTP/1.1 → their
 # handshake fails); keep it targeted.
 http2 = [
@@ -271,12 +271,12 @@ http2 = [
     #"*.api5.cursor.sh",
     #"api2.cursor.sh",
 ]
-# Keep denied telemetry out of the default `ops net logs` (still denied by construction, still
-# counted in `ops net stats`; see them with `--all`). Add hosts the proxy names as telemetry.
+# Keep denied telemetry out of the default `sbx net logs` (still denied by construction, still
+# counted in `sbx net stats`; see them with `--all`). Add hosts the proxy names as telemetry.
 mute = [
     # Chrome's component/dictionary CDN — the spellcheck `.bdic` from `redirector.gvt1.com`, etc. Not
     # model/agent traffic and not needed for editing/AI, so it stays denied by construction; muted so
-    # its refusals don't clutter `ops net logs` (still counted in `ops net stats`; see them with `--all`).
+    # its refusals don't clutter `sbx net logs` (still counted in `sbx net stats`; see them with `--all`).
     "*.gvt1.com",
     # The in-cage Chromium's OWN telemetry/component-update noise (not Cursor traffic) — safebrowsing,
     # optimization-guide, component update, "checkin", the time server. Denied by construction; muted so
@@ -313,10 +313,10 @@ mute = [
 # If Cursor's Node backend (the extension host that makes model calls) reaches its endpoints through
 # Node's built-in fetch (undici) — its proxy support is documented as "inherited from Node.js" —
 # undici ignores http_proxy/https_proxy unless this is set, and in the Model-B empty netns a bypassed
-# fetch dies with `EAI_AGAIN` before the proxy is ever consulted (0 denies in `ops net stats`).
+# fetch dies with `EAI_AGAIN` before the proxy is ever consulted (0 denies in `sbx net stats`).
 # NODE_USE_ENV_PROXY (Node 24+) routes fetch through the proxy so every request is subject to the
 # allowlist. Harmless if the backend uses a proxy-aware client instead.
 NODE_USE_ENV_PROXY = "1"
 
 # No [secret] block: the desktop editor logs in to a Cursor account (see the credential note in the
-# header), not a header-injectable provider key — there is nothing for ops to inject host-side.
+# header), not a header-injectable provider key — there is nothing for sbx to inject host-side.

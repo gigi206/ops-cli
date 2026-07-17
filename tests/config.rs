@@ -1,4 +1,4 @@
-//! Integration tests for `ops config`, exercising the built binary end to end:
+//! Integration tests for `sbx config`, exercising the built binary end to end:
 //! global+project layering and the trust gate, against redirected config/state
 //! dirs and a temp project as the working directory.
 
@@ -20,7 +20,7 @@ impl TmpDir {
         // other e2e suites.
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
-        d.push(format!("ops-config-it-{}-{n}", std::process::id()));
+        d.push(format!("sbx-config-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -78,13 +78,13 @@ impl Fixture {
     }
 
     fn write_global(&self, body: &str) {
-        let dir = self.config_home.path().join("ops");
+        let dir = self.config_home.path().join("sbx");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ops.toml"), body).unwrap();
+        std::fs::write(dir.join("sbx.toml"), body).unwrap();
     }
 
     fn write_project(&self, body: &str) {
-        std::fs::write(self.proj.path().join(".ops.toml"), body).unwrap();
+        std::fs::write(self.proj.path().join(".sbx.toml"), body).unwrap();
     }
 
     fn write_mise(&self, body: &str) {
@@ -92,18 +92,18 @@ impl Fixture {
     }
 
     /// Drop an imported app profile under the profiles directory
-    /// (`<config>/ops/apps/<name>.toml`) — the artifact `ops app import` produces, trusted by
+    /// (`<config>/sbx/apps/<name>.toml`) — the artifact `sbx app import` produces, trusted by
     /// location beside the global config.
     fn write_profile(&self, name: &str, body: &str) {
-        let dir = self.config_home.path().join("ops").join("apps");
+        let dir = self.config_home.path().join("sbx").join("apps");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
     }
 
     /// Stage a resolver plugin under the data dir (`<data>/plugins/<name>/plugin.toml`), the
-    /// trusted-by-location registry `ops config` and the launcher read.
+    /// trusted-by-location registry `sbx config` and the launcher read.
     fn write_plugin(&self, name: &str, manifest: &str) {
-        let dir = self.data_home.path().join("ops").join("plugins").join(name);
+        let dir = self.data_home.path().join("sbx").join("plugins").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     }
@@ -115,7 +115,7 @@ impl Fixture {
         let exec = self
             .data_home
             .path()
-            .join("ops/plugins")
+            .join("sbx/plugins")
             .join(name)
             .join("resolve");
         std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
@@ -124,7 +124,7 @@ impl Fixture {
     }
 
     /// Build a *source* plugin directory (a manifest and a `resolve` executable) under a scratch
-    /// area, returning its path — the kind of directory `ops plugins install <dir>` consumes. It is
+    /// area, returning its path — the kind of directory `sbx plugins install <dir>` consumes. It is
     /// deliberately outside the data dir, so the install must copy it in.
     fn source_plugin(&self, dirname: &str, manifest: &str, exec_mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -145,9 +145,9 @@ impl Fixture {
         p
     }
 
-    /// An `ops` invocation in the project dir with the redirected dirs.
-    fn ops(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    /// An `sbx` invocation in the project dir with the redirected dirs.
+    fn sbx(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
         cmd.args(args)
             .current_dir(self.proj.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
@@ -162,7 +162,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        self.ops(args).output().expect("spawn ops")
+        self.sbx(args).output().expect("spawn sbx")
     }
 }
 
@@ -187,7 +187,7 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
     let out = fx.run(&["config", "show", "--json"]);
     assert!(
         out.status.success(),
-        "`ops config show --json` should exit 0"
+        "`sbx config show --json` should exit 0"
     );
     let doc: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("config --json must emit valid JSON");
@@ -204,16 +204,16 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
 
 #[test]
 fn config_show_reflects_and_tags_an_ambient_override() {
-    // `ops config show` must reflect an ambient `OPS_CONFIG` — otherwise it would lie about what a
+    // `sbx config show` must reflect an ambient `SBX_CONFIG` — otherwise it would lie about what a
     // launch in this environment does — and tag the overridden value's provenance as `override`
     // (distinct from the persisted `default`/`global`/`project`). No project config, so the baseline
     // network is the default `shared`; the ambient override isolates it.
     let fx = Fixture::new();
     let out = fx
-        .ops(&["config", "show"])
-        .env("OPS_CONFIG", "network=\"none\"")
+        .sbx(&["config", "show"])
+        .env("SBX_CONFIG", "network=\"none\"")
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     assert!(out.status.success(), "config show should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -224,10 +224,10 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     // A set-but-invalid ambient override is surfaced (as an error note), never silently ignored: the
     // baseline stands, so the view neither lies that a bad value took effect nor hides the mistake.
     let bad = fx
-        .ops(&["config", "show"])
-        .env("OPS_CONFIG", "network=\"nonee\"")
+        .sbx(&["config", "show"])
+        .env("SBX_CONFIG", "network=\"nonee\"")
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     let text =
         String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
     assert!(
@@ -243,15 +243,15 @@ fn config_show_reflects_and_tags_an_ambient_override() {
 
 #[test]
 fn config_show_reflects_an_ambient_typed_override() {
-    // The typed ambient variables (`OPS_NET` here) must reach `ops config show` too — it reads the
-    // same `collect` the launch does, so a stale `OPS_NET` cannot silently change a launch's posture
+    // The typed ambient variables (`SBX_NET` here) must reach `sbx config show` too — it reads the
+    // same `collect` the launch does, so a stale `SBX_NET` cannot silently change a launch's posture
     // without the view admitting it. No project config, so the baseline network is `shared`.
     let fx = Fixture::new();
     let out = fx
-        .ops(&["config", "show"])
-        .env("OPS_NET", "none")
+        .sbx(&["config", "show"])
+        .env("SBX_NET", "none")
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     assert!(out.status.success(), "config show should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -262,17 +262,17 @@ fn config_show_reflects_an_ambient_typed_override() {
 
 #[test]
 fn config_show_reflects_an_ambient_seccomp_and_device_override() {
-    // `--seccomp`/`--device` relax the cage; their ambient `OPS_*` forms must reach `ops config show`
+    // `--seccomp`/`--device` relax the cage; their ambient `SBX_*` forms must reach `sbx config show`
     // (via the same `collect` a launch uses) and be tagged `(override)` — so a stale variable cannot
     // silently widen a launch without the view admitting it. No project config → the baseline is the
     // full mandatory denylist and a minimal /dev, so both lines appear only because of the override.
     let fx = Fixture::new();
     let out = fx
-        .ops(&["config", "show"])
-        .env("OPS_SECCOMP", "ptrace,unshare")
-        .env("OPS_DEVICE", "/dev/kvm")
+        .sbx(&["config", "show"])
+        .env("SBX_SECCOMP", "ptrace,unshare")
+        .env("SBX_DEVICE", "/dev/kvm")
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     assert!(out.status.success(), "config show should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -297,29 +297,29 @@ fn config_show_rejects_an_unknown_argument() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unexpected argument"), "stderr:\n{stderr}");
     assert!(
-        stderr.contains("ops config show"),
+        stderr.contains("sbx config show"),
         "should print the usage synopsis:\n{stderr}"
     );
 }
 
 #[test]
 fn bare_config_reveals_its_subcommands() {
-    // `ops config` with no subcommand must not silently render the resolved view (which would
+    // `sbx config` with no subcommand must not silently render the resolved view (which would
     // hide that `show`/`get`/set/… exist) — it prints the config page, listing the subcommands,
-    // to stderr and exits non-zero, the way bare `ops` does.
+    // to stderr and exits non-zero, the way bare `sbx` does.
     let fx = Fixture::new();
     let out = fx.run(&["config"]);
     assert_eq!(
         out.status.code(),
         Some(2),
-        "bare `ops config` is a no-subcommand usage error"
+        "bare `sbx config` is a no-subcommand usage error"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("Subcommands:") && stderr.contains("show") && stderr.contains("get"),
         "bare config must list its subcommands:\n{stderr}"
     );
-    // The resolved view never lands on stdout for a bare invocation — that is `ops config show`.
+    // The resolved view never lands on stdout for a bare invocation — that is `sbx config show`.
     assert!(
         out.stdout.is_empty(),
         "bare config must not print the resolved view to stdout"
@@ -328,15 +328,15 @@ fn bare_config_reveals_its_subcommands() {
 
 #[test]
 fn config_a_misplaced_flag_points_at_show() {
-    // A flag with no subcommand (the old `ops config --json` muscle memory) is a usage error that
+    // A flag with no subcommand (the old `sbx config --json` muscle memory) is a usage error that
     // names the right form, rather than being silently accepted.
     let fx = Fixture::new();
     let out = fx.run(&["config", "--json"]);
     assert_eq!(out.status.code(), Some(2), "a bare flag is a usage error");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("ops config show --json"),
-        "a misplaced flag must point at `ops config show`:\n{stderr}"
+        stderr.contains("sbx config show --json"),
+        "a misplaced flag must point at `sbx config show`:\n{stderr}"
     );
 }
 
@@ -356,7 +356,7 @@ fn a_mise_file_is_withheld_until_the_project_is_trusted() {
     );
 
     // Trusting the project (which hashes both files) honors it.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -370,7 +370,7 @@ fn editing_the_mise_file_re_arms_the_project_trust() {
     let fx = Fixture::new();
     fx.write_project("[env]\nA = \"1\"\n");
     fx.write_mise("[tools]\nnode = \"20\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // Editing only the mise file must re-arm the gate — trust covers both inputs.
     // The project declares no security field to drop, so the "changed" signal rides
@@ -385,7 +385,7 @@ fn editing_the_mise_file_re_arms_the_project_trust() {
 }
 
 #[test]
-fn a_mise_file_without_an_ops_toml_warns_and_is_not_honored() {
+fn a_mise_file_without_an_sbx_toml_warns_and_is_not_honored() {
     let fx = Fixture::new();
     fx.write_mise("[tools]\nnode = \"20\"\n");
 
@@ -396,11 +396,11 @@ fn a_mise_file_without_an_ops_toml_warns_and_is_not_honored() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // anchored on .ops.toml — with none present, mise is not honored, and the
+    // anchored on .sbx.toml — with none present, mise is not honored, and the
     // no-op is surfaced rather than left silent.
     assert!(stdout.contains("mise:  (none)"), "stdout:\n{stdout}");
     assert!(
-        stderr.contains("mise file") && stderr.contains(".ops.toml"),
+        stderr.contains("mise file") && stderr.contains(".sbx.toml"),
         "an unanchored mise file must be explained:\n{stderr}"
     );
 }
@@ -490,7 +490,7 @@ fn trusting_the_project_applies_its_binds() {
         extra.display()
     ));
 
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "trust failed: {}",
@@ -538,7 +538,7 @@ fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
     );
 
     // Trust it → the allowlist applies and the mute rule is surfaced (dimmed) in `config show`.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -546,12 +546,12 @@ fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
         "a trusted mute rule must be visible in `config show`:\n{stdout}"
     );
 
-    // …and it is listed by `ops net rules` too, tagged `mute` (distinct from allow/deny).
+    // …and it is listed by `sbx net rules` too, tagged `mute` (distinct from allow/deny).
     let rules = fx.run(&["net", "rules"]);
     let rstdout = String::from_utf8_lossy(&rules.stdout);
     assert!(
         rstdout.contains("mute") && rstdout.contains("play.googleapis.com"),
-        "`ops net rules` must list the mute rule:\n{rstdout}"
+        "`sbx net rules` must list the mute rule:\n{rstdout}"
     );
 }
 
@@ -576,7 +576,7 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
     );
 
     // Trust it → the allowlist applies and the http2 host is surfaced in `config show`.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -591,7 +591,7 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
         "[network]\nmode = \"deny\"\nallow = [\"{POST} grpc.example.com:9001\"]\n\
          http2 = [\"grpc.example.com:9001\", \"grpc.example.com:99999\"]\n",
     );
-    assert!(fx2.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx2.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx2.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -612,7 +612,7 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     // The bind is still honored (trusted field, not dropped), but the overlap is surfaced.
     let fx = Fixture::new();
     fx.write_project("binds = [\"/etc\"]\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
@@ -634,7 +634,7 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
 
 #[test]
 fn a_read_write_bind_is_honored_and_marked() {
-    // A trusted `mode = "rw"` bind resolves read-write, and `ops config show` marks it `(rw)` so a
+    // A trusted `mode = "rw"` bind resolves read-write, and `sbx config show` marks it `(rw)` so a
     // writable host hole is visible; `--json` carries `writable: true`.
     let fx = Fixture::new();
     let rw = fx.bind_target("writable");
@@ -642,7 +642,7 @@ fn a_read_write_bind_is_honored_and_marked() {
         "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
         rw.display()
     ));
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
@@ -677,10 +677,10 @@ fn a_bind_path_expands_a_leading_home_variable() {
     );
 
     let out = fx
-        .ops(&["config", "show", "--json"])
+        .sbx(&["config", "show", "--json"])
         .env("HOME", home.path())
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     assert!(
         out.status.success(),
         "config must succeed: {}",
@@ -726,17 +726,17 @@ fn a_bind_path_expands_a_leading_home_variable() {
 
 #[test]
 fn app_export_preserves_a_tilde_bind_verbatim_for_portability() {
-    // Expansion is a *load-time* convenience; `ops app export` must emit the raw `~` form, not the
+    // Expansion is a *load-time* convenience; `sbx app export` must emit the raw `~` form, not the
     // author's expanded home path — otherwise a shared profile would hard-code one machine's home
     // and lose portability, the reason `~` exists. Correct by construction (export serializes the
     // untouched raw declaration), locked here against a future "canonicalize everything" refactor.
     let fx = Fixture::new();
     fx.write_project("[app.demo]\ncmd = \"sh\"\nbinds = [{ path = \"~/sub\", mode = \"rw\" }]\n");
     let out = fx
-        .ops(&["app", "export", "demo"])
+        .sbx(&["app", "export", "demo"])
         .env("HOME", "/home/someone")
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     assert!(
         out.status.success(),
         "export must succeed: {}",
@@ -757,7 +757,7 @@ fn app_export_preserves_a_tilde_bind_verbatim_for_portability() {
 fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
     // The same path bound by the global layer (read-only) and the trusted project (read-write)
     // must resolve to ONE bind, read-write — the launch would otherwise mount the dest twice and
-    // `ops config` would double-list it while the cage silently got the project's mode. Last
+    // `sbx config` would double-list it while the cage silently got the project's mode. Last
     // declaration (project) wins, matching how the launch's later mount wins.
     let fx = Fixture::new();
     let shared = fx.bind_target("shared");
@@ -767,7 +767,7 @@ fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
         "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
         shared.display()
     ));
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let json = fx.run(&["config", "show", "--json"]);
     assert!(json.status.success());
@@ -786,26 +786,26 @@ fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
 }
 
 #[test]
-fn a_read_write_bind_over_ops_own_config_dir_is_forced_read_only() {
-    // The global config directory (`<config>/ops`) is one of ops's control-plane roots — a
+fn a_read_write_bind_over_sbx_own_config_dir_is_forced_read_only() {
+    // The global config directory (`<config>/sbx`) is one of sbx's control-plane roots — a
     // read-write bind over it would let in-cage untrusted code rewrite the trusted-by-location
     // global config for a future launch. Even from a trusted project the bind is forced read-only,
-    // with a warning naming ops's control plane. The dir exists because the global config does.
+    // with a warning naming sbx's control plane. The dir exists because the global config does.
     let fx = Fixture::new();
     fx.write_global("[env]\nGLOBALVAR = \"g\"\n");
-    let ops_config_dir = fx.config_home.path().join("ops");
+    let sbx_config_dir = fx.config_home.path().join("sbx");
     fx.write_project(&format!(
         "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
-        ops_config_dir.display()
+        sbx_config_dir.display()
     ));
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("control plane"),
-        "a rw bind over ops's control plane must warn:\n{stderr}"
+        "a rw bind over sbx's control plane must warn:\n{stderr}"
     );
 
     let json = fx.run(&["config", "show", "--json"]);
@@ -818,7 +818,7 @@ fn a_read_write_bind_over_ops_own_config_dir_is_forced_read_only() {
     );
     assert_eq!(
         binds[0]["writable"], false,
-        "a rw bind over ops's control plane must be forced read-only"
+        "a rw bind over sbx's control plane must be forced read-only"
     );
 }
 
@@ -843,7 +843,7 @@ fn the_network_posture_is_a_trust_gated_security_field() {
     );
 
     // Trusted: the posture is honored — the cage would isolate the network.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -874,7 +874,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
     );
 
     // Trusted: the allowlist is honored and its classified rules are shown.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // `config show` renders the resolved posture, so a deny-by-default policy reads as `deny`.
@@ -915,7 +915,7 @@ fn the_egress_stats_toggle_is_shown_and_trust_gated() {
     // A trusted project that turns its audit off reads `stats: off`.
     let fx = Fixture::new();
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\nstats = false\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -962,7 +962,7 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
         "a dropped allow-mode posture must be explained:\n{stderr}"
     );
 
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // `config show` names the mode and frames it as a denylist, not an allowlist.
     let out = fx.run(&["config", "show"]);
@@ -977,7 +977,7 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
         "the deny carve-out must be shown:\n{stdout}"
     );
 
-    // `ops test net`: an unlisted host is ALLOWED (the new default-allow behavior)...
+    // `sbx test net`: an unlisted host is ALLOWED (the new default-allow behavior)...
     let out = fx.run(&["test", "net", "https://anything.example/page"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -997,7 +997,7 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
 fn editing_a_trusted_project_re_arms_the_gate() {
     let fx = Fixture::new();
     fx.write_project("binds = [\"/etc/ssh\"]\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // an edit changes the content hash; the binds must drop again until re-trusted
     fx.write_project("binds = [\"/etc/ssh\", \"/opt/extra\"]\n");
@@ -1032,7 +1032,7 @@ fn a_malformed_project_config_is_ignored_not_fatal() {
         "nothing applied:\n{stdout}"
     );
     assert!(
-        stderr.contains(".ops.toml") && stderr.to_lowercase().contains("ignoring"),
+        stderr.contains(".sbx.toml") && stderr.to_lowercase().contains("ignoring"),
         "the ignored file must be named:\n{stderr}"
     );
 }
@@ -1042,7 +1042,7 @@ fn a_world_writable_project_config_is_skipped() {
     use std::os::unix::fs::PermissionsExt;
     let fx = Fixture::new();
     fx.write_project("binds = [\"/etc/ssh\"]\n[env]\nPROJVAR = \"p\"\n");
-    let cfg = fx.proj.path().join(".ops.toml");
+    let cfg = fx.proj.path().join(".sbx.toml");
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
 
     let out = fx.run(&["config", "show"]);
@@ -1069,7 +1069,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
     // emitted before it). Skip where the host cannot sandbox or the path is absent.
     let fx = Fixture::new();
     let can_sandbox = fx
-        .ops(&["run", "--", "true"])
+        .sbx(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1084,9 +1084,9 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
 
     // Untrusted: the security bind must not reach the sandbox.
     let untrusted = fx
-        .ops(&["run", "--", "/bin/sh", "-c", probe])
+        .sbx(&["run", "--", "/bin/sh", "-c", probe])
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         String::from_utf8_lossy(&untrusted.stdout).contains("ABSENT"),
         "an untrusted bind must not reach the sandbox; stdout:\n{}\nstderr:\n{}",
@@ -1095,11 +1095,11 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
     );
 
     // Trust it, and the same bind is now visible inside.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let trusted = fx
-        .ops(&["run", "--", "/bin/sh", "-c", probe])
+        .sbx(&["run", "--", "/bin/sh", "-c", probe])
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         String::from_utf8_lossy(&trusted.stdout).contains("PRESENT"),
         "a trusted bind must reach the sandbox; stdout:\n{}\nstderr:\n{}",
@@ -1110,7 +1110,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
 
 #[test]
 fn config_shows_packages_with_their_trust_verdict() {
-    // `ops config` reports declared tools and whether each would be provisioned,
+    // `sbx config` reports declared tools and whether each would be provisioned,
     // without realising anything — so this needs no nix.
     let fx = Fixture::new();
     fx.write_project("[packages]\nnode = \"nix:nodejs_20\"\n");
@@ -1129,7 +1129,7 @@ fn config_shows_packages_with_their_trust_verdict() {
     );
 
     // Trusted: shown plainly, no longer withheld.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -1144,12 +1144,12 @@ fn config_shows_packages_with_their_trust_verdict() {
 
 #[test]
 fn a_trusted_project_package_lands_on_the_sandbox_path() {
-    // End-to-end: a declared tool is provisioned into ops's store and reachable on
+    // End-to-end: a declared tool is provisioned into sbx's store and reachable on
     // PATH inside the sandbox — but only once the project is trusted. Uses `hello`
     // (tiny, in the signed cache). Skipped where the host cannot sandbox.
     let fx = Fixture::new();
     let can_sandbox = fx
-        .ops(&["run", "--", "true"])
+        .sbx(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1162,9 +1162,9 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
     // Untrusted: the tool is withheld, so it is not on PATH.
     let probe = "command -v hello >/dev/null 2>&1 && echo PRESENT || echo ABSENT";
     let untrusted = fx
-        .ops(&["run", "--", "/bin/sh", "-c", probe])
+        .sbx(&["run", "--", "/bin/sh", "-c", probe])
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         String::from_utf8_lossy(&untrusted.stdout).contains("ABSENT"),
         "an untrusted project's tool must not reach PATH; stdout:\n{}\nstderr:\n{}",
@@ -1173,11 +1173,11 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
     );
 
     // Trust it, and the tool is provisioned and runs.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let trusted = fx
-        .ops(&["run", "--", "hello"])
+        .sbx(&["run", "--", "hello"])
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         String::from_utf8_lossy(&trusted.stdout).contains("Hello, world!"),
         "a trusted tool must run inside the sandbox; stdout:\n{}\nstderr:\n{}",
@@ -1194,7 +1194,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
     // where the host cannot sandbox.
     let fx = Fixture::new();
     let can_sandbox = fx
-        .ops(&["run", "--", "true"])
+        .sbx(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1204,13 +1204,13 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
     }
     // a well-formed attribute (so it passes validation and reaches nix) that no real
     // package provides
-    fx.write_project("[packages]\nbogus = \"nix:ops-no-such-attribute-xyz\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    fx.write_project("[packages]\nbogus = \"nix:sbx-no-such-attribute-xyz\"\n");
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx
-        .ops(&["run", "--", "true"])
+        .sbx(&["run", "--", "true"])
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         !out.status.success(),
         "an unrealisable declared tool must fail the launch"
@@ -1224,7 +1224,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
 
 #[test]
 fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
-    // `ops config` shows which nixpkgs source the tools resolve against, without
+    // `sbx config` shows which nixpkgs source the tools resolve against, without
     // resolving a revision — so this needs no nix.
     let fx = Fixture::new();
 
@@ -1252,7 +1252,7 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
     );
 
     // trusting the project applies the pin
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("nixpkgs: nixos-23.11  (project pin)"),
@@ -1264,10 +1264,10 @@ fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
 #[test]
 fn config_shows_the_locked_revision_once_resolved() {
     // Once a revision is locked, the source line shows it — routed through the same
-    // channel decision a launch uses. Seeded directly here (`ops config` never
+    // channel decision a launch uses. Seeded directly here (`sbx config` never
     // resolves), so the check stays network-free.
     let fx = Fixture::new();
-    let lock_dir = fx.data_home.path().join("ops");
+    let lock_dir = fx.data_home.path().join("sbx");
     std::fs::create_dir_all(&lock_dir).unwrap();
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     std::fs::write(
@@ -1287,14 +1287,14 @@ fn config_shows_the_locked_revision_once_resolved() {
 
 #[test]
 fn upgrade_in_a_trusted_pinned_project_rolls_the_per_project_lock() {
-    // The headline of M3.2d's context-awareness: `ops upgrade` rolls the lock the
+    // The headline of M3.2d's context-awareness: `sbx upgrade` rolls the lock the
     // current directory resolves against — a trusted pin's own per-project lock, not
     // the global one. A 40-hex revision pin resolves to itself, so this needs no nix
     // call (only nix on PATH, which `upgrade` gates on); skipped if nix is absent.
     let fx = Fixture::new();
     let rev = "205fd4226592cc83fd4c0885a3e4c9c400efabb5";
     fx.write_project(&format!("nixpkgs = \"{rev}\"\n"));
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["upgrade", "nix"]);
     if !out.status.success() {
@@ -1315,14 +1315,14 @@ fn upgrade_in_a_trusted_pinned_project_rolls_the_per_project_lock() {
         "a pinned upgrade must write a per-project lock"
     );
     assert!(
-        !fx.data_home.path().join("ops/nixpkgs.lock").exists(),
+        !fx.data_home.path().join("sbx/nixpkgs.lock").exists(),
         "a pure project pin must not write the global lock"
     );
 }
 
 #[test]
 fn upgrade_with_an_untrusted_pin_falls_back_to_the_global_lock() {
-    // An untrusted project pin is a dropped security field, so `ops upgrade` rolls the
+    // An untrusted project pin is a dropped security field, so `sbx upgrade` rolls the
     // global channel instead — and says why. A global revision override keeps this
     // network-free (it resolves to itself). Skipped if nix is absent.
     let fx = Fixture::new();
@@ -1352,7 +1352,7 @@ fn upgrade_with_an_untrusted_pin_falls_back_to_the_global_lock() {
     );
     // the global lock was written; no per-project lock was created
     assert!(
-        fx.data_home.path().join("ops/nixpkgs.lock").is_file(),
+        fx.data_home.path().join("sbx/nixpkgs.lock").is_file(),
         "the global lock must be written"
     );
     assert!(
@@ -1364,7 +1364,7 @@ fn upgrade_with_an_untrusted_pin_falls_back_to_the_global_lock() {
 /// Whether a per-project nixpkgs lock was recorded anywhere under the data dir's
 /// `projects/` tree.
 fn has_per_project_nixpkgs_lock(data_home: &Path) -> bool {
-    let projects = data_home.join("ops/projects");
+    let projects = data_home.join("sbx/projects");
     std::fs::read_dir(&projects)
         .map(|entries| {
             entries
@@ -1385,10 +1385,10 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     // (one base closure, not two). Skipped where the host cannot sandbox.
     let fx = Fixture::new();
     fx.write_project("nixpkgs = \"nixos-23.11\"\n[packages]\nhello = \"nix:hello\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let can_sandbox = fx
-        .ops(&["run", "--", "true"])
+        .sbx(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1398,9 +1398,9 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     }
 
     let out = fx
-        .ops(&["run", "--", "hello"])
+        .sbx(&["run", "--", "hello"])
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("Hello, world!"),
         "a tool pinned to a different channel must run (base must share the pin); \
@@ -1426,7 +1426,7 @@ fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
          [secret.\"api.github.com\"]\nfrom = \"pass://github/token\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1450,7 +1450,7 @@ fn an_unregistered_resolver_scheme_drops_the_secret_with_a_warning() {
          [secret.\"api.github.com\"]\nfrom = \"vault://secret/x\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "an unknown scheme must not hard-fail");
@@ -1620,7 +1620,7 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
     assert!(out.status.success(), "install must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("installed 'pass'") && stdout.contains("ops plugins rm pass"),
+        stdout.contains("installed 'pass'") && stdout.contains("sbx plugins rm pass"),
         "the install report must name the plugin and the rm token:\n{stdout}"
     );
 
@@ -1634,7 +1634,7 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
         "the installed plugin must be listed:\n{stdout}"
     );
     assert!(
-        stdout.contains("remove one with: ops plugins rm <name>"),
+        stdout.contains("remove one with: sbx plugins rm <name>"),
         "list must surface the rm token:\n{stdout}"
     );
     assert!(
@@ -1787,7 +1787,7 @@ fn git_in(dir: &Path, args: &[&str]) {
     assert!(ok, "git {args:?} failed");
 }
 
-/// The producing side feeds the consuming side through a *real* git clone: `ops plugins store
+/// The producing side feeds the consuming side through a *real* git clone: `sbx plugins store
 /// publish` signs a plugin tree, the operator commits exactly that tree, and `store add`/`store
 /// install` fetch it via `file://`. This is the only proof the signed format survives a clone —
 /// the catalogue bytes the signature is over, the per-plugin content digest, and the executable
@@ -1917,7 +1917,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
 
     // Trusted: the bind is honored — no drop note remains — and the package is admitted, so it
     // shows plainly, no longer marked `(withheld)`.
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -2125,14 +2125,14 @@ fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
     // A baseline credential (global, trusted by location) under a network allowlist, and two apps:
     // `wide` inherits the allowlist (so the launch injects the secret), `narrow` cuts the network
     // to none (so the launch injects nothing). The per-app view must match the launch — it must not
-    // report a credential `ops app narrow` would silently drop.
+    // report a credential `sbx app narrow` would silently drop.
     fx.write_global(
         "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          [secret.\"api.example.com\"]\nfrom = \"env://DEMO_TOKEN\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     );
     // The two apps live as imported profiles (a global app is a profile file, never an inline
-    // `[app.<name>]` in `ops.toml`): `wide` inherits the baseline allowlist, `narrow` cuts to none.
+    // `[app.<name>]` in `sbx.toml`): `wide` inherits the baseline allowlist, `narrow` cuts to none.
     fx.write_profile("wide", "cmd = \"agent\"\n");
     fx.write_profile("narrow", "cmd = \"agent\"\nnetwork = \"none\"\n");
 
@@ -2296,7 +2296,7 @@ fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
         stdout.contains("app.demo.cmd"),
         "the write must name the app-scoped key:\n{stdout}"
     );
-    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         body.contains("[app.demo]") && body.contains("cmd = \"mytool\""),
         "the file must carry the app table:\n{body}"
@@ -2310,7 +2310,7 @@ fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
     // `unset --app` removes it.
     let out = fx.run(&["config", "unset", "--app", "demo", "cmd"]);
     assert!(out.status.success());
-    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         !body.contains("cmd = \"mytool\""),
         "unset --app must remove the key:\n{body}"
@@ -2321,11 +2321,11 @@ fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
 fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
     let fx = Fixture::new();
     // A name with a `.` cannot be one TOML table segment under the naive key splitter — the error
-    // points at `ops config edit`.
+    // points at `sbx config edit`.
     let out = fx.run(&["config", "set", "--app", "my.app", "cmd", "x"]);
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ops config edit"), "stderr:\n{stderr}");
+    assert!(stderr.contains("sbx config edit"), "stderr:\n{stderr}");
 
     // A name no app could carry is rejected outright.
     let out = fx.run(&["config", "set", "--app", "bad name", "cmd", "x"]);
@@ -2381,10 +2381,10 @@ fn config_short_flags_alias_their_long_forms() {
 
     // `-a` on the write verbs is `--app`: with `-l` (here) `set -a` writes under the project's
     // `[app.<name>]` overlay table; with `-g` it targets the app's profile file instead (an inline
-    // `[app.<name>]` in the global `ops.toml` is forbidden), covered by its own test below.
+    // `[app.<name>]` in the global `sbx.toml` is forbidden), covered by its own test below.
     let out = fx.run(&["config", "set", "-a", "demo", "-l", "cmd", "mytool"]);
     assert!(out.status.success(), "set -a -l must succeed");
-    let project = fx.proj.path().join(".ops.toml");
+    let project = fx.proj.path().join(".sbx.toml");
     let body = std::fs::read_to_string(&project).unwrap();
     assert!(
         body.contains("[app.demo]") && body.contains("cmd = \"mytool\""),
@@ -2419,7 +2419,7 @@ fn config_set_get_unset_on_a_global_app_route_to_its_profile_file() {
     let profile = fx
         .config_home
         .path()
-        .join("ops")
+        .join("sbx")
         .join("apps")
         .join("demo.toml");
 
@@ -2443,11 +2443,11 @@ fn config_set_get_unset_on_a_global_app_route_to_its_profile_file() {
             out.status.success(),
             "set network {posture} --app demo -g must succeed"
         );
-        // No false-positive trust note: a profile is trusted by location, so `ops trust` is never
+        // No false-positive trust note: a profile is trusted by location, so `sbx trust` is never
         // mentioned on a `-g` write.
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !stderr.to_lowercase().contains("ops trust"),
+            !stderr.to_lowercase().contains("sbx trust"),
             "a profile write must not print a trust note:\n{stderr}"
         );
         // The write landed in the profile file, top-level (not under an `[app.demo]` table).
@@ -2485,7 +2485,7 @@ fn unset_network_mode_on_a_global_app_yields_an_inheriting_table() {
     fx.write_global("network = \"ask\"\n"); // the mode the app will inherit
     fx.write_profile("demo", "cmd = \"agent\"\n");
 
-    // `ops net allow` bootstraps a `deny`-mode table in the profile...
+    // `sbx net allow` bootstraps a `deny`-mode table in the profile...
     assert!(fx
         .run(&["net", "allow", "api.example.com", "--app", "demo", "-g"])
         .status
@@ -2495,7 +2495,7 @@ fn unset_network_mode_on_a_global_app_yields_an_inheriting_table() {
         .run(&["config", "unset", "network.mode", "--app", "demo", "-g"])
         .status
         .success());
-    let profile = fx.config_home.path().join("ops/apps/demo.toml");
+    let profile = fx.config_home.path().join("sbx/apps/demo.toml");
     let body = std::fs::read_to_string(&profile).unwrap();
     assert!(
         !body.contains("mode =") && body.contains("api.example.com"),
@@ -2566,7 +2566,7 @@ fn config_set_on_a_full_profile_survives_validation_and_resolves() {
     );
 
     // The other sections are intact and the profile still resolves through the app view.
-    let profile = fx.config_home.path().join("ops/apps/agent.toml");
+    let profile = fx.config_home.path().join("sbx/apps/agent.toml");
     let body = std::fs::read_to_string(&profile).unwrap();
     assert!(
         body.contains("cmd = \"agent\"")
@@ -2586,17 +2586,17 @@ fn config_set_on_a_full_profile_survives_validation_and_resolves() {
 #[test]
 fn a_local_write_still_warns_when_it_re_arms_a_trusted_project() {
     // The trust note is scope-aware: suppressed for the global config / profiles (trusted by
-    // location), but a project write that re-arms a trusted `.ops.toml` MUST still warn — the guard
+    // location), but a project write that re-arms a trusted `.sbx.toml` MUST still warn — the guard
     // that the note-suppression above did not silence the case that matters.
     let fx = Fixture::new();
     fx.write_project("network = \"deny\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "set", "network", "ask"]);
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("re-armed the trust gate") && stderr.contains("ops trust"),
+        stderr.contains("re-armed the trust gate") && stderr.contains("sbx trust"),
         "a local write to a trusted file must still warn:\n{stderr}"
     );
 }
@@ -2607,7 +2607,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     // A profile whose credential lives in the app overlay — the common case, since the shipped
     // profiles inject host-side from the overlay while the baseline carries no secret. The compact
     // view shows a count; `--details` expands each by destination and source. The value never
-    // appears (ops reads it host-side at launch, and never resolves it here) — only the header,
+    // appears (sbx reads it host-side at launch, and never resolves it here) — only the header,
     // host, shape, and the source *locator* (the variable name, `env DEMO_API_KEY`).
     fx.write_profile(
         "demo-app",
@@ -2630,7 +2630,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     );
 
     // --details: the credential by destination, header, shape, and source *locator* — the variable
-    // name, a pointer, never a resolved value (ops config does not read the secret's source).
+    // name, a pointer, never a resolved value (sbx config does not read the secret's source).
     let out = fx.run(&["config", "show", "--details"]);
     assert!(out.status.success(), "config show --details must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2739,7 +2739,7 @@ fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project(
 }
 
 #[test]
-fn ops_app_import_places_validates_renames_and_removes_a_profile() {
+fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
     let fx = Fixture::new();
     // A portable profile authored as a standalone file (the app's fields at the top level).
     std::fs::write(
@@ -2808,7 +2808,7 @@ fn ops_app_import_places_validates_renames_and_removes_a_profile() {
 }
 
 #[test]
-fn ops_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
+fn sbx_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
     let fx = Fixture::new();
     // A file mistakenly wrapped in `[app.<name>]` has no top-level cmd → refused with a hint.
     std::fs::write(
@@ -2834,7 +2834,7 @@ fn ops_app_import_refuses_a_wrapped_profile_and_a_reserved_name() {
 }
 
 #[test]
-fn ops_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_trips() {
+fn sbx_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_trips() {
     let fx = Fixture::new();
 
     // (a) An imported profile exports verbatim — comments and formatting survive.
@@ -3012,7 +3012,7 @@ fn the_shipped_profiles_import_and_resolve() {
         "expected at least one shipped profile in {}",
         dir.display()
     );
-    // Each imported profile now resolves as an app (`ops config` lists it by name).
+    // Each imported profile now resolves as an app (`sbx config` lists it by name).
     let cfg = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).to_string();
     for name in &imported {
         assert!(
@@ -3023,11 +3023,11 @@ fn the_shipped_profiles_import_and_resolve() {
 }
 
 #[test]
-fn ops_app_rm_of_an_absent_profile_points_at_ops_toml() {
+fn sbx_app_rm_of_an_absent_profile_points_at_sbx_toml() {
     let fx = Fixture::new();
     let out = fx.run(&["app", "rm", "nope"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("ops.toml"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sbx.toml"));
 }
 
 #[test]
@@ -3055,7 +3055,7 @@ fn config_get_set_unset_round_trip() {
 fn config_set_preserves_comments_and_warns_when_it_re_arms_trust() {
     let fx = Fixture::new();
     fx.write_project("# a comment to keep\nnixpkgs = \"nixos-23.11\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["config", "set", "nixpkgs", "nixos-24.05"]);
     assert!(out.status.success());
@@ -3064,9 +3064,9 @@ fn config_set_preserves_comments_and_warns_when_it_re_arms_trust() {
         stderr.contains("re-armed the trust gate"),
         "a write to a trusted file must warn:\n{stderr}"
     );
-    assert!(stderr.contains("ops trust"), "and point at re-trusting");
+    assert!(stderr.contains("sbx trust"), "and point at re-trusting");
 
-    let after = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let after = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         after.contains("# a comment to keep"),
         "comment kept:\n{after}"
@@ -3121,13 +3121,13 @@ fn config_path_reports_the_target_file_per_scope() {
     assert!(local.status.success());
     assert!(String::from_utf8_lossy(&local.stdout)
         .trim()
-        .ends_with(".ops.toml"));
+        .ends_with(".sbx.toml"));
 
     let global = fx.run(&["config", "path", "--global"]);
     assert!(global.status.success());
     let g = String::from_utf8_lossy(&global.stdout);
     assert!(
-        g.contains("ops.toml") && !g.contains(".ops.toml"),
+        g.contains("sbx.toml") && !g.contains(".sbx.toml"),
         "global path:\n{g}"
     );
 }
@@ -3166,7 +3166,7 @@ fn config_path_lists_the_resolution_order_by_default() {
 
 #[test]
 fn config_set_global_creates_a_missing_config_dir() {
-    // A fresh fixture has no <config>/ops/ directory yet: the first `set --global` must create it,
+    // A fresh fixture has no <config>/sbx/ directory yet: the first `set --global` must create it,
     // not fail to write.
     let fx = Fixture::new();
     let out = fx.run(&["config", "set", "env.G", "1", "--global"]);
@@ -3191,7 +3191,7 @@ fn config_set_into_a_non_scalar_field_is_refused() {
     );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("edit"),
-        "the error should point at `ops config edit`"
+        "the error should point at `sbx config edit`"
     );
 }
 
@@ -3200,7 +3200,7 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
     use std::os::unix::fs::PermissionsExt;
     let fx = Fixture::new();
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // A non-interactive "editor": a script that appends a line to its file argument, standing in
     // for a real $EDITOR so the test stays headless.
@@ -3213,14 +3213,14 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let out = fx
-        .ops(&["config", "edit"])
+        .sbx(&["config", "edit"])
         .env("EDITOR", &editor)
         .env_remove("VISUAL")
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     assert!(out.status.success(), "edit should exit 0");
 
-    let after = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let after = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         after.contains("EDITED = \"yes\""),
         "the editor ran:\n{after}"
@@ -3256,7 +3256,7 @@ fn an_untrusted_seccomp_relaxation_is_dropped_but_trusting_applies_it() {
 
     // Trust it → the relaxation applies, rendered as canonical, sorted tokens (the comma-split and
     // the fine-grained selector both resolved) and tagged with the project layer.
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "trust failed: {}",
@@ -3365,7 +3365,7 @@ fn an_untrusted_devices_grant_is_dropped_but_trusting_applies_it() {
     );
 
     // Trust it → the grant applies, rendered as sorted paths tagged with the project layer.
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "trust failed: {}",
@@ -3469,7 +3469,7 @@ fn an_untrusted_gpu_posture_is_dropped_but_trusting_applies_it() {
     );
 
     // Trust it → the posture applies, tagged with the project layer.
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "trust failed: {}",
@@ -3532,7 +3532,7 @@ fn an_untrusted_audio_posture_is_dropped_but_trusting_applies_it() {
     );
 
     // Trust it → the posture applies, tagged with the project layer.
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "trust failed: {}",
@@ -3595,7 +3595,7 @@ fn an_untrusted_dbus_posture_is_dropped_but_trusting_applies_it() {
     );
 
     // Trust it → the posture applies, tagged with the project layer.
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(
         trusted.status.success(),
         "trust failed: {}",
@@ -3643,7 +3643,7 @@ fn a_stale_string_dbus_value_is_rejected_never_silently_opening_a_portal() {
     // shipped profiles after this cutover; a stale profile string is rejected the same way.)
     let fx = Fixture::new();
     fx.write_project("dbus = \"incage\"\n");
-    let trusted = fx.run(&["trust", ".ops.toml"]);
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(trusted.status.success(), "trust failed");
 
     let out = fx.run(&["config", "show"]);

@@ -1,5 +1,5 @@
-//! Integration tests for `ops path`: the built binary lists every on-disk
-//! location ops uses, grouped by XDG base, marks which exist, and enumerates the
+//! Integration tests for `sbx path`: the built binary lists every on-disk
+//! location sbx uses, grouped by XDG base, marks which exist, and enumerates the
 //! per-project / per-app / per-profile entries actually on disk. Read-only: no
 //! trust gate, no network — so the assertions exercise the layout against
 //! redirected XDG data/config/state dirs and a temp project as the cwd.
@@ -18,7 +18,7 @@ impl TmpDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
-        d.push(format!("ops-path-{}-{n}", std::process::id()));
+        d.push(format!("sbx-path-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -51,8 +51,8 @@ impl Fixture {
         }
     }
 
-    fn ops(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    fn sbx(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
         cmd.args(args)
             .current_dir(self.proj.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
@@ -64,28 +64,28 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
-        self.ops(args).output().expect("spawn ops")
+        self.sbx(args).output().expect("spawn sbx")
     }
 }
 
 #[test]
 fn path_lists_the_three_bases_with_present_absent_markers() {
     let fx = Fixture::new();
-    // The common first-run state: the data root exists (ops creates it lazily on
+    // The common first-run state: the data root exists (sbx creates it lazily on
     // a launch, but here nothing has run yet) only if we make it; the overview
     // must still succeed and mark each entry honestly either way.
     let out = fx.run(&["path"]);
-    assert!(out.status.success(), "ops path must exit 0");
+    assert!(out.status.success(), "sbx path must exit 0");
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("ops on-disk locations"), "header:\n{s}");
+    assert!(s.contains("sbx on-disk locations"), "header:\n{s}");
     // All three bases are listed, each with its XDG-contract hint.
     assert!(
         s.contains("data:") && s.contains("config:") && s.contains("state:"),
         "bases:\n{s}"
     );
-    assert!(s.contains("$XDG_DATA_HOME/ops"), "data env hint:\n{s}");
-    assert!(s.contains("$XDG_CONFIG_HOME/ops"), "config env hint:\n{s}");
-    assert!(s.contains("$XDG_STATE_HOME/ops"), "state env hint:\n{s}");
+    assert!(s.contains("$XDG_DATA_HOME/sbx"), "data env hint:\n{s}");
+    assert!(s.contains("$XDG_CONFIG_HOME/sbx"), "config env hint:\n{s}");
+    assert!(s.contains("$XDG_STATE_HOME/sbx"), "state env hint:\n{s}");
     // Every known entry appears, and each carries a present/absent tag — never
     // a bare path with no state.
     for entry in [
@@ -99,7 +99,7 @@ fn path_lists_the_three_bases_with_present_absent_markers() {
         "gcroots/",
         "projects/",
         "apps/",
-        "ops.toml",
+        "sbx.toml",
         "trusted/",
     ] {
         assert!(s.contains(entry), "entry {entry} listed:\n{s}");
@@ -109,7 +109,7 @@ fn path_lists_the_three_bases_with_present_absent_markers() {
         "state tags:\n{s}"
     );
     // The cross-reference to the config-files overview is shown.
-    assert!(s.contains("ops config path"), "cross-ref:\n{s}");
+    assert!(s.contains("sbx config path"), "cross-ref:\n{s}");
 }
 
 #[test]
@@ -117,9 +117,9 @@ fn path_enumerates_per_project_per_app_and_per_profile_entries() {
     let fx = Fixture::new();
     // A project runtime tree, a global app home (data), and an imported profile
     // (config) — the three enumeration axes.
-    std::fs::create_dir_all(fx.data_home.path().join("ops/projects/abcdef")).unwrap();
-    std::fs::create_dir_all(fx.data_home.path().join("ops/apps/myagent")).unwrap();
-    let cfg_apps = fx.config_home.path().join("ops/apps");
+    std::fs::create_dir_all(fx.data_home.path().join("sbx/projects/abcdef")).unwrap();
+    std::fs::create_dir_all(fx.data_home.path().join("sbx/apps/myagent")).unwrap();
+    let cfg_apps = fx.config_home.path().join("sbx/apps");
     std::fs::create_dir_all(&cfg_apps).unwrap();
     std::fs::write(cfg_apps.join("codex.toml"), "").unwrap();
     // A non-.toml file in the profiles dir is ignored by the Profiles filter.
@@ -155,7 +155,7 @@ fn path_enumerates_per_project_per_app_and_per_profile_entries() {
         s.contains(
             fx.data_home
                 .path()
-                .join("ops/projects/abcdef")
+                .join("sbx/projects/abcdef")
                 .to_str()
                 .unwrap()
         ),
@@ -165,7 +165,7 @@ fn path_enumerates_per_project_per_app_and_per_profile_entries() {
         s.contains(
             fx.config_home
                 .path()
-                .join("ops/apps/codex.toml")
+                .join("sbx/apps/codex.toml")
                 .to_str()
                 .unwrap()
         ),
@@ -176,14 +176,14 @@ fn path_enumerates_per_project_per_app_and_per_profile_entries() {
 #[test]
 fn path_json_is_a_valid_document_carrying_the_layout() {
     let fx = Fixture::new();
-    std::fs::create_dir_all(fx.data_home.path().join("ops/projects/abcdef")).unwrap();
-    std::fs::create_dir_all(fx.data_home.path().join("ops/apps/myagent")).unwrap();
-    let cfg_apps = fx.config_home.path().join("ops/apps");
+    std::fs::create_dir_all(fx.data_home.path().join("sbx/projects/abcdef")).unwrap();
+    std::fs::create_dir_all(fx.data_home.path().join("sbx/apps/myagent")).unwrap();
+    let cfg_apps = fx.config_home.path().join("sbx/apps");
     std::fs::create_dir_all(&cfg_apps).unwrap();
     std::fs::write(cfg_apps.join("codex.toml"), "").unwrap();
 
     let out = fx.run(&["path", "--json"]);
-    assert!(out.status.success(), "ops path --json must exit 0");
+    assert!(out.status.success(), "sbx path --json must exit 0");
     let doc: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("path --json must emit valid JSON");
 
@@ -197,7 +197,7 @@ fn path_json_is_a_valid_document_carrying_the_layout() {
     let data = &bases[0];
     assert_eq!(
         data["root"],
-        fx.data_home.path().join("ops").to_str().unwrap()
+        fx.data_home.path().join("sbx").to_str().unwrap()
     );
     let projects = data["entries"]
         .as_array()

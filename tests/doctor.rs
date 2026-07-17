@@ -1,17 +1,17 @@
-//! Integration tests for `ops doctor`, exercising the built binary end to end.
+//! Integration tests for `sbx doctor`, exercising the built binary end to end.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-fn ops() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops` so an e2e never depends on
-    // the developer's global ops config; default it to a fixed empty dir under the test tree
+fn sbx() -> Command {
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
+    // the developer's global sbx config; default it to a fixed empty dir under the test tree
     // (no test here writes a global config, so a shared empty dir is race-free).
     let mut cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     cfg.push("target/test-tmp/isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.env("XDG_CONFIG_HOME", cfg);
     cmd
 }
@@ -25,7 +25,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-it-{}-{n}", std::process::id()));
+        d.push(format!("sbx-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -62,14 +62,14 @@ fn force_remove(path: &Path) {
 
 #[test]
 fn doctor_prints_the_preflight_structure() {
-    // Redirect ops's data dir to a throwaway location so the asserted store path
+    // Redirect sbx's data dir to a throwaway location so the asserted store path
     // is deterministic and independent of the real `$HOME`.
     let data = TmpDir::new();
-    let out = ops()
+    let out = sbx()
         .arg("doctor")
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops doctor");
+        .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("runtime preflight"), "stdout was: {stdout}");
     assert!(stdout.contains("bubblewrap"), "stdout was: {stdout}");
@@ -84,7 +84,7 @@ fn doctor_prints_the_preflight_structure() {
 
     // the store line points at our redirected data dir; doctor is read-only, so
     // it reports the path without creating it.
-    let store_path = data.path().join("ops/store");
+    let store_path = data.path().join("sbx/store");
     assert!(
         stdout.contains(&*store_path.to_string_lossy()),
         "store line should mention {}; stdout was: {stdout}",
@@ -106,26 +106,26 @@ fn doctor_prints_the_preflight_structure() {
 fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
     // Where the host can actually sandbox, doctor decides the security boundary
     // from a real bwrap launch — not the `unshare` stand-in — and says so. Gate
-    // on a real `ops run`: if that succeeds, the engine, the namespace, and nix
+    // on a real `sbx run`: if that succeeds, the engine, the namespace, and nix
     // are all present, so doctor must be fully green. Skipped, not failed,
     // elsewhere.
     let data = TmpDir::new();
-    let can_sandbox = ops()
+    let can_sandbox = sbx()
         .args(["run", "--", "true"])
         .env("XDG_DATA_HOME", data.path())
         .status()
-        .expect("spawn ops run")
+        .expect("spawn sbx run")
         .success();
     if !can_sandbox {
         eprintln!("skipping doctor launch-proof: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
-    let out = ops()
+    let out = sbx()
         .arg("doctor")
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops doctor");
+        .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -148,11 +148,11 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
     // unambiguously the engine. Skipped, not failed, where the host cannot
     // sandbox.
     let data = TmpDir::new();
-    let can_sandbox = ops()
+    let can_sandbox = sbx()
         .args(["run", "--", "true"])
         .env("XDG_DATA_HOME", data.path())
         .status()
-        .expect("spawn ops run")
+        .expect("spawn sbx run")
         .success();
     if !can_sandbox {
         eprintln!("skipping bubblewrap-fault attribution: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
@@ -175,12 +175,12 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let out = ops()
+    let out = sbx()
         .arg("doctor")
         .env("PATH", path)
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops doctor");
+        .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -203,7 +203,7 @@ fn doctor_reports_the_locked_channel_revision() {
     // closing the gap where doctor was blind to the resolved revision. Seeded directly
     // (doctor never resolves), so this needs no nix.
     let data = TmpDir::new();
-    let lock_dir = data.path().join("ops");
+    let lock_dir = data.path().join("sbx");
     std::fs::create_dir_all(&lock_dir).unwrap();
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     std::fs::write(
@@ -212,11 +212,11 @@ fn doctor_reports_the_locked_channel_revision() {
     )
     .unwrap();
 
-    let out = ops()
+    let out = sbx()
         .arg("doctor")
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops doctor");
+        .expect("spawn sbx doctor");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("nixos-unstable @ 9ae611a"),
@@ -226,7 +226,7 @@ fn doctor_reports_the_locked_channel_revision() {
 
 #[test]
 fn no_arguments_is_a_usage_error() {
-    let out = ops().output().expect("spawn ops");
+    let out = sbx().output().expect("spawn sbx");
     assert_eq!(out.status.code(), Some(2));
     // No command prints the command list to stderr (an error path) and exits non-zero.
     assert!(String::from_utf8_lossy(&out.stderr).contains("Usage:"));
@@ -234,7 +234,7 @@ fn no_arguments_is_a_usage_error() {
 
 #[test]
 fn unknown_command_is_rejected() {
-    let out = ops().arg("bogus").output().expect("spawn ops bogus");
+    let out = sbx().arg("bogus").output().expect("spawn sbx bogus");
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown command"));
 }

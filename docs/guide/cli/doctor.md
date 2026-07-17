@@ -1,7 +1,7 @@
-# `ops doctor`
+# `sbx doctor`
 
 ```
-ops doctor
+sbx doctor
 ```
 
 Verify the runtime prerequisites before anything can run.
@@ -13,6 +13,6 @@ remediation hint** — never a silent fallback to a weaker engine. Also reports
 best-effort resource limiting and the store location and channel revision.
 
 For the full explanation of each check, see
-[`ops doctor` and prerequisites](../getting-started/doctor.md).
+[`sbx doctor` and prerequisites](../getting-started/doctor.md).
 
 See also: [Installation](../getting-started/installation.md) · [Security model](../concepts/security-model.md) · [Enforcement stack](../concepts/enforcement.md).

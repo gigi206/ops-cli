@@ -1,6 +1,6 @@
 # Security model
 
-`ops`'s security rests on one central idea: the cage runs **as your uid**
+`sbx`'s security rests on one central idea: the cage runs **as your uid**
 (same-uid), so **the bind layout is the security control**. This page explains what
 that means and what it protects.
 
@@ -18,20 +18,20 @@ consequence:
 > protected by being **absent** from the cage, not by being mounted read-only.
 
 If a file is bound into the cage — even read-only — the process inside can read it,
-because it runs as the uid that owns the file. So the way `ops` keeps your `~/.ssh`,
+because it runs as the uid that owns the file. So the way `sbx` keeps your `~/.ssh`,
 your browser profile, and your cloud credentials safe from an untrusted agent is
 simply that **they are not mounted at all**. The host filesystem is absent by
 default; only what a *trusted* config explicitly binds appears.
 
-This is why `ops` is not a container manager: there is no separate identity to lean
+This is why `sbx` is not a container manager: there is no separate identity to lean
 on. The mount set *is* the boundary.
 
 ## The hard requirement
 
 There is no security boundary without **capability-bearing unprivileged user
-namespaces**. `ops` treats their absence as a hard failure, never a silent fallback
+namespaces**. `sbx` treats their absence as a hard failure, never a silent fallback
 to emulation (which would isolate nothing while looking sandboxed). See
-[`ops doctor`](../getting-started/doctor.md).
+[`sbx doctor`](../getting-started/doctor.md).
 
 ## The synthetic identity
 
@@ -52,7 +52,7 @@ host identifier.
 ## The bind zones
 
 The cage's filesystem is assembled from a small, explicit set of binds, layered so a
-project's own binds cannot displace `ops`'s structural mounts:
+project's own binds cannot displace `sbx`'s structural mounts:
 
 - **The hermetic FHS** — a minimal `/bin/sh`, `/usr/bin/env`, `/nix` (the store),
   and the synthetic `/etc`. No host `/usr`, no ambient system libraries.
@@ -68,15 +68,15 @@ handled fail-closed and warned about; see [`binds`](../configuration/binds.md).)
 
 ## The control plane is pinned
 
-`ops`'s own state — its data, trust, and config directories, all under your `$HOME` —
+`sbx`'s own state — its data, trust, and config directories, all under your `$HOME` —
 is protected even inside a broad read-write bind:
 
-- A read-write bind aimed **at or inside** one of `ops`'s directories is forced
+- A read-write bind aimed **at or inside** one of `sbx`'s directories is forced
   read-only, with a warning.
 - A broad read-write bind that merely **contains** them (e.g. `mode = "rw"` on your
-  whole home) stays read-write, but each of `ops`'s roots is **pinned read-only in
+  whole home) stays read-write, but each of `sbx`'s roots is **pinned read-only in
   place** — so the rest of the tree is writable while the agent still cannot alter
-  what `ops` runs or trusts.
+  what `sbx` runs or trusts.
 
 This closes an escalation where a writable parent directory would let the agent
 substitute a forged control-plane directory. See [`binds`](../configuration/binds.md)
@@ -84,7 +84,7 @@ for the details and [The trust gate](trust.md) for why it matters.
 
 ## What the trust gate protects
 
-An untrusted project's `.ops.toml` **cannot** touch security-relevant fields — binds,
+An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields — binds,
 network, secrets, packages, GUI, limits, app definitions. Only the free `env` field
 applies from an untrusted project (minus a reserved-key denylist). Trust is bound to
 the file's content hash on the direnv model, so any edit re-arms the gate. See

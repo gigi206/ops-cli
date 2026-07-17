@@ -1,9 +1,9 @@
-# Freebuff — CodebuffAI's free terminal coding agent, sandboxed by ops.
+# Freebuff — CodebuffAI's free terminal coding agent, sandboxed by sbx.
 #
-#   ops app import profiles/freebuff.toml
-#   ops app freebuff
+#   sbx app import profiles/freebuff.toml
+#   sbx app freebuff
 #
-# Freebuff is a Node CLI distributed on npm, so ops equips it in-cage with a node
+# Freebuff is a Node CLI distributed on npm, so sbx equips it in-cage with a node
 # runtime (nix) plus mise's npm backend. The npm package is a thin launcher: on the
 # first run it downloads the real ~46 MB binary from www.codebuff.com into the app's
 # isolated home (`~/.config/manicode/`), where it persists across launches. (This is
@@ -14,7 +14,7 @@
 # routes model traffic through Codebuff's backend server-side. So there is no API key
 # to inject and no [secret] block. Instead you log in ONCE inside the cage:
 #
-#   ops app freebuff        # then, in the agent: `freebuff login`
+#   sbx app freebuff        # then, in the agent: `freebuff login`
 #
 # The login token is written under the app's dedicated, persistent, isolated home
 # (`~/.config/manicode/`), so it survives later launches and never bleeds into the
@@ -23,7 +23,7 @@
 # sandbox + the egress allowlist still bound everything the agent can reach.
 #
 # If a request is blocked, the proxy reports the host it refused — add it to `allow`
-# (or check ahead with `ops test net <url>`).
+# (or check ahead with `sbx test net <url>`).
 cmd = "freebuff"
 
 # Your host Freebuff config, mounted read-write at its real absolute path. `binds` is a security
@@ -60,14 +60,14 @@ allow = [
   #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
 # leave DENIED — here Codebuff's PostHog product telemetry (POST /batch/), which a live run hits
 # periodically and whose `denied-default` lines would clutter the ones worth acting on. PostHog's
 # ingest endpoint is regional (`us.i.posthog.com`, `eu.i.posthog.com`), so the apex + subdomains are
 # muted together via `*.i.posthog.com` (spoof-safe). A `mute` never changes the verdict (the
-# telemetry is still refused) and never hides a count (`ops net stats` still tallies it); it only
-# keeps the line out of the default log. See it anytime with `ops net log --all`, and edit this list
-# from the CLI with `ops net mute|unmute <host> -a freebuff`. Remove the entry here the day you
+# telemetry is still refused) and never hides a count (`sbx net stats` still tallies it); it only
+# keeps the line out of the default log. See it anytime with `sbx net log --all`, and edit this list
+# from the CLI with `sbx net mute|unmute <host> -a freebuff`. Remove the entry here the day you
 # decide to allow the endpoint (uncomment the `{POST} https://us.i.posthog.com/batch/` line above).
 mute = [
     "*.i.posthog.com",                # Codebuff PostHog telemetry (POST /batch/)
@@ -82,7 +82,7 @@ mute = [
 # The real key is then read on the HOST and injected by the egress proxy on the wire — never in
 # the cage.
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

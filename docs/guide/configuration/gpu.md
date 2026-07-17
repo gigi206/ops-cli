@@ -21,9 +21,9 @@ See also: [`gui`](gui.md) · [`[devices]`](devices.md) · [Enforcement stack](..
 
 Three pieces, together, all supplied automatically — no paths to write:
 
-1. **mesa's DRI drivers**, provisioned into ops's own store and pointed at through
+1. **mesa's DRI drivers**, provisioned into sbx's own store and pointed at through
    `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS`. The driver path
-   never depends on the host and does not drift across `ops upgrade` (the same pinned
+   never depends on the host and does not drift across `sbx upgrade` (the same pinned
    nixpkgs as the app → the same mesa, no ABI skew with the app's own libgbm/libEGL).
 2. **The render node(s)** under `/dev/dri`, granted through the same device-bind mechanism
    as [`[devices]`](devices.md).
@@ -72,11 +72,11 @@ gpu = true
 
 ## One-shot override
 
-To set the GPU posture for a single launch without editing the file, use `--gpu` or `OPS_GPU`:
+To set the GPU posture for a single launch without editing the file, use `--gpu` or `SBX_GPU`:
 
 ```sh
-ops app opencode-desktop --gpu=false   # disable the profile's gpu for this launch
-ops run --gpu -- some-gl-app           # bare --gpu means true
+sbx app opencode-desktop --gpu=false   # disable the profile's gpu for this launch
+sbx run --gpu -- some-gl-app           # bare --gpu means true
 ```
 
 `--gpu` is a boolean: bare `--gpu` means `true`, or write `--gpu=true` / `--gpu=false` (it never
@@ -87,8 +87,8 @@ is trusted by invocation. The command line beats the environment, and both beat 
 ## Viewing the effective posture
 
 ```sh
-ops config show               # a `gpu:` line only when it is enabled
-ops config show --app desktop  # an app's effective posture, tagged inherited or set
+sbx config show               # a `gpu:` line only when it is enabled
+sbx config show --app desktop  # an app's effective posture, tagged inherited or set
 ```
 
 ## Access, not new privilege
@@ -96,4 +96,4 @@ ops config show --app desktop  # an app's effective posture, tagged inherited or
 `gpu = true` binds the render node and the driver's sysfs; whether a process may *use* the
 GPU is still governed by the device's own file permissions and the host uid the cage runs as
 (same-uid) — exactly as on the host (on most desktops your login session already has an ACL
-granting access to the render node). `ops` grants visibility, not new privilege.
+granting access to the render node). `sbx` grants visibility, not new privilege.

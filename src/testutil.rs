@@ -21,7 +21,7 @@ impl TmpDir {
         // keeps it out of the way and reclaimable by `cargo clean`.
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
-        d.push(format!("ops-test-{}-{n}", std::process::id()));
+        d.push(format!("sbx-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }

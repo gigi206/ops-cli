@@ -10,9 +10,9 @@
 //! - the host binds a `TcpListener` on `127.0.0.1:<port>` (and, best-effort, on `[::1]:<port>` so a
 //!   `localhost` callback the browser sends over IPv6 is caught too) for each declared port —
 //!   loopback only, never an external interface, and **fail-closed on collision** on the primary
-//!   `127.0.0.1` bind (the OAuth redirect URL is baked in, so ops does not pick an ephemeral
+//!   `127.0.0.1` bind (the OAuth redirect URL is baked in, so sbx does not pick an ephemeral
 //!   substitute; a port already in use aborts the launch with a clear message);
-//! - a per-launch host directory is bound read-write into the cage at `/tmp/ops-forward`, so the
+//! - a per-launch host directory is bound read-write into the cage at `/tmp/sbx-forward`, so the
 //!   in-cage forwarder can create its per-port Unix socket there and the host sees the same inode;
 //! - inside the cage a `socat UNIX-LISTEN:<cage path>,fork TCP-CONNECT:127.0.0.1:<port>` forwarder
 //!   accepts a Unix connection (from the host, for each accepted TCP conn) and bridges it to the
@@ -22,7 +22,7 @@
 //!
 //! Teardown is deterministic: the accept loops poll a shared shutdown flag (each listener is
 //! non-blocking), so dropping the [`Forwarder`] guard stops them, closes the listeners, and frees
-//! the host ports before the drop returns — a later launch (e.g. a sequential `ops upgrade` group)
+//! the host ports before the drop returns — a later launch (e.g. a sequential `sbx upgrade` group)
 //! can rebind the same port.
 //!
 //! Security does not rest on the forwarder: it is a deliberately-declared, loopback-only,
@@ -48,7 +48,7 @@ use std::time::Duration;
 /// Where the per-launch host directory appears in the cage. Under the `/tmp` tmpfs (a writable
 /// mountpoint — a bind onto the read-only root would fail), and a single dir carries every
 /// per-port socket the in-cage forwarder creates, so one `ExtraBind` covers all ports.
-const CAGE_FORWARD_DIR: &str = "/tmp/ops-forward";
+const CAGE_FORWARD_DIR: &str = "/tmp/sbx-forward";
 
 /// A cap on live host→cage pump threads per listener, matching [`super::proxy::serve`]'s shape: a
 /// connection beyond the cap is refused (fail-closed) rather than allowed to pin a thread.
@@ -105,7 +105,7 @@ pub(crate) struct Forward {
 /// (its backlog queues connections) from the moment the launch is up — never a first-request race
 /// (mirrors [`super::egress::start`]). The primary `127.0.0.1` bind fails the launch **closed** with
 /// a message naming the port when it is already in use: the OAuth redirect URL is fixed, so an
-/// ephemeral substitute would silently break the callback, and two `ops app codex` logins colliding
+/// ephemeral substitute would silently break the callback, and two `sbx app codex` logins colliding
 /// is a one-shot, not a recurring hazard. The `[::1]` bind is best-effort — it catches a `localhost`
 /// callback the browser sends over IPv6, but a host with IPv6 disabled simply keeps the v4 path.
 pub(crate) fn start(layout: &Layout, mut ports: Vec<u16>) -> io::Result<(Forwarder, Wiring)> {
@@ -254,10 +254,10 @@ fn bridge(mut client: TcpStream, sock: &Path) -> io::Result<()> {
 /// Wrap `cmd` so the cage starts the in-cage forwarders before running it: a static bash that
 /// backgrounds one `socat UNIX-LISTEN → TCP-CONNECT` per declared port (stdio detached so it
 /// never touches the terminal), then `exec`s the real command — which therefore stays the cage's
-/// main process, leaving `ops shell`'s pty job control unchanged. The command rides `"$@"`
+/// main process, leaving `sbx shell`'s pty job control unchanged. The command rides `"$@"`
 /// positionally, so nothing the agent controls is ever interpolated into the script (no shell
-/// injection, non-UTF-8 argv preserved); only ops-owned ASCII — the socat store path, the
-/// `/tmp/ops-forward` socket paths, and the port numbers — goes into the script string. Mirrors
+/// injection, non-UTF-8 argv preserved); only sbx-owned ASCII — the socat store path, the
+/// `/tmp/sbx-forward` socket paths, and the port numbers — goes into the script string. Mirrors
 /// [`super::egress::wrap_command`].
 pub(crate) fn wrap_command(
     socat: &Path,
@@ -277,7 +277,7 @@ pub(crate) fn wrap_command(
     }
     // Share the `bash -c '<preamble> exec "$@"'` assembly with the egress forwarder — same
     // positional-argv, exec-the-command shape, only the socat preamble differs.
-    super::egress::wrap_background(bash, &preamble, "ops-forward", cmd)
+    super::egress::wrap_background(bash, &preamble, "sbx-forward", cmd)
 }
 
 #[cfg(test)]
@@ -318,7 +318,7 @@ mod tests {
     }
 
     /// Dropping the guard frees the host port — the accept loops stop and their listeners close, so
-    /// a sequential re-launch (an `ops upgrade` group) can rebind the same port. This is the RAII
+    /// a sequential re-launch (an `sbx upgrade` group) can rebind the same port. This is the RAII
     /// property the guard promises; a leaked listener would make the rebind fail.
     #[test]
     fn a_dropped_guard_frees_the_host_port() {
@@ -377,11 +377,11 @@ mod tests {
         let forwards = vec![
             Forward {
                 cage_port: 1455,
-                cage_uds: PathBuf::from("/tmp/ops-forward/p-1455.sock"),
+                cage_uds: PathBuf::from("/tmp/sbx-forward/p-1455.sock"),
             },
             Forward {
                 cage_port: 8080,
-                cage_uds: PathBuf::from("/tmp/ops-forward/p-8080.sock"),
+                cage_uds: PathBuf::from("/tmp/sbx-forward/p-8080.sock"),
             },
         ];
         let out = wrap_command(
@@ -393,13 +393,13 @@ mod tests {
         assert_eq!(out[0], OsString::from("/nix/store/y-bash/bin/bash"));
         assert_eq!(out[1], OsString::from("-c"));
         let script = out[2].to_string_lossy();
-        assert!(script.contains("UNIX-LISTEN:/tmp/ops-forward/p-1455.sock,fork"));
+        assert!(script.contains("UNIX-LISTEN:/tmp/sbx-forward/p-1455.sock,fork"));
         assert!(script.contains("TCP-CONNECT:127.0.0.1:1455"));
-        assert!(script.contains("UNIX-LISTEN:/tmp/ops-forward/p-8080.sock,fork"));
+        assert!(script.contains("UNIX-LISTEN:/tmp/sbx-forward/p-8080.sock,fork"));
         assert!(script.contains("TCP-CONNECT:127.0.0.1:8080"));
         assert!(script.trim_end().ends_with("exec \"$@\""));
         // `$0` label, then the command positionally — nothing interpolated into the script.
-        assert_eq!(out[3], OsString::from("ops-forward"));
+        assert_eq!(out[3], OsString::from("sbx-forward"));
         assert_eq!(out[4], OsString::from("codex"));
         assert_eq!(out[5], OsString::from("login"));
     }

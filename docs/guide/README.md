@@ -1,6 +1,6 @@
-# ops — user guide
+# sbx — user guide
 
-`ops` is a **sandbox launcher**: a single static Rust binary that runs tools —
+`sbx` is a **sandbox launcher**: a single static Rust binary that runs tools —
 including **encapsulated AI agents** — inside a [bubblewrap](https://github.com/containers/bubblewrap)
 sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
@@ -10,7 +10,7 @@ cross-linked pages so you can start anywhere and follow the links. For the desig
 rationale and threat analysis behind each subsystem, each section links out to the
 [design documents](#design-documents).
 
-> New to `ops`? Start with [What ops is](concepts/overview.md), then
+> New to `sbx`? Start with [What sbx is](concepts/overview.md), then
 > [Quick start](getting-started/quickstart.md).
 
 ---
@@ -19,18 +19,18 @@ rationale and threat analysis behind each subsystem, each section links out to t
 
 - [Installation](getting-started/installation.md) — build the static binary, or a dev build.
 - [Quick start](getting-started/quickstart.md) — your first sandboxed command in five minutes.
-- [`ops doctor` and prerequisites](getting-started/doctor.md) — the runtime requirements and how to check them.
+- [`sbx doctor` and prerequisites](getting-started/doctor.md) — the runtime requirements and how to check them.
 
 ## Concepts
 
-- [What ops is (and is not)](concepts/overview.md) — the reference class, the two actor modes.
+- [What sbx is (and is not)](concepts/overview.md) — the reference class, the two actor modes.
 - [Security model](concepts/security-model.md) — same-uid, confidentiality by absence, the bind layout.
 - [The trust gate](concepts/trust.md) — the direnv content-hash model, free vs security fields.
 - [Enforcement stack](concepts/enforcement.md) — bubblewrap, seccomp, cgroups, Landlock.
 - [Provisioning model](concepts/provisioning.md) — the rolling nix channel, the per-project store, self-equip.
 - [Directory layout](concepts/directory-layout.md) — where the config, data, and trust state live.
 
-## Configuration (`.ops.toml`)
+## Configuration (`.sbx.toml`)
 
 - [Configuration overview](configuration/README.md) — layering, the trust gate, free vs security fields.
 - [`env`](configuration/env.md) — extra environment variables (a free field).
@@ -49,7 +49,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).
 - [`[app.<name>]`](configuration/apps.md) — named launch profiles (links to [Apps](apps/README.md)).
 - [`[net.groups]`](configuration/net-groups.md) — reusable egress groups.
-- [One-shot overrides](configuration/overrides.md) — `--config`/`--env`/`--net`/… and `OPS_*`.
+- [One-shot overrides](configuration/overrides.md) — `--config`/`--env`/`--net`/… and `SBX_*`.
 
 ## Command reference
 
@@ -85,8 +85,8 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [Network modes](networking/modes.md) — `none` / `shared` / `deny` / `allow` / `ask`.
 - [Rule grammar](networking/rules.md) — hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
 - [Egress groups](networking/groups.md) — reusable `[net.groups]` referenced by `@name`.
-- [Ask mode](networking/ask.md) — park-and-confirm requests with `ops net pending`.
-- [Observability](networking/observability.md) — `ops net rules` / `stats` / `logs` / `live`, `ops test net`.
+- [Ask mode](networking/ask.md) — park-and-confirm requests with `sbx net pending`.
+- [Observability](networking/observability.md) — `sbx net rules` / `stats` / `logs` / `live`, `sbx test net`.
 
 ## Secrets
 
@@ -99,12 +99,12 @@ rationale and threat analysis behind each subsystem, each section links out to t
 ## Housekeeping
 
 - [Sessions](housekeeping/sessions.md) — `ls`, `attach`, `stop`, and `--detach`.
-- [Garbage collection](housekeeping/gc.md) — `ops gc`.
-- [Upgrading toolchains](housekeeping/upgrade.md) — `ops upgrade` and the lock model.
+- [Garbage collection](housekeeping/gc.md) — `sbx gc`.
+- [Upgrading toolchains](housekeeping/upgrade.md) — `sbx upgrade` and the lock model.
 
 ## Reference
 
-- [Environment variables](reference/environment-variables.md) — `OPS_*` and the cage environment.
+- [Environment variables](reference/environment-variables.md) — `SBX_*` and the cage environment.
 - [Exit codes](reference/exit-codes.md) — what each exit status means.
 - [Glossary](reference/glossary.md) — the terms this guide uses.
 
@@ -117,7 +117,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
   [Network modes](networking/modes.md) → [Secrets](secrets/README.md).
 - **"I want to give my project a reproducible toolchain."**
   [Provisioning](concepts/provisioning.md) → [`packages`](configuration/packages.md) /
-  [`[tools]`](configuration/tools.md) → [`ops upgrade`](housekeeping/upgrade.md).
+  [`[tools]`](configuration/tools.md) → [`sbx upgrade`](housekeeping/upgrade.md).
 - **"I want to lock down what a tool can reach on the network."**
   [Network modes](networking/modes.md) → [Rule grammar](networking/rules.md) →
   [Ask mode](networking/ask.md) → [Observability](networking/observability.md).

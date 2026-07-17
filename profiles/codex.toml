@@ -1,19 +1,19 @@
-# Codex — OpenAI's coding agent CLI, sandboxed by ops.
+# Codex — OpenAI's coding agent CLI, sandboxed by sbx.
 #
-#   ops app import profiles/codex.toml
-#   ops app codex
+#   sbx app import profiles/codex.toml
+#   sbx app codex
 #
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls OpenAI's codex
 # release binary) — no nixpkgs lag. It is equipped at the latest upstream version on the
 # first launch in a project; advancing an already-installed version is not yet automated
-# by `ops upgrade`.
+# by `sbx upgrade`.
 #
 # Two authentication paths are supported:
 #
 #  - **API key** (header-injected): set `$OPENAI_API_KEY` on the host and uncomment the
 #    `[secret."api.openai.com"]` block below. The egress proxy injects the key on the wire
 #    to api.openai.com; the plaintext never enters the cage.
-#  - **ChatGPT login (OAuth)**: run `ops app codex`, then `codex login` inside the cage.
+#  - **ChatGPT login (OAuth)**: run `sbx app codex`, then `codex login` inside the cage.
 #    Codex opens the OAuth URL in your host browser; the provider redirects to
 #    http://localhost:1455/auth/callback, and `forward = [1455]` forwards that host
 #    loopback port into the cage so codex (listening on its own loopback) receives the
@@ -22,14 +22,14 @@
 #
 # Both paths ride the same Model-B allowlist; the OAuth runtime hosts the CLI talks to are
 # confirmed at first login — a host the flow reaches that is not listed returns a 403 whose
-# body names `ops net allow <host>`, so add any missing host the proxy surfaces.
-# ops IS the sandbox (bwrap + seccomp + empty netns + egress allowlist), so codex's own nested
+# body names `sbx net allow <host>`, so add any missing host the proxy surfaces.
+# sbx IS the sandbox (bwrap + seccomp + empty netns + egress allowlist), so codex's own nested
 # bubblewrap sandbox is redundant here — and unreachable anyway: the cage's seccomp filter blocks
 # the mount/namespace family a nested bwrap needs (unshare/mount/pivot_root), so it cannot start
 # (that is the "could not find bubblewrap on PATH" warning, and the bundled fallback fails too).
 # `--sandbox danger-full-access` turns codex's own sandbox off — OpenAI recommends exactly this when
 # Codex runs inside a pre-existing containment environment. It drops only codex's *internal*
-# restrictions; the real filesystem and network boundary stays ops's cage and its egress allowlist.
+# restrictions; the real filesystem and network boundary stays sbx's cage and its egress allowlist.
 cmd = ["codex", "--sandbox", "danger-full-access"]
 
 # Forward the host's localhost:1455 into the cage so the OAuth callback reaches codex.
@@ -86,7 +86,7 @@ allow = [
 # the cage. Provide it on the host as $OPENAI_API_KEY (or a resolver) and uncomment to use the
 # API-key path instead of the OAuth login.
 [env]
-#OPENAI_API_KEY = "sk-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."api.openai.com"]
 #from = "env://OPENAI_API_KEY"

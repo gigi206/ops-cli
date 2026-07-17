@@ -2,11 +2,11 @@
 //!
 //! For a GUI/desktop app distributed only as a `.deb` (no runnable release binary, no nixpkgs
 //! attribute, and — for opencode-desktop — an official flake whose from-source build is broken by a
-//! bun-version mismatch), ops packages the prebuilt `.deb` directly: resolve the URL to a content
+//! bun-version mismatch), sbx packages the prebuilt `.deb` directly: resolve the URL to a content
 //! hash, then build a generated derivation that `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the
 //! ELF binaries against a curated Electron/Chromium library set. **No build script runs**
 //! (`dontBuild`), so — unlike an arbitrary `flake:` — evaluating and building it host-side is safe;
-//! it is therefore provisioned like `nix:` (into ops's store, seeded, offline-reusable) rather than
+//! it is therefore provisioned like `nix:` (into sbx's store, seeded, offline-reusable) rather than
 //! in-cage.
 //!
 //! Three source forms (all trusted-only, like every `[packages]` backend):
@@ -16,14 +16,14 @@
 //!     asset, so even a project whose asset name embeds the version rolls forward.
 //!   * `deb:apt:<https Packages-index url>` — track an apt repository's highest-version `.deb`, for a
 //!     vendor pool that publishes versioned filenames with no `latest` alias (so a hand-pinned URL
-//!     goes stale). ops fetches the uncompressed `Packages` index, picks the newest version, and
+//!     goes stale). sbx fetches the uncompressed `Packages` index, picks the newest version, and
 //!     **re-validates the derived `.deb` URL** through the same charset check a hand-written `deb:`
 //!     URL passes. Scope, not a gap: uncompressed index only, no `InRelease`/GPG check, a
 //!     single-application repo — the same TLS-plus-unpack trust level as a direct `deb:` URL.
 //!
 //! Update model: pin-on-first-use. A launch resolves the source to a concrete `.deb` URL and its
 //! content hash, records both in a per-project lock (`deb-packages.lock`), and later launches reuse
-//! the pin offline — the launch hot path never touches the network. `ops upgrade` re-resolves each
+//! the pin offline — the launch hot path never touches the network. `sbx upgrade` re-resolves each
 //! declared source forward (re-querying GitHub for the `github:` form, the apt index for the `apt:`
 //! form) and rewrites the lock.
 
@@ -74,7 +74,7 @@ fn parse_source(locator: &str) -> DebSource {
     DebSource::Url(locator.to_string())
 }
 
-/// The outcome of re-resolving one declared `deb:` reference during `ops upgrade`.
+/// The outcome of re-resolving one declared `deb:` reference during `sbx upgrade`.
 pub(crate) enum DebUpgrade {
     Pinned {
         url: String,
@@ -134,7 +134,7 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin
 }
 
 /// The pinned content hashes for a project's `deb:` packages, keyed by the declared URL (a
-/// package's locator, so `ops config` can look each up directly), shortened for display. Reads
+/// package's locator, so `sbx config` can look each up directly), shortened for display. Reads
 /// only the per-project lock — surfaces a pin without resolving or building — so the config view
 /// stays side-effect-free, exactly like [`super::flake::pinned_revs`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
@@ -201,7 +201,7 @@ fn write_pins(
 /// resolves to itself; a `github:<owner>/<repo>` locator queries the repo's latest release, selects
 /// its linux `.deb` asset, and **re-validates that GitHub-supplied URL** through the same
 /// injection-free barrier a hand-written `deb:` URL passes before it is fetched or interpolated into
-/// the generated derivation. `fresh` bypasses the fetch cache (set on `ops upgrade`, so it sees a
+/// the generated derivation. `fresh` bypasses the fetch cache (set on `sbx upgrade`, so it sees a
 /// new release). Fail-closed: an unvalidated or unselectable asset returns an error and no pin.
 pub(crate) fn resolve_source(
     nix: &Path,
@@ -238,7 +238,7 @@ pub(crate) fn resolve_source(
 /// Resolve an `apt:` locator's Packages index to the concrete `.deb` URL of its highest-version
 /// package — the one network+derivation step `deb:apt:` adds over a direct `deb:` URL, kept as a
 /// seam so it is testable against a real index without the heavy `.deb` prefetch. Fetches the index
-/// (fresh past the cache on `ops upgrade`), selects the newest version, resolves its `Filename:`
+/// (fresh past the cache on `sbx upgrade`), selects the newest version, resolves its `Filename:`
 /// against the repo root, and **re-validates that derived URL through [`is_valid_deb_url`]** — the
 /// index is remote-controlled, so this is the injection boundary before the URL is fetched or
 /// interpolated into the generated derivation. Fail-closed at every step.
@@ -272,7 +272,7 @@ fn resolve_apt_deb_url(
 
 /// Select the newest package's `.deb` from an apt `Packages` index. The index is RFC822-style
 /// stanzas separated by blank lines, each carrying `Package:`, `Version:`, and `Filename:` fields.
-/// ops targets a **single-application** apt repo (a vendor's own pool), so every stanza must name the
+/// sbx targets a **single-application** apt repo (a vendor's own pool), so every stanza must name the
 /// SAME `Package:` — a multi-package Debian mirror is refused (it is ambiguous which app to track).
 /// The highest `Version:` wins, compared as dotted **decimal** components (`1.21459.0` > `1.18286.2`);
 /// a version carrying a non-numeric component is **refused** rather than mis-ordered — this is
@@ -379,7 +379,7 @@ fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
 /// for an Electron layout — it locates the app directory by its `resources/` signature (a packed
 /// `resources/app.asar` or, for an asar-less VS Code fork, the `resources/app/` directory) and
 /// wraps the app's own launcher (the executable beside it that is not a `.so` or a Chromium helper),
-/// so no per-app path is hardcoded. Every interpolated value is ops-controlled and charset-validated
+/// so no per-app path is hardcoded. Every interpolated value is sbx-controlled and charset-validated
 /// (`name`, `url`, `hash`, the pinned `nixpkgs`, the `system`), so the expression carries nothing to
 /// escape; placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
 fn derivation_expr(nixpkgs: &str, system: &str, name: &str, url: &str, hash: &str) -> String {
@@ -426,7 +426,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
 }
 
 /// Provision one `deb:` package host-side: resolve the URL to a hash (pinning it on first use),
-/// build the generated derivation into ops's store, and return `(bin directory, store root)` — the
+/// build the generated derivation into sbx's store, and return `(bin directory, store root)` — the
 /// bin dir to prepend to the sandbox `PATH`, the root whose closure the project store seeds. Mirrors
 /// [`super::packages::provision`]'s per-package gcroot, name-keyed under the project.
 pub(crate) fn provision(
@@ -533,7 +533,7 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// The two views `ops upgrade deb` needs of a project's declared `deb:` URLs, collected in one pass
+/// The two views `sbx upgrade deb` needs of a project's declared `deb:` URLs, collected in one pass
 /// over the baseline and each app overlay (see [`declared`]).
 struct Declared {
     /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
@@ -546,7 +546,7 @@ struct Declared {
 
 /// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
 /// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
-/// universe — so `ops upgrade` walks the apps once, not twice.
+/// universe — so `sbx upgrade` walks the apps once, not twice.
 fn declared(cfg: &crate::config::Resolved) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
@@ -573,7 +573,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
 }
 
 /// How many declared `deb:` packages are withheld for being untrusted — across the baseline and
-/// each app. A count only (the per-package reason is warned on the launch path), so `ops upgrade`
+/// each app. A count only (the per-package reason is warned on the launch path), so `sbx upgrade`
 /// does not read as "none declared" when an untrusted project declares one.
 pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
     let untrusted = |pkgs: &[crate::config::Package]| {
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn the_prune_universe_keeps_untrusted_so_upgrade_never_prunes_a_withheld_pin() {
         // The prune universe must NOT drop a still-declared url just because the project is
-        // untrusted — else `ops upgrade deb` on a Changed project unpins it. Unlike the trusted roll
+        // untrusted — else `sbx upgrade deb` on a Changed project unpins it. Unlike the trusted roll
         // set, `declared().all` keeps the untrusted url; `withheld` counts it so the summary is honest.
         let cfg = resolved(
             vec![

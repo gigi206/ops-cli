@@ -1,7 +1,7 @@
-# OpenFox — a local-LLM web coding agent (github.com/co-l/openfox), sandboxed by ops.
+# OpenFox — a local-LLM web coding agent (github.com/co-l/openfox), sandboxed by sbx.
 #
-#   ops app import profiles/openfox.toml
-#   ops app openfox
+#   sbx app import profiles/openfox.toml
+#   sbx app openfox
 #   # then open http://127.0.0.1:10369 in your browser
 #
 # OpenFox is a Node.js/TypeScript coding agent with a "Plan → Builder" workflow, an integrated
@@ -12,7 +12,7 @@
 #
 # WHY `network = "shared"` (AND WHAT IT COSTS). OpenFox talks to a LLM on your machine's
 # `localhost` (OPENFOX_LLM_URL default `http://localhost:8000/v1`; ollama is usually :11434,
-# llama.cpp :8080). The default ops posture is Model-B — an EMPTY network namespace whose
+# llama.cpp :8080). The default sbx posture is Model-B — an EMPTY network namespace whose
 # `127.0.0.1` is the CAGE's own loopback, NOT the host's — and there is no outbound bridge to a
 # host-local service (`forward` is INBOUND only). So under the empty netns the caged openfox
 # simply cannot reach a LLM running on your host. `network = "shared"` makes the cage share the
@@ -38,12 +38,12 @@
 # npm backend installs with `--ignore-scripts=true` (a deliberate security default — it will not
 # run arbitrary package scripts), so `mise use -g` places openfox WITHOUT those binaries and it
 # crashes at startup with "Could not locate the bindings file … better_sqlite3.node". The wrapper
-# below heals that: on first launch (and again after `ops upgrade mise` rolls openfox to a new
+# below heals that: on first launch (and again after `sbx upgrade mise` rolls openfox to a new
 # version, whose fresh install dir has no `.node` yet) it runs `npm rebuild better-sqlite3 node-pty`
 # inside openfox's install tree, which DOWNLOADS the prebuilt binaries (no compiler needed — they
 # are published for Node 24 / this platform) and then execs openfox. The rebuild fetches from the
 # network, which `shared` provides; it is idempotent (the guard skips it once the binary exists).
-# Keeping openfox as a `mise:npm:` `[packages]` entry means `ops upgrade mise` still rolls it.
+# Keeping openfox as a `mise:npm:` `[packages]` entry means `sbx upgrade mise` still rolls it.
 #
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
 # `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
@@ -80,7 +80,7 @@ network = "shared"
 [packages]
 # A node runtime (OpenFox needs it at runtime AND to install/rebuild; `nix:nodejs` is v24.x,
 # satisfying OpenFox's Node >= 24 requirement — and matching the ABI the prebuilt native addons
-# target) then OpenFox itself via mise's npm backend, so `ops upgrade mise` can roll it forward.
+# target) then OpenFox itself via mise's npm backend, so `sbx upgrade mise` can roll it forward.
 # Both are trusted-only [packages]; this profile is trusted by location once imported. The native
 # addons are healed at launch by the `cmd` wrapper above (mise installs them --ignore-scripts).
 nodejs = "nix:nodejs"
@@ -88,7 +88,7 @@ openfox = "mise:npm:openfox"
 # OpenFox's integrated terminal / sub-agents run shell commands. The hermetic cage ships a curated
 # base toolset (bash, coreutils, curl, git, less, grep, sed, awk, find, which) plus node. If your
 # agent needs more tools (a compiler, a language runtime, ripgrep, …), declare them here per app or
-# in the project's own `.ops.toml [packages]`.
+# in the project's own `.sbx.toml [packages]`.
 
 [env]
 # LLM BACKEND. On first run OpenFox auto-detects a local OpenAI-compatible backend by probing common

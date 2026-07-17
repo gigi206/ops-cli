@@ -1,7 +1,7 @@
-# `ops untrust`
+# `sbx untrust`
 
 ```
-ops untrust [path]
+sbx untrust [path]
 ```
 
 Revoke a config's trust, so its security-relevant fields stop applying until it is
@@ -9,17 +9,17 @@ trusted again.
 
 | Operand | Meaning |
 |---|---|
-| `[path]` | the config to act on (default `./.ops.toml`) |
+| `[path]` | the config to act on (default `./.sbx.toml`) |
 
-See also: [`ops trust`](trust.md) · [The trust gate](../concepts/trust.md).
+See also: [`sbx trust`](trust.md) · [The trust gate](../concepts/trust.md).
 
 ## Example
 
 ```sh
-ops untrust               # revoke ./.ops.toml
-ops untrust path/to/.ops.toml
+sbx untrust               # revoke ./.sbx.toml
+sbx untrust path/to/.sbx.toml
 ```
 
 After `untrust`, the project's [security fields](../concepts/trust.md#free-fields-vs-security-fields)
 (binds, network, secrets, packages, …) are dropped from a launch; the free `env` field
-still applies. Re-approve with [`ops trust`](trust.md).
+still applies. Re-approve with [`sbx trust`](trust.md).

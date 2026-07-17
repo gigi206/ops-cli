@@ -28,12 +28,12 @@ into the cage at a fixed path and named through `PULSE_SERVER`. Same-uid, so a r
 still permits `connect()` (exactly like the Wayland socket).
 
 **For a native PulseAudio client** (Chromium/Electron): the **PulseAudio client library**
-(`libpulse.so.0`) is provisioned into ops's own store and put on the app's loader search path
+(`libpulse.so.0`) is provisioned into sbx's own store and put on the app's loader search path
 (`LD_LIBRARY_PATH`). Chromium loads it by soname, and it is absent from a packaged app's own
 closure (which carries only ALSA), so without it the PulseAudio backend never loads.
 
 **For an ALSA client** (a terminal tool whose voice mode uses `cpal`/PortAudio/`arecord`): these
-speak the ALSA API and do **not** honor `PULSE_SERVER`, so ops adds the standard **ALSA→PulseAudio
+speak the ALSA API and do **not** honor `PULSE_SERVER`, so sbx adds the standard **ALSA→PulseAudio
 compatibility shim** — the `alsa-plugins` `pcm_pulse`/`ctl_pulse` plugins plus a generated
 `asound.conf` routing the default PCM/control to `pulse` (`ALSA_CONFIG_DIR`/`ALSA_PLUGIN_DIR`
 point ALSA at them). An ALSA `default` capture/playback is then transparently routed to the same
@@ -85,11 +85,11 @@ audio = true
 ## One-shot override
 
 To set the audio posture for a single launch without editing the file, use `--audio` or
-`OPS_AUDIO`:
+`SBX_AUDIO`:
 
 ```sh
-ops app claude-desktop --audio        # bare --audio means true
-ops app claude-desktop --audio=false  # disable the profile's audio for this launch
+sbx app claude-desktop --audio        # bare --audio means true
+sbx app claude-desktop --audio=false  # disable the profile's audio for this launch
 ```
 
 `--audio` is a boolean: bare `--audio` means `true`, or write `--audio=true` / `--audio=false`
@@ -100,14 +100,14 @@ the config file. See [One-shot overrides](overrides.md).
 ## Viewing the effective posture
 
 ```sh
-ops config show                # an `audio:` line only when it is enabled
-ops config show --app desktop  # an app's effective posture, tagged inherited or set
+sbx config show                # an `audio:` line only when it is enabled
+sbx config show --app desktop  # an app's effective posture, tagged inherited or set
 ```
 
 ## Access, not new privilege
 
 `audio = true` binds the host audio socket; whether a process may capture is still governed by
-the host's audio server and the uid the cage runs as (same-uid) — exactly as on the host. `ops`
+the host's audio server and the uid the cage runs as (same-uid) — exactly as on the host. `sbx`
 grants visibility, not new privilege. The confidentiality point stands: it is a **capability**,
 exposing the microphone and all system audio to the cage, which is why it is off by default and
 trusted-only.

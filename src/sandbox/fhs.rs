@@ -1,10 +1,10 @@
-//! Resolving the hermetic-FHS userland from ops's own store.
+//! Resolving the hermetic-FHS userland from sbx's own store.
 //!
 //! The base userland (an interactive shell, coreutils, the glibc loader and the
 //! C/C++ runtime that *foreign* binaries need, the nix-ld shim that routes them to
 //! it, nix itself so an agent can self-equip its toolchain into the project's
 //! writable store, and a CA bundle so its HTTPS is hermetic) is provisioned into
-//! ops's user-owned store — never the host `/nix`
+//! sbx's user-owned store — never the host `/nix`
 //! — against the pinned nixpkgs, each output rooted by a gcroot so a later store
 //! GC cannot collect it. The store is bound read-only at `/nix` inside the
 //! sandbox, so the *logical* `/nix/store/…` paths these provisions report resolve
@@ -52,7 +52,7 @@ const ANCHOR_LOCALE: &str = "en_US.UTF-8";
 
 /// Normalize a host locale env value (e.g. from `LANG`) to the glibc UTF-8 locale name the cage's
 /// archive is built for (e.g. `fr_FR.utf8` → `fr_FR.UTF-8`), or `None` if it is not a UTF-8 locale
-/// ops should build. Only an explicit UTF-8 codeset is accepted: a bare `fr_FR`, a non-UTF-8
+/// sbx should build. Only an explicit UTF-8 codeset is accepted: a bare `fr_FR`, a non-UTF-8
 /// codeset (`fr_FR.ISO-8859-1`), or the built-in `C`/`POSIX`/`C.UTF-8` all yield `None` (the last
 /// needs no archive — glibc has it compiled in). A final safe-charset gate (letters, digits, and
 /// `_ . - @`) rejects anything that could not be a locale name, so a hostile `LANG` cannot inject
@@ -82,7 +82,7 @@ fn normalize_utf8_locale(raw: &str) -> Option<String> {
 /// The UTF-8 locales to compile into the cage's archive, derived from the host's own locale
 /// (`LC_ALL` then `LANG` — the general selectors the cage inherits through the passthrough) so
 /// each machine's cage renders that machine's language, plus the [`ANCHOR_LOCALE`] English
-/// fallback. A host locale ops cannot recognize is simply omitted (the cage falls back to the
+/// fallback. A host locale sbx cannot recognize is simply omitted (the cage falls back to the
 /// compiled-in `C.UTF-8`, still UTF-8-clean); `C.UTF-8` stays the structural `LANG` default
 /// regardless.
 fn host_locales() -> Vec<String> {
@@ -107,12 +107,12 @@ fn locale_set(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     set
 }
 
-/// Provision a UTF-8 locale archive carrying exactly `locales` into ops's store, gcrooted under
+/// Provision a UTF-8 locale archive carrying exactly `locales` into sbx's store, gcrooted under
 /// `roots`. Built with `glibcLocales.override` (a curated set, ~3 MB) rather than the stock
 /// `glibcLocales` (every locale, ~230 MB) — and *not* the stock `glibcLocalesUtf8`, whose archive
 /// lists locales but does not actually load them. Built against the base's own `nixpkgs`
 /// reference, so the archive and the base glibc stay version-locked (glibc ignores an archive
-/// built for another version). Every interpolated value is ops-controlled or charset-validated
+/// built for another version). Every interpolated value is sbx-controlled or charset-validated
 /// (the resolved reference, the detected system, and the normalized locale names), so the
 /// expression carries nothing to escape.
 ///
@@ -148,7 +148,7 @@ fn provision_locale_archive(
     )
 }
 
-/// Provision the base hermetic userland into ops's store and report its paths.
+/// Provision the base hermetic userland into sbx's store and report its paths.
 /// The launcher resolves the userland before assembling a spec; on a project's
 /// first launch this fetches the base closure from the binary cache. `nixpkgs` is
 /// the pinned reference for the OS substrate (glibc, stdcpp, bash, coreutils, nix-ld,
@@ -156,7 +156,7 @@ fn provision_locale_archive(
 /// shared with the project's own
 /// package provisioning (and so a future channel override is plumbed in a single
 /// place). `engine_ref` is the **separately-locked** reference for mise alone (see
-/// below) — usually the same revision, but advanced on its own by `ops upgrade mise`.
+/// below) — usually the same revision, but advanced on its own by `sbx upgrade mise`.
 pub(crate) fn resolve_userland(
     nix: &Path,
     layout: &Layout,
@@ -199,9 +199,9 @@ pub(crate) fn resolve_userland(
     // project's toolchain into the project's own writable store (the cage's `/nix`).
     // nix's compiled defaults already do the heavy lifting unconfigured — they resolve
     // the store to the local `/nix`, build from the seeded base offline, and substitute
-    // new tools from the default cache over HTTPS (the cage binds ops's own CA bundle at
+    // new tools from the default cache over HTTPS (the cage binds sbx's own CA bundle at
     // nix's default certificate path, so trust does not depend on the host — see `cacert`
-    // below). ops adds three settings via `NIX_CONFIG` (set by the assembler):
+    // below). sbx adds three settings via `NIX_CONFIG` (set by the assembler):
     // `extra-experimental-features = nix-command flakes`, which the mise `nix:`
     // plugin's `nix build` needs (`extra-`, so purely additive — it does not touch
     // `substituters` or `require-sigs`, leaving the offline base build unaffected),
@@ -217,7 +217,7 @@ pub(crate) fn resolve_userland(
     // store. Carried in every cage — an agent may self-equip from any launch, not
     // only the dedicated passthrough. Unlike the rest of the base, mise is provisioned
     // against its OWN engine reference and gcrooted under the mise tree (not the base),
-    // so `ops upgrade mise` rolls the engine while `ops upgrade nix` leaves it put. This
+    // so `sbx upgrade mise` rolls the engine while `sbx upgrade nix` leaves it put. This
     // is safe to run on a different revision than the base because the cage exposes no
     // global `LD_LIBRARY_PATH`: mise finds its own glibc by RPATH, like any cross-channel
     // nix tool. One consequence, recorded consciously: where the in-cage mise once
@@ -232,7 +232,7 @@ pub(crate) fn resolve_userland(
     // in every cage (like nix and mise) so the posture stays a launch decision, not a different
     // base. Only the allowlist posture references it; other postures simply never invoke it.
     let socat = realise("socat", "bin/socat", "socat")?;
-    // cacert: a bundle of trusted CA roots from ops's own store, so the cage's TLS does not
+    // cacert: a bundle of trusted CA roots from sbx's own store, so the cage's TLS does not
     // depend on the host carrying one. Its `ca-bundle.crt` is bound read-only at the standard
     // certificate paths (replacing any host bind) and named by the CA-bundle environment
     // variables, so an HTTPS fetch — an agent self-equipping over the default cache, or a
@@ -256,7 +256,7 @@ pub(crate) fn resolve_userland(
     let locales = provision_locale_archive(nix, layout, &roots, nixpkgs, &system, &host_locales())
         .or_else(|e| {
             eprintln!(
-                "ops: warning: could not build the host locale archive ({e}); \
+                "sbx: warning: could not build the host locale archive ({e}); \
                  falling back to {ANCHOR_LOCALE}"
             );
             provision_locale_archive(
@@ -420,7 +420,7 @@ mod locale_tests {
 /// Provisioning the userland needs a real nix and store, so this is an
 /// integration check: it skips (does not fail) where nix is absent, and otherwise
 /// asserts the reported paths are well-formed — bind sources physically present in
-/// ops's store, in-sandbox paths logical and backed by the store.
+/// sbx's store, in-sandbox paths logical and backed by the store.
 #[cfg(test)]
 mod resolve_tests {
     use super::*;
@@ -428,7 +428,7 @@ mod resolve_tests {
     use crate::testutil::TmpDir;
 
     #[test]
-    fn resolves_a_usable_hermetic_userland_from_ops_store() {
+    fn resolves_a_usable_hermetic_userland_from_sbx_store() {
         let Some(nix) = crate::store::resolve_nix(None) else {
             eprintln!("skipping userland resolution: no nix on PATH");
             return;
@@ -440,7 +440,7 @@ mod resolve_tests {
             .resolve(&nix, &layout)
             .expect("resolve nixpkgs");
         // engine == base here (the decoupling is exercised by the launcher and its own
-        // tests); this check is about the userland being usable from ops's store.
+        // tests); this check is about the userland being usable from sbx's store.
         let Ok(u) = resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs) else {
             eprintln!(
                 "skipping userland resolution: base provisioning failed (cache or channel drift)"
@@ -448,7 +448,7 @@ mod resolve_tests {
             return;
         };
 
-        // the base roots are logical store paths, each backed by ops's store and each a
+        // the base roots are logical store paths, each backed by sbx's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure
         // roots the per-project store is seeded from. The expected base set is present:
         // the eleven core provisions plus one root per curated CLI tool.
@@ -477,12 +477,12 @@ mod resolve_tests {
             );
             assert!(
                 physical_path(&layout, root).is_dir(),
-                "a base root is not backed by ops's store: {}",
+                "a base root is not backed by sbx's store: {}",
                 root.display()
             );
         }
         // the interpreter bound at /lib64/ld-linux is the nix-ld shim, present in
-        // ops's store as a physical bind source
+        // sbx's store as a physical bind source
         assert!(
             u.interp_src.exists(),
             "nix-ld shim missing: {}",
@@ -490,20 +490,20 @@ mod resolve_tests {
         );
         assert!(
             u.interp_src.starts_with(layout.store_dir()),
-            "nix-ld shim is not under ops's store: {}",
+            "nix-ld shim is not under sbx's store: {}",
             u.interp_src.display()
         );
 
-        // the CA bundle bound under /etc/ssl/certs is ops's own cacert: a physical bind
-        // source under ops's store, the very file nix and OpenSSL verify against
+        // the CA bundle bound under /etc/ssl/certs is sbx's own cacert: a physical bind
+        // source under sbx's store, the very file nix and OpenSSL verify against
         assert!(
             u.ca_bundle_src.starts_with(layout.store_dir()),
-            "CA bundle is not under ops's store: {}",
+            "CA bundle is not under sbx's store: {}",
             u.ca_bundle_src.display()
         );
         assert!(
             u.ca_bundle_src.is_file(),
-            "CA bundle missing from ops's cacert: {}",
+            "CA bundle missing from sbx's cacert: {}",
             u.ca_bundle_src.display()
         );
 
@@ -530,7 +530,7 @@ mod resolve_tests {
         }
 
         // nix-ld exposes `libz.so.1` to foreign binaries: zlib's lib dir is on the
-        // foreign library path and the library file is backed by ops's store. A binary
+        // foreign library path and the library file is backed by sbx's store. A binary
         // the cage loads through the shim (the Cursor CLI, Node native addons) dlopens it.
         let zlib_lib = u
             .foreign_lib_paths

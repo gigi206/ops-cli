@@ -5,18 +5,18 @@
 //! It is purely informational — it enforces nothing (the empty network namespace plus
 //! the host filtering proxy are the boundary). Its job is to let a process inside the
 //! cage understand *why* a direct connection or a `ping` fails and *which* hosts it can
-//! actually reach, without running the host-side `ops net` tools (which it cannot, from
-//! inside the cage). The companion `OPS_SANDBOX=1` / `OPS_EGRESS_CONTRACT` environment
+//! actually reach, without running the host-side `sbx net` tools (which it cannot, from
+//! inside the cage). The companion `SBX_SANDBOX=1` / `SBX_EGRESS_CONTRACT` environment
 //! variables (set by the assembler) are the discovery handle: a tool reads the file the
 //! second variable points at.
 
 use crate::config::NetworkPolicy;
 
 /// Where the generated contract is bound read-only inside the cage. Also the value of
-/// the `OPS_EGRESS_CONTRACT` environment variable, so a tool need not hard-code the path.
-/// Under `/opt/ops`, beside the mise plugin and the shell rc, colliding with no
+/// the `SBX_EGRESS_CONTRACT` environment variable, so a tool need not hard-code the path.
+/// Under `/opt/sbx`, beside the mise plugin and the shell rc, colliding with no
 /// structural mount.
-pub(crate) const EGRESS_CONTRACT_INCAGE: &str = "/opt/ops/egress-contract.md";
+pub(crate) const EGRESS_CONTRACT_INCAGE: &str = "/opt/sbx/egress-contract.md";
 
 /// Render the egress contract for a resolved network posture. Pure: the text derives only
 /// from the policy.
@@ -79,7 +79,7 @@ fn allowlist_contract(policy: &crate::allowlist::EgressPolicy) -> String {
 /// The shared head of every empty-netns contract: the cage has no route of its own, so a
 /// direct connection, DNS, ICMP and UDP all fail — the only egress is the filtering proxy.
 const ISOLATION_NOTE: &str = "\
-# ops sandbox — egress contract\n\
+# sbx sandbox — egress contract\n\
 \n\
 This process runs in an isolated network namespace. The only way out is a filtering\n\
 HTTPS proxy reached over a loopback forwarder. Consequences:\n\
@@ -92,7 +92,7 @@ HTTPS proxy reached over a loopback forwarder. Consequences:\n\
 
 /// The contract for `network = "none"`: an empty namespace with no egress at all.
 const ISOLATED: &str = "\
-# ops sandbox — egress contract\n\
+# sbx sandbox — egress contract\n\
 \n\
 This process runs in an isolated network namespace with no egress at all: no host is\n\
 reachable, DNS does not resolve, and `ping` fails (there is no route). This is by\n\
@@ -103,7 +103,7 @@ design — the sandbox was launched with the network cut off.\n";
 /// unconditionally, so a raw `ping` may still fail; the note steers to a TCP test rather
 /// than claiming ICMP works.
 const SHARED: &str = "\
-# ops sandbox — egress contract\n\
+# sbx sandbox — egress contract\n\
 \n\
 This process shares the host network namespace: normal outbound connectivity (TCP and\n\
 UDP) to any reachable host, with no egress filtering.\n\

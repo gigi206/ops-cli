@@ -1,13 +1,13 @@
-//! Pinning `flake:` `[packages]` to a fixed revision for `ops upgrade`.
+//! Pinning `flake:` `[packages]` to a fixed revision for `sbx upgrade`.
 //!
 //! A `flake:<ref>` package is built in-cage at launch with `nix build`. By default the ref
-//! *floats* — each cold launch resolves the flake's latest revision. `ops upgrade flake` pins
+//! *floats* — each cold launch resolves the flake's latest revision. `sbx upgrade flake` pins
 //! it: it resolves each declared ref to its current immutable revision with `nix flake
 //! metadata` and records `(declared ref → revision, locked ref)` in a per-project lock. A launch
 //! then builds the *locked* ref into an out-link keyed by that revision (`<name>-<rev>`), so a
 //! lock change — a rev-keyed path that does not yet exist — triggers a rebuild at the next
 //! launch, with no home enumerated: the host-side lock rewrite is the whole roll. A package
-//! with no lock entry keeps the floating behaviour, so a project that never runs `ops upgrade
+//! with no lock entry keeps the floating behaviour, so a project that never runs `sbx upgrade
 //! flake` is unchanged.
 //!
 //! The lock is keyed by the *declared* reference (the floating `flake:<ref>` value), not the
@@ -90,7 +90,7 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, FlakeP
 /// The pinned revisions for a project's `flake:` packages, keyed by the declared reference —
 /// which is byte-identical to a package's locator, so a caller can look each up directly. Reads
 /// only the per-project lock, exactly as the launch path does, so surfacing a pin realises and
-/// fetches nothing — the property `ops config` relies on. Empty when the data dir or the project
+/// fetches nothing — the property `sbx config` relies on. Empty when the data dir or the project
 /// identity is unavailable, or nothing is pinned (the floating state).
 pub(crate) fn pinned_revs(cwd: &Path) -> BTreeMap<String, String> {
     let Some(layout) = store::Layout::from_env() else {
@@ -135,7 +135,7 @@ fn write_pins(
 
 /// Resolve a declared `flake:` reference to its current immutable pin via `nix flake metadata`.
 /// The flake (the part before `#`) is locked to a revision and an immutable URL; the output
-/// attribute is reattached, so the result is the exact reference a launch builds. Uses ops's
+/// attribute is reattached, so the result is the exact reference a launch builds. Uses sbx's
 /// nix with the flakes feature, like the nixhub fetcher.
 fn resolve(nix: &Path, layout: &Layout, reference: &str) -> io::Result<FlakePin> {
     let (base, attr) = split_attr(reference);
@@ -193,7 +193,7 @@ pub(crate) enum FlakeUpgrade {
     },
 }
 
-/// The two views `ops upgrade flake` needs of a project's declared `flake:` references, collected
+/// The two views `sbx upgrade flake` needs of a project's declared `flake:` references, collected
 /// in one pass over the baseline and each app overlay (see [`declared`]).
 struct Declared {
     /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
@@ -207,7 +207,7 @@ struct Declared {
 
 /// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
 /// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
-/// universe — so `ops upgrade` walks the apps once, not twice.
+/// universe — so `sbx upgrade` walks the apps once, not twice.
 fn declared(cfg: &crate::config::Resolved) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
@@ -235,7 +235,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
 
 /// How many declared `flake:` packages are withheld for being untrusted — across the project
 /// baseline and each app's own overlay. A count only: the per-package withholding reason is
-/// already warned on the launch path, so `ops upgrade` just needs to not read as "none declared".
+/// already warned on the launch path, so `sbx upgrade` just needs to not read as "none declared".
 pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
     let untrusted_flake = |pkgs: &[crate::config::Package]| {
         pkgs.iter()
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn the_prune_universe_keeps_untrusted_refs_so_upgrade_never_prunes_a_withheld_pin() {
         // The prune universe must NOT drop a still-declared ref just because the project is
-        // untrusted — otherwise `ops upgrade flake` on a Changed project unpins it and a later
+        // untrusted — otherwise `sbx upgrade flake` on a Changed project unpins it and a later
         // re-trust floats to latest. Unlike the trusted roll set, `declared().all` keeps the ref.
         let cfg = resolved(
             vec![
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn a_pin_is_keyed_by_the_real_project_runtime_id() {
-        // `ops upgrade flake` (the writer) and `ops config`/launch (the readers, via `pinned_revs`)
+        // `sbx upgrade flake` (the writer) and `sbx config`/launch (the readers, via `pinned_revs`)
         // both key the per-project lock by `binds::project_runtime_id(cwd)` — the same function on
         // the same project path — so a pin written for a project is read back for it, and never for
         // a different one. Exercise that shared keying through the real id derivation (no nix, no

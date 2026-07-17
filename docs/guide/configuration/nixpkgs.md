@@ -11,7 +11,7 @@ nixpkgs = "nixos-23.11"                                   # a branch/channel
 project, ignored from an untrusted one — because the source of your toolchain is a
 supply-chain-relevant choice.
 
-See also: [Provisioning](../concepts/provisioning.md) · [`ops upgrade`](../housekeeping/upgrade.md) · [`packages`](packages.md).
+See also: [Provisioning](../concepts/provisioning.md) · [`sbx upgrade`](../housekeeping/upgrade.md) · [`packages`](packages.md).
 
 ## What it accepts
 
@@ -45,8 +45,8 @@ OS-substrate layer.)
 
 ## Source-aware locks
 
-The resolved revision is recorded in a lock so versions do not move on an `ops` binary
-update — only on an explicit [`ops upgrade`](../housekeeping/upgrade.md):
+The resolved revision is recorded in a lock so versions do not move on an `sbx` binary
+update — only on an explicit [`sbx upgrade`](../housekeeping/upgrade.md):
 
 - A **global** override records to the shared `<data>/nixpkgs.lock`.
 - A trusted **project** pin records to a per-project
@@ -58,25 +58,25 @@ source stays fixed. A first launch of a pinned project downloads its own base cl
 
 ## Rolling a channel forward
 
-A **channel** pin (`nixos-23.11`) advances *within itself* only via `ops upgrade` run
+A **channel** pin (`nixos-23.11`) advances *within itself* only via `sbx upgrade` run
 in that project — a global upgrade would not touch a project's own pin. A **revision**
 pin refreshes to itself (a no-op). See [Upgrading](../housekeeping/upgrade.md).
 
 ## Viewing the effective channel
 
 ```sh
-ops config show    # the effective source: project pin / global / default
-ops doctor         # the store's channel revision (accurate to disk)
+sbx config show    # the effective source: project pin / global / default
+sbx doctor         # the store's channel revision (accurate to disk)
 ```
 
 ## One-shot override
 
 To resolve against a different channel or revision for a single launch without editing
-the file, use `--nixpkgs` or `OPS_NIXPKGS`:
+the file, use `--nixpkgs` or `SBX_NIXPKGS`:
 
 ```sh
-ops run --nixpkgs nixos-23.11 -- ./build.sh
-OPS_NIXPKGS=nixos-unstable ops shell
+sbx run --nixpkgs nixos-23.11 -- ./build.sh
+SBX_NIXPKGS=nixos-unstable sbx shell
 ```
 
 `--nixpkgs` takes a branch/channel name or a 40-hex revision (same as the field). The

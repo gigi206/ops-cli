@@ -1,4 +1,4 @@
-//! ops — sandbox launcher (bubblewrap + daemonless nix).
+//! sbx — sandbox launcher (bubblewrap + daemonless nix).
 //!
 //! The `doctor` preflight verifies the load-bearing runtime requirements before
 //! anything else can run: capability-bearing unprivileged user namespaces (the
@@ -31,7 +31,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 fn main() -> ExitCode {
-    // `args_os`, not `args`: a command run via `ops run` may carry non-UTF-8
+    // `args_os`, not `args`: a command run via `sbx run` may carry non-UTF-8
     // arguments, and panicking on them would be wrong.
     let mut args = std::env::args_os().skip(1);
     let cmd = args.next();
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     };
 
     // A known command carrying a help flag shows the page for the deepest command path it
-    // names (so `ops plugins store add --help` lands on that page). `run` (which forwards
+    // names (so `sbx plugins store add --help` lands on that page). `run` (which forwards
     // `--help` after a `--`) and `mise` (a passthrough) handle a leading help flag
     // themselves; an *unknown* command is left to the dispatch below, which names it and may
     // hint a subcommand parent.
@@ -71,11 +71,11 @@ fn main() -> ExitCode {
         "path" => path_cmd(&rest),
         "run" => {
             let mut cmd: Vec<OsString> = rest;
-            // Leading ops flags before the command: `--detach` to run in the background, a one-shot
+            // Leading sbx flags before the command: `--detach` to run in the background, a one-shot
             // override (the whole-schema `--config <toml|@file>` and the typed `--env`/`--net`/
             // `--gui`/`--nixpkgs`/`--bind`/`--limit`/`--package`, each repeatable), `--help`/`-h` for
-            // this command's page, and an optional `--` separating ops's arguments from the
-            // command's. The `--` is consumed before scanning the command, so `ops run -- --detach`
+            // this command's page, and an optional `--` separating sbx's arguments from the
+            // command's. The `--` is consumed before scanning the command, so `sbx run -- --detach`
             // (or `-- --help`) runs the literal argument.
             let mut detach = false;
             let mut cli = config::CliOverrides::default();
@@ -105,8 +105,8 @@ fn main() -> ExitCode {
             sandbox::run(cmd, detach, ov)
         }
         "mise" => {
-            // A passthrough, so a help flag is only ops's when it leads: `ops mise --help`
-            // shows ops's page, while `ops mise help` (and any later `--help`) reaches the
+            // A passthrough, so a help flag is only sbx's when it leads: `sbx mise --help`
+            // shows sbx's page, while `sbx mise help` (and any later `--help`) reaches the
             // in-cage mise's own help.
             if matches!(rest.first().and_then(|a| a.to_str()), Some("--help" | "-h")) {
                 return help::show(&["mise"]);
@@ -119,11 +119,11 @@ fn main() -> ExitCode {
         "net" => net_cmd(rest),
         "plugins" => plugins_cmd(rest),
         other => {
-            eprintln!("ops: unknown command '{other}'");
+            eprintln!("sbx: unknown command '{other}'");
             if let Some(path) = help::subcommand_hint(other) {
                 eprintln!("       did you mean `{path}`?");
             }
-            eprintln!("Run `ops --help` for the list of commands.");
+            eprintln!("Run `sbx --help` for the list of commands.");
             ExitCode::from(2)
         }
     }
@@ -134,7 +134,7 @@ fn main() -> ExitCode {
 const USERNS_REMEDIATION: &str = "enable capability-bearing unprivileged user namespaces \
 (no security boundary without them; no fallback): \
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, \
-or an AppArmor profile allowing unprivileged userns for ops";
+or an AppArmor profile allowing unprivileged userns for sbx";
 
 /// Remediation when the namespace itself is fine but a real launch still failed —
 /// the fault is the engine, not the boundary.
@@ -163,13 +163,13 @@ fn tag_fail(p: &style::Palette) -> String {
 fn doctor() -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);
-    println!("{h}ops doctor{r} — runtime preflight\n");
+    println!("{h}sbx doctor{r} — runtime preflight\n");
 
     let mut remediation: Vec<&str> = Vec::new();
 
     // The data directory, resolved once and reused for the engines and the store/channel
     // report below. Read-only in that it derives paths from the environment; resolving the
-    // engines may materialize one ops ships (the bundled-* builds), which is intended.
+    // engines may materialize one sbx ships (the bundled-* builds), which is intended.
     let layout = store::Layout::from_env();
 
     // The sandbox engine itself. Hold the choice: a present engine is what lets the
@@ -196,7 +196,7 @@ fn doctor() -> ExitCode {
         }
     }
 
-    // The security boundary, proven the way ops actually uses it: a real bwrap
+    // The security boundary, proven the way sbx actually uses it: a real bwrap
     // launch through the argv builder. A hardened process (CapEff=0,
     // NoNewPrivs=1) proves the user namespace is capability-bearing more
     // conclusively than a raw `unshare` can — bubblewrap cannot nest its
@@ -223,8 +223,8 @@ fn doctor() -> ExitCode {
     report_resource_limits(&pal, &config::global_limits());
 
     // The nix that drives the store. Its absence is load-bearing too — without
-    // nix, ops cannot provision a project's tools. Resolution follows override,
-    // then an ops-owned engine, then `PATH`; it makes no store or config change,
+    // nix, sbx cannot provision a project's tools. Resolution follows override,
+    // then an sbx-owned engine, then `PATH`; it makes no store or config change,
     // though a `bundled-nix` build materializes its embedded engine under
     // `<data>/engine/` on first use (idempotent), which a launch would do anyway.
     match store::resolve_nix(layout.as_ref()) {
@@ -236,23 +236,23 @@ fn doctor() -> ExitCode {
         }
         None => {
             println!("  {} nix               not found", tag_fail(&pal));
-            remediation.push("install nix (the store engine ops drives daemonlessly)");
+            remediation.push("install nix (the store engine sbx drives daemonlessly)");
         }
     }
 
-    // git fetches a remote plugin store (`ops plugins store add`). It is not on the launch
+    // git fetches a remote plugin store (`sbx plugins store add`). It is not on the launch
     // path — a sandbox runs without it — so its absence is a feature gap reported for
-    // context, never a boundary failure that blocks `ops run`.
+    // context, never a boundary failure that blocks `sbx run`.
     match store::resolve_git() {
         Some(git) => println!("  {} git               {}", tag_ok(&pal), git.display()),
         None => println!(
-            "  {} git               not found on PATH — needed only for `ops plugins store`",
+            "  {} git               not found on PATH — needed only for `sbx plugins store`",
             tag_warn(&pal)
         ),
     }
 
     // Where the user-owned store lives, and which channel revision it is pinned to.
-    // Both are reported read-only: ops creates the store lazily on first use and
+    // Both are reported read-only: sbx creates the store lazily on first use and
     // seeds the channel lock on first launch, so their absence here is informational,
     // not a failure. The channel state is the host-level global lock (doctor has no
     // project context), shown straight from disk.
@@ -297,12 +297,12 @@ fn doctor() -> ExitCode {
 
     println!();
     if remediation.is_empty() {
-        println!("ops: prerequisites OK.");
+        println!("sbx: prerequisites OK.");
         ExitCode::SUCCESS
     } else {
         let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
         eprintln!(
-            "{}ops: missing prerequisite(s) — ops CANNOT run until these are resolved:{}",
+            "{}sbx: missing prerequisite(s) — sbx CANNOT run until these are resolved:{}",
             epal.err, epal.reset
         );
         for hint in remediation {
@@ -320,7 +320,7 @@ fn doctor() -> ExitCode {
 fn report_resource_limits(pal: &style::Palette, limits: &sandbox::cgroup::Limits) {
     // Reflect the *global* config's limits — they apply to every launch regardless of project,
     // and the live probe validates them, so a bad global value surfaces here. A trusted project
-    // may further tune them per project; `ops config` is the project-aware view.
+    // may further tune them per project; `sbx config` is the project-aware view.
     let report: sandbox::LimitReport = sandbox::resource_limits(limits);
     if report.verified {
         println!(
@@ -440,11 +440,11 @@ fn classify_namespace_failure(
     remediation.push(USERNS_REMEDIATION);
 }
 
-/// `ops session <subcommand>` (alias `ops sessions`): the namespace grouping every operation on a
+/// `sbx session <subcommand>` (alias `sbx sessions`): the namespace grouping every operation on a
 /// live sandbox session — `ls` lists them, `attach` runs a shell or a command inside one, `stop`
 /// ends them.
 /// A leading `--help` (at any depth) is intercepted by [`help::maybe_help`], which also covers the
-/// `sessions` alias that the top-level help interception does not reach. A bare `ops session` prints
+/// `sessions` alias that the top-level help interception does not reach. A bare `sbx session` prints
 /// the namespace page; an unknown subcommand is a usage error.
 fn session_cmd(args: Vec<OsString>) -> ExitCode {
     if let Some(code) = help::maybe_help("session", &args) {
@@ -459,30 +459,30 @@ fn session_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         Some(other) => {
-            eprintln!("ops: session: unknown subcommand `{other}`");
-            eprintln!("       run `ops help session` for usage.");
+            eprintln!("sbx: session: unknown subcommand `{other}`");
+            eprintln!("       run `sbx help session` for usage.");
             ExitCode::from(2)
         }
     }
 }
 
-/// `ops session ls`: list the live sandbox sessions from the on-disk registry. Reading
+/// `sbx session ls`: list the live sandbox sessions from the on-disk registry. Reading
 /// the registry re-validates and prunes dead records as a side effect, so the
 /// list is always current without a daemon.
 fn list_sessions() -> ExitCode {
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ops: cannot read the session registry: {e}");
+            eprintln!("sbx: cannot read the session registry: {e}");
             return ExitCode::FAILURE;
         }
     };
     if sessions.is_empty() {
-        println!("ops: no active sandbox sessions.");
+        println!("sbx: no active sandbox sessions.");
         return ExitCode::SUCCESS;
     }
 
@@ -491,7 +491,7 @@ fn list_sessions() -> ExitCode {
     let uptime = uptime_seconds();
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     // Each row is materialized first so the column widths can flex to the widest value: an
-    // app session's KIND is `app:<name>` and a cage name is `ops-<slug>`, either of which can
+    // app session's KIND is `app:<name>` and a cage name is `sbx-<slug>`, either of which can
     // exceed a fixed width and shift every following column out of alignment.
     let rows: Vec<(String, String, String, String, String)> = sessions
         .iter()
@@ -529,10 +529,10 @@ fn list_sessions() -> ExitCode {
     );
     println!("{h}{header}{r}");
     for (name, label, pid, age, project) in &rows {
-        // NAME is the cage's own name — the same `ops-<slug>` its systemd scope and in-cage
+        // NAME is the cage's own name — the same `sbx-<slug>` its systemd scope and in-cage
         // hostname show — so a session cross-references with the host tooling. An app session's
         // KIND is `app:<name>`, so the user can tell which sessions are agents (and that
-        // `ops session attach`/`ops session stop` act on that app's isolated environment). NAME is
+        // `sbx session attach`/`sbx session stop` act on that app's isolated environment). NAME is
         // padded before
         // coloring so the color span does not disturb the width.
         let name = format!("{name:<name_w$}");
@@ -541,10 +541,10 @@ fn list_sessions() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops session attach <id> [-- command [args...]]`: enter a running session's live cage. With no
+/// `sbx session attach <id> [-- command [args...]]`: enter a running session's live cage. With no
 /// command it opens an interactive shell; with `-- command` it runs that command inside the cage
 /// (through a pty when stdin is a terminal, inherited stdio otherwise). The operand before any `--`
-/// is the PID `ops session ls` shows — exactly one; a missing, extra, or non-UTF-8 operand, or a
+/// is the PID `sbx session ls` shows — exactly one; a missing, extra, or non-UTF-8 operand, or a
 /// bare `--` with no command, is a usage error; a well-formed id that matches no live session is
 /// reported by `attach` itself.
 fn attach_cmd(args: Vec<OsString>) -> ExitCode {
@@ -556,7 +556,7 @@ fn attach_cmd(args: Vec<OsString>) -> ExitCode {
     };
     let usage = || {
         eprintln!(
-            "ops: usage: {}   (the PID shown by `ops session ls`)",
+            "sbx: usage: {}   (the PID shown by `sbx session ls`)",
             help::synopsis_of(&["session", "attach"])
         );
         ExitCode::from(2)
@@ -571,12 +571,12 @@ fn attach_cmd(args: Vec<OsString>) -> ExitCode {
     sandbox::attach(id, cmd)
 }
 
-/// The default grace period between SIGTERM and SIGKILL for `ops session stop`: long enough for an agent to
+/// The default grace period between SIGTERM and SIGKILL for `sbx session stop`: long enough for an agent to
 /// finish writing and shut down cleanly, short enough not to hang. `--delay` overrides it.
 const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
 
-/// `ops session stop <id>... [--delay <secs>]` / `ops session stop --all [--delay <secs>]`: stop
-/// running sessions. With ids, stop the named ones (the pids `ops session ls` shows); with `--all`,
+/// `sbx session stop <id>... [--delay <secs>]` / `sbx session stop --all [--delay <secs>]`: stop
+/// running sessions. With ids, stop the named ones (the pids `sbx session ls` shows); with `--all`,
 /// stop every live session.
 /// Sends SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once).
 /// Either ids or `--all` is required (not both); a non-UTF-8 operand or a malformed `--delay` value
@@ -590,14 +590,14 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
         match arg.to_str() {
             Some("--delay") => {
                 let Some(value) = it.next() else {
-                    eprintln!("ops: --delay needs a value in seconds (e.g. --delay 10).");
+                    eprintln!("sbx: --delay needs a value in seconds (e.g. --delay 10).");
                     return ExitCode::from(2);
                 };
                 match value.to_str().and_then(|v| v.parse::<u64>().ok()) {
                     Some(secs) => delay = Duration::from_secs(secs),
                     None => {
                         eprintln!(
-                            "ops: --delay must be a whole number of seconds, not '{}'.",
+                            "sbx: --delay must be a whole number of seconds, not '{}'.",
                             value.to_string_lossy()
                         );
                         return ExitCode::from(2);
@@ -607,18 +607,18 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
             Some("--all") => all = true,
             Some(id) => ids.push(id.to_string()),
             None => {
-                eprintln!("ops: stop ids must be valid text (the PID shown by `ops session ls`).");
+                eprintln!("sbx: stop ids must be valid text (the PID shown by `sbx session ls`).");
                 return ExitCode::from(2);
             }
         }
     }
     if all && !ids.is_empty() {
-        eprintln!("ops: stop takes either explicit ids or --all, not both.");
+        eprintln!("sbx: stop takes either explicit ids or --all, not both.");
         return ExitCode::from(2);
     }
     if !all && ids.is_empty() {
         eprintln!(
-            "ops: usage: {}\n   (ids are the PIDs shown by `ops session ls`)",
+            "sbx: usage: {}\n   (ids are the PIDs shown by `sbx session ls`)",
             help::synopsis_of(&["session", "stop"])
         );
         return ExitCode::from(2);
@@ -627,11 +627,11 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
     sandbox::stop(&id_refs, delay, all)
 }
 
-/// The config path an `ops trust`/`untrust` invocation targets: the given path,
-/// or the project `.ops.toml` in the current directory by default.
+/// The config path an `sbx trust`/`untrust` invocation targets: the given path,
+/// or the project `.sbx.toml` in the current directory by default.
 fn config_path_arg(arg: Option<OsString>) -> std::path::PathBuf {
     arg.map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(".ops.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".sbx.toml"))
 }
 
 /// Resolve the trust store directory or report why it cannot be located. The
@@ -640,21 +640,21 @@ fn config_path_arg(arg: Option<OsString>) -> std::path::PathBuf {
 fn trust_store_dir() -> Result<std::path::PathBuf, ExitCode> {
     trust::default_store_dir().ok_or_else(|| {
         eprintln!(
-            "ops: cannot locate the trust store — set HOME or XDG_STATE_HOME to an absolute path."
+            "sbx: cannot locate the trust store — set HOME or XDG_STATE_HOME to an absolute path."
         );
         ExitCode::FAILURE
     })
 }
 
-/// `ops trust [path]` vouches for a project config's current contents;
-/// `ops trust --show [path]` reports its trust state without changing it. `--show` is honored in
+/// `sbx trust [path]` vouches for a project config's current contents;
+/// `sbx trust --show [path]` reports its trust state without changing it. `--show` is honored in
 /// any position, and an unknown flag or a second path is a usage error — recording trust is the
 /// most security-sensitive write in the tool, so a mistyped `--show` must never fall through to it.
 fn trust_cmd(args: Vec<OsString>) -> ExitCode {
     let (show, path) = match parse_trust_args(args) {
         Ok(parsed) => parsed,
         Err(msg) => {
-            eprintln!("ops: {msg} — usage: ops trust [--show] [path]");
+            eprintln!("sbx: {msg} — usage: sbx trust [--show] [path]");
             return ExitCode::from(2);
         }
     };
@@ -666,7 +666,7 @@ fn trust_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// Parse `ops trust`'s arguments into `(show, path)`. `--show` is honored in any position and an
+/// Parse `sbx trust`'s arguments into `(show, path)`. `--show` is honored in any position and an
 /// unknown flag or a second path is an error — recording trust is the tool's most security-sensitive
 /// write, so a mistyped or trailing `--show` must never fall through to it. A pure helper (tested).
 fn parse_trust_args(args: Vec<OsString>) -> Result<(bool, Option<OsString>), String> {
@@ -701,17 +701,17 @@ fn record_trust(path: std::path::PathBuf) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("ops: cannot trust {}: {e}", path.display());
+            eprintln!("sbx: cannot trust {}: {e}", path.display());
             ExitCode::FAILURE
         }
     }
 }
 
 /// The confirmation line for a recorded trust — the resulting `trusted` state word in green,
-/// matching how `ops trust --show` renders that state. A pure presenter (its colored layout is
+/// matching how `sbx trust --show` renders that state. A pure presenter (its colored layout is
 /// asserted in a test); every span is empty under a non-terminal.
 fn render_trust_recorded(path: &Path, pal: &style::Palette) -> String {
-    format!("ops: {}trusted{} {}", pal.ok, pal.reset, path.display())
+    format!("sbx: {}trusted{} {}", pal.ok, pal.reset, path.display())
 }
 
 /// Report a config's current trust state. A query never changes anything, so it
@@ -738,13 +738,13 @@ fn render_trust_verdict(path: &Path, state: trust::TrustState, pal: &style::Pale
         trust::TrustState::Trusted => format!("{ok}trusted{r}"),
         trust::TrustState::Untrusted => format!("{warn}untrusted{r}"),
         trust::TrustState::Changed => {
-            format!("{err}changed{r} since it was trusted — re-run `ops trust` to re-approve")
+            format!("{err}changed{r} since it was trusted — re-run `sbx trust` to re-approve")
         }
     };
-    format!("ops: {} is {verdict}", path.display())
+    format!("sbx: {} is {verdict}", path.display())
 }
 
-/// `ops untrust [path]`: revoke a project config's trust, so its security-relevant
+/// `sbx untrust [path]`: revoke a project config's trust, so its security-relevant
 /// fields stop applying until it is trusted again.
 fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
     let path = config_path_arg(arg);
@@ -755,7 +755,7 @@ fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
     let result = match trust::untrust(&store_dir, &path) {
         Ok(existed) => existed,
         Err(e) => {
-            eprintln!("ops: cannot revoke trust for {}: {e}", path.display());
+            eprintln!("sbx: cannot revoke trust for {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -764,20 +764,20 @@ fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The confirmation line for `ops untrust`. When a marker existed it is revoked — the result is
+/// The confirmation line for `sbx untrust`. When a marker existed it is revoked — the result is
 /// the untrusted default, so `revoked` takes the caution hue that `--show` gives that state; when
 /// none existed it is a benign no-op, with the note dimmed. A pure presenter, asserted in a test.
 fn render_untrust_result(path: &Path, existed: bool, pal: &style::Palette) -> String {
     if existed {
         format!(
-            "ops: {}revoked{} trust for {}",
+            "sbx: {}revoked{} trust for {}",
             pal.warn,
             pal.reset,
             path.display()
         )
     } else {
         format!(
-            "ops: {} was not trusted; {}nothing to revoke{}",
+            "sbx: {} was not trusted; {}nothing to revoke{}",
             path.display(),
             pal.dim,
             pal.reset
@@ -785,13 +785,13 @@ fn render_untrust_result(path: &Path, existed: bool, pal: &style::Palette) -> St
     }
 }
 
-/// `ops config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
+/// `sbx config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
 /// shows the resolved configuration for the current project — the layered global + project
 /// environment and host binds (each read-only or read-write), after the trust gate has dropped
 /// anything an untrusted project may not set. The human form renders a colored document with
 /// warnings on stderr;
 /// `--json` prints the same resolved model as a JSON document. The verbs read and edit a single
-/// raw layer file (the project `.ops.toml`, the global config, or an explicit path).
+/// raw layer file (the project `.sbx.toml`, the global config, or an explicit path).
 fn config_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("show") => config_show(&args[1..]),
@@ -801,20 +801,20 @@ fn config_cmd(args: Vec<OsString>) -> ExitCode {
         Some("path") => config_path_cmd(&args[1..]),
         Some("edit") => config_edit(&args[1..]),
         // No subcommand — or an unknown one. Print the config page (which lists the subcommands)
-        // to stderr and exit non-zero, so `ops config` reveals `show`/`get`/… instead of silently
-        // doing one of them. Mirrors the no-command usage of bare `ops`.
+        // to stderr and exit non-zero, so `sbx config` reveals `show`/`get`/… instead of silently
+        // doing one of them. Mirrors the no-command usage of bare `sbx`.
         other => {
             match other {
-                // The old `ops config --json` muscle memory: the resolved view (and its --json) is
+                // The old `sbx config --json` muscle memory: the resolved view (and its --json) is
                 // now `show`, so point straight at it. Other flags belong to a specific subcommand
                 // (get/set/… take -c/--local/--trust), so name no verb and let the page below guide.
                 Some("--json") => {
-                    eprintln!("ops: config: --json is now `ops config show --json`")
+                    eprintln!("sbx: config: --json is now `sbx config show --json`")
                 }
                 Some(tok) if tok.starts_with('-') => eprintln!(
-                    "ops: config: {tok:?} is an option of a subcommand — pick one from the list below"
+                    "sbx: config: {tok:?} is an option of a subcommand — pick one from the list below"
                 ),
-                Some(tok) => eprintln!("ops: config: unknown subcommand {tok:?}"),
+                Some(tok) => eprintln!("sbx: config: unknown subcommand {tok:?}"),
                 None => {}
             }
             eprint!("{}", help::page_usage(&["config"]).unwrap_or_default());
@@ -823,7 +823,7 @@ fn config_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `ops config show [--json]`: show the resolved configuration for the current project — the
+/// `sbx config show [--json]`: show the resolved configuration for the current project — the
 /// layered, trust-gated view a launch would use. The human render is colored when stdout is a
 /// terminal; `--json` emits the whole resolved model for tooling.
 /// Record a chosen single-source `config show` view flag (`--global`/`--local`/`--default`),
@@ -837,8 +837,8 @@ fn set_show_source(
     match current {
         Some((prev, _)) if *prev == flag => Ok(()),
         Some((prev, _)) => {
-            eprintln!("ops: config show: `{flag}` conflicts with `{prev}` (choose one source)");
-            eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+            eprintln!("sbx: config show: `{flag}` conflicts with `{prev}` (choose one source)");
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
             Err(ExitCode::from(2))
         }
         None => {
@@ -861,8 +861,8 @@ fn config_show(args: &[OsString]) -> ExitCode {
             Some("--app") | Some("-a") => match it.next() {
                 Some(name) => app = Some(name.to_string_lossy().into_owned()),
                 None => {
-                    eprintln!("ops: config show: `--app` needs an app name");
-                    eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+                    eprintln!("sbx: config show: `--app` needs an app name");
+                    eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
                     return ExitCode::from(2);
                 }
             },
@@ -886,10 +886,10 @@ fn config_show(args: &[OsString]) -> ExitCode {
             }
             _ => {
                 eprintln!(
-                    "ops: config show: unexpected argument {:?}",
+                    "sbx: config show: unexpected argument {:?}",
                     arg.to_string_lossy()
                 );
-                eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+                eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
                 return ExitCode::from(2);
             }
         }
@@ -900,8 +900,8 @@ fn config_show(args: &[OsString]) -> ExitCode {
     // ignoring one flag.
     if app.is_some() {
         if let Some((flag, _)) = source {
-            eprintln!("ops: config show: `--app` does not combine with `{flag}`");
-            eprintln!("ops: usage: {}", help::synopsis_of(&["config", "show"]));
+            eprintln!("sbx: config show: `--app` does not combine with `{flag}`");
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
             return ExitCode::from(2);
         }
     }
@@ -909,7 +909,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -934,7 +934,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
         match serde_json::to_string_pretty(&view) {
             Ok(doc) => println!("{doc}"),
             Err(e) => {
-                eprintln!("ops: cannot serialize the configuration: {e}");
+                eprintln!("sbx: cannot serialize the configuration: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -955,16 +955,16 @@ fn config_show(args: &[OsString]) -> ExitCode {
 /// Errors (listing the declared apps) when no such app exists.
 fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCode {
     let Some(view) = config::view::build_app_detail(cwd, name) else {
-        eprintln!("ops: config show: no app named {name:?}");
+        eprintln!("sbx: config show: no app named {name:?}");
         let declared: Vec<String> = config::view::build(cwd)
             .apps
             .into_iter()
             .map(|a| a.name)
             .collect();
         if declared.is_empty() {
-            eprintln!("ops: no apps are declared for this directory");
+            eprintln!("sbx: no apps are declared for this directory");
         } else {
-            eprintln!("ops: declared apps: {}", declared.join(", "));
+            eprintln!("sbx: declared apps: {}", declared.join(", "));
         }
         return ExitCode::FAILURE;
     };
@@ -973,7 +973,7 @@ fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCod
         match serde_json::to_string_pretty(&view) {
             Ok(doc) => println!("{doc}"),
             Err(e) => {
-                eprintln!("ops: cannot serialize the app configuration: {e}");
+                eprintln!("sbx: cannot serialize the app configuration: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -1076,7 +1076,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     // — so where a value came from reads at a glance. None of this is new data; it is the gating
     // outcome and the per-value origin made visible. Every span is empty under a non-terminal, so
     // captured output stays byte-for-byte the plain text the integration tests pin.
-    let _ = writeln!(o, "{h}ops config{r} — resolved for {n}{}{r}", view.cwd);
+    let _ = writeln!(o, "{h}sbx config{r} — resolved for {n}{}{r}", view.cwd);
 
     // The layered environment and host binds (read-only or read-write), after the trust gate.
     if view.env.is_empty() {
@@ -1228,7 +1228,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 let _ = writeln!(
                     o,
                     "    {dim}ask notice: off (parked requests are silent — answer via \
-                     `ops net pending`){r}"
+                     `sbx net pending`){r}"
                 );
             }
             match default_action {
@@ -1281,7 +1281,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 NetDefaultView::Ask => {
                     let _ = writeln!(
                         o,
-                        "    {dim}an unlisted host parks for a live `ops net pending` decision; \
+                        "    {dim}an unlisted host parks for a live `sbx net pending` decision; \
                          these are pre-decided:{r}"
                     );
                     if !allow.is_empty() {
@@ -1308,7 +1308,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if !mute.is_empty() {
                 let _ = writeln!(
                     o,
-                    "    {dim}mute (refusals kept out of `ops net log`; see `--all`):{r}"
+                    "    {dim}mute (refusals kept out of `sbx net log`; see `--all`):{r}"
                 );
                 for rule in mute {
                     let _ = writeln!(o, "      {dim}mute{r}  {n}{rule}{r}");
@@ -1333,7 +1333,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 o,
                 "    {dim}stats: {}{r}",
                 if view.egress_stats {
-                    "recording (ops net stats)"
+                    "recording (sbx net stats)"
                 } else {
                     "off"
                 }
@@ -1393,7 +1393,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     }
 
     // Resource limits — shown only when a config `[limits]` override customizes one, so a
-    // default-profile config stays uncluttered (the effective defaults are in `ops doctor`). When
+    // default-profile config stays uncluttered (the effective defaults are in `sbx doctor`). When
     // shown, each of the three fields carries its own provenance: the overridden ones name their
     // layer, the untouched ones read `(default)`, so the line tells exactly which limits were tuned.
     let l = &view.limits;
@@ -1452,7 +1452,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     }
 
     // Named application profiles, each a gated overlay over the baseline: the command it runs,
-    // what its overlay adds, and its own dropped-field notes (so `ops app <name>` holds no
+    // what its overlay adds, and its own dropped-field notes (so `sbx app <name>` holds no
     // surprises). Security fields appear only when their source was trusted, exactly as at launch.
     if !view.apps.is_empty() {
         let _ = writeln!(o, "  {h}apps:{r}");
@@ -1470,7 +1470,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             // The environment this overlay adds over the baseline — a count by default, each
             // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
             // value shown is the one that enters the cage (a placeholder for a credential profile),
-            // never the injected secret, which ops reads host-side and never prints.
+            // never the injected secret, which sbx reads host-side and never prints.
             if !app.env.is_empty() {
                 if details {
                     let _ = writeln!(o, "      {dim}env:{r}");
@@ -1482,7 +1482,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 }
             }
             // The host binds this overlay adds — a security field, so what host paths
-            // `ops app <name>` exposes (and whether read-write) is visible here, the same as the
+            // `sbx app <name>` exposes (and whether read-write) is visible here, the same as the
             // baseline `binds` section. A count by default, each canonical path under `--details`.
             if !app.binds.is_empty() {
                 if details {
@@ -1533,7 +1533,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             }
             // An overlay is a compact summary by default — one line per field; an allowlist shows
             // just its rule counts. `--details` expands that to the individual allow/deny rules
-            // and the always-allowed built-in hosts, so what `ops app <name>` can reach is visible
+            // and the always-allowed built-in hosts, so what `sbx app <name>` can reach is visible
             // here (the baseline `network` section shows the built-in set only when the *baseline*
             // is an allowlist, which a profile's app-overlay allowlist is not).
             if let Some(net) = &app.network {
@@ -1651,7 +1651,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             }
             // The cgroup limits this overlay overrides — only the fields it tunes, since an app
             // does not carry the full effective set (an unset field inherits the baseline, shown in
-            // `ops doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
+            // `sbx doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
             if let Some(limits) = &app.limits {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = &limits.memory_high {
@@ -1687,7 +1687,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
             // under `--details` to each by destination and source, the same metadata the baseline
-            // section shows. Never the value; ops reads that host-side.
+            // section shows. Never the value; sbx reads that host-side.
             if !app.secrets.is_empty() {
                 if details {
                     let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
@@ -1733,7 +1733,7 @@ fn render_app_detail(
 
     let _ = writeln!(
         o,
-        "{h}ops config{r} — app {n}{}{r} resolved for {n}{}{r}",
+        "{h}sbx config{r} — app {n}{}{r} resolved for {n}{}{r}",
         view.name, view.cwd
     );
 
@@ -1791,7 +1791,7 @@ fn render_app_detail(
                 let _ = writeln!(
                     o,
                     "    {dim}ask notice: off (parked requests are silent — answer via \
-                     `ops net pending`){r}"
+                     `sbx net pending`){r}"
                 );
             }
             if details {
@@ -1935,7 +1935,7 @@ fn render_app_detail(
 
     // Collections: the overlay's own additions and how many baseline entries it inherits. The own
     // entry lists expand under `--details`; the inherited baseline entries are not re-listed (they
-    // are one hop away in `ops config show`).
+    // are one hop away in `sbx config show`).
     let _ = writeln!(
         o,
         "  {h}env:{r}     {}",
@@ -1989,7 +1989,7 @@ fn render_app_detail(
 
 /// The compact summary for a per-app collection: `<own> own · inherits <n> baseline`. The own count
 /// rides the name span (the app's own contribution), the inherited count is dim (it lives in the
-/// baseline `ops config show`).
+/// baseline `sbx config show`).
 fn collection_summary(own: usize, inherited: usize, pal: &style::Palette) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
     format!("{n}{own}{r} own  {dim}· inherits {inherited} baseline{r}")
@@ -2074,7 +2074,7 @@ struct ScopeArgs {
     positionals: Vec<String>,
     scope: config::manage::Scope,
     /// Whether a scope flag (`-l`/`-g`/`-c`) was given explicitly, as opposed to the `Local`
-    /// default — `ops config path` shows the resolution overview when none was.
+    /// default — `sbx config path` shows the resolution overview when none was.
     scope_explicit: bool,
     trust: bool,
     app: Option<String>,
@@ -2138,13 +2138,13 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
 /// Rewrite a dotted `key` to address it under app `name`'s table — the `--app <name>` sugar, so
 /// `set --app demo network shared` writes `app.demo.network`. The name keys a single TOML table
 /// segment, and the segment splitter does not handle quoting, so a name with a `.` (which is a
-/// valid app name otherwise) cannot be addressed this way — it is edited directly with `ops config
+/// valid app name otherwise) cannot be addressed this way — it is edited directly with `sbx config
 /// edit`. A name that no app could ever carry is rejected outright.
 fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
     if name.contains('.') {
         return Err(format!(
             "an app name containing `.` (`{name}`) cannot be addressed with `--app`; \
-             edit it directly with `ops config edit`"
+             edit it directly with `sbx config edit`"
         ));
     }
     if !config::is_valid_app_name(name) {
@@ -2155,21 +2155,21 @@ fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
 
 /// Print the usage synopsis for a `config` verb and return the usage exit code.
 fn config_usage(verb: &str) -> ExitCode {
-    eprintln!("ops: usage: {}", help::synopsis_of(&["config", verb]));
+    eprintln!("sbx: usage: {}", help::synopsis_of(&["config", verb]));
     ExitCode::from(2)
 }
 
 /// Resolve the working directory, mapping a failure to an error exit. Shared by the verbs.
 fn config_cwd() -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|e| {
-        eprintln!("ops: cannot read the current directory: {e}");
+        eprintln!("sbx: cannot read the current directory: {e}");
         ExitCode::FAILURE
     })
 }
 
-/// `ops config get <key>`: print the value declared at a dotted key in the target layer file
+/// `sbx config get <key>`: print the value declared at a dotted key in the target layer file
 /// (`--local` by default). This reads the *raw declared* value in that one file; for the
-/// *effective resolved* value across layers, use `ops config show` / `ops config show --json`. An
+/// *effective resolved* value across layers, use `sbx config show` / `sbx config show --json`. An
 /// unset key OR a read/parse error both exit 1 (each prints a distinct stderr line saying which); a
 /// usage problem exits 2.
 fn config_get(args: &[OsString]) -> ExitCode {
@@ -2181,7 +2181,7 @@ fn config_get(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("ops: config get: {e}");
+            eprintln!("sbx: config get: {e}");
             return config_usage("get");
         }
     };
@@ -2203,11 +2203,11 @@ fn config_get(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(None) => {
-            eprintln!("ops: config: `{}` is not set in {}", key, path.display());
+            eprintln!("sbx: config: `{}` is not set in {}", key, path.display());
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("ops: config: {e}");
+            eprintln!("sbx: config: {e}");
             ExitCode::FAILURE
         }
     }
@@ -2218,7 +2218,7 @@ fn config_get(args: &[OsString]) -> ExitCode {
 /// `--app` was passed, else `None`.
 fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
     if app.is_some() {
-        eprintln!("ops: config {verb}: `--app` does not apply to `{verb}` (it takes no key)");
+        eprintln!("sbx: config {verb}: `--app` does not apply to `{verb}` (it takes no key)");
         Some(config_usage(verb))
     } else {
         None
@@ -2228,9 +2228,9 @@ fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
 /// Resolve the file a key-taking verb (`get`/`set`/`unset`) targets and the dotted key within it,
 /// applying the `--app <name>` routing and reporting whether the target is trust-gated.
 ///
-/// The routing mirrors `ops net … -a <name>`: a **global** app lives in its own profile file
+/// The routing mirrors `sbx net … -a <name>`: a **global** app lives in its own profile file
 /// `apps/<name>.toml` with **top-level** keys, so the key is used as-is; an app declared **inline**
-/// (a project `.ops.toml` or a `-c` file) is addressed under its `app.<name>.` table. The name
+/// (a project `.sbx.toml` or a `-c` file) is addressed under its `app.<name>.` table. The name
 /// asymmetry is deliberate, not a bug: a `.`-containing app name is addressable at `-g` (it keys the
 /// profile *filename*) but rejected inline (the dotted-key splitter does not handle a quoted segment).
 ///
@@ -2249,7 +2249,7 @@ fn resolve_key_target(
     let gated = !matches!(scope, Scope::Global);
     let scope_path = |scope: &Scope| {
         manage::scope_path(scope, cwd).map_err(|e| {
-            eprintln!("ops: config: {e}");
+            eprintln!("sbx: config: {e}");
             ExitCode::FAILURE
         })
     };
@@ -2257,21 +2257,21 @@ fn resolve_key_target(
         (None, _) => Ok((scope_path(scope)?, raw_key.to_string(), gated)),
         (Some(name), Scope::Global) => {
             // A global app is its own profile file with top-level keys. The name keys that
-            // filename, so validate it (anti-traversal) the way `ops net … -a <name> -g` does.
+            // filename, so validate it (anti-traversal) the way `sbx net … -a <name> -g` does.
             if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
-                eprintln!("ops: config {verb}: invalid app name `{name}`");
+                eprintln!("sbx: config {verb}: invalid app name `{name}`");
                 return Err(config_usage(verb));
             }
             let path = manage::scope_app_path(scope, cwd, name).map_err(|e| {
-                eprintln!("ops: config: {e}");
+                eprintln!("sbx: config: {e}");
                 ExitCode::FAILURE
             })?;
             Ok((path, raw_key.to_string(), false))
         }
         (Some(name), _) => {
-            // An inline app (project `.ops.toml` or a `-c` file) is addressed under `app.<name>.`.
+            // An inline app (project `.sbx.toml` or a `-c` file) is addressed under `app.<name>.`.
             let key = app_prefixed_key(name, raw_key).map_err(|e| {
-                eprintln!("ops: config {verb}: {e}");
+                eprintln!("sbx: config {verb}: {e}");
                 config_usage(verb)
             })?;
             Ok((scope_path(scope)?, key, gated))
@@ -2285,17 +2285,17 @@ fn resolve_key_target(
 fn render_config_write(verb: &str, key: &str, path: &Path, pal: &style::Palette) -> String {
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
     format!(
-        "ops: {ok}{verb}{r} `{n}{key}{r}` in {n}{}{r}",
+        "sbx: {ok}{verb}{r} `{n}{key}{r}` in {n}{}{r}",
         path.display()
     )
 }
 
-/// The no-op confirmation for `ops config unset` on a key that was not set — dimmed, since nothing
+/// The no-op confirmation for `sbx config unset` on a key that was not set — dimmed, since nothing
 /// changed (and so trust is never re-armed). A pure presenter.
 fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palette) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
     format!(
-        "ops: `{n}{key}{r}` {dim}was not set in {}{r}",
+        "sbx: `{n}{key}{r}` {dim}was not set in {}{r}",
         path.display()
     )
 }
@@ -2305,15 +2305,15 @@ fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palette) -> Stri
 fn render_trusted_whole_file(path: &Path, pal: &style::Palette) -> String {
     let (ok, n, dim, r) = (pal.ok, pal.name, pal.dim, pal.reset);
     format!(
-        "ops: {ok}trusted{r} {n}{}{r} {dim}(the whole file is now trusted){r}",
+        "sbx: {ok}trusted{r} {n}{}{r} {dim}(the whole file is now trusted){r}",
         path.display()
     )
 }
 
-/// `ops config set <key> <value>`: write a string value at a dotted key in the target layer file
+/// `sbx config set <key> <value>`: write a string value at a dotted key in the target layer file
 /// (`--local` by default), preserving the rest of the file's comments and formatting. Because the
 /// trust gate hashes the whole file, any edit re-arms it — so a write to a trusted file warns that
-/// its security fields will not apply until `ops trust`, and `--trust` re-trusts in one step.
+/// its security fields will not apply until `sbx trust`, and `--trust` re-trusts in one step.
 fn config_set(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
@@ -2324,7 +2324,7 @@ fn config_set(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("ops: config set: {e}");
+            eprintln!("sbx: config set: {e}");
             return config_usage("set");
         }
     };
@@ -2359,13 +2359,13 @@ fn config_set(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("ops: config: {e}");
+            eprintln!("sbx: config: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops config unset <key>`: remove a dotted key from the target layer file. Removing a key that
+/// `sbx config unset <key>`: remove a dotted key from the target layer file. Removing a key that
 /// was not set is a no-op (exit 0) that changes nothing — so it never re-arms trust. A removal
 /// that does change a trusted file re-arms it, with the same warning as `set`.
 fn config_unset(args: &[OsString]) -> ExitCode {
@@ -2378,7 +2378,7 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("ops: config unset: {e}");
+            eprintln!("sbx: config unset: {e}");
             return config_usage("unset");
         }
     };
@@ -2413,22 +2413,22 @@ fn config_unset(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("ops: config: {e}");
+            eprintln!("sbx: config: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops config path`: with no scope flag, show the config files a launch resolves, in order, each
-/// with whether it exists — so it is clear where ops looks (and that a default project `.ops.toml`
+/// `sbx config path`: with no scope flag, show the config files a launch resolves, in order, each
+/// with whether it exists — so it is clear where sbx looks (and that a default project `.sbx.toml`
 /// need not exist). With an explicit scope (`-l`/`-g`/`-c`), print the single bare path that scope
 /// targets — the file `set`/`unset`/`edit` would touch, for scripting and for finding the global
 /// config.
-/// `ops path [--json]`: show every on-disk location ops uses, grouped by XDG base
+/// `sbx path [--json]`: show every on-disk location sbx uses, grouped by XDG base
 /// (data, config, state), marking which exist and enumerating the per-project /
 /// per-app / per-profile entries actually on disk. Read-only, no trust gate, no
-/// network — the layout map that answers "where on disk does ops put things?".
-/// The counterpart of `ops config path` (the config files in resolution order)
+/// network — the layout map that answers "where on disk does sbx put things?".
+/// The counterpart of `sbx config path` (the config files in resolution order)
 /// for the rest of the filesystem.
 fn path_cmd(args: &[OsString]) -> ExitCode {
     let mut json = false;
@@ -2436,12 +2436,12 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
         match a.to_str() {
             Some("--json") => json = true,
             Some(other) => {
-                eprintln!("ops: path: unknown argument `{other}`");
-                eprintln!("       run `ops help path` for usage.");
+                eprintln!("sbx: path: unknown argument `{other}`");
+                eprintln!("       run `sbx help path` for usage.");
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("ops: path: argument is not valid UTF-8");
+                eprintln!("sbx: path: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -2455,7 +2455,7 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("ops: path: failed to serialize: {e}");
+                eprintln!("sbx: path: failed to serialize: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -2476,7 +2476,7 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("ops: config path: {e}");
+            eprintln!("sbx: config path: {e}");
             return config_usage("path");
         }
     };
@@ -2506,7 +2506,7 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("ops: config: {e}");
+            eprintln!("sbx: config: {e}");
             ExitCode::FAILURE
         }
     }
@@ -2541,11 +2541,11 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
             }
         }
     }
-    let _ = writeln!(o, "{dim}for the resolved values, see `ops config show`.{r}");
+    let _ = writeln!(o, "{dim}for the resolved values, see `sbx config show`.{r}");
     o
 }
 
-/// `ops config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
+/// `sbx config edit`: open the target layer file in `$VISUAL`/`$EDITOR` (falling back to `vi`).
 /// The escape hatch for what `set` does not handle — arrays, secrets, and app tables. Runs through
 /// a shell so an editor carrying arguments (e.g. `code --wait`) works, with the path passed as a
 /// positional so it needs no quoting. Because the trust gate hashes the whole file, an edit that
@@ -2561,7 +2561,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("ops: config edit: {e}");
+            eprintln!("sbx: config edit: {e}");
             return config_usage("edit");
         }
     };
@@ -2578,7 +2578,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     let path = match config::manage::scope_path(&scope, &cwd) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: config: {e}");
+            eprintln!("sbx: config: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2586,7 +2586,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     // directory may not exist yet).
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("ops: config: cannot create {}: {e}", parent.display());
+            eprintln!("sbx: config: cannot create {}: {e}", parent.display());
             return ExitCode::FAILURE;
         }
     }
@@ -2610,7 +2610,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
         // The editor ran (whatever its exit) — the file is now whatever the user saved.
         Ok(_) => {}
         Err(e) => {
-            eprintln!("ops: config: could not launch the editor `{editor}`: {e}");
+            eprintln!("sbx: config: could not launch the editor `{editor}`: {e}");
             return ExitCode::FAILURE;
         }
     }
@@ -2635,7 +2635,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
                 path.display()
             ));
             diag::hint(&format!(
-                "       run `ops trust {}` to re-apply its security fields",
+                "       run `sbx trust {}` to re-apply its security fields",
                 path.display()
             ));
         }
@@ -2646,7 +2646,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
 /// Report the trust consequence of a write, the load-bearing UX of `set`/`unset`: the whole-file
 /// trust hash means any edit re-arms the gate. `--trust` re-trusts in one step (blessing the whole
 /// current file); otherwise a write to a previously-trusted file warns that its security fields
-/// will not apply until `ops trust`, and a write of a security field to an untrusted file notes it
+/// will not apply until `sbx trust`, and a write of a security field to an untrusted file notes it
 /// needs trust to take effect. A free `env` write to an untrusted file needs neither.
 fn report_write_trust(
     path: &Path,
@@ -2657,7 +2657,7 @@ fn report_write_trust(
     gated: bool,
 ) {
     // The global config and the app profiles under `apps/` are trusted **by location** — they carry
-    // no per-file trust marker, so a write never re-arms a gate and needs no `ops trust`. Reporting
+    // no per-file trust marker, so a write never re-arms a gate and needs no `sbx trust`. Reporting
     // one would be a false positive (the field applies as soon as the file is read), so say nothing —
     // beyond noting that an explicit `--trust` is unnecessary here.
     if !gated {
@@ -2688,12 +2688,12 @@ fn report_write_trust(
             path.display()
         ));
         diag::hint(&format!(
-            "       its security fields will not apply until you run `ops trust {}`",
+            "       its security fields will not apply until you run `sbx trust {}`",
             path.display()
         ));
     } else if is_security_key(key) {
         diag::note(&format!(
-            "`{key}` is a security field; it applies only once {} is trusted (`ops trust`)",
+            "`{key}` is a security field; it applies only once {} is trusted (`sbx trust`)",
             path.display()
         ));
     }
@@ -2732,7 +2732,7 @@ fn take_flag_value(
             Ok(())
         }
         None => {
-            eprintln!("ops: {verb}: `{flag}` needs a value");
+            eprintln!("sbx: {verb}: `{flag}` needs a value");
             Err(ExitCode::from(2))
         }
     }
@@ -2749,7 +2749,7 @@ fn flag_name(raw: &str) -> &str {
 /// inline `--gpu=true`/`--gpu=false` form carries a value — the next argument is **never** consumed,
 /// so `--gpu <app>` leaves the app name in place. The raw `true`/`false` string is pushed as-is; the
 /// override collector validates it (a value other than true/false is a usage error there), keeping the
-/// grammar identical for the CLI flag and its `OPS_GPU`/`OPS_DBUS` environment twin.
+/// grammar identical for the CLI flag and its `SBX_GPU`/`SBX_DBUS` environment twin.
 fn take_flag_bool(head: &mut Vec<OsString>, sink: &mut Vec<String>) {
     let token = head.remove(0);
     // `--gpu=value`: the value is inline; a bare `--gpu` normalizes to `true`.
@@ -2775,7 +2775,7 @@ fn take_override_flag(
     // is taken (which mutates `head`).
     let name = flag_name(head.first()?.to_str()?).to_string();
     // The boolean flags are optional-value (`--gpu`, `--gpu=true`, `--gpu=false`) and must never
-    // consume the following argument — else `ops app --gpu <name>` would swallow the app name — so
+    // consume the following argument — else `sbx app --gpu <name>` would swallow the app name — so
     // they take a dedicated path rather than the value-required `take_flag_value`.
     match name.as_str() {
         "--gpu" => {
@@ -2809,7 +2809,7 @@ fn take_override_flag(
     Some(take_flag_value(head, sink, verb, &name))
 }
 
-/// Build the one-shot override from the collected CLI flag values and the ambient `OPS_*`
+/// Build the one-shot override from the collected CLI flag values and the ambient `SBX_*`
 /// environment, surfacing its notices. Fail-closed: a malformed override (bad TOML, an unreadable
 /// `@file`, a `--env`/`--limit`/`--package` without `=`, a bad `--net`/`--bind` value) is a usage
 /// error (exit 2), never a silent drop that would launch a different posture than asked.
@@ -2822,13 +2822,13 @@ fn build_override(cli: config::CliOverrides) -> Result<config::Override, ExitCod
             Ok(ov)
         }
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             Err(ExitCode::from(2))
         }
     }
 }
 
-/// `ops shell`: an interactive shell in the project sandbox. Takes no command, only the leading
+/// `sbx shell`: an interactive shell in the project sandbox. Takes no command, only the leading
 /// override flags (`--config`/`--env`) and `--help`; any other argument is a usage error (a stray
 /// token would otherwise be silently dropped, since a shell launch has no positional).
 fn shell_cmd(mut args: Vec<OsString>) -> ExitCode {
@@ -2842,7 +2842,7 @@ fn shell_cmd(mut args: Vec<OsString>) -> ExitCode {
                 Some(Err(c)) => return c,
                 None => {
                     let tok = args.first().and_then(|a| a.to_str()).unwrap_or_default();
-                    eprintln!("ops: shell: unexpected argument `{tok}` (it takes no command)");
+                    eprintln!("sbx: shell: unexpected argument `{tok}` (it takes no command)");
                     return ExitCode::from(2);
                 }
             },
@@ -2855,7 +2855,7 @@ fn shell_cmd(mut args: Vec<OsString>) -> ExitCode {
     sandbox::shell(ov)
 }
 
-/// `ops app <name>`: launch a named application profile (an `[app.<name>]` table from the global
+/// `sbx app <name>`: launch a named application profile (an `[app.<name>]` table from the global
 /// or project config, or an imported `<name>.toml` profile) inside the project sandbox. The
 /// management verbs `import`/`export`/`rm`/`list` are reserved (and so can never be an app name),
 /// so the first token disambiguates a subcommand from an app to launch with no overlap.
@@ -2866,7 +2866,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("rm") => app_rm(&args[1..]),
         Some("list" | "ls") => app_list(),
         // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
-        // background as a session `ops session ls` can see. Tokens after a `--` are passed
+        // background as a session `sbx session ls` can see. Tokens after a `--` are passed
         // through to the app's command (see `parse_app_launch`).
         _ => match parse_app_launch(&args) {
             Ok(launch) => {
@@ -2891,7 +2891,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// Apply the rules `ops app <name> --net-learn` synthesized from the run: surface the notes (nothing
+/// Apply the rules `sbx app <name> --net-learn` synthesized from the run: surface the notes (nothing
 /// is dropped silently), then either preview the diff (`--dry-run`) or write each rule to the chosen
 /// profile. The exit code reflects the *learning* outcome, not the agent's exit — a `--net-learn` run
 /// is expected to fail hosts it lacks rules for, so its non-zero exit is not this command's failure;
@@ -2903,7 +2903,7 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     }
     if synth.rules.is_empty() {
         println!(
-            "ops net-learn: no new egress rules — app `{name}` was refused nothing it lacked a rule for."
+            "sbx net-learn: no new egress rules — app `{name}` was refused nothing it lacked a rule for."
         );
         return ExitCode::SUCCESS;
     }
@@ -2916,13 +2916,13 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     let target = match egress_write_target(&nl.scope, Some(name), &cwd) {
         Ok((_, _, target)) => target,
         Err((code, msg)) => {
-            eprintln!("ops net-learn: {msg}");
+            eprintln!("sbx net-learn: {msg}");
             return ExitCode::from(code);
         }
     };
     if nl.dry_run {
         println!(
-            "ops net-learn ({}): {} rule(s) would be added to {target} (dry run — nothing written):",
+            "sbx net-learn ({}): {} rule(s) would be added to {target} (dry run — nothing written):",
             nl.gran.as_str(),
             synth.rules.len()
         );
@@ -2932,14 +2932,14 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
         return ExitCode::SUCCESS;
     }
     // Write each rule through the shared persister, so a project write is trust-gated and re-trusted
-    // exactly like `ops net allow`. One rule per call (each re-trusts a gated project write); a batch
+    // exactly like `sbx net allow`. One rule per call (each re-trusts a gated project write); a batch
     // writer is a future refinement.
     let mut failed = false;
     for rule in &synth.rules {
         match persist_egress_rule(EgressList::Allow, rule, &nl.scope, Some(name), &cwd) {
             Ok(msg) => println!("{msg}"),
             Err((_, msg)) => {
-                eprintln!("ops net-learn: {msg}");
+                eprintln!("sbx net-learn: {msg}");
                 failed = true;
             }
         }
@@ -2951,9 +2951,9 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     }
 }
 
-/// Parse the launch form of `ops app`: split ops's own arguments from the app command's trailing
+/// Parse the launch form of `sbx app`: split sbx's own arguments from the app command's trailing
 /// arguments at the first `--`, then read the app name and `--detach` from the head. Tokens after
-/// `--` are appended verbatim to the app's declared `cmd` (e.g. `ops app claude -- -c` passes `-c`
+/// `--` are appended verbatim to the app's declared `cmd` (e.g. `sbx app claude -- -c` passes `-c`
 /// to the launched command, so an agent can resume a session or tweak a flag without editing the
 /// profile). An unknown flag or a second name in the head is a usage error, so a typo cannot
 /// silently launch a different posture (a mistyped `--detach` running attached, or extra tokens
@@ -2988,7 +2988,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         // value-taking flag can mutate the queue.
         let Some(raw) = head[0].to_str().map(str::to_string) else {
             eprintln!(
-                "ops: app name must be valid text — usage: {}",
+                "sbx: app name must be valid text — usage: {}",
                 help::synopsis("app")
             );
             return Err(ExitCode::from(2));
@@ -3005,7 +3005,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                     Some((_, value)) => match sandbox::Granularity::parse(value) {
                         Ok(g) => g,
                         Err(e) => {
-                            eprintln!("ops: {e}");
+                            eprintln!("sbx: {e}");
                             return Err(ExitCode::from(2));
                         }
                     },
@@ -3033,12 +3033,12 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                 Some(res) => res?,
                 None => {
                     if raw.starts_with('-') {
-                        eprintln!("ops: unknown flag {raw} — usage: {}", help::synopsis("app"));
+                        eprintln!("sbx: unknown flag {raw} — usage: {}", help::synopsis("app"));
                         return Err(ExitCode::from(2));
                     }
                     if name.is_some() {
                         eprintln!(
-                            "ops: app takes a single name — usage: {}",
+                            "sbx: app takes a single name — usage: {}",
                             help::synopsis("app")
                         );
                         return Err(ExitCode::from(2));
@@ -3050,22 +3050,22 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         }
     }
     let Some(name) = name else {
-        // No app name and no subcommand (bare `ops app`, or only flags): print the full page so
-        // its Subcommands list and launch synopsis guide, like bare `ops net`/`ops config`.
+        // No app name and no subcommand (bare `sbx app`, or only flags): print the full page so
+        // its Subcommands list and launch synopsis guide, like bare `sbx net`/`sbx config`.
         eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
         return Err(ExitCode::from(2));
     };
     // `--net-learn` reviews and writes rules in the foreground; `--detach` has no session to observe.
     if learn_gran.is_some() && detach {
         eprintln!(
-            "ops: --net-learn cannot be combined with --detach (it observes a foreground run)."
+            "sbx: --net-learn cannot be combined with --detach (it observes a foreground run)."
         );
         return Err(ExitCode::from(2));
     }
     // The write scope and `--dry-run` only shape where `--net-learn` puts its rules; refuse them on a
     // plain launch rather than silently ignoring a flag the user expected to matter.
     if learn_gran.is_none() && (scope_seen || dry_run) {
-        eprintln!("ops: --global/--local/--dry-run apply only with --net-learn.");
+        eprintln!("sbx: --global/--local/--dry-run apply only with --net-learn.");
         return Err(ExitCode::from(2));
     }
     let net_learn = learn_gran.map(|gran| NetLearn {
@@ -3082,7 +3082,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
     })
 }
 
-/// The parsed launch form of `ops app`: the app name, `--detach`, the passthrough args after `--`,
+/// The parsed launch form of `sbx app`: the app name, `--detach`, the passthrough args after `--`,
 /// the one-shot overrides, and the optional `--net-learn` intent.
 struct AppLaunch {
     name: String,
@@ -3125,7 +3125,7 @@ fn render_app_imported(
     for line in summary {
         let _ = writeln!(o, "    {line}");
     }
-    let _ = write!(o, "  {dim}launch it with: ops app{r} {n}{name}{r}");
+    let _ = write!(o, "  {dim}launch it with: sbx app{r} {n}{name}{r}");
     o
 }
 
@@ -3140,10 +3140,10 @@ fn render_app_exported(name: &str, path: &Path, pal: &style::Palette) -> String 
     )
 }
 
-/// `ops app import <file> [--as <name>] [--force]`: validate a portable app profile and place it
+/// `sbx app import <file> [--as <name>] [--force]`: validate a portable app profile and place it
 /// under the imported-profiles directory, where it is trusted by location (honored even on an
 /// untrusted project). The deliberate command IS the consent — an agent in the cage cannot run it,
-/// and the profile stays inert until `ops app <name>` launches it — so there is no interactive
+/// and the profile stays inert until `sbx app <name>` launches it — so there is no interactive
 /// prompt, but the granted posture is printed so the act is informed. The bytes are copied
 /// verbatim (comments and formatting preserved); the name comes from `--as` or the source file
 /// stem, never the file's contents, so the profile is name-agnostic and re-namable for free.
@@ -3157,27 +3157,27 @@ fn app_import(args: &[OsString]) -> ExitCode {
             Some("--as") => match it.next().and_then(|a| a.to_str()) {
                 Some(n) => as_name = Some(n.to_string()),
                 None => {
-                    eprintln!("ops: --as needs a name");
+                    eprintln!("sbx: --as needs a name");
                     return ExitCode::from(2);
                 }
             },
             Some("--force") => force = true,
             Some(flag) if flag.starts_with("--") => {
                 eprintln!(
-                    "ops: unknown flag '{flag}' (usage: {})",
+                    "sbx: unknown flag '{flag}' (usage: {})",
                     help::synopsis_of(&["app", "import"])
                 );
                 return ExitCode::from(2);
             }
             _ if source.is_none() => source = Some(arg),
             _ => {
-                eprintln!("ops: ops app import takes a single file");
+                eprintln!("sbx: sbx app import takes a single file");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(source) = source else {
-        eprintln!("ops: usage: {}", help::synopsis_of(&["app", "import"]));
+        eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "import"]));
         return ExitCode::from(2);
     };
     let src_path = Path::new(source);
@@ -3190,7 +3190,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
             Some(s) => s.to_string(),
             None => {
                 eprintln!(
-                    "ops: cannot derive a name from {} — pass --as <name>",
+                    "sbx: cannot derive a name from {} — pass --as <name>",
                     src_path.display()
                 );
                 return ExitCode::from(2);
@@ -3199,14 +3199,14 @@ fn app_import(args: &[OsString]) -> ExitCode {
     };
     if config::is_reserved_app_verb(&name) || !config::is_valid_app_name(&name) {
         eprintln!(
-            "ops: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`, and not \
+            "sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`, and not \
              a reserved subcommand)"
         );
         return ExitCode::from(2);
     }
 
     let Some(dir) = config::profiles_dir() else {
-        eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        eprintln!("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
         return ExitCode::FAILURE;
     };
 
@@ -3215,7 +3215,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let bytes = match config::safety::read_safe_bytes(src_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("ops: cannot read {}: {e}", src_path.display());
+            eprintln!("sbx: cannot read {}: {e}", src_path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -3223,7 +3223,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
-                "ops: {} is not a valid app profile: {e}",
+                "sbx: {} is not a valid app profile: {e}",
                 src_path.display()
             );
             return ExitCode::FAILURE;
@@ -3233,13 +3233,13 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let dest = dir.join(format!("{name}.toml"));
     if dest.exists() && !force {
         eprintln!(
-            "ops: a profile '{name}' already exists at {} (use --force to overwrite)",
+            "sbx: a profile '{name}' already exists at {} (use --force to overwrite)",
             dest.display()
         );
         return ExitCode::FAILURE;
     }
     if let Err(e) = write_profile_file(&dir, &dest, &bytes) {
-        eprintln!("ops: cannot write {}: {e}", dest.display());
+        eprintln!("sbx: cannot write {}: {e}", dest.display());
         return ExitCode::FAILURE;
     }
 
@@ -3254,7 +3254,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
 /// Write a profile's bytes to `dest`, owner-only, creating the profiles directory owner-only if
 /// it is missing. The bytes go to a sibling temp file (owner-only from creation, so a later read
 /// passes the safety gate) and are then renamed into place — atomic, like every other on-disk
-/// placement ops makes: a failed or interrupted write never leaves a partial profile at the real
+/// placement sbx makes: a failed or interrupted write never leaves a partial profile at the real
 /// name, and a `--force` overwrite keeps the previous profile until the new one is fully written.
 fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -3282,10 +3282,10 @@ fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-/// `ops app export <name> [--out <file>]`: write a named app out as a portable profile — an
+/// `sbx app export <name> [--out <file>]`: write a named app out as a portable profile — an
 /// imported profile verbatim, or an inline app serialized to a minimal top-level profile (as
 /// authored, security fields and all; import is the trust act, not export). Writes to stdout by
-/// default (composable and clobber-safe — `ops app export claude > claude.toml`), or to `--out
+/// default (composable and clobber-safe — `sbx app export claude > claude.toml`), or to `--out
 /// <file>` directly. The exported file re-imports identically (the round-trip the feature sells).
 fn app_export(args: &[OsString]) -> ExitCode {
     let mut name: Option<&str> = None;
@@ -3296,49 +3296,49 @@ fn app_export(args: &[OsString]) -> ExitCode {
             Some("--out") => match it.next() {
                 Some(p) => out = Some(p),
                 None => {
-                    eprintln!("ops: --out needs a file");
+                    eprintln!("sbx: --out needs a file");
                     return ExitCode::from(2);
                 }
             },
             Some(flag) if flag.starts_with("--") => {
                 eprintln!(
-                    "ops: unknown flag '{flag}' (usage: {})",
+                    "sbx: unknown flag '{flag}' (usage: {})",
                     help::synopsis_of(&["app", "export"])
                 );
                 return ExitCode::from(2);
             }
             Some(n) if name.is_none() => name = Some(n),
             None if name.is_none() => {
-                eprintln!("ops: the app name must be valid UTF-8");
+                eprintln!("sbx: the app name must be valid UTF-8");
                 return ExitCode::from(2);
             }
             _ => {
-                eprintln!("ops: ops app export takes a single name");
+                eprintln!("sbx: sbx app export takes a single name");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(name) = name else {
-        eprintln!("ops: usage: {}", help::synopsis_of(&["app", "export"]));
+        eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "export"]));
         return ExitCode::from(2);
     };
     // The name reaches a filesystem lookup, so validate it (and a reserved verb can never be an
     // app name anyway).
     if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
-        eprintln!("ops: '{name}' is not a valid app name");
+        eprintln!("sbx: '{name}' is not a valid app name");
         return ExitCode::from(2);
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
     let bytes = match config::export_profile(&cwd, name) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -3346,14 +3346,14 @@ fn app_export(args: &[OsString]) -> ExitCode {
         None => {
             use std::io::Write as _;
             if let Err(e) = std::io::stdout().write_all(&bytes) {
-                eprintln!("ops: cannot write the profile: {e}");
+                eprintln!("sbx: cannot write the profile: {e}");
                 return ExitCode::FAILURE;
             }
         }
         Some(path) => {
             let path = Path::new(path);
             if let Err(e) = std::fs::write(path, &bytes) {
-                eprintln!("ops: cannot write {}: {e}", path.display());
+                eprintln!("sbx: cannot write {}: {e}", path.display());
                 return ExitCode::FAILURE;
             }
             // The confirmation goes to stderr (stdout is reserved for the profile bytes), so its
@@ -3365,10 +3365,10 @@ fn app_export(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops app rm <name> [--purge] [--gc]`: remove an app.
+/// `sbx app rm <name> [--purge] [--gc]`: remove an app.
 ///
 /// By default this removes only the imported **profile** (a file in the profiles directory) — a
-/// project `[app.<name>]` overlay lives in that project's `.ops.toml` and is the user's to edit
+/// project `[app.<name>]` overlay lives in that project's `.sbx.toml` and is the user's to edit
 /// there. With `--purge` it also removes the app's isolated **runtime state**: its per-app home(s)
 /// (the mise tools its `mise:` backends installed, its config, and its login/session state), which
 /// is freed immediately. `--gc` (which requires `--purge`) then sweeps the **current project's**
@@ -3379,32 +3379,32 @@ fn app_rm(args: &[OsString]) -> ExitCode {
     let (purge, gc, name) = match parse_app_rm(args) {
         AppRmArgs::Ok { purge, gc, name } => (purge, gc, name),
         AppRmArgs::MissingName => {
-            eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "rm"]));
             return ExitCode::from(2);
         }
         AppRmArgs::UnknownOption(tok) => {
-            eprintln!("ops: app rm: unknown option `{tok}`");
-            eprintln!("ops: usage: {}", help::synopsis_of(&["app", "rm"]));
+            eprintln!("sbx: app rm: unknown option `{tok}`");
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "rm"]));
             return ExitCode::from(2);
         }
         AppRmArgs::Extra(tok) => {
-            eprintln!("ops: app rm: unexpected argument `{tok}` (one app name only)");
+            eprintln!("sbx: app rm: unexpected argument `{tok}` (one app name only)");
             return ExitCode::from(2);
         }
         AppRmArgs::NonUtf8 => {
-            eprintln!("ops: app rm: argument is not valid UTF-8");
+            eprintln!("sbx: app rm: argument is not valid UTF-8");
             return ExitCode::from(2);
         }
     };
     if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
-        eprintln!("ops: '{name}' is not a valid app name");
+        eprintln!("sbx: '{name}' is not a valid app name");
         return ExitCode::from(2);
     }
     // `--gc` reclaims the store an app's homes referenced, so it only makes sense alongside the
     // home removal `--purge` performs — never on a bare profile removal.
     if gc && !purge {
         eprintln!(
-            "ops: app rm: `--gc` requires `--purge` (it sweeps the store the purged home used)"
+            "sbx: app rm: `--gc` requires `--purge` (it sweeps the store the purged home used)"
         );
         return ExitCode::from(2);
     }
@@ -3415,7 +3415,7 @@ fn app_rm(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// The structural parse of `ops app rm` arguments (before name validation). Kept pure so the flag/
+/// The structural parse of `sbx app rm` arguments (before name validation). Kept pure so the flag/
 /// positional handling — `--purge`, `--gc`, and the single app name in any order — is unit-tested.
 /// The name's charset/reserved-verb validation and the `--gc`-requires-`--purge` rule are the
 /// caller's next steps.
@@ -3451,12 +3451,12 @@ fn parse_app_rm(args: &[OsString]) -> AppRmArgs<'_> {
     }
 }
 
-/// Remove app `name`'s imported profile only (the default `ops app rm`). A missing profile is an
+/// Remove app `name`'s imported profile only (the default `sbx app rm`). A missing profile is an
 /// error here — the user asked to remove a profile and there is none to remove (with `--purge` a
 /// missing profile is tolerated, since the homes may still exist).
 fn app_rm_profile(name: &str) -> ExitCode {
     let Some(dir) = config::profiles_dir() else {
-        eprintln!("ops: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        eprintln!("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
         return ExitCode::FAILURE;
     };
     let path = dir.join(format!("{name}.toml"));
@@ -3468,35 +3468,35 @@ fn app_rm_profile(name: &str) -> ExitCode {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "ops: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
-                 project's .ops.toml — edit it there). To also remove an app's home/tools, use \
-                 `ops app rm {name} --purge`."
+                "sbx: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
+                 project's .sbx.toml — edit it there). To also remove an app's home/tools, use \
+                 `sbx app rm {name} --purge`."
             );
             ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("ops: cannot remove {}: {e}", path.display());
+            eprintln!("sbx: cannot remove {}: {e}", path.display());
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops app rm <name> --purge`: remove the profile **and** the app's isolated runtime state.
+/// `sbx app rm <name> --purge`: remove the profile **and** the app's isolated runtime state.
 ///
 /// The runtime state is the per-app home(s): the global `<data>/apps/<name>/` and each per-project
 /// `<data>/projects/<id>/apps/<name>/`. They hold the tools the app's `mise:` backends installed
 /// (under the home's mise data dir), the app's config, and its login/session state — all removed
 /// immediately, so "delete from mise" is satisfied here, not deferred. What this does **not** touch
 /// is the shared per-project nix store: it backs every app in a project, so a purged app's
-/// `nix:`/`flake:` closures are reclaimed by `ops gc`, which the closing note points at.
+/// `nix:`/`flake:` closures are reclaimed by `sbx gc`, which the closing note points at.
 ///
 /// A running session of the app is a hard stop — deleting its home mid-run would corrupt it — so
-/// this refuses until the session is stopped (the same live guard `ops gc` applies). Under `--purge`
+/// this refuses until the session is stopped (the same live guard `sbx gc` applies). Under `--purge`
 /// a missing profile is tolerated (the homes may still exist), but finding *nothing at all* — no
 /// profile and no home — is reported as a no-op so a typo never silently "succeeds".
 ///
 /// When `gc` is set (the `--gc` flag), it then sweeps the **current project's** store via the same
-/// path as `ops gc --prune`, reclaiming the app's now-unreferenced closures there in one command.
+/// path as `sbx gc --prune`, reclaiming the app's now-unreferenced closures there in one command.
 /// The sweep is a distinct step with its own prerequisites (a capable host, nix); its failure is
 /// reflected in the exit code but never undoes the purge that already happened.
 fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
@@ -3504,7 +3504,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate ops's data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate sbx's data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
 
@@ -3519,8 +3519,8 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
                 .collect();
             if !pids.is_empty() {
                 eprintln!(
-                    "ops: app '{name}' has a running session (pid {}); stop it first \
-                     (see `ops session ls`; then `ops session stop {}`).",
+                    "sbx: app '{name}' has a running session (pid {}); stop it first \
+                     (see `sbx session ls`; then `sbx session stop {}`).",
                     pids.join(", "),
                     pids.join(" ")
                 );
@@ -3528,7 +3528,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("ops: cannot read the session registry ({e}); not purging '{name}'.");
+            eprintln!("sbx: cannot read the session registry ({e}); not purging '{name}'.");
             return ExitCode::FAILURE;
         }
     }
@@ -3543,7 +3543,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
-                eprintln!("ops: cannot remove {}: {e}", path.display());
+                eprintln!("sbx: cannot remove {}: {e}", path.display());
                 false
             }
         },
@@ -3560,12 +3560,12 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         );
     }
     for (path, e) in &report.failed {
-        eprintln!("{warn}ops: could not remove {}: {e}{r}", path.display());
+        eprintln!("{warn}sbx: could not remove {}: {e}{r}", path.display());
     }
 
     // 3. Nothing found across either source → a no-op (likely a typo); do not report success.
     if !profile_removed && report.found_nothing() {
-        eprintln!("ops: nothing to purge for '{name}' (no profile and no home)");
+        eprintln!("sbx: nothing to purge for '{name}' (no profile and no home)");
         return ExitCode::FAILURE;
     }
 
@@ -3596,7 +3596,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         println!();
         let gc_code = sandbox::gc(true, false, &pal);
         println!(
-            "{dim}note: `--gc` swept this project's store; run `ops gc --prune` in the app's other \
+            "{dim}note: `--gc` swept this project's store; run `sbx gc --prune` in the app's other \
              projects to reclaim their copies too.{r}"
         );
         // The purge succeeded independently of the sweep; when it did, defer to the sweep's own exit
@@ -3607,7 +3607,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
 
     println!(
         "{dim}note: an app's nix:/flake: tool closures live in the shared per-project store; \
-         run `ops gc --prune` in a project to reclaim any no longer referenced there \
+         run `sbx gc --prune` in a project to reclaim any no longer referenced there \
          (or re-run with --gc for the current project).{r}"
     );
     if purge_ok {
@@ -3617,20 +3617,20 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     }
 }
 
-/// `ops app list`: what is on disk to manage, one row per app — whether it has an imported
+/// `sbx app list`: what is on disk to manage, one row per app — whether it has an imported
 /// **profile** (`import`/`rm` artifacts) and whether it has an **installed home** (its mise tools +
 /// login state, with disk size, which `--purge` removes). The two are distinct: an app can have a
 /// profile with no home yet (never launched), or a home with no profile (launched from an
 /// inline/project app, or a profile since removed) — so a name may carry a profile, a home, or both.
 /// The full resolved app set — inline, project, and profile apps with their gating — is
-/// `ops config show`.
+/// `sbx config show`.
 fn app_list() -> ExitCode {
     use std::collections::{BTreeMap, BTreeSet};
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
 
-    // Imported profiles under <config>/ops/apps/*.toml.
+    // Imported profiles under <config>/sbx/apps/*.toml.
     let profiles_dir = config::profiles_dir();
     let mut profiles: BTreeSet<String> = BTreeSet::new();
     if let Some(dir) = &profiles_dir {
@@ -3647,7 +3647,7 @@ fn app_list() -> ExitCode {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                eprintln!("ops: cannot read {}: {e}", dir.display());
+                eprintln!("sbx: cannot read {}: {e}", dir.display());
                 return ExitCode::FAILURE;
             }
         }
@@ -3663,7 +3663,7 @@ fn app_list() -> ExitCode {
     if profiles.is_empty() && installed.is_empty() {
         println!(
             "{dim}no imported app profiles and no installed app homes \
-             (import one with: ops app import <file>){r}"
+             (import one with: sbx app import <file>){r}"
         );
         return ExitCode::SUCCESS;
     }
@@ -3710,14 +3710,14 @@ fn app_list() -> ExitCode {
     }
 
     println!(
-        "{dim}(remove a profile: ops app rm <name>; also remove its home + tools: \
-         ops app rm <name> --purge){r}"
+        "{dim}(remove a profile: sbx app rm <name>; also remove its home + tools: \
+         sbx app rm <name> --purge){r}"
     );
     ExitCode::SUCCESS
 }
 
 /// A compact description of where an app's installed homes live — `global`, `N project home(s)`, or
-/// both joined with ` + ` — for the `ops app list` installed-homes line.
+/// both joined with ` + ` — for the `sbx app list` installed-homes line.
 fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
     let mut parts = Vec::new();
     if app.global_bytes.is_some() {
@@ -3731,7 +3731,7 @@ fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
     parts.join(" + ")
 }
 
-/// `ops search <query>`: discover the `nix:` tools (and `[packages]` attributes) a
+/// `sbx search <query>`: discover the `nix:` tools (and `[packages]` attributes) a
 /// project can declare, by querying nixhub. Host-side and read-only — it resolves
 /// nothing into the sandbox and needs no trust gate (a discovery front-end, like a plain
 /// `nix search`). It needs nix only to ride its fetcher for the one network step.
@@ -3744,15 +3744,15 @@ fn search_cmd(args: Vec<OsString>) -> ExitCode {
         .filter_map(|a| a.to_str())
         .find(|a| !a.starts_with('-'));
     let Some(query) = query else {
-        eprintln!("ops: usage: {}", help::synopsis("search"));
+        eprintln!("sbx: usage: {}", help::synopsis("search"));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        eprintln!("ops: nix not found — `ops search` needs it to query nixhub. See `ops doctor`.");
+        eprintln!("sbx: nix not found — `sbx search` needs it to query nixhub. See `sbx doctor`.");
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -3762,23 +3762,23 @@ fn search_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("ops search: {e}");
+            eprintln!("sbx search: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops test <kind> <target>`: probe whether an access would be allowed and explain why —
-/// a diagnostic surface meant to grow with ops's access controls (the network egress
+/// `sbx test <kind> <target>`: probe whether an access would be allowed and explain why —
+/// a diagnostic surface meant to grow with sbx's access controls (the network egress
 /// allowlist now; filesystem/Landlock access later). No launch, no nix, no network.
 fn test_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("net") => net_test(&args[1..]),
         // Unknown or no kind: name the mistake (if any), then print the full page so its
-        // Subcommands list guides, like bare `ops net`/`ops config`.
+        // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
             if let Some(tok) = other {
-                eprintln!("ops: test: unknown kind {tok:?}");
+                eprintln!("sbx: test: unknown kind {tok:?}");
             }
             eprint!("{}", help::page_usage(&["test"]).unwrap_or_default());
             ExitCode::from(2)
@@ -3787,10 +3787,10 @@ fn test_cmd(args: Vec<OsString>) -> ExitCode {
 }
 
 /// Fold the named app's overlay onto the resolved baseline so a read-only diagnostic sees the
-/// *effective* policy `ops app <name>` would launch with — the shared core of `ops test net --app`
-/// and `ops net rules --app`. The baseline warnings are the caller's to surface; this captures the
+/// *effective* policy `sbx app <name>` would launch with — the shared core of `sbx test net --app`
+/// and `sbx net rules --app`. The baseline warnings are the caller's to surface; this captures the
 /// warning count *before* the merge and emits only the app's own new ones (no double-print). On an
-/// unknown app it returns a pointed message (the caller prepends its own `ops: <verb>:` prefix);
+/// unknown app it returns a pointed message (the caller prepends its own `sbx: <verb>:` prefix);
 /// the merge itself reuses `config::load` → `merge_app`, so the trust gate and the "a global app
 /// keeps its posture under an untrusted project" property hold through that path, not new code.
 fn fold_app_overlay(resolved: &mut config::Resolved, name: &str) -> Result<(), String> {
@@ -3810,7 +3810,7 @@ fn fold_app_overlay(resolved: &mut config::Resolved, name: &str) -> Result<(), S
     Ok(())
 }
 
-/// `ops test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
+/// `sbx test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
 /// report the rule that decides it. A diagnostic for the egress allowlist — it reflects the trust
 /// gate (an untrusted project's policy is dropped, so the *effective* posture is shown), folds in a
 /// named app's overlay when `--app` is given, includes the built-in allow-set the proxy
@@ -3828,38 +3828,38 @@ fn net_test(args: &[OsString]) -> ExitCode {
         match a.to_str() {
             Some("--app") | Some("-a") => {
                 let Some(name) = it.next().and_then(|n| n.to_str()) else {
-                    eprintln!("ops: test net: `--app` needs an app name");
+                    eprintln!("sbx: test net: `--app` needs an app name");
                     return ExitCode::from(2);
                 };
                 app = Some(name.to_string());
             }
             Some("--method") | Some("-X") => {
                 let Some(m) = it.next().and_then(|n| n.to_str()) else {
-                    eprintln!("ops: test net: `--method` needs an HTTP verb (e.g. GET, POST)");
+                    eprintln!("sbx: test net: `--method` needs an HTTP verb (e.g. GET, POST)");
                     return ExitCode::from(2);
                 };
                 method = m.to_ascii_uppercase();
             }
             Some(s) if target.is_none() => target = Some(s),
             Some(s) => {
-                eprintln!("ops: test net: unexpected argument `{s}`");
+                eprintln!("sbx: test net: unexpected argument `{s}`");
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("ops: test net: an argument is not valid UTF-8");
+                eprintln!("sbx: test net: an argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(target) = target else {
-        eprintln!("ops: usage: {}", help::synopsis("test"));
+        eprintln!("sbx: usage: {}", help::synopsis("test"));
         return ExitCode::from(2);
     };
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -3868,11 +3868,11 @@ fn net_test(args: &[OsString]) -> ExitCode {
         diag::warn(w);
     }
     // Fold a named app's overlay onto the baseline so the URL is tested against the *effective*
-    // policy `ops app <name>` would launch with (its own posture, allow/deny rules, credentials),
+    // policy `sbx app <name>` would launch with (its own posture, allow/deny rules, credentials),
     // not the bare baseline.
     if let Some(name) = &app {
         if let Err(e) = fold_app_overlay(&mut resolved, name) {
-            eprintln!("ops: test net: {e}");
+            eprintln!("sbx: test net: {e}");
             return ExitCode::from(2);
         }
     }
@@ -3917,7 +3917,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     "allow (denylist — every public host reaches except the deny rules)"
                 }
                 allowlist::DefaultAction::Ask => {
-                    "ask (an unmatched host parks for a live `ops net pending` decision)"
+                    "ask (an unmatched host parks for a live `sbx net pending` decision)"
                 }
             };
             println!("{h}network{scope}:{r} {mode}");
@@ -3928,7 +3928,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 let (host, port) = match allowlist::parse_tcp_target(target) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("ops: {e}");
+                        eprintln!("sbx: {e}");
                         return ExitCode::from(2);
                     }
                 };
@@ -3939,7 +3939,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
             let (host, port, path) = match allowlist::parse_url_target(&url) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("ops: {e}");
+                    eprintln!("sbx: {e}");
                     return ExitCode::from(2);
                 }
             };
@@ -3994,7 +3994,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
 
 /// Render an egress allowlist decision — a pure presenter (so its colored layout is asserted in a
 /// test): the verdict (`ALLOWED` green / `DENIED` red), the URL and the deciding rule as
-/// identifiers (cyan, matching how `ops config` renders allow/deny rules), and the reason as
+/// identifiers (cyan, matching how `sbx config` renders allow/deny rules), and the reason as
 /// de-emphasized prose. Every span is empty under a non-terminal, so a capture is plain text.
 fn render_net_decision(
     url: &str,
@@ -4034,14 +4034,14 @@ fn render_net_decision(
             let _ = writeln!(o, "{dim}WOULD ASK{r} {n}{url}{r}");
             let _ = writeln!(
                 o,
-                "  {dim}no rule matches (ask-by-default — it would park for `ops net pending`){r}"
+                "  {dim}no rule matches (ask-by-default — it would park for `sbx net pending`){r}"
             );
         }
     }
     o
 }
 
-/// Render an L4 (`tcp://`) raw-splice decision for `ops test net tcp://host:port` — a pure presenter
+/// Render an L4 (`tcp://`) raw-splice decision for `sbx test net tcp://host:port` — a pure presenter
 /// (its color is asserted in a test). A raw splice is strictly opt-in, so the verdict is binary:
 /// SPLICED (a `tcp://` allow rule covers this host:port and no host-level deny suppresses it — the
 /// proxy tunnels it uninspected) or NOT SPLICED (the connection would instead take the inspected L7
@@ -4084,7 +4084,7 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
 
 /// Render the dim "+ a credential would be injected" note for a secret whose destination matches
 /// the tested request — by header name and source locator only (never the plaintext, and with no
-/// I/O), mirroring how `ops config` describes a credential. A pure presenter (its color is asserted
+/// I/O), mirroring how `sbx config` describes a credential. A pure presenter (its color is asserted
 /// in a test); every span is empty under a non-terminal, so a capture is plain text.
 fn render_injection_note(secret: &config::HeaderSecret, pal: &style::Palette) -> String {
     let (dim, n, r) = (pal.dim, pal.name, pal.reset);
@@ -4097,7 +4097,7 @@ fn render_injection_note(secret: &config::HeaderSecret, pal: &style::Palette) ->
 
 /// The displayed keyword for a filtered-egress policy's default action: `allow` (a denylist —
 /// everything public reaches except the deny rules) or `deny` (an allowlist — only the listed and
-/// built-in hosts reach). Used wherever `ops config` renders a filtered network posture.
+/// built-in hosts reach). Used wherever `sbx config` renders a filtered network posture.
 fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
     match default_action {
         config::view::NetDefaultView::Deny => "deny",
@@ -4106,10 +4106,10 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
     }
 }
 
-/// `ops net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
+/// `sbx net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
 /// rules (optionally for one app), `allow`/`deny` persist a rule to a config file, `pending`
 /// drives the live `ask`-posture control plane, and `stats` reports the per-host allow/deny/blocked
-/// decision counters a launch recorded. Distinct from `ops test net <url>` (the URL matcher): `net`
+/// decision counters a launch recorded. Distinct from `sbx test net <url>` (the URL matcher): `net`
 /// is the listing/management surface.
 fn net_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
@@ -4130,10 +4130,10 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("live") => net_live(&args[1..]),
         // Unknown or no subcommand: name the mistake (if any), then print the full page — its
         // Subcommands list reveals rules/allow/deny/pending/… instead of a bare one-line synopsis,
-        // the way `ops config` and bare `ops` guide.
+        // the way `sbx config` and bare `sbx` guide.
         other => {
             if let Some(tok) = other {
-                eprintln!("ops: net: unknown subcommand {tok:?}");
+                eprintln!("sbx: net: unknown subcommand {tok:?}");
             }
             eprint!("{}", help::page_usage(&["net"]).unwrap_or_default());
             ExitCode::from(2)
@@ -4141,7 +4141,7 @@ fn net_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `ops net pending` family — the live control plane for the `ask` egress posture (see
+/// `sbx net pending` family — the live control plane for the `ask` egress posture (see
 /// [`sandbox::control`]). With no verb it lists the requests parked across every reachable ask-mode
 /// session; `allow <id>`/`deny <id>` answer one (`<id>` = `<pid>.<seq>` from the listing or the
 /// launch's notice), optionally persisting a matching rule with `--save` + a scope. The control
@@ -4181,8 +4181,8 @@ fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
         .collect()
 }
 
-/// The live-session pids that belong to app `name` (an `ops app <name>` session), from the registry
-/// — the basis for scoping `ops net pending` to one app. A session not in the registry (a race, or a
+/// The live-session pids that belong to app `name` (an `sbx app <name>` session), from the registry
+/// — the basis for scoping `sbx net pending` to one app. A session not in the registry (a race, or a
 /// plain shell) has no known app, so under a filter it is excluded: scoping to an app shows only
 /// sessions the registry confirms are that app.
 fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSet<u32> {
@@ -4195,7 +4195,7 @@ fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSe
         .collect()
 }
 
-/// The app a session pid runs as (`ops app <name>`), from the registry — or `None` if the session is
+/// The app a session pid runs as (`sbx app <name>`), from the registry — or `None` if the session is
 /// a plain project shell, or is not in the registry. The basis for validating that a `<pid>.<seq>` id
 /// the user scoped with `--app` really belongs to that app.
 fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
@@ -4208,8 +4208,8 @@ fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
 }
 
 /// The live-session pids running in `project` (a canonical project root), from the registry — the
-/// basis for scoping `ops net pending` to the current project. The match is `s.project == project`,
-/// the exact comparison the launch path records and `ops gc` already uses (both sides go through
+/// basis for scoping `sbx net pending` to the current project. The match is `s.project == project`,
+/// the exact comparison the launch path records and `sbx gc` already uses (both sides go through
 /// [`sandbox::project_identity`]), so a session and its project never disagree. A session not in the
 /// registry has no known project, so under a filter it is excluded.
 fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections::HashSet<u32> {
@@ -4242,7 +4242,7 @@ fn collect_pending(
     (sessions, context)
 }
 
-/// `ops net pending [-a|--app <name>] [--json]`: list every reachable ask-mode session's parked
+/// `sbx net pending [-a|--app <name>] [--json]`: list every reachable ask-mode session's parked
 /// requests, grouped by session (with its agent/project context); identical retries of one URL
 /// collapse to a single destination carrying the `<pid>.<seq>` id to answer it (and, in `--json`, a
 /// `count`). `--app <name>` limits the listing to that app's session(s). No launch / nix / network —
@@ -4257,12 +4257,12 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
             Some("--app") | Some("-a") => match it.next() {
                 Some(name) => app = Some(name.to_string_lossy().into_owned()),
                 None => {
-                    eprintln!("ops: `--app` needs an app name");
+                    eprintln!("sbx: `--app` needs an app name");
                     return ExitCode::from(2);
                 }
             },
             _ => {
-                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "pending"]));
+                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "pending"]));
                 return ExitCode::from(2);
             }
         }
@@ -4270,7 +4270,7 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4318,7 +4318,7 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The parsed `ops net pending watch` flags: how often to refresh, and an optional app scope.
+/// The parsed `sbx net pending watch` flags: how often to refresh, and an optional app scope.
 #[derive(Debug)]
 struct WatchArgs {
     interval: Duration,
@@ -4365,9 +4365,9 @@ fn parse_watch_args(args: &[OsString]) -> Result<WatchArgs, String> {
     })
 }
 
-/// `ops net pending watch [-i|--interval <secs>] [-a|--app <name>]`: redraw the parked-request
+/// `sbx net pending watch [-i|--interval <secs>] [-a|--app <name>]`: redraw the parked-request
 /// listing in place on an interval (default 2s) until interrupted. A `top`-style poll of the same
-/// live control sockets `ops net pending` queries — no launch, nix, or network, and nothing is held
+/// live control sockets `sbx net pending` queries — no launch, nix, or network, and nothing is held
 /// open between ticks. Requires a terminal (the frame is redrawn in place); the one-shot listing
 /// (optionally `--json`) is the path for a pipe or a script.
 fn net_pending_watch(args: &[OsString]) -> ExitCode {
@@ -4375,14 +4375,14 @@ fn net_pending_watch(args: &[OsString]) -> ExitCode {
     let parsed = match parse_watch_args(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::from(2);
         }
     };
     let is_tty = std::io::stdout().is_terminal();
     if !is_tty {
         eprintln!(
-            "ops: `watch` needs a terminal — use `ops net pending` for a one-shot listing, \
+            "sbx: `watch` needs a terminal — use `sbx net pending` for a one-shot listing, \
              or `--json` to script it"
         );
         return ExitCode::from(2);
@@ -4390,7 +4390,7 @@ fn net_pending_watch(args: &[OsString]) -> ExitCode {
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4414,7 +4414,7 @@ fn net_pending_watch(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// Parsed `ops net live` options: the redraw interval, an optional app filter, and JSON output.
+/// Parsed `sbx net live` options: the redraw interval, an optional app filter, and JSON output.
 #[derive(Debug)]
 struct LiveArgs {
     interval: Duration,
@@ -4563,7 +4563,7 @@ fn render_live(
     o
 }
 
-/// Emit one `ops net live --json` snapshot object (the whole state this tick, NDJSON — one object per
+/// Emit one `sbx net live --json` snapshot object (the whole state this tick, NDJSON — one object per
 /// line, not one per flow: a live view is a state, not an event stream). Each flow carries its session
 /// context, destination, transport, age, and byte totals.
 fn flush_live_json(
@@ -4598,10 +4598,10 @@ fn flush_live_json(
     out.flush()
 }
 
-/// `ops net live [-i|--interval <secs>] [-a|--app <name>] [--json]`: show the egress tunnels open
+/// `sbx net live [-i|--interval <secs>] [-a|--app <name>] [--json]`: show the egress tunnels open
 /// right now — one line per flow (destination, transport, age, bytes each way) — redrawn in place on
 /// an interval (default 1s) until interrupted. A `top`-style live view of the same control sockets
-/// `ops net logs` reads, but of *open connections* rather than *decided requests*. Because the proxy
+/// `sbx net logs` reads, but of *open connections* rather than *decided requests*. Because the proxy
 /// closes each inspected L7 request after one response, short API calls flash by in under a second; the
 /// durable rows are raw `tcp://` tunnels (SSH/DB), WebSockets, and large L7 transfers in progress.
 /// Requires a terminal (the frame redraws in place); `--json` emits one snapshot object per tick and
@@ -4611,21 +4611,21 @@ fn net_live(args: &[OsString]) -> ExitCode {
     let parsed = match parse_live_args(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::from(2);
         }
     };
     let is_tty = std::io::stdout().is_terminal();
     if !parsed.json && !is_tty {
         eprintln!(
-            "ops: `net live` needs a terminal — use `--json` to script it (one snapshot per tick)"
+            "sbx: `net live` needs a terminal — use `--json` to script it (one snapshot per tick)"
         );
         return ExitCode::from(2);
     }
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4773,16 +4773,16 @@ fn render_pending(
     }
     let _ = writeln!(
         o,
-        "  {dim}answer: ops net pending allow <id> [--save --local|--global|--app <name>]{r}"
+        "  {dim}answer: sbx net pending allow <id> [--save --local|--global|--app <name>]{r}"
     );
     let _ = writeln!(
         o,
-        "  {dim}        ops net pending allow|deny --all  (drain every parked request at once){r}"
+        "  {dim}        sbx net pending allow|deny --all  (drain every parked request at once){r}"
     );
     o
 }
 
-/// `ops net pending allow|deny <id> [--save --local|--global|--app <name>]`: answer one parked
+/// `sbx net pending allow|deny <id> [--save --local|--global|--app <name>]`: answer one parked
 /// request live. The unblock is the primary action; `--save` additionally persists a matching rule
 /// (the request's host) through the shared writer so the same host is pre-decided next launch — a
 /// secondary step whose failure is a warning, never undoing the answer. `<id>` is `<pid>.<seq>`.
@@ -4820,13 +4820,13 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         let parsed = match split_scope(&rest) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ops: {e}");
+                eprintln!("sbx: {e}");
                 return ExitCode::from(2);
             }
         };
         if !parsed.positionals.is_empty() {
             eprintln!(
-                "ops: `--all` answers every parked request and takes no id \
+                "sbx: `--all` answers every parked request and takes no id \
                  (use `--app <name>` to limit it to one app; `--session` to remember)"
             );
             return ExitCode::from(2);
@@ -4841,7 +4841,7 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         }
         if parsed.scope_explicit {
             eprintln!(
-                "ops: `--all` without `--save` takes no scope (--local/--global/-c) — add `--save` \
+                "sbx: `--all` without `--save` takes no scope (--local/--global/-c) — add `--save` \
                  to persist a rule per host, or use `--app <name>` to limit the drain to one app"
             );
             return ExitCode::from(2);
@@ -4851,7 +4851,7 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::from(2);
         }
     };
@@ -4859,30 +4859,30 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         [id] => id.as_str(),
         _ => {
             eprintln!(
-                "ops: usage: {}",
+                "sbx: usage: {}",
                 help::synopsis_of(&["net", "pending", verb])
             );
             return ExitCode::from(2);
         }
     };
     let Some((pid, seq)) = sandbox::control::parse_id(id) else {
-        eprintln!("ops: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)");
+        eprintln!("sbx: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)");
         return ExitCode::from(2);
     };
     // A *config* scope (--global / -c) without `--save` is meaningless — there is no rule to write, so
     // flag it rather than silently ignore it. `--local` is the `split_scope` default, so a bare oneshot
     // does not trip it. `--app` is deliberately *not* here: it doubles as a session scope, so it is
-    // honored without `--save` too (a natural carry-over from `ops net pending -a <app>`) and validated
+    // honored without `--save` too (a natural carry-over from `sbx net pending -a <app>`) and validated
     // against the id below.
     if !save && !matches!(parsed.scope, config::manage::Scope::Local) {
-        eprintln!("ops: --global/-c only applies with --save (it names where to persist the rule)");
+        eprintln!("sbx: --global/-c only applies with --save (it names where to persist the rule)");
         return ExitCode::from(2);
     }
 
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4894,7 +4894,7 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     if let Some(name) = parsed.app.as_deref() {
         if let Some(actual) = session_app_of(&data_dir, pid) {
             if actual != name {
-                eprintln!("ops: {id} is a session of app `{actual}`, not `{name}`");
+                eprintln!("sbx: {id} is a session of app `{actual}`, not `{name}`");
                 return ExitCode::from(2);
             }
         }
@@ -4904,13 +4904,13 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
             Ok(sandbox::control::AnswerOutcome::NotFound) => {
                 eprintln!(
-                "ops: no pending request '{id}' (it may have been answered already or timed out)"
+                "sbx: no pending request '{id}' (it may have been answered already or timed out)"
             );
                 return ExitCode::from(2);
             }
             Err(_) => {
                 eprintln!(
-                    "ops: no live session for '{id}' (the launch may have ended, or its socket is \
+                    "sbx: no live session for '{id}' (the launch may have ended, or its socket is \
                  stale)"
                 );
                 return ExitCode::from(2);
@@ -4957,7 +4957,7 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     ExitCode::SUCCESS
 }
 
-/// `ops net pending allow|deny --all [-a|--app <name>] [--session]`: drain every parked request
+/// `sbx net pending allow|deny --all [-a|--app <name>] [--session]`: drain every parked request
 /// across every reachable ask-mode session in one shot — or, with `--app <name>`, only that app's
 /// session(s). A point-in-time bulk answer — a request that parks *after* the drain still waits. It
 /// reports per session what it answered, so a cross-agent grant (one keystroke can open egress for
@@ -4976,7 +4976,7 @@ fn net_pending_answer_all(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4998,7 +4998,7 @@ fn net_pending_answer_all(
             }
             // A healthy session with nothing parked — nothing to report.
             Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
-            // A session launched by an older ops that does not understand `--all` — its requests stay
+            // A session launched by an older sbx that does not understand `--all` — its requests stay
             // parked, so name it rather than fold it into a misleading "nothing parked".
             Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
             // A dead/stale socket (the session went away) — skip it.
@@ -5049,7 +5049,7 @@ fn render_drain(
     let total: usize = answered.iter().map(|(_, hosts)| hosts.len()).sum();
     if total == 0 {
         // Nothing answered. Distinguish "every session is healthy but empty" from "the only sessions
-        // present were launched by an older ops that does not understand `--all`" — the latter would
+        // present were launched by an older sbx that does not understand `--all`" — the latter would
         // otherwise read as "nothing parked" while requests are in fact still blocked.
         if unsupported.is_empty() {
             match app {
@@ -5116,16 +5116,16 @@ fn write_unsupported_note(o: &mut String, unsupported: &[u32], warn: &str, dim: 
         .join(", ");
     let _ = writeln!(
         o,
-        "{warn}session(s) {pids} were launched by an older ops without `--all` support — their \
+        "{warn}session(s) {pids} were launched by an older sbx without `--all` support — their \
          parked requests stay blocked.{r}"
     );
     let _ = writeln!(
         o,
-        "  {dim}relaunch the agent with the current ops to drain them in bulk.{r}"
+        "  {dim}relaunch the agent with the current sbx to drain them in bulk.{r}"
     );
 }
 
-/// `ops net stats [--app <name>] [--reset] [--json]`: report the per-host egress decision counters a
+/// `sbx net stats [--app <name>] [--reset] [--json]`: report the per-host egress decision counters a
 /// project's launches recorded — how often each destination was allowed, denied by a rule, or
 /// stopped by a security guard (SSRF, an outbound-secret tripwire, a domain-fronting mismatch).
 /// Read-only and host-side: it aggregates the session files under `<data>/egress`, with no launch,
@@ -5141,13 +5141,13 @@ fn net_stats(args: &[OsString]) -> ExitCode {
             Some("--reset") => reset = true,
             Some("--app") | Some("-a") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("ops: net stats: `--app` needs an app name");
+                    eprintln!("sbx: net stats: `--app` needs an app name");
                     return ExitCode::from(2);
                 };
                 app = Some(v.to_string());
             }
             _ => {
-                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "stats"]));
+                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "stats"]));
                 return ExitCode::from(2);
             }
         }
@@ -5155,14 +5155,14 @@ fn net_stats(args: &[OsString]) -> ExitCode {
     // `--reset` reports how many files it cleared; pairing it with `--json` is meaningless — flag it
     // rather than silently pick one.
     if reset && json {
-        eprintln!("ops: net stats: `--reset` does not combine with `--json`");
+        eprintln!("sbx: net stats: `--reset` does not combine with `--json`");
         return ExitCode::from(2);
     }
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -5171,14 +5171,14 @@ fn net_stats(args: &[OsString]) -> ExitCode {
     let project = match sandbox::project_identity(&cwd) {
         Ok((_, canon)) => canon.display().to_string(),
         Err(e) => {
-            eprintln!("ops: cannot resolve the project directory: {e}");
+            eprintln!("sbx: cannot resolve the project directory: {e}");
             return ExitCode::FAILURE;
         }
     };
     let egress_dir = match egress_data_dir() {
         Ok(d) => d.join("egress"),
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -5264,7 +5264,7 @@ fn render_stats(
     o
 }
 
-/// The parsed `ops net logs` display options.
+/// The parsed `sbx net logs` display options.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct LogView {
     json: bool,
@@ -5281,12 +5281,12 @@ struct LogView {
     /// The `--follow` poll interval in seconds (`-i`), default 1. Ignored without `--follow`.
     interval_secs: u64,
     /// `--all`: also show refusals a `mute` (`dontaudit`) rule suppressed from the default view —
-    /// tagged `muted`. They live in a separate ring and are still counted in `ops net stats`; the
+    /// tagged `muted`. They live in a separate ring and are still counted in `sbx net stats`; the
     /// default view omits them.
     all: bool,
 }
 
-/// Parse `ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
+/// Parse `sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
 /// [-n <N>] [--with-query] [--with-status] [--follow] [-i|--interval <secs>] [--json]`. Pure (no
 /// I/O), so every reject path is unit-testable — a missing value, an unknown verdict, a non-numeric
 /// count or interval, a zero interval, or an unknown flag is an error.
@@ -5359,7 +5359,7 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
 
 /// Query the live control sockets for each session's recent egress events, scoped to one app's
 /// session(s) when `app` is set, and pair them with their registry context. The read-only gather
-/// step behind `ops net logs` — the log's analogue of [`collect_pending`]. No launch / nix / network.
+/// step behind `sbx net logs` — the log's analogue of [`collect_pending`]. No launch / nix / network.
 fn collect_logs(
     data_dir: &Path,
     app: Option<&str>,
@@ -5420,7 +5420,7 @@ fn display_log_path(path: &str, with_query: bool) -> &str {
 fn format_log_time(at_epoch_ms: u128) -> String {
     // `libc::time_t` is the exact argument type `localtime_r` expects. On musl it carries a
     // deprecation notice — a heads-up that musl 1.2 widened `time_t` to 64-bit and a future `libc`
-    // will drop this alias — but it stays the correct FFI type, and on ops's x86_64 target it is
+    // will drop this alias — but it stays the correct FFI type, and on sbx's x86_64 target it is
     // already 64-bit, so the widening is a no-op here. Silence the notice on the one line that names
     // it rather than reach for a hardcoded integer type that would be wrong on a 32-bit target.
     #[allow(deprecated)]
@@ -5442,22 +5442,22 @@ fn snapshot_evicted(snapshot: &sandbox::control::LogSnapshot) -> u64 {
     snapshot.events.first().map(|e| e.seq - 1).unwrap_or(0)
 }
 
-/// `ops net logs [-a|--app <name>] [--host <h>] [--verdict …] [-n <N>] [--with-query] [--json]`:
+/// `sbx net logs [-a|--app <name>] [--host <h>] [--verdict …] [-n <N>] [--with-query] [--json]`:
 /// the live egress event log — a chronological, per-session record of every egress decision the
-/// proxy made, read from the same control sockets `ops net pending` uses. Live-only: it shows a
+/// proxy made, read from the same control sockets `sbx net pending` uses. Live-only: it shows a
 /// running session's egress, and nothing remains once the session exits. No launch / nix / network.
 fn net_logs(args: &[OsString]) -> ExitCode {
     let view = match parse_log_args(args) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ops: net logs: {e}");
+            eprintln!("sbx: net logs: {e}");
             return ExitCode::from(2);
         }
     };
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -5505,7 +5505,7 @@ fn net_logs(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops net logs --follow`: after seeding with the current listing, poll each reachable session on
+/// `sbx net logs --follow`: after seeding with the current listing, poll each reachable session on
 /// the interval and **append** the events past a per-session seq cursor — a `tail -f` for egress. A
 /// ring overflow between polls (`dropped` > 0) is announced, never dropped silently. A session that
 /// ends (its control socket vanishes) is noted once; a new one is picked up. Runs until interrupted
@@ -5560,7 +5560,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     if flush_stream(&seed).is_err() {
         return ExitCode::SUCCESS;
     }
-    eprintln!("ops: following egress (Ctrl-C to quit)");
+    eprintln!("sbx: following egress (Ctrl-C to quit)");
 
     let mut last_pid: Option<u32> = None; // the session whose header was last printed (human view)
     loop {
@@ -5781,7 +5781,7 @@ fn render_logs(
 }
 
 /// One event's display line (indented, no trailing newline): `session-id · time · host:port ·
-/// method path · verdict · reason`. The `pid` is the session id (the one `ops session ls`/`attach`/`stop`
+/// method path · verdict · reason`. The `pid` is the session id (the one `sbx session ls`/`attach`/`stop`
 /// use), led so a line is self-contained when scanned or piped. The `reason` is dropped for a plain
 /// `allow` (it would just repeat "allowed"); a blank host (a malformed handshake) shows `-`. Shared
 /// by the one-shot render and the `--follow` stream so a line looks identical in both.
@@ -5854,7 +5854,7 @@ fn render_log_line(
         String::new()
     };
     format!(
-        "    {dim}{pid}{r}  {dim}{time}{r}  {dim}{proto}{r}  {n}{hostport}{r}  {method}{path}  {vc}{}{r}{reason}{ws}{muted}{status}",
+        "    {dim}{pid}{r}  {dim}{time}{r}  {dim}{proto}{r}  {n}{hostport}{r}  {method}{path}{rpc}  {vc}{}{r}{reason}{ws}{muted}{status}",
         e.verdict.as_str()
     )
 }
@@ -5897,10 +5897,10 @@ fn log_event_json(
     obj
 }
 
-/// `ops net rules [--source config|builtin|session] [--filter <substr>] [--json]`: list the effective
+/// `sbx net rules [--source config|builtin|session] [--filter <substr>] [--json]`: list the effective
 /// egress rules, each tagged by source, optionally filtered. Reflects the trust gate (an untrusted
 /// project's rules are dropped), and does no launch / nix / network — the read-only posture of
-/// `ops config show` and `ops test net`.
+/// `sbx config show` and `sbx test net`.
 fn net_rules(args: &[OsString]) -> ExitCode {
     use config::view::RuleSourceView;
     let mut source: Option<RuleSourceView> = None;
@@ -5915,14 +5915,14 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             Some("--expand") | Some("-e") => expand = true,
             Some("--app") | Some("-a") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("ops: net rules: `--app` needs an app name");
+                    eprintln!("sbx: net rules: `--app` needs an app name");
                     return ExitCode::from(2);
                 };
                 app = Some(v.to_string());
             }
             Some("--source") | Some("-s") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("ops: `--source` needs a value (config, builtin, session)");
+                    eprintln!("sbx: `--source` needs a value (config, builtin, session)");
                     return ExitCode::from(2);
                 };
                 source = Some(match v {
@@ -5933,7 +5933,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
                     "session" | "manual" => RuleSourceView::Manual,
                     other => {
                         eprintln!(
-                            "ops: unknown rule source '{other}' (known: config, builtin, session)"
+                            "sbx: unknown rule source '{other}' (known: config, builtin, session)"
                         );
                         return ExitCode::from(2);
                     }
@@ -5941,13 +5941,13 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             }
             Some("--filter") | Some("-f") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("ops: `--filter` needs a substring");
+                    eprintln!("sbx: `--filter` needs a substring");
                     return ExitCode::from(2);
                 };
                 filter = Some(v.to_lowercase());
             }
             _ => {
-                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "rules"]));
+                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "rules"]));
                 return ExitCode::from(2);
             }
         }
@@ -5956,14 +5956,14 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
     // `--source session` is live runtime state, not config: query the running sessions for the rules
     // loaded into their live overlay, rather than reading the static config policy. Scoped to this
     // project by default, or — with `-a <app>` — to that app's session(s), mirroring how
-    // `ops net allow --session -a <app>` scopes the load (`--app` here filters *which sessions* to
+    // `sbx net allow --session -a <app>` scopes the load (`--app` here filters *which sessions* to
     // query, it does not fold a config overlay the way it does for the config/builtin sources).
     if source == Some(RuleSourceView::Manual) {
         return net_rules_manual(&cwd, app.as_deref(), filter.as_deref(), json);
@@ -5973,19 +5973,19 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     for w in &resolved.warnings {
         diag::warn(w);
     }
-    // Fold a named app's overlay so the rules listed are the *effective* set `ops app <name>` would
+    // Fold a named app's overlay so the rules listed are the *effective* set `sbx app <name>` would
     // launch with (its own posture, allow/deny, credentials), not the bare baseline — the same path
-    // `ops test net --app` uses, so the two read the same policy.
+    // `sbx test net --app` uses, so the two read the same policy.
     if let Some(name) = &app {
         if let Err(e) = fold_app_overlay(&mut resolved, name) {
-            eprintln!("ops: net rules: {e}");
+            eprintln!("sbx: net rules: {e}");
             return ExitCode::from(2);
         }
     }
 
     // A `--filter` is a search for a host, so it forces expansion: otherwise the substring would run
     // against a collapsed `@<group>` row and a host *inside* a group would be reported absent though
-    // it is allowed — a filter must never hide a matching rule. (`ops test net <url>` is the
+    // it is allowed — a filter must never hide a matching rule. (`sbx test net <url>` is the
     // authoritative "does this resolve" check regardless.)
     let expand = expand || filter.is_some();
 
@@ -6025,7 +6025,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     }
 
     // Name the posture in view: the baseline, or one app's effective overlay (matching the label
-    // `ops test net --app` prints, so the two commands read the same).
+    // `sbx test net --app` prints, so the two commands read the same).
     let scope = app
         .as_ref()
         .map(|n| format!(" (app {n})"))
@@ -6035,7 +6035,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops net groups` — the reusable-egress-group surface. `export`/`import` move groups between
+/// `sbx net groups` — the reusable-egress-group surface. `export`/`import` move groups between
 /// configs (they are reserved subcommand verbs, so a group named `export`/`import` is listable and
 /// referenceable as `@export` but not resolvable by bare name — use the listing); anything else is
 /// the list/resolve reader ([`net_groups_list`]).
@@ -6047,7 +6047,7 @@ fn net_groups(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `ops net groups [<name>…] [--json]`: list the reusable egress groups declared in the global
+/// `sbx net groups [<name>…] [--json]`: list the reusable egress groups declared in the global
 /// config (`[net.groups]`), or resolve named ones to their entries. Groups are global-only (the
 /// resolver honors them only from the global config), so there is no scope flag — this always reads
 /// the global config. Read-only, network-free. With no name it lists each group and its entry count;
@@ -6059,13 +6059,13 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--json") => json = true,
             Some(s) if s.starts_with('-') => {
-                eprintln!("ops: net groups: unknown flag `{s}`");
-                eprintln!("ops: usage: {}", help::synopsis_of(&["net", "groups"]));
+                eprintln!("sbx: net groups: unknown flag `{s}`");
+                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "groups"]));
                 return ExitCode::from(2);
             }
             Some(s) => names.push(s.to_string()),
             None => {
-                eprintln!("ops: net groups: a group name must be valid UTF-8");
+                eprintln!("sbx: net groups: a group name must be valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -6084,15 +6084,15 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
-            eprintln!("ops: net groups: no such group: {}", missing.join(", "));
+            eprintln!("sbx: net groups: no such group: {}", missing.join(", "));
             if groups.is_empty() {
                 eprintln!(
-                    "ops: no egress groups are defined — declare them under [net.groups] in the \
+                    "sbx: no egress groups are defined — declare them under [net.groups] in the \
                      global config"
                 );
             } else {
                 let avail: Vec<&str> = groups.keys().map(String::as_str).collect();
-                eprintln!("ops: defined groups: {}", avail.join(", "));
+                eprintln!("sbx: defined groups: {}", avail.join(", "));
             }
             return ExitCode::from(2);
         }
@@ -6127,9 +6127,9 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops net groups export [<name>…] [--out <file>]`: write the reusable egress groups as a portable
+/// `sbx net groups export [<name>…] [--out <file>]`: write the reusable egress groups as a portable
 /// `[net.groups]` TOML fragment — every group, or the named subset — to stdout (the default,
-/// composable and clobber-safe: `ops net groups export > groups.toml`) or to `--out <file>`. The
+/// composable and clobber-safe: `sbx net groups export > groups.toml`) or to `--out <file>`. The
 /// inverse of `import`. Read-only on the config; no launch, no nix.
 fn net_groups_export(args: &[OsString]) -> ExitCode {
     let mut out: Option<PathBuf> = None;
@@ -6139,22 +6139,22 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--out") | Some("-o") => {
                 let Some(v) = it.next() else {
-                    eprintln!("ops: net groups export: `--out` needs a file path");
+                    eprintln!("sbx: net groups export: `--out` needs a file path");
                     return ExitCode::from(2);
                 };
                 out = Some(PathBuf::from(v));
             }
             Some(s) if s.starts_with('-') => {
-                eprintln!("ops: net groups export: unknown flag `{s}`");
+                eprintln!("sbx: net groups export: unknown flag `{s}`");
                 eprintln!(
-                    "ops: usage: {}",
+                    "sbx: usage: {}",
                     help::synopsis_of(&["net", "groups", "export"])
                 );
                 return ExitCode::from(2);
             }
             Some(s) => names.push(s.to_string()),
             None => {
-                eprintln!("ops: net groups export: a group name must be valid UTF-8");
+                eprintln!("sbx: net groups export: a group name must be valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -6176,7 +6176,7 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
             .collect();
         if !missing.is_empty() {
             eprintln!(
-                "ops: net groups export: no such group: {}",
+                "sbx: net groups export: no such group: {}",
                 missing.join(", ")
             );
             return ExitCode::from(2);
@@ -6188,7 +6188,7 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
     };
     if selected.is_empty() {
         eprintln!(
-            "ops: net groups export: no egress groups to export (none are defined under \
+            "sbx: net groups export: no egress groups to export (none are defined under \
              [net.groups] in the global config)"
         );
         return ExitCode::from(2);
@@ -6209,7 +6209,7 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
             }
             Err(e) => {
                 eprintln!(
-                    "ops: net groups export: cannot write {}: {e}",
+                    "sbx: net groups export: cannot write {}: {e}",
                     path.display()
                 );
                 ExitCode::FAILURE
@@ -6218,7 +6218,7 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `ops net groups import <file> [--force]`: merge a portable `[net.groups]` fragment into the
+/// `sbx net groups import <file> [--force]`: merge a portable `[net.groups]` fragment into the
 /// global config, preserving every existing group and comment (`toml_edit`). Groups are global-only,
 /// so the target is always the global config; the deliberate command is the consent (an agent in the
 /// cage cannot run it), and the global config is trusted by location, so there is no prompt. A name
@@ -6231,16 +6231,16 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--force") | Some("-f") => force = true,
             Some(s) if s.starts_with('-') => {
-                eprintln!("ops: net groups import: unknown flag `{s}`");
+                eprintln!("sbx: net groups import: unknown flag `{s}`");
                 eprintln!(
-                    "ops: usage: {}",
+                    "sbx: usage: {}",
                     help::synopsis_of(&["net", "groups", "import"])
                 );
                 return ExitCode::from(2);
             }
             _ => {
                 if file.is_some() {
-                    eprintln!("ops: net groups import: expected exactly one file");
+                    eprintln!("sbx: net groups import: expected exactly one file");
                     return ExitCode::from(2);
                 }
                 file = Some(PathBuf::from(arg));
@@ -6249,7 +6249,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
     }
     let Some(file) = file else {
         eprintln!(
-            "ops: usage: {}",
+            "sbx: usage: {}",
             help::synopsis_of(&["net", "groups", "import"])
         );
         return ExitCode::from(2);
@@ -6258,7 +6258,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
     let groups = match config::read_net_groups_fragment(&file) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("ops: net groups import: {e}");
+            eprintln!("sbx: net groups import: {e}");
             return ExitCode::from(2);
         }
     };
@@ -6266,7 +6266,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
     // would be dropped at load) — fail closed, naming the offender.
     if let Some(bad) = groups.keys().find(|n| !config::is_valid_group_name(n)) {
         eprintln!(
-            "ops: net groups import: invalid group name `{bad}` (1–64 of [A-Za-z0-9._-]); nothing imported"
+            "sbx: net groups import: invalid group name `{bad}` (1–64 of [A-Za-z0-9._-]); nothing imported"
         );
         return ExitCode::from(2);
     }
@@ -6274,14 +6274,14 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
     let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: net groups import: {e}");
+            eprintln!("sbx: net groups import: {e}");
             return ExitCode::from(1);
         }
     };
@@ -6306,7 +6306,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
             );
             // Import is the one moment the user consciously brings in someone else's data, so flag any
             // entry that will not resolve (a malformed or nested one) right here — the same inspect-time
-            // check `ops net groups <name>` applies — rather than let it surface only at the next launch.
+            // check `sbx net groups <name>` applies — rather than let it surface only at the next launch.
             let dead: Vec<String> = groups
                 .iter()
                 .filter(|(_, entries)| entries.iter().any(|e| net_group_entry_issue(e).is_some()))
@@ -6314,7 +6314,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
                 .collect();
             if !dead.is_empty() {
                 diag::warn(&format!(
-                    "some entries will not resolve in: {} — inspect with `ops net groups <name>`",
+                    "some entries will not resolve in: {} — inspect with `sbx net groups <name>`",
                     dead.join(", ")
                 ));
             }
@@ -6322,7 +6322,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
         }
         Err(config::manage::ManageError::GroupCollision(names)) => {
             eprintln!(
-                "ops: net groups import: {} already defined: {} — re-run with --force to overwrite, \
+                "sbx: net groups import: {} already defined: {} — re-run with --force to overwrite, \
                  or rename in the fragment (nothing was written)",
                 if names.len() == 1 { "group" } else { "groups" },
                 names.join(", ")
@@ -6330,7 +6330,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
             ExitCode::from(2)
         }
         Err(e) => {
-            eprintln!("ops: net groups import: {e}");
+            eprintln!("sbx: net groups import: {e}");
             ExitCode::FAILURE
         }
     }
@@ -6339,7 +6339,7 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
 /// Why a group entry is not a usable rule, or `None` if it is fine. Mirrors what `build_net_groups`
 /// does at resolve time: a leading `@` is a nested reference (a group is flat, so it is ignored);
 /// anything else is classified, and a classification error is the reason. Used to flag an entry in
-/// the `ops net groups <name>` listing so a typo in a group is visible where the group is inspected.
+/// the `sbx net groups <name>` listing so a typo in a group is visible where the group is inspected.
 fn net_group_entry_issue(entry: &str) -> Option<String> {
     if entry.trim().starts_with('@') {
         return Some("nested group reference — ignored (a group is a flat list of entries)".into());
@@ -6347,7 +6347,7 @@ fn net_group_entry_issue(entry: &str) -> Option<String> {
     allowlist::classify(entry).err()
 }
 
-/// Render `ops net groups` — a pure presenter (its layout is asserted in a test). With no names it
+/// Render `sbx net groups` — a pure presenter (its layout is asserted in a test). With no names it
 /// lists each group and its entry count; with names it prints each named group's entries (as a
 /// `@name` block), appending a note to any entry that would be ignored or is malformed.
 fn render_net_groups(
@@ -6378,7 +6378,7 @@ fn render_net_groups(
                 plural(entries.len())
             );
         }
-        let _ = writeln!(o, "  {dim}resolve one with `ops net groups <name>`{r}");
+        let _ = writeln!(o, "  {dim}resolve one with `sbx net groups <name>`{r}");
         return o;
     }
 
@@ -6409,8 +6409,8 @@ fn render_net_groups(
     o
 }
 
-/// `ops net rules --source session`: the live overlay rules this project's running sessions carry —
-/// loaded with `ops net allow|deny --session` or remembered from a `ops net pending … --session`
+/// `sbx net rules --source session`: the live overlay rules this project's running sessions carry —
+/// loaded with `sbx net allow|deny --session` or remembered from a `sbx net pending … --session`
 /// answer. These live in the sessions' memory (not config) and are gone when the sessions end. The
 /// proxy folds them into its effective policy, so they apply in any filtering posture, not only
 /// `ask`. Cross-references the registry to find the sessions for this project (by the
@@ -6421,7 +6421,7 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -6498,7 +6498,7 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
 
 /// Render the egress rule listing — a pure presenter (so its colored layout is asserted in a test):
 /// a header naming the effective mode, then one line per shown rule (`allow`/`deny` keyword, the
-/// rule as a cyan identifier matching `ops config`, the source dim). `shared`/`none` carry no rules
+/// rule as a cyan identifier matching `sbx config`, the source dim). `shared`/`none` carry no rules
 /// and say so; an empty result distinguishes "no rules declared" from "nothing matched the filter".
 fn render_net_rules(
     mode: &str,
@@ -6537,7 +6537,7 @@ fn render_net_rules(
         "ask" => {
             let _ = writeln!(
                 o,
-                "{h}network{scope}:{r} ask {dim}— an unmatched host parks for a live `ops net pending` decision; \
+                "{h}network{scope}:{r} ask {dim}— an unmatched host parks for a live `sbx net pending` decision; \
                  allow rules auto-pass, deny rules auto-fail{r}"
             );
         }
@@ -6552,8 +6552,8 @@ fn render_net_rules(
             };
             let _ = writeln!(
                 o,
-                "{h}session egress rules{r} {dim}— live, loaded with `ops net allow|deny --session` \
-                 (or a `ops net pending … --session` answer) into {where_} (gone when they end){r}"
+                "{h}session egress rules{r} {dim}— live, loaded with `sbx net allow|deny --session` \
+                 (or a `sbx net pending … --session` answer) into {where_} (gone when they end){r}"
             );
         }
         _ => {
@@ -6604,9 +6604,9 @@ fn render_net_rules(
     o
 }
 
-/// `ops net allow|deny <rule> [--local|--global|-c <file>] [--app <name>]`: persist an egress rule
+/// `sbx net allow|deny <rule> [--local|--global|-c <file>] [--app <name>]`: persist an egress rule
 /// to a config file. The rule is validated up front (fail-closed), then `manage::add_egress_rule`
-/// places it per the posture matrix. A write to the project `.ops.toml` is trust-gated: it must be
+/// places it per the posture matrix. A write to the project `.sbx.toml` is trust-gated: it must be
 /// absent or already trusted (else refuse — never bless an unreviewed file by appending), and is
 /// re-trusted after the write so the rule takes effect. The global config is trusted by location
 /// (no gate). `--app <name>` targets the app's own `[app.<name>.network]`.
@@ -6631,24 +6631,24 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::from(2);
         }
     };
     let rule = match parsed.positionals.as_slice() {
         [r] => r.clone(),
         [] => {
-            eprintln!("ops: usage: {}", help::synopsis_of(&["net", verb]));
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["net", verb]));
             return ExitCode::from(2);
         }
         _ => {
-            eprintln!("ops: net {verb}: expected exactly one rule");
+            eprintln!("sbx: net {verb}: expected exactly one rule");
             return ExitCode::from(2);
         }
     };
     if let Some(name) = &parsed.app {
         if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
-            eprintln!("ops: invalid app name '{name}'");
+            eprintln!("sbx: invalid app name '{name}'");
             return ExitCode::from(2);
         }
     }
@@ -6663,12 +6663,12 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         let group = rule.trim().strip_prefix('@').unwrap_or_default();
         if !config::is_valid_group_name(group) {
             eprintln!(
-                "ops: invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
+                "sbx: invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
             );
             return ExitCode::from(2);
         }
     } else if let Err(e) = allowlist::classify(&rule) {
-        eprintln!("ops: invalid rule {rule:?}: {e}");
+        eprintln!("sbx: invalid rule {rule:?}: {e}");
         return ExitCode::from(2);
     }
 
@@ -6677,7 +6677,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         // session-scope flags instead of silently ignoring a `--global` the user expected to matter.
         if parsed.scope_explicit {
             eprintln!(
-                "ops: --session loads a live rule and writes no file, so --local/--global/-c do not \
+                "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
                  apply — use -a <app> or --all to scope the session(s)"
             );
             return ExitCode::from(2);
@@ -6686,7 +6686,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         // so it cannot carry one. Point at the two ways to use a group.
         if is_group {
             eprintln!(
-                "ops: --session cannot load a @group (a group is expanded from the config at launch) \
+                "sbx: --session cannot load a @group (a group is expanded from the config at launch) \
                  — pass the concrete rules, or add the group to the config without --session"
             );
             return ExitCode::from(2);
@@ -6694,7 +6694,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("ops: cannot read the current directory: {e}");
+                eprintln!("sbx: cannot read the current directory: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -6704,18 +6704,18 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
     if all {
         eprintln!(
-            "ops: --all only applies with --session (it widens a live rule to every session); a config \
+            "sbx: --all only applies with --session (it widens a live rule to every session); a config \
              write targets one file — drop --all"
         );
         return ExitCode::from(2);
     }
 
-    // `ops net allow|deny` resolves a `--local` scope against the cwd, as one expects of a command
+    // `sbx net allow|deny` resolves a `--local` scope against the cwd, as one expects of a command
     // run in a project.
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -6725,16 +6725,16 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             ExitCode::SUCCESS
         }
         Err((code, message)) => {
-            eprintln!("ops: {message}");
+            eprintln!("sbx: {message}");
             ExitCode::from(code)
         }
     }
 }
 
-/// `ops net unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove a `mute` rule from a
-/// config file — the inverse of `ops net mute`. Idempotent (removing a rule that is not there is a
-/// reported no-op, not an error); a project `.ops.toml` write is trust-gated and re-trusted exactly
-/// like `ops net mute`. There is no `--session` form — a live mute overlay is not yet wired, so a
+/// `sbx net unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove a `mute` rule from a
+/// config file — the inverse of `sbx net mute`. Idempotent (removing a rule that is not there is a
+/// reported no-op, not an error); a project `.sbx.toml` write is trust-gated and re-trusted exactly
+/// like `sbx net mute`. There is no `--session` form — a live mute overlay is not yet wired, so a
 /// session-scope flag is refused rather than silently ignored.
 fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
     if args
@@ -6742,38 +6742,38 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
         .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
     {
         eprintln!(
-            "ops: net unmute: --session/--all do not apply — this removes a rule from a config file"
+            "sbx: net unmute: --session/--all do not apply — this removes a rule from a config file"
         );
         return ExitCode::from(2);
     }
     let parsed = match split_scope(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::from(2);
         }
     };
     let rule = match parsed.positionals.as_slice() {
         [r] => r.clone(),
         [] => {
-            eprintln!("ops: usage: {}", help::synopsis_of(&["net", "unmute"]));
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "unmute"]));
             return ExitCode::from(2);
         }
         _ => {
-            eprintln!("ops: net unmute: expected exactly one rule");
+            eprintln!("sbx: net unmute: expected exactly one rule");
             return ExitCode::from(2);
         }
     };
     if let Some(name) = &parsed.app {
         if config::is_reserved_app_verb(name) || !config::is_valid_app_name(name) {
-            eprintln!("ops: invalid app name '{name}'");
+            eprintln!("sbx: invalid app name '{name}'");
             return ExitCode::from(2);
         }
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -6783,14 +6783,14 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
             ExitCode::SUCCESS
         }
         Err((code, message)) => {
-            eprintln!("ops: {message}");
+            eprintln!("sbx: {message}");
             ExitCode::from(code)
         }
     }
 }
 
-/// `ops net allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
-/// the running session(s) instead of a config file — the proactive sibling of `ops net pending
+/// `sbx net allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
+/// the running session(s) instead of a config file — the proactive sibling of `sbx net pending
 /// allow|deny <id> --session`, which remembers a decision for a request that already parked. It writes
 /// no file (so it never re-trusts a project the way a config write does) and the rule dies with the
 /// session. Scope: by default the **current project's** sessions; `-a <app>` narrows to that app's;
@@ -6814,7 +6814,7 @@ fn net_inject_session(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -6826,7 +6826,7 @@ fn net_inject_session(
         let canonical = match sandbox::project_identity(cwd) {
             Ok((_, c)) => c,
             Err(e) => {
-                eprintln!("ops: cannot resolve the current project directory: {e}");
+                eprintln!("sbx: cannot resolve the current project directory: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -6907,11 +6907,11 @@ fn render_inject(
                 }
             }
         }
-        // The rule is live-only, never written to config — so plain `ops net rules` (the config
+        // The rule is live-only, never written to config — so plain `sbx net rules` (the config
         // policy) will not show it. Point at where it *is* visible.
         let _ = writeln!(
             o,
-            "  {dim}see it with `ops net rules --source session` (it is not in the config){r}"
+            "  {dim}see it with `sbx net rules --source session` (it is not in the config){r}"
         );
     }
     if !refused.is_empty() {
@@ -6922,7 +6922,7 @@ fn render_inject(
             .join(", ");
         let _ = writeln!(
             o,
-            "{warn}session(s) {pids} refused the rule (an older ops without --session rule \
+            "{warn}session(s) {pids} refused the rule (an older sbx without --session rule \
              support).{r}"
         );
     }
@@ -6945,7 +6945,7 @@ fn render_inject(
         let app_flag = app.map(|a| format!(" --app {a}")).unwrap_or_default();
         let _ = writeln!(
             o,
-            "  {dim}to pre-decide it for the next launch, persist it: ops net {verb} \
+            "  {dim}to pre-decide it for the next launch, persist it: sbx net {verb} \
              {rule}{app_flag}{r}"
         );
     }
@@ -6955,11 +6955,11 @@ fn render_inject(
 /// Pre-flight the trust gate for a `--local` save at `cwd`, *before* any irreversible action (a bulk
 /// drain unblocks agents and cannot be undone). Mirrors [`persist_egress_rule`]'s gate exactly — same
 /// `scope_path`, same trust-store, same "existing config must be trusted" rule — so a save that would
-/// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (ops's
+/// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (sbx's
 /// append is then the sole delta).
 /// The write-side trust gate for a `--local` save: an existing-but-untrusted (or changed) project
 /// config must not be silently blessed by an appended rule — the user reviews and re-trusts it
-/// first. An absent config (bootstrap) or an already-trusted one is fine, so ops's edit is the sole
+/// first. An absent config (bootstrap) or an already-trusted one is fine, so sbx's edit is the sole
 /// delta from the trusted bytes. Pure on the `(exists, state)` pair, so the refuse/allow matrix is
 /// unit-testable without a filesystem.
 fn local_save_permitted(exists: bool, state: trust::TrustState) -> bool {
@@ -6979,7 +6979,7 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
         return Err((
             2,
             format!(
-                "{} is not trusted — review it and run `ops trust {}`, then retry (a `--local` save \
+                "{} is not trusted — review it and run `sbx trust {}`, then retry (a `--local` save \
                  will not silently bless an untrusted project)",
                 path.display(),
                 config::PROJECT_CONFIG
@@ -6989,7 +6989,7 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
     Ok(())
 }
 
-/// `ops net pending allow|deny --all --save [-l|-g|-a <app>]`: drain parked requests *and* persist a
+/// `sbx net pending allow|deny --all --save [-l|-g|-a <app>]`: drain parked requests *and* persist a
 /// rule per answered host, so the same destinations are pre-decided next launch. The drain is scoped
 /// to match the save target: a `--local` save (the default) writes the **current project's** config,
 /// so it drains only that project's sessions — never machine-wide — which is what makes a bulk local
@@ -7008,7 +7008,7 @@ fn net_pending_drain_and_save(
         sandbox::control::Verdict::Deny => (EgressList::Deny, "deny", "denied"),
     };
     if matches!(scope, Scope::File(_)) {
-        eprintln!("ops: `--all --save` takes --local or --global, not `-c <file>`");
+        eprintln!("sbx: `--all --save` takes --local or --global, not `-c <file>`");
         return ExitCode::from(2);
     }
     let local = matches!(scope, Scope::Local);
@@ -7016,7 +7016,7 @@ fn net_pending_drain_and_save(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -7026,19 +7026,19 @@ fn net_pending_drain_and_save(
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
     let project_canonical = if local {
         if let Err((code, msg)) = precheck_local_save(&cwd) {
-            eprintln!("ops: {msg}");
+            eprintln!("sbx: {msg}");
             return ExitCode::from(code);
         }
         match sandbox::project_identity(&cwd) {
             Ok((_, canonical)) => Some(canonical),
             Err(e) => {
-                eprintln!("ops: cannot resolve the current project directory: {e}");
+                eprintln!("sbx: cannot resolve the current project directory: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -7072,7 +7072,7 @@ fn net_pending_drain_and_save(
                 answered.push((pid, answered_hosts));
             }
             Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
-            // A session launched by an older ops that does not understand `--all` — nothing was
+            // A session launched by an older sbx that does not understand `--all` — nothing was
             // answered, so nothing is saved for it either; name it so the user knows why.
             Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
             Err(_) => {}
@@ -7206,8 +7206,8 @@ fn egress_write_target<'a>(
 }
 
 /// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
-/// it after — the shared writer behind `ops net allow|deny <rule>` and the `--save` of
-/// `ops net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
+/// it after — the shared writer behind `sbx net allow|deny <rule>` and the `--save` of
+/// `sbx net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
 /// refusal (a `-c` file scope, an untrusted project config, a posture conflict) is code `2`; an
 /// operational failure (no trust store, an unwritable path, a re-trust failure) is code `1`. A
 /// `Scope::File` is refused — the vocabulary is local/global/app, and a `-c` write would be
@@ -7228,11 +7228,11 @@ fn persist_egress_rule(
     if matches!(scope, Scope::File(_)) {
         return Err((
             2,
-            format!("`ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
+            format!("`sbx net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
         ));
     }
     // Validate the app name here, in the shared writer, so every path that persists a rule is
-    // covered — including `ops net pending --save --app <name>`, whose by-id form does not
+    // covered — including `sbx net pending --save --app <name>`, whose by-id form does not
     // pre-check the name. An invalid or reserved name keys a table `resolve_apps` drops at load,
     // so the rule would be silently inert; refuse it rather than report a durable restriction.
     if let Some(name) = app {
@@ -7240,15 +7240,15 @@ fn persist_egress_rule(
             return Err((2, format!("`{name}` is not a valid app name")));
         }
     }
-    // `base` is the directory a `--local` scope resolves against: the cwd for `ops net allow|deny`,
-    // or the *answered session's* project for `ops net pending --save` (so the rule lands in the
+    // `base` is the directory a `--local` scope resolves against: the cwd for `sbx net allow|deny`,
+    // or the *answered session's* project for `sbx net pending --save` (so the rule lands in the
     // project the agent runs in, not wherever the user happens to stand). Global ignores it. The
     // file, the in-file table shape (`app_key`), and the human `target` are resolved together — and
     // shared with the drain path — so the write and the message it prints can never disagree about
     // where the rule landed.
     let (path, app_key, target) = egress_write_target(scope, app, base)?;
 
-    // A write to the project `.ops.toml` is trust-gated; the global config and the app profiles
+    // A write to the project `.sbx.toml` is trust-gated; the global config and the app profiles
     // under `apps/` are trusted by location.
     let gated = matches!(scope, Scope::Local);
     let store =
@@ -7265,14 +7265,14 @@ fn persist_egress_rule(
         };
 
     // Pre-check: an existing-but-untrusted project config must not be silently blessed by an append
-    // — the user reviews and trusts it first. Absent or already-trusted is fine: ops's edit is then
+    // — the user reviews and trusts it first. Absent or already-trusted is fine: sbx's edit is then
     // the sole delta from the trusted bytes.
     if let Some(store) = &store {
         if !local_save_permitted(path.exists(), trust::state(store, &path)) {
             return Err((
                 2,
                 format!(
-                    "{} is not trusted — review it and run `ops trust {}`, then retry",
+                    "{} is not trusted — review it and run `sbx trust {}`, then retry",
                     path.display(),
                     config::PROJECT_CONFIG
                 ),
@@ -7291,7 +7291,7 @@ fn persist_egress_rule(
             (
                 1,
                 format!(
-                    "wrote the rule but could not re-trust {}: {e} — run `ops trust {}` so it \
+                    "wrote the rule but could not re-trust {}: {e} — run `sbx trust {}` so it \
                      takes effect",
                     path.display(),
                     config::PROJECT_CONFIG
@@ -7320,7 +7320,7 @@ fn persist_egress_rule(
 }
 
 /// Remove an egress `rule` from the scoped config file — the removal sibling of
-/// [`persist_egress_rule`], behind `ops net unmute`. A rule that is not present is a reported no-op
+/// [`persist_egress_rule`], behind `sbx net unmute`. A rule that is not present is a reported no-op
 /// (no write, no re-trust). Same scope vocabulary, trust-gate, and error codes as the add path: a
 /// `-c <file>` scope or an untrusted project config is code `2`; a trust-store/write/re-trust
 /// failure is code `1`.
@@ -7340,7 +7340,7 @@ fn persist_egress_removal(
     if matches!(scope, Scope::File(_)) {
         return Err((
             2,
-            format!("`ops net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
+            format!("`sbx net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
         ));
     }
     if let Some(name) = app {
@@ -7350,7 +7350,7 @@ fn persist_egress_removal(
     }
     let (path, app_key, target) = egress_write_target(scope, app, base)?;
 
-    // A project `.ops.toml` edit is trust-gated and re-trusted, exactly like the add path — removing
+    // A project `.sbx.toml` edit is trust-gated and re-trusted, exactly like the add path — removing
     // a rule still rewrites the file, so it must not silently bless an untrusted one.
     let gated = matches!(scope, Scope::Local);
     let store = if gated {
@@ -7366,7 +7366,7 @@ fn persist_egress_removal(
             return Err((
                 2,
                 format!(
-                    "{} is not trusted — review it and run `ops trust {}`, then retry",
+                    "{} is not trusted — review it and run `sbx trust {}`, then retry",
                     path.display(),
                     config::PROJECT_CONFIG
                 ),
@@ -7388,7 +7388,7 @@ fn persist_egress_removal(
                     (
                         1,
                         format!(
-                            "removed the rule but could not re-trust {}: {e} — run `ops trust {}`",
+                            "removed the rule but could not re-trust {}: {e} — run `sbx trust {}`",
                             path.display(),
                             config::PROJECT_CONFIG
                         ),
@@ -7404,8 +7404,8 @@ fn persist_egress_removal(
     }
 }
 
-/// `ops plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
-/// — it reads `<data>/plugins`, not a project's `.ops.toml`. A read-only diagnostic for now;
+/// `sbx plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
+/// — it reads `<data>/plugins`, not a project's `.sbx.toml`. A read-only diagnostic for now;
 /// installation and the signed plugin store are later increments, so the dispatch only knows the
 /// inspection verbs and names them on anything else (no inert stubs).
 fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
@@ -7416,10 +7416,10 @@ fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
         Some("rm") => plugins_remove(args.get(1).and_then(|a| a.to_str())),
         Some("store") => plugins_store(&args[1..]),
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
-        // Subcommands list guides, like bare `ops net`/`ops config`.
+        // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
             if let Some(tok) = other {
-                eprintln!("ops: plugins: unknown subcommand {tok:?}");
+                eprintln!("sbx: plugins: unknown subcommand {tok:?}");
             }
             eprint!("{}", help::page_usage(&["plugins"]).unwrap_or_default());
             ExitCode::from(2)
@@ -7437,7 +7437,7 @@ fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
     Some((registry, warnings))
 }
 
-/// `ops plugins list`: the reserved built-in schemes (never claimable by a plugin) and every
+/// `sbx plugins list`: the reserved built-in schemes (never claimable by a plugin) and every
 /// installed resolver plugin — its scheme, name, version, network grant, and one-line
 /// description. A plugin whose executable would be refused at launch (not owner-only, not a
 /// regular file) is flagged here, using the very check the runner enforces, so the gap between
@@ -7445,7 +7445,7 @@ fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
 /// scheme) go to stderr. No nix, no network, no launch.
 fn plugins_list() -> ExitCode {
     let Some((registry, warnings)) = load_plugin_registry() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
 
@@ -7478,9 +7478,9 @@ fn plugins_list() -> ExitCode {
                 println!("    {dim}{desc}{r}");
             }
         }
-        println!("{dim}(remove one with: ops plugins rm <name>){r}");
+        println!("{dim}(remove one with: sbx plugins rm <name>){r}");
     }
-    println!("{dim}(browse the built-in store with: ops plugins store list){r}");
+    println!("{dim}(browse the built-in store with: sbx plugins store list){r}");
     for w in &warnings {
         diag::warn(w);
     }
@@ -7504,7 +7504,7 @@ fn render_plugin_installed(
     };
     format!(
         "{ok}installed{r} '{n}{name}{r}' {dim}({scheme}://){r}{from} \
-         {dim}— remove with: ops plugins rm {name}{r}"
+         {dim}— remove with: sbx plugins rm {name}{r}"
     )
 }
 
@@ -7518,7 +7518,7 @@ fn render_removed(label: Option<&str>, name: &str, pal: &style::Palette) -> Stri
     }
 }
 
-/// The trust-on-first-use caution for a freshly added store — yellow, since it pinned a key ops
+/// The trust-on-first-use caution for a freshly added store — yellow, since it pinned a key sbx
 /// could not pre-verify. The pinned key is highlighted for an out-of-band comparison; the
 /// follow-up hint is dimmed. Goes to stderr, so its palette is decided from stderr's stream.
 fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palette) -> String {
@@ -7526,7 +7526,7 @@ fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palette) -> Stri
     format!(
         "{warn}⚠ trust-on-first-use: pinned the key this store ships, unverified{r}\n  \
          pinned key: {n}{pubkey_hex}{r}\n  \
-         {dim}verify it out of band; re-shown by `ops plugins store info {name}`{r}"
+         {dim}verify it out of band; re-shown by `sbx plugins store info {name}`{r}"
     )
 }
 
@@ -7594,7 +7594,7 @@ fn render_published(
     let _ = write!(
         o,
         "{dim}commit and host the directory, then consumers add it with: \
-         ops plugins store add --name <n> --url <git-url> --key {pubkey_hex}{r}"
+         sbx plugins store add --name <n> --url <git-url> --key {pubkey_hex}{r}"
     );
     o
 }
@@ -7623,18 +7623,18 @@ fn render_store_updated(
     }
 }
 
-/// `ops plugins install <name | dir>`: place a resolver plugin into the data dir, where it becomes
+/// `sbx plugins install <name | dir>`: place a resolver plugin into the data dir, where it becomes
 /// trusted by location. A bare `name` installs a plugin from the built-in store (bundled in the
 /// binary); a path-like argument (`./dir`, `/abs/dir`) copies a local directory. A deliberate user
 /// act (an agent in the cage cannot run it); either way the staged copy is validated exactly as the
 /// launcher will and refused, fail-closed, on any flaw. No fetch, no network, no signature.
 fn plugins_install(source: Option<&OsString>) -> ExitCode {
     let Some(source) = source else {
-        eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "install"]));
+        eprintln!("sbx: usage: {}", help::synopsis_of(&["plugins", "install"]));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     // The rule is syntactic, not based on what exists on disk, so the command's meaning never
@@ -7645,7 +7645,7 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     } else if let Some(name) = source.to_str() {
         plugins::install_embedded(&layout, name)
     } else {
-        eprintln!("ops: a built-in plugin name must be valid UTF-8 (use ./<dir> for a local path)");
+        eprintln!("sbx: a built-in plugin name must be valid UTF-8 (use ./<dir> for a local path)");
         return ExitCode::from(2);
     };
     match result {
@@ -7658,7 +7658,7 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("ops: cannot install plugin: {why}");
+            eprintln!("sbx: cannot install plugin: {why}");
             ExitCode::FAILURE
         }
     }
@@ -7673,7 +7673,7 @@ fn is_path_like(arg: &OsStr) -> bool {
     bytes.first() == Some(&b'.') || bytes.contains(&b'/')
 }
 
-/// `ops plugins store <subcommand>`: the plugin stores. `list` shows the built-in (embedded)
+/// `sbx plugins store <subcommand>`: the plugin stores. `list` shows the built-in (embedded)
 /// store and every configured remote store; `add` configures and fetches a remote signed store
 /// (a git repository whose catalogue is verified against a public key); `update` re-fetches one
 /// or all configured stores (re-verifying against the pinned key and refusing a revision that
@@ -7689,10 +7689,10 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
         Some("info") => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
         Some("rm") => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
-        // Subcommands list guides, like bare `ops net`/`ops config`.
+        // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
             if let Some(tok) = other {
-                eprintln!("ops: plugins store: unknown subcommand {tok:?}");
+                eprintln!("sbx: plugins store: unknown subcommand {tok:?}");
             }
             eprint!(
                 "{}",
@@ -7703,7 +7703,7 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)`: configure a
+/// `sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)`: configure a
 /// remote signed plugin store and fetch it for the first time. The repository is cloned, its
 /// catalogue verified, and the verified result cached under the data directory. A deliberate user
 /// act (an agent in the cage cannot run it). The store's trust anchor comes from exactly one of two
@@ -7713,7 +7713,7 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
 /// two is required: a store with no verifying key would be unsigned, refused fail-closed.
 fn plugins_store_add(args: &[OsString]) -> ExitCode {
     let usage = format!(
-        "ops: usage: {}",
+        "sbx: usage: {}",
         help::synopsis_of(&["plugins", "store", "add"])
     );
     let (mut name, mut url, mut key) = (None, None, None);
@@ -7727,7 +7727,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             Some("--trust") => trust = true,
             other => {
                 eprintln!(
-                    "ops: unexpected argument '{}'",
+                    "sbx: unexpected argument '{}'",
                     other.unwrap_or("(non-UTF-8)")
                 );
                 eprintln!("{usage}");
@@ -7743,25 +7743,25 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
     // The trust anchor is exactly one of --key (pin a known key) or --trust (accept the shipped one).
     if key.is_some() && trust {
         eprintln!(
-            "ops: --key and --trust are mutually exclusive: --key pins a key you supply, \
+            "sbx: --key and --trust are mutually exclusive: --key pins a key you supply, \
              --trust accepts the key the store ships"
         );
         return ExitCode::from(2);
     }
     if key.is_none() && !trust {
         eprintln!(
-            "ops: supply --key <hex|@file> to pin a known key, or --trust to accept the key the \
+            "sbx: supply --key <hex|@file> to pin a known key, or --trust to accept the key the \
              store ships on first use"
         );
         return ExitCode::from(2);
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     let Some(git) = store::resolve_git() else {
-        eprintln!("ops: git is not on PATH — a remote plugin store is a git repository");
+        eprintln!("sbx: git is not on PATH — a remote plugin store is a git repository");
         return ExitCode::FAILURE;
     };
 
@@ -7770,7 +7770,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             let pubkey = match stores::parse_pubkey_arg(key) {
                 Ok(k) => k,
                 Err(why) => {
-                    eprintln!("ops: invalid --key: {why}");
+                    eprintln!("sbx: invalid --key: {why}");
                     return ExitCode::from(2);
                 }
             };
@@ -7781,7 +7781,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 
     match result {
         Ok(added) => {
-            // Trust on first use pinned a key ops could not pre-verify: surface it loudly on stderr
+            // Trust on first use pinned a key sbx could not pre-verify: surface it loudly on stderr
             // (so it is never silently swallowed in a scripted run) with the full key for an
             // out-of-band comparison, while the configured-store report goes to stdout. Each line's
             // palette is decided from the stream it actually goes to.
@@ -7806,13 +7806,13 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("ops: cannot add store: {why}");
+            eprintln!("sbx: cannot add store: {why}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops plugins store publish <dir> --key <key-file> [--rev <n>]`: sign a directory of resolver
+/// `sbx plugins store publish <dir> --key <key-file> [--rev <n>]`: sign a directory of resolver
 /// plugins into a store. It writes a `catalogue.toml` (pinning each plugin by a content digest), a
 /// detached signature, the store's `pubkey`, and a `.gitattributes`; the operator then commits and
 /// hosts the result. The producing counterpart of `store add` — an operator tool, never reachable
@@ -7821,7 +7821,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 /// and never leaves the operator's host.
 fn plugins_store_publish(args: &[OsString]) -> ExitCode {
     let usage = format!(
-        "ops: usage: {}",
+        "sbx: usage: {}",
         help::synopsis_of(&["plugins", "store", "publish"])
     );
     let mut dir: Option<&OsStr> = None;
@@ -7839,20 +7839,20 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
                 match value.parse::<u64>() {
                     Ok(n) => rev = Some(n),
                     Err(_) => {
-                        eprintln!("ops: --rev must be a non-negative integer");
+                        eprintln!("sbx: --rev must be a non-negative integer");
                         return ExitCode::from(2);
                     }
                 }
             }
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("ops: unexpected argument '{flag}'");
+                eprintln!("sbx: unexpected argument '{flag}'");
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             }
             // Anything else (including a non-UTF-8 path) is the positional directory.
             _ => {
                 if dir.is_some() {
-                    eprintln!("ops: publish takes a single directory");
+                    eprintln!("sbx: publish takes a single directory");
                     eprintln!("{usage}");
                     return ExitCode::from(2);
                 }
@@ -7886,31 +7886,31 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("ops: cannot publish store: {why}");
+            eprintln!("sbx: cannot publish store: {why}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops plugins store update [name]`: re-fetch one configured remote store, or every configured
+/// `sbx plugins store update [name]`: re-fetch one configured remote store, or every configured
 /// store when no name is given. Each re-fetch re-verifies the catalogue against the store's
 /// pinned key (a compromised remote cannot rotate it) and refuses a revision that would roll
 /// back, replacing the cache atomically. A deliberate user act. When updating all stores, a
 /// failure on one is reported and the rest still run, with a non-zero exit if any failed.
 fn plugins_store_update(args: &[OsString]) -> ExitCode {
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     let Some(git) = store::resolve_git() else {
-        eprintln!("ops: git is not on PATH — a remote plugin store is a git repository");
+        eprintln!("sbx: git is not on PATH — a remote plugin store is a git repository");
         return ExitCode::FAILURE;
     };
 
     let names: Vec<String> = match args.first() {
         Some(arg) => {
             let Some(name) = arg.to_str() else {
-                eprintln!("ops: a store name must be valid UTF-8");
+                eprintln!("sbx: a store name must be valid UTF-8");
                 return ExitCode::from(2);
             };
             vec![name.to_string()]
@@ -7922,7 +7922,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
                 let (dim, r) = (pal.dim, pal.reset);
                 println!(
                     "{dim}no remote stores are configured \
-                     (add one with: ops plugins store add --name <n> --url <git-url> --key <hex>){r}"
+                     (add one with: sbx plugins store add --name <n> --url <git-url> --key <hex>){r}"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -7947,7 +7947,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
                 );
             }
             Err(why) => {
-                eprintln!("ops: cannot update store '{name}': {why}");
+                eprintln!("sbx: cannot update store '{name}': {why}");
                 failed = true;
             }
         }
@@ -7959,7 +7959,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `ops plugins store install <store> <plugin>`: install a resolver plugin a configured store
+/// `sbx plugins store install <store> <plugin>`: install a resolver plugin a configured store
 /// lists, by name. The store's cached catalogue (verified when the store was added or updated)
 /// pins the plugin's content by hash; the install verifies that hash, reconciles the catalogue's
 /// advertised name and scheme against the plugin's manifest, and places it exactly as a local
@@ -7970,13 +7970,13 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
         args.get(1).and_then(|a| a.to_str()),
     ) else {
         eprintln!(
-            "ops: usage: {}",
+            "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "install"])
         );
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     match stores::install_plugin(&layout, store_name, plugin_name) {
@@ -7989,31 +7989,31 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("ops: cannot install plugin: {why}");
+            eprintln!("sbx: cannot install plugin: {why}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops plugins store info <name>`: a configured remote store in detail — its origin URL, the
+/// `sbx plugins store info <name>`: a configured remote store in detail — its origin URL, the
 /// pinned public key, the accepted catalogue revision, and each plugin it lists. Reads only the
 /// owner-only cache (trusted by location): no fetch, no network.
 fn plugins_store_info(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
         eprintln!(
-            "ops: usage: {}",
+            "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "info"])
         );
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     let cfg = match stores::read_configured(&layout, name) {
         Ok(cfg) => cfg,
         Err(why) => {
-            eprintln!("ops: {why}");
+            eprintln!("sbx: {why}");
             return ExitCode::FAILURE;
         }
     };
@@ -8052,18 +8052,18 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops plugins store rm <name>`: remove a configured remote store from the cache. Host-level,
+/// `sbx plugins store rm <name>`: remove a configured remote store from the cache. Host-level,
 /// like `add`; refuses a name that is not configured.
 fn plugins_store_remove(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
         eprintln!(
-            "ops: usage: {}",
+            "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "rm"])
         );
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     match stores::remove(&layout, name) {
@@ -8073,13 +8073,13 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("ops: cannot remove store: {why}");
+            eprintln!("sbx: cannot remove store: {why}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops plugins store list`: the resolver plugins bundled in the binary, each with its scheme,
+/// `sbx plugins store list`: the resolver plugins bundled in the binary, each with its scheme,
 /// version, description, and whether it is already installed, followed by every configured
 /// remote store with its accepted revision and plugin count. No fetch, no network.
 fn plugins_store_list() -> ExitCode {
@@ -8087,7 +8087,7 @@ fn plugins_store_list() -> ExitCode {
     let installed_dir = layout.as_ref().map(|l| l.plugins_dir());
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
-    println!("{h}built-in plugin store{r} (install one with: ops plugins install <name>):");
+    println!("{h}built-in plugin store{r} (install one with: sbx plugins install <name>):");
     for entry in plugins::embedded_listing() {
         let scheme = entry.scheme.as_deref().unwrap_or("?");
         print!("  {n}{}{r}  {dim}({scheme}://){r}", entry.name);
@@ -8111,7 +8111,7 @@ fn plugins_store_list() -> ExitCode {
         let names = stores::list(layout);
         if !names.is_empty() {
             println!(
-                "{h}configured remote stores{r} (update with: ops plugins store update <name>):"
+                "{h}configured remote stores{r} (update with: sbx plugins store update <name>):"
             );
             for name in &names {
                 match stores::read_configured(layout, name) {
@@ -8141,15 +8141,15 @@ fn plugins_store_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `ops plugins rm <name>`: remove an installed resolver plugin by its name (the token `list`
+/// `sbx plugins rm <name>`: remove an installed resolver plugin by its name (the token `list`
 /// shows). Host-level, like `install`; refuses an unsafe name or a directory that is not a plugin.
 fn plugins_remove(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "rm"]));
+        eprintln!("sbx: usage: {}", help::synopsis_of(&["plugins", "rm"]));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     match plugins::remove(&layout, name) {
@@ -8159,26 +8159,26 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("ops: cannot remove plugin: {why}");
+            eprintln!("sbx: cannot remove plugin: {why}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// `ops plugins info <scheme>`: the full manifest and sandbox grant of the plugin claiming
+/// `sbx plugins info <scheme>`: the full manifest and sandbox grant of the plugin claiming
 /// `scheme`. A built-in scheme is reported as such (not an error); an unknown scheme is a
 /// non-zero "no such plugin". Like `list`, host-level and side-effect-free.
 fn plugins_info(scheme: Option<&str>) -> ExitCode {
     let Some(scheme) = scheme else {
-        eprintln!("ops: usage: {}", help::synopsis_of(&["plugins", "info"]));
+        eprintln!("sbx: usage: {}", help::synopsis_of(&["plugins", "info"]));
         return ExitCode::from(2);
     };
     if plugins::builtin_schemes().contains(&scheme) {
-        println!("{scheme}: a built-in resolver (compiled into ops, not a plugin)");
+        println!("{scheme}: a built-in resolver (compiled into sbx, not a plugin)");
         return ExitCode::SUCCESS;
     }
     let Some((registry, warnings)) = load_plugin_registry() else {
-        eprintln!("ops: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
         return ExitCode::FAILURE;
     };
     let Some(p) = registry.resolver(scheme) else {
@@ -8189,7 +8189,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         for w in &warnings {
             diag::warn(w);
         }
-        eprintln!("ops: no installed resolver plugin claims the scheme '{scheme}'");
+        eprintln!("sbx: no installed resolver plugin claims the scheme '{scheme}'");
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -8216,7 +8216,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// One `ops plugins info` grant line listing read-only path binds, or `(none)`.
+/// One `sbx plugins info` grant line listing read-only path binds, or `(none)`.
 fn print_grant_paths(label: &str, paths: &[PathBuf]) {
     if paths.is_empty() {
         println!("    {label}:  (none)");
@@ -8230,7 +8230,7 @@ fn print_grant_paths(label: &str, paths: &[PathBuf]) {
     }
 }
 
-/// One `ops plugins info` grant line listing passed-through environment variables, or `(none)`.
+/// One `sbx plugins info` grant line listing passed-through environment variables, or `(none)`.
 fn print_grant_env(label: &str, keys: &[String]) {
     if keys.is_empty() {
         println!("    {label}:    (none)");
@@ -8239,8 +8239,8 @@ fn print_grant_env(label: &str, keys: &[String]) {
     }
 }
 
-/// `ops upgrade [all|nix|mise]`: roll managed channels forward by re-resolving and
-/// rewriting their locks, so versions advance only here, never on an ops binary update.
+/// `sbx upgrade [all|nix|mise]`: roll managed channels forward by re-resolving and
+/// rewriting their locks, so versions advance only here, never on an sbx binary update.
 /// `nix` rolls the nixpkgs channel the current directory tracks (a trusted project pin,
 /// else the global channel) — base and native `nix:` `[packages]`. `mise` rolls the mise
 /// engine (its own dedicated lock), the project's `nix:` tools, and the project's and apps'
@@ -8259,7 +8259,7 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
             Some(w @ ("all" | "nix" | "mise" | "flake" | "deb" | "appimage")) => w,
             _ => {
                 eprintln!(
-                    "ops: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage)",
+                    "sbx: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage)",
                     arg.to_string_lossy()
                 );
                 return ExitCode::from(2);
@@ -8267,24 +8267,24 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         },
     };
     // Exactly one (optional) target. A trailing token — a mistyped flag or a second target —
-    // is rejected, not silently swallowed (so `ops upgrade nix mise` does not roll only `nix`).
+    // is rejected, not silently swallowed (so `sbx upgrade nix mise` does not roll only `nix`).
     if args.len() > 1 {
-        eprintln!("ops: usage: {}", help::synopsis("upgrade"));
+        eprintln!("sbx: usage: {}", help::synopsis("upgrade"));
         return ExitCode::from(2);
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        eprintln!("ops: nix not found — cannot upgrade. See `ops doctor`.");
+        eprintln!("sbx: nix not found — cannot upgrade. See `sbx doctor`.");
         return ExitCode::FAILURE;
     };
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -8342,7 +8342,7 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `ops gc [--all] [--prune]`: reclaim ops's per-project store space. By default it sweeps the
+/// `sbx gc [--all] [--prune]`: reclaim sbx's per-project store space. By default it sweeps the
 /// current project's store; `--all` also reaps whole runtime trees whose project directory is
 /// gone. A dry run by default (it reports what would be freed and touches nothing); `--prune`
 /// actually reclaims. Reclamation is irreversible, so the destructive form is opt-in.
@@ -8354,11 +8354,11 @@ fn gc_cmd(args: Vec<OsString>) -> ExitCode {
             Some("--prune") => prune = true,
             Some("--all") => all = true,
             Some(_) => {
-                eprintln!("ops: usage: {}", help::synopsis("gc"));
+                eprintln!("sbx: usage: {}", help::synopsis("gc"));
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("ops: gc: argument is not valid UTF-8");
+                eprintln!("sbx: gc: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -8367,16 +8367,31 @@ fn gc_cmd(args: Vec<OsString>) -> ExitCode {
     sandbox::gc(prune, all, &pal)
 }
 
-/// `ops projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
-/// default) and `rm`. The reaping primitives it drives are shared with `ops gc` (which keeps the
+/// `sbx projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
+/// default) and `rm`. The reaping primitives it drives are shared with `sbx gc` (which keeps the
 /// nix-store side); this is the discoverable front-end over the project-tree lifecycle.
 fn projects_cmd(args: Vec<OsString>) -> ExitCode {
+    if let Some(code) = help::maybe_help("projects", &args) {
+        return code;
+    }
     match args.first().and_then(|a| a.to_str()) {
-        Some("--help") | Some("-h") => help::show(&["projects"]),
-        Some("rm") | Some("remove") => projects_rm_cmd(&args[1..]),
         Some("list") | Some("ls") => projects_list_cmd(&args[1..]),
-        // No subcommand, or a leading flag like `--json`: default to `list` over all the args.
-        _ => projects_list_cmd(&args),
+        Some("rm") | Some("remove") => projects_rm_cmd(&args[1..]),
+        // Bare `sbx projects`, or only flags (e.g. `--json`) with no subcommand: print the page so
+        // its subcommand list guides, like bare `sbx app`/`sbx session`.
+        None => {
+            eprint!("{}", help::page_usage(&["projects"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
+        Some(flag) if flag.starts_with('-') => {
+            eprint!("{}", help::page_usage(&["projects"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
+        Some(other) => {
+            eprintln!("sbx: projects: unknown subcommand `{other}`");
+            eprintln!("       run `sbx help projects` for usage.");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -8387,12 +8402,12 @@ fn projects_list_cmd(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--help") | Some("-h") => return help::show(&["projects"]),
             Some(other) => {
-                eprintln!("ops: projects: unknown argument `{other}`");
-                eprintln!("       run `ops help projects` for usage.");
+                eprintln!("sbx: projects: unknown argument `{other}`");
+                eprintln!("       run `sbx help projects` for usage.");
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("ops: projects: argument is not valid UTF-8");
+                eprintln!("sbx: projects: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -8416,28 +8431,28 @@ fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
             Some("-f") | Some("--force") => force = true,
             Some("--help") | Some("-h") => return help::show(&["projects"]),
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("ops: projects rm: unknown flag `{flag}`");
-                eprintln!("       run `ops help projects` for usage.");
+                eprintln!("sbx: projects rm: unknown flag `{flag}`");
+                eprintln!("       run `sbx help projects` for usage.");
                 return ExitCode::from(2);
             }
             Some(id) => ids.push(id.to_string()),
             None => {
-                eprintln!("ops: projects rm: argument is not valid UTF-8");
+                eprintln!("sbx: projects rm: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     if ids.is_empty() && !dead && !markerless {
         eprintln!(
-            "ops: projects rm: name a project id, or use --dead / --markerless. \
-             Run `ops projects` to list them."
+            "sbx: projects rm: name a project id, or use --dead / --markerless. \
+             Run `sbx projects` to list them."
         );
         return ExitCode::from(2);
     }
     let targeted = !ids.is_empty();
     let bulk = dead || markerless;
     let Some(apply) = sandbox::projects_rm_apply(targeted, bulk, dry_run, yes) else {
-        eprintln!("ops: projects rm: `--dry-run` and `--yes` are contradictory — pick one.");
+        eprintln!("sbx: projects rm: `--dry-run` and `--yes` are contradictory — pick one.");
         return ExitCode::from(2);
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -8457,19 +8472,19 @@ fn upgrade_nix_channel(
     let target = match sandbox::effective_lock_target(cwd, layout, cfg) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("ops: cannot resolve the channel target: {e}");
+            eprintln!("sbx: cannot resolve the channel target: {e}");
             return false;
         }
     };
     let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("ops: cannot upgrade the nixpkgs channel: {e}");
+            eprintln!("sbx: cannot upgrade the nixpkgs channel: {e}");
             return false;
         }
     };
     for line in channel_upgrade_summary(
-        "ops upgrade — nix channel",
+        "sbx upgrade — nix channel",
         "channel",
         "the new base and tools download",
         target.origin().label(),
@@ -8483,7 +8498,7 @@ fn upgrade_nix_channel(
 
 /// Roll the mise engine: force a fresh resolution of its dedicated lock (the global
 /// channel source, in `mise-engine.lock`) and rewrite it, so the engine advances
-/// independently of the base channel that `ops upgrade nix` rolls. Host-global and
+/// independently of the base channel that `sbx upgrade nix` rolls. Host-global and
 /// present in every cage, so it rolls regardless of any project's trust — unlike the
 /// project's `nix:` tools. Returns whether it succeeded; the new engine is provisioned
 /// on the next launch.
@@ -8497,12 +8512,12 @@ fn upgrade_mise_engine(
     let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("ops: cannot upgrade the mise engine: {e}");
+            eprintln!("sbx: cannot upgrade the mise engine: {e}");
             return false;
         }
     };
     for line in channel_upgrade_summary(
-        "ops upgrade — mise engine",
+        "sbx upgrade — mise engine",
         "engine",
         "the new engine is provisioned",
         target.origin().label(),
@@ -8544,7 +8559,7 @@ fn upgrade_mise_tools(
         match sandbox::upgrade_tools(nix, layout, cwd, &mise.files, &sandbox::current_system()) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("ops: cannot roll the mise tools: {e}");
+                eprintln!("sbx: cannot roll the mise tools: {e}");
                 return false;
             }
         };
@@ -8557,14 +8572,14 @@ fn upgrade_mise_tools(
 }
 
 /// The human-readable summary of a mise tools roll: one line per declared tool (rolled,
-/// unchanged, newly pinned, or failed), the entries pruned, and any token ops does not
+/// unchanged, newly pinned, or failed), the entries pruned, and any token sbx does not
 /// handle. Pure, so every outcome is unit-tested without invoking nix.
 fn upgrade_tools_summary(outcomes: &[sandbox::ToolUpgrade], pal: &style::Palette) -> Vec<String> {
     use sandbox::ToolUpgrade::*;
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}ops upgrade — mise tools{r}")];
+    let mut lines = vec![format!("{h}sbx upgrade — mise tools{r}")];
     if outcomes.is_empty() {
         lines.push(format!("  {dim}no nix: tools to roll.{r}"));
         return lines;
@@ -8622,7 +8637,7 @@ fn upgrade_flake_packages(
     let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("ops: cannot roll the flake packages: {e}");
+            eprintln!("sbx: cannot roll the flake packages: {e}");
             return false;
         }
     };
@@ -8647,10 +8662,10 @@ fn flake_upgrade_summary(
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}ops upgrade — flake packages{r}")];
+    let mut lines = vec![format!("{h}sbx upgrade — flake packages{r}")];
     let withheld_note = || {
         format!(
-            "  {warn}{withheld} flake: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
+            "  {warn}{withheld} flake: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
         )
     };
     if outcomes.is_empty() {
@@ -8717,7 +8732,7 @@ fn upgrade_deb_packages(
     let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("ops: cannot roll the deb packages: {e}");
+            eprintln!("sbx: cannot roll the deb packages: {e}");
             return false;
         }
     };
@@ -8748,10 +8763,10 @@ fn deb_upgrade_summary(
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}ops upgrade — deb packages{r}")];
+    let mut lines = vec![format!("{h}sbx upgrade — deb packages{r}")];
     let withheld_note = || {
         format!(
-            "  {warn}{withheld} deb: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
+            "  {warn}{withheld} deb: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
         )
     };
     if outcomes.is_empty() {
@@ -8805,7 +8820,7 @@ fn upgrade_appimage_packages(
     let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("ops: cannot roll the appimage packages: {e}");
+            eprintln!("sbx: cannot roll the appimage packages: {e}");
             return false;
         }
     };
@@ -8829,10 +8844,10 @@ fn appimage_upgrade_summary(
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}ops upgrade — appimage packages{r}")];
+    let mut lines = vec![format!("{h}sbx upgrade — appimage packages{r}")];
     let withheld_note = || {
         format!(
-            "  {warn}{withheld} appimage: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
+            "  {warn}{withheld} appimage: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
         )
     };
     if outcomes.is_empty() {
@@ -9130,7 +9145,7 @@ mod tests {
         use trust::TrustState::{Changed, Trusted, Untrusted};
         // absent config → allowed (a `--local` save bootstraps it, then trusts it)
         assert!(local_save_permitted(false, Untrusted));
-        // already-trusted config → allowed (ops's append is the sole delta)
+        // already-trusted config → allowed (sbx's append is the sole delta)
         assert!(local_save_permitted(true, Trusted));
         // existing untrusted/changed config → refused (never silently bless it)
         assert!(!local_save_permitted(true, Untrusted));
@@ -9309,7 +9324,7 @@ mod tests {
         // allow mode frames it as a denylist.
         assert!(render_net_rules("allow", "", &refs, refs.len(), &p).contains("network: allow"));
 
-        // A `--app` scope labels the header exactly as `ops test net --app` does, on every posture.
+        // A `--app` scope labels the header exactly as `sbx test net --app` does, on every posture.
         assert!(
             render_net_rules("deny", " (app demo)", &refs, refs.len(), &p)
                 .contains("network (app demo): deny"),
@@ -9477,9 +9492,9 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("session 67890 (unregistered)"), "{out}");
-        assert!(out.contains("ops net pending allow <id>"), "{out}");
+        assert!(out.contains("sbx net pending allow <id>"), "{out}");
         // The footer also advertises the bulk drain.
-        assert!(out.contains("ops net pending allow|deny --all"), "{out}");
+        assert!(out.contains("sbx net pending allow|deny --all"), "{out}");
     }
 
     #[test]
@@ -9518,7 +9533,7 @@ mod tests {
         assert!(parse_watch_args(&osv(&["bogus"])).is_err());
     }
 
-    // ── ops net live ───────────────────────────────────────────────────────────────────────────
+    // ── sbx net live ───────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn parse_live_args_defaults_and_overrides() {
@@ -9624,7 +9639,7 @@ mod tests {
         );
     }
 
-    // ── ops net logs ───────────────────────────────────────────────────────────────────────────
+    // ── sbx net logs ───────────────────────────────────────────────────────────────────────────
 
     fn log_event(
         seq: u64,
@@ -10161,7 +10176,7 @@ mod tests {
         assert!(
             !old.contains("no pending requests")
                 && old.contains("99999")
-                && old.contains("older ops")
+                && old.contains("older sbx")
                 && old.contains("relaunch the agent"),
             "an unsupported-only drain must name the older session and the fix, not claim emptiness:\n{old}"
         );
@@ -10244,7 +10259,7 @@ mod tests {
     #[test]
     fn egress_write_target_names_the_file_and_the_target_by_scope() {
         // The single source of truth for both the single-rule and the drain summaries. A `--local`
-        // app targets the project `.ops.toml` with an `[app.<name>]` overlay key; an explicit `-c`
+        // app targets the project `.sbx.toml` with an `[app.<name>]` overlay key; an explicit `-c`
         // file targets that path. Both are env-independent (the `--global` app arm resolves the
         // profile path from the config home, so it is covered by the `net pending … --save -g --app`
         // integration test instead). The target string must carry the app itself — a caller adds no
@@ -10261,12 +10276,12 @@ mod tests {
         assert_eq!(key, None);
         assert_eq!(target, "the project config");
 
-        let explicit = std::path::PathBuf::from("/etc/ops.toml");
+        let explicit = std::path::PathBuf::from("/etc/sbx.toml");
         let (path, key, target) =
             egress_write_target(&Scope::File(explicit.clone()), None, cwd).unwrap();
         assert_eq!(path, explicit);
         assert_eq!(key, None);
-        assert_eq!(target, "/etc/ops.toml");
+        assert_eq!(target, "/etc/sbx.toml");
     }
 
     #[test]
@@ -10294,7 +10309,7 @@ mod tests {
 
         // A `-c` file with an app: the file itself, the prefixed key, still gated (not trusted by
         // location).
-        let explicit = std::path::PathBuf::from("/etc/ops.toml");
+        let explicit = std::path::PathBuf::from("/etc/sbx.toml");
         let (path, key, gated) = resolve_key_target(
             "set",
             &Scope::File(explicit.clone()),
@@ -10342,19 +10357,19 @@ mod tests {
         assert_eq!((a.name.as_str(), a.detach), ("claude", true));
         assert!(a.tail.is_empty());
 
-        // `--` separates ops's args from the passthrough tail, appended verbatim.
+        // `--` separates sbx's args from the passthrough tail, appended verbatim.
         let a = parse_app_launch(&v(&["claude", "--", "-c"])).unwrap();
         assert_eq!((a.name.as_str(), a.detach), ("claude", false));
         assert_eq!(a.tail, v(&["-c"]));
 
-        // A flag before `--` is ops's; the same token after `--` is the program's (passthrough).
+        // A flag before `--` is sbx's; the same token after `--` is the program's (passthrough).
         let a = parse_app_launch(&v(&["claude", "--detach", "--", "-c", "--foo"])).unwrap();
         assert_eq!((a.name.as_str(), a.detach), ("claude", true));
         assert_eq!(a.tail, v(&["-c", "--foo"]));
         let a = parse_app_launch(&v(&["claude", "--", "--detach"])).unwrap();
         assert!(
             !a.detach,
-            "`--detach` after `--` is the program's, not ops's"
+            "`--detach` after `--` is the program's, not sbx's"
         );
         assert_eq!(a.tail, v(&["--detach"]));
 
@@ -10364,7 +10379,7 @@ mod tests {
         assert!(a.tail.is_empty());
 
         // A one-shot override is collected from the head, in any order with the name/`--detach`, and
-        // stops at `--` (a later `--config` after `--` is the program's argument, not ops's).
+        // stops at `--` (a later `--config` after `--` is the program's argument, not sbx's).
         let a = parse_app_launch(&v(&[
             "--env",
             "FOO=bar",
@@ -10454,7 +10469,7 @@ mod tests {
         use session::{Kind, Registry, Session, SessionRuntime};
 
         // Register THIS process (alive, so it survives the registry's liveness pruning) as an
-        // `ops app claude-code` session in a throwaway data dir.
+        // `sbx app claude-code` session in a throwaway data dir.
         let data = TmpDir::new();
         let me = Session::current(
             std::path::PathBuf::from("/home/u/proj"),
@@ -10563,18 +10578,18 @@ mod tests {
     #[test]
     fn trust_verdict_is_plain_text_when_uncolored() {
         let p = style::Palette::plain();
-        let path = Path::new("/p/.ops.toml");
+        let path = Path::new("/p/.sbx.toml");
         assert_eq!(
             render_trust_verdict(path, trust::TrustState::Trusted, &p),
-            "ops: /p/.ops.toml is trusted"
+            "sbx: /p/.sbx.toml is trusted"
         );
         assert_eq!(
             render_trust_verdict(path, trust::TrustState::Untrusted, &p),
-            "ops: /p/.ops.toml is untrusted"
+            "sbx: /p/.sbx.toml is untrusted"
         );
         assert_eq!(
             render_trust_verdict(path, trust::TrustState::Changed, &p),
-            "ops: /p/.ops.toml is changed since it was trusted — re-run `ops trust` to re-approve"
+            "sbx: /p/.sbx.toml is changed since it was trusted — re-run `sbx trust` to re-approve"
         );
     }
 
@@ -10582,11 +10597,11 @@ mod tests {
     fn parse_trust_args_honors_show_in_any_position_and_rejects_stray_tokens() {
         let os = |s: &str| OsString::from(s);
         // `--show` after the path must SHOW, not record trust — the security-sensitive default.
-        let (show, path) = parse_trust_args(vec![os("./repo/.ops.toml"), os("--show")]).unwrap();
+        let (show, path) = parse_trust_args(vec![os("./repo/.sbx.toml"), os("--show")]).unwrap();
         assert!(show, "trailing --show must be honored");
         assert_eq!(
             path.as_deref(),
-            Some(std::ffi::OsStr::new("./repo/.ops.toml"))
+            Some(std::ffi::OsStr::new("./repo/.sbx.toml"))
         );
         // `--show` first, path after.
         let (show, path) = parse_trust_args(vec![os("--show"), os("p.toml")]).unwrap();
@@ -10604,7 +10619,7 @@ mod tests {
         // The ON path: each state word takes its own span (green/yellow/red) and resets — a
         // swapped hue (the failure plain output cannot see) is caught here.
         let p = style::Palette::colored();
-        let path = Path::new("/p/.ops.toml");
+        let path = Path::new("/p/.sbx.toml");
         let cases = [
             (trust::TrustState::Trusted, p.ok, "trusted"),
             (trust::TrustState::Untrusted, p.warn, "untrusted"),
@@ -10622,15 +10637,15 @@ mod tests {
     #[test]
     fn trust_confirmations_are_plain_text_when_uncolored() {
         let p = style::Palette::plain();
-        let path = Path::new("/p/.ops.toml");
-        assert_eq!(render_trust_recorded(path, &p), "ops: trusted /p/.ops.toml");
+        let path = Path::new("/p/.sbx.toml");
+        assert_eq!(render_trust_recorded(path, &p), "sbx: trusted /p/.sbx.toml");
         assert_eq!(
             render_untrust_result(path, true, &p),
-            "ops: revoked trust for /p/.ops.toml"
+            "sbx: revoked trust for /p/.sbx.toml"
         );
         assert_eq!(
             render_untrust_result(path, false, &p),
-            "ops: /p/.ops.toml was not trusted; nothing to revoke"
+            "sbx: /p/.sbx.toml was not trusted; nothing to revoke"
         );
     }
 
@@ -10639,7 +10654,7 @@ mod tests {
         // The ON path: `trusted` green (matching the verdict), `revoked` yellow (the result is the
         // untrusted default), and the no-op note dimmed — each closed with a reset.
         let p = style::Palette::colored();
-        let path = Path::new("/p/.ops.toml");
+        let path = Path::new("/p/.sbx.toml");
         assert!(
             render_trust_recorded(path, &p).contains(&format!("{}trusted{}", p.ok, p.reset)),
             "a recorded trust must show `trusted` in green"
@@ -10662,7 +10677,7 @@ mod tests {
         let newer = "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c";
         let text = |up| {
             channel_upgrade_summary(
-                "ops upgrade — nix channel",
+                "sbx upgrade — nix channel",
                 "channel",
                 "the new base and tools download",
                 "default",
@@ -10709,7 +10724,7 @@ mod tests {
         // `engine` item word, and the engine-specific "provisioned" tail — so the two
         // roll commands read differently.
         let engine = channel_upgrade_summary(
-            "ops upgrade — mise engine",
+            "sbx upgrade — mise engine",
             "engine",
             "the new engine is provisioned",
             "default",
@@ -10730,7 +10745,7 @@ mod tests {
         // each closed by a reset — the feature a captured (plain) stream never exercises.
         let p = style::Palette::colored();
         let colored = channel_upgrade_summary(
-            "ops upgrade — nix channel",
+            "sbx upgrade — nix channel",
             "channel",
             "the new base and tools download",
             "default",
@@ -10742,7 +10757,7 @@ mod tests {
             &p,
         )
         .join("\n");
-        assert!(colored.contains(&format!("{}ops upgrade — nix channel{}", p.head, p.reset)));
+        assert!(colored.contains(&format!("{}sbx upgrade — nix channel{}", p.head, p.reset)));
         assert!(colored.contains(&format!("{}rolled forward{}", p.ok, p.reset)));
     }
 
@@ -11132,11 +11147,11 @@ mod tests {
         let p = style::Palette::plain();
         assert_eq!(
             render_plugin_installed("pass", "pass", None, &p),
-            "installed 'pass' (pass://) — remove with: ops plugins rm pass"
+            "installed 'pass' (pass://) — remove with: sbx plugins rm pass"
         );
         assert_eq!(
             render_plugin_installed("vault", "vault", Some("hub"), &p),
-            "installed 'vault' (vault://) from store 'hub' — remove with: ops plugins rm vault"
+            "installed 'vault' (vault://) from store 'hub' — remove with: sbx plugins rm vault"
         );
         assert_eq!(render_removed(None, "pass", &p), "removed 'pass'");
         assert_eq!(
@@ -11151,7 +11166,7 @@ mod tests {
             render_store_tofu("ab12", "hub", &p),
             "⚠ trust-on-first-use: pinned the key this store ships, unverified\n  \
              pinned key: ab12\n  \
-             verify it out of band; re-shown by `ops plugins store info hub`"
+             verify it out of band; re-shown by `sbx plugins store info hub`"
         );
         assert_eq!(
             render_store_configured("hub", 3, &[("vault", "vault", "1.0"), ("pass", "pass", "")], &p),
@@ -11165,7 +11180,7 @@ mod tests {
             render_published(5, &[("vault", "vault")], "deadbeef", &p),
             "published store at rev 5 (1 plugin):\n  vault  (vault://)\npubkey: deadbeef\n\
              commit and host the directory, then consumers add it with: \
-             ops plugins store add --name <n> --url <git-url> --key deadbeef"
+             sbx plugins store add --name <n> --url <git-url> --key deadbeef"
         );
         assert_eq!(
             render_store_updated("hub", 3, 5, 2, &p),
@@ -11184,28 +11199,28 @@ mod tests {
             ),
             "imported app profile 'demo-app' -> /c/demo-app.toml\n  \
              granted posture (trusted by location — honored even on an untrusted project):\n    \
-             command: x\n    network: allowlist\n  launch it with: ops app demo-app"
+             command: x\n    network: allowlist\n  launch it with: sbx app demo-app"
         );
         assert_eq!(
             render_app_exported("demo-app", Path::new("/c/out.toml"), &p),
             "exported app `demo-app` -> /c/out.toml"
         );
-        let cfg = Path::new("/p/.ops.toml");
+        let cfg = Path::new("/p/.sbx.toml");
         assert_eq!(
             render_config_write("set", "env.FOO", cfg, &p),
-            "ops: set `env.FOO` in /p/.ops.toml"
+            "sbx: set `env.FOO` in /p/.sbx.toml"
         );
         assert_eq!(
             render_config_write("unset", "env.FOO", cfg, &p),
-            "ops: unset `env.FOO` in /p/.ops.toml"
+            "sbx: unset `env.FOO` in /p/.sbx.toml"
         );
         assert_eq!(
             render_config_unchanged("env.FOO", cfg, &p),
-            "ops: `env.FOO` was not set in /p/.ops.toml"
+            "sbx: `env.FOO` was not set in /p/.sbx.toml"
         );
         assert_eq!(
             render_trusted_whole_file(cfg, &p),
-            "ops: trusted /p/.ops.toml (the whole file is now trusted)"
+            "sbx: trusted /p/.sbx.toml (the whole file is now trusted)"
         );
     }
 
@@ -11259,7 +11274,7 @@ mod tests {
         let exported = render_app_exported("demo-app", Path::new("/c/out.toml"), &p);
         assert!(exported.contains(&format!("{}exported{}", p.ok, p.reset)));
 
-        let cfg = Path::new("/p/.ops.toml");
+        let cfg = Path::new("/p/.sbx.toml");
         let set = render_config_write("set", "env.FOO", cfg, &p);
         assert!(set.contains(&format!("{}set{}", p.ok, p.reset)));
         assert!(set.contains(&format!("`{}env.FOO{}`", p.name, p.reset)));
@@ -11349,7 +11364,7 @@ mod tests {
 
     #[test]
     fn config_render_is_plain_text_when_uncolored() {
-        // The OFF path the `ops config show` integration assertions stand on: empty spans, so the
+        // The OFF path the `sbx config show` integration assertions stand on: empty spans, so the
         // wording and spacing are exactly today's — a withheld note, a channel line (with and
         // without a locked revision), and a deny rule.
         let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
@@ -11380,7 +11395,7 @@ mod tests {
     #[test]
     fn config_render_marks_a_writable_bind() {
         // The `(rw)` marker: a writable bind is flagged so a host write-through hole is
-        // visible in `ops config show`; the marker precedes the provenance tag. A read-only bind
+        // visible in `sbx config show`; the marker precedes the provenance tag. A read-only bind
         // (the default, covered above) carries none.
         let mut view = sample_config_view();
         view.binds = vec![config::view::BindView {
@@ -11592,7 +11607,7 @@ mod tests {
         );
         // A name with a `.` is not one TOML segment under the naive key splitter — point at `edit`.
         let err = app_prefixed_key("my.app", "cmd").unwrap_err();
-        assert!(err.contains("ops config edit"), "{err}");
+        assert!(err.contains("sbx config edit"), "{err}");
         // A name no app could ever carry is rejected outright.
         assert!(app_prefixed_key("bad name", "cmd").is_err());
     }
@@ -11634,7 +11649,7 @@ mod tests {
     fn config_render_shows_limits_only_when_overridden() {
         let p = style::Palette::colored();
         // A default-profile config prints no `limits:` line — the section surfaces a custom cap,
-        // not the documented defaults (which `ops doctor` shows).
+        // not the documented defaults (which `sbx doctor` shows).
         let out = render_config(&sample_config_view(), &p, false);
         assert!(
             !out.contains("limits:"),
@@ -11859,7 +11874,7 @@ mod tests {
         // An app overlay's allowlist is a one-line count by default and expands to its rules under
         // `--details`. The expansion includes the built-in set, which the baseline
         // `network` section does not show here (the baseline is `shared`), so this is the only place
-        // a profile's app-overlay allowlist surfaces what `ops app <name>` can actually reach.
+        // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
             cwd: "/proj".into(),
@@ -11964,7 +11979,7 @@ mod tests {
     #[test]
     fn config_render_app_overlay_postures_carry_the_baseline_parentheticals() {
         // An app overlay's simple postures read with the same parentheticals the baseline sections
-        // carry, so `ops app <name>` explains them identically: `network: shared` notes the host
+        // carry, so `sbx app <name>` explains them identically: `network: shared` notes the host
         // network, `network: none` notes the isolation, and a `wayland` gui carries the
         // compositor-exposure caveat. None of these is an expandable list, so they render the same
         // with or without `--details` — the default render is enough to pin them.
@@ -12054,7 +12069,7 @@ mod tests {
         // An app overlay's injected credentials are a one-line count by default and expand to each
         // by destination and source under `--details` — the same metadata the baseline section
         // shows. The shipped profiles put their secret in the overlay, so this is the only place a
-        // profile's credential surfaces in `ops config` (the baseline `secrets` section is empty).
+        // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
             cwd: "/proj".into(),

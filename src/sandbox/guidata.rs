@@ -36,7 +36,7 @@ pub(crate) struct GuiDataLayer {
     pub(crate) env: Vec<(String, String)>,
 }
 
-/// Provision the compiled GSettings schemas plus the GTK themes into ops's store against the pinned
+/// Provision the compiled GSettings schemas plus the GTK themes into sbx's store against the pinned
 /// `nixpkgs`. The gcroot is keyed by revision (`<data>/gcroots/gui/<rev>/guidata`), shared across
 /// every project on the same channel — like the fonts.
 pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<GuiDataLayer> {
@@ -52,7 +52,7 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
         layout,
         &gcroot,
         &expr,
-        "ops-gui-data",
+        "sbx-gui-data",
         "share/glib-2.0/schemas",
     )?;
     let env = data_env(&root);
@@ -74,11 +74,11 @@ fn data_env(root: &Path) -> Vec<(String, String)> {
 /// (whose `org.gtk.Settings.FileChooser` the file dialog reads), compile them into one
 /// `gschemas.compiled`, and stage `gnome-themes-extra`'s `share/themes` (the source of the named
 /// `Adwaita-dark` theme the file dialog uses). The placeholders are substituted
-/// (`@NIXPKGS@`/`@SYSTEM@`); every interpolated value is ops-controlled, so the expression carries
+/// (`@NIXPKGS@`/`@SYSTEM@`); every interpolated value is sbx-controlled, so the expression carries
 /// nothing to escape.
 fn derivation_expr(nixpkgs: &str, system: &str) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
-in pkgs.runCommand "ops-gui-data" { nativeBuildInputs = [ pkgs.glib ]; } ''
+in pkgs.runCommand "sbx-gui-data" { nativeBuildInputs = [ pkgs.glib ]; } ''
   mkdir -p $out/share/glib-2.0/schemas
   for p in ${pkgs.gsettings-desktop-schemas} ${pkgs.gtk3}; do
     find "$p/share/gsettings-schemas" -name "*.gschema.xml" -exec cp -f -t $out/share/glib-2.0/schemas {} + 2>/dev/null || true
@@ -114,12 +114,12 @@ mod tests {
 
     #[test]
     fn the_env_points_xdg_data_dirs_at_the_output_share() {
-        let env = data_env(Path::new("/nix/store/abc-ops-gui-data"));
+        let env = data_env(Path::new("/nix/store/abc-sbx-gui-data"));
         assert_eq!(
             env,
             vec![(
                 "XDG_DATA_DIRS".to_string(),
-                "/nix/store/abc-ops-gui-data/share".to_string()
+                "/nix/store/abc-sbx-gui-data/share".to_string()
             )]
         );
     }

@@ -68,7 +68,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!("ops's seccomp denylist is implemented only for x86_64 and aarch64");
+compile_error!("sbx's seccomp denylist is implemented only for x86_64 and aarch64");
 
 #[cfg(target_arch = "x86_64")]
 const TARGET_ARCH: TargetArch = TargetArch::x86_64;
@@ -181,7 +181,7 @@ fn enosys_named() -> Vec<(&'static str, i64)> {
 
 /// The number of a denied syscall by name — searching both the EPERM and ENOSYS unconditional
 /// sets (not `clone`/`ioctl`, which are argument-filtered and handled by name in [`resolve_allow`]).
-/// `None` for a name ops does not deny, so an `allow` entry for it is refused (loosening nothing).
+/// `None` for a name sbx does not deny, so an `allow` entry for it is refused (loosening nothing).
 fn denied_number(name: &str) -> Option<i64> {
     eperm_unconditional_named()
         .into_iter()
@@ -191,7 +191,7 @@ fn denied_number(name: &str) -> Option<i64> {
 }
 
 /// The canonical name of a denied syscall by number, for rendering a policy back to tokens
-/// (`ops config`). `clone`/`ioctl` are recognized explicitly; every other number is looked up in
+/// (`sbx config`). `clone`/`ioctl` are recognized explicitly; every other number is looked up in
 /// the two named sets. `None` for a number that is not denied (never happens for a policy built by
 /// [`resolve_allow`], whose whole-syscall lifts are all drawn from these sets).
 fn denied_name(nr: i64) -> Option<&'static str> {
@@ -309,7 +309,7 @@ pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
 fn write_to_memfd(bytes: Vec<u8>) -> io::Result<File> {
     // SAFETY: the name is a valid NUL-terminated C string and `flags = 0` yields a
     // descriptor without O_CLOEXEC, so it survives the exec into bwrap.
-    let fd = unsafe { libc::memfd_create(c"ops-seccomp".as_ptr(), 0) };
+    let fd = unsafe { libc::memfd_create(c"sbx-seccomp".as_ptr(), 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -333,7 +333,7 @@ pub(crate) fn argv_prefix(memfds: &[File]) -> Vec<OsString> {
 
 /// The compiled denylist filters (serialized cBPF) for `policy`, in load order — the
 /// same bytes [`memfds`] hands to bwrap, exposed for direct in-process installation
-/// by [`install_filters`]. `ops session attach` needs this because, entering an existing
+/// by [`install_filters`]. `sbx session attach` needs this because, entering an existing
 /// cage's namespaces, there is no bwrap to load the filters for it.
 pub(crate) fn filter_bytes(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
     programs(policy)
@@ -347,7 +347,7 @@ const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
 /// exactly as bwrap's two `--add-seccomp-fd` do (a non-matching filter yields
 /// *allow*, an `errno` action outranks it). Returns `false` on the first failure.
 ///
-/// Async-signal-safe: called between `fork` and `exec` (in `ops session attach`'s cage-entry
+/// Async-signal-safe: called between `fork` and `exec` (in `sbx session attach`'s cage-entry
 /// child), it only reads the prebuilt bytes and builds a `sock_fprog` on the stack —
 /// no allocation. The caller MUST have set `PR_SET_NO_NEW_PRIVS` first, or an
 /// unprivileged install is refused with `EACCES`.
@@ -414,7 +414,7 @@ pub(crate) enum Caution {
     /// Reopens injecting input into the controlling terminal (bare `ioctl`, `ioctl:tiocsti`,
     /// `ioctl:tioclinux`).
     TerminalInjection,
-    /// Reopens tearing down a mount, which can defeat a control-plane pin ops relies on (`umount2`).
+    /// Reopens tearing down a mount, which can defeat a control-plane pin sbx relies on (`umount2`).
     ControlPlane,
 }
 
@@ -425,7 +425,7 @@ impl Caution {
             Caution::Userns => "unprivileged user-namespace creation",
             Caution::TerminalInjection => "terminal input injection",
             Caution::ControlPlane => {
-                "tearing down a mount (can defeat a control-plane pin when ops's control plane is \
+                "tearing down a mount (can defeat a control-plane pin when sbx's control plane is \
                  bound read-write)"
             }
         }
@@ -483,7 +483,7 @@ pub(crate) fn resolve_allow(token: &str) -> Result<(Allow, Option<Caution>), Str
                 };
                 Ok((Allow::Whole(nr), caution))
             }
-            None => Err(format!("`{name}` is not in ops's seccomp denylist")),
+            None => Err(format!("`{name}` is not in sbx's seccomp denylist")),
         },
     }
 }
@@ -519,7 +519,7 @@ impl SeccompPolicy {
         self.ioctl_reqs.extend(&other.ioctl_reqs);
     }
 
-    /// The canonical, sorted token strings this policy allows — for `ops config` display. Derived
+    /// The canonical, sorted token strings this policy allows — for `sbx config` display. Derived
     /// from the same name tables the parse used, so what is shown can never drift from what the
     /// cage enforces. A `clone`/`ioctl` lifted wholesale renders as the bare name; a lifted flag or
     /// request renders in its `:selector` form.

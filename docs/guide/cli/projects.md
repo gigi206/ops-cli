@@ -1,23 +1,24 @@
-# `ops projects`
+# `sbx projects`
 
 ```
-ops projects [list] [--json]
-ops projects rm <id>... [--dead] [--markerless] [--dry-run] [--yes] [--gc] [--force]
+sbx projects list [--json]
+sbx projects rm <id>... [--dead] [--markerless] [--dry-run] [--yes] [--gc] [--force]
 ```
 
 List and remove the **per-project runtime trees** — the directories under
 `<data>/projects/<id>` that hold each project's writable nix store, isolated home, and
-locks. `ops projects` (or `ops projects list`) shows them; `ops projects rm` removes them.
+locks. `sbx projects list` shows them; `sbx projects rm` removes them. Bare `sbx projects`
+prints this page.
 
 Removing a tree is host-side only (no sandbox, no nix). Its nix store closures are left for
-[`ops gc`](gc.md) to reclaim — or add `--gc` to do both at once.
+[`sbx gc`](gc.md) to reclaim — or add `--gc` to do both at once.
 
-See also: [`ops gc`](gc.md) · [`ops path`](path.md) · [Garbage collection](../housekeeping/gc.md) · [Directory layout](../concepts/directory-layout.md).
+See also: [`sbx gc`](gc.md) · [`sbx path`](path.md) · [Garbage collection](../housekeeping/gc.md) · [Directory layout](../concepts/directory-layout.md).
 
 ## `list`
 
-The default. Lists every runtime tree with its id, state, on-disk size, last-used date, and
-recorded project path — richer than [`ops path`](path.md)'s `projects/` section, which omits
+Lists every runtime tree with its id, state, on-disk size, last-used date, and
+recorded project path — richer than [`sbx path`](path.md)'s `projects/` section, which omits
 the size. The tree of the directory you are in is marked `*`.
 
 Each tree's **state**:
@@ -35,7 +36,7 @@ Each tree's **state**:
 
 | Option | Meaning |
 |---|---|
-| `<id>...` | remove one or more named trees (the id `ops projects` lists) |
+| `<id>...` | remove one or more named trees (the id `sbx projects list` shows) |
 | `--dead` | sweep every tree whose project directory is gone |
 | `--markerless` | also sweep markerless legacy trees (no deadness proof) |
 | `--dry-run`, `-n` | preview a targeted removal instead of removing |
@@ -49,20 +50,20 @@ default** and require `--yes` to apply, since they act on more than one tree at 
 
 Two trees are always protected:
 
-- a tree a **live session** holds is refused — stop it with [`ops session stop`](session.md#stop) first;
+- a tree a **live session** holds is refused — stop it with [`sbx session stop`](session.md#stop) first;
 - the **current project's** own tree is refused without `--force`.
 
 ## Examples
 
 ```sh
-ops projects                         # list every runtime tree with its state and size
-ops projects --json                  # the same, as JSON
+sbx projects list                    # list every runtime tree with its state and size
+sbx projects list --json             # the same, as JSON
 
-ops projects rm 1a2b3c4d5e6f7a8b     # remove one named tree now
-ops projects rm 1a2b… --dry-run      # preview it first
+sbx projects rm 1a2b3c4d5e6f7a8b     # remove one named tree now
+sbx projects rm 1a2b… --dry-run      # preview it first
 
-ops projects rm --dead --yes         # reap every tree whose project is gone
-ops projects rm --dead --yes --gc    # + collect the freed shared-store closures
+sbx projects rm --dead --yes         # reap every tree whose project is gone
+sbx projects rm --dead --yes --gc    # + collect the freed shared-store closures
 ```
 
 Re-seeding heals a removed tree: the next launch in that project re-seeds its store from the

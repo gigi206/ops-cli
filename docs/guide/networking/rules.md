@@ -439,9 +439,9 @@ The HTTPS-only guarantee here comes from the **layer**, not the anchor: opening
 cleartext GET to a host is always a separate, deliberate `http://` rule.
 
 **Raw SSH plus inspected HTTPS on the same host is a smell** — the L7 rule cannot
-apply to the spliced port. `ops config` warns when a host carries both an L4 allow
+apply to the spliced port. `sbx config` warns when a host carries both an L4 allow
 and an overlapping L7 rule. Test any rule set with
-[`ops test net`](observability.md#ops-test-net).
+[`sbx test net`](observability.md#sbx-test-net).
 
 ---
 
@@ -450,8 +450,8 @@ and an overlapping L7 rule. Test any rule set with
 - [Network modes](modes.md) — where these lists live and how a mode is chosen.
 - [Egress groups](groups.md) — the `@name` references above.
 - [Ask mode](ask.md) — how an *undecided* request (matching neither list) is handled.
-- [Observability](observability.md) — `ops test net <url>` to check a rule, and
-  `ops net rules` to see the effective, expanded set.
+- [Observability](observability.md) — `sbx test net <url>` to check a rule, and
+  `sbx net rules` to see the effective, expanded set.
 - [Secrets: injection](../secrets/injection.md) · [redaction](../secrets/redaction.md)
   — what rides the L7 path (and why L4 bypasses it).
 - [`network` configuration reference](../configuration/network.md)

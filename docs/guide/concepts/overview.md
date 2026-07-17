@@ -1,6 +1,6 @@
-# What ops is (and is not)
+# What sbx is (and is not)
 
-`ops` is a **sandbox launcher**: a single static Rust binary that runs tools —
+`sbx` is a **sandbox launcher**: a single static Rust binary that runs tools —
 including **encapsulated AI agents** — inside a [bubblewrap](https://github.com/containers/bubblewrap)
 sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
@@ -10,7 +10,7 @@ See also: [Security model](security-model.md) · [Provisioning](provisioning.md)
 ## The problem it solves
 
 Running an autonomous coding agent on a project means letting untrusted code install
-dependencies and execute. `ops` gives that agent a real boundary: it runs as your
+dependencies and execute. `sbx` gives that agent a real boundary: it runs as your
 user, but the **bind layout is the security control** — the host filesystem and your
 secrets are absent from the cage unless explicitly and trustedly granted. The agent
 self-equips a per-project Nix store it cannot use to escape, behind an always-on
@@ -19,15 +19,15 @@ network by default and can be narrowed to a [deny-by-default allowlist](../netwo
 
 ## What it is not
 
-`ops` is **not** an OCI container manager. There is no docker/podman/nerdctl, no
+`sbx` is **not** an OCI container manager. There is no docker/podman/nerdctl, no
 image to build, no registry.
 
 The reference class is **sandboxes** (nono.sh, landrun) — tools whose job is
 isolation — **not** environment managers (devbox, devenv, flox) that assemble a
-toolchain but isolate nothing. `ops` does both: it provisions a project's toolchain
+toolchain but isolate nothing. `sbx` does both: it provisions a project's toolchain
 *and* confines it.
 
-| | `ops` | container manager | env manager |
+| | `sbx` | container manager | env manager |
 |---|---|---|---|
 | Isolates the host | yes (bind layout + namespaces) | yes (image + namespaces) | no |
 | Builds an image | no | yes | no |
@@ -37,12 +37,12 @@ toolchain but isolate nothing. `ops` does both: it provisions a project's toolch
 
 ## The two actor modes
 
-`ops` distinguishes two ways a sandbox is used, and the *default* is the locked-down
+`sbx` distinguishes two ways a sandbox is used, and the *default* is the locked-down
 one:
 
-- **Mode A — interactive shell** (`ops shell`, `ops run`): a semi-trusted user at a
+- **Mode A — interactive shell** (`sbx shell`, `sbx run`): a semi-trusted user at a
   keyboard. Network egress rules stay all-verbs; the human is the trust anchor.
-- **Mode B — autonomous agent** (`ops app <name>`): actions are untrusted. **This is
+- **Mode B — autonomous agent** (`sbx app <name>`): actions are untrusted. **This is
   the default posture.** An app's egress allowlist defaults to read-only verbs
   (`GET`/`HEAD`) unless a rule opts a host out, credentials are injected host-side
   and never enter the cage, and the app gets its own isolated home.
@@ -54,10 +54,10 @@ code. See [the app framework](../apps/README.md).
 
 - The default posture is the **locked-down agent**, not the interactive shell.
 - **Capability-bearing unprivileged user namespaces are a hard requirement** — no
-  boundary, no launch (see [`ops doctor`](../getting-started/doctor.md)).
+  boundary, no launch (see [`sbx doctor`](../getting-started/doctor.md)).
 - The cage runs **as your uid** (same-uid), so a secret is protected by being
   **absent**, not merely read-only.
-- An untrusted project's `.ops.toml` **cannot** touch security-relevant fields; the
+- An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields; the
   [trust gate](trust.md) binds approval to the file's content hash.
 
 Continue with the [security model](security-model.md).

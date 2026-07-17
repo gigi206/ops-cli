@@ -1,6 +1,6 @@
 //! Per-host egress decision counters: how often each destination an agent reached was allowed,
 //! denied by a rule, or stopped by a security guard. The proxy ([`super::proxy`]) records one
-//! outcome per request into an [`EgressStats`]; a host-side `ops net stats` aggregates the
+//! outcome per request into an [`EgressStats`]; a host-side `sbx net stats` aggregates the
 //! per-session files back into a project view.
 //!
 //! Design notes:
@@ -10,13 +10,13 @@
 //!   failures (a malformed request, a DNS or upstream error) are not a policy verdict and are not
 //!   counted, so the numbers mean "what the policy did", not "what the network did".
 //! - **Flush per decision, not on exit.** A long-running agent session most often ends by being
-//!   killed (`ops session stop` sends SIGTERM→SIGKILL), and a Rust `Drop` does not run on a signal — so a
+//!   killed (`sbx session stop` sends SIGTERM→SIGKILL), and a Rust `Drop` does not run on a signal — so a
 //!   flush-on-drop would silently persist nothing for exactly the sessions worth auditing. Each
 //!   recorded decision rewrites the (tiny — one line per distinct host) session file atomically, so
 //!   the file is current as of the last completed request regardless of how the session dies.
 //! - **One file per session, aggregated at read.** Files are keyed by this process *incarnation*
 //!   (`stats-<pid>-<start-ticks>`), so two sessions of the same project never contend on a write and
-//!   a later process reusing the pid cannot clobber a prior session's still-wanted file; `ops net
+//!   a later process reusing the pid cannot clobber a prior session's still-wanted file; `sbx net
 //!   stats` sums every session file whose embedded `project=` header matches the project the user
 //!   stands in. The project key
 //!   is the canonical path [`super::binds::project_identity`] derives, the same on the write and
@@ -71,7 +71,7 @@ pub(crate) struct EgressStats {
     path: PathBuf,
     /// The canonical project path (the `project=` header), for read-side attribution.
     project: String,
-    /// The app name when this is an `ops app <name>` launch (the `app=` header), else `None`.
+    /// The app name when this is an `sbx app <name>` launch (the `app=` header), else `None`.
     app: Option<String>,
     /// A monotonic counter giving each flush a unique temp filename, so concurrent flushes from
     /// different connection threads never collide on the temp before the atomic rename.
@@ -255,7 +255,7 @@ pub(crate) fn aggregate(
 }
 
 /// Delete every session file matching `project` (and `app`, when given), returning how many were
-/// removed — `ops net stats --reset`. Best-effort per file: a removal error is skipped, so a
+/// removed — `sbx net stats --reset`. Best-effort per file: a removal error is skipped, so a
 /// partially-removable set still clears what it can.
 ///
 /// This clears the persisted counters of *ended* sessions. A still-**live** session keeps its

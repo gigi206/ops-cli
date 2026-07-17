@@ -1,11 +1,11 @@
-//! The on-disk shape of an `ops` config file and its parse.
+//! The on-disk shape of an `sbx` config file and its parse.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The fields a global `ops.toml` or a project `.ops.toml` may declare. Every
+/// The fields a global `sbx.toml` or a project `.sbx.toml` may declare. Every
 /// field is optional, and unknown fields are ignored, so a config written for a
-/// newer ops still loads on an older one — the schema is additive, never a hard
+/// newer sbx still loads on an older one — the schema is additive, never a hard
 /// parse wall a project could trip a command on.
 ///
 /// Fields are split by the trust gate, not by this struct: `env` is a *free*
@@ -32,7 +32,7 @@ pub(crate) struct RawConfig {
     pub(crate) packages: BTreeMap<String, String>,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
     /// written directly in the config (the `flake` field, a multiline string) plus an optional
-    /// output `attr` (default `"default"`); ops stages it, binds it read-only into the cage, and
+    /// output `attr` (default `"default"`); sbx stages it, binds it read-only into the cage, and
     /// builds `path:<dir>#<attr>` **in-cage** exactly like a `flake:` package, folding it into the
     /// same tool set (the name is the merge key and the on-disk root name). A security field like
     /// `packages` — arbitrary nix build source, honored only from a trusted source. Distinct from
@@ -66,7 +66,7 @@ pub(crate) struct RawConfig {
     /// X client can snoop and drive every other window, which Wayland's per-client isolation
     /// prevents on a well-behaved compositor.
     pub(crate) gui: Option<String>,
-    /// Whether to open hardware-accelerated GPU rendering for the cage (`gpu = true`). ops
+    /// Whether to open hardware-accelerated GPU rendering for the cage (`gpu = true`). sbx
     /// provisions mesa's DRI drivers into its own store and points the cage's libgbm/libEGL at
     /// them, grants the render node(s) under `/dev/dri`, and read-only-binds the minimal `/sys`
     /// DRM subtree the driver reads to enumerate the device. A security field — honored from the
@@ -76,7 +76,7 @@ pub(crate) struct RawConfig {
     /// (Intel/AMD/nouveau); the NVIDIA proprietary stack is a separate, not-yet-built mechanism.
     /// Most useful together with `gui = "wayland"`.
     pub(crate) gpu: Option<bool>,
-    /// Whether to open audio (microphone + playback) for the cage (`audio = true`). ops provisions
+    /// Whether to open audio (microphone + playback) for the cage (`audio = true`). sbx provisions
     /// the PulseAudio client library into its own store and puts it on the app's loader path, and
     /// binds the host PulseAudio socket (`$XDG_RUNTIME_DIR/pulse/native`, which a PipeWire host
     /// exposes via `pipewire-pulse`) into the cage. A security field — honored from the global
@@ -85,7 +85,7 @@ pub(crate) struct RawConfig {
     /// source (record whatever is playing on the host), a capability an untrusted project may not
     /// grant itself. Most useful together with `gui = "wayland"`.
     pub(crate) audio: Option<bool>,
-    /// Whether to give the cage a **private in-cage desktop portal** (`dbus = true`). ops stands up
+    /// Whether to give the cage a **private in-cage desktop portal** (`dbus = true`). sbx stands up
     /// a private D-Bus session bus inside the cage carrying its own `xdg-desktop-portal` with the GTK
     /// backend, so a Chromium/Electron app's file chooser renders **inside** the cage (seeing only
     /// the cage filesystem), the host light/dark theme is seeded at launch and followed live, and
@@ -103,7 +103,7 @@ pub(crate) struct RawConfig {
     /// empty-netns cage. A security field — honored from the global config or a trusted
     /// project, ignored from an untrusted one: opening a host port is a deliberate inbound
     /// hole, a choice an untrusted project may not make. A port already in use on the host
-    /// fails the launch closed (the redirect URL is baked in for OAuth, so ops does not
+    /// fails the launch closed (the redirect URL is baked in for OAuth, so sbx does not
     /// pick an ephemeral substitute). Loopback-only — never the host's external interfaces.
     pub(crate) forward: Option<Vec<u16>>,
     /// Credentials the egress proxy injects into matching outbound requests, declared
@@ -116,10 +116,10 @@ pub(crate) struct RawConfig {
     /// overlay over the sandbox baseline — a command to run plus the extra tools,
     /// environment, binds, network posture, and credentials that app needs. The overlay's
     /// fields are gated exactly like the baseline (the security ones honored only from a
-    /// trusted source), then merged onto the baseline by `ops app <name>`.
+    /// trusted source), then merged onto the baseline by `sbx app <name>`.
     #[serde(default)]
     pub(crate) app: BTreeMap<String, RawApp>,
-    /// Resource limits for the cage's cgroup scope (anti-DoS), overriding ops's built-in
+    /// Resource limits for the cage's cgroup scope (anti-DoS), overriding sbx's built-in
     /// defaults. A security field — honored from the global config or a trusted project,
     /// ignored from an untrusted one: loosening a limit (a higher `tasks_max`, an unbounded
     /// memory ceiling) reduces the anti-DoS protection, a choice an untrusted project may not
@@ -365,15 +365,15 @@ impl RawCmd {
 
 /// An inline nix flake declared as a `[flakes.<name>]` table: the full `flake.nix` source plus
 /// an optional output attribute. Unlike a `flake:<ref>` package (a reference to an external
-/// flake), the flake source lives directly in the config — ops stages it to a directory, binds it
+/// flake), the flake source lives directly in the config — sbx stages it to a directory, binds it
 /// read-only into the cage, and builds `path:<dir>#<attr>` in-cage. The flake floats: it has no
-/// persisted lock and no `ops upgrade` path, so pin the inputs inside the `flake.nix` itself
+/// persisted lock and no `sbx upgrade` path, so pin the inputs inside the `flake.nix` itself
 /// (e.g. `nixpkgs.url = "github:NixOS/nixpkgs/<rev>"`) for a reproducible build.
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawInlineFlake {
     /// The `flake.nix` source, verbatim. A multiline TOML string (`'''…'''`) is the natural form.
     pub(crate) flake: String,
-    /// The flake output attribute to build, the `#<attr>` fragment — e.g. `default` (the ops
+    /// The flake output attribute to build, the `#<attr>` fragment — e.g. `default` (the sbx
     /// default when unset) or a dotted path like `packages.x86_64-linux.hello`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attr: Option<String>,
@@ -526,8 +526,8 @@ pub(crate) struct NetworkTable {
     #[serde(default)]
     pub(crate) deny: Vec<String>,
     /// Log-suppression entries (SELinux `dontaudit`): a **denied** request matching one is still
-    /// refused and still counted in `ops net stats`, but its refusal is kept out of the default
-    /// `ops net log` view (`ops net log --all` shows it). Same entry grammar as `allow`/`deny`
+    /// refused and still counted in `sbx net stats`, but its refusal is kept out of the default
+    /// `sbx net log` view (`sbx net log --all` shows it). Same entry grammar as `allow`/`deny`
     /// (hosts, `*.domain`, exact URLs, `re:`, ports, `{VERB}` prefixes, `@group` references). A
     /// pure logging filter — it never changes a verdict. Trusted/global-only like the rest of the
     /// table.
@@ -558,11 +558,11 @@ pub(crate) struct NetworkTable {
     pub(crate) ask_timeout: Option<String>,
     /// Whether to print the `ask`-mode park notice to stderr when a request parks. On by default; a
     /// trusted layer may set `false` to silence the inline alert — the request still parks, answer it
-    /// with `ops net pending`. Inert outside `ask` mode. Absent means "inherit" — a layer that does
+    /// with `sbx net pending`. Inert outside `ask` mode. Absent means "inherit" — a layer that does
     /// not mention it does not change the inherited value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ask_notice: Option<bool>,
-    /// Whether the egress proxy records its per-host decision counters (`ops net stats`). On by
+    /// Whether the egress proxy records its per-host decision counters (`sbx net stats`). On by
     /// default; a trusted layer may set `false` to turn the audit off (`true` re-enables it). Absent
     /// means "inherit" — a layer that does not mention it does not change the inherited value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,8 +571,8 @@ pub(crate) struct NetworkTable {
     /// posture. Only meaningful on an `[app.<name>.network]` (or an imported profile's `[network]`):
     /// every Mode-B app defaults to `["GET","HEAD"]` so an agent reads but does not write unless a
     /// rule opts a host out with `{*}`/`{VERB}`; this field overrides that default for the app (e.g.
-    /// `["GET","POST"]`, or `["*"]` for all verbs). Ignored on the baseline `[network]` — `ops run`/
-    /// `ops shell` (Mode A) stay all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
+    /// `["GET","POST"]`, or `["*"]` for all verbs). Ignored on the baseline `[network]` — `sbx run`/
+    /// `sbx shell` (Mode A) stay all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_methods: Option<Vec<String>>,
 }
@@ -586,7 +586,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<RawConfig, String> {
 }
 
 /// Serialize an app as a top-level profile — the inverse of [`parse_app`], producing the portable
-/// file `ops app export` writes. Empty `env`/`binds`/`packages` are skipped (the field attributes),
+/// file `sbx app export` writes. Empty `env`/`binds`/`packages` are skipped (the field attributes),
 /// and an unset `Option` is omitted by TOML, so the output is the minimal faithful profile. The
 /// error is a human-readable string. Proven a lossless round-trip with [`parse_app`] in the tests,
 /// including the `#[serde(flatten)]` secret hosts and the untagged `cmd`/`network`/`from` enums.
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn serializing_an_app_round_trips_through_toml() {
-        // `serialize_app` is the inverse of `parse_app` — what `ops app export` writes must
+        // `serialize_app` is the inverse of `parse_app` — what `sbx app export` writes must
         // re-import identically. Covers the fragile corners: `#[serde(flatten)]` secret hosts
         // (with a `defaults` table and an array-of-tables host) and the untagged `cmd`/`network`/
         // `from` enums.
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn the_dbus_bool_round_trips_and_the_removed_string_form_is_rejected() {
-        // `dbus` is a plain bool (`true` = the in-cage portal). `ops app export` must round-trip it.
+        // `dbus` is a plain bool (`true` = the in-cage portal). `sbx app export` must round-trip it.
         let app = parse_app(b"cmd = \"demo\"\ndbus = true\n").unwrap();
         assert_eq!(app.dbus, Some(true));
         let out = serialize_app(&app).unwrap();
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn a_mode_less_network_table_round_trips_without_a_mode_line() {
-        // `ops app export` of a profile that inherits its mode must not materialize a `mode` line —
+        // `sbx app export` of a profile that inherits its mode must not materialize a `mode` line —
         // that would pin the mode and break the inheritance the author chose.
         let app = parse_app(b"cmd = \"demo\"\n[network]\nallow = [\"api.foo.com\"]\n").unwrap();
         let out = serialize_app(&app).unwrap();
@@ -1122,7 +1122,7 @@ mod tests {
     #[test]
     fn a_network_table_with_an_unknown_field_is_ignored_not_a_parse_error() {
         // The schema is deliberately additive (unknown fields ignored) so a config using a *newer*
-        // ops field still loads on an older ops. `[network]` must not break that: `NetworkField` is
+        // sbx field still loads on an older sbx. `[network]` must not break that: `NetworkField` is
         // an untagged enum, so a parse error there fails the WHOLE `RawConfig` → the loader drops the
         // entire layer → the network silently reverts to the open `shared` default (a fail-OPEN on a
         // security field). So an unknown `[network]` field is ignored, and the table still parses.
@@ -1313,7 +1313,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_ignored_for_forward_compatibility() {
-        // a field a newer ops understands must not break an older one
+        // a field a newer sbx understands must not break an older one
         let cfg = parse(b"some_future_field = 42\n[env]\nA = \"1\"\n").unwrap();
         assert_eq!(cfg.env.get("A").map(String::as_str), Some("1"));
     }

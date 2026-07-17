@@ -1,7 +1,7 @@
 //! The host-side sandboxed runner for resolver plugins.
 //!
 //! A resolver plugin turns a secret reference (`scheme://locator`) into the secret's
-//! plaintext. ops runs it **host-side, in its own bubblewrap cage** — never inside the
+//! plaintext. sbx runs it **host-side, in its own bubblewrap cage** — never inside the
 //! agent's cage — because a resolver is in the trusted computing base (it touches the
 //! plaintext) yet is third-party code, so it is confined to exactly the least-privilege
 //! grant its manifest declares ([`crate::plugins::SandboxGrant`]).
@@ -17,7 +17,7 @@
 //!   absent-vs-resolved split is applied by the caller's shared `classify_value`, so a plugin is
 //!   uniform with the `env`/`file`/`sops` built-ins and is safe in a non-terminal chain position.
 //!
-//! The plaintext lives only in ops's own memory (host-side, in the trusted computing base) and
+//! The plaintext lives only in sbx's own memory (host-side, in the trusted computing base) and
 //! is never logged: a failure folds the plugin's *stderr* into the error, never its stdout.
 //!
 //! The cage is built from the audited [`SandboxSpec`]/[`to_argv`] keystone, so every cage gets
@@ -44,7 +44,7 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     // owner-only permissions (a project cannot write there), but defend the thing we actually
     // exec directly: refuse it unless it is a regular file owned by us and not writable by group
     // or other. An attacker can only create files owned by *their* uid, so the owner check is the
-    // load-bearing one against a planted executable. (`ops plugins` surfaces the same verdict.)
+    // load-bearing one against a planted executable. (`sbx plugins` surfaces the same verdict.)
     plugin.check_exec().map_err(|why| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -68,7 +68,7 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
 
     let out = Command::new(bwrap)
         .args(to_argv(&spec))
-        // No stdin: a resolver must not read or block on ops's stdin.
+        // No stdin: a resolver must not read or block on sbx's stdin.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -103,7 +103,7 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     })
 }
 
-/// Read each declared `allow_env` variable from ops's environment, keeping only the ones that
+/// Read each declared `allow_env` variable from sbx's environment, keeping only the ones that
 /// are set: an unset variable is simply not passed (the resolver sees a cleared environment plus
 /// exactly these). A non-Unicode value cannot become a `--setenv` value, so it is skipped with a
 /// warning rather than silently dropped.
@@ -204,7 +204,7 @@ fn cage_spec(
         NetPolicy::Isolated
     };
 
-    // The grant's pass-throughs first, then ops's structural HOME/PATH last so the cage's own
+    // The grant's pass-throughs first, then sbx's structural HOME/PATH last so the cage's own
     // identity always wins over a manifest that happens to name them (self-harm at worst).
     let mut env: Vec<(String, String)> = allow_env.to_vec();
     env.push(("HOME".to_string(), CAGE_HOME.to_string()));

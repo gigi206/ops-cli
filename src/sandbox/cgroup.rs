@@ -61,7 +61,7 @@ pub(crate) struct Limits {
 
 impl Limits {
     /// The effective `MemoryHigh` value (the override when set, else the default) and whether it
-    /// came from a config override — for display by `ops config` / `doctor`.
+    /// came from a config override — for display by `sbx config` / `doctor`.
     pub(crate) fn memory_high(&self) -> (String, bool) {
         effective(&self.memory_high, MEMORY_HIGH)
     }
@@ -276,7 +276,7 @@ fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsStr
         // unit-name collision, so uniqueness is load-bearing, not cosmetic: the launcher
         // pid distinguishes two cages of one project (which share a slug), and `--collect`
         // frees a finished cage's name so it never blocks the next. The one multi-cage
-        // path in a single process (`ops upgrade`) runs its cages sequentially.
+        // path in a single process (`sbx upgrade`) runs its cages sequentially.
         OsString::from(format!(
             "--unit={}",
             super::naming::scope_unit(cage_slug, std::process::id())
@@ -617,7 +617,7 @@ mod tests {
             .find_map(|a| a.to_str()?.strip_prefix("--unit="))
             .expect("a --unit= argument is present");
         assert!(
-            unit.starts_with("ops-demo-app-") && unit.ends_with(".scope"),
+            unit.starts_with("sbx-demo-app-") && unit.ends_with(".scope"),
             "the unit is named after the cage slug: {unit}"
         );
         // The pid segment is the launcher's, keeping concurrent same-slug scopes distinct.

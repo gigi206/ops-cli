@@ -1,15 +1,15 @@
-# `ops test`
+# `sbx test`
 
 ```
-ops test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
+sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
 ```
 
 A diagnostic surface that reports whether an access would be allowed, and why. No
 launch, no nix, no network — it reports a verdict against the resolved policy.
 
-See also: [`ops net`](net.md) · [Network modes](../networking/modes.md) · [Rule grammar](../networking/rules.md) · [Observability](../networking/observability.md).
+See also: [`sbx net`](net.md) · [Network modes](../networking/modes.md) · [Rule grammar](../networking/rules.md) · [Observability](../networking/observability.md).
 
-## `ops test net`
+## `sbx test net`
 
 Reports **ALLOWED / DENIED / WOULD ASK** and the rule that decides it, against the
 effective [egress policy](../networking/modes.md) a launch would serve. The built-in
@@ -27,11 +27,11 @@ is noted (by header and source, never the value, and not resolved). Reflects the
 ## Examples
 
 ```sh
-ops test net https://api.github.com
-ops test net api.github.com --method POST
-ops test net --app claude-code https://api.anthropic.com/v1/messages
-ops test net tcp://db.internal:5432
+sbx test net https://api.github.com
+sbx test net api.github.com --method POST
+sbx test net --app claude-code https://api.anthropic.com/v1/messages
+sbx test net tcp://db.internal:5432
 ```
 
-`ops test net` tests **one URL**; to list the effective rules, use
-[`ops net rules`](net.md).
+`sbx test net` tests **one URL**; to list the effective rules, use
+[`sbx net rules`](net.md).

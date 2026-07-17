@@ -19,7 +19,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-color-{}-{n}", std::process::id()));
+        d.push(format!("sbx-color-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -34,11 +34,11 @@ impl Drop for TmpDir {
     }
 }
 
-/// Run `ops <args>` with a throwaway home (data, state, config all redirected) and a clean cwd,
+/// Run `sbx <args>` with a throwaway home (data, state, config all redirected) and a clean cwd,
 /// capturing stdout (a pipe — so color must be off). `NO_COLOR`/`TERM` are also neutralised so the
 /// result does not depend on the host's environment leaking in.
 fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ops"))
+    Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(args)
         .current_dir(cwd)
         .env("HOME", home)
@@ -48,7 +48,7 @@ fn run(args: &[&str], home: &Path, cwd: &Path) -> std::process::Output {
         .env_remove("NO_COLOR")
         .env_remove("TERM")
         .output()
-        .expect("spawn ops")
+        .expect("spawn sbx")
 }
 
 /// Assert a captured invocation carries no ANSI escape on either stream.
@@ -72,7 +72,7 @@ fn captured_output_carries_no_ansi_escapes() {
     // A real project config so `trust`/`untrust` take their confirmation path (recording then
     // revoking a marker), not an early read error — the colored confirmation lines must still be
     // plain when captured.
-    std::fs::write(cwd.path().join(".ops.toml"), "env = { A = \"1\" }\n").unwrap();
+    std::fs::write(cwd.path().join(".sbx.toml"), "env = { A = \"1\" }\n").unwrap();
     // Each is a renderer the color pass touched; all are cheap and host-agnostic. `doctor` is
     // included even though it probes the host — its output is captured, so it too must be plain.
     // `trust` precedes `untrust` so the revoke finds the marker it recorded (the `existed` path).
@@ -99,21 +99,21 @@ fn captured_output_carries_no_ansi_escapes() {
         // The egress-stats table (empty here) — its header + "nothing recorded" line must be plain.
         &["net", "stats"],
         &["trust", "--show"],
-        &["trust", ".ops.toml"],
-        &["untrust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
+        &["untrust", ".sbx.toml"],
         &["doctor"],
     ];
     for args in invocations {
         let out = run(args, home.path(), cwd.path());
         assert!(
             !out.stdout.contains(&0x1b),
-            "`ops {}` emitted an ANSI escape on a captured stream:\n{}",
+            "`sbx {}` emitted an ANSI escape on a captured stream:\n{}",
             args.join(" "),
             String::from_utf8_lossy(&out.stdout)
         );
         assert!(
             !out.stderr.contains(&0x1b),
-            "`ops {}` emitted an ANSI escape on captured stderr:\n{}",
+            "`sbx {}` emitted an ANSI escape on captured stderr:\n{}",
             args.join(" "),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -182,7 +182,7 @@ fn transactional_confirmations_are_plain_when_captured() {
     let update = run(&["plugins", "store", "update"], home.path(), cwd.path());
     assert_no_ansi(&update, "plugins store update");
 
-    // config writes: set (creates the local .ops.toml), then unset (removes the key). Both print a
+    // config writes: set (creates the local .sbx.toml), then unset (removes the key). Both print a
     // confirmation on stdout; no nix, no network.
     let set = run(
         &["config", "set", "env.FOO", "bar"],
@@ -216,14 +216,14 @@ fn transactional_confirmations_are_plain_when_captured() {
 
 #[test]
 fn app_targeted_net_test_is_plain_when_captured() {
-    // `ops test net --app <name>` renders spans the flat read-only loop never reaches: the app
+    // `sbx test net --app <name>` renders spans the flat read-only loop never reaches: the app
     // scope label, the built-in-built-in tag, and the credential-injection note. A miswired
     // renderer (raw `colored()` instead of the captured-stream palette) would leak ANSI here only.
     let home = TmpDir::new();
     let cwd = TmpDir::new();
     // A global app lives as a profile file (trusted by location; an inline `[app.<name>]` in the
     // global config is forbidden): a top-level `RawApp` with its own allowlist and injected credential.
-    let apps_dir = home.path().join("ops").join("apps");
+    let apps_dir = home.path().join("sbx").join("apps");
     std::fs::create_dir_all(&apps_dir).unwrap();
     std::fs::write(
         apps_dir.join("demo.toml"),
@@ -262,7 +262,7 @@ fn app_targeted_net_test_is_plain_when_captured() {
     assert!(builtin.status.success());
     assert_no_ansi(&builtin, "test net --app (built-in tag)");
 
-    // `ops net rules --app demo` colors the app-scoped header and the per-rule source tags — a
+    // `sbx net rules --app demo` colors the app-scoped header and the per-rule source tags — a
     // captured run must still be plain.
     let rules = run(&["net", "rules", "--app", "demo"], home.path(), cwd.path());
     assert!(rules.status.success());
@@ -271,11 +271,11 @@ fn app_targeted_net_test_is_plain_when_captured() {
 
 #[test]
 fn a_captured_warning_is_plain_with_exactly_one_prefix() {
-    // The `ops: warning:` / `ops: note:` family routes through the diag chokepoint. Drive a real
-    // warning (an orphan mise file with no `.ops.toml`, the anchoring warning) and assert the
+    // The `sbx: warning:` / `sbx: note:` family routes through the diag chokepoint. Drive a real
+    // warning (an orphan mise file with no `.sbx.toml`, the anchoring warning) and assert the
     // captured stream is plain AND carries exactly one `warning:` prefix. The count is the guard a
     // plain `.contains("warning:")` cannot give: the mechanical conversion stripped the literal
-    // `ops: warning:` from ~30 sites, and a missed strip would double the prefix while every
+    // `sbx: warning:` from ~30 sites, and a missed strip would double the prefix while every
     // substring assertion still passed.
     let home = TmpDir::new();
     let cwd = TmpDir::new();

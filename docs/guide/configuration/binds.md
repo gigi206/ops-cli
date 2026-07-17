@@ -18,7 +18,7 @@ binds = [
 `binds` is a **security field**: honored only from a trusted source. An untrusted
 project gets no bind at all, so it can never obtain a writable one.
 
-See also: [Security model](../concepts/security-model.md) · [The trust gate](../concepts/trust.md) · [`ops config edit`](../cli/config.md).
+See also: [Security model](../concepts/security-model.md) · [The trust gate](../concepts/trust.md) · [`sbx config edit`](../cli/config.md).
 
 ## Read-only vs read-write, and same-uid
 
@@ -43,38 +43,38 @@ bind it at all; bind read-only only what the tool may read but must not modify.
 ## Editing binds
 
 `binds` is an array of strings and tables, so it is edited with
-[`ops config edit`](../cli/config.md), not `ops config set` (which handles single
+[`sbx config edit`](../cli/config.md), not `sbx config set` (which handles single
 scalar values):
 
 ```sh
-ops config edit          # add/remove bind entries
-ops config edit --trust  # and re-trust in one step
+sbx config edit          # add/remove bind entries
+sbx config edit --trust  # and re-trust in one step
 ```
 
 ## Layering with the structural mounts
 
-A config bind is emitted **before** `ops`'s structural mounts (`/nix`, the synthetic
+A config bind is emitted **before** `sbx`'s structural mounts (`/nix`, the synthetic
 identity, the project), so a colliding entry is **shadowed** — a bind cannot displace
 `/nix` or the synthetic `/etc`.
 
 One known nuance: a config bind that **nests** with a structural mount (rather than
 colliding exactly) is resolved by path and handled fail-closed, with a warning. A
 *descendant* of a structural mount (e.g. a path under `/tmp`, which the cage covers
-with a tmpfs) may be listed by `ops config show` yet dropped by the launch; an
-*ancestor* (e.g. `/etc`) would over-expose that directory. `ops` warns when a config
+with a tmpfs) may be listed by `sbx config show` yet dropped by the launch; an
+*ancestor* (e.g. `/etc`) would over-expose that directory. `sbx` warns when a config
 bind's destination nests with a structural mount.
 
 ## The control plane is protected
 
-`ops`'s own state — its data, trust, and config directories, all under your `$HOME` —
+`sbx`'s own state — its data, trust, and config directories, all under your `$HOME` —
 is protected regardless of what a bind requests:
 
-- A read-write bind aimed **at or inside** one of `ops`'s directories is **forced
+- A read-write bind aimed **at or inside** one of `sbx`'s directories is **forced
   read-only**, with a warning.
 - A broad read-write bind that merely **contains** them (e.g. `mode = "rw"` on your
-  whole `$HOME`) **stays read-write**, but each `ops` root is **pinned read-only in
+  whole `$HOME`) **stays read-write**, but each `sbx` root is **pinned read-only in
   place** — so the rest of the tree is writable while the agent still cannot alter
-  what `ops` runs or trusts.
+  what `sbx` runs or trusts.
 
 This closes an escalation where a writable parent directory would let the agent
 rename a control-plane directory out of the way and substitute a forged one. See
@@ -93,12 +93,12 @@ gating (security field), same rules. See [`[app.<name>]`](apps.md).
 ## One-shot override
 
 To add a host bind for a single launch without editing the file, use `--bind`
-(repeatable) or `OPS_BIND`:
+(repeatable) or `SBX_BIND`:
 
 ```sh
-ops run --bind /opt/data -- ./tool          # read-only (the default)
-ops run --bind /work/scratch:rw -- ./tool   # read-write
-OPS_BIND=/etc/ssl/custom:ro ops shell
+sbx run --bind /opt/data -- ./tool          # read-only (the default)
+sbx run --bind /work/scratch:rw -- ./tool   # read-write
+SBX_BIND=/etc/ssl/custom:ro sbx shell
 ```
 
 The mode is the suffix after the **last** `:`, and only when it is exactly `ro` or

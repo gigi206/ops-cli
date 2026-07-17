@@ -1,12 +1,12 @@
 //! `appimage:` packages — a prebuilt AppImage provisioned host-side.
 //!
 //! For a GUI/desktop app distributed only as an `.AppImage` (no `.deb`, no runnable release binary,
-//! no nixpkgs attribute), ops packages the prebuilt AppImage directly, exactly as it does a `.deb`:
+//! no nixpkgs attribute), sbx packages the prebuilt AppImage directly, exactly as it does a `.deb`:
 //! resolve the URL to a content hash, then build a generated derivation that extracts the AppImage's
 //! squashfs and `autoPatchelfHook`s the ELF binaries against the curated Electron/Chromium library
 //! set ([`super::prebuilt::ELECTRON_LIBS`]). Extraction runs no build script (`dontBuild`), so —
 //! unlike an arbitrary `flake:` — evaluating and building it host-side is safe; it is therefore
-//! provisioned like `nix:`/`deb:` (into ops's store, seeded, offline-reusable) rather than in-cage.
+//! provisioned like `nix:`/`deb:` (into sbx's store, seeded, offline-reusable) rather than in-cage.
 //!
 //! **The AppImage is unpacked at BUILD time, never run as an AppImage.** `wrapType2`, `appimage-run`,
 //! and the raw `.AppImage` all self-mount a squashfs via FUSE (a runtime namespace op) — which the
@@ -75,7 +75,7 @@ fn parse_source(locator: &str) -> AppImageSource {
     AppImageSource::Url(locator.to_string())
 }
 
-/// The outcome of re-resolving one declared `appimage:` reference during `ops upgrade`.
+/// The outcome of re-resolving one declared `appimage:` reference during `sbx upgrade`.
 pub(crate) enum AppImageUpgrade {
     Pinned {
         url: String,
@@ -135,7 +135,7 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, AppIma
 }
 
 /// The pinned content hashes for a project's `appimage:` packages, keyed by the declared URL (a
-/// package's locator, so `ops config` can look each up directly), shortened for display. Reads only
+/// package's locator, so `sbx config` can look each up directly), shortened for display. Reads only
 /// the per-project lock — surfaces a pin without resolving or building — so the config view stays
 /// side-effect-free, exactly like [`super::deb::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
@@ -201,7 +201,7 @@ fn write_pins(
 /// URL resolves to itself; a `github:<owner>/<repo>` locator queries the repo's latest release,
 /// selects its linux `.AppImage` asset, and **re-validates that GitHub-supplied URL** through the
 /// same injection-free barrier a hand-written `appimage:` URL passes before it is fetched or
-/// interpolated into the generated derivation. `fresh` bypasses the fetch cache (set on `ops upgrade`,
+/// interpolated into the generated derivation. `fresh` bypasses the fetch cache (set on `sbx upgrade`,
 /// so it sees a new release). Fail-closed: an unvalidated or unselectable asset returns an error.
 pub(crate) fn resolve_source(
     nix: &Path,
@@ -264,7 +264,7 @@ fn select_appimage_asset(json: &serde_json::Value, system: &str) -> Option<Strin
 /// extract its squashfs with `appimageTools.extractType2`, copy it into `$out`, and autoPatchelf it
 /// against [`ELECTRON_LIBS`] from the pinned `nixpkgs`. The launcher-locating install phase is shared
 /// with `deb:` ([`prebuilt::electron_wrap`], which excludes the AppImage `AppRun` script so the real
-/// binary is wrapped). Every interpolated value is ops-controlled and charset-validated (`name`,
+/// binary is wrapped). Every interpolated value is sbx-controlled and charset-validated (`name`,
 /// `url`, `hash`, the pinned `nixpkgs`, `system`), so the expression carries nothing to escape;
 /// placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
 fn derivation_expr(nixpkgs: &str, system: &str, name: &str, url: &str, hash: &str) -> String {
@@ -315,7 +315,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
 }
 
 /// Provision one `appimage:` package host-side: resolve the URL to a hash (pinning it on first use),
-/// build the generated derivation into ops's store, and return `(bin directory, store root)` — the
+/// build the generated derivation into sbx's store, and return `(bin directory, store root)` — the
 /// bin dir to prepend to the sandbox `PATH`, the root whose closure the project store seeds. Mirrors
 /// [`super::deb::provision`]'s per-package gcroot, name-keyed under the project.
 pub(crate) fn provision(
@@ -419,7 +419,7 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// The two views `ops upgrade appimage` needs of a project's declared `appimage:` URLs, collected in
+/// The two views `sbx upgrade appimage` needs of a project's declared `appimage:` URLs, collected in
 /// one pass over the baseline and each app overlay (see [`declared`]).
 struct Declared {
     /// Deterministic, deduplicated, **trusted-only** — the set to roll forward.
@@ -430,7 +430,7 @@ struct Declared {
 }
 
 /// Collect both views in a single walk of the layers, each app overlay materialized once (a
-/// `merge_app` clone) — so `ops upgrade` walks the apps once, not twice.
+/// `merge_app` clone) — so `sbx upgrade` walks the apps once, not twice.
 fn declared(cfg: &crate::config::Resolved) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
@@ -457,7 +457,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
 }
 
 /// How many declared `appimage:` packages are withheld for being untrusted — across the baseline and
-/// each app. A count only (the per-package reason is warned on the launch path), so `ops upgrade`
+/// each app. A count only (the per-package reason is warned on the launch path), so `sbx upgrade`
 /// does not read as "none declared" when an untrusted project declares one.
 pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
     let untrusted = |pkgs: &[crate::config::Package]| {
@@ -739,7 +739,7 @@ mod tests {
             declared(&cfg).trusted,
             vec!["https://e/a.AppImage", "https://e/b.AppImage"]
         );
-        // the prune universe keeps the untrusted url (so `ops upgrade` never unpins a withheld pin).
+        // the prune universe keeps the untrusted url (so `sbx upgrade` never unpins a withheld pin).
         let universe = declared(&cfg).all;
         assert!(universe.contains("https://e/evil.AppImage"));
         assert_eq!(withheld(&cfg), 1);

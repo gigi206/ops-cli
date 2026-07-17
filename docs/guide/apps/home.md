@@ -1,6 +1,6 @@
 # Per-app isolated `$HOME`
 
-Each `ops app <name>` gets a **dedicated, persistent, isolated `$HOME`**, so the app's
+Each `sbx app <name>` gets a **dedicated, persistent, isolated `$HOME`**, so the app's
 config, login state, and history never bleed into your project shell or another app.
 The `home_scope` field chooses whether that home is also per-project.
 
@@ -10,7 +10,7 @@ See also: [The app framework](README.md) · [`[app.<name>]`](../configuration/ap
 
 An app's home is **always** per-app and isolated from the project's default shell home.
 An agent that logs in, writes a config, or accumulates history does so in its own home
-— an `ops run` in the same project sees none of it, and neither does another app. This
+— an `sbx run` in the same project sees none of it, and neither does another app. This
 persistence is what lets an agent keep an identity across launches.
 
 ## `home_scope` — global vs per-project
@@ -60,19 +60,19 @@ data and store both per-project, aligned).
 ## Inspecting a running app
 
 ```sh
-ops attach <id>     # join the running app's cage and open a shell inside it
+sbx attach <id>     # join the running app's cage and open a shell inside it
 ```
 
-`ops session attach` enters the live cage (its processes, its real `/tmp`, its network, and the
+`sbx session attach` enters the live cage (its processes, its real `/tmp`, its network, and the
 app's isolated home as the agent currently sees it) — not a fresh cage. See
-[`ops session attach`](../cli/session.md#attach) and [Sessions](../housekeeping/sessions.md).
+[`sbx session attach`](../cli/session.md#attach) and [Sessions](../housekeeping/sessions.md).
 
 ## Removing an app's home
 
-The home persists until you remove it. `ops app rm <name> --purge` deletes the app's
+The home persists until you remove it. `sbx app rm <name> --purge` deletes the app's
 home(s) — the global one and any per-project ones — freeing the tools its `mise:`
-backends installed, its config, and its login state. `ops app list` shows which apps
+backends installed, its config, and its login state. `sbx app list` shows which apps
 have an installed home, with size. Any `nix:`/`flake:` closures in the shared per-project
-store are reclaimed by [`ops gc --prune`](../cli/gc.md) — or add `--gc` to the purge to
+store are reclaimed by [`sbx gc --prune`](../cli/gc.md) — or add `--gc` to the purge to
 sweep the current project's store in one command. See
-[`ops app`](../cli/app.md#removing-an-app).
+[`sbx app`](../cli/app.md#removing-an-app).

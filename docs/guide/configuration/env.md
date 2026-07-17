@@ -19,10 +19,10 @@ See also: [The trust gate](../concepts/trust.md) · [Configuration overview](REA
 Inside the cage, environment values are layered:
 
 ```
-structural (set by ops)  <  passthrough (TERM/LANG)  <  ops-injected  <  config env
+structural (set by sbx)  <  passthrough (TERM/LANG)  <  sbx-injected  <  config env
 ```
 
-So a trusted config `env` value wins over `ops`'s own structural defaults. (An
+So a trusted config `env` value wins over `sbx`'s own structural defaults. (An
 untrusted config's `env` has already lost its reserved keys — see below — so it
 cannot override those.) An app's `[app.<name>.env]` overlays the baseline `env`, the
 app winning on a key collision.
@@ -49,11 +49,11 @@ police the already-in-cage agent.
 ## Environment overrides for a single launch
 
 To set a cage variable for one launch without editing the file, use the one-shot
-override — `--env KEY=VALUE` (repeatable) or `OPS_ENV_<KEY>`:
+override — `--env KEY=VALUE` (repeatable) or `SBX_ENV_<KEY>`:
 
 ```sh
-ops run --env RUST_LOG=debug -- cargo test
-OPS_ENV_RUST_LOG=debug ops run -- cargo test
+sbx run --env RUST_LOG=debug -- cargo test
+SBX_ENV_RUST_LOG=debug sbx run -- cargo test
 ```
 
 See [One-shot overrides](overrides.md).
@@ -61,7 +61,7 @@ See [One-shot overrides](overrides.md).
 ## What the cage inherits
 
 The cage does **not** inherit your host environment. Only a small structural set
-(`TERM`, `LANG`, the paths `ops` sets, and whatever `env` declares) reaches it — part
+(`TERM`, `LANG`, the paths `sbx` sets, and whatever `env` declares) reaches it — part
 of [confidentiality by absence](../concepts/security-model.md). So a variable a tool
 needs must be declared in `env` (or injected as a [secret](secret.md) if it is a
 credential — a credential should **not** go in `env`, which is visible in the cage).

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ops resolver plugin: HashiCorp Vault KV.
-# Contract: ops passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
+# sbx resolver plugin: HashiCorp Vault KV.
+# Contract: sbx passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
 #   Ref:  vault://<path>#<field>   e.g.  vault://secret/myapp#password
 # Needs VAULT_ADDR and VAULT_TOKEN in the environment (declared in plugin.toml).
 set -euo pipefail

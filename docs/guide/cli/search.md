@@ -1,7 +1,7 @@
-# `ops search`
+# `sbx search`
 
 ```
-ops search <query>
+sbx search <query>
 ```
 
 Discover the `nix:` tools a project can declare, via [nixhub](https://www.nixhub.io/).
@@ -20,9 +20,9 @@ See also: [`packages`](../configuration/packages.md) · [`[tools]`](../configura
 ## Examples
 
 ```sh
-ops search ripgrep      # exact: versions + declaration lines
-ops search ripgr        # fuzzy: a capped list of matches
-ops search jq
+sbx search ripgrep      # exact: versions + declaration lines
+sbx search ripgr        # fuzzy: a capped list of matches
+sbx search jq
 ```
 
 The `[tools]`/`[packages]` lines it prints use the `nix:` backend; for the `mise:` and

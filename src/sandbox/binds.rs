@@ -34,7 +34,7 @@ const SANDBOX_SHELL: &str = "/bin/sh";
 /// path a hermetic cage lacks), so the kernel cannot exec them without this name.
 /// It is the *same* binary `/bin/sh` already exposes — a second name for an
 /// interpreter already present, not a new mount — so it adds no exposure, only the
-/// name a `#!/bin/bash` shebang assumes. Also the shell `ops session attach` execs inside a
+/// name a `#!/bin/bash` shebang assumes. Also the shell `sbx session attach` execs inside a
 /// running cage (an absolute path that resolves in the cage's own mount namespace).
 pub(crate) const SANDBOX_BASH: &str = "/bin/bash";
 
@@ -58,11 +58,11 @@ const SANDBOX_ENV: &str = "/usr/bin/env";
 const XDG_OPEN_INCAGE: &str = "/usr/bin/xdg-open";
 
 /// The synthetic `xdg-open` body. POSIX `sh` (the cage's `/bin/sh`), prints every
-/// argument (the common call is a single file or URL) to stderr with an `ops:`
+/// argument (the common call is a single file or URL) to stderr with an `sbx:`
 /// prefix, then exits 0. Robust to any argv a tool passes: it never inspects or
 /// forks — `xdg-open` may be asked to open anything, not only a URL.
 const XDG_OPEN_CONTENTS: &str = "#!/bin/sh\n\
-echo \"ops: open on the host:\" \"$@\" >&2\n\
+echo \"sbx: open on the host:\" \"$@\" >&2\n\
 exit 0\n";
 
 /// The resolved hermetic userland (provided by the nix resolver). A nix binary
@@ -85,7 +85,7 @@ pub(crate) struct Userland {
     /// The nix-ld shim file, bound at the standard interpreter path so a foreign
     /// binary that hard-codes it is intercepted by it.
     pub(crate) interp_src: PathBuf,
-    /// ops's own CA bundle (`cacert`'s `ca-bundle.crt`), bound read-only at the standard
+    /// sbx's own CA bundle (`cacert`'s `ca-bundle.crt`), bound read-only at the standard
     /// certificate paths so the cage's TLS trusts a known set of roots without depending on
     /// the host. A physical bind source (it backs a mount), unlike the logical store paths
     /// elsewhere on this type.
@@ -120,7 +120,7 @@ pub(crate) struct Userland {
     /// it), but invoked by *absolute* path from the `flake:` build wrapper so a persisted shim
     /// cannot shadow it.
     pub(crate) nix_bin: PathBuf,
-    /// ops's own compiled UTF-8 locale archive, as an in-sandbox logical path. Named in
+    /// sbx's own compiled UTF-8 locale archive, as an in-sandbox logical path. Named in
     /// `LOCALE_ARCHIVE` so the cage's glibc can load a UTF-8 `LANG` without a host
     /// `/usr/lib/locale`; ships no binary, so it is off `PATH`.
     pub(crate) locale_archive: PathBuf,
@@ -129,7 +129,7 @@ pub(crate) struct Userland {
 /// One explicit bind injected by the launcher after the structural mounts (so it is
 /// neither shadowed by, nor shadows, them): a host source exposed at a distinct cage
 /// destination. Used for the network-allowlist machinery — the bound egress socket and
-/// the proxy's CA certificate — whose destinations are ops's, not the project's.
+/// the proxy's CA certificate — whose destinations are sbx's, not the project's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExtraBind {
     /// Host path bound into the cage.
@@ -147,7 +147,7 @@ pub(crate) struct ExtraBind {
 /// the cage may write into `/nix` (an agent self-equipping its toolchain), and those
 /// writes land only in that project's own physical copy — the shared store is never
 /// in the cage, so its integrity is protected by physical separation rather than by
-/// the read-only bind. Which store backs the cage is ops's decision, never a
+/// the read-only bind. Which store backs the cage is sbx's decision, never a
 /// configurable field, so an untrusted project cannot widen its own access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NixMount {
@@ -310,12 +310,12 @@ fn assemble(
         // Zone 1 — the embedded mise "nix" backend plugin, read-only: an agent's
         // in-cage mise resolves it (via a symlink in the writable mise data dir) to
         // self-equip the project's `nix:` tools. Read-only so the agent cannot rewrite
-        // ops's own plugin code.
+        // sbx's own plugin code.
         Mount::RoBind {
             src: paths.mise_plugin_src.to_path_buf(),
             dest: PathBuf::from(super::miseplugin::INCAGE_DIR),
         },
-        // Zone 1 — the synthetic interactive-shell rc, read-only: `ops shell` points
+        // Zone 1 — the synthetic interactive-shell rc, read-only: `sbx shell` points
         // bash's `--rcfile` at it to activate mise. Sourced from outside every writable
         // mount, so the agent cannot rewrite its own shell init.
         Mount::RoBind {
@@ -368,7 +368,7 @@ fn assemble(
             src: paths.machine_id_src.to_path_buf(),
             dest: PathBuf::from("/var/lib/dbus/machine-id"),
         },
-        // Zone 1 — TLS: ops's own CA bundle from its store rather than the host, so HTTPS
+        // Zone 1 — TLS: sbx's own CA bundle from its store rather than the host, so HTTPS
         // trust is hermetic. Bound at the two standard certificate paths a Linux toolchain
         // looks for by default — the NixOS `ca-bundle.crt` (nix's own libcurl) and the
         // Debian/OpenSSL `ca-certificates.crt` (a tool that reads the system store and does
@@ -422,9 +422,9 @@ fn assemble(
     }));
 
     // Launcher-injected binds, emitted last so they neither shadow a structural mount nor
-    // are shadowed by one. Their destinations are ops's (the egress socket under the tmpfs,
-    // the proxy CA under `/opt/ops`), never a project path; their parents are already
-    // mounted above (the tmpfs for the socket, the userland binds' `/opt/ops`).
+    // are shadowed by one. Their destinations are sbx's (the egress socket under the tmpfs,
+    // the proxy CA under `/opt/sbx`), never a project path; their parents are already
+    // mounted above (the tmpfs for the socket, the userland binds' `/opt/sbx`).
     mounts.extend(extra_binds.iter().map(|b| {
         if b.writable {
             Mount::Bind {
@@ -442,13 +442,13 @@ fn assemble(
     // The sandbox PATH: the project's declared tools first, then mise's shims, then
     // the base userland, so a declared tool wins over an agent-activated one, which
     // wins over the base. A tool the in-cage mise has activated (`mise use`) gets a
-    // shim in the shims dir, so a later `ops run -- <tool>` resolves it. `/bin/sh` and
+    // shim in the shims dir, so a later `sbx run -- <tool>` resolves it. `/bin/sh` and
     // the loader are wired by absolute path, not PATH, so prepending here never weakens
     // them.
     let mut path_dirs = overlay.bin_paths.to_vec();
     path_dirs.push(PathBuf::from(format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}")));
     path_dirs.extend(userland.bin_paths.iter().cloned());
-    // The synthetic `/usr/bin` (only `env` and `xdg-open`, both ops-owned — no host
+    // The synthetic `/usr/bin` (only `env` and `xdg-open`, both sbx-owned — no host
     // leak) is on PATH last, so a tool that calls `xdg-open` by name resolves the
     // stub. Last so declared tools, mise shims, and the base userland all win on a
     // name collision; `/usr/bin/env` is the same coreutils `env` already on PATH.
@@ -473,19 +473,19 @@ fn assemble(
             "NIX_LD_LIBRARY_PATH".to_string(),
             join_paths(&userland.foreign_lib_paths),
         ),
-        // The sandbox-awareness handle: `OPS_SANDBOX=1` lets a process tell it is running
-        // inside an ops cage, and `OPS_EGRESS_CONTRACT` points it at the read-only contract
+        // The sandbox-awareness handle: `SBX_SANDBOX=1` lets a process tell it is running
+        // inside an sbx cage, and `SBX_EGRESS_CONTRACT` points it at the read-only contract
         // describing the cage's network posture. Both are structural (lowest precedence): a
         // trusted `[env]` could override them, but that only mispoints the project's own
         // tools at its own value — self-sabotage of an informational handle, not an escape
         // (the same class as `FONTCONFIG_FILE`/`WAYLAND_DISPLAY`) — so neither needs a
         // denylist entry.
-        ("OPS_SANDBOX".to_string(), "1".to_string()),
+        ("SBX_SANDBOX".to_string(), "1".to_string()),
         (
-            "OPS_EGRESS_CONTRACT".to_string(),
+            "SBX_EGRESS_CONTRACT".to_string(),
             super::contract::EGRESS_CONTRACT_INCAGE.to_string(),
         ),
-        // Locale. `LOCALE_ARCHIVE` names ops's own UTF-8 locale archive so the cage's glibc
+        // Locale. `LOCALE_ARCHIVE` names sbx's own UTF-8 locale archive so the cage's glibc
         // can load a UTF-8 `LANG` — a hermetic cage has no host `/usr/lib/locale`, so without
         // it glibc falls back to the C locale and byte-escapes accented text and filenames.
         // `LANG` defaults to the always-available compiled `C.UTF-8` so a cage with no host
@@ -511,7 +511,7 @@ fn assemble(
 /// The fixed in-cage destinations the structural mounts in [`assemble`] occupy — every mount
 /// destination that does not depend on the specific project or app. The runtime-derived paths are
 /// deliberately excluded (the project is mounted at its own absolute path, and a config bind that
-/// overlaps the project tree is normal; the launcher's extra binds live at ops's own paths), while
+/// overlaps the project tree is normal; the launcher's extra binds live at sbx's own paths), while
 /// the fixed `SANDBOX_HOME` is listed. A config bind whose canonical destination *nests* with one
 /// of these is not reconciled by the exact-destination shadowing `assemble` relies on, so
 /// [`structural_nesting_warning`] surfaces it. Kept in lockstep with `assemble` by
@@ -547,7 +547,7 @@ enum Nesting {
     /// shadowed and never appears inside.
     Shadowed,
     /// The bind contains the structural path: the cage mounts that path over part of the bound
-    /// directory, so that sub-path inside the cage is ops's, not the bind's.
+    /// directory, so that sub-path inside the cage is sbx's, not the bind's.
     Contains,
 }
 
@@ -604,7 +604,7 @@ pub(crate) fn structural_nesting_warning(dest: &Path, writable: bool) -> Option<
             };
             format!(
                 "bind `{}` contains the sandbox's own mount `{structural}` — the cage mounts that \
-                 path over part of it, so `{structural}` inside the cage is ops's, not your \
+                 path over part of it, so `{structural}` inside the cage is sbx's, not your \
                  bind's{write_note}",
                 dest.display()
             )
@@ -621,7 +621,7 @@ const MISE_DATA_REL: &str = ".local/share/mise";
 /// mise's shims directory inside the cage, relative to the sandbox `$HOME`. mise
 /// writes a shim here for every tool it has *activated* (`mise use`); putting this
 /// directory on PATH is mise's documented mechanism for making those tools available
-/// without a shell hook — exactly `ops run -- <cmd>`, which execs the command directly
+/// without a shell hook — exactly `sbx run -- <cmd>`, which execs the command directly
 /// with no shell to activate. The dir need not exist yet (an empty project has none);
 /// a missing PATH entry is simply ignored.
 const MISE_SHIMS_REL: &str = ".local/share/mise/shims";
@@ -630,10 +630,10 @@ const MISE_SHIMS_REL: &str = ".local/share/mise/shims";
 /// relative to the sandbox `$HOME`. Each package gets `<this>/<name>`, a symlink into
 /// `/nix` (the per-project store); its `<name>/bin` joins PATH. Under the persistent home,
 /// so the out-link survives across launches (the warm-launch short-circuit reuses it).
-const FLAKE_ROOTS_REL: &str = ".local/state/ops/flake";
+const FLAKE_ROOTS_REL: &str = ".local/state/sbx/flake";
 
 /// The directory holding every `flake:` package's out-link inside the cage (the parent the
-/// build wrapper creates before `nix build`). A fixed, ops-owned path under the home.
+/// build wrapper creates before `nix build`). A fixed, sbx-owned path under the home.
 pub(crate) fn flake_roots_dir() -> PathBuf {
     PathBuf::from(format!("{SANDBOX_HOME}/{FLAKE_ROOTS_REL}"))
 }
@@ -657,53 +657,53 @@ pub(crate) fn flake_out_link_rev(name: &str, rev: &str) -> PathBuf {
 /// The content-hash-keyed in-cage out-link for the inline flake `name` whose source hashes to
 /// `hash` — the analogue of [`flake_out_link_rev`] for an inline `[flakes.<name>]`, which has no
 /// revision to key by. Editing the flake changes the hash, so the out-link path is absent and the
-/// warm short-circuit rebuilds (the stale build is left unrooted, so `ops gc` reclaims it). `name`
+/// warm short-circuit rebuilds (the stale build is left unrooted, so `sbx gc` reclaims it). `name`
 /// is a validated package name and `hash` is hex, so neither escapes [`flake_roots_dir`].
 ///
 /// Residual (the same class as the rev-keyed remote out-links, but accruing per *edit* rather than
-/// per `ops upgrade`): each edit leaves the old `<name>-<oldhash>` symlink dangling in the home. The
-/// store path it pointed at is reclaimed (its `ops-flake-<name>` gcroot was re-pointed to the new
+/// per `sbx upgrade`): each edit leaves the old `<name>-<oldhash>` symlink dangling in the home. The
+/// store path it pointed at is reclaimed (its `sbx-flake-<name>` gcroot was re-pointed to the new
 /// build), so only the dead symlink lingers; re-editing back to a prior source reuses its surviving
-/// out-link. Cleaning the dead symlinks is an `ops gc` concern, not a per-launch one.
+/// out-link. Cleaning the dead symlinks is an `sbx gc` concern, not a per-launch one.
 pub(crate) fn flake_out_link_hash(name: &str, hash: &str) -> PathBuf {
     flake_roots_dir().join(format!("{name}-{hash}"))
 }
 
 /// Where an inline `[flakes.<name>]` flake's staged directory is bound read-only inside the cage,
-/// so the in-cage `nix build path:<this>#<attr>` reads exactly the trusted source. Under `/opt/ops`,
+/// so the in-cage `nix build path:<this>#<attr>` reads exactly the trusted source. Under `/opt/sbx`,
 /// beside the mise plugin and synthetic rc, colliding with no structural mount. `name` is a
-/// validated package name (no path separators), so this never escapes `/opt/ops/flakes`.
+/// validated package name (no path separators), so this never escapes `/opt/sbx/flakes`.
 pub(crate) fn flake_inline_incage(name: &str) -> PathBuf {
-    PathBuf::from(format!("/opt/ops/flakes/{name}"))
+    PathBuf::from(format!("/opt/sbx/flakes/{name}"))
 }
 
-/// Where the synthetic interactive-shell rc is bound read-only. `ops shell` starts
+/// Where the synthetic interactive-shell rc is bound read-only. `sbx shell` starts
 /// bash with `--rcfile` pointing here, so mise is activated in the interactive shell —
 /// mise's documented interactive mechanism (a prompt hook that manages PATH/env for the
-/// project's activated tools). `ops run` does not use it; its tools come from the shims
-/// dir on PATH. Under `/opt/ops`, beside the mise plugin, colliding with no structural
+/// project's activated tools). `sbx run` does not use it; its tools come from the shims
+/// dir on PATH. Under `/opt/sbx`, beside the mise plugin, colliding with no structural
 /// mount.
-pub(crate) const SHELL_RC_INCAGE: &str = "/opt/ops/bashrc";
+pub(crate) const SHELL_RC_INCAGE: &str = "/opt/sbx/bashrc";
 
 /// The synthetic interactive-shell rc: set a default prompt that names the cage, show the
 /// egress contract once (to stderr, so a captured stdout stays clean), source the home's own
 /// `.bashrc` if the agent has written one, then activate mise so its activated tools manage
 /// PATH/env. Static (no per-project data, so the same bytes back every cage), bound read-only
 /// from outside every writable mount, so the agent cannot rewrite what its own shell sources.
-/// The prompt uses `\h`, which resolves to the cage's `ops-<slug>` hostname, so `ops shell`
-/// reads `(ops-<slug>) <cwd>$` instead of the bare `bash-<v>$` default — set *before* the
+/// The prompt uses `\h`, which resolves to the cage's `sbx-<slug>` hostname, so `sbx shell`
+/// reads `(sbx-<slug>) <cwd>$` instead of the bare `bash-<v>$` default — set *before* the
 /// `.bashrc` source so a home's own `PS1` still wins. The contract `cat` is guarded on the
 /// variable being set and readable, so it is a no-op where the handle is absent.
 const SHELL_RC_CONTENTS: &str = "\
 PS1='(\\h) \\w\\$ '\n\
-[ -r \"$OPS_EGRESS_CONTRACT\" ] && cat \"$OPS_EGRESS_CONTRACT\" >&2\n\
+[ -r \"$SBX_EGRESS_CONTRACT\" ] && cat \"$SBX_EGRESS_CONTRACT\" >&2\n\
 [ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
 command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 
 /// The structural environment that turns the cage's mise into a working
 /// self-equip front-end. Lowest precedence (a trusted config may still override
 /// it, which only harms that project's own in-cage builds):
-/// - `MISE_DATA_DIR` anchors mise under the writable home, where ops has placed
+/// - `MISE_DATA_DIR` anchors mise under the writable home, where sbx has placed
 ///   the `nix:` backend plugin registration;
 /// - `MISE_EXPERIMENTAL` enables mise's custom backends, the gate on `nix:`;
 /// - `MISE_YES` auto-confirms prompts so a non-interactive `mise install` never
@@ -716,7 +716,7 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 ///   sandbox would use, so an in-cage build must run without it (the cage is the
 ///   boundary, not nix's inner sandbox); setting it here makes that deterministic
 ///   rather than relying on nix's silent fallback. These keys are on the
-///   untrusted-only env denylist, so only ops sets them.
+///   untrusted-only env denylist, so only sbx sets them.
 fn mise_env() -> Vec<(String, String)> {
     vec![
         (
@@ -735,12 +735,12 @@ fn mise_env() -> Vec<(String, String)> {
     ]
 }
 
-/// Where ops's CA bundle appears in the cage. The cacert tree is bound at `/etc/ssl`
+/// Where sbx's CA bundle appears in the cage. The cacert tree is bound at `/etc/ssl`
 /// (replacing the host's), so the bundle sits at the path nix and OpenSSL look for by
 /// default.
 const CAGE_CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
 
-/// The CA-bundle environment, naming ops's own bundle so the cage's toolchains trust it
+/// The CA-bundle environment, naming sbx's own bundle so the cage's toolchains trust it
 /// without depending on the host having certificates. It uses the exact key set the egress
 /// proxy injects ([`super::egress::CA_FILE_ENV_KEYS`]) — one source of truth — so under a
 /// network allowlist the proxy's per-session CA, layered *after* this by the launcher,
@@ -794,7 +794,7 @@ fn group_contents(id: &Identity) -> String {
     )
 }
 
-/// The synthetic `/etc/hosts`: `localhost` (and the cage's own `ops-<slug>` hostname) mapped to
+/// The synthetic `/etc/hosts`: `localhost` (and the cage's own `sbx-<slug>` hostname) mapped to
 /// loopback, so a name lookup of either resolves via the file without reaching DNS — which the
 /// cage's empty netns has no resolver for. Only these loopback mappings appear; no host entry is
 /// leaked. The hostname is placed on the `localhost` lines so a tool that resolves its own
@@ -819,7 +819,7 @@ fn hosts_contents(hostname: &str) -> String {
 fn machine_id_contents(home_src: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"ops-cage-machine-id\0");
+    h.update(b"sbx-cage-machine-id\0");
     h.update(home_src.as_os_str().as_encoded_bytes());
     let digest = h.finalize();
     let mut id = String::with_capacity(33);
@@ -831,21 +831,21 @@ fn machine_id_contents(home_src: &Path) -> String {
 }
 
 /// Which persistent runtime a launch uses — the writable `$HOME` and its sibling synthetic
-/// `/etc`. `ops run`/`ops shell` use the project's shared default; an app gets a dedicated,
+/// `/etc`. `sbx run`/`sbx shell` use the project's shared default; an app gets a dedicated,
 /// persistent home so its config, login state, and history never bleed into the project shell
 /// or another app. An app's home is either shared across projects (`GlobalApp`, one identity
 /// everywhere) or keyed per-project (`ProjectApp`, isolated per project).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Runtime<'a> {
-    /// The project's default shared home — `ops run` and `ops shell`.
+    /// The project's default shared home — `sbx run` and `sbx shell`.
     ProjectDefault,
-    /// `ops app <name>` with one home per app, shared across every project.
+    /// `sbx app <name>` with one home per app, shared across every project.
     GlobalApp(&'a str),
-    /// `ops app <name>` with a home per (project, app).
+    /// `sbx app <name>` with a home per (project, app).
     ProjectApp(&'a str),
 }
 
-/// Host-side runtime paths for `project` under ops's data directory, for the given
+/// Host-side runtime paths for `project` under sbx's data directory, for the given
 /// [`Runtime`]. The home and the synthetic `/etc` are always siblings so the latter sits
 /// outside every read-write bind (module integrity note). An app name is a validated single
 /// path component (the config app-name check), so joining it cannot traverse out of the data
@@ -888,7 +888,7 @@ pub(crate) fn project_id(project: &Path) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// The stable per-project identity ops keys runtime state on. The writable home,
+/// The stable per-project identity sbx keys runtime state on. The writable home,
 /// the synthetic identity, and a project's garbage-collection roots all derive from
 /// it, so housekeeping can reclaim a project's tools alongside the rest of its
 /// runtime. Canonicalises first, so a relative or symlinked `cwd` maps to the same
@@ -959,7 +959,7 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
     Ok((passwd, group))
 }
 
-/// Build a launch-ready [`SandboxSpec`] for `cwd` under ops's `data_dir`. This is
+/// Build a launch-ready [`SandboxSpec`] for `cwd` under sbx's `data_dir`. This is
 /// the I/O orchestration around the pure [`assemble`]: it canonicalises the
 /// project root (pinning the bind source — see the module integrity note),
 /// materialises the per-project writable home and read-only synthetic identity,
@@ -1019,7 +1019,7 @@ pub(crate) fn build_spec(
 
     // Materialize the synthetic interactive-shell rc beside the synthetic identity
     // (outside every writable mount, so it has no writable alias the agent could use to
-    // rewrite it); `ops shell` binds it read-only and points bash's `--rcfile` at it.
+    // rewrite it); `sbx shell` binds it read-only and points bash's `--rcfile` at it.
     let shell_rc = rt.etc_dir.join("bashrc");
     write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
 
@@ -1041,11 +1041,11 @@ pub(crate) fn build_spec(
     // Materialize the embedded mise `nix:` backend plugin (read-only, content-keyed,
     // shared across projects) and register it for this cage's mise: a symlink in the
     // writable mise data dir pointing at the read-only in-cage plugin. Both run on
-    // every launch so an ops upgrade (a changed embedded tree) re-stages and re-points.
+    // every launch so an sbx upgrade (a changed embedded tree) re-stages and re-points.
     let mise_plugin = super::miseplugin::stage(data_dir)?;
     super::miseplugin::register(&rt.home_src.join(MISE_DATA_REL).join("plugins"))?;
 
-    // The cage's readable name: the app name for `ops app <name>`, else the project's own
+    // The cage's readable name: the app name for `sbx app <name>`, else the project's own
     // directory name. Carried on the spec so the scope, hostname, and session listing all
     // read the same slug. Computed here (not only at the end) because the synthetic
     // `/etc/hosts` maps the cage hostname derived from it.
@@ -1057,7 +1057,7 @@ pub(crate) fn build_spec(
 
     // Materialize the synthetic `/etc/hosts` beside the other synthetic files (outside every
     // writable mount, so the agent has no writable alias to rewrite the name resolution it
-    // relies on). It maps `localhost` and the cage's own `ops-<slug>` hostname to loopback;
+    // relies on). It maps `localhost` and the cage's own `sbx-<slug>` hostname to loopback;
     // the hostname matches the `--hostname` the launch sets, both from this same slug.
     let hosts = rt.etc_dir.join("hosts");
     write_atomic(
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn the_shell_rc_sets_a_cage_naming_prompt_before_sourcing_bashrc() {
-        // The interactive prompt names the cage via `\h` (the `ops-<slug>` hostname), and is
+        // The interactive prompt names the cage via `\h` (the `sbx-<slug>` hostname), and is
         // set *before* the home's own `.bashrc` is sourced, so a user's own `PS1` still wins.
         let rc = SHELL_RC_CONTENTS;
         let ps1 = rc.find("PS1=").expect("the rc sets a default PS1");
@@ -1181,7 +1181,7 @@ mod tests {
     /// store is supplied by the launcher).
     fn nix_mount() -> NixMount {
         NixMount {
-            src: PathBuf::from("/data/ops/store/nix"),
+            src: PathBuf::from("/data/sbx/store/nix"),
             writable: false,
         }
     }
@@ -1189,15 +1189,15 @@ mod tests {
     fn assembled() -> SandboxSpec {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/ops/projects/abc/home"),
-            passwd_src: Path::new("/data/ops/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/ops/projects/abc/etc/group"),
+            home_src: Path::new("/data/sbx/projects/abc/home"),
+            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
+            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
-            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
+            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -1255,7 +1255,7 @@ mod tests {
         match hosts {
             Mount::RoBind { src, .. } => assert_eq!(
                 src.as_path(),
-                Path::new("/data/ops/projects/abc/etc/hosts"),
+                Path::new("/data/sbx/projects/abc/etc/hosts"),
                 "bound from the synthetic source"
             ),
             other => panic!("/etc/hosts must be a read-only bind, got {other:?}"),
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[test]
     fn the_synthetic_hosts_maps_localhost_and_the_cage_hostname() {
-        let h = hosts_contents("ops-agy");
+        let h = hosts_contents("sbx-agy");
         assert!(
             h.contains("127.0.0.1\tlocalhost"),
             "localhost → IPv4 loopback: {h:?}"
@@ -1274,7 +1274,7 @@ mod tests {
             "localhost → IPv6 loopback: {h:?}"
         );
         assert!(
-            h.contains("ops-agy"),
+            h.contains("sbx-agy"),
             "the cage's own hostname resolves too: {h:?}"
         );
         // Every entry maps to loopback — no host address is ever written into the cage.
@@ -1288,9 +1288,9 @@ mod tests {
 
     #[test]
     fn the_synthetic_machine_id_is_systemd_shaped_deterministic_and_per_home() {
-        let a1 = machine_id_contents(Path::new("/data/ops/apps/cursor/home"));
-        let a2 = machine_id_contents(Path::new("/data/ops/apps/cursor/home"));
-        let b = machine_id_contents(Path::new("/data/ops/apps/codex/home"));
+        let a1 = machine_id_contents(Path::new("/data/sbx/apps/cursor/home"));
+        let a2 = machine_id_contents(Path::new("/data/sbx/apps/cursor/home"));
+        let b = machine_id_contents(Path::new("/data/sbx/apps/codex/home"));
         // systemd format: exactly 32 lowercase hex digits + a trailing newline.
         let body = a1.strip_suffix('\n').expect("newline-terminated");
         assert_eq!(body.len(), 32, "32 hex digits: {a1:?}");
@@ -1323,7 +1323,7 @@ mod tests {
             match m {
                 Mount::RoBind { src, .. } => assert_eq!(
                     src.as_path(),
-                    Path::new("/data/ops/projects/abc/etc/machine-id"),
+                    Path::new("/data/sbx/projects/abc/etc/machine-id"),
                     "{dest} bound from the synthetic source"
                 ),
                 other => panic!("{dest} must be a read-only bind, got {other:?}"),
@@ -1388,7 +1388,7 @@ mod tests {
 
         // the store at /nix is a read-only bind of the shared store here.
         let nix = text.iter().position(|s| s == "/nix").unwrap();
-        assert_eq!(text[nix - 1], "/data/ops/store/nix");
+        assert_eq!(text[nix - 1], "/data/sbx/store/nix");
         assert_eq!(text[nix - 2], "--ro-bind");
         // the standard interpreter is the nix-ld shim, read-only
         let interp = text
@@ -1413,10 +1413,10 @@ mod tests {
 
         // synthetic identity is read-only
         let passwd = text.iter().position(|s| s == "/etc/passwd").unwrap();
-        assert_eq!(text[passwd - 1], "/data/ops/projects/abc/etc/passwd");
+        assert_eq!(text[passwd - 1], "/data/sbx/projects/abc/etc/passwd");
         assert_eq!(text[passwd - 2], "--ro-bind");
 
-        // TLS is hermetic — the CA bundle is a firm bind of ops's cacert (not the host's);
+        // TLS is hermetic — the CA bundle is a firm bind of sbx's cacert (not the host's);
         // only DNS stays best-effort.
         let ssl = text
             .iter()
@@ -1435,15 +1435,15 @@ mod tests {
         // being shadowed by it. Both granted devices must be present, each after the `--dev`.
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/ops/projects/abc/home"),
-            passwd_src: Path::new("/data/ops/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/ops/projects/abc/etc/group"),
+            home_src: Path::new("/data/sbx/projects/abc/home"),
+            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
+            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
-            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
+            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1486,9 +1486,9 @@ mod tests {
     }
 
     #[test]
-    fn the_cage_trusts_ops_own_ca_bundle_not_the_host() {
-        // ops's CA bundle is bound at both standard certificate paths (the NixOS and the
-        // Debian/OpenSSL conventions), so the cage's TLS trust comes from ops's store rather
+    fn the_cage_trusts_sbx_own_ca_bundle_not_the_host() {
+        // sbx's CA bundle is bound at both standard certificate paths (the NixOS and the
+        // Debian/OpenSSL conventions), so the cage's TLS trust comes from sbx's store rather
         // than whatever the host happens to carry — and the host's own `/etc/ssl` is never a
         // bind source, so the cage cannot see it.
         let spec = assembled();
@@ -1508,7 +1508,7 @@ mod tests {
             assert_eq!(
                 text[i - 1],
                 "/store/cacert/etc/ssl/certs/ca-bundle.crt",
-                "{dest} must be ops's cacert bundle, not the host's"
+                "{dest} must be sbx's cacert bundle, not the host's"
             );
             assert_eq!(text[i - 2], "--ro-bind", "{dest} must be a firm bind");
         }
@@ -1521,9 +1521,9 @@ mod tests {
     }
 
     #[test]
-    fn cacert_env_names_ops_bundle_under_every_ca_key() {
-        // One source of truth: the keys ops sets equal the egress key set, each pointing at
-        // ops's in-cage bundle.
+    fn cacert_env_names_sbx_bundle_under_every_ca_key() {
+        // One source of truth: the keys sbx sets equal the egress key set, each pointing at
+        // sbx's in-cage bundle.
         let env = cacert_env();
         assert_eq!(env.len(), super::super::egress::CA_FILE_ENV_KEYS.len());
         for (k, v) in &env {
@@ -1531,7 +1531,7 @@ mod tests {
                 super::super::egress::CA_FILE_ENV_KEYS.contains(&k.as_str()),
                 "unexpected CA key {k}"
             );
-            assert_eq!(v, CAGE_CA_BUNDLE, "{k} must name ops's bundle");
+            assert_eq!(v, CAGE_CA_BUNDLE, "{k} must name sbx's bundle");
         }
     }
 
@@ -1577,11 +1577,11 @@ mod tests {
         assert!(joined.iter().any(|s| s == "TERM"));
         // the sandbox-awareness handles are present: a process can tell it is caged, and
         // find the egress contract describing its network posture
-        let sandbox_i = joined.iter().position(|s| s == "OPS_SANDBOX").unwrap();
+        let sandbox_i = joined.iter().position(|s| s == "SBX_SANDBOX").unwrap();
         assert_eq!(joined[sandbox_i + 1], "1");
         let contract_i = joined
             .iter()
-            .position(|s| s == "OPS_EGRESS_CONTRACT")
+            .position(|s| s == "SBX_EGRESS_CONTRACT")
             .unwrap();
         assert_eq!(
             joined[contract_i + 1],
@@ -1595,7 +1595,7 @@ mod tests {
         // bind from the synthetic source, so the agent cannot rewrite the contract it is
         // told to read.
         // Key off the bind *source* — unique in the argv — since the in-cage destination
-        // path is also the value of the `OPS_EGRESS_CONTRACT` environment variable.
+        // path is also the value of the `SBX_EGRESS_CONTRACT` environment variable.
         let argv = argv_strings(&assembled());
         let src = argv
             .iter()
@@ -1619,15 +1619,15 @@ mod tests {
         // socket sits on a writable mountpoint, and carry their declared mode.
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/ops/projects/abc/home"),
-            passwd_src: Path::new("/data/ops/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/ops/projects/abc/etc/group"),
+            home_src: Path::new("/data/sbx/projects/abc/home"),
+            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
+            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
-            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
+            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
             env: &[],
@@ -1636,13 +1636,13 @@ mod tests {
         };
         let extra = [
             ExtraBind {
-                src: PathBuf::from("/data/ops/egress/proxy.sock"),
-                dest: PathBuf::from("/tmp/ops-egress.sock"),
+                src: PathBuf::from("/data/sbx/egress/proxy.sock"),
+                dest: PathBuf::from("/tmp/sbx-egress.sock"),
                 writable: true,
             },
             ExtraBind {
-                src: PathBuf::from("/data/ops/egress/ca.pem"),
-                dest: PathBuf::from("/opt/ops/egress-ca.pem"),
+                src: PathBuf::from("/data/sbx/egress/ca.pem"),
+                dest: PathBuf::from("/opt/sbx/egress-ca.pem"),
                 writable: false,
             },
         ];
@@ -1665,16 +1665,16 @@ mod tests {
         // the socket is a read-write bind at its cage destination
         let sock = text
             .iter()
-            .position(|s| s == "/tmp/ops-egress.sock")
+            .position(|s| s == "/tmp/sbx-egress.sock")
             .unwrap();
-        assert_eq!(text[sock - 1], "/data/ops/egress/proxy.sock");
+        assert_eq!(text[sock - 1], "/data/sbx/egress/proxy.sock");
         assert_eq!(text[sock - 2], "--bind");
         // the CA is a read-only bind
         let ca = text
             .iter()
-            .position(|s| s == "/opt/ops/egress-ca.pem")
+            .position(|s| s == "/opt/sbx/egress-ca.pem")
             .unwrap();
-        assert_eq!(text[ca - 1], "/data/ops/egress/ca.pem");
+        assert_eq!(text[ca - 1], "/data/sbx/egress/ca.pem");
         assert_eq!(text[ca - 2], "--ro-bind");
         // both come after the /tmp tmpfs — the socket needs a writable mountpoint under it
         let tmpfs = text.iter().position(|s| s == "--tmpfs").unwrap();
@@ -1693,15 +1693,15 @@ mod tests {
     ) -> SandboxSpec {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/ops/projects/abc/home"),
-            passwd_src: Path::new("/data/ops/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/ops/projects/abc/etc/group"),
+            home_src: Path::new("/data/sbx/projects/abc/home"),
+            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
+            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
-            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
+            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
             env: extra_env,
@@ -1759,7 +1759,7 @@ mod tests {
         let argv = argv_strings(&spec);
         let path_i = argv.iter().position(|s| s == "PATH").unwrap();
         // declared tools first, then mise's shims, then the base userland, then the
-        // synthetic `/usr/bin` (env + xdg-open, ops-owned) so `xdg-open` resolves by name.
+        // synthetic `/usr/bin` (env + xdg-open, sbx-owned) so `xdg-open` resolves by name.
         assert_eq!(
             argv[path_i + 1],
             "/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin"
@@ -1798,7 +1798,7 @@ mod tests {
             .expect("/usr/bin/xdg-open is synthesised");
         assert_eq!(
             argv[xdg - 1],
-            "/data/ops/projects/abc/etc/xdg-open",
+            "/data/sbx/projects/abc/etc/xdg-open",
             "/usr/bin/xdg-open binds the staged stub"
         );
         assert_eq!(
@@ -1857,7 +1857,7 @@ mod tests {
 
     #[test]
     fn the_shell_rc_is_bound_read_only_for_mise_activation() {
-        // `ops shell` points bash's `--rcfile` at this path; it must be a read-only bind
+        // `sbx shell` points bash's `--rcfile` at this path; it must be a read-only bind
         // so the agent cannot rewrite the init its own interactive shell sources.
         let argv = argv_strings(&assembled());
         let rc = argv
@@ -1932,7 +1932,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             argv[last_nix - 1],
-            "/data/ops/store/nix",
+            "/data/sbx/store/nix",
             "the structural store bind is the last mount at /nix"
         );
         assert_eq!(
@@ -1953,7 +1953,7 @@ mod tests {
         let first_ro = argv.iter().position(|s| s == "--ro-bind").unwrap();
         assert_eq!(
             argv[first_ro + 1],
-            "/data/ops/store/nix",
+            "/data/sbx/store/nix",
             "no extra bind may precede the store"
         );
         assert_eq!(argv[first_ro + 2], "/nix", "the store binds at /nix");
@@ -1970,8 +1970,8 @@ mod tests {
                 "PATH",
                 "NIX_LD",
                 "NIX_LD_LIBRARY_PATH",
-                "OPS_SANDBOX",
-                "OPS_EGRESS_CONTRACT",
+                "SBX_SANDBOX",
+                "SBX_EGRESS_CONTRACT",
                 "LOCALE_ARCHIVE",
                 "LANG",
                 "MISE_DATA_DIR",
@@ -1989,18 +1989,18 @@ mod tests {
         // store), not the read-only bind of the shared store.
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/ops/projects/abc/home"),
-            passwd_src: Path::new("/data/ops/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/ops/projects/abc/etc/group"),
+            home_src: Path::new("/data/sbx/projects/abc/home"),
+            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
+            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/ops/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/ops/projects/abc/etc/hosts"),
-            machine_id_src: Path::new("/data/ops/projects/abc/etc/machine-id"),
+            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
+            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let nix = NixMount {
-            src: PathBuf::from("/data/ops/projects/abc/store/nix"),
+            src: PathBuf::from("/data/sbx/projects/abc/store/nix"),
             writable: true,
         };
         let overlay = Overlay {
@@ -2023,7 +2023,7 @@ mod tests {
 
         // a read-write bind: `--bind <per-project store> /nix`, never `--ro-bind`
         let nix_pos = argv.iter().position(|s| s == "/nix").unwrap();
-        assert_eq!(argv[nix_pos - 1], "/data/ops/projects/abc/store/nix");
+        assert_eq!(argv[nix_pos - 1], "/data/sbx/projects/abc/store/nix");
         assert_eq!(argv[nix_pos - 2], "--bind");
     }
 
@@ -2031,7 +2031,7 @@ mod tests {
     fn synthetic_etc_lives_outside_the_writable_home() {
         // The core integrity property holds for every runtime scope: the read-only identity
         // files have no read-write alias inside the sandbox.
-        let data = Path::new("/data/ops");
+        let data = Path::new("/data/sbx");
         let project = Path::new("/home/u/proj");
         for runtime in [
             Runtime::ProjectDefault,
@@ -2056,7 +2056,7 @@ mod tests {
         // second app all resolve to different homes — so no two share writable state. The
         // global app's home is project-independent; the per-project app's nests under the
         // project.
-        let data = Path::new("/data/ops");
+        let data = Path::new("/data/sbx");
         let p1 = Path::new("/home/u/proj");
         let p2 = Path::new("/home/u/other");
         let home = |project: &Path, rt| project_runtime(data, project, rt).home_src;
@@ -2220,7 +2220,7 @@ mod smoke {
             userland.shell_bin.clone().into_os_string(),
             OsString::from("-c"),
             // resolve the synthetic user, show `/usr` is the minimal synthetic tree (only
-            // `bin`, never the host's), show `/usr/bin/env` resolves into ops's store, list
+            // `bin`, never the host's), show `/usr/bin/env` resolves into sbx's store, list
             // the project
             OsString::from(
                 "id -un; echo USR=$(ls /usr | tr '\\n' ','); echo ENV=$(readlink /usr/bin/env); ls",
@@ -2276,11 +2276,11 @@ mod smoke {
             stdout.contains("USR=bin,"),
             "/usr is not the minimal synthetic tree (host /usr may have leaked):\n{stdout}"
         );
-        // `/usr/bin/env` is the synthetic symlink into ops's store, so an interpreted
+        // `/usr/bin/env` is the synthetic symlink into sbx's store, so an interpreted
         // tool's `#!/usr/bin/env <interp>` shebang resolves
         assert!(
             stdout.contains("ENV=/nix/store") && stdout.contains("bin/env"),
-            "/usr/bin/env does not resolve into ops's store:\n{stdout}"
+            "/usr/bin/env does not resolve into sbx's store:\n{stdout}"
         );
         // nix coreutils ran and saw the project
         assert!(
@@ -2647,7 +2647,7 @@ mod smoke {
     /// PATH), `substituters` is emptied (no network fetch is possible — the shared store
     /// is not even bound in the cage), and the derivation is novel with its output
     /// asserted **absent before** and **present after**, so a successful build can only
-    /// be a real local build from the seeded bash+coreutils. nix needs *no* ops-supplied
+    /// be a real local build from the seeded bash+coreutils. nix needs *no* sbx-supplied
     /// configuration: its compiled defaults resolve the store to the local `/nix` and
     /// build there. The teeth: a sibling derivation whose only input is a package realised
     /// into the shared store but **left out of the seed** must *fail* offline — proving
@@ -2703,7 +2703,7 @@ mod smoke {
         let reuse = proj.join("reuse.nix");
         std::fs::write(
             &reuse,
-            r#"let b = builtins.storePath "@BASH@"; c = builtins.storePath "@CU@"; in derivation { name = "ops-reuse-proof"; system = builtins.currentSystem; builder = "${b}/bin/bash"; args = ["-c" "${c}/bin/mkdir -p $out; ${c}/bin/echo ok > $out/result"]; }"#
+            r#"let b = builtins.storePath "@BASH@"; c = builtins.storePath "@CU@"; in derivation { name = "sbx-reuse-proof"; system = builtins.currentSystem; builder = "${b}/bin/bash"; args = ["-c" "${c}/bin/mkdir -p $out; ${c}/bin/echo ok > $out/result"]; }"#
                 .replace("@BASH@", &bash_store.to_string_lossy())
                 .replace("@CU@", &cu_store.to_string_lossy()),
         )
@@ -2715,7 +2715,7 @@ mod smoke {
         let discriminant = proj.join("discriminant.nix");
         std::fs::write(
             &discriminant,
-            r#"let j = builtins.storePath "@HELLO@"; in derivation { name = "ops-discriminant"; system = builtins.currentSystem; builder = "${j}/bin/hello"; args = []; }"#
+            r#"let j = builtins.storePath "@HELLO@"; in derivation { name = "sbx-discriminant"; system = builtins.currentSystem; builder = "${j}/bin/hello"; args = []; }"#
                 .replace("@HELLO@", &hello.to_string_lossy()),
         )
         .unwrap();
@@ -2846,14 +2846,14 @@ mod smoke {
         })
     }
 
-    /// The `ops mise` payoff: an agent self-equips a project's `nix:` tool from inside
+    /// The `sbx mise` payoff: an agent self-equips a project's `nix:` tool from inside
     /// the open cage. The cage carries mise (in the base userland) with the embedded
     /// `nix:` backend plugin registered, so `mise install nix:jq` resolves jq through
     /// nixhub and builds it into the project's **own** writable store. Two things are
     /// proven: the tool genuinely installs and runs (the plugin path works end to end
     /// against the relocated single-user store), and — the multi-tenant boundary — the
     /// **shared store stays byte-identical**, since an in-cage install can only reach
-    /// the project's store. Untrusted by construction (no `ops trust`): the open-cage
+    /// the project's store. Untrusted by construction (no `sbx trust`): the open-cage
     /// self-equip posture works regardless of trust, unlike host-side provisioning.
     ///
     /// This is the project's first *network* smoke (nixhub + the binary cache), heavier
@@ -2992,7 +2992,7 @@ mod smoke {
     /// nix:<pkg>`) is on PATH in a **later, separate** launch — without re-declaring it
     /// and without touching the project's repo. Both mechanisms are proven against a
     /// fresh spec over the same project: the **shims dir on PATH** for the
-    /// non-interactive `ops run` (a bare `jq` resolves *through the shim*), and
+    /// non-interactive `sbx run` (a bare `jq` resolves *through the shim*), and
     /// **`mise activate`** for the interactive shell (bash started with the synthetic
     /// `--rcfile` puts the *real* tool bin on PATH). The first cage activates jq into the
     /// project's own store and persistent home; the second is a brand-new spec, so "on
@@ -3094,7 +3094,7 @@ mod smoke {
         let script = "set +e\n\
              echo \"SHIM_WHICH=$(command -v rg || echo NONE)\"\n\
              echo \"SHIM_VER=$(rg --version 2>/dev/null)\"\n\
-             bash --rcfile /opt/ops/bashrc -i -c 'echo \"ACT_WHICH=$(command -v rg || echo NONE)\"; echo \"ACT_VER=$(rg --version 2>/dev/null)\"' 2>/dev/null\n";
+             bash --rcfile /opt/sbx/bashrc -i -c 'echo \"ACT_WHICH=$(command -v rg || echo NONE)\"; echo \"ACT_VER=$(rg --version 2>/dev/null)\"' 2>/dev/null\n";
         let (ok, out, err) = run_script(script);
         assert!(ok, "the later launch failed:\n{err}\nstdout:\n{out}");
         let marker = |key: &str| {
@@ -3103,7 +3103,7 @@ mod smoke {
                 .unwrap_or_else(|| panic!("missing marker {key} in:\n{out}"))
         };
 
-        // `ops run` (non-interactive): rg is on PATH via the shims dir, resolved through
+        // `sbx run` (non-interactive): rg is on PATH via the shims dir, resolved through
         // the shim itself, and runs.
         assert!(
             marker("SHIM_WHICH").ends_with("/shims/rg"),
@@ -3116,7 +3116,7 @@ mod smoke {
             marker("SHIM_VER")
         );
 
-        // `ops shell` (interactive): mise activate (via `--rcfile`) puts the *real* tool
+        // `sbx shell` (interactive): mise activate (via `--rcfile`) puts the *real* tool
         // bin on PATH — ending in `/bin/rg`, not `/shims/rg`, so this proves activation
         // engaged rather than the shim doing the work again.
         assert!(

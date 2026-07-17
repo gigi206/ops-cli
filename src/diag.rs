@@ -1,4 +1,4 @@
-//! Styled stderr diagnostics — the single chokepoint for the `ops: warning:` / `ops: note:`
+//! Styled stderr diagnostics — the single chokepoint for the `sbx: warning:` / `sbx: note:`
 //! family. Each call decides its palette from stderr, so a captured stream is plain text; the
 //! prefix carries the severity hue (yellow `warning:`, bold `note:`) and any `` `identifier` ``
 //! span in the message is lifted to the identifier hue (cyan). A plain stream is byte-for-byte the
@@ -7,9 +7,9 @@
 use crate::style::Palette;
 use std::io::IsTerminal;
 
-/// Print `ops: warning: <msg>` to stderr — the prefix in the caution hue, the message's
+/// Print `sbx: warning: <msg>` to stderr — the prefix in the caution hue, the message's
 /// `` `identifiers` `` in the identifier hue, when stderr is a terminal. The message must be the
-/// bare text (no `ops: warning:` prefix — this adds it), so a slip cannot double the prefix.
+/// bare text (no `sbx: warning:` prefix — this adds it), so a slip cannot double the prefix.
 pub(crate) fn warn(msg: &str) {
     eprintln!(
         "{}",
@@ -17,7 +17,7 @@ pub(crate) fn warn(msg: &str) {
     );
 }
 
-/// Print `ops: note: <msg>` to stderr — an advisory. The prefix is bold (not the caution hue): a
+/// Print `sbx: note: <msg>` to stderr — an advisory. The prefix is bold (not the caution hue): a
 /// note explains a silent no-op (e.g. why a security field did not apply), so it must stay visible
 /// without reading as a problem. Same `` `identifier` `` highlighting as [`warn`].
 pub(crate) fn note(msg: &str) {
@@ -38,21 +38,21 @@ pub(crate) fn hint(line: &str) {
     );
 }
 
-/// The `ops: warning: <msg>` line. Pure, so the prefix and highlighting are unit-testable without
+/// The `sbx: warning: <msg>` line. Pure, so the prefix and highlighting are unit-testable without
 /// capturing stderr.
 fn warning_line(msg: &str, pal: &Palette) -> String {
     format!(
-        "ops: {}warning:{} {}",
+        "sbx: {}warning:{} {}",
         pal.warn,
         pal.reset,
         highlight(msg, pal)
     )
 }
 
-/// The `ops: note: <msg>` line. Pure (see [`warning_line`]).
+/// The `sbx: note: <msg>` line. Pure (see [`warning_line`]).
 fn note_line(msg: &str, pal: &Palette) -> String {
     format!(
-        "ops: {}note:{} {}",
+        "sbx: {}note:{} {}",
         pal.head,
         pal.reset,
         highlight(msg, pal)
@@ -104,12 +104,12 @@ mod tests {
         // the invariant the captured-output assertions (some matching a `token`) depend on.
         let p = Palette::plain();
         assert_eq!(
-            warning_line("found a mise file (`mise.toml`) but no `.ops.toml`", &p),
-            "ops: warning: found a mise file (`mise.toml`) but no `.ops.toml`"
+            warning_line("found a mise file (`mise.toml`) but no `.sbx.toml`", &p),
+            "sbx: warning: found a mise file (`mise.toml`) but no `.sbx.toml`"
         );
         assert_eq!(
             note_line("`network` is a security field", &p),
-            "ops: note: `network` is a security field"
+            "sbx: note: `network` is a security field"
         );
         assert_eq!(highlight("a `b` c", &p), "a `b` c");
     }
@@ -146,12 +146,12 @@ mod tests {
         // backticks.
         let plain = Palette::plain();
         assert_eq!(
-            highlight("       run `ops trust /p`", &plain),
-            "       run `ops trust /p`"
+            highlight("       run `sbx trust /p`", &plain),
+            "       run `sbx trust /p`"
         );
         let p = Palette::colored();
-        let out = highlight("       run `ops trust /p`", &p);
+        let out = highlight("       run `sbx trust /p`", &p);
         assert!(out.starts_with("       run "));
-        assert!(out.contains(&format!("{}ops trust /p{}", p.name, p.reset)));
+        assert!(out.contains(&format!("{}sbx trust /p{}", p.name, p.reset)));
     }
 }

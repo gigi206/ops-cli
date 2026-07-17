@@ -1,4 +1,4 @@
-# mise.toml — development toolchain for the ops sandbox launcher.
+# mise.toml — development toolchain for the sbx sandbox launcher.
 #
 # Run once after cloning:
 #
@@ -78,9 +78,9 @@ echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
 description = "Build the shipping static musl binary WITH the embedded nix + bwrap engines (needs host nix)"
 run = '''
 set -euo pipefail
-OPS_BUNDLED_NIX="$(mise run static-nix)"
-OPS_BUNDLED_BWRAP="$(mise run static-bwrap)"
-export OPS_BUNDLED_NIX OPS_BUNDLED_BWRAP
+SBX_BUNDLED_NIX="$(mise run static-nix)"
+SBX_BUNDLED_BWRAP="$(mise run static-bwrap)"
+export SBX_BUNDLED_NIX SBX_BUNDLED_BWRAP
 cargo zigbuild --release --target x86_64-unknown-linux-musl --features bundled-nix,bundled-bwrap
 '''
 
@@ -88,9 +88,9 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl --features bundled-n
 description = "Compile + clippy the bundled-* feature paths (not covered by default CI; needs host nix)"
 run = '''
 set -euo pipefail
-OPS_BUNDLED_NIX="$(mise run static-nix)"
-OPS_BUNDLED_BWRAP="$(mise run static-bwrap)"
-export OPS_BUNDLED_NIX OPS_BUNDLED_BWRAP
+SBX_BUNDLED_NIX="$(mise run static-nix)"
+SBX_BUNDLED_BWRAP="$(mise run static-bwrap)"
+export SBX_BUNDLED_NIX SBX_BUNDLED_BWRAP
 cargo clippy --bins --features bundled-nix,bundled-bwrap -- -D warnings
 '''
 

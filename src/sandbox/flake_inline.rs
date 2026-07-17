@@ -2,7 +2,7 @@
 //! config — to a content-keyed directory on disk, ready to be bound read-only into the cage and
 //! built with `nix build path:<dir>#<attr>`.
 //!
-//! Unlike a `flake:<ref>` package (a reference to an external flake), the source is ours, so ops
+//! Unlike a `flake:<ref>` package (a reference to an external flake), the source is ours, so sbx
 //! materializes it as a real directory a `path:` flake can point at. The directory name is a hash
 //! of the source, so a launch reuses the same staged flake (warm) while *editing* the flake in the
 //! config stages a fresh directory beside it — and, crucially, changes the hash the out-link is

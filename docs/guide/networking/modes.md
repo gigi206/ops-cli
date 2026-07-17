@@ -39,7 +39,7 @@ DNS, no way out. A direct connection fails immediately (`Could not resolve host`
 phone home.
 
 Because there is no proxy, there are no rules, no [stats](observability.md), and no
-[live log](observability.md#ops-net-logs). Note that a project's *first* provision
+[live log](observability.md#sbx-net-logs). Note that a project's *first* provision
 of a tool needs the network — an offline `none` cage can only run what is already
 in the per-project store.
 
@@ -47,13 +47,13 @@ in the per-project store.
 
 The host network, unfiltered — the cage shares your network namespace and reaches
 whatever your host can. This is the **default** when `network` is unset. It is the
-right posture for your own interactive shell (`ops shell`) and for trusted work
+right posture for your own interactive shell (`sbx shell`) and for trusted work
 where filtering would only get in the way. There is no proxy, so no rules, stats,
 or log apply.
 
 `shared` is also the documented **escape hatch**: set `network = "shared"` in your
 global config to make open networking the default for every project, overriding
-whatever `ops`'s built-in default becomes. An untrusted project still cannot reach
+whatever `sbx`'s built-in default becomes. An untrusted project still cannot reach
 this posture (see [the security gate](#security-gated)).
 
 ## `deny`
@@ -98,7 +98,7 @@ network.
 **Park-and-confirm.** An `allow` entry auto-passes and a `deny` entry auto-fails
 (exactly as under the other modes), but anything *undecided* **parks**: the request
 blocks inside the cage while you answer it from another terminal with
-[`ops net pending`](ask.md). You allow or deny it live, optionally remembering the
+[`sbx net pending`](ask.md). You allow or deny it live, optionally remembering the
 answer for the session or persisting a rule. This is the discovery posture — run an
 agent and watch, in real time, what it tries to reach, deciding as you go.
 
@@ -116,7 +116,7 @@ Two table fields tune `ask` (both inert outside `ask` mode):
   request waits before it times out to a deny. Absent means wait indefinitely.
 - `ask_notice` — `true` by default; a stderr alert is printed when a request parks.
   Set `false` to silence the inline alert (the request still parks; answer it with
-  `ops net pending`).
+  `sbx net pending`).
 
 The full workflow is on the [ask mode](ask.md) page.
 
@@ -137,8 +137,8 @@ allowed so a project can provision its toolchain even when untrusted:
 These are the *version-resolution and nix-source* hosts both self-equip front-ends
 (in-cage nix and the `mise:` backends) need. The per-tool *artifact* hosts (npm, a
 release host) are **not** in this set — a profile that fetches from them must list
-them explicitly. The whole set is shown in `ops config` (and in
-[`ops net rules --source builtin`](observability.md)), so it is never a silent
+them explicitly. The whole set is shown in `sbx config` (and in
+[`sbx net rules --source builtin`](observability.md)), so it is never a silent
 allowance, and a `deny` rule can carve any of it back out.
 
 ---
@@ -150,12 +150,12 @@ while keeping its own `allow`/`deny` rules. This lets a project add rules withou
 restating the posture, and lets an app narrow the baseline's rule set:
 
 ```toml
-# global ops.toml
+# global sbx.toml
 [network]
 mode  = "deny"
 allow = ["*.nixos.org"]
 
-# project .ops.toml — no `mode`, inherits "deny", adds a host
+# project .sbx.toml — no `mode`, inherits "deny", adds a host
 [network]
 allow = ["api.anthropic.com"]
 ```
@@ -175,7 +175,7 @@ mention them leaves the inherited value unchanged.
 
 ## default_methods (apps only)
 
-An app launched in **Mode B** (the locked-down agent posture — every `ops app` is
+An app launched in **Mode B** (the locked-down agent posture — every `sbx app` is
 Mode B) reads by default: its unscoped allow rules default to `["GET", "HEAD"]`, so
 an agent can read from an allowed host but cannot POST/PUT/DELETE unless a rule
 opts the host out with a `{VERB}` or `{*}` [method prefix](rules.md#method-scoping).
@@ -190,7 +190,7 @@ default_methods = ["GET", "POST"]   # this app may also POST to unscoped hosts
 # default_methods = ["*"]           # all verbs (opt the whole app back to Mode A behavior)
 ```
 
-This field is **ignored on the baseline** `[network]` — `ops run` and `ops shell`
+This field is **ignored on the baseline** `[network]` — `sbx run` and `sbx shell`
 (Mode A) stay all-verbs. It only changes an app's unscoped (`{...}`-less) allow
 rules; an explicit `{VERB}` or `{*}` on a rule always keeps its own verbs. See the
 [rule grammar](rules.md#method-scoping) for how a per-rule prefix interacts with
@@ -206,7 +206,7 @@ rules, groups, `ask_timeout`, `stats`, and `default_methods` — is honored **on
 from:
 
 - the **global** config (trusted by its location), or
-- a **trusted** project `.ops.toml` (blessed with [`ops trust`](../concepts/trust.md)).
+- a **trusted** project `.sbx.toml` (blessed with [`sbx trust`](../concepts/trust.md)).
 
 An untrusted (or edited-since-trusted) project's `network` is **dropped with a
 warning**, and the cage falls back to the built-in default. This holds both

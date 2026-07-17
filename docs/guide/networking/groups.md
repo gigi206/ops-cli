@@ -6,7 +6,7 @@ copying the same hosts into every app profile, you declare them in one place and
 share them:
 
 ```toml
-# global ops.toml
+# global sbx.toml
 [net.groups]
 ci-hosts   = ["github.com", "api.github.com", "codeload.github.com"]
 anthropic  = ["api.anthropic.com"]
@@ -35,7 +35,7 @@ Groups are a security-relevant input — they expand into egress rules — so th
 honored **only from the global config** (trusted by its location). A project's
 `[net.groups]` is **ignored** with a warning; a project may *reference* a
 global group with `@name`, but it cannot *define* one. This is why the
-[`ops net groups`](observability.md) command has no scope flag: it always reads the
+[`sbx net groups`](observability.md) command has no scope flag: it always reads the
 global config.
 
 ---
@@ -52,7 +52,7 @@ warning**. The direction of the failure depends on the list:
   intent*, which is exactly why the warning is loud and un-ignorable: an undefined
   reference must never pass unnoticed.
 
-Always check `ops config` (or [`ops net rules`](observability.md)) after editing
+Always check `sbx config` (or [`sbx net rules`](observability.md)) after editing
 groups so an undefined reference is caught before a launch.
 
 A group is a **flat list** — a group entry may **not** itself be a `@other`
@@ -64,14 +64,14 @@ dropped). This makes an unbounded or cyclic expansion impossible by construction
 ## Inspecting groups
 
 ```bash
-ops net groups                 # list every group and its entry count
-ops net groups anthropic       # resolve one group to its authored entries
-ops net groups anthropic --json
+sbx net groups                 # list every group and its entry count
+sbx net groups anthropic       # resolve one group to its authored entries
+sbx net groups anthropic --json
 ```
 
-`ops net groups` reads the global config only. A malformed or nested entry in a
+`sbx net groups` reads the global config only. A malformed or nested entry in a
 group is flagged. To see a group *expanded inline* within an effective policy, use
-[`ops net rules --expand`](observability.md) — a rule that came from a group shows
+[`sbx net rules --expand`](observability.md) — a rule that came from a group shows
 its `@name` origin.
 
 ---
@@ -81,17 +81,17 @@ its `@name` origin.
 Export and import let you share a curated group set:
 
 ```bash
-ops net groups export > groups.toml        # every group, as a [net.groups] fragment
-ops net groups export ci-hosts anthropic   # only these groups
-ops net groups export -o groups.toml       # to a file
+sbx net groups export > groups.toml        # every group, as a [net.groups] fragment
+sbx net groups export ci-hosts anthropic   # only these groups
+sbx net groups export -o groups.toml       # to a file
 ```
 
 `export` emits a portable `[net.groups]` TOML fragment (a group is data, so source
 comments are not carried).
 
 ```bash
-ops net groups import groups.toml          # merge into the global config
-ops net groups import groups.toml --force  # overwrite a name that already exists
+sbx net groups import groups.toml          # merge into the global config
+sbx net groups import groups.toml --force  # overwrite a name that already exists
 ```
 
 `import` merges the fragment's groups into the global config, preserving every
@@ -100,7 +100,7 @@ deliberate command *is* the consent — an agent inside a cage cannot run it —
 there is no interactive prompt. A name that already exists is **refused** unless
 `--force`, and the merge is all-or-nothing. A group carrying an entry that will not
 resolve (malformed or nested) is flagged after the import; inspect it with
-`ops net groups <name>`.
+`sbx net groups <name>`.
 
 Imported groups are **inert** until a `[network]` `allow`/`deny` list references them
 with `@name`.
@@ -112,12 +112,12 @@ with `@name`.
 You do not have to edit a file to reference a group:
 
 ```bash
-ops net allow @ci-hosts               # add "@ci-hosts" to the project allow list
-ops net allow @anthropic -a claude    # under an app's [app.claude.network]
-ops net deny  @telemetry -g           # to the global config's deny list
+sbx net allow @ci-hosts               # add "@ci-hosts" to the project allow list
+sbx net allow @anthropic -a claude    # under an app's [app.claude.network]
+sbx net deny  @telemetry -g           # to the global config's deny list
 ```
 
-`ops net allow`/`deny` validate the reference name and write it like any other rule.
+`sbx net allow`/`deny` validate the reference name and write it like any other rule.
 See [Observability](observability.md#persisting-rules) for the write scopes.
 
 ---
@@ -127,6 +127,6 @@ See [Observability](observability.md#persisting-rules) for the write scopes.
 - [Rule grammar](rules.md) — what a group entry may contain, and how `@name` is
   parsed within a list.
 - [Network modes](modes.md) — where the referencing `allow`/`deny` lists live.
-- [Observability](observability.md) — `ops net groups`, `ops net rules --expand`.
+- [Observability](observability.md) — `sbx net groups`, `sbx net rules --expand`.
 - [`[net.groups]` configuration reference](../configuration/net-groups.md)
-- [`ops net` CLI reference](../cli/net.md)
+- [`sbx net` CLI reference](../cli/net.md)

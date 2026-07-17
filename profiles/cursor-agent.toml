@@ -1,20 +1,20 @@
-# Cursor CLI — Cursor's headless terminal coding agent (`cursor-agent`), sandboxed by ops.
+# Cursor CLI — Cursor's headless terminal coding agent (`cursor-agent`), sandboxed by sbx.
 #
-#   ops app import profiles/cursor-agent.toml
-#   ops app cursor-agent -- -p "your task here"        # headless: prompt in, result out
-#   ops app cursor-agent                               # interactive TUI
+#   sbx app import profiles/cursor-agent.toml
+#   sbx app cursor-agent -- -p "your task here"        # headless: prompt in, result out
+#   sbx app cursor-agent                               # interactive TUI
 #
 # This is the Cursor **CLI** (`cursor-agent`, a.k.a. `agent`), NOT the Cursor desktop editor
 # (that Electron app is packaged from Cursor's `.deb` — see `profiles/cursor.toml`). The CLI runs the same
 # Cursor agent from a terminal: `cursor-agent -p "…"` takes a prompt and returns a result, the
-# form used in CI, git hooks, and scripts — the ideal fit for ops's Mode-B sandbox.
+# form used in CI, git hooks, and scripts — the ideal fit for sbx's Mode-B sandbox.
 #
-# PACKAGING — a bootstrap download, NOT a clean ops backend (and NOT the npm "cursor-agent").
+# PACKAGING — a bootstrap download, NOT a clean sbx backend (and NOT the npm "cursor-agent").
 # Cursor distributes the CLI ONLY as a versioned tarball from `downloads.cursor.com` (its own
 # `curl https://cursor.com/install | bash` installer) — there is no nixpkgs attribute, no GitHub
 # release, and no genuine npm/mise package (the npm package literally named `cursor-agent` is an
 # UNRELATED third-party package by another author — using it would install the wrong thing). So
-# none of ops's `nix:`/`mise:`/`flake:`/`deb:`/`appimage:` backends fit. Instead the `cmd` below
+# none of sbx's `nix:`/`mise:`/`flake:`/`deb:`/`appimage:` backends fit. Instead the `cmd` below
 # runs Cursor's OWN installer INSIDE the cage on the first launch, into the app's isolated home —
 # contained by bubblewrap + seccomp + the empty netns + the egress allowlist. The installer needs
 # `tar` + `gzip` (absent from the base toolset), so `[packages]` provisions them via nix (host-side,
@@ -26,15 +26,15 @@
 #
 # CREDENTIAL POSTURE — a Cursor ACCOUNT key, NOT a header-injectable provider key. `cursor-agent`
 # authenticates to YOUR Cursor account (which pays for the models) and routes model traffic through
-# Cursor's own backend, so there is no per-provider HTTP header for ops's `[secret]` broker to
+# Cursor's own backend, so there is no per-provider HTTP header for sbx's `[secret]` broker to
 # strip-and-inject, and this profile ships **no `[secret]` block** (contrast the BYOK profiles like
 # `cline`/`opencode`). Two ways in:
 #
 #   1. API KEY (recommended for the cage) — generate one at cursor.com/dashboard/api, then inject it
 #      for a single caged launch WITHOUT baking it into this file:
-#          ops app cursor-agent --env CURSOR_API_KEY=… -- -p "your task"
+#          sbx app cursor-agent --env CURSOR_API_KEY=… -- -p "your task"
 #      (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage
-#      env for that launch only, so the key never lands in the committed profile. `$OPS_ENV_CURSOR_API_KEY`
+#      env for that launch only, so the key never lands in the committed profile. `$SBX_ENV_CURSOR_API_KEY`
 #      works too. The CLI also accepts a `--api-key` flag.) Do NOT put `CURSOR_API_KEY` in `[env]`
 #      below: profile `[env]` is highest-precedence, so a placeholder value would BLANK the key the
 #      `--env` override supplies.
@@ -49,12 +49,12 @@
 # When you do log in, the credential persists in the app's dedicated, persistent, isolated home,
 # never bleeding into the project shell or another app.
 #
-# EGRESS AND HTTP/2 (gRPC). Under `mode = "deny"` ops runs a TLS-terminating MITM proxy. By default
+# EGRESS AND HTTP/2 (gRPC). Under `mode = "deny"` sbx runs a TLS-terminating MITM proxy. By default
 # it speaks HTTP/1.1 to a host; a host listed in `[network] http2` is instead man-in-the-middled as
 # HTTP/2 (ALPN h2) for gRPC, with every stream still inspected and verdict-checked (so `allow` still
 # governs the verdict — `http2` only picks the transport). Cursor's own doc still notes some proxies
 # "can cause issues with streaming responses" and recommends against SSL inspection on its domains,
-# so if the agent misbehaves under `deny`, diagnose with `ops net logs -a cursor-agent` (a named
+# so if the agent misbehaves under `deny`, diagnose with `sbx net logs -a cursor-agent` (a named
 # deny → add the host to `allow`, and `http2-required`/`bad-request` → the `[network] http2`
 # designation does not match the client's transport for that host; an `EAI_AGAIN`/0-deny → the
 # request bypassed the proxy, i.e. `NODE_USE_ENV_PROXY` is not taking effect) and, as a last resort,
@@ -68,11 +68,11 @@
 #
 # STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
 # test). PROVEN LIVE: the bootstrap download + the un-patchelf'd binary under nix-ld runs (after
-# ops's base userland supplies `libz.so.1`), the CLI routes through ops's proxy, and the api5 agent
+# sbx's base userland supplies `libz.so.1`), the CLI routes through sbx's proxy, and the api5 agent
 # hosts + repo42 reach their transport. Still to be proven with a real Cursor account: the AUTH
 # (`CURSOR_API_KEY` via `--env`, or `cursor-agent login`) and a full prompt round-trip. Treat it as
 # a grounded starting point to validate, not a turnkey profile. If a request is blocked, the proxy
-# names the host it refused — add it to `allow` (or check ahead with `ops test net <url>`).
+# names the host it refused — add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = [
     "bash",
     "-c",
@@ -87,7 +87,7 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 exec cursor-agent "$@"
 ''',
-    # `$0` placeholder: `ops app cursor-agent -- <args>` appends <args> to this cmd array, so they
+    # `$0` placeholder: `sbx app cursor-agent -- <args>` appends <args> to this cmd array, so they
     # arrive as `$1 $2 …` (this element fills `$0`) and reach the agent verbatim via `exec … "$@"`.
     "cursor-agent",
 ]
@@ -115,7 +115,7 @@ allow = [
     # POSTs prompts and workspace context.
     "{*} https://*.cursor.sh",
     # A git fetch of the `makenotion/cursor-notion-plugin` repo (the CLI pulls it as a dependency
-    # via the git smart-HTTP protocol). github.com is already allowed for {GET} by ops's built-in
+    # via the git smart-HTTP protocol). github.com is already allowed for {GET} by sbx's built-in
     # nix-cache set (so `GET /info/refs` passes); only the `POST /git-upload-pack` was denied by
     # method-scope. Authorized as the EXACT upload-pack URL (least privilege — not a host wildcard).
     "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
@@ -125,7 +125,7 @@ allow = [
     # exact URL. Lets the plugin read/write your Notion pages from inside the cage.
     "{*} https://mcp.notion.com",
     # If the CLI fetches client updates / extensions, these are the documented hosts — uncomment the
-    # one the proxy names in `ops net logs -a cursor-agent` (least privilege; not needed for the
+    # one the proxy names in `sbx net logs -a cursor-agent` (least privilege; not needed for the
     # agent's core prompt/response path).
     #"{GET} https://*.cursor-cdn.com",
     #"{GET} https://*.cursorapi.com",
@@ -140,7 +140,7 @@ allow = [
 # host — keep it targeted (exact hosts or `*.api5.cursor.sh`), never a blanket `*.cursor.sh` (which
 # would also force h2 on the auth hosts authenticate/authenticator.cursor.sh that speak HTTP/1.1).
 #
-# PROVEN LIVE (Node CLI client, `ops net logs -a cursor-agent`) — the transport is the OPPOSITE of
+# PROVEN LIVE (Node CLI client, `sbx net logs -a cursor-agent`) — the transport is the OPPOSITE of
 # the desktop (Chromium) client: the CLI speaks HTTP/1.1 to `repo42.cursor.sh` (so designating it h2
 # blocked it `http2-required`), and speaks HTTP/2/gRPC to the `*.api5.cursor.sh` agent hosts (so NOT
 # designating them sent `PRI *` → `bad-request`). The Cursor desktop profile inverts this — a
@@ -154,11 +154,11 @@ http2 = [
 [env]
 # REQUIRED if `cursor-agent` reaches its backend through Node's built-in fetch (undici) — Cursor's
 # proxy support is documented as "inherited from Node.js", and undici does NOT honour the
-# http_proxy/https_proxy variables ops injects unless this is set. In the Model-B cage (empty netns,
+# http_proxy/https_proxy variables sbx injects unless this is set. In the Model-B cage (empty netns,
 # no DNS resolver) a fetch that bypasses the proxy dies with `EAI_AGAIN: getaddrinfo <host>` and
-# never reaches the proxy (0 denies in `ops net stats`). NODE_USE_ENV_PROXY (Node 24+) routes fetch
+# never reaches the proxy (0 denies in `sbx net stats`). NODE_USE_ENV_PROXY (Node 24+) routes fetch
 # through the proxy so every request is subject to the allowlist above. Harmless if the binary uses a
 # proxy-aware client instead. (Do NOT add `CURSOR_API_KEY` here — see the credential note in the
-# header; a placeholder in `[env]` would blank the `--env` key. ops injects its MITM CA into the cage
+# header; a placeholder in `[env]` would blank the `--env` key. sbx injects its MITM CA into the cage
 # automatically under a filtering posture via NODE_EXTRA_CA_CERTS / SSL_CERT_FILE, which Cursor honours.)
 NODE_USE_ENV_PROXY = "1"

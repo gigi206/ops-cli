@@ -1,15 +1,15 @@
-//! The presentation-agnostic view model for `ops config`.
+//! The presentation-agnostic view model for `sbx config`.
 //!
 //! [`ConfigView`] is a serializable projection of the resolved configuration: every value is a
 //! plain `String`/`bool`/local enum, so it carries no dependency on the resolution internals
 //! (`allowlist::Rule`, `trust::TrustState`, the channel-lock types) and any front-end can render
-//! or serialize it without pulling those in. [`build`] assembles it — the same data `ops config`
+//! or serialize it without pulling those in. [`build`] assembles it — the same data `sbx config`
 //! has always shown — by loading and projecting the resolved configuration plus the channel
 //! locks. The CLI presenter and a future management UI are both adapters over this one model.
 //!
 //! It carries the provenance of each baseline value — which layer (`Default`/`Global`/`Project`)
 //! supplied it: per-entry for `env`/`binds`, and per-field for the scalar postures (`network`,
-//! `gui`) and the cgroup `limits` — so `ops config` can show where every value came from. What it
+//! `gui`) and the cgroup `limits` — so `sbx config` can show where every value came from. What it
 //! still does *not* carry: a queryable schema, an affordance for a management UI that does not yet
 //! exist; it is added when that consumer is concrete, against its real shape.
 
@@ -23,7 +23,7 @@ use crate::trust::TrustState;
 use crate::{sandbox, store};
 
 /// A serializable projection of the resolved configuration for a directory — the model both the
-/// `ops config` CLI and a future management front-end render. Field order mirrors the CLI's
+/// `sbx config` CLI and a future management front-end render. Field order mirrors the CLI's
 /// long-standing display order so a presenter can walk it top to bottom.
 #[derive(Serialize)]
 pub(crate) struct ConfigView {
@@ -48,7 +48,7 @@ pub(crate) struct ConfigView {
     pub(crate) network: NetworkView,
     /// Which layer supplied the network posture (`Default` when neither config set it).
     pub(crate) network_origin: ProvenanceView,
-    /// Whether the egress proxy records `ops net stats` (on by default; off via `[network] stats =
+    /// Whether the egress proxy records `sbx net stats` (on by default; off via `[network] stats =
     /// false`). Only meaningful under a filtering posture (the proxy runs only then).
     pub(crate) egress_stats: bool,
     /// The resolved GUI posture.
@@ -113,7 +113,7 @@ pub(crate) struct BindView {
 }
 
 /// Where a resolved value came from — the presentation-agnostic mirror of [`super::Provenance`].
-/// `Default` is ops's built-in, `Global`/`Project` the two config files; `Inherited` is the per-app
+/// `Default` is sbx's built-in, `Global`/`Project` the two config files; `Inherited` is the per-app
 /// view's marker for a field the app overlay did not set (it takes the baseline's value).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum ProvenanceView {
@@ -159,7 +159,7 @@ pub(crate) struct PackageView {
     pub(crate) trusted: bool,
     /// Why it was withheld, when it was (`None` for a trusted, admitted package).
     pub(crate) withheld_reason: Option<String>,
-    /// The locked revision when this is a `flake:` package `ops upgrade flake` has pinned; `None`
+    /// The locked revision when this is a `flake:` package `sbx upgrade flake` has pinned; `None`
     /// for a floating flake package (no lock entry) or any non-flake backend.
     pub(crate) pinned_rev: Option<String>,
 }
@@ -257,8 +257,8 @@ pub(crate) enum NetworkView {
         ask_notice: Option<bool>,
         allow: Vec<String>,
         deny: Vec<String>,
-        /// `mute` (`dontaudit`) rules: refusals suppressed from the default `ops net log` view (still
-        /// counted in `ops net stats`, shown by `ops net log --all`). Surfaced so the suppression is
+        /// `mute` (`dontaudit`) rules: refusals suppressed from the default `sbx net log` view (still
+        /// counted in `sbx net stats`, shown by `sbx net log --all`). Surfaced so the suppression is
         /// never silent. Empty for a policy that mutes nothing.
         mute: Vec<String>,
         /// `http2` hosts: CONNECT targets the proxy man-in-the-middles as HTTP/2 (ALPN `h2`, for
@@ -278,7 +278,7 @@ pub(crate) enum NetRuleKind {
     Mute,
 }
 
-/// Where a listed egress rule came from: the resolved config (`.ops.toml`/global, after the trust
+/// Where a listed egress rule came from: the resolved config (`.sbx.toml`/global, after the trust
 /// gate), the always-allowed built-in set, or `Manual` — a runtime rule a live `ask`
 /// session remembered from a `--session` answer (it lives in that session's memory, not config).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +288,7 @@ pub(crate) enum RuleSourceView {
     Manual,
 }
 
-/// One egress rule projected for `ops net rules`: its kind, its source, its display text, and — for
+/// One egress rule projected for `sbx net rules`: its kind, its source, its display text, and — for
 /// a rule expanded from a `[net.groups]` group — the group's name (`None` otherwise). In the default
 /// (collapsed) view a contiguous run of one group's rules is a single row whose `rule` is `@<name>`;
 /// under `--expand` each rule is its own row carrying `group` so the renderer can note its origin.
@@ -364,7 +364,7 @@ pub(crate) fn net_rules_view(
     let mut rules = Vec::new();
     project_config_rules(policy.allow_rules(), NetRuleKind::Allow, expand, &mut rules);
     project_config_rules(policy.deny_rules(), NetRuleKind::Deny, expand, &mut rules);
-    // Mute (`dontaudit`) rules are policy too — surfaced so `ops net rules` shows what refusals are
+    // Mute (`dontaudit`) rules are policy too — surfaced so `sbx net rules` shows what refusals are
     // suppressed from the default log. They never change a verdict; the renderer tags them.
     project_config_rules(policy.mute_rules(), NetRuleKind::Mute, expand, &mut rules);
     for r in sandbox::builtin_allow_rules() {
@@ -386,7 +386,7 @@ pub(crate) enum GuiView {
 }
 
 /// The cage's effective cgroup resource limits: the throttle threshold, the hard memory ceiling,
-/// and the task cap, each its config override when set or ops's built-in default otherwise.
+/// and the task cap, each its config override when set or sbx's built-in default otherwise.
 #[derive(Serialize, Default)]
 pub(crate) struct LimitsView {
     pub(crate) memory_high: LimitView,
@@ -402,7 +402,7 @@ pub(crate) struct LimitView {
     pub(crate) origin: ProvenanceView,
 }
 
-/// An injected credential, by destination and source — never the plaintext, which ops reads only
+/// An injected credential, by destination and source — never the plaintext, which sbx reads only
 /// host-side at launch.
 #[derive(Serialize)]
 pub(crate) struct SecretView {
@@ -425,7 +425,7 @@ pub(crate) struct AppEnvVar {
 
 /// An app overlay's own network posture, projected for display. An allowlist carries its declared
 /// allow/deny rules and the always-allowed built-in set: the proxy unions that set into
-/// whatever policy is in effect at launch, so for an app it is part of what `ops app <name>` can
+/// whatever policy is in effect at launch, so for an app it is part of what `sbx app <name>` can
 /// reach — and the baseline `network` section shows it only when the *baseline* is an allowlist, so
 /// a profile that puts its allowlist in the app overlay (the common case) would otherwise show it
 /// nowhere. The CLI shows this compactly by default and expands the rules under `--details`.
@@ -522,12 +522,12 @@ pub(crate) struct AppView {
 /// The *effective* configuration one app launches with — the baseline folded with the app's
 /// overlay — annotated, field by field, with where each value came from: `inherited` (the overlay
 /// set none of its own, so the baseline's value stands), `app:global`/`app:project` (the app
-/// declaration in that config file set it). This is what `ops config show --app <name>` renders,
+/// declaration in that config file set it). This is what `sbx config show --app <name>` renders,
 /// and it answers "what does this app actually run with, and which of it did the app change?" — a
 /// view the compact baseline `apps:` section (overlay-own only) cannot give. Scalars carry their
 /// effective value plus a [`ProvenanceView`]; collections carry the overlay's *own* additions plus
 /// a count of how many baseline entries they inherit (never the inherited entries themselves —
-/// those live in the baseline `ops config show`, one hop away).
+/// those live in the baseline `sbx config show`, one hop away).
 #[derive(Serialize)]
 pub(crate) struct AppDetailView {
     pub(crate) name: String,
@@ -592,20 +592,20 @@ pub(crate) struct AppDetailView {
 
 /// Assemble the view for a directory: load and resolve the configuration, then project it (plus
 /// the channel locks, which need a touch of I/O) into the serializable model. This is the data
-/// gathering only — no realisation, no nix, no network — exactly as `ops config` has always been.
+/// gathering only — no realisation, no nix, no network — exactly as `sbx config` has always been.
 pub(crate) fn build(cwd: &Path) -> ConfigView {
     build_scoped(cwd, super::Source::All)
 }
 
-/// Assemble the view restricted to one configuration `source` — the single-source `ops config show
+/// Assemble the view restricted to one configuration `source` — the single-source `sbx config show
 /// --global/--local/--default` views. `build(cwd)` is `build_scoped(cwd, Source::All)`; a
 /// restricted form projects the same model from fewer layers, so each value's provenance tag reads
 /// as what that source contributes over the built-in defaults.
 pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     let mut resolved = super::load_scoped(cwd, source);
 
-    // Reflect an ambient one-shot override (`OPS_CONFIG`/`OPS_ENV_*` and the `OPS_*` typed
-    // variables) in the full view, so `ops config show` does not lie about what a launch in this
+    // Reflect an ambient one-shot override (`SBX_CONFIG`/`SBX_ENV_*` and the `SBX_*` typed
+    // variables) in the full view, so `sbx config show` does not lie about what a launch in this
     // environment would do — its values then carry the `override` provenance tag. Only the full
     // (`All`) view: the single-source `--global/--local/--default` views show what one config *file*
     // contributes, which an override is not. Per-invocation CLI flags are not previewed here (run the
@@ -614,7 +614,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         if let Ok(ov) = super::overrides::collect(&super::CliOverrides::default()) {
             if !ov.is_empty() {
                 // A set-but-invalid override value would abort a real launch; here (a read-only view)
-                // surface the error as a note and show the untouched baseline, so `ops config show`
+                // surface the error as a note and show the untouched baseline, so `sbx config show`
                 // neither lies about the override nor pretends a bad value took effect.
                 if let Err(e) = resolved.apply_override_channel(&ov) {
                     resolved.warnings.push(e);
@@ -893,7 +893,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
 
 /// Whether the `ask` park notice prints, projected for display: `None` when the default action is
 /// not `ask` (moot), else `Some(true)` (shown, the default) or `Some(false)` (silenced by
-/// `ask_notice = false`). Surfaced so a silenced notice is visible in `ops config`.
+/// `ask_notice = false`). Surfaced so a silenced notice is visible in `sbx config`.
 fn ask_notice_view(a: &crate::allowlist::EgressPolicy) -> Option<bool> {
     if a.default_action() != crate::allowlist::DefaultAction::Ask {
         return None;
@@ -903,7 +903,7 @@ fn ask_notice_view(a: &crate::allowlist::EgressPolicy) -> Option<bool> {
 
 /// The ask-default's parked-request wait, projected for display: `None` when the default action is
 /// not `ask` (the field is moot), `Some("none")` for an indefinite wait, or `Some("90s")` for a
-/// configured bound. Surfaced so a configured timeout is visible in `ops config`.
+/// configured bound. Surfaced so a configured timeout is visible in `sbx config`.
 fn ask_timeout_view(a: &crate::allowlist::EgressPolicy) -> Option<String> {
     if a.default_action() != crate::allowlist::DefaultAction::Ask {
         return None;
@@ -926,8 +926,8 @@ fn fmt_secs(secs: u64) -> String {
     }
 }
 
-/// Project the cage's effective resource limits — each the config override when set, or ops's
-/// built-in default — with the layer that supplied it, so `ops config` shows what the launch would
+/// Project the cage's effective resource limits — each the config override when set, or sbx's
+/// built-in default — with the layer that supplied it, so `sbx config` shows what the launch would
 /// actually apply and where each limit came from.
 fn limits_view(limits: &sandbox::cgroup::Limits, origin: &super::LimitsOrigin) -> LimitsView {
     let project = |(value, _overridden): (String, bool), origin: super::Provenance| LimitView {
@@ -1037,7 +1037,7 @@ fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
     })
 }
 
-/// Assemble the per-app detail view for `name` in `cwd` — the effective configuration `ops app
+/// Assemble the per-app detail view for `name` in `cwd` — the effective configuration `sbx app
 /// <name>` would launch with, annotated with provenance. `None` when no such app is declared (the
 /// CLI then errors, listing the available names). Pure data gathering, like [`build`].
 pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> {
@@ -1155,7 +1155,7 @@ fn app_detail_view(
     // Effective credentials mirror `merge_app`: the baseline's plus the app's, then
     // `enforce_secret_posture` clears *all* of them when the effective network is not an
     // allowlist (the proxy that injects them runs only under one). Reproduce that check so the
-    // count — and the note — match what `ops app <name>` would actually inject; otherwise the
+    // count — and the note — match what `sbx app <name>` would actually inject; otherwise the
     // view over-reports credentials an app silently drops by narrowing its network.
     let mut eff_secrets = baseline.declared_secrets.clone();
     eff_secrets.extend(app.secrets.iter().cloned());
@@ -1521,7 +1521,7 @@ mod tests {
         assert_eq!(json["forward_origin"], "Global");
         assert_eq!(json["apps"][0]["forward"][0], 1455);
         // An app overlay's allowlist serializes its rules and the built-in set in full, so the
-        // JSON form carries what `ops app <name>` can reach without a `--details` equivalent.
+        // JSON form carries what `sbx app <name>` can reach without a `--details` equivalent.
         let app_net = &json["apps"][0]["network"]["Allowlist"];
         assert_eq!(app_net["default_action"], "Deny");
         assert_eq!(app_net["allow"][0], "api.example.com");
@@ -1541,7 +1541,7 @@ mod tests {
         assert_eq!(json["apps"][0]["packages"][0]["backend"], "mise");
         assert_eq!(json["apps"][0]["packages"][0]["trusted"], true);
         // An app overlay's injected credentials serialize by destination and source — never the
-        // value — so the JSON form carries what `ops app <name>` injects without a `--details` flag.
+        // value — so the JSON form carries what `sbx app <name>` injects without a `--details` flag.
         let app_secret = &json["apps"][0]["secrets"][0];
         assert_eq!(app_secret["header"], "x-api-key");
         assert_eq!(app_secret["to"], "api.example.com");

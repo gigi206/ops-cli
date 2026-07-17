@@ -1,4 +1,4 @@
-//! Integration tests for `ops run`, exercising the built binary end to end —
+//! Integration tests for `sbx run`, exercising the built binary end to end —
 //! including the exec-replace exit-status propagation that the in-crate smokes
 //! (which spawn rather than exec) cannot cover. The sandbox cases skip, rather
 //! than fail, where the host cannot create a sandbox.
@@ -7,16 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-fn ops() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops`: these e2es must not read the
-    // developer's global ops config (imported app profiles, a global `[network]` posture), or a
+fn sbx() -> Command {
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx`: these e2es must not read the
+    // developer's global sbx config (imported app profiles, a global `[network]` posture), or a
     // test's outcome would depend on the host. Default it to a fixed empty dir under the test
     // tree — no run.rs test writes a global config there (the profile-import test sets its own
     // XDG_CONFIG_HOME, which overrides this default), so a shared empty dir is race-free.
     let mut cfg = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     cfg.push("target/test-tmp/isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.env("XDG_CONFIG_HOME", cfg);
     // Pin a deterministic UTF-8 locale: the cage now honors the host locale, so a provisioned
     // tool's output (e.g. GNU `hello`) would otherwise be translated on a non-English developer
@@ -40,7 +40,7 @@ impl TmpDir {
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
         // A short prefix on purpose: a launch's egress proxy binds a Unix socket under this
-        // data dir (`…/<dir>/ops/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path
+        // data dir (`…/<dir>/sbx/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path
         // at 108 bytes. A longer prefix plus a 7-digit pid (counted twice — here and in the
         // socket name) tips a deep checkout over the limit, so keep this terse.
         d.push(format!("r-{tag}-{}-{n}", std::process::id()));
@@ -78,34 +78,34 @@ fn force_remove(path: &Path) {
     }
 }
 
-/// `ops run -- <args>` from `project`, with ops's data dir redirected to `data`
+/// `sbx run -- <args>` from `project`, with sbx's data dir redirected to `data`
 /// so the test never touches the real `$HOME`.
 fn run_in(project: &Path, data: &Path, args: &[&str]) -> Output {
-    ops()
+    sbx()
         .arg("run")
         .arg("--")
         .args(args)
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .expect("spawn ops run")
+        .expect("spawn sbx run")
 }
 
-/// `ops app <name>` from `project`, with ops's data dir redirected to `data`.
+/// `sbx app <name>` from `project`, with sbx's data dir redirected to `data`.
 fn app_in(project: &Path, data: &Path, name: &str) -> Output {
-    ops()
+    sbx()
         .arg("app")
         .arg(name)
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .expect("spawn ops app")
+        .expect("spawn sbx app")
 }
 
-/// `ops app <name> -- <extra...>`: the passthrough form, where `extra` is appended to the app's
+/// `sbx app <name> -- <extra...>`: the passthrough form, where `extra` is appended to the app's
 /// declared command.
 fn app_in_args(project: &Path, data: &Path, name: &str, extra: &[&str]) -> Output {
-    ops()
+    sbx()
         .arg("app")
         .arg(name)
         .arg("--")
@@ -113,26 +113,26 @@ fn app_in_args(project: &Path, data: &Path, name: &str, extra: &[&str]) -> Outpu
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .expect("spawn ops app")
+        .expect("spawn sbx app")
 }
 
-/// `ops <args>` from `project` with both the data dir and the trust-store dir
+/// `sbx <args>` from `project` with both the data dir and the trust-store dir
 /// redirected, so a test can trust a project and launch it without touching the
 /// real `$HOME` or the user's trust store.
-fn ops_in(project: &Path, data: &Path, state: &Path, args: &[&str]) -> Output {
-    ops()
+fn sbx_in(project: &Path, data: &Path, state: &Path, args: &[&str]) -> Output {
+    sbx()
         .args(args)
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .env("XDG_STATE_HOME", state)
         .output()
-        .expect("spawn ops")
+        .expect("spawn sbx")
 }
 
 #[test]
 fn run_without_a_command_is_a_usage_error() {
     // fails before any sandbox work, so it needs no capable host
-    let out = ops().arg("run").output().expect("spawn ops run");
+    let out = sbx().arg("run").output().expect("spawn sbx run");
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
 }
@@ -147,7 +147,7 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping ops run smoke: host cannot sandbox ({})",
+            "skipping sbx run smoke: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
@@ -204,7 +204,7 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     // A hermetic cage carries no `/etc/hosts`, so the *name* `localhost` would fall through to
     // DNS — which the empty-netns posture (Model B) has no resolver for. A tool that resolves the
     // name to bind or reach an internal loopback server (an in-process language server, a dev
-    // server, a local MCP) then fails hard. ops synthesises an `/etc/hosts` mapping localhost →
+    // server, a local MCP) then fails hard. sbx synthesises an `/etc/hosts` mapping localhost →
     // loopback. Prove resolution with teeth in the exact failing posture (`network = "none"`, an
     // empty netns where only `/etc/hosts` can answer): `curl -v http://localhost:1` must resolve
     // to 127.0.0.1 (then a connection error, nothing listening), NOT report "could not resolve
@@ -213,7 +213,7 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     let data = TmpDir::new("hosts-data");
     let state = TmpDir::new("hosts-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"none\"\n",
     )
     .unwrap();
@@ -235,20 +235,20 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     }
 
     // trust the project so `network = "none"` (a security field) is honored → empty netns.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // the synthetic file is present with the localhost → loopback mapping
-    let hosts = ops_in(
+    let hosts = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -261,7 +261,7 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     );
 
     // teeth: the NAME resolves to loopback in the empty netns (only /etc/hosts can do this here).
-    let curl = ops_in(
+    let curl = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -289,12 +289,12 @@ fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
     // host (it fails at parse time).
     let project = TmpDir::new("ov-bad-proj");
     let data = TmpDir::new("ov-bad-data");
-    let bad_toml = ops()
+    let bad_toml = sbx()
         .args(["run", "--config", "x = = not toml", "--", "true"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert_eq!(
         bad_toml.status.code(),
         Some(2),
@@ -311,12 +311,12 @@ fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
     // the baseline posture, which for a `network` typo would be the wide default `shared` while the
     // user believed they isolated the cage. It aborts *before* provisioning, so it needs no capable
     // host, and it must not have launched (`false` would exit 1 if it ran; the abort is 2).
-    let bad_value = ops()
+    let bad_value = sbx()
         .args(["run", "--config", "network=\"nonee\"", "--", "false"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert_eq!(
         bad_value.status.code(),
         Some(2),
@@ -332,14 +332,14 @@ fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
 
 #[test]
 fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
-    // The flagship, end to end through the real binary: `ops app <name> --env` must beat the app's
+    // The flagship, end to end through the real binary: `sbx app <name> --env` must beat the app's
     // own `env` overlay — proving the dispatch applies the override *after* `merge_app`, the load-
     // bearing ordering a unit test that calls the two by hand cannot cover. Skips (never fails) when
     // the host cannot sandbox.
     let project = TmpDir::new("ov-app-proj");
     let data = TmpDir::new("ov-app-data");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[app.greet]\ncmd = [\"printenv\", \"APPVAR\"]\n[app.greet.env]\nAPPVAR = \"from-app\"\n",
     )
     .unwrap();
@@ -362,12 +362,12 @@ fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
     );
 
     // With `--env`, the override is the final word — it beats the app overlay.
-    let overridden = ops()
+    let overridden = sbx()
         .args(["app", "greet", "--env", "APPVAR=from-override"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops app");
+        .expect("spawn sbx app");
     assert_eq!(
         String::from_utf8_lossy(&overridden.stdout).trim(),
         "from-override",
@@ -379,7 +379,7 @@ fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
 
 #[test]
 fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() {
-    // The one-shot override, proven end to end through a real launch: `--env`/`OPS_ENV_<KEY>`/
+    // The one-shot override, proven end to end through a real launch: `--env`/`SBX_ENV_<KEY>`/
     // `--config` all reach the cage environment, and the documented precedence holds — the command
     // line beats the environment. Observed by `printenv` inside the cage. Skips (never fails) when
     // the host cannot sandbox.
@@ -396,9 +396,9 @@ fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() 
         return;
     }
 
-    // Run `ops run` with arbitrary leading flags and process env, reading one cage variable.
+    // Run `sbx run` with arbitrary leading flags and process env, reading one cage variable.
     let read = |args: &[&str], env: &[(&str, &str)]| -> String {
-        let mut cmd = ops();
+        let mut cmd = sbx();
         cmd.arg("run").args(args);
         cmd.args(["--", "printenv", "OVMARK"]);
         cmd.current_dir(project.path())
@@ -406,19 +406,19 @@ fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() 
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = cmd.output().expect("spawn ops run");
+        let out = cmd.output().expect("spawn sbx run");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
 
     // `--env KEY=VALUE` reaches the cage.
     assert_eq!(read(&["--env", "OVMARK=cli"], &[]), "cli");
-    // `OPS_ENV_<KEY>` in the environment reaches the cage.
-    assert_eq!(read(&[], &[("OPS_ENV_OVMARK", "env")]), "env");
+    // `SBX_ENV_<KEY>` in the environment reaches the cage.
+    assert_eq!(read(&[], &[("SBX_ENV_OVMARK", "env")]), "env");
     // The `--config` TOML blob's `[env]` reaches the cage.
     assert_eq!(read(&["--config", "env.OVMARK = \"blob\""], &[]), "blob");
-    // Precedence: the command line beats the environment (a stale `OPS_ENV_*` cannot win).
+    // Precedence: the command line beats the environment (a stale `SBX_ENV_*` cannot win).
     assert_eq!(
-        read(&["--env", "OVMARK=cli"], &[("OPS_ENV_OVMARK", "env")]),
+        read(&["--env", "OVMARK=cli"], &[("SBX_ENV_OVMARK", "env")]),
         "cli"
     );
     // Precedence within the command line: the typed `--env` beats the `--config` blob.
@@ -456,7 +456,7 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     std::fs::write(ro_dir.join("preexisting"), b"host-content\n").unwrap();
 
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         format!(
             "binds = [\n  {{ path = \"{}\", mode = \"rw\" }},\n  \"{}\",\n]\n",
             rw_dir.display(),
@@ -476,21 +476,21 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     }
 
     // `binds` is trusted-only, so trust the project before it takes effect.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The rw bind: the cage writes a marker, and it must land at the host path.
     let rw_target = rw_dir.join("marker");
-    let write_rw = ops_in(
+    let write_rw = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -516,7 +516,7 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
 
     // The ro bind IS mounted (not merely absent): the cage reads the pre-placed host file
     // through it, so a subsequent write refusal means "read-only", not "path not there".
-    let read_ro = ops_in(
+    let read_ro = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -536,7 +536,7 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
 
     // The ro bind: a write must fail, and no new host file may appear.
     let ro_target = ro_dir.join("marker");
-    let write_ro = ops_in(
+    let write_ro = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -561,9 +561,9 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
 #[test]
 fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // The security teeth of the mountpoint-chain protection. A whole-home read-write bind that
-    // *contains* ops's own control plane (data dir, trust store, config dir) stays read-write —
+    // *contains* sbx's own control plane (data dir, trust store, config dir) stays read-write —
     // but each control-plane path is pinned as a mountpoint chain, so in-cage code cannot rename a
-    // writable parent to move a root aside and substitute a forged one (which ops would then read
+    // writable parent to move a root aside and substitute a forged one (which sbx would then read
     // or `execve` on the host). Proven with teeth on both sides in one real launch:
     //   DENY — a write into a pinned root is `EROFS`; renaming or removing any chain component is
     //          `EBUSY`; and the pre-placed host trust marker survives untouched (the substitution
@@ -579,7 +579,7 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // exercises the reachable filesystem attack (rename/remove), not a raw syscall. Skips (never
     // fails) where the host cannot sandbox.
     let home = TmpDir::new("cp-home");
-    // A fabricated `$HOME` with ops's XDG roots inside it, so the control plane lives under the
+    // A fabricated `$HOME` with sbx's XDG roots inside it, so the control plane lives under the
     // read-write bind. Canonical, because `load` canonicalizes the bind source and the roots.
     let h = std::fs::canonicalize(home.path()).unwrap();
     let data = h.join(".local/share");
@@ -587,10 +587,10 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     let config = h.join(".config");
     let project = h.join("project");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir_all(config.join("ops")).unwrap();
+    std::fs::create_dir_all(config.join("sbx")).unwrap();
     // The global config (trusted by location) binds the whole fabricated home read-write.
     std::fs::write(
-        config.join("ops/ops.toml"),
+        config.join("sbx/sbx.toml"),
         format!(
             "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
             h.display()
@@ -598,12 +598,12 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     )
     .unwrap();
     // A pre-placed trust marker whose survival proves the pin defeats path substitution.
-    let sentinel = state.join("ops/trusted/sentinel");
+    let sentinel = state.join("sbx/trusted/sentinel");
     std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
     std::fs::write(&sentinel, b"REAL").unwrap();
 
     let run = |script: &str| {
-        ops()
+        sbx()
             .arg("run")
             .arg("--")
             .arg("sh")
@@ -614,7 +614,7 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
             .env("XDG_STATE_HOME", &state)
             .env("XDG_CONFIG_HOME", &config)
             .output()
-            .expect("spawn ops run")
+            .expect("spawn sbx run")
     };
 
     // capability probe (also seeds the base store and exercises the pin path); skip if incapable.
@@ -630,11 +630,11 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     let script = format!(
         r#"H="{h}"
 echo "A:$(touch "$H/writeprobe" 2>/dev/null && echo OK || echo FAIL)"
-echo "B:$(echo x > "$H/.local/state/ops/trusted/forged" 2>/dev/null && echo BAD || echo RO)"
+echo "B:$(echo x > "$H/.local/state/sbx/trusted/forged" 2>/dev/null && echo BAD || echo RO)"
 echo "C:$(mv "$H/.local/state" "$H/.local/state.bak" 2>/dev/null && echo BAD || echo EBUSY)"
-echo "D:$(mv "$H/.local/state/ops/trusted" "$H/stolen" 2>/dev/null && echo BAD || echo EBUSY)"
-echo "E:$(rmdir "$H/.config/ops" 2>/dev/null && echo BAD || echo BLOCKED)"
-echo "F:$(touch /nix/.ops-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
+echo "D:$(mv "$H/.local/state/sbx/trusted" "$H/stolen" 2>/dev/null && echo BAD || echo EBUSY)"
+echo "E:$(rmdir "$H/.config/sbx" 2>/dev/null && echo BAD || echo BLOCKED)"
+echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
 "#,
         h = h.display()
     );
@@ -678,13 +678,13 @@ echo "F:$(touch /nix/.ops-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
 }
 
 #[test]
-fn ops_app_launches_the_apps_command_with_its_overlay() {
+fn sbx_app_launches_the_apps_command_with_its_overlay() {
     let project = TmpDir::new("appproj");
     let data = TmpDir::new("appdata");
     // Two untrusted apps: `probe` runs the synthetic-identity check; `greet` carries a free
     // `env` overlay (which applies even untrusted, like the baseline `env`).
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[app.probe]\n\
           cmd = [\"id\"]\n\n\
           [app.greet]\n\
@@ -696,11 +696,11 @@ fn ops_app_launches_the_apps_command_with_its_overlay() {
     )
     .unwrap();
 
-    // capability probe via `ops run -- true`; skip (not fail) if the host cannot sandbox.
+    // capability probe via `sbx run -- true`; skip (not fail) if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping ops app e2e: host cannot sandbox ({})",
+            "skipping sbx app e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
@@ -724,7 +724,7 @@ fn ops_app_launches_the_apps_command_with_its_overlay() {
     );
 
     // Arguments after `--` are appended to the app's declared command. `echoer` runs `echo BASE`;
-    // launched as `ops app echoer -- EXTRA-ARG` it prints `BASE EXTRA-ARG`, so the tail reached the
+    // launched as `sbx app echoer -- EXTRA-ARG` it prints `BASE EXTRA-ARG`, so the tail reached the
     // program's argv (echo never emits EXTRA-ARG on its own) while the profile's own argv (BASE) is
     // preserved. This proves the append on the unwrapped launch path; the wrapped path (packages /
     // network) forwards the command positionally, so the multi-element `printenv APPVAR` above
@@ -757,13 +757,13 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
     // one home per app — and this single project exercises persistence; isolation from the
     // project shell is the second assertion.
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[app.counter]\n\
           cmd = [\"sh\", \"-c\", \"echo x >> \\\"$HOME/COUNT\\\"; wc -l < \\\"$HOME/COUNT\\\" | tr -d ' '\"]\n",
     )
     .unwrap();
 
-    // capability probe via `ops run -- true`; skip (not fail) if the host cannot sandbox.
+    // capability probe via `sbx run -- true`; skip (not fail) if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
@@ -789,7 +789,7 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
         String::from_utf8_lossy(&second.stdout)
     );
 
-    // Isolation with teeth: `ops run` uses the project's default home, a different directory,
+    // Isolation with teeth: `sbx run` uses the project's default home, a different directory,
     // so the app's COUNT file is absent there — the app's writable state never bleeds into the
     // project shell.
     let leaked = run_in(
@@ -823,7 +823,7 @@ fn an_imported_profile_launches_trusted_by_location() {
     )
     .unwrap();
 
-    // capability probe via `ops run -- true`; skip (not fail) if the host cannot sandbox.
+    // capability probe via `sbx run -- true`; skip (not fail) if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
@@ -834,13 +834,13 @@ fn an_imported_profile_launches_trusted_by_location() {
     }
 
     // Import the profile — the deliberate consent act; it lands under the config dir.
-    let imp = ops()
+    let imp = sbx()
         .args(["app", "import", "greet.toml"])
         .current_dir(project.path())
         .env("XDG_CONFIG_HOME", config.path())
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops app import");
+        .expect("spawn sbx app import");
     assert!(
         imp.status.success(),
         "import failed: {}",
@@ -849,13 +849,13 @@ fn an_imported_profile_launches_trusted_by_location() {
 
     // Launch it by name: the profile's command runs in the cage and its free env reaches it —
     // proving the imported profile was discovered and launched end to end.
-    let greet = ops()
+    let greet = sbx()
         .args(["app", "greet"])
         .current_dir(project.path())
         .env("XDG_CONFIG_HOME", config.path())
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops app");
+        .expect("spawn sbx app");
     assert!(
         String::from_utf8_lossy(&greet.stdout).contains("from-profile"),
         "the imported profile did not launch with its env: stdout={:?} stderr={:?}",
@@ -869,17 +869,17 @@ fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
     let project = TmpDir::new("mise-proj");
     let data = TmpDir::new("mise-data");
     let state = TmpDir::new("mise-state");
-    // a mise file declares an env var; the (empty) .ops.toml anchors it
-    std::fs::write(project.path().join(".ops.toml"), b"").unwrap();
+    // a mise file declares an env var; the (empty) .sbx.toml anchors it
+    std::fs::write(project.path().join(".sbx.toml"), b"").unwrap();
     std::fs::write(
         project.path().join(".mise.toml"),
-        b"[env]\nOPS_MISE_VAR = \"from-mise\"\n",
+        b"[env]\nSBX_MISE_VAR = \"from-mise\"\n",
     )
     .unwrap();
 
     // capability probe: a capable host runs `true` to success; otherwise skip. This
     // also primes the base userland, so a later provisioning failure is a real fault.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -894,11 +894,11 @@ fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
     }
 
     // untrusted: the mise `[env]` is withheld, so `printenv` finds nothing (exit 1)
-    let before = ops_in(
+    let before = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["run", "--", "printenv", "OPS_MISE_VAR"],
+        &["run", "--", "printenv", "SBX_MISE_VAR"],
     );
     assert!(
         !before.status.success(),
@@ -907,23 +907,23 @@ fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
     );
 
     // trust the project, then the same var is mapped into the sandbox
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let after = ops_in(
+    let after = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["run", "--", "printenv", "OPS_MISE_VAR"],
+        &["run", "--", "printenv", "SBX_MISE_VAR"],
     );
     assert!(
         after.status.success(),
@@ -1010,7 +1010,7 @@ fn a_gui_wayland_launch_connects_to_the_host_compositor() {
     let data = TmpDir::new("gui-data");
     let state = TmpDir::new("gui-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\nnetwork = \"none\"\n\
          [packages]\nwayland-utils = \"nix:wayland-utils\"\n",
     )
@@ -1035,19 +1035,19 @@ fn a_gui_wayland_launch_connects_to_the_host_compositor() {
     }
 
     // `gui` and `[packages]` are trusted-only, so trust the project before launching.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1087,7 +1087,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     let data = TmpDir::new("gui-fonts-data");
     let state = TmpDir::new("gui-fonts-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\nnetwork = \"none\"\n\
          [packages]\nfontconfig = \"nix:fontconfig\"\n",
     )
@@ -1110,19 +1110,19 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     }
 
     // `gui` and `[packages]` are trusted-only, so trust the project before launching.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1149,7 +1149,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
 #[test]
 fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     // `dbus = true` under `gui = "wayland"` stands up a *private* session bus inside the cage
-    // carrying ops's own `xdg-desktop-portal` with the GTK backend, so a Chromium/Electron app's
+    // carrying sbx's own `xdg-desktop-portal` with the GTK backend, so a Chromium/Electron app's
     // file chooser renders in-cage (seeing only the cage filesystem). Proven with the cage's network
     // CUT (`network = "none"`, empty netns): the only session bus reachable is the private one the
     // command wrapper created, so a `FileChooser` version probe that answers on it can only be the
@@ -1162,7 +1162,7 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     let data = TmpDir::new("portal-data");
     let state = TmpDir::new("portal-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
          [packages]\nglib = \"nix:glib.bin\"\n",
     )
@@ -1187,15 +1187,15 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     }
 
     // `gui`/`dbus`/`[packages]` are trusted-only, so trust the project before launching.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
@@ -1208,7 +1208,7 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
          gdbus call --session --dest org.freedesktop.secrets \
          --object-path /org/freedesktop/secrets \
          --method org.freedesktop.DBus.Peer.Ping 2>&1 | sed 's/^/KEYRING: /'";
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1235,7 +1235,7 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
 
 #[test]
 fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
-    // Under `dbus = true`, ops runs a host-side relay that owns `org.freedesktop.Notifications`
+    // Under `dbus = true`, sbx runs a host-side relay that owns `org.freedesktop.Notifications`
     // on the cage's private bus and forwards to the host daemon, so the app's desktop notifications
     // work. Teeth on the wiring, end to end through a real cage: on the private bus (the only one
     // reachable — `network = "none"`, empty netns) the notifications name must have an OWNER (the
@@ -1249,7 +1249,7 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
     let data = TmpDir::new("relay-data");
     let state = TmpDir::new("relay-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
          [packages]\nglib = \"nix:glib.bin\"\n",
     )
@@ -1277,15 +1277,15 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
@@ -1301,7 +1301,7 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
          gdbus call --session --dest org.freedesktop.Notifications \
            --object-path /org/freedesktop/Notifications \
            --method org.freedesktop.Notifications.GetServerInformation 2>&1 | sed 's/^/SERVERINFO: /'";
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1344,7 +1344,7 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
     let data = TmpDir::new("theme-data");
     let state = TmpDir::new("theme-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
          [packages]\nglib = \"nix:glib.bin\"\n",
     )
@@ -1367,15 +1367,15 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
@@ -1395,7 +1395,7 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
          kill $MON 2>/dev/null; \
          echo \"CHANGED: $(grep -c SettingChanged /tmp/mon.log 2>/dev/null)\"; \
          grep SettingChanged /tmp/mon.log 2>/dev/null | sed 's/^/SIG: /'";
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1422,9 +1422,9 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     // trusts the proxy. Each launch has a distinct per-session CA sharing a FIXED subject DN, so
     // without the purge two launches would leave two same-subject CAs — which collide on the NSS
     // issuer lookup and make Chromium reject the current cert (ERR_CERT_AUTHORITY_INVALID, the bug
-    // that shipped). The wrap purges every prior `ops-mitm*` entry before re-adding the current one,
-    // so the persistent app home's db holds exactly ONE. Teeth: two sequential `ops app` launches
-    // share the app's persistent home; the second reports the `ops-mitm` count read from the db with
+    // that shipped). The wrap purges every prior `sbx-mitm*` entry before re-adding the current one,
+    // so the persistent app home's db holds exactly ONE. Teeth: two sequential `sbx app` launches
+    // share the app's persistent home; the second reports the `sbx-mitm` count read from the db with
     // its own `nix:nss.tools` certutil — it must be 1, not 2 (a count of 2 is exactly the pre-fix
     // accumulation). `gui = "wayland"` + a filtering posture is what gates catrust on (no real
     // compositor needed — the CA import does not render). Skips when the host cannot sandbox or the
@@ -1433,11 +1433,11 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     let data = TmpDir::new("catrust-data");
     let state = TmpDir::new("catrust-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\n[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
          [packages]\nnss = \"nix:nss.tools\"\n\
          [app.probe]\ncmd = [\"bash\", \"-c\", \
-         \"certutil -L -d sql:$HOME/.pki/nssdb 2>/dev/null | grep -c ops-mitm | sed 's/^/MITM-COUNT=/'\"]\n",
+         \"certutil -L -d sql:$HOME/.pki/nssdb 2>/dev/null | grep -c sbx-mitm | sed 's/^/MITM-COUNT=/'\"]\n",
     )
     .unwrap();
 
@@ -1455,20 +1455,20 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     }
 
     // `gui`/`network`/`[packages]` are trusted-only, so trust before launching.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // Launch 1: imports the first session's CA (db now holds one ops-mitm entry).
-    let first = ops_in(project.path(), data.path(), state.path(), &["app", "probe"]);
+    // Launch 1: imports the first session's CA (db now holds one sbx-mitm entry).
+    let first = sbx_in(project.path(), data.path(), state.path(), &["app", "probe"]);
     assert!(
         first.status.success(),
         "first launch failed: {}",
@@ -1477,13 +1477,13 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
 
     // Launch 2: a NEW session CA. Without the purge the shared home's db would now hold TWO
     // same-subject CAs; with it, the count stays 1.
-    let second = ops_in(project.path(), data.path(), state.path(), &["app", "probe"]);
+    let second = sbx_in(project.path(), data.path(), state.path(), &["app", "probe"]);
     let out = String::from_utf8_lossy(&second.stdout);
     let log = format!("{}{}", String::from_utf8_lossy(&second.stderr), out);
     assert!(second.status.success(), "second launch failed: {log}");
     assert!(
         out.contains("MITM-COUNT=1"),
-        "the NSS db must hold exactly one ops-mitm CA after two launches (the purge), not accumulate: {log}"
+        "the NSS db must hold exactly one sbx-mitm CA after two launches (the purge), not accumulate: {log}"
     );
 }
 
@@ -1495,7 +1495,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     // the proxy's injected per-session CA, and the allowlist decides each request. Teeth: an
     // allowed host's fetch returns the real content (the known nix-cache-info hash); a denied
     // host is refused with a 403 *at the proxy* (a real filename, so the fetch is actually
-    // attempted — not a tool-side URL rejection). Because `ops run` must supervise on this
+    // attempted — not a tool-side URL rejection). Because `sbx run` must supervise on this
     // path (it cannot exec-replace while the proxy thread outlives the cage), this also covers
     // exit-status propagation there. Skips (never fails) when the host cannot sandbox or the
     // cache is unreachable.
@@ -1503,7 +1503,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     let data = TmpDir::new("egress-data");
     let state = TmpDir::new("egress-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
@@ -1525,20 +1525,20 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     }
 
     // trust the project so its allowlist posture is honored (a security field).
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // exit-status propagation on the supervised (allowlist) path
-    let seven = ops_in(
+    let seven = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1554,7 +1554,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     // ALLOWED: a real fetch through the proxy returns the known nix-cache-info content hash,
     // which proves the whole chain — forwarder bridged the empty netns, nix trusted the MITM
     // leaf via the injected CA, the proxy validated the upstream and relayed the bytes intact.
-    let allowed = ops_in(
+    let allowed = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1581,7 +1581,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
 
     // DENIED (teeth): the same request shape to a non-allowlisted host is refused with a 403 at
     // the proxy. `example.com` is not in the allow list nor the built-in set.
-    let denied = ops_in(
+    let denied = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1606,11 +1606,11 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     );
 
     // STATS — the write↔read key agreement, end to end. The proxy recorded one outcome per request
-    // into a session file keyed by the project's canonical path; `ops net stats` run from the same
+    // into a session file keyed by the project's canonical path; `sbx net stats` run from the same
     // project reads it back. That it finds the rows proves the launch-side write key and the
     // read-side filter cannot drift (a mismatch would yield an empty, silently-wrong listing). The
     // allowed host shows an allow, the denied host a deny — the buckets the two requests exercised.
-    let stats = ops_in(
+    let stats = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1647,7 +1647,7 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
     // The HTTP/2 (gRPC) MITM path end to end through the real binary. A trusted `deny` allowlist
     // designates `cache.nixos.org` as `http2`, so the proxy speaks HTTP/2 to it; an in-cage
     // `curl --http2` GET reports the negotiated version. Teeth on two properties:
-    //   * TRANSPORT: `http_version = 2` can only happen because ops advertised ALPN `h2` on the
+    //   * TRANSPORT: `http_version = 2` can only happen because sbx advertised ALPN `h2` on the
     //     h2 branch — the default HTTP/1.1 MITM advertises no ALPN, so a regression that routed the
     //     designated host through the sync path would report `1.1` and fail this assertion.
     //   * VERDICT on the h2 path: `example.com` is also designated `http2` but is NOT allowed, so
@@ -1659,7 +1659,7 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
     let data = TmpDir::new("h2-data");
     let state = TmpDir::new("h2-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
          http2 = [\"cache.nixos.org\", \"example.com\"]\n",
     )
@@ -1679,24 +1679,24 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // ALLOWED + h2: a real GET through the h2 MITM to the designated host. The base `curl` carries
     // nghttp2, `--http2` offers ALPN `h2`, and the proxy speaks it → `http_version = 2`, `200`.
-    // Runs via `ops_in` (with the test state dir) so the trust marker is honored — otherwise the
+    // Runs via `sbx_in` (with the test state dir) so the trust marker is honored — otherwise the
     // untrusted policy is dropped and the cage runs `shared`, which would negotiate h2 *directly*
     // with the upstream (no proxy) and pass this assertion for the wrong reason.
-    let allowed = ops_in(
+    let allowed = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1722,7 +1722,7 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
 
     // DENIED on the h2 path (teeth): example.com is http2-designated but not allowed, so the h2
     // branch refuses its stream with a 403 — the verdict fires on h2, not just the transport.
-    let denied = ops_in(
+    let denied = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -1766,11 +1766,11 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
     let state = TmpDir::new("h2-secret-state");
     let secret = "s3cr3t-h2-inject-9q2z7w1k";
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
          http2 = [\"cache.nixos.org\"]\n\n\
-         [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
-         header = \"X-Ops-Test\"\ntype = \"raw\"\n",
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://SBX_E2E_SECRET\"\n\
+         header = \"X-Sbx-Test\"\ntype = \"raw\"\n",
     )
     .unwrap();
 
@@ -1787,21 +1787,21 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // A. A normal request: injected + forwarded (not fail-closed), body delivered intact through the
-    //    masking relay. The secret is set in ops's env so the launch resolves it host-side.
-    let a = ops()
+    //    masking relay. The secret is set in sbx's env so the launch resolves it host-side.
+    let a = sbx()
         .args([
             "run",
             "--",
@@ -1815,9 +1815,9 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
-        .env("OPS_E2E_SECRET", secret)
+        .env("SBX_E2E_SECRET", secret)
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     let aout = String::from_utf8_lossy(&a.stdout);
     assert!(
         aout.contains("C=200") && aout.contains("StoreDir"),
@@ -1828,7 +1828,7 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
     );
 
     // B. A request that carries the secret value verbatim must be refused by the outbound tripwire.
-    let b = ops()
+    let b = sbx()
         .args([
             "run",
             "--",
@@ -1846,9 +1846,9 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
-        .env("OPS_E2E_SECRET", secret)
+        .env("SBX_E2E_SECRET", secret)
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     let bout = String::from_utf8_lossy(&b.stdout);
     assert!(
         bout.contains("outbound-secret"),
@@ -1866,10 +1866,10 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
     //   * INJECTION reaches the upstream: a host-scoped credential is injected host-side (never in the
     //     cage) and arrives at the server.
     //   * RESPONSE MASKING: a reflected secret is masked out of the response DATA.
-    //   * STRIP-AND-REPLACE (6.3a): the client also sends a DECOY `x-ops-test` header; it must be
-    //     dropped and only ops's value forwarded, so the decoy must be absent from the echo.
+    //   * STRIP-AND-REPLACE (6.3a): the client also sends a DECOY `x-sbx-test` header; it must be
+    //     dropped and only sbx's value forwarded, so the decoy must be absent from the echo.
     // `grpcbin.GRPCBin/HeadersUnary` echoes the request metadata into the response body, so a masked
-    // `x-ops-test` value (an equal-length `*` run) that is neither the real secret nor the decoy
+    // `x-sbx-test` value (an equal-length `*` run) that is neither the real secret nor the decoy
     // proves injection-reached + masking + no-leak + strip in one shot. Skips (never fails) when the
     // host cannot sandbox, the cache is unreachable (grpcurl won't provision), or grpcb.in is down.
     let project = TmpDir::new("h2-grpc-proj");
@@ -1878,12 +1878,12 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
     let secret = "s3cr3t-grpc-inject-7w1k9q2z";
     let decoy = "DECOY-CLIENT-VALUE-must-be-stripped";
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[packages]\ngrpcurl = \"nix:grpcurl\"\n\n\
          [network]\nmode = \"deny\"\nallow = [\"{POST} grpcb.in:9001\"]\n\
          http2 = [\"grpcb.in:9001\"]\n\n\
-         [secret.\"grpcb.in:9001\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
-         header = \"x-ops-test\"\ntype = \"raw\"\n",
+         [secret.\"grpcb.in:9001\"]\nfrom = \"env://SBX_E2E_SECRET\"\n\
+         header = \"x-sbx-test\"\ntype = \"raw\"\n",
     )
     .unwrap();
 
@@ -1904,41 +1904,41 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops()
+    let out = sbx()
         .args([
             "run",
             "--",
             "grpcurl",
             "-H",
-            &format!("x-ops-test: {decoy}"),
+            &format!("x-sbx-test: {decoy}"),
             "grpcb.in:9001",
             "grpcbin.GRPCBin/HeadersUnary",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
-        .env("OPS_E2E_SECRET", secret)
+        .env("SBX_E2E_SECRET", secret)
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     // Injection reached the upstream (the header is echoed) and its value is masked (a `*` run at
     // least as long as our 10-char floor — the real value is 27 chars, so this can only be masking).
     assert!(
-        stdout.contains("x-ops-test") && stdout.contains("**********"),
+        stdout.contains("x-sbx-test") && stdout.contains("**********"),
         "the injected header must reach the upstream and its echoed value be masked; got:\n{stdout}\n\
          stderr: {stderr}"
     );
@@ -1956,7 +1956,7 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
 
 #[test]
 fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
-    // `ops app <name> --net-learn` end to end through the real binary: an app under a `deny`
+    // `sbx app <name> --net-learn` end to end through the real binary: an app under a `deny`
     // allowlist runs a command that reaches a host it has no rule for; the proxy refuses it
     // (`denied-default`) and logs it; net-learn snapshots that log after the run, synthesizes the
     // allow rule that would admit the host, and (a) prints it under `--dry-run` and (b) writes it to
@@ -1972,7 +1972,7 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
     let original_config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
          [app.probe]\ncmd = [\"curl\", \"-sS\", \"-m\", \"20\", \"-o\", \"/dev/null\", \
          \"https://example.com\"]\n";
-    std::fs::write(project.path().join(".ops.toml"), original_config).unwrap();
+    std::fs::write(project.path().join(".sbx.toml"), original_config).unwrap();
 
     // capability probe (also seeds the project store, so a later egress failure is a real fault
     // rather than a cold cage).
@@ -1989,20 +1989,20 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // DRY RUN: the refused host is synthesized into a domain rule and only printed — nothing written.
-    let dry = ops_in(
+    let dry = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2023,16 +2023,16 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
     );
     // A dry run writes nothing: the config is byte-identical to what we wrote (the app's `cmd`
     // already names the host, so a substring check would be a false positive — compare the whole).
-    let cfg_after_dry = std::fs::read_to_string(project.path().join(".ops.toml")).unwrap();
+    let cfg_after_dry = std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap();
     assert_eq!(
         cfg_after_dry, original_config,
         "a dry run must not modify the config"
     );
 
     // REAL WRITE (local scope): the same rule is persisted to the project config for app `probe` and
-    // the project is re-trusted. The write path is `ops net allow`'s, so this proves net-learn wires
+    // the project is re-trusted. The write path is `sbx net allow`'s, so this proves net-learn wires
     // into it correctly (the file gains the rule under the app's table).
-    let write = ops_in(
+    let write = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2047,7 +2047,7 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
         write.status.success(),
         "net-learn write should succeed: {write_out}"
     );
-    let cfg_after = std::fs::read_to_string(project.path().join(".ops.toml")).unwrap();
+    let cfg_after = std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap();
     assert_ne!(
         cfg_after, original_config,
         "the write must change the config: {cfg_after}"
@@ -2096,7 +2096,7 @@ fn free_loopback_port() -> u16 {
 fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
     // The inbound loopback-forward path end to end through the real binary: a trusted
     // `network = "none"` cage with `forward = [<port>]` starts a service on its own loopback, and a
-    // host process reaches it only because ops bound the host port and the in-cage socat bridged it
+    // host process reaches it only because sbx bound the host port and the in-cage socat bridged it
     // over the shared Unix socket. Teeth: with `forward` declared the host curl gets the cage
     // server's marker; a second project with the SAME server but NO `forward` is unreachable from
     // the host (connection refused) — so the forwarder is provably the bridge, not some ambient
@@ -2104,7 +2104,7 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
     // to put it on PATH), serving a fixed one-line banner on connect. Skips (never fails) when the
     // host cannot sandbox or the cache is unreachable (the first launch seeds the store).
     let port = free_loopback_port();
-    let marker = "OPS-FORWARD-OK";
+    let marker = "SBX-FORWARD-OK";
 
     // Helper: run the cage server in the background (spawn, not wait), poll from the host, kill.
     // The in-cage server is `socat` serving a static banner file on each connection: the file is
@@ -2128,16 +2128,16 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
             } else {
                 "network = \"none\"\n[packages]\nsocat = \"nix:socat\"\n".to_string()
             };
-            std::fs::write(proj.join(".ops.toml"), cfg).unwrap();
+            std::fs::write(proj.join(".sbx.toml"), cfg).unwrap();
             // Trust so the security fields (network, forward) are honored.
-            let trusted = ops_in(proj, data, state, &["trust", ".ops.toml"]);
+            let trusted = sbx_in(proj, data, state, &["trust", ".sbx.toml"]);
             assert!(
                 trusted.status.success(),
                 "trust: {}",
                 String::from_utf8_lossy(&trusted.stderr)
             );
             // Spawn the cage server in the background; hold the child so we can kill it after probing.
-            let mut child = ops()
+            let mut child = sbx()
                 .args(["run", "--", "sh", "-c", &server_cmd])
                 .current_dir(proj)
                 .env("XDG_DATA_HOME", data)
@@ -2158,7 +2158,7 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
 
     // Capability + cache probe on the first project (also seeds the store for the socat closure).
     std::fs::write(
-        proj_a.path().join(".ops.toml"),
+        proj_a.path().join(".sbx.toml"),
         "network = \"none\"\n[packages]\nsocat = \"nix:socat\"\n",
     )
     .unwrap();
@@ -2216,7 +2216,7 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
     let data = TmpDir::new("clear-data");
     let state = TmpDir::new("clear-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"http://cache.nixos.org\"]\n",
     )
     .unwrap();
@@ -2237,15 +2237,15 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
     }
 
     // trust the project so its allowlist posture (a security field) is honored.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
@@ -2258,7 +2258,7 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
     // origin-form round-trip is proven conclusively by the `proxy` unit test against a loopback
     // upstream. Here the load-bearing new seam is `method != CONNECT` → `handle_cleartext` → the
     // verdict, which only the real binary exercises.
-    let allowed = ops_in(
+    let allowed = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2281,14 +2281,14 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
         "an allowed cleartext fetch must get a response, not a dropped connection: {allowed_out}"
     );
     assert!(
-        !allowed_out.contains("X-Ops-Egress-Reason: denied"),
+        !allowed_out.contains("X-Sbx-Egress-Reason: denied"),
         "the http:// rule must open the cleartext request past the filter (no proxy deny): {allowed_out}"
     );
 
     // DENIED (teeth): a host with no `http://` rule is refused at the proxy with `403 denied-default`,
-    // and the suggestion names the http:// scheme (a bare `ops net allow host` adds an https rule that
+    // and the suggestion names the http:// scheme (a bare `sbx net allow host` adds an https rule that
     // still would not open the clear). curl exits 0 (it received the proxy's 403 as the response).
-    let denied = ops_in(
+    let denied = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2300,20 +2300,20 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
         String::from_utf8_lossy(&denied.stderr)
     );
     assert!(
-        denied_out.contains("403") && denied_out.contains("X-Ops-Egress-Reason: denied-default"),
+        denied_out.contains("403") && denied_out.contains("X-Sbx-Egress-Reason: denied-default"),
         "an unallowed cleartext host must be refused with 403 denied-default at the proxy: {denied_out}"
     );
     assert!(
-        denied_out.contains("ops net allow http://example.com"),
+        denied_out.contains("sbx net allow http://example.com"),
         "the cleartext deny-default body must suggest the http:// scheme: {denied_out}"
     );
 }
 
 #[test]
-fn ops_net_logs_reads_a_running_sessions_live_egress() {
-    // The live egress log end to end through the real binary: a background `ops run` under a
+fn sbx_net_logs_reads_a_running_sessions_live_egress() {
+    // The live egress log end to end through the real binary: a background `sbx run` under a
     // trusted allowlist makes one allowed and one denied egress attempt, then sleeps; while it is
-    // alive, `ops net logs` (run from another process) reads its per-request events over the
+    // alive, `sbx net logs` (run from another process) reads its per-request events over the
     // control socket. Teeth: the allowed host shows an `allow` and the denied host a `deny`, each
     // carrying the request's method and path — and, under `--with-status`, the allowed fetch's
     // upstream `200` — proving the proxy's push, the status amend, the ring, the socket wire, and the
@@ -2327,7 +2327,7 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     let data = TmpDir::new("logs-data");
     let state = TmpDir::new("logs-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
@@ -2345,21 +2345,21 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
         eprintln!("skipping net logs e2e: the binary cache is unreachable");
         return;
     }
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // A background session: one allowed fetch (logged `allow`), one denied fetch (logged `deny`),
     // then a sleep long enough to read its live log. The denied fetch fails; `sh` continues.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ops"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args([
             "run",
             "--",
@@ -2375,7 +2375,7 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn the background ops run");
+        .expect("spawn the background sbx run");
 
     // Poll the live log until both decisions have been recorded AND the allowed request's upstream
     // status has been amended in (or a generous deadline). The reader globs the one control socket in
@@ -2395,7 +2395,7 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     let mut last;
     let (mut saw_allow, mut saw_deny, mut saw_status) = (false, false, false);
     loop {
-        let out = ops_in(
+        let out = sbx_in(
             project.path(),
             data.path(),
             state.path(),
@@ -2433,7 +2433,7 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     }
 
     // The human render also surfaces the live session (exercises `render_logs` through the binary).
-    let human = ops_in(project.path(), data.path(), state.path(), &["net", "logs"]);
+    let human = sbx_in(project.path(), data.path(), state.path(), &["net", "logs"]);
     let human_out = String::from_utf8_lossy(&human.stdout);
 
     // Tear the background session down before asserting, so a failure never leaks a live cage.
@@ -2450,14 +2450,14 @@ fn ops_net_logs_reads_a_running_sessions_live_egress() {
     );
     assert!(
         human_out.contains("egress log:") && human_out.contains("cache.nixos.org"),
-        "the human `ops net logs` must render the live session's events:\n{human_out}"
+        "the human `sbx net logs` must render the live session's events:\n{human_out}"
     );
 }
 
 #[test]
-fn ops_net_logs_follow_streams_a_running_sessions_egress() {
+fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     // The `--follow` live tail end to end: while a background session under a trusted allowlist makes
-    // an allowed and a denied egress, a separate `ops net logs --follow --json` child streams its
+    // an allowed and a denied egress, a separate `sbx net logs --follow --json` child streams its
     // events (NDJSON, one object per line). A reader thread accumulates the child's stdout; the test
     // polls it until the allow and the deny both appear (or a deadline), proving the poll loop's seed
     // + per-session cursor + append. Skips (never fails) when the host cannot sandbox or the cache is
@@ -2471,7 +2471,7 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
     let data = TmpDir::new("logsf-data");
     let state = TmpDir::new("logsf-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
@@ -2488,20 +2488,20 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
         eprintln!("skipping net logs --follow e2e: the binary cache is unreachable");
         return;
     }
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The background session: one allowed and one denied egress, then a sleep long enough to tail.
-    let mut session = Command::new(env!("CARGO_BIN_EXE_ops"))
+    let mut session = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args([
             "run",
             "--",
@@ -2517,14 +2517,14 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn the background ops run");
+        .expect("spawn the background sbx run");
 
     // Give the session a moment to come up (the seed then catches early events).
     std::thread::sleep(Duration::from_secs(2));
 
     // The follower streams new events as NDJSON over a pipe; a thread accumulates them so the test
     // can watch the stream grow.
-    let mut follower = Command::new(env!("CARGO_BIN_EXE_ops"))
+    let mut follower = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(["net", "logs", "--follow", "--interval", "1", "--json"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -2532,7 +2532,7 @@ fn ops_net_logs_follow_streams_a_running_sessions_egress() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn ops net logs --follow");
+        .expect("spawn sbx net logs --follow");
     let captured = Arc::new(Mutex::new(String::new()));
     let reader = {
         let sink = captured.clone();
@@ -2638,7 +2638,7 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     });
 
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         format!("[network]\nmode = \"deny\"\nallow = [\"tcp://127.0.0.1:{port}\"]\n"),
     )
     .unwrap();
@@ -2654,25 +2654,25 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The in-cage client: tunnel a plain-HTTP request through the proxy's HTTP CONNECT (18043 is the
     // in-cage forwarder) to the plain upstream. `--proxytunnel` forces CONNECT even for an http://
-    // target; `--noproxy ''` overrides ops's `no_proxy` (which lists 127.0.0.1) so the loopback
+    // target; `--noproxy ''` overrides sbx's `no_proxy` (which lists 127.0.0.1) so the loopback
     // target is sent *through* the proxy rather than bypassing it.
     let cmd =
         format!("curl -sS --proxytunnel --noproxy '' -x 127.0.0.1:18043 http://127.0.0.1:{port}/");
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2701,7 +2701,7 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
     let data = TmpDir::new("allowmode-data");
     let state = TmpDir::new("allowmode-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"allow\"\ndeny = [\"example.com/nix-cache-info\"]\n",
     )
     .unwrap();
@@ -2722,20 +2722,20 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
     }
 
     // trust the project so its allow-mode posture is honored (a security field).
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // exit-status propagation on the supervised (filtered) path
-    let seven = ops_in(
+    let seven = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2751,7 +2751,7 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
     // ALLOWED: a real fetch serves through the allow-mode proxy and returns the known
     // nix-cache-info content hash — the forwarder bridged the empty netns, nix trusted the MITM
     // leaf, and the bytes relayed intact under the new mode.
-    let allowed = ops_in(
+    let allowed = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2778,7 +2778,7 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
 
     // DENIED: the deny carve-out still wins under allow-by-default. The 403 is the proxy's verdict
     // (the deny rule matched the path), so it does not depend on `example.com` being reachable.
-    let denied = ops_in(
+    let denied = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2810,7 +2810,7 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     // bound read-only), the fonts (seeded + a generated config), and the egress machinery (the
     // bound proxy socket + the injected CA + the empty netns) must coexist — neither hole displaces
     // the other. Separately, Slice A proved the display and 6.2d proved the allowlist; the
-    // *composition* is what this asserts, so the teeth are co-located in a SINGLE `ops run`:
+    // *composition* is what this asserts, so the teeth are co-located in a SINGLE `sbx run`:
     //
     //   - `wayland-info` enumerates the compositor  ⇒ the display socket connects *inside the empty
     //     netns* (it has no network route, so a successful connect can only be the bound Unix socket);
@@ -2827,7 +2827,7 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     let data = TmpDir::new("gui-net-data");
     let state = TmpDir::new("gui-net-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "gui = \"wayland\"\n\
          [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
          [packages]\nwayland-utils = \"nix:wayland-utils\"\nfontconfig = \"nix:fontconfig\"\n",
@@ -2853,15 +2853,15 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     }
 
     // `gui`, `network`, and `[packages]` are all trusted-only, so trust the project first.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
@@ -2876,7 +2876,7 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
             | grep -q 15sqg1j6gq6081nk0v5c6npadlswb9238l336wb2g9bmmrry779c && echo COMPOSE-ALLOW\n\
         nix-prefetch-url --type sha256 https://example.com/nix-cache-info 2>&1 \
             | grep -q 403 && echo COMPOSE-DENY\n";
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -2909,12 +2909,12 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
 }
 
 #[test]
-fn a_shared_network_launch_trusts_ops_own_cacert() {
+fn a_shared_network_launch_trusts_sbx_own_cacert() {
     // Under the default shared-network posture the cage no longer binds the host's `/etc/ssl`;
-    // ops provisions its own cacert and names it through the CA-bundle variables, so HTTPS is
+    // sbx provisions its own cacert and names it through the CA-bundle variables, so HTTPS is
     // hermetic — it works on a host that carries no certificates of its own. Teeth, both in one
     // test so success proves causation: an HTTPS fetch returns the known nix-cache-info hash
-    // (TLS verified against ops's bundle), and the *same* fetch with the CA file forced empty
+    // (TLS verified against sbx's bundle), and the *same* fetch with the CA file forced empty
     // FAILS — so the fetch succeeds *because of* the configured trust anchor, not some ambient
     // cert path. Skips (never fails) when the host cannot sandbox or the cache is unreachable.
     let project = TmpDir::new("cacert-proj");
@@ -2934,7 +2934,7 @@ fn a_shared_network_launch_trusts_ops_own_cacert() {
         return;
     }
 
-    // HTTPS works, trusting ops's hermetic bundle (the host's /etc/ssl is not bound).
+    // HTTPS works, trusting sbx's hermetic bundle (the host's /etc/ssl is not bound).
     let fetched = run_in(
         project.path(),
         data.path(),
@@ -2958,7 +2958,7 @@ fn a_shared_network_launch_trusts_ops_own_cacert() {
     );
 
     // teeth: the configured CA is load-bearing — with the cert vars pointed at an empty file
-    // the same fetch fails, so the success above is ops's bundle at work, not an ambient path.
+    // the same fetch fails, so the success above is sbx's bundle at work, not an ambient path.
     let no_ca = run_in(
         project.path(),
         data.path(),
@@ -2972,7 +2972,7 @@ fn a_shared_network_launch_trusts_ops_own_cacert() {
     assert!(
         !no_ca.status.success(),
         "fetch with an empty CA file unexpectedly succeeded — TLS trust is not coming from \
-         ops's bundle: {}",
+         sbx's bundle: {}",
         String::from_utf8_lossy(&no_ca.stdout)
     );
 }
@@ -3037,7 +3037,7 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
     let data = TmpDir::new("env-data");
     let state = TmpDir::new("env-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[packages]\nnodejs = \"nix:nodejs\"\n",
     )
     .unwrap();
@@ -3068,21 +3068,21 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
     }
 
     // `[packages]` is trusted-only, so trust the project before the node toolchain provisions.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // run the script by its own absolute path, so the shebang (not an explicit `node`) drives
     // execution — the path through `/usr/bin/env`.
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3171,7 +3171,7 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
 
     // run the script by its own absolute path, so the shebang (not an explicit `bash`) drives
     // execution — the path through `/bin/bash`.
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3190,7 +3190,7 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
 
 #[test]
 fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
-    // The headline self-equip path (`ops mise install`) under the headline security posture (a
+    // The headline self-equip path (`sbx mise install`) under the headline security posture (a
     // trusted `network = "deny"`). mise reads its CA roots from the certificate *file*, not
     // the CA-bundle env variables, so this is the exact case where the two halves of the trust
     // setup must combine: the hermetic cacert (a real bundle at the file path, which mise needs
@@ -3200,12 +3200,12 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     // (never fails) when the host cannot sandbox or the cache is unreachable.
     // Short tags: the egress proxy's Unix socket lives under the data dir, and its full path
     // must fit a `sockaddr_un` (~108 bytes). The test tree (`target/test-tmp/…`) is already
-    // deep, so a long tag would overflow `SUN_LEN`. (Production's `~/.local/share/ops` is short.)
+    // deep, so a long tag would overflow `SUN_LEN`. (Production's `~/.local/share/sbx` is short.)
     let project = TmpDir::new("ma-proj");
     let data = TmpDir::new("ma-data");
     let state = TmpDir::new("ma-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
@@ -3226,22 +3226,22 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
 
     // trust the project so its allowlist posture is honored (otherwise it degrades to shared
     // network and the proxy path — the thing under test — is never exercised).
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // self-equip jq through the MITM proxy: mise must trust the proxy's per-session leaf
     // (devbox.sh metadata + cache.nixos.org substitution both ride the allowlist's built-in
     // built-in set).
-    let installed = ops_in(
+    let installed = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3268,15 +3268,15 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
 fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     // Multi-backend: a project that declares a non-`nix:` mise tool (here `aqua:`) must have
     // it auto-installed in-cage at launch and resolvable on PATH — with no manual
-    // `ops mise install` and no `ops trust` (the open self-equip posture). Teeth: `rg` runs
-    // on a plain `ops run` of an UNtrusted project, so the launcher fetched it through mise,
+    // `sbx mise install` and no `sbx trust` (the open self-equip posture). Teeth: `rg` runs
+    // on a plain `sbx run` of an UNtrusted project, so the launcher fetched it through mise,
     // installed it into the project's own store, and resolved it through the shims dir — the
     // whole auto-equip chain. Skips (never fails) when the host cannot sandbox or the network
     // is unreachable (the tool is fetched from upstream on first launch).
     let project = TmpDir::new("equip-proj");
     let data = TmpDir::new("equip-data");
-    // anchored on an (empty) .ops.toml; the tool is fresh-from-upstream via mise's aqua backend
-    std::fs::write(project.path().join(".ops.toml"), "").unwrap();
+    // anchored on an (empty) .sbx.toml; the tool is fresh-from-upstream via mise's aqua backend
+    std::fs::write(project.path().join(".sbx.toml"), "").unwrap();
     std::fs::write(
         project.path().join("mise.toml"),
         "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
@@ -3297,7 +3297,7 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
         return;
     }
 
-    // untrusted project, plain `ops run` — the tool must still equip and run (open posture).
+    // untrusted project, plain `sbx run` — the tool must still equip and run (open posture).
     let out = run_in(project.path(), data.path(), &["rg", "--version"]);
     let log = format!(
         "{}{}",
@@ -3306,7 +3306,7 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     );
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
-        "an auto-equipped aqua: tool must run on a plain `ops run` of an untrusted project: {log}"
+        "an auto-equipped aqua: tool must run on a plain `sbx run` of an untrusted project: {log}"
     );
 }
 
@@ -3325,7 +3325,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     let data = TmpDir::new("aql-data");
     let state = TmpDir::new("aql-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
@@ -3351,19 +3351,19 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
 
     // trust so the allowlist posture is honored (otherwise it degrades to shared and the MITM
     // path under test is never exercised).
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3385,7 +3385,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
 fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     // The load-bearing proof of the fresh-profiles increment: an app declaring its tool as a
     // `[packages] mise:` backend (the form the shipped profiles use) equips it *globally* via
-    // `mise use -g` at the `ops app` launch and runs it fresh, under the app's *own* network
+    // `mise use -g` at the `sbx app` launch and runs it fresh, under the app's *own* network
     // allowlist — claude-code's aqua release fetch rides the built-in allow-set
     // (github / *.githubusercontent.com), never a wide-open net. Teeth: `claude --version` prints
     // the upstream version through the empty-netns MITM, proving (1) the global `[packages] mise:`
@@ -3396,7 +3396,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     let data = TmpDir::new("fmp-data");
     let state = TmpDir::new("fmp-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[app.cc]\n\
          cmd = [\"claude\", \"--version\"]\n\
          [app.cc.packages]\n\
@@ -3423,19 +3423,19 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
 
     // trust so the app's `[packages] mise:` and its allowlist are honored (otherwise the package
     // is withheld and the allowlist degrades, and the MITM path under test is never exercised).
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops_in(project.path(), data.path(), state.path(), &["app", "cc"]);
+    let out = sbx_in(project.path(), data.path(), state.path(), &["app", "cc"]);
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -3449,11 +3449,11 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
 }
 
 /// The path to a mise shim in the single project's default home under `data`, if present.
-/// `ops upgrade mise`/`ops run` equip a baseline `mise:` tool into this home, where mise creates
+/// `sbx upgrade mise`/`sbx run` equip a baseline `mise:` tool into this home, where mise creates
 /// a per-tool shim (its non-interactive PATH entry). Used as the teeth that the in-cage roll
 /// touched the right home.
 fn project_home_mise_shim(data: &Path, name: &str) -> Option<PathBuf> {
-    let projects = data.join("ops").join("projects");
+    let projects = data.join("sbx").join("projects");
     for entry in std::fs::read_dir(&projects).ok()?.flatten() {
         let shim = entry.path().join("home/.local/share/mise/shims").join(name);
         // The shim is a symlink mise writes inside the cage, pointing at the cage's own mise
@@ -3471,15 +3471,15 @@ fn project_home_mise_shim(data: &Path, name: &str) -> Option<PathBuf> {
 }
 
 #[test]
-fn ops_upgrade_mise_rolls_a_mise_package_in_cage() {
-    // The load-bearing proof of the `mise:` `[packages]` roll-forward: `ops upgrade mise` runs
+fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
+    // The load-bearing proof of the `mise:` `[packages]` roll-forward: `sbx upgrade mise` runs
     // `mise upgrade` *in-cage*, per home, for the project's (and apps') `mise:` packages. A `mise:`
     // tool freezes at its installed version after the first equip (the floating `latest` request
     // stays satisfied, so a later launch never re-resolves), so advancing it must run `mise
     // upgrade` inside the same cage that equips it. Teeth: the capability probe runs against an
     // *empty* project (no package), so the only thing that can equip ripgrep into the project's
     // home is the upgrade cage itself — proven by the `rg` shim appearing in that home's mise data
-    // dir after `ops upgrade mise` and *before* any `ops run`. The aqua release fetch rides the
+    // dir after `sbx upgrade mise` and *before* any `sbx run`. The aqua release fetch rides the
     // host network (the default `shared` posture). Skips (never fails) without sandbox or network.
     let project = TmpDir::new("umr-proj");
     let data = TmpDir::new("umr-data");
@@ -3502,23 +3502,23 @@ fn ops_upgrade_mise_rolls_a_mise_package_in_cage() {
     // Declare the package only now, so nothing equipped it before the upgrade; trust so the
     // `mise:` package (a trusted-only field) is admitted.
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[packages]\nrg = \"mise:aqua:BurntSushi/ripgrep\"\n",
     )
     .unwrap();
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3531,7 +3531,7 @@ fn ops_upgrade_mise_rolls_a_mise_package_in_cage() {
     );
     assert!(
         out.status.success(),
-        "ops upgrade mise must roll the baseline `mise:` package in-cage: {log}"
+        "sbx upgrade mise must roll the baseline `mise:` package in-cage: {log}"
     );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("mise upgrade aqua:BurntSushi/ripgrep"),
@@ -3539,10 +3539,10 @@ fn ops_upgrade_mise_rolls_a_mise_package_in_cage() {
     );
 
     // Teeth: the upgrade cage equipped ripgrep into the project's own home (the `rg` shim mise
-    // creates for a `use`d tool); no `ops run` ran in between, so only the upgrade cage could have.
+    // creates for a `use`d tool); no `sbx run` ran in between, so only the upgrade cage could have.
     assert!(
         project_home_mise_shim(data.path(), "rg").is_some(),
-        "ops upgrade mise must equip+roll ripgrep in the project home (no `rg` shim found): {log}"
+        "sbx upgrade mise must equip+roll ripgrep in the project home (no `rg` shim found): {log}"
     );
 }
 
@@ -3552,7 +3552,7 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
     //
     // PHASE 1 (cold build under the allowlist): an app declaring its tool as a
     // `[packages] flake:<ref>` builds the flake **in-cage** with `nix build --out-link` at the
-    // `ops app` launch — an uncurated third-party flake contained by the cage, not built
+    // `sbx app` launch — an uncurated third-party flake contained by the cage, not built
     // host-side like a `nix:` attribute — lands the result on PATH, and runs it under the app's
     // *own* network allowlist. The ref is a real, pinned flake (`nixpkgs#hello`); `hello` prints
     // "Hello, world!" through the empty-netns MITM, proving the parse → in-cage build →
@@ -3585,7 +3585,7 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
         )
     };
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         toml("deny", "allow = [\"cache.nixos.org\"]\n"),
     )
     .unwrap();
@@ -3607,14 +3607,14 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
     let trust = |project: &Path| {
         // trust so the app's `[packages] flake:` and its network posture are honored (both
         // security fields); editing the network mode re-arms the gate, hence trusting per phase.
-        let t = ops_in(project, data.path(), state.path(), &["trust", ".ops.toml"]);
+        let t = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
         assert!(
             t.status.success(),
-            "ops trust failed: {}",
+            "sbx trust failed: {}",
             String::from_utf8_lossy(&t.stderr)
         );
     };
-    let launch = || ops_in(project.path(), data.path(), state.path(), &["app", "fk"]);
+    let launch = || sbx_in(project.path(), data.path(), state.path(), &["app", "fk"]);
 
     // PHASE 1 — cold build under the allowlist.
     trust(project.path());
@@ -3635,7 +3635,7 @@ fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link
     );
 
     // PHASE 2 — cut the network entirely and re-launch: the warm out-link must run offline.
-    std::fs::write(project.path().join(".ops.toml"), toml("none", "")).unwrap();
+    std::fs::write(project.path().join(".sbx.toml"), toml("none", "")).unwrap();
     trust(project.path());
     let warm = launch();
     let warm_log = format!(
@@ -3657,7 +3657,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     //
     // PHASE 1 (cold build): an app whose tool is an inline `[flakes.hello]` — a full `flake.nix`
     // written directly in the config — has that source staged, bound read-only into the cage, and
-    // built with `nix build path:<dir>#<attr>` **in-cage** at the `ops app` launch (the same
+    // built with `nix build path:<dir>#<attr>` **in-cage** at the `sbx app` launch (the same
     // containment as a `flake:` package, applied to arbitrary inline build source). The flake pins
     // its nixpkgs input to a revision and builds `hello`; "Hello, world!" through the empty-netns
     // MITM proves the parse → stage → bind → in-cage build → out-link-on-PATH → run chain.
@@ -3677,7 +3677,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     let state = TmpDir::new("ifk-state");
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     // `body` is the `default` output expression; the rest of the flake is fixed. A quoted heredoc
-    // delimiter is not needed — the whole file is an ops-owned literal here, no shell interpolation.
+    // delimiter is not needed — the whole file is an sbx-owned literal here, no shell interpolation.
     let toml = |body: &str| {
         format!(
             "[app.fk]\n\
@@ -3698,7 +3698,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     };
     let phase1 = toml("pkgs.hello");
     let phase2 = toml("pkgs.writeShellScriptBin \"hello\" \"echo INLINE-REBUILD-OK\"");
-    std::fs::write(project.path().join(".ops.toml"), &phase1).unwrap();
+    std::fs::write(project.path().join(".sbx.toml"), &phase1).unwrap();
 
     // capability probe (untrusted → shared net); also seeds the project store once.
     let probe = run_in(project.path(), data.path(), &["true"]);
@@ -3717,14 +3717,14 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     let trust = |project: &Path| {
         // Trust so the app's inline `[flakes]` and its network posture (both security fields) are
         // honored; editing the file re-arms the gate, hence trusting per phase.
-        let t = ops_in(project, data.path(), state.path(), &["trust", ".ops.toml"]);
+        let t = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
         assert!(
             t.status.success(),
-            "ops trust failed: {}",
+            "sbx trust failed: {}",
             String::from_utf8_lossy(&t.stderr)
         );
     };
-    let launch = || ops_in(project.path(), data.path(), state.path(), &["app", "fk"]);
+    let launch = || sbx_in(project.path(), data.path(), state.path(), &["app", "fk"]);
 
     // PHASE 1 — cold in-cage build of the inline flake.
     trust(project.path());
@@ -3745,7 +3745,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     );
 
     // PHASE 2 — edit the inline flake; the content-hash-keyed out-link must rebuild the NEW output.
-    std::fs::write(project.path().join(".ops.toml"), &phase2).unwrap();
+    std::fs::write(project.path().join(".sbx.toml"), &phase2).unwrap();
     trust(project.path());
     let edited = launch();
     let edited_out = String::from_utf8_lossy(&edited.stdout).into_owned();
@@ -3769,15 +3769,15 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
 }
 
 /// The names under the (single) project default home's flake out-link directory, in `data`.
-/// `ops run` builds a `flake:` package's out-link here; the name reveals whether the launch chose
+/// `sbx run` builds a `flake:` package's out-link here; the name reveals whether the launch chose
 /// the rev-keyed (locked) form or the floating one.
 fn project_flake_out_links(data: &Path) -> Vec<String> {
-    let projects = data.join("ops").join("projects");
+    let projects = data.join("sbx").join("projects");
     let Ok(entries) = std::fs::read_dir(&projects) else {
         return vec![];
     };
     for entry in entries.flatten() {
-        let dir = entry.path().join("home/.local/state/ops/flake");
+        let dir = entry.path().join("home/.local/state/sbx/flake");
         if let Ok(links) = std::fs::read_dir(&dir) {
             return links
                 .flatten()
@@ -3791,7 +3791,7 @@ fn project_flake_out_links(data: &Path) -> Vec<String> {
 #[test]
 fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
     // The load-bearing proof of the *locked* launch path — the entire launch-side deliverable of
-    // the flake roll-forward. After `ops upgrade flake` pins a `flake:` package, a launch reads the
+    // the flake roll-forward. After `sbx upgrade flake` pins a `flake:` package, a launch reads the
     // per-project lock and builds the *locked* (narHash'd, immutable) reference — not the declared
     // floating one — into an out-link keyed by the revision, in-cage through the allowlist. Teeth:
     // (1) `hello` prints "Hello, world!", proving the locked narHash ref builds in-cage through the
@@ -3805,7 +3805,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
     let data = TmpDir::new("lfk-data");
     let state = TmpDir::new("lfk-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         format!(
             "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
              [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n"
@@ -3828,20 +3828,20 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
     }
 
     // trust so the flake package and the allowlist are honored.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // pin the flake package to its current revision (a host-side lock rewrite).
-    let pinned = ops_in(
+    let pinned = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3862,7 +3862,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
     );
 
     // launch: build the *locked* ref into the rev-keyed out-link, in-cage through the allowlist.
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3896,7 +3896,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
 
 /// The single project store dir under `data` (these tests run one project).
 fn project_store_dir(data: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(data.join("ops").join("projects"))
+    std::fs::read_dir(data.join("sbx").join("projects"))
         .ok()?
         .flatten()
         .map(|e| e.path().join("store"))
@@ -3904,11 +3904,11 @@ fn project_store_dir(data: &Path) -> Option<PathBuf> {
 }
 /// The logical store path a flake out-link named `link` points at (its build output).
 fn project_flake_link_target(data: &Path, link: &str) -> Option<PathBuf> {
-    std::fs::read_dir(data.join("ops").join("projects"))
+    std::fs::read_dir(data.join("sbx").join("projects"))
         .ok()?
         .flatten()
         .find_map(|e| {
-            std::fs::read_link(e.path().join("home/.local/state/ops/flake").join(link)).ok()
+            std::fs::read_link(e.path().join("home/.local/state/sbx/flake").join(link)).ok()
         })
 }
 /// Whether `path` (a logical `/nix/store/<hash>-name`) is physically present in `store_dir`.
@@ -3920,16 +3920,16 @@ fn in_store(store_dir: &Path, path: &Path) -> bool {
 }
 
 #[test]
-fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
-    // The load-bearing live proof of `ops gc` (the M5 in-project store slice), in two phases that
-    // pin the one property that matters: a host-side `ops gc --prune` must KEEP a current `flake:`
+fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
+    // The load-bearing live proof of `sbx gc` (the M5 in-project store slice), in two phases that
+    // pin the one property that matters: a host-side `sbx gc --prune` must KEEP a current `flake:`
     // build and reclaim one whose package is gone. The build registers a host-resolvable gc root
     // (keyed by package name, target `/nix/store/<hash>`), the same way mise roots its installs —
     // without it, the in-cage `--out-link` root targets `/home/sandbox/…`, which dangles host-side,
     // so a host-side gc would delete the *current* build (the bug phase 1 exists to catch).
-    //   Phase 1: build `hello`, then `ops gc --prune` with `hello` still declared — the build SURVIVES,
+    //   Phase 1: build `hello`, then `sbx gc --prune` with `hello` still declared — the build SURVIVES,
     //            and a seeded base path survives too (checked before any relaunch).
-    //   Phase 2: remove the package, re-trust, `ops gc --prune` — its lingering root is pruned and the
+    //   Phase 2: remove the package, re-trust, `sbx gc --prune` — its lingering root is pruned and the
     //            build COLLECTED (deterministic: `hello`'s output is unique to it). A roll reaches the
     //            same end by overwriting the root, which the `wrap_flake_equip` unit test covers.
     // Skips (never fails) without sandbox or network.
@@ -3941,31 +3941,31 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
         "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
          [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n"
     );
-    std::fs::write(project.path().join(".ops.toml"), &flake_cfg).unwrap();
+    std::fs::write(project.path().join(".sbx.toml"), &flake_cfg).unwrap();
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping ops gc e2e: host cannot sandbox ({})",
+            "skipping sbx gc e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping ops gc e2e: the network is unreachable");
+        eprintln!("skipping sbx gc e2e: the network is unreachable");
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
-    assert!(trusted.status.success(), "ops trust failed");
+    assert!(trusted.status.success(), "sbx trust failed");
 
     // Build the flake package in-cage. Floating is enough — no pin needed.
-    let built = ops_in(
+    let built = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -3974,7 +3974,7 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     if !built.status.success() || !String::from_utf8_lossy(&built.stdout).contains("Hello, world!")
     {
         eprintln!(
-            "skipping ops gc e2e: the flake build did not complete in-cage: {}{}",
+            "skipping sbx gc e2e: the flake build did not complete in-cage: {}{}",
             String::from_utf8_lossy(&built.stderr),
             String::from_utf8_lossy(&built.stdout)
         );
@@ -3990,7 +3990,7 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     );
     // The build registered a host-resolvable gc root keyed by package name (the fix): a symlink
     // under the store's gcroots whose target is the build's `/nix/store/<hash>` path.
-    let flake_root = store_dir.join("nix/var/nix/gcroots/ops-flake-hello");
+    let flake_root = store_dir.join("nix/var/nix/gcroots/sbx-flake-hello");
     assert_eq!(
         std::fs::read_link(&flake_root).ok().as_deref(),
         Some(built_path.as_path()),
@@ -4001,12 +4001,12 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     let base_path = std::fs::read_dir(store_dir.join("nix/var/nix/gcroots"))
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name() != "auto" && e.file_name() != "ops-flake-hello")
+        .filter(|e| e.file_name() != "auto" && e.file_name() != "sbx-flake-hello")
         .find_map(|e| std::fs::read_link(e.path()).ok())
         .expect("a seeded base gc-root");
 
     // ---- Phase 1: gc with `hello` still current — the build must SURVIVE. ----
-    let gc1 = ops_in(
+    let gc1 = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4019,7 +4019,7 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     );
     assert!(
         gc1.status.success(),
-        "ops gc --prune (phase 1) failed: {gc1_log}"
+        "sbx gc --prune (phase 1) failed: {gc1_log}"
     );
     assert!(
         in_store(&store_dir, &built_path),
@@ -4036,19 +4036,19 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     // removed-package path end-to-end (no manual gcroot mutation); a roll's self-clean is the same
     // outcome reached by an overwrite, which the `wrap_flake_equip` unit test covers. ----
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
     )
     .unwrap();
-    let retrust = ops_in(
+    let retrust = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(retrust.status.success(), "re-trust failed");
 
-    let gc2 = ops_in(
+    let gc2 = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4061,7 +4061,7 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
     );
     assert!(
         gc2.status.success(),
-        "ops gc --prune (phase 2) failed: {gc2_log}"
+        "sbx gc --prune (phase 2) failed: {gc2_log}"
     );
     // the lingering root was pruned, and its build collected by the sweep
     assert!(
@@ -4082,11 +4082,11 @@ fn ops_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
 }
 
 #[test]
-fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
-    // The live proof of `ops projects rm --dead --yes --gc` (the cross-project dead-tree reap plus
+fn sbx_projects_rm_dead_reaps_a_deleted_projects_tree() {
+    // The live proof of `sbx projects rm --dead --yes --gc` (the cross-project dead-tree reap plus
     // the chained shared-store collection), through the real binary. A launch records the project's
     // canonical path in a `<data>/projects/<id>/project` marker and seeds the project's own
-    // (read-only, 0555) nix store; once the project directory is deleted, `ops projects rm --dead`
+    // (read-only, 0555) nix store; once the project directory is deleted, `sbx projects rm --dead`
     // reads that marker, sees the path is gone (its parent — the scratch root — still present), and
     // reclaims the whole tree (store dirs and all, which is why the reaper forces them writable).
     // `--gc` then runs the shared-store collection in the same command. Skips (never fails) without
@@ -4102,19 +4102,19 @@ fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping ops projects rm --dead e2e: host cannot sandbox ({})",
+            "skipping sbx projects rm --dead e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping ops projects rm --dead e2e: the network is unreachable");
+        eprintln!("skipping sbx projects rm --dead e2e: the network is unreachable");
         return;
     }
 
     // The launch created exactly one project tree; capture it and confirm its marker records the
     // project's canonical path (the part-1 marker, proven end-to-end through the binary).
-    let projects = data.path().join("ops").join("projects");
+    let projects = data.path().join("sbx").join("projects");
     let tree = std::fs::read_dir(&projects)
         .unwrap()
         .flatten()
@@ -4133,10 +4133,10 @@ fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
     // as a deleted project, not an unmounted drive.
     std::fs::remove_dir_all(project.path()).unwrap();
 
-    // Reap from a separate scratch directory (`ops projects rm` never seeds or sweeps a current
+    // Reap from a separate scratch directory (`sbx projects rm` never seeds or sweeps a current
     // project, so the scratch dir just gives the command a cwd): the dead tree is reclaimed by the
     // `--dead` sweep, and `--gc` chains the shared-store collection.
-    let gc = ops_in(
+    let gc = sbx_in(
         scratch.path(),
         data.path(),
         state.path(),
@@ -4149,7 +4149,7 @@ fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
     );
     assert!(
         gc.status.success(),
-        "ops projects rm --dead --yes --gc failed: {log}"
+        "sbx projects rm --dead --yes --gc failed: {log}"
     );
     assert!(
         !tree.exists(),
@@ -4159,7 +4159,7 @@ fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
         String::from_utf8_lossy(&gc.stdout).contains(&canonical.display().to_string()),
         "the reap should name the reclaimed project path: {log}"
     );
-    // The dead tree was the only one; `ops projects rm` seeds nothing, so after the reap the
+    // The dead tree was the only one; `sbx projects rm` seeds nothing, so after the reap the
     // projects directory is left empty.
     let remaining = std::fs::read_dir(&projects)
         .map(|d| {
@@ -4181,14 +4181,14 @@ fn ops_projects_rm_dead_reaps_a_deleted_projects_tree() {
         String::from_utf8_lossy(&gc.stdout).contains("shared store"),
         "the shared-store gc pass did not run: {log}"
     );
-    let base_gcroots = data.path().join("ops/gcroots/base");
+    let base_gcroots = data.path().join("sbx/gcroots/base");
     assert!(
         std::fs::read_dir(&base_gcroots)
             .map(|d| d.flatten().any(|e| e.path().is_dir()))
             .unwrap_or(false),
         "the live base channel's gc root was collected by the shared-store gc: {base_gcroots:?}\n{log}"
     );
-    let shared_paths = data.path().join("ops/store/nix/store");
+    let shared_paths = data.path().join("sbx/store/nix/store");
     assert!(
         std::fs::read_dir(&shared_paths)
             .map(|d| d.flatten().next().is_some())
@@ -4210,11 +4210,11 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     let project = TmpDir::new("secret-proj");
     let data = TmpDir::new("secret-data");
     let state = TmpDir::new("secret-state");
-    let secret_value = "ops-e2e-secret-must-not-leak-4b7x";
+    let secret_value = "sbx-e2e-secret-must-not-leak-4b7x";
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
-         [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_SECRET\"\n\
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://SBX_E2E_SECRET\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     )
     .unwrap();
@@ -4231,21 +4231,21 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     }
 
     // trust the project so its secret (a security field) is honored.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // `ops config` confirms the secret is honored host-side (not silently dropped), so the
+    // `sbx config` confirms the secret is honored host-side (not silently dropped), so the
     // cage-absence below is meaningful — and it must show the source by locator, never a value.
-    let cfg = ops_in(
+    let cfg = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4254,21 +4254,21 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     let cfg_out = String::from_utf8_lossy(&cfg.stdout);
     assert!(
         cfg_out.contains("Authorization -> https://cache.nixos.org")
-            && cfg_out.contains("from env OPS_E2E_SECRET"),
-        "the trusted secret was not honored by `ops config`: {cfg_out}"
+            && cfg_out.contains("from env SBX_E2E_SECRET"),
+        "the trusted secret was not honored by `sbx config`: {cfg_out}"
     );
 
-    // the launch: `printenv` inside the cage, with the secret set in ops's environment. The
+    // the launch: `printenv` inside the cage, with the secret set in sbx's environment. The
     // launch must succeed (the secret resolved and wired without error), and the cage env must
     // contain neither the source variable's name nor its value.
-    let env_out = ops()
+    let env_out = sbx()
         .args(["run", "--", "printenv"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
-        .env("OPS_E2E_SECRET", secret_value)
+        .env("SBX_E2E_SECRET", secret_value)
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         env_out.status.success(),
         "the launch with a wired secret failed: {}",
@@ -4276,7 +4276,7 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     );
     let cage_env = String::from_utf8_lossy(&env_out.stdout);
     assert!(
-        !cage_env.contains("OPS_E2E_SECRET"),
+        !cage_env.contains("SBX_E2E_SECRET"),
         "the secret's source variable leaked into the cage env: {cage_env}"
     );
     assert!(
@@ -4296,11 +4296,11 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     let project = TmpDir::new("rplugin-proj");
     let data = TmpDir::new("rplugin-data");
     let state = TmpDir::new("rplugin-state");
-    let secret_value = "ops-plugin-e2e-secret-7q2z";
+    let secret_value = "sbx-plugin-e2e-secret-7q2z";
 
     // install a resolver plugin: a manifest plus an executable that returns a constant plaintext.
-    // (`PluginRegistry::load` reads `<XDG_DATA_HOME>/ops/plugins`.)
-    let plugin_dir = data.path().join("ops/plugins/myresolver");
+    // (`PluginRegistry::load` reads `<XDG_DATA_HOME>/sbx/plugins`.)
+    let plugin_dir = data.path().join("sbx/plugins/myresolver");
     std::fs::create_dir_all(&plugin_dir).unwrap();
     std::fs::write(
         plugin_dir.join("plugin.toml"),
@@ -4315,7 +4315,7 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     }
 
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
          [secret.\"cache.nixos.org\"]\nfrom = \"myscheme://github/token\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
@@ -4332,20 +4332,20 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // `ops config` shows the plugin-backed source honored, by scheme + locator (never a value).
-    let cfg = ops_in(
+    // `sbx config` shows the plugin-backed source honored, by scheme + locator (never a value).
+    let cfg = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4355,18 +4355,18 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     assert!(
         cfg_out.contains("Authorization -> https://cache.nixos.org")
             && cfg_out.contains("from myscheme github/token"),
-        "the plugin-backed secret was not honored by `ops config`: {cfg_out}"
+        "the plugin-backed secret was not honored by `sbx config`: {cfg_out}"
     );
 
     // the launch resolves the secret by *running the plugin host-side*; it must succeed, and the
     // cage env must contain neither the locator nor the resolved value.
-    let env_out = ops()
+    let env_out = sbx()
         .args(["run", "--", "printenv"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         env_out.status.success(),
         "the launch running the resolver plugin failed: {}",
@@ -4397,11 +4397,11 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     let data = TmpDir::new("leak-data");
     let state = TmpDir::new("leak-state");
     // a filename-safe value (it rides in a URL path below) that appears nowhere in normal traffic
-    let secret_value = "ops-e2e-leak-canary-9z3k";
+    let secret_value = "sbx-e2e-leak-canary-9z3k";
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
-         [secret.\"cache.nixos.org\"]\nfrom = \"env://OPS_E2E_LEAK\"\n\
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://SBX_E2E_LEAK\"\n\
          header = \"Authorization\"\ntype = \"bearer\"\n",
     )
     .unwrap();
@@ -4417,15 +4417,15 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     }
 
     // trust the project so its secret + allowlist (security fields) are honored
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
@@ -4433,7 +4433,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     // ALLOWED host. The proxy's tripwire refuses it with a 403 before any fetch — the refusal is
     // local to the proxy, so this holds even offline (no DNS/connect happens).
     let exfil_url = format!("https://cache.nixos.org/{secret_value}");
-    let exfil = ops()
+    let exfil = sbx()
         .args([
             "run",
             "--",
@@ -4445,9 +4445,9 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
-        .env("OPS_E2E_LEAK", secret_value)
+        .env("SBX_E2E_LEAK", secret_value)
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         !exfil.status.success(),
         "an outbound secret unexpectedly succeeded: {}",
@@ -4465,7 +4465,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
         eprintln!("skipping the outbound-secret positive control: the binary cache is unreachable");
         return;
     }
-    let clean = ops()
+    let clean = sbx()
         .args([
             "run",
             "--",
@@ -4477,9 +4477,9 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
-        .env("OPS_E2E_LEAK", secret_value)
+        .env("SBX_E2E_LEAK", secret_value)
         .output()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     assert!(
         clean.status.success(),
         "a clean allowed request must still succeed: {}",
@@ -4494,7 +4494,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
 }
 
 /// The cage runs inside a transient systemd scope carrying the anti-DoS resource
-/// limits. `ops run` exec-replaces, so the spawned child keeps its pid *as* the
+/// limits. `sbx run` exec-replaces, so the spawned child keeps its pid *as* the
 /// bwrap process placed in the scope; reading that pid's cgroup from the host and
 /// finding `pids.max` equal to the configured task cap is conclusive proof the
 /// limit landed through the full launch path — no unrelated process carries that
@@ -4516,7 +4516,7 @@ fn the_cage_runs_under_a_resource_limit_scope() {
         return;
     }
 
-    let mut child = ops()
+    let mut child = sbx()
         .arg("run")
         .arg("--")
         .args(["sleep", "5"])
@@ -4525,7 +4525,7 @@ fn the_cage_runs_under_a_resource_limit_scope() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     let pid = child.id();
 
     // Poll the cage's host-visible cgroup until the scope's task cap appears.
@@ -4544,7 +4544,7 @@ fn the_cage_runs_under_a_resource_limit_scope() {
     let _ = child.kill();
     let _ = child.wait();
 
-    // A match means a real `ops run` placed the cage in a scope with the
+    // A match means a real `sbx run` placed the cage in a scope with the
     // configured cap; otherwise skip (no systemd user session delegating pids).
     if pids_max != TASK_CAP {
         eprintln!(
@@ -4568,16 +4568,16 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
     let state = TmpDir::new("cglim-state");
 
     // A trusted project lowers the task cap below the default. `[limits]` is a security field,
-    // honored only after `ops trust`.
+    // honored only after `sbx trust`.
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[limits]\ntasks_max = 4096\n",
     )
     .unwrap();
 
     // Capability probe (also primes the base userland so the measured launch starts fast). It runs
     // before the trust step, which is fine — it only checks the host can sandbox.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4592,19 +4592,19 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
     }
 
     // Trust the project so its `[limits]` override applies.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let mut child = ops()
+    let mut child = sbx()
         .arg("run")
         .arg("--")
         .args(["sleep", "5"])
@@ -4614,7 +4614,7 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     let pid = child.id();
 
     let mut pids_max = String::new();
@@ -4652,7 +4652,7 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
 /// config → spec → `memfds(&policy)` → bwrap `--add-seccomp-fd` chain a `build_spec` unit test
 /// cannot cover (it never invokes bwrap with the compiled filters). The kernel *enforcement* of a
 /// fine-grained lift is proven in `src/sandbox/seccomp.rs`'s real-cage tests; this proves the
-/// relaxed filters still compile, load, and launch a working cage through `ops run` — a
+/// relaxed filters still compile, load, and launch a working cage through `sbx run` — a
 /// non-regression that a `[seccomp]` config never breaks a launch.
 #[test]
 fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
@@ -4662,15 +4662,15 @@ fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
 
     // A relaxation mixing a whole-syscall lift (comma-separated in one string) and a fine-grained
     // selector — the union of both must thread through. `[seccomp]` is a security field, so it
-    // applies only after `ops trust`.
+    // applies only after `sbx trust`.
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[seccomp]\nallow = [\"ptrace,perf_event_open\", \"clone:newns\"]\n",
     )
     .unwrap();
 
     // Capability probe (also seeds the base userland); skip if the host cannot sandbox.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4685,21 +4685,21 @@ fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
     }
 
     // Trust the project so its `[seccomp]` relaxation applies.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The relaxed cage launches and runs `id` to success — the policy threaded to the real bwrap
     // invocation, the modified filters loaded, and the synthetic identity resolves (hermetic).
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4739,7 +4739,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
     let state = TmpDir::new("dev-state");
 
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         format!("[devices]\nallow = [\"{device}\"]\n").as_bytes(),
     )
     .unwrap();
@@ -4747,7 +4747,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
 
     // Untrusted probe (also seeds the base userland): the grant is dropped, so the device is ABSENT
     // in the minimal /dev. A failed launch means the host cannot sandbox → skip.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4767,20 +4767,20 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
     );
 
     // Trust the project so its `[devices]` grant applies.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The device is now bound into the cage — the whole thread landed at a real `--dev-bind-try`.
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4816,14 +4816,14 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
     let data = TmpDir::new("gpu-data");
     let state = TmpDir::new("gpu-state");
 
-    std::fs::write(project.path().join(".ops.toml"), b"gpu = true\n").unwrap();
+    std::fs::write(project.path().join(".sbx.toml"), b"gpu = true\n").unwrap();
     let check = "test -e /dev/dri && echo DRI-PRESENT || echo DRI-ABSENT; \
                  test -e /sys/class/drm && echo SYS-PRESENT || echo SYS-ABSENT; \
                  test -n \"$LIBGL_DRIVERS_PATH\" && echo ENV-SET || echo ENV-UNSET";
 
     // Untrusted probe (also seeds the base userland): the posture is dropped, so neither the render
     // node nor `/sys` is exposed. A failed launch means the host cannot sandbox → skip.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4847,20 +4847,20 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
     );
 
     // Trust the project so its `gpu = true` posture applies.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The render node and the `/sys` DRM index are now bound into the cage.
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4893,7 +4893,7 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
 }
 
 /// A trusted `audio = true` binds the host PulseAudio socket into the cage and wires the ALSA→pulse
-/// shim, gated by trust. The firm teeth are network-independent: the cage socket `/run/ops-pulse` and
+/// shim, gated by trust. The firm teeth are network-independent: the cage socket `/run/sbx-pulse` and
 /// `PULSE_SERVER` are ABSENT under an untrusted (dropped) posture and PRESENT once trusted — the whole
 /// audio→launch→`--ro-bind` thread a `build_spec` unit test cannot reach. The shim (the `asound.conf`
 /// bind + `ALSA_*` env) and a REAL `arecord` capture through it are best-effort (they need the
@@ -4921,11 +4921,11 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
     // `alsa-utils` gives the cage `arecord`, so the e2e can attempt a real ALSA capture through the
     // shim (best-effort). A `[packages]` backend is trusted-only, so it is also dropped untrusted.
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"audio = true\n\n[packages]\nalsautils = \"nix:alsa-utils\"\n",
     )
     .unwrap();
-    let check = "test -S /run/ops-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT; \
+    let check = "test -S /run/sbx-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT; \
                  test -n \"$PULSE_SERVER\" && echo ENV-SET || echo ENV-UNSET; \
                  test -f /etc/asound.conf && echo ASOUND-PRESENT || echo ASOUND-ABSENT; \
                  test -n \"$ALSA_PLUGIN_DIR\" && echo ALSAENV-SET || echo ALSAENV-UNSET; \
@@ -4934,7 +4934,7 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
 
     // Untrusted probe (also seeds the base userland): the posture is dropped, so no socket is bound.
     // A failed launch means the host cannot sandbox → skip.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4954,20 +4954,20 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
     );
 
     // Trust the project so its `audio = true` posture applies.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // The host PulseAudio socket is now bound into the cage and named through PULSE_SERVER.
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -4989,7 +4989,7 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
     );
     // The ALSA→pulse shim + a real capture are best-effort (need provisioning + a live mic here) —
     // reported, not asserted, since a missing closure or absent mic degrades to no-audio rather than
-    // a launch failure. A `CAPTURED-<bytes>` line is the full ops-wired shim proven end-to-end.
+    // a launch failure. A `CAPTURED-<bytes>` line is the full sbx-wired shim proven end-to-end.
     let capture = stdout
         .lines()
         .find(|l| l.starts_with("CAPTURED-") || *l == "CAPTURE-FAILED")
@@ -5012,7 +5012,7 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
 /// A trusted `audio = true` also equips a Python **PortAudio** tool (`sounddevice`) — the third audio
 /// client kind, distinct from the ALSA-direct path the `arecord` e2e above covers (that one passed
 /// while PortAudio was broken — the false-green this test closes). The firm, network-independent
-/// teeth: the `find_library` shim `/opt/ops/audio-pyshim/sitecustomize.py` is ABSENT under an
+/// teeth: the `find_library` shim `/opt/sbx/audio-pyshim/sitecustomize.py` is ABSENT under an
 /// untrusted (dropped) posture — the shim is gated by trust. When provisioning succeeds (needs the nix
 /// cache), the test installs an UNPATCHED PyPI `sounddevice` and asserts it imports: that exercises
 /// the real PortAudio path — the shim resolving `libportaudio.so.2` off `LD_LIBRARY_PATH`, which the
@@ -5044,13 +5044,13 @@ fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
     // would bypass the very `find_library` shim under test. A `[packages]` backend is trusted-only,
     // so it is dropped untrusted (no python/uv on PATH there).
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"audio = true\n\n[packages]\npython = \"nix:python312\"\nuv = \"nix:uv\"\n",
     )
     .unwrap();
 
-    let check = r#"test -S /run/ops-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT
-test -f /opt/ops/audio-pyshim/sitecustomize.py && echo PYSHIM-PRESENT || echo PYSHIM-ABSENT
+    let check = r#"test -S /run/sbx-pulse && echo PULSE-PRESENT || echo PULSE-ABSENT
+test -f /opt/sbx/audio-pyshim/sitecustomize.py && echo PYSHIM-PRESENT || echo PYSHIM-ABSENT
 test -n "$PYTHONPATH" && echo PYTHONPATH-SET || echo PYTHONPATH-UNSET
 case ":$LD_LIBRARY_PATH:" in *portaudio*) echo PORTAUDIO-ON-LDPATH;; *) echo PORTAUDIO-OFF-LDPATH;; esac
 if command -v uv >/dev/null 2>&1 && uv venv /tmp/pv >/dev/null 2>&1 && VIRTUAL_ENV=/tmp/pv uv pip install -q sounddevice >/dev/null 2>&1; then
@@ -5061,7 +5061,7 @@ fi"#;
 
     // Untrusted probe (also seeds the base userland): the posture is dropped, so the shim is unbound.
     // A failed launch means the host cannot sandbox → skip.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5081,19 +5081,19 @@ fi"#;
     );
 
     // Trust so the audio posture applies.
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5158,7 +5158,7 @@ fi"#;
 /// which build_spec consumes differently:
 ///   - `--device`: measurable teeth. The SAME project (no trusted `[devices]`) leaves the device
 ///     ABSENT without the flag and PRESENT with it → the grant threads to a real `--dev-bind-try`,
-///     and applies with NO `ops trust` (trusted **by invocation**).
+///     and applies with NO `sbx trust` (trusted **by invocation**).
 ///   - `--seccomp`: threading coverage. The grant launch also carries `--seccomp ptrace`, so an
 ///     override-sourced `SeccompPolicy` threads through the real launch path
 ///     (`apply_override` → `cfg.seccomp` → `build_spec` → `with_seccomp` → `memfds` →
@@ -5185,7 +5185,7 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
 
     // Baseline (also seeds the base userland): no flag, no config → the device is ABSENT from the
     // minimal /dev. A failed launch means the host cannot sandbox → skip.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5204,10 +5204,10 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
         String::from_utf8_lossy(&probe.stdout)
     );
 
-    // The one-shot grants — trusted by invocation, so they apply with NO `ops trust`. `--seccomp
+    // The one-shot grants — trusted by invocation, so they apply with NO `sbx trust`. `--seccomp
     // ptrace` rides the same launch: its success proves the override's seccomp policy threaded to a
     // valid filter (a union/apply bug corrupting the policy would fail `memfds`/`--add-seccomp-fd`).
-    let out = ops_in(
+    let out = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5235,9 +5235,9 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
     );
 }
 
-/// A trusted app's `[limits]` overlay reaches the cage's scope at `ops app` dispatch — the seam a
+/// A trusted app's `[limits]` overlay reaches the cage's scope at `sbx app` dispatch — the seam a
 /// `merge_app` unit test cannot cover: that the real dispatch merges the overlay *before* it
-/// consumes the limits. An inline `[app.cap]` caps tasks below the default; after trust, `ops app
+/// consumes the limits. An inline `[app.cap]` caps tasks below the default; after trust, `sbx app
 /// cap` runs `sleep`, and the cage's host-visible `pids.max` equal to the *app override* — not the
 /// default — proves the overlay threaded resolve → merge_app → `cgroup::wrap` → the systemd scope.
 /// The default leaking through would be a real regression in that threading (panic); no scope at
@@ -5253,14 +5253,14 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
     // A trusted app caps tasks below the default — on its overlay, not the baseline. `[limits]` is a
     // security field, so the app must be trusted for the cap to apply.
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[app.cap]\ncmd = [\"sleep\", \"5\"]\n[app.cap.limits]\ntasks_max = 2048\n",
     )
     .unwrap();
 
     // Capability probe (also primes the base userland so the measured launch starts fast). Runs
     // before the trust step — it only checks the host can sandbox.
-    let probe = ops_in(
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5274,19 +5274,19 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
         return;
     }
 
-    let trusted = ops_in(
+    let trusted = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let mut child = ops()
+    let mut child = sbx()
         .arg("app")
         .arg("cap")
         .current_dir(project.path())
@@ -5295,7 +5295,7 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn ops app");
+        .expect("spawn sbx app");
     let pid = child.id();
 
     let mut pids_max = String::new();
@@ -5327,7 +5327,7 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
 }
 
 /// A typed one-shot `--limit` reaches the cage's scope — no project config, no trust: the override
-/// is trusted by invocation. `ops run --limit tasks_max=8192 -- sleep` with the cage's host-visible
+/// is trusted by invocation. `sbx run --limit tasks_max=8192 -- sleep` with the cage's host-visible
 /// `pids.max` equal to 8192 (not the built-in default) proves the typed flag threads collect →
 /// apply_override → `cgroup::wrap` → the systemd scope, the same seam the `[limits]` config e2e
 /// proves for a file — but through the increment-2 typed-flag surface instead of a TOML blob.
@@ -5340,8 +5340,8 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
     let state = TmpDir::new("cgtyped-state");
 
     // Capability probe (also primes the base userland so the measured launch starts fast). No
-    // project config and no `ops trust` — the one-shot override is trusted by invocation.
-    let probe = ops_in(
+    // project config and no `sbx trust` — the one-shot override is trusted by invocation.
+    let probe = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5355,7 +5355,7 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
         return;
     }
 
-    let mut child = ops()
+    let mut child = sbx()
         .args(["run", "--limit", "tasks_max=8192", "--"])
         .args(["sleep", "5"])
         .current_dir(project.path())
@@ -5364,7 +5364,7 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn ops run");
+        .expect("spawn sbx run");
     let pid = child.id();
 
     let mut pids_max = String::new();
@@ -5409,7 +5409,7 @@ fn host_cgroup_path(pid: u32) -> Option<String> {
 }
 
 /// True once `session_pid` has a descendant process in a *child* user namespace — i.e. the cage's
-/// bubblewrap has created its namespaces, so `ops session attach` will find a live process to enter. Used to
+/// bubblewrap has created its namespaces, so `sbx session attach` will find a live process to enter. Used to
 /// wait deterministically for the background cage to come up, rather than sleeping a fixed guess.
 fn cage_userns_ready(session_pid: u32) -> bool {
     let host = std::fs::read_link("/proc/self/ns/user").ok();
@@ -5443,7 +5443,7 @@ fn cage_userns_ready(session_pid: u32) -> bool {
     false
 }
 
-/// `ops session attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
+/// `sbx session attach <id>` joins a **running** cage and opens a shell *inside* it — the real thing, not a
 /// fresh cage that merely shares the home. Driven through a pty against a live background session,
 /// with two teeth:
 ///  - **live cage, not a reopened one:** the joined shell reads a unique marker the agent wrote to
@@ -5463,7 +5463,7 @@ fn cage_userns_ready(session_pid: u32) -> bool {
 ///
 /// Skips (never fails) where the host cannot sandbox or the cage does not come up.
 #[test]
-fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
+fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     use std::os::fd::FromRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -5491,8 +5491,8 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     }
 
     // A background agent: write the marker into the cage's own /tmp, then sleep so the cage stays
-    // alive to be attached. `child.id()` is the session pid `ops session ls`/`ops session attach` use.
-    let mut agent = ops()
+    // alive to be attached. `child.id()` is the session pid `sbx session ls`/`sbx session attach` use.
+    let mut agent = sbx()
         .args(["run", "--"])
         .args([
             "sh",
@@ -5504,7 +5504,7 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn the background ops run");
+        .expect("spawn the background sbx run");
     let session_pid = agent.id();
 
     // Wait deterministically for the cage's namespaces to exist before attaching.
@@ -5519,8 +5519,8 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
         return;
     }
 
-    // Drive `ops session attach` through a pty (it needs a real terminal on stdin), exactly like the
-    // `ops shell` supervisor test.
+    // Drive `sbx session attach` through a pty (it needs a real terminal on stdin), exactly like the
+    // `sbx shell` supervisor test.
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     let rc = unsafe {
@@ -5535,7 +5535,7 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     assert_eq!(rc, 0, "openpty failed");
 
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
-    let mut attach = ops()
+    let mut attach = sbx()
         .args(["session", "attach", &session_pid.to_string()])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -5543,7 +5543,7 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops session attach");
+        .expect("spawn sbx session attach");
     unsafe { libc::close(slave) };
 
     // Read the agent's live marker; assemble the confinement triple from /proc (so it cannot come
@@ -5596,21 +5596,21 @@ fn ops_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     );
 }
 
-/// `ops session attach <id> -- command` runs one command in the live cage instead of an interactive
+/// `sbx session attach <id> -- command` runs one command in the live cage instead of an interactive
 /// shell. With no terminal on stdin it takes the **inherited-stdio** path (no pty), so it composes
 /// with pipes and its exit status propagates — the value of the feature over an interactive shell.
 /// Three teeth, all through the real binary against a live background session:
 ///  - **live cage + clean bytes:** `-- cat /tmp/<marker>` prints the marker the agent wrote to the
 ///    cage's own tmpfs on a captured (piped, non-tty) stdout — a fresh cage's tmpfs would be empty,
 ///    and a pty would have translated the bytes.
-///  - **status propagation:** `-- sh -c 'exit 7'` makes ops exit 7 (a plain command's status is ops's).
+///  - **status propagation:** `-- sh -c 'exit 7'` makes sbx exit 7 (a plain command's status is sbx's).
 ///  - **confinement re-applied on the direct path (the security ship-gate):** `-- awk …/proc/self/status`
 ///    reads `Seccomp: 2` with both filters, `NoNewPrivs: 1`, empty `CapEff` — the same `CONFINE` the
 ///    pty attach asserts, proving the non-pty path re-applies the cage's confinement just as tightly.
 ///
 /// Skips (never fails) where the host cannot sandbox or the cage does not come up.
 #[test]
-fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
+fn sbx_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -5631,8 +5631,8 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     }
 
     // A background agent writes the marker into the cage's own /tmp, then sleeps so the cage stays
-    // alive to be attached. `child.id()` is the session pid `ops session attach` uses.
-    let mut agent = ops()
+    // alive to be attached. `child.id()` is the session pid `sbx session attach` uses.
+    let mut agent = sbx()
         .args(["run", "--"])
         .args([
             "sh",
@@ -5644,7 +5644,7 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn the background ops run");
+        .expect("spawn the background sbx run");
     let session_pid = agent.id();
 
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -5666,7 +5666,7 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     // inherited-stdio path — the one an interactive shell could not reach.
 
     // A) Live cage + clean piped bytes: read the agent's own /tmp marker and print it.
-    let cat = ops()
+    let cat = sbx()
         .args([
             "session",
             "attach",
@@ -5682,8 +5682,8 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
         .expect("run attach -- cat");
     let cat_out = String::from_utf8_lossy(&cat.stdout).into_owned();
 
-    // B) The command's exit status becomes ops's.
-    let seven = ops()
+    // B) The command's exit status becomes sbx's.
+    let seven = sbx()
         .args([
             "session",
             "attach",
@@ -5700,7 +5700,7 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
         .expect("run attach -- 'exit 7'");
 
     // C) Confinement re-applied on the direct path — the same triple the pty attach asserts.
-    let confine = ops()
+    let confine = sbx()
         .args([
             "session", "attach", &session_pid.to_string(), "--",
             "awk",
@@ -5727,7 +5727,7 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     assert_eq!(
         seven.code(),
         Some(7),
-        "attach -- 'exit 7' must propagate the command's exit status as ops's"
+        "attach -- 'exit 7' must propagate the command's exit status as sbx's"
     );
     assert!(
         confine_out.contains(CONFINE),
@@ -5736,14 +5736,14 @@ fn ops_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     );
 }
 
-/// Ending a session tears down every shell attached to it. `ops session attach` runs the shell **inside**
+/// Ending a session tears down every shell attached to it. `sbx session attach` runs the shell **inside**
 /// the cage's pid namespace, so when the cage's init (bubblewrap, pid 1 of that namespace) dies —
-/// here via `ops session stop` — the kernel SIGKILLs every process in the namespace, the attached shell
+/// here via `sbx session stop` — the kernel SIGKILLs every process in the namespace, the attached shell
 /// included. So an attached shell can neither outlive nor keep alive the agent it joined. (The same
-/// pid-namespace-collapse mechanism fires when the agent exits on its own; `ops session stop` is the
+/// pid-namespace-collapse mechanism fires when the agent exits on its own; `sbx session stop` is the
 /// deterministic trigger to assert on.)
 ///
-/// Teeth: with a shell attached and confirmed live, `ops session stop <session>` must make the `ops session attach`
+/// Teeth: with a shell attached and confirmed live, `sbx session stop <session>` must make the `sbx session attach`
 /// process exit **on its own** (the SIGKILL of its in-cage shell ends its pty relay) — the test polls
 /// `try_wait` and never kills it, so a survivor is a real failure (a regression where the attached
 /// shell escaped the cage's pid namespace). Skips where the host cannot sandbox.
@@ -5767,14 +5767,14 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     }
 
     // A background agent to attach to.
-    let mut agent = ops()
+    let mut agent = sbx()
         .args(["run", "--", "sleep", "120"])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn the background ops run");
+        .expect("spawn the background sbx run");
     let session_pid = agent.id();
 
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -5802,7 +5802,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     };
     assert_eq!(rc, 0, "openpty failed");
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
-    let mut attach = ops()
+    let mut attach = sbx()
         .args(["session", "attach", &session_pid.to_string()])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -5810,7 +5810,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops session attach");
+        .expect("spawn sbx session attach");
     unsafe { libc::close(slave) };
 
     // Confirm the attached shell is really live before killing the session — a runtime-assembled
@@ -5853,7 +5853,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     }
 
     // End the session. The attached shell is in its pid namespace, so it must die with it.
-    let stop = ops_in(
+    let stop = sbx_in(
         project.path(),
         data.path(),
         state.path(),
@@ -5861,11 +5861,11 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     );
     assert!(
         stop.status.success(),
-        "ops session stop failed: {}",
+        "sbx session stop failed: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
 
-    // The `ops session attach` process must now exit on its own: the pid-namespace collapse SIGKILLs its
+    // The `sbx session attach` process must now exit on its own: the pid-namespace collapse SIGKILLs its
     // in-cage shell, ending the pty relay. Poll `try_wait` (master still open, so it is the session's
     // death — not our cleanup — that ends it); never `kill()`, so a survivor is a real failure.
     let kill_deadline = Instant::now() + Duration::from_secs(15);
@@ -5895,7 +5895,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     let _ = agent.wait();
     assert!(
         attach_exited,
-        "`ops session attach` outlived the session it joined — the attached shell escaped the cage's pid \
+        "`sbx session attach` outlived the session it joined — the attached shell escaped the cage's pid \
          namespace instead of being killed with it"
     );
 }
@@ -5907,31 +5907,31 @@ fn touch_under(path: &Path) {
     std::fs::write(path, b"x").unwrap();
 }
 
-/// `ops <args>` with only the data dir redirected — enough for the host-side `ops app` management
+/// `sbx <args>` with only the data dir redirected — enough for the host-side `sbx app` management
 /// verbs (list/rm), which read the config and data dirs but never launch a cage.
-fn ops_data(data: &Path, args: &[&str]) -> Output {
-    ops()
+fn sbx_data(data: &Path, args: &[&str]) -> Output {
+    sbx()
         .args(args)
         .env("XDG_DATA_HOME", data)
         .output()
-        .expect("spawn ops")
+        .expect("spawn sbx")
 }
 
 #[test]
-fn ops_app_rm_purge_removes_the_installed_homes_and_lists_them() {
+fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     let data = TmpDir::new("purge-data");
-    let ops_dir = data.path().join("ops");
+    let sbx_dir = data.path().join("sbx");
     // The target app 'claude': a global home (with a sibling etc) and one per-project home.
-    touch_under(&ops_dir.join("apps/claude/home/state"));
-    touch_under(&ops_dir.join("apps/claude/etc/passwd"));
-    touch_under(&ops_dir.join("projects/testproj/apps/claude/home/state"));
+    touch_under(&sbx_dir.join("apps/claude/home/state"));
+    touch_under(&sbx_dir.join("apps/claude/etc/passwd"));
+    touch_under(&sbx_dir.join("projects/testproj/apps/claude/home/state"));
     // A different app and unrelated project state that must all survive the purge.
-    touch_under(&ops_dir.join("apps/codex/home/state"));
-    touch_under(&ops_dir.join("projects/testproj/store/nix/keepme"));
+    touch_under(&sbx_dir.join("apps/codex/home/state"));
+    touch_under(&sbx_dir.join("projects/testproj/store/nix/keepme"));
 
-    // `ops app list` shows one row per app with its installed home, so a user can see what there is
+    // `sbx app list` shows one row per app with its installed home, so a user can see what there is
     // to purge. The unified table carries the `HOME` column header and a row for each installed app.
-    let listed = ops_data(data.path(), &["app", "list"]);
+    let listed = sbx_data(data.path(), &["app", "list"]);
     assert!(listed.status.success(), "app list failed: {listed:?}");
     let list_out = String::from_utf8_lossy(&listed.stdout);
     assert!(
@@ -5940,7 +5940,7 @@ fn ops_app_rm_purge_removes_the_installed_homes_and_lists_them() {
     );
 
     // Purge 'claude': profile absent (fine), both homes removed, everything else intact.
-    let purged = ops_data(data.path(), &["app", "rm", "claude", "--purge"]);
+    let purged = sbx_data(data.path(), &["app", "rm", "claude", "--purge"]);
     assert!(purged.status.success(), "purge failed: {purged:?}");
     let purge_out = String::from_utf8_lossy(&purged.stdout);
     assert!(
@@ -5948,24 +5948,24 @@ fn ops_app_rm_purge_removes_the_installed_homes_and_lists_them() {
         "no purge summary:\n{purge_out}"
     );
     assert!(
-        !ops_dir.join("apps/claude").exists(),
+        !sbx_dir.join("apps/claude").exists(),
         "global home survived"
     );
     assert!(
-        !ops_dir.join("projects/testproj/apps/claude").exists(),
+        !sbx_dir.join("projects/testproj/apps/claude").exists(),
         "per-project home survived"
     );
     assert!(
-        ops_dir.join("apps/codex/home/state").exists(),
+        sbx_dir.join("apps/codex/home/state").exists(),
         "codex was collateral"
     );
     assert!(
-        ops_dir.join("projects/testproj/store/nix/keepme").exists(),
-        "the shared per-project store was touched — purge must leave it to `ops gc`"
+        sbx_dir.join("projects/testproj/store/nix/keepme").exists(),
+        "the shared per-project store was touched — purge must leave it to `sbx gc`"
     );
 
     // A second purge finds nothing and says so (a typo/no-op must not report success).
-    let again = ops_data(data.path(), &["app", "rm", "claude", "--purge"]);
+    let again = sbx_data(data.path(), &["app", "rm", "claude", "--purge"]);
     assert!(!again.status.success(), "a no-op purge reported success");
     assert!(
         String::from_utf8_lossy(&again.stderr).contains("nothing to purge"),
@@ -5974,11 +5974,11 @@ fn ops_app_rm_purge_removes_the_installed_homes_and_lists_them() {
 }
 
 #[test]
-fn ops_app_rm_gc_requires_purge() {
+fn sbx_app_rm_gc_requires_purge() {
     // `--gc` sweeps the store a purged home referenced, so it is meaningless without `--purge`.
     // This errors before any work, so it needs no capable host and no data setup.
     let data = TmpDir::new("gc-needs-purge");
-    let out = ops_data(data.path(), &["app", "rm", "agent", "--gc"]);
+    let out = sbx_data(data.path(), &["app", "rm", "agent", "--gc"]);
     assert!(
         !out.status.success(),
         "`--gc` without `--purge` should be a usage error"
@@ -5995,10 +5995,10 @@ fn ops_app_rm_gc_requires_purge() {
 }
 
 #[test]
-fn ops_app_rm_purge_refuses_while_a_session_is_live() {
+fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
     let data = TmpDir::new("purge-live-data");
-    let ops_dir = data.path().join("ops");
-    touch_under(&ops_dir.join("apps/agent/home/state"));
+    let sbx_dir = data.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/agent/home/state"));
 
     // A real live process to anchor a session record: the guard is decided by a start-time match
     // against /proc, so a fabricated record must name a genuinely-running pid.
@@ -6011,9 +6011,9 @@ fn ops_app_rm_purge_refuses_while_a_session_is_live() {
     let after = &stat[stat.rfind(')').unwrap() + 1..];
     let start_ticks: u64 = after.split_whitespace().nth(19).unwrap().parse().unwrap();
 
-    // A session record tagging that live pid as `ops app agent` (runtime `global-app:agent`); the
+    // A session record tagging that live pid as `sbx app agent` (runtime `global-app:agent`); the
     // record format is the module's `key=value` text, project hex-encoded (`/x` = 2f78).
-    let sessions = ops_dir.join("sessions");
+    let sessions = sbx_dir.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     std::fs::write(
         sessions.join(format!("{pid}-{start_ticks}")),
@@ -6023,7 +6023,7 @@ fn ops_app_rm_purge_refuses_while_a_session_is_live() {
     )
     .unwrap();
 
-    let out = ops_data(data.path(), &["app", "rm", "agent", "--purge"]);
+    let out = sbx_data(data.path(), &["app", "rm", "agent", "--purge"]);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -6038,7 +6038,7 @@ fn ops_app_rm_purge_refuses_while_a_session_is_live() {
     );
     // Nothing was removed — the home is still there for a retry after the session stops.
     assert!(
-        ops_dir.join("apps/agent/home/state").exists(),
+        sbx_dir.join("apps/agent/home/state").exists(),
         "purge removed the home despite the live session"
     );
 }

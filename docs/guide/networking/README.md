@@ -1,6 +1,6 @@
 # Networking (egress)
 
-`ops` controls what the sandbox can reach on the network. This is the
+`sbx` controls what the sandbox can reach on the network. This is the
 *confidentiality-and-integrity* half of running an untrusted agent: the cage
 already cannot read your host filesystem (secrets are absent, not merely
 read-only), and the egress control decides which hosts — and, for HTTP, which
@@ -31,13 +31,13 @@ untrusted one.
 `deny`, `allow`, and `ask` are the three **filtering** postures — each runs the
 egress proxy and honors the [rule grammar](rules.md). `none` and `shared` run no
 proxy (there is nothing to filter), so they have no rules, no
-[stats](observability.md), no [live log](observability.md#ops-net-logs), and no
-[live flow view](observability.md#ops-net-live).
+[stats](observability.md), no [live log](observability.md#sbx-net-logs), and no
+[live flow view](observability.md#sbx-net-live).
 
 Under a filtering posture, one **always-allowed self-equip set** is unioned into
 your rules regardless of trust so a project can still provision its toolchain (the
 nix binary cache, the nixpkgs GitHub sources, and the nixhub/mise version
-indexes). It is shown in `ops config`, so it is never a silent allowance, and a
+indexes). It is shown in `sbx config`, so it is never a silent allowance, and a
 `deny` rule can still carve it back out. See [modes](modes.md#the-built-in-self-equip-set).
 
 ---
@@ -49,7 +49,7 @@ loopback, no route, no DNS. Nothing leaves it by construction; a misconfiguratio
 fails *closed*. The one and only path out is a **Unix-domain socket** bound into
 the cage, onto which an in-cage `socat` forwarder relays `127.0.0.1:18043` (the
 proxy the tools point at) as a TCP→UDS bridge. On the host side of that socket sits
-an **`ops`-owned MITM CONNECT proxy** that terminates TLS with a per-session,
+an **`sbx`-owned MITM CONNECT proxy** that terminates TLS with a per-session,
 cage-only CA, checks each request against your resolved policy (host, port, path,
 method, regex), resolves DNS **host-side** (so the cage never sees a name to
 exfiltrate through), validates the upstream certificate against the system trust
@@ -70,10 +70,10 @@ pasta NAT) are in [architecture](architecture.md) and the
 - **[Egress groups](groups.md)** — `[net.groups]`: declare a set of hosts once,
   reference it from any allow/deny list with `@name`.
 - **[Ask mode](ask.md)** — the park-and-confirm workflow end to end, with
-  `ops net pending` and `ops net pending watch`.
+  `sbx net pending` and `sbx net pending watch`.
 - **[Observability](observability.md)** — inspect and audit egress with
-  `ops net rules`, `ops net stats`, `ops net logs`, `ops net live`, and
-  `ops test net`.
+  `sbx net rules`, `sbx net stats`, `sbx net logs`, `sbx net live`, and
+  `sbx test net`.
 - **[Architecture](architecture.md)** — how Model B works under the hood, and why
   it was chosen over the alternatives.
 - **[Inbound forwarding (`forward`)](forward.md)** — the reverse direction: forward a host
@@ -93,6 +93,6 @@ that ride the same proxy) are a separate subsystem — see
 - [Secrets](../secrets/README.md) — credential injection over the egress proxy.
 - [Security model](../concepts/security-model.md) — why the bind layout, not the
   network alone, is the boundary.
-- [`ops net` CLI reference](../cli/net.md) · [`ops test` CLI reference](../cli/test.md)
+- [`sbx net` CLI reference](../cli/net.md) · [`sbx test` CLI reference](../cli/test.md)
 - Design: [egress spike findings](../../bwrap-net-spike-findings.md) ·
   [threat model and binds](../../bwrap-threat-model-and-binds.md)

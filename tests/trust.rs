@@ -1,12 +1,12 @@
-//! Integration tests for `ops trust` / `ops untrust`, exercising the built
+//! Integration tests for `sbx trust` / `sbx untrust`, exercising the built
 //! binary end to end against a redirected trust store.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-fn ops() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ops"))
+fn sbx() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_sbx"))
 }
 
 /// A unique temp dir removed on drop, so the trust store and the project config
@@ -18,7 +18,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-trust-it-{}-{n}", std::process::id()));
+        d.push(format!("sbx-trust-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -35,7 +35,7 @@ impl Drop for TmpDir {
 
 /// Count the marker files under a redirected trust store.
 fn marker_count(state_home: &Path) -> usize {
-    let trusted = state_home.join("ops/trusted");
+    let trusted = state_home.join("sbx/trusted");
     match std::fs::read_dir(&trusted) {
         Ok(entries) => entries.filter_map(Result::ok).count(),
         Err(_) => 0,
@@ -46,17 +46,17 @@ fn marker_count(state_home: &Path) -> usize {
 fn trust_then_untrust_records_and_revokes_a_marker() {
     let state = TmpDir::new();
     let proj = TmpDir::new();
-    let cfg = proj.path().join(".ops.toml");
+    let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
 
     assert_eq!(marker_count(state.path()), 0, "no markers before trust");
 
-    let trust = ops()
+    let trust = sbx()
         .arg("trust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert!(
         trust.status.success(),
         "trust failed: {}",
@@ -64,22 +64,22 @@ fn trust_then_untrust_records_and_revokes_a_marker() {
     );
     assert_eq!(marker_count(state.path()), 1, "one marker after trust");
 
-    let untrust = ops()
+    let untrust = sbx()
         .arg("untrust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops untrust");
+        .expect("spawn sbx untrust");
     assert!(untrust.status.success(), "untrust should succeed");
     assert_eq!(marker_count(state.path()), 0, "marker gone after untrust");
 
     // A second untrust is a no-op success that says so.
-    let again = ops()
+    let again = sbx()
         .arg("untrust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops untrust");
+        .expect("spawn sbx untrust");
     assert!(again.status.success());
     assert!(String::from_utf8_lossy(&again.stdout).contains("was not trusted"));
 }
@@ -88,16 +88,16 @@ fn trust_then_untrust_records_and_revokes_a_marker() {
 fn show_reports_untrusted_then_trusted_then_changed() {
     let state = TmpDir::new();
     let proj = TmpDir::new();
-    let cfg = proj.path().join(".ops.toml");
+    let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
 
     let show = |label: &str| {
-        let out = ops()
+        let out = sbx()
             .args(["trust", "--show"])
             .arg(&cfg)
             .env("XDG_STATE_HOME", state.path())
             .output()
-            .expect("spawn ops trust --show");
+            .expect("spawn sbx trust --show");
         assert!(
             out.status.success(),
             "{label}: --show should always succeed"
@@ -107,12 +107,12 @@ fn show_reports_untrusted_then_trusted_then_changed() {
 
     assert!(show("before").contains("untrusted"));
 
-    ops()
+    sbx()
         .arg("trust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .status()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert!(show("after trust").contains("is trusted"));
 
     std::fs::write(&cfg, b"network = \"isolated\"\nbinds = [\"/etc/ssh\"]\n").unwrap();
@@ -123,28 +123,28 @@ fn show_reports_untrusted_then_trusted_then_changed() {
 fn trust_covers_a_sibling_mise_file_and_editing_it_re_arms() {
     let state = TmpDir::new();
     let proj = TmpDir::new();
-    let cfg = proj.path().join(".ops.toml");
+    let cfg = proj.path().join(".sbx.toml");
     let mise = proj.path().join(".mise.toml");
     std::fs::write(&cfg, b"[env]\nA = \"1\"\n").unwrap();
     std::fs::write(&mise, b"[tools]\nnode = \"20\"\n").unwrap();
 
     let show = |label: &str| {
-        let out = ops()
+        let out = sbx()
             .args(["trust", "--show"])
             .arg(&cfg)
             .env("XDG_STATE_HOME", state.path())
             .output()
-            .expect("spawn ops trust --show");
+            .expect("spawn sbx trust --show");
         assert!(out.status.success(), "{label}: --show should succeed");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
-    ops()
+    sbx()
         .arg("trust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .status()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert!(show("after trust").contains("is trusted"));
 
     // Editing only the mise file must re-arm the gate: trust is the single
@@ -158,18 +158,18 @@ fn trust_refuses_a_world_writable_mise_file() {
     use std::os::unix::fs::PermissionsExt;
     let state = TmpDir::new();
     let proj = TmpDir::new();
-    let cfg = proj.path().join(".ops.toml");
+    let cfg = proj.path().join(".sbx.toml");
     let mise = proj.path().join(".mise.toml");
     std::fs::write(&cfg, b"x = 1\n").unwrap();
     std::fs::write(&mise, b"[tools]\nnode = \"20\"\n").unwrap();
     std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    let out = ops()
+    let out = sbx()
         .arg("trust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -184,16 +184,16 @@ fn trust_refuses_a_world_writable_config() {
     use std::os::unix::fs::PermissionsExt;
     let state = TmpDir::new();
     let proj = TmpDir::new();
-    let cfg = proj.path().join(".ops.toml");
+    let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"x = 1\n").unwrap();
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    let out = ops()
+    let out = sbx()
         .arg("trust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -206,19 +206,19 @@ fn trust_refuses_a_world_writable_config() {
 #[test]
 fn an_unresolvable_store_is_a_hard_failure() {
     let proj = TmpDir::new();
-    let cfg = proj.path().join(".ops.toml");
+    let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"x = 1\n").unwrap();
 
     // A relative XDG_STATE_HOME must be ignored (never resolved against the cwd);
     // with HOME also cleared there is no absolute base, so trust must fail loudly
     // rather than write a marker somewhere unexpected.
-    let out = ops()
+    let out = sbx()
         .arg("trust")
         .arg(&cfg)
         .env("XDG_STATE_HOME", "relative/state")
         .env_remove("HOME")
         .output()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot locate the trust store"));
 }

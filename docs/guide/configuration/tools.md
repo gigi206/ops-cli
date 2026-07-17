@@ -1,17 +1,17 @@
 # `[tools]` — a project's mise toolchain
 
-`ops` honors a project's [mise](https://mise.jdx.dev/) configuration
+`sbx` honors a project's [mise](https://mise.jdx.dev/) configuration
 (`.mise.toml` / `mise.toml` / `.tool-versions`) as its per-project dev toolchain.
 This is distinct from the trusted-only [`[packages]`](packages.md) field — `[tools]`
 is the **open, local, self-equip** path, the way an agent equips a project's tools
 from inside the cage.
 
-See also: [`packages`](packages.md) · [Provisioning](../concepts/provisioning.md) · [`ops mise`](../cli/mise.md) · [`ops upgrade mise`](../housekeeping/upgrade.md).
+See also: [`packages`](packages.md) · [Provisioning](../concepts/provisioning.md) · [`sbx mise`](../cli/mise.md) · [`sbx upgrade mise`](../housekeeping/upgrade.md).
 
 ## The `nix:` prefix — an exact, pinned dev toolchain
 
 A tool prefixed `nix:` in a mise `[tools]` table is resolved to the nixpkgs revision
-that shipped that version and realised through `ops`'s own store:
+that shipped that version and realised through `sbx`'s own store:
 
 ```toml
 # .mise.toml
@@ -32,8 +32,8 @@ A project's `nix:` tools are host-provisioned and **trusted-only** (like
 ## Non-`nix:` backends — auto-equipped in-cage
 
 A project's non-`nix:` mise tools (`aqua:`, `github:`, `npm:`, `cargo:`, a plain
-registry token, …) are **auto-installed in-cage at launch**, so `ops run` / `ops shell`
-/ `ops app` start with them on `PATH` without a manual `ops mise install`:
+registry token, …) are **auto-installed in-cage at launch**, so `sbx run` / `sbx shell`
+/ `sbx app` start with them on `PATH` without a manual `sbx mise install`:
 
 ```toml
 # .mise.toml
@@ -53,8 +53,8 @@ first-launch** — the price of freshness versus the nix seed's offline reuse.
 
 ## Trust and mise files
 
-The trust gate hashes a project's mise files **together** with `.ops.toml`, so editing
-either re-arms it (see [The trust gate](../concepts/trust.md)). `ops` binds exactly
+The trust gate hashes a project's mise files **together** with `.sbx.toml`, so editing
+either re-arms it (see [The trust gate](../concepts/trust.md)). `sbx` binds exactly
 the hashed mise files into the cage and runs mise with
 `MISE_TRUSTED_CONFIG_PATHS` naming only them — the mount layout is the containment, so
 an unhashed file mise might otherwise discover (a parent-directory or user-global
@@ -70,17 +70,17 @@ only variables whose source is an authorized mise file are kept.
 | Scope | project-local (`mise install`) | global/durable (`mise use -g`, `nix:` store, `flake:` build) |
 | `nix:` tools | trusted-only, host-side, pinned | trusted-only, host-side |
 | non-`nix:` tools | auto-equipped at launch (open) | trusted-only |
-| Reproducible-in-git | yes (committed mise file) | yes (committed `.ops.toml`) |
+| Reproducible-in-git | yes (committed mise file) | yes (committed `.sbx.toml`) |
 
 ## Self-equipping from inside the cage
 
-An agent can equip tools live with [`ops mise`](../cli/mise.md):
+An agent can equip tools live with [`sbx mise`](../cli/mise.md):
 
 ```sh
-ops mise install nix:jq                 # build into the project's own store
-ops mise use -g aqua:BurntSushi/ripgrep # activate (auto-on-PATH next launch)
+sbx mise install nix:jq                 # build into the project's own store
+sbx mise use -g aqua:BurntSushi/ripgrep # activate (auto-on-PATH next launch)
 ```
 
 A tool the agent **activates** (`mise use`) is auto-on-`PATH` in later launches; a
 bare `mise install` (not activated) stays reachable via `mise exec`/`mise which`. See
-[`ops mise`](../cli/mise.md) and [Provisioning](../concepts/provisioning.md).
+[`sbx mise`](../cli/mise.md) and [Provisioning](../concepts/provisioning.md).

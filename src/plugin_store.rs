@@ -1,6 +1,6 @@
 //! The remote signed plugin store — its offline trust core.
 //!
-//! A plugin store is a git repository of resolver plugins that ops fetches on the
+//! A plugin store is a git repository of resolver plugins that sbx fetches on the
 //! user's behalf. Because the user does not inspect what is fetched, authenticity
 //! cannot come from the transport (git moves bytes and checks their integrity, not
 //! their origin); it comes from an Ed25519 signature over a `catalogue.toml` that
@@ -86,7 +86,7 @@ impl Catalogue {
             crate::plugins::validate_scheme(&entry.scheme).map_err(here)?;
             validate_repo_path(&entry.path).map_err(here)?;
             validate_sha256(&entry.sha256).map_err(here)?;
-            // The free-text fields are displayed verbatim (`ops plugins store list/info`), and a
+            // The free-text fields are displayed verbatim (`sbx plugins store list/info`), and a
             // TOML basic string can carry a control byte via a `\uXXXX` escape; the serializer
             // refuses control chars, so mirror that on the consuming side (a legitimately-published
             // store never carries one) to keep a TOFU-pinned store from injecting terminal escapes.

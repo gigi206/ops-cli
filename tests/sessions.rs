@@ -1,6 +1,6 @@
-//! Integration tests for the session registry and `ops session ls`.
+//! Integration tests for the session registry and `sbx session ls`.
 //!
-//! Two properties: `ops session ls` reports cleanly when there is nothing to show
+//! Two properties: `sbx session ls` reports cleanly when there is nothing to show
 //! (no sandbox needed), and — the M1.4 headline — a second sandbox launched in
 //! the same project shares the first's persistent `$HOME`, i.e. "a 2nd terminal
 //! in the same env". The shared-env test is skipped, not failed, where the host
@@ -13,14 +13,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// The in-sandbox `$HOME` (a fixed mountpoint inside every sandbox).
 const SANDBOX_HOME: &str = "/home/sandbox";
 
-fn ops() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops` so an e2e never depends on
-    // the developer's global ops config; default it to a fixed empty dir under the test tree
+fn sbx() -> Command {
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
+    // the developer's global sbx config; default it to a fixed empty dir under the test tree
     // (no test here writes a global config, so a shared empty dir is race-free).
     let mut cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     cfg.push("target/test-tmp/isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.env("XDG_CONFIG_HOME", cfg);
     cmd
 }
@@ -33,7 +33,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-sessions-it-{tag}-{}-{n}", std::process::id()));
+        d.push(format!("sbx-sessions-it-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -68,14 +68,14 @@ fn force_remove(path: &Path) {
     }
 }
 
-/// Run `ops <args...>` in `project` against `data`, returning (success, stdout).
+/// Run `sbx <args...>` in `project` against `data`, returning (success, stdout).
 fn run(args: &[&str], project: &Path, data: &Path) -> (bool, String) {
-    let out = ops()
+    let out = sbx()
         .args(args)
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .expect("spawn ops");
+        .expect("spawn sbx");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -84,18 +84,18 @@ fn run(args: &[&str], project: &Path, data: &Path) -> (bool, String) {
 
 #[test]
 fn ls_reports_no_sessions_on_an_empty_registry() {
-    // A fresh data dir holds no records; `ops session ls` must succeed and say so. Needs
+    // A fresh data dir holds no records; `sbx session ls` must succeed and say so. Needs
     // no sandbox, so it always runs.
     let data = TmpDir::new("data");
-    let out = ops()
+    let out = sbx()
         .arg("session")
         .arg("ls")
         .env("XDG_DATA_HOME", data.path())
         .output()
-        .expect("spawn ops session ls");
+        .expect("spawn sbx session ls");
     assert!(
         out.status.success(),
-        "ops ls should succeed on an empty registry"
+        "sbx ls should succeed on an empty registry"
     );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("no active"),

@@ -1,11 +1,11 @@
-# Droid — Factory's terminal coding agent (factory.ai), sandboxed by ops.
+# Droid — Factory's terminal coding agent (factory.ai), sandboxed by sbx.
 #
-#   ops app import profiles/droid.toml
-#   ops app droid
+#   sbx app import profiles/droid.toml
+#   sbx app droid
 #
 # Droid ships a genuine terminal CLI on npm (the `droid` package), distributed as a
 # self-contained native binary resolved through a platform-specific optional dependency
-# — so ops equips it in-cage with a node runtime (for the npm install) plus mise's npm
+# — so sbx equips it in-cage with a node runtime (for the npm install) plus mise's npm
 # backend. The native binary needs no node at runtime; the install fetches it from
 # registry.npmjs.org, so the first launch in a project needs the network and the allowlist
 # below.
@@ -14,13 +14,13 @@
 # provider key. Droid authenticates to a Factory ACCOUNT: an interactive launch logs in, and
 # the headless path (`droid exec`) reads a Factory account key `FACTORY_API_KEY` (format
 # `fk-…`, generated at app.factory.ai/settings/api-keys). There is no documented per-provider
-# env var that Droid reads on its own, so ops does not inject a header here. Instead the
+# env var that Droid reads on its own, so sbx does not inject a header here. Instead the
 # account credential persists in the app's dedicated, persistent, isolated home (`~/.factory/`),
 # never bleeding into the project shell or another app:
 #
-#   ops app droid        # then log in interactively (the token persists in the isolated home)
+#   sbx app droid        # then log in interactively (the token persists in the isolated home)
 #
-# Headless use (`droid exec`) reads `FACTORY_API_KEY` from the environment — but ops has NO
+# Headless use (`droid exec`) reads `FACTORY_API_KEY` from the environment — but sbx has NO
 # host->cage env passthrough for a credential (its passthrough channel carries only TERM/LANG,
 # and the [secret] broker injects an HTTP header on the wire, not an env var). So this profile
 # ships no key and no [env]: for unattended use you would add a local `[env] FACTORY_API_KEY =
@@ -34,7 +34,7 @@
 # `openrouter.ai`, `api.anthropic.com`, or `api.openai.com`.
 #
 # If a request is blocked, the proxy reports the host it refused — add it to `allow` (or check
-# ahead with `ops test net <url>`).
+# ahead with `sbx test net <url>`).
 cmd = "droid"
 
 # Your host Droid config, mounted read-write at its real absolute path. `binds` is a security
@@ -73,12 +73,12 @@ allow = [
     #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
 # leave DENIED — here Factory's telemetry sink (POST /api/ingest), which a live run hits every few
 # seconds and whose `denied-default` lines would drown the ones worth acting on. A `mute` never
-# changes the verdict (the telemetry is still refused) and never hides a count (`ops net stats`
+# changes the verdict (the telemetry is still refused) and never hides a count (`sbx net stats`
 # still tallies it); it only keeps the line out of the default log. See it anytime with
-# `ops net log --all`, and edit this list from the CLI with `ops net mute|unmute <host> -a droid`.
+# `sbx net log --all`, and edit this list from the CLI with `sbx net mute|unmute <host> -a droid`.
 # Remove the entry here the day you decide to allow the endpoint (uncomment the `{POST} telemetry.factory.ai`
 # line above instead).
 mute = [
@@ -97,7 +97,7 @@ mute = [
 # read on the HOST and injected by the egress proxy on the wire to openrouter.ai — never in the
 # cage; the in-cage placeholder just lets the request go out.
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

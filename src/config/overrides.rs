@@ -1,16 +1,16 @@
 //! One-shot configuration overrides carried on the command line or in the environment.
 //!
 //! An override is the *final word* on a launch's configuration — it beats a trusted project
-//! config **and** a named app's overlay — because it comes from the person running `ops`, whose
+//! config **and** a named app's overlay — because it comes from the person running `sbx`, whose
 //! authority over the process's argv and environment no lower-trust context (an in-cage agent, a
 //! project directory) can reach. So an override is trusted *by invocation*, distinct from the
 //! direnv-style content trust of a project config: it touches no trust marker.
 //!
-//! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `OPS_CONFIG` — carries
-//! inline TOML shaped exactly like an `ops.toml`, so it can set *any* field the schema has. A
+//! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `SBX_CONFIG` — carries
+//! inline TOML shaped exactly like an `sbx.toml`, so it can set *any* field the schema has. A
 //! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
 //! `--seccomp`/`--device`/`--gpu`/`--audio`/`--dbus` (and their `--env` sibling), each with an
-//! `OPS_*` environment equivalent — is an ergonomic shorthand for one field. The booleans
+//! `SBX_*` environment equivalent — is an ergonomic shorthand for one field. The booleans
 //! `--gpu`/`--audio`/`--dbus` are optional-value (bare = `true`, or `=true`/`=false`); the rest take
 //! a required value.
 //!
@@ -26,7 +26,7 @@
 //! Precedence, lowest to highest — four tiers:
 //!
 //! ```text
-//! OPS_CONFIG (env blob) < OPS_* typed (env) < --config (cli blob) < --* typed (cli)
+//! SBX_CONFIG (env blob) < SBX_* typed (env) < --config (cli blob) < --* typed (cli)
 //! ```
 //!
 //! so any CLI input beats any environment one ("the CLI wins over the environment"), and within a
@@ -54,16 +54,16 @@ use super::schema::{
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
-/// `OPS_ENV_FOO=bar` contributes `FOO=bar` to the cage environment.
-const OPS_ENV_PREFIX: &str = "OPS_ENV_";
-/// The environment-variable prefix that tunes one cgroup limit: `OPS_LIMIT_TASKS_MAX=8192`
+/// `SBX_ENV_FOO=bar` contributes `FOO=bar` to the cage environment.
+const SBX_ENV_PREFIX: &str = "SBX_ENV_";
+/// The environment-variable prefix that tunes one cgroup limit: `SBX_LIMIT_TASKS_MAX=8192`
 /// contributes `tasks_max = 8192` (the suffix, lowercased, is the limit field).
-const OPS_LIMIT_PREFIX: &str = "OPS_LIMIT_";
-/// The environment-variable prefix that declares one package: `OPS_PACKAGE_hello=nix:hello`
+const SBX_LIMIT_PREFIX: &str = "SBX_LIMIT_";
+/// The environment-variable prefix that declares one package: `SBX_PACKAGE_hello=nix:hello`
 /// contributes the `hello` package (the suffix is the package name, the value its backend locator).
-const OPS_PACKAGE_PREFIX: &str = "OPS_PACKAGE_";
-/// The whole-schema environment blob: inline TOML (or `@<file>`) shaped like an `ops.toml`.
-const OPS_CONFIG: &str = "OPS_CONFIG";
+const SBX_PACKAGE_PREFIX: &str = "SBX_PACKAGE_";
+/// The whole-schema environment blob: inline TOML (or `@<file>`) shaped like an `sbx.toml`.
+const SBX_CONFIG: &str = "SBX_CONFIG";
 
 /// A collected, merged one-shot override plus the one-time notices to print before launch.
 #[derive(Debug)]
@@ -71,7 +71,7 @@ pub(crate) struct Override {
     /// The merged overlay, shaped as a config file. Applied authoritatively last.
     pub(super) raw: RawConfig,
     /// Messages to surface **once**, at collection time — not per apply, which runs twice for
-    /// `ops app` (before and after the app overlay merges). Two kinds: the security-field-via-
+    /// `sbx app` (before and after the app overlay merges). Two kinds: the security-field-via-
     /// environment notices and the ignored-field warnings.
     notices: Vec<String>,
 }
@@ -145,44 +145,44 @@ pub(crate) struct CliOverrides {
     pub(crate) dbus: Vec<String>,
 }
 
-/// The ambient (`OPS_*`) override inputs, scanned from the environment. Passed to [`collect_from`]
+/// The ambient (`SBX_*`) override inputs, scanned from the environment. Passed to [`collect_from`]
 /// rather than read there, so the whole merge and its precedence are unit-testable without touching
 /// the process environment. The typed fields mirror [`CliOverrides`]; the maps carry the per-key
-/// forms (`OPS_ENV_<KEY>`, `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`).
+/// forms (`SBX_ENV_<KEY>`, `SBX_LIMIT_<key>`, `SBX_PACKAGE_<name>`).
 #[derive(Debug, Default)]
 struct AmbientOverrides {
-    /// `OPS_CONFIG` — the whole-schema blob.
+    /// `SBX_CONFIG` — the whole-schema blob.
     config: Option<String>,
-    /// `OPS_ENV_<KEY>` — one cage environment variable each.
+    /// `SBX_ENV_<KEY>` — one cage environment variable each.
     env: Vec<(String, String)>,
-    /// `OPS_NET` — the network posture.
+    /// `SBX_NET` — the network posture.
     net: Option<String>,
-    /// `OPS_GUI` — the display posture.
+    /// `SBX_GUI` — the display posture.
     gui: Option<String>,
-    /// `OPS_NIXPKGS` — the nixpkgs channel/revision.
+    /// `SBX_NIXPKGS` — the nixpkgs channel/revision.
     nixpkgs: Option<String>,
-    /// `OPS_BIND` — one host bind (a list is a blob concern).
+    /// `SBX_BIND` — one host bind (a list is a blob concern).
     binds: Vec<String>,
-    /// `OPS_FORWARD` — host loopback forward ports, a comma-list (e.g. `1455,8080`).
+    /// `SBX_FORWARD` — host loopback forward ports, a comma-list (e.g. `1455,8080`).
     forward: Vec<String>,
-    /// `OPS_LIMIT_<key>` — one cgroup limit each (key lowercased).
+    /// `SBX_LIMIT_<key>` — one cgroup limit each (key lowercased).
     limits: Vec<(String, String)>,
-    /// `OPS_PACKAGE_<name>` — one package each.
+    /// `SBX_PACKAGE_<name>` — one package each.
     packages: Vec<(String, String)>,
-    /// `OPS_SECCOMP` — a seccomp relaxation, a comma-list of allow tokens (e.g. `ptrace,unshare`).
+    /// `SBX_SECCOMP` — a seccomp relaxation, a comma-list of allow tokens (e.g. `ptrace,unshare`).
     seccomp: Vec<String>,
-    /// `OPS_DEVICE` — one host device path (a list is a blob concern, like `OPS_BIND`).
+    /// `SBX_DEVICE` — one host device path (a list is a blob concern, like `SBX_BIND`).
     devices: Vec<String>,
-    /// `OPS_GPU` — the GPU posture (`true`/`false`).
+    /// `SBX_GPU` — the GPU posture (`true`/`false`).
     gpu: Option<String>,
-    /// `OPS_AUDIO` — the audio posture (`true`/`false`).
+    /// `SBX_AUDIO` — the audio posture (`true`/`false`).
     audio: Option<String>,
-    /// `OPS_DBUS` — the in-cage desktop portal (`true`/`false`).
+    /// `SBX_DBUS` — the in-cage desktop portal (`true`/`false`).
     dbus: Option<String>,
 }
 
 /// The flag names a typed fragment reports in its structural-error messages, so a `--bind` error
-/// and an `OPS_BIND` error each name their own source. `gui`/`nixpkgs` are passthrough (their value
+/// and an `SBX_BIND` error each name their own source. `gui`/`nixpkgs` are passthrough (their value
 /// is validated downstream, never here), so they carry no label.
 struct TypedLabels {
     net: &'static str,
@@ -207,59 +207,59 @@ const CLI_LABELS: TypedLabels = TypedLabels {
 };
 
 const ENV_LABELS: TypedLabels = TypedLabels {
-    net: "OPS_NET",
-    bind: "OPS_BIND",
-    limit: "OPS_LIMIT_*",
-    package: "OPS_PACKAGE_*",
-    forward: "OPS_FORWARD",
-    gpu: "OPS_GPU",
-    audio: "OPS_AUDIO",
-    dbus: "OPS_DBUS",
+    net: "SBX_NET",
+    bind: "SBX_BIND",
+    limit: "SBX_LIMIT_*",
+    package: "SBX_PACKAGE_*",
+    forward: "SBX_FORWARD",
+    gpu: "SBX_GPU",
+    audio: "SBX_AUDIO",
+    dbus: "SBX_DBUS",
 };
 
 /// Collect a one-shot override from the CLI values (already stripped from argv by the caller) and
-/// the ambient `OPS_*` environment. Fail-closed: a malformed blob, an unreadable `@file`, or a
+/// the ambient `SBX_*` environment. Fail-closed: a malformed blob, an unreadable `@file`, or a
 /// structurally-bad typed value (a `--limit` with no `=`, a `--bind` with an empty path) is an
 /// `Err(message)`.
 pub(crate) fn collect(cli: &CliOverrides) -> Result<Override, String> {
     collect_from(cli, scan_ambient())
 }
 
-/// Read the ambient `OPS_*` override variables from the environment. Exact names first, then the
-/// per-key prefixes; the two never collide (`OPS_NET` is not an `OPS_ENV_*`).
+/// Read the ambient `SBX_*` override variables from the environment. Exact names first, then the
+/// per-key prefixes; the two never collide (`SBX_NET` is not an `SBX_ENV_*`).
 fn scan_ambient() -> AmbientOverrides {
     let mut a = AmbientOverrides {
-        config: env_nonempty(OPS_CONFIG),
-        net: env_nonempty("OPS_NET"),
-        gui: env_nonempty("OPS_GUI"),
-        nixpkgs: env_nonempty("OPS_NIXPKGS"),
-        gpu: env_nonempty("OPS_GPU"),
-        audio: env_nonempty("OPS_AUDIO"),
-        dbus: env_nonempty("OPS_DBUS"),
+        config: env_nonempty(SBX_CONFIG),
+        net: env_nonempty("SBX_NET"),
+        gui: env_nonempty("SBX_GUI"),
+        nixpkgs: env_nonempty("SBX_NIXPKGS"),
+        gpu: env_nonempty("SBX_GPU"),
+        audio: env_nonempty("SBX_AUDIO"),
+        dbus: env_nonempty("SBX_DBUS"),
         ..AmbientOverrides::default()
     };
-    if let Some(v) = env_nonempty("OPS_BIND") {
+    if let Some(v) = env_nonempty("SBX_BIND") {
         a.binds.push(v);
     }
-    if let Some(v) = env_nonempty("OPS_FORWARD") {
+    if let Some(v) = env_nonempty("SBX_FORWARD") {
         a.forward.push(v);
     }
-    if let Some(v) = env_nonempty("OPS_SECCOMP") {
+    if let Some(v) = env_nonempty("SBX_SECCOMP") {
         a.seccomp.push(v);
     }
-    if let Some(v) = env_nonempty("OPS_DEVICE") {
+    if let Some(v) = env_nonempty("SBX_DEVICE") {
         a.devices.push(v);
     }
     for (k, v) in std::env::vars() {
-        if let Some(name) = k.strip_prefix(OPS_ENV_PREFIX) {
+        if let Some(name) = k.strip_prefix(SBX_ENV_PREFIX) {
             if !name.is_empty() {
                 a.env.push((name.to_string(), v));
             }
-        } else if let Some(key) = k.strip_prefix(OPS_LIMIT_PREFIX) {
+        } else if let Some(key) = k.strip_prefix(SBX_LIMIT_PREFIX) {
             if !key.is_empty() {
                 a.limits.push((key.to_lowercase(), v));
             }
-        } else if let Some(name) = k.strip_prefix(OPS_PACKAGE_PREFIX) {
+        } else if let Some(name) = k.strip_prefix(SBX_PACKAGE_PREFIX) {
             if !name.is_empty() {
                 a.packages.push((name.to_string(), v));
             }
@@ -274,12 +274,12 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 /// The pure core of [`collect`]: the ambient environment is passed in. Builds the four precedence
-/// tiers (`OPS_CONFIG` blob, `OPS_*` typed, `--config` blob, `--*` typed), folds each into one
+/// tiers (`SBX_CONFIG` blob, `SBX_*` typed, `--config` blob, `--*` typed), folds each into one
 /// overlay per the uniform merge rule, and records the one-time notices.
 fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Override, String> {
     // Tier 0 — the environment blob.
     let t0 = match &ambient.config {
-        Some(s) => parse_blob(s).map_err(|e| format!("{OPS_CONFIG}: {e}"))?,
+        Some(s) => parse_blob(s).map_err(|e| format!("{SBX_CONFIG}: {e}"))?,
         None => RawConfig::default(),
     };
     // Tier 1 — the environment's typed fragments.
@@ -363,8 +363,8 @@ fn push_ignored_field_notices(
     }
 }
 
-/// Push a notice for each **security** field whose value the environment (either the `OPS_CONFIG`
-/// blob or an `OPS_*` typed variable) contributed — so a stale ambient variable cannot silently
+/// Push a notice for each **security** field whose value the environment (either the `SBX_CONFIG`
+/// blob or an `SBX_*` typed variable) contributed — so a stale ambient variable cannot silently
 /// change a launch's posture without a word. `env` is a *free* field (folded without a notice).
 ///
 /// A replaced (scalar) field is environment-sourced when the CLI did not set it but the environment
@@ -373,7 +373,7 @@ fn push_ignored_field_notices(
 fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: &mut Vec<String>) {
     let mut note = |field: &str| {
         notices.push(format!(
-            "security field `{field}` set from the environment — an ambient OPS_* variable changes \
+            "security field `{field}` set from the environment — an ambient SBX_* variable changes \
              every launch; set it on the command line for a true one-shot"
         ));
     };
@@ -486,7 +486,7 @@ fn bind_path(b: &RawBind) -> Option<&str> {
 }
 
 /// Union two bind lists, a higher-tier entry replacing a lower-tier one that binds the same path, so
-/// `--bind /data:rw` overrides an `OPS_BIND=/data:ro`. Order is preserved; a keyless (malformed)
+/// `--bind /data:rw` overrides an `SBX_BIND=/data:ro`. Order is preserved; a keyless (malformed)
 /// entry appends.
 fn union_binds(mut base: Vec<RawBind>, higher: Vec<RawBind>) -> Vec<RawBind> {
     for h in higher {
@@ -524,7 +524,7 @@ fn union_limits(base: Option<RawLimits>, higher: Option<RawLimits>) -> Option<Ra
 
 /// Union two optional forward port lists, deduped and sorted. `None` means "this tier set none"; a
 /// higher tier's ports add to a lower's, never replace — the collection-union rule, so `--forward`
-/// over `OPS_FORWARD` accumulates rather than clobbers.
+/// over `SBX_FORWARD` accumulates rather than clobbers.
 fn union_forward_opt(base: Option<Vec<u16>>, higher: Option<Vec<u16>>) -> Option<Vec<u16>> {
     match (base, higher) {
         (b, None) => b,
@@ -643,7 +643,7 @@ fn build_typed_fragment(
     Ok(raw)
 }
 
-/// Parse a boolean typed-flag value (`--gpu`/`--dbus`, `OPS_GPU`/`OPS_DBUS`). Only `true`/`false` are
+/// Parse a boolean typed-flag value (`--gpu`/`--dbus`, `SBX_GPU`/`SBX_DBUS`). Only `true`/`false` are
 /// valid; anything else is a structural error, fail-closed — an explicit request the user mistyped.
 fn parse_bool(value: &str, label: &str) -> Result<bool, String> {
     match value {
@@ -773,7 +773,7 @@ fn parse_raw_limit(value: &str) -> RawLimit {
 }
 
 /// Parse one blob value: `@<path>` reads the file, anything else is inline TOML. The bytes are then
-/// parsed as an `ops.toml`-shaped config.
+/// parsed as an `sbx.toml`-shaped config.
 fn parse_blob(value: &str) -> Result<RawConfig, String> {
     let bytes = match value.strip_prefix('@') {
         Some(path) => {
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn the_forward_flag_parses_a_comma_list_and_unions_across_tiers() {
         // A single `--forward` value may carry a comma-list; repeated flags accumulate; and the
-        // env tier (`OPS_FORWARD`) unions with the CLI tier rather than being replaced.
+        // env tier (`SBX_FORWARD`) unions with the CLI tier rather than being replaced.
         let ov = collect_from(
             &CliOverrides {
                 forward: owned(&["1455", "8080,9090"]),
@@ -944,9 +944,9 @@ mod tests {
     }
 
     #[test]
-    fn a_cli_gpu_flag_beats_an_ambient_ops_gpu_and_the_env_source_notice_fires() {
-        // The command line beats the environment (CLI `false` wins over `OPS_GPU=true`); and because
-        // `OPS_DBUS` (a security field) is set only in the environment, a source notice fires for it.
+    fn a_cli_gpu_flag_beats_an_ambient_sbx_gpu_and_the_env_source_notice_fires() {
+        // The command line beats the environment (CLI `false` wins over `SBX_GPU=true`); and because
+        // `SBX_DBUS` (a security field) is set only in the environment, a source notice fires for it.
         let ov = collect_from(
             &CliOverrides {
                 gpu: owned(&["false"]),
@@ -995,12 +995,12 @@ mod tests {
             ..Default::default()
         })
         .unwrap_err();
-        assert!(err.starts_with("OPS_CONFIG:"), "{err}");
+        assert!(err.starts_with("SBX_CONFIG:"), "{err}");
     }
 
     #[test]
     fn the_cli_beats_the_environment_per_field() {
-        // OPS_CONFIG says shared, --config says none: the CLI wins, and because the winning value is
+        // SBX_CONFIG says shared, --config says none: the CLI wins, and because the winning value is
         // from the CLI, no security-via-env notice fires.
         let ov = collect_from(
             &CliOverrides {
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn env_precedence_is_ops_config_then_ops_env_then_config_then_env() {
+    fn env_precedence_is_sbx_config_then_sbx_env_then_config_then_env() {
         // K set in all four sources: --env wins. Keys unique to a source survive untouched.
         let ov = collect_from(
             &CliOverrides {
@@ -1043,8 +1043,8 @@ mod tests {
                 ..Default::default()
             },
             AmbientOverrides {
-                config: Some("[env]\nK = \"from-ops-config\"\nONLY_OPS = \"o\"".into()),
-                env: pairs(&[("K", "from-ops-env")]),
+                config: Some("[env]\nK = \"from-sbx-config\"\nONLY_SBX = \"o\"".into()),
+                env: pairs(&[("K", "from-sbx-env")]),
                 ..Default::default()
             },
         )
@@ -1053,13 +1053,13 @@ mod tests {
             ov.raw.env.get("K").map(String::as_str),
             Some("from-cli-env")
         );
-        assert_eq!(ov.raw.env.get("ONLY_OPS").map(String::as_str), Some("o"));
+        assert_eq!(ov.raw.env.get("ONLY_SBX").map(String::as_str), Some("o"));
         assert_eq!(ov.raw.env.get("ONLY_CFG").map(String::as_str), Some("c"));
         assert!(ov.notices().is_empty(), "env is free — no notice");
     }
 
     #[test]
-    fn ops_env_per_key_variables_become_cage_env() {
+    fn sbx_env_per_key_variables_become_cage_env() {
         let ov = ambient(AmbientOverrides {
             env: pairs(&[("FOO", "bar"), ("BAZ", "qux")]),
             ..Default::default()
@@ -1182,7 +1182,7 @@ mod tests {
 
     #[test]
     fn a_config_file_reference_reads_the_file() {
-        let dir = std::env::temp_dir().join(format!("ops-ov-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sbx-ov-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("ov.toml");
         std::fs::write(&file, b"network = \"none\"\n").unwrap();
@@ -1199,7 +1199,7 @@ mod tests {
     #[test]
     fn a_missing_config_file_is_a_hard_error() {
         let err = collect_cli(Cli {
-            config: &["@/no/such/ops-override.toml"],
+            config: &["@/no/such/sbx-override.toml"],
             ..Default::default()
         })
         .unwrap_err();
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn the_four_tiers_layer_env_typed_below_cli_blob_below_cli_typed() {
-        // OPS_NET (env typed) is beaten by --config (cli blob), which is beaten by --net (cli typed).
+        // SBX_NET (env typed) is beaten by --config (cli blob), which is beaten by --net (cli typed).
         let ov = collect_from(
             &CliOverrides {
                 config: owned(&["network = \"none\""]),
@@ -1431,7 +1431,7 @@ mod tests {
 
     #[test]
     fn typed_collections_union_across_the_env_and_cli_tiers() {
-        // OPS_BIND + --bind -> both binds; OPS_LIMIT_* + --limit on different keys -> both limits.
+        // SBX_BIND + --bind -> both binds; SBX_LIMIT_* + --limit on different keys -> both limits.
         let ov = collect_from(
             &CliOverrides {
                 binds: owned(&["/b"]),
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn a_higher_tier_bind_replaces_a_lower_tier_bind_on_the_same_path() {
-        // OPS_BIND=/data:ro then --bind /data:rw -> one entry, read-write (the CLI wins the path).
+        // SBX_BIND=/data:ro then --bind /data:rw -> one entry, read-write (the CLI wins the path).
         let ov = collect_from(
             &CliOverrides {
                 binds: owned(&["/data:rw"]),
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn an_ambient_typed_security_field_is_noticed() {
-        // OPS_NET alone (a scalar the CLI did not set) is noticed.
+        // SBX_NET alone (a scalar the CLI did not set) is noticed.
         let ov = ambient(AmbientOverrides {
             net: Some("none".into()),
             ..Default::default()
@@ -1491,7 +1491,7 @@ mod tests {
             "{:?}",
             ov.notices()
         );
-        // OPS_BIND alone (a collection the environment contributed to) is noticed.
+        // SBX_BIND alone (a collection the environment contributed to) is noticed.
         let ov = ambient(AmbientOverrides {
             binds: owned(&["/a"]),
             ..Default::default()
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn seccomp_and_device_union_across_the_env_and_cli_tiers() {
-        // OPS_SECCOMP + --seccomp accumulate; OPS_DEVICE + --device accumulate — the collection-union
+        // SBX_SECCOMP + --seccomp accumulate; SBX_DEVICE + --device accumulate — the collection-union
         // rule, so the CLI adds to the environment's list rather than replacing it.
         let ov = collect_from(
             &CliOverrides {
@@ -1583,7 +1583,7 @@ mod tests {
 
     #[test]
     fn ambient_seccomp_and_device_are_noticed_as_security_fields() {
-        // OPS_SECCOMP / OPS_DEVICE relax the cage, so a stale ambient variable must not change a
+        // SBX_SECCOMP / SBX_DEVICE relax the cage, so a stale ambient variable must not change a
         // launch silently — each fires a security-via-environment notice.
         let ov = ambient(AmbientOverrides {
             seccomp: owned(&["ptrace"]),

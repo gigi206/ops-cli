@@ -1,4 +1,4 @@
-//! Integration tests for `ops session attach`.
+//! Integration tests for `sbx session attach`.
 //!
 //! The headline property: attaching to a running **app** (agent) session drops a new interactive
 //! shell into the agent's *isolated* home — not the project's shared home — so "attach to a running
@@ -11,14 +11,14 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-fn ops() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops` so an e2e never depends on
-    // the developer's global ops config; default it to a fixed empty dir under the test tree
+fn sbx() -> Command {
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
+    // the developer's global sbx config; default it to a fixed empty dir under the test tree
     // (no test here writes a global config, so a shared empty dir is race-free).
     let mut cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     cfg.push("target/test-tmp/isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.env("XDG_CONFIG_HOME", cfg);
     cmd
 }
@@ -31,7 +31,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-attach-it-{tag}-{}-{n}", std::process::id()));
+        d.push(format!("sbx-attach-it-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -69,17 +69,17 @@ fn force_remove(path: &Path) {
 #[test]
 fn attach_to_an_unknown_id_reports_and_exits_two() {
     // No tty needed: `attach` resolves the target before the terminal check, so an unknown id is a
-    // clean exit-2 with a pointer to `ops session ls` — never a panic or a misparse of garbage.
+    // clean exit-2 with a pointer to `sbx session ls` — never a panic or a misparse of garbage.
     let data = TmpDir::new("noid");
     for id in ["999999", "not-a-pid"] {
-        let out = ops()
+        let out = sbx()
             .arg("session")
             .arg("attach")
             .arg(id)
             .env("XDG_DATA_HOME", data.path())
             .stdin(Stdio::null())
             .output()
-            .expect("spawn ops session attach");
+            .expect("spawn sbx session attach");
         assert_eq!(
             out.status.code(),
             Some(2),
@@ -96,7 +96,7 @@ fn attach_to_an_unknown_id_reports_and_exits_two() {
 /// Whether the host can launch a sandbox (also warms the userland cache so later launches start
 /// promptly, and creates the project's default home).
 fn host_can_sandbox(project: &Path, data: &Path) -> bool {
-    ops()
+    sbx()
         .arg("run")
         .arg("--")
         .arg("true")
@@ -107,10 +107,10 @@ fn host_can_sandbox(project: &Path, data: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The session record file for `pid`, once it appears under `<data>/ops/sessions/` (the launch
+/// The session record file for `pid`, once it appears under `<data>/sbx/sessions/` (the launch
 /// registers it after seeding). `None` if it does not show up before the deadline.
 fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf> {
-    let dir = data.join("ops").join("sessions");
+    let dir = data.join("sbx").join("sessions");
     let prefix = format!("{pid}-");
     while Instant::now() < deadline {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -125,7 +125,7 @@ fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf>
     None
 }
 
-/// Drive an interactive `ops session attach <pid>` through a pty: wait for the shell's prompt, send
+/// Drive an interactive `sbx session attach <pid>` through a pty: wait for the shell's prompt, send
 /// `script`, and read until the session ends or the deadline. Returns the captured output.
 fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
     let mut master: libc::c_int = -1;
@@ -142,7 +142,7 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
     assert_eq!(rc, 0, "openpty failed");
 
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdio.
-    let mut child = ops()
+    let mut child = sbx()
         .arg("session")
         .arg("attach")
         .arg(pid.to_string())
@@ -151,7 +151,7 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops session attach");
+        .expect("spawn sbx session attach");
     unsafe { libc::close(slave) };
 
     let mut out = Vec::new();
@@ -188,7 +188,7 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
 
 #[test]
 fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
-    // A running `ops app` agent uses its own isolated home. `ops session attach <pid>` must drop the new
+    // A running `sbx app` agent uses its own isolated home. `sbx session attach <pid>` must drop the new
     // shell into THAT home, not the project's shared one — the property that makes attaching to a
     // running agent mean "the same environment". Teeth: a marker the attached shell writes to
     // `$HOME` must land in the app's home (`<data>/apps/probe/home`) and NOT in the project's
@@ -197,19 +197,19 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     let project = TmpDir::new("proj");
     let data = TmpDir::new("data");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[app.probe]\ncmd = [\"sleep\", \"300\"]\n",
     )
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping ops attach app e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!("skipping sbx attach app e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
     // Launch the app in the background: it registers a global-app session and `exec`s into the
     // cage running `sleep`, so the spawned pid is the session's pid throughout.
-    let mut agent = ops()
+    let mut agent = sbx()
         .arg("app")
         .arg("probe")
         .current_dir(project.path())
@@ -218,7 +218,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn ops app probe");
+        .expect("spawn sbx app probe");
     let pid = agent.id();
 
     let record = wait_for_session(data.path(), pid, Instant::now() + Duration::from_secs(60));
@@ -226,7 +226,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         let _ = agent.kill();
         let _ = agent.wait();
         eprintln!(
-            "skipping ops attach app e2e: the app session never registered (cannot sandbox?)"
+            "skipping sbx attach app e2e: the app session never registered (cannot sandbox?)"
         );
         return;
     }
@@ -238,7 +238,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         b"printf done > \"$HOME/ATTACH_OK\"\nexit\n",
     );
 
-    let app_home_marker = data.path().join("ops/apps/probe/home/ATTACH_OK");
+    let app_home_marker = data.path().join("sbx/apps/probe/home/ATTACH_OK");
     // Allow a brief window for the in-cage write to become observable on the host-bound home after
     // the attached shell exits — a slow flush under load must not flake the assertion. The marker
     // lives in the app's persistent home, so it survives killing the agent below.
@@ -255,9 +255,9 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         "the attached shell did not land in the app's isolated home ({app_home_marker:?})\n{log}"
     );
 
-    // Teeth: the project's default home (created by the warm-up `ops run -- true`) must NOT have
+    // Teeth: the project's default home (created by the warm-up `sbx run -- true`) must NOT have
     // received the marker — proving attach reproduced the app's home, not the project's.
-    let project_homes: Vec<PathBuf> = std::fs::read_dir(data.path().join("ops/projects"))
+    let project_homes: Vec<PathBuf> = std::fs::read_dir(data.path().join("sbx/projects"))
         .map(|d| {
             d.flatten()
                 .map(|e| e.path().join("home/ATTACH_OK"))

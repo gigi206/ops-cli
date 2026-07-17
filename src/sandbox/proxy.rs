@@ -47,17 +47,17 @@
 //! ## Refusal reasons
 //!
 //! Every refusal the proxy *itself* issues (as opposed to a genuine upstream response it relays
-//! verbatim) carries an `X-Ops-Egress-Reason` header with a stable category token, plus a short
+//! verbatim) carries an `X-Sbx-Egress-Reason` header with a stable category token, plus a short
 //! `text/plain` body repeating it — so the agent can tell an explicit policy refusal from an
 //! unreachable host or a name that did not resolve, instead of an opaque status or a dropped
 //! connection. The categories:
 //!
-//! | Status | `X-Ops-Egress-Reason` | Meaning |
+//! | Status | `X-Sbx-Egress-Reason` | Meaning |
 //! |---|---|---|
 //! | `403` | `denied-default`         | no allow rule matched the host / port / path |
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
 //! | `403` | `denied-method`          | an allow rule matched the host but not the request's HTTP method (a `{VERB}`-scoped rule) |
-//! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `ops net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
+//! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `sbx net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
@@ -75,7 +75,7 @@
 //! peer that closed early, an unparseable CONNECT, or a failure mid-response — closes the
 //! connection with no status, there being no well-formed HTTP peer to answer. The category and body echo only what the agent already sent (its own host /
 //! port) or a fixed token; they never disclose the injected credential, a host-side secret, or
-//! the policy's internal rule text (for the deciding rule, `ops test net` is the host-side tool).
+//! the policy's internal rule text (for the deciding rule, `sbx test net` is the host-side tool).
 //!
 //! Whether the agent *surfaces* the reason depends on its tool: a raw-HTTP client or `curl -i`
 //! shows the header and body, while a tool like `nix` reports the status code — but the coarse
@@ -202,7 +202,7 @@ impl Ca {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params
             .distinguished_name
-            .push(DnType::CommonName, "ops egress proxy CA");
+            .push(DnType::CommonName, "sbx egress proxy CA");
         let cert = params.self_signed(&key).map_err(io::Error::other)?;
         let cert_der = cert.der().clone();
         let cert_pem = cert.pem();
@@ -331,7 +331,7 @@ pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>
 }
 
 /// The hosts of the built-in self-equip allow-set, in allowlist-entry syntax. Sourced once so
-/// the policy (`builtin_allow_rules`) and the `ops config` display can never drift.
+/// the policy (`builtin_allow_rules`) and the `sbx config` display can never drift.
 ///
 /// All pinned to :443 (every one is HTTPS-only, so closing port 80 is pure least-privilege). The
 /// whole set is scoped to `{GET,HEAD}`: substitution, channel and tarball fetches (incl. the
@@ -362,7 +362,7 @@ pub(crate) fn builtin_allow_hosts() -> &'static [&'static str] {
 /// version-resolution host belongs here; the artifact hosts they download from (npm, the per-tool
 /// release host) stay per-profile. Unioned into every policy regardless of trust (a user `deny`
 /// can still carve it). The exact set is refined empirically against a real self-equip and is
-/// shown in `ops config`, so it is never a silent allowance.
+/// shown in `sbx config`, so it is never a silent allowance.
 pub(crate) fn builtin_allow_rules() -> Vec<Rule> {
     builtin_allow_hosts()
         .iter()
@@ -624,12 +624,12 @@ pub(crate) struct ProxyCtx {
     /// stats are off. The launch ([`super::egress::start`]) attaches the session's
     /// [`EgressStats`] via [`Self::with_stats`]; tests leave it unset.
     stats: Option<Arc<EgressStats>>,
-    /// The live event ring this launch pushes each decision into, read by `ops net log`, or `None`
+    /// The live event ring this launch pushes each decision into, read by `sbx net log`, or `None`
     /// when the log is off (tests). The launch ([`super::egress::start`]) attaches the session's
     /// [`super::control::LogRing`] via [`Self::with_log`]; a decision's outcome is both counted in
     /// `stats` and pushed here through the single [`Self::outcome`] chokepoint.
     log: Option<Arc<super::control::LogRing>>,
-    /// The live registry of egress tunnels currently open, read by `ops net live`, or `None` when
+    /// The live registry of egress tunnels currently open, read by `sbx net live`, or `None` when
     /// off (tests). The launch ([`super::egress::start`]) attaches the session's
     /// [`super::control::FlowRegistry`] via [`Self::with_flows`]; each permitted tunnel registers a
     /// flow for its lifetime through a [`super::control::FlowGuard`], and the relay increments the
@@ -645,9 +645,9 @@ pub(crate) struct ProxyCtx {
     /// (see [`MAX_CONCURRENT_CONNS`]) — a burst of connections cannot exhaust host threads/fds and
     /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
     conns: AtomicUsize,
-    /// The `ops app <name>` this launch runs, if any — used only to scope the `ops net allow`
+    /// The `sbx app <name>` this launch runs, if any — used only to scope the `sbx net allow`
     /// suggestion in a `denied-default` refusal body to the app (`--app <name>`). `None` for a bare
-    /// `ops run`/`shell`.
+    /// `sbx run`/`shell`.
     app: Option<String>,
 }
 
@@ -699,9 +699,9 @@ impl ProxyCtx {
         })
     }
 
-    /// Name the `ops app <name>` this launch runs, so the refusal notice scopes its `ops net allow`
+    /// Name the `sbx app <name>` this launch runs, so the refusal notice scopes its `sbx net allow`
     /// suggestion to that app. Set once by the launch ([`super::egress::start`]); left unset (a bare
-    /// `ops run`/`shell`) the suggestion targets the project baseline.
+    /// `sbx run`/`shell`) the suggestion targets the project baseline.
     pub(crate) fn with_app(mut self, app: Option<String>) -> Self {
         self.app = app;
         self
@@ -714,7 +714,7 @@ impl ProxyCtx {
         self
     }
 
-    /// Attach the session's live event ring, so each request's decision is pushed for `ops net log`.
+    /// Attach the session's live event ring, so each request's decision is pushed for `sbx net log`.
     /// Set once by the launch ([`super::egress::start`]) whenever the proxy runs.
     pub(crate) fn with_log(mut self, log: Arc<super::control::LogRing>) -> Self {
         self.log = Some(log);
@@ -722,7 +722,7 @@ impl ProxyCtx {
     }
 
     /// Attach the session's live flow registry, so each permitted tunnel registers itself for its
-    /// lifetime and `ops net live` can read the tunnels open right now. Set once by the launch
+    /// lifetime and `sbx net live` can read the tunnels open right now. Set once by the launch
     /// ([`super::egress::start`]) whenever the proxy runs.
     pub(crate) fn with_flows(mut self, flows: Arc<super::control::FlowRegistry>) -> Self {
         self.flows = Some(flows);
@@ -731,7 +731,7 @@ impl ProxyCtx {
 
     /// Register a permitted tunnel in the live flow registry, returning its RAII guard — hold it for
     /// the tunnel's lifetime so the flow stays visible until it closes, then drops off the
-    /// `ops net live` view. Always returns a guard (a **detached** one, counting into throwaway
+    /// `sbx net live` view. Always returns a guard (a **detached** one, counting into throwaway
     /// counters, when no registry is attached — tests), so the relay's counting wrappers work
     /// uniformly with no branch. Call only after the request is permitted and the upstream is connected.
     fn register_flow(
@@ -747,7 +747,7 @@ impl ProxyCtx {
     }
 
     /// The single decision chokepoint every site in [`handle_client`] calls: it both counts the
-    /// outcome for `ops net stats` and pushes one event for the live `ops net log`, so the two can
+    /// outcome for `sbx net stats` and pushes one event for the live `sbx net log`, so the two can
     /// never drift and a missed site is a missed *pair*, not a silent stats/log mismatch. `method`
     /// and `path` are the inspected request's (absent for an early-CONNECT block or a raw `tcp://`
     /// splice); `reason` is the same stable category token the adjacent refusal writes (or `allowed`
@@ -818,22 +818,22 @@ impl ProxyCtx {
         )
     }
 
-    /// The copy-paste `ops net allow` command a `denied-default` refusal body suggests. When the
-    /// launch is an `ops app <name>` (the app hint is set), it names the app — `ops net allow
+    /// The copy-paste `sbx net allow` command a `denied-default` refusal body suggests. When the
+    /// launch is an `sbx app <name>` (the app hint is set), it names the app — `sbx net allow
     /// <host> --app <name>` writes the allow into that app's config rather than the project
     /// baseline, which is what the user almost always means when an *app's* egress was blocked.
     /// Pure so it is unit-testable. The `--app` write defaults to the project scope (least
     /// privilege); the user adds `-g` to reach a global profile.
     fn allow_suggestion(&self, host: &str) -> String {
         match &self.app {
-            Some(name) => format!("ops net allow {host} --app {name}"),
-            None => format!("ops net allow {host}"),
+            Some(name) => format!("sbx net allow {host} --app {name}"),
+            None => format!("sbx net allow {host}"),
         }
     }
 
     /// Push one event into the live log **without** touching the stat counters — for the outcomes the
     /// coarse stats taxonomy does not count but the diagnostic log should: a permitted request that
-    /// failed downstream (`Error` — DNS/unreachable/cert) and a request ops declined before any
+    /// failed downstream (`Error` — DNS/unreachable/cert) and a request sbx declined before any
     /// verdict (`Blocked` — an IP-literal target or a malformed/smuggling request). Stats stay a
     /// pure allow/deny/blocked policy counter; the log is the richer record.
     #[allow(clippy::too_many_arguments)]
@@ -863,7 +863,7 @@ impl ProxyCtx {
 
     /// The muted-aware inner of [`Self::push_log`]: when `muted` (a denied request matched a `mute`
     /// rule), the event is routed to the log's separate muted ring so it is kept out of the default
-    /// `ops net log` view yet still recoverable via `--all` — the stat counter was already bumped by
+    /// `sbx net log` view yet still recoverable via `--all` — the stat counter was already bumped by
     /// the caller, so a muted refusal is *collapsed*, never destroyed. All non-deny sites route here
     /// with `muted = false` via [`Self::push_log`].
     #[allow(clippy::too_many_arguments)]
@@ -922,7 +922,7 @@ impl ProxyCtx {
     /// park notices unless the policy suppressed them (`[network] ask_notice = false`). The launch
     /// ([`super::egress::start`]) passes the same [`super::control::PendingState`] and
     /// [`super::control::ManualRules`] it serves on the control socket, so a request parked here is
-    /// answerable by `ops net pending` and a `--session` answer it adds is honored here.
+    /// answerable by `sbx net pending` and a `--session` answer it adds is honored here.
     pub(crate) fn with_control(
         mut self,
         pending: Arc<super::control::PendingState>,
@@ -1034,7 +1034,7 @@ fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPolicy> {
     allow.extend(overlay_allow);
     let mut deny = ctx.policy.deny_rules().to_vec();
     deny.extend(overlay_deny);
-    // The mute (`dontaudit`) overlay — a live `ops net mute --session` — folds onto the config
+    // The mute (`dontaudit`) overlay — a live `sbx net mute --session` — folds onto the config
     // mutes, so a suppressed refusal is honored identically whether it came from config or the
     // session. Carried through this rebuild (like default_action/ask), or it would be dropped.
     let mut mute = ctx.policy.mute_rules().to_vec();
@@ -1064,7 +1064,7 @@ pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()
                 // A transient accept error (host fd exhaustion, an aborted connection) must not
                 // take the whole session's egress down — skip this connection and keep serving. A
                 // short sleep avoids a hot spin if the condition persists.
-                eprintln!("ops: egress proxy: accept error: {e}");
+                eprintln!("sbx: egress proxy: accept error: {e}");
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
@@ -1114,7 +1114,7 @@ const ASK_PENDING_CAP: usize = 256;
 /// one inner request, decide it against the policy (with the host/SNI/Host triple agreeing and
 /// the SSRF guard applied to the resolved address), and — when permitted — forward it to the
 /// validated upstream and stream the response back. Every failure path is fail-closed, and each
-/// returns a [`write_refusal`] reason (an `X-Ops-Egress-Reason` category plus a text body) so the
+/// returns a [`write_refusal`] reason (an `X-Sbx-Egress-Reason` category plus a text body) so the
 /// agent can tell an explicit policy refusal from an unreachable host or a name that did not
 /// resolve, instead of an opaque status or a dropped connection.
 fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
@@ -1424,7 +1424,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
 
     // 4c. Outbound leak tripwire: if the decrypted client head carries a configured secret value
     //     verbatim, refuse the whole request — block, never strip (a partial strip gives false
-    //     confidence). Scanned on the pre-injection client bytes, so ops's own injected credential
+    //     confidence). Scanned on the pre-injection client bytes, so sbx's own injected credential
     //     can never trip it, and reached before the verdict so an exfil attempt never resolves a
     //     name or opens an upstream. A backstop against naive re-exfil only: it sees the head, not
     //     the streamed body, and matches the value byte-for-byte (any encoding evades it).
@@ -1446,7 +1446,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         );
     }
 
-    // 5. The verdict — built through the SAME canonicalizer `ops test net` uses, so enforcement
+    // 5. The verdict — built through the SAME canonicalizer `sbx test net` uses, so enforcement
     //    cannot drift from the tester's prediction. Evaluated against the effective policy (config +
     //    any live `--session` overlay), so a `--session allow` opens an otherwise-default-denied host
     //    and a `--session deny` blocks a config-allowed one (deny wins). The two denial shapes get
@@ -1506,10 +1506,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     ),
                 );
             }
-            // The refusal body carries a copy-paste `ops net allow` — sound here because nothing
+            // The refusal body carries a copy-paste `sbx net allow` — sound here because nothing
             // allowed the host (never for an explicit deny or a security refusal). It rides the
             // response the client already shows, so there is no second, host-side message to
-            // duplicate it or interleave with it. Scoped to the app when this is an `ops app` launch.
+            // duplicate it or interleave with it. Scoped to the app when this is an `sbx app` launch.
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",
@@ -1523,7 +1523,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         }
         // Ask-by-default: no rule in the effective policy decided (a `--session` overlay rule would
         // have folded into it and returned Allowed/Denied above, so reaching here means the host is
-        // genuinely undecided). Park and block until a host-side `ops net pending` answers it or the
+        // genuinely undecided). Park and block until a host-side `sbx net pending` answers it or the
         // timeout elapses (deny — fail-closed). A fresh allow names this exact host:port as the
         // deciding rule so the SSRF guard permits a deliberately-approved internal target.
         Decision::Ask => {
@@ -1541,8 +1541,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                                 "egress decision needed [{id}] {connect_host}:{port}{itarget}"
                             ),
                             &[
-                                ("allow", &format!("ops net pending allow {id}")),
-                                ("deny", &format!("ops net pending deny {id}")),
+                                ("allow", &format!("sbx net pending allow {id}")),
+                                ("deny", &format!("sbx net pending deny {id}")),
                             ],
                         );
                     }
@@ -1710,7 +1710,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         "allowed",
     );
 
-    // The tunnel is now open — register it for `ops net live` until this connection returns (the
+    // The tunnel is now open — register it for `sbx net live` until this connection returns (the
     // tunnel closes). One guard covers both the one-shot request/response below and a WebSocket
     // upgrade: a WS over TLS is still inspected TLS, so its proto stays `https`. The relay increments
     // the guard's byte counters as data flows (application-plaintext bytes on this inspected path).
@@ -2060,7 +2060,7 @@ fn splice_l4(
         StatKind::Allow,
         "allowed",
     );
-    // Register the raw tunnel for `ops net live` for its whole lifetime: `splice_copy` joins both
+    // Register the raw tunnel for `sbx net live` for its whole lifetime: `splice_copy` joins both
     // directions before returning, so this guard (dropped after it) stays registered until the tunnel
     // fully closes. A splice is uninspected, so the byte counters reflect raw ciphertext volume.
     let flow = ctx.register_flow(connect_host, port, super::control::Proto::Tcp);
@@ -2253,9 +2253,9 @@ fn handle_cleartext(
 
     // 5. The verdict — cleartext is strictly opt-in, so only an explicit `http://` allow rule permits
     //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
-    //    Evaluated against the effective policy, so an `http://` rule loaded live with `ops net allow
+    //    Evaluated against the effective policy, so an `http://` rule loaded live with `sbx net allow
     //    http://host --session` opens it too. The two denial shapes get distinct reasons, and the
-    //    `denied-default` suggestion names the `http://` scheme (a bare `ops net allow host` would add
+    //    `denied-default` suggestion names the `http://` scheme (a bare `sbx net allow host` would add
     //    an https rule that does not open the clear).
     let policy = effective_policy(ctx);
     let deciding: Rule = match policy.explain_clear(&host, port, &path, method) {
@@ -2407,7 +2407,7 @@ fn handle_cleartext(
         "allowed",
     );
 
-    // Register the open cleartext tunnel for `ops net live` until this function returns (the tunnel
+    // Register the open cleartext tunnel for `sbx net live` until this function returns (the tunnel
     // closes). This is inspected cleartext, so the byte counters reflect application data.
     let flow = ctx.register_flow(&host, port, super::control::Proto::Http);
 
@@ -2463,7 +2463,7 @@ fn handle_cleartext(
 /// It is a sibling of the synchronous HTTP/1.1 tail of [`handle_client`], not a rewrite of it: the
 /// sync path is untouched. Because the `h2` crate is async (tokio-based), the whole branch runs on a
 /// **per-connection current-thread tokio runtime** built and dropped inside [`handle`], so tokio
-/// never leaks into ops's std-thread world.
+/// never leaks into sbx's std-thread world.
 ///
 /// Security parity with the HTTP/1.1 path is the invariant: every stream is checked against the same
 /// [`effective_policy`]/[`EgressPolicy::explain`] chokepoint (host/`:path`/method), the `:authority`
@@ -2628,7 +2628,7 @@ mod h2mitm {
 
     /// Handle one h2 stream: decode it, enforce the verdict + SSRF exactly like the HTTP/1.1 path,
     /// then relay it to the validated upstream. Every early return has already answered the client
-    /// with a refusal carrying an `x-ops-egress-reason`.
+    /// with a refusal carrying an `x-sbx-egress-reason`.
     async fn stream(
         req: Request<h2::RecvStream>,
         respond: h2::server::SendResponse<Bytes>,
@@ -2683,7 +2683,7 @@ mod h2mitm {
         }
         // Outbound secret tripwire (GLOBAL): if the client's decoded request head carries any
         // configured secret value verbatim, refuse it — a secret must not leave the cage, whatever
-        // the verdict. Scanned on the client's head *before* ops's own injection is added, so it can
+        // the verdict. Scanned on the client's head *before* sbx's own injection is added, so it can
         // never self-trip on an injected credential (parity with the HTTP/1.1 `carries_secret`).
         if !ctx.redactions.is_empty() && head_carries_secret(&req, &ctx.redactions) {
             ctx.outcome(
@@ -2758,7 +2758,7 @@ mod h2mitm {
             };
         // The allow is recorded only after the upstream connects (in `relay`), matching the
         // HTTP/1.1 path: a request that passes the verdict but then fails SSRF/DNS/upstream is
-        // logged (an `Error`/`Blocked` line) but never counted as an allow in `ops net stats`.
+        // logged (an `Error`/`Blocked` line) but never counted as an allow in `sbx net stats`.
 
         // Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata
         // address is refused unless the rule names the exact host) — then connect the checked IP with
@@ -2906,12 +2906,12 @@ mod h2mitm {
         // Any host-scoped credential to inject — keyed on the already-verified host and the decrypted
         // path, so it reaches exactly its scoped destination. Runs after the verdict (a denied request
         // never got here). Each is **strip-and-replace**: the client's own copy of that header is
-        // dropped and ops's value is the only one forwarded.
+        // dropped and sbx's value is the only one forwarded.
         let injected = matching_injections(ctx, host, port, path);
 
         // Rebuild the request for the upstream: reuse the decoded method/URI (h2 re-derives the
         // pseudo-headers), copying regular headers minus the connection-specific ones h2 forbids and
-        // minus any header ops is injecting (stripped so its value is the only one upstream).
+        // minus any header sbx is injecting (stripped so its value is the only one upstream).
         let (parts, client_body) = req.into_parts();
         let mut builder = Request::builder()
             .method(parts.method)
@@ -3108,7 +3108,7 @@ mod h2mitm {
 
     /// Whether the client's decoded request head carries any configured secret value verbatim — the
     /// outbound leak tripwire, HTTP/2 form. Reconstructs a byte blob of the `:path` plus each
-    /// `name: value` header line and reuses the HTTP/1.1 [`carries_secret`] scan. Scanned before ops's
+    /// `name: value` header line and reuses the HTTP/1.1 [`carries_secret`] scan. Scanned before sbx's
     /// own injection is added, so an injected credential can never self-trip it.
     fn head_carries_secret(req: &Request<h2::RecvStream>, needles: &[SecretNeedle]) -> bool {
         let mut blob = Vec::new();
@@ -3139,7 +3139,7 @@ mod h2mitm {
     }
 
     /// Answer the client on this stream with a header-only refusal carrying the reason category (as
-    /// `x-ops-egress-reason`), ending the stream. A gRPC client maps the non-`200` status to an RPC
+    /// `x-sbx-egress-reason`), ending the stream. A gRPC client maps the non-`200` status to an RPC
     /// error; the header names the exact category for a raw-HTTP client.
     fn refuse(
         mut respond: h2::server::SendResponse<Bytes>,
@@ -3148,7 +3148,7 @@ mod h2mitm {
     ) -> Result<(), h2::Error> {
         let resp = Response::builder()
             .status(status)
-            .header("x-ops-egress-reason", reason)
+            .header("x-sbx-egress-reason", reason)
             .body(())
             .expect("a static status + ASCII reason is always a valid response");
         respond.send_response(resp, true)?;
@@ -3323,7 +3323,7 @@ fn matching_injections<'a>(
 
 /// Whether the decrypted client request head carries any configured secret value verbatim — the
 /// outbound leak tripwire. Scans the raw head bytes (request line + every client header, before
-/// ops's own injection is added), so it can never self-trip on an injected credential. A backstop,
+/// sbx's own injection is added), so it can never self-trip on an injected credential. A backstop,
 /// not a boundary: it catches a *verbatim* secret in the *head* only — an encoded value, or one in
 /// the streamed body, is out of scope (see the module doc).
 fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle]) -> bool {
@@ -3348,8 +3348,8 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 ///
 /// Each `(header, value)` in `injections` is **strip-and-replace**d: every client-supplied copy of
 /// that header — over all spellings (case- and `_`/`-`-insensitive, see [`header_name_eq`]) — is
-/// dropped, then ops's value is appended. The agent in the cage is the adversary, so it must never
-/// be able to leave its own copy of an injected header alongside ops's (which a permissive proxy
+/// dropped, then sbx's value is appended. The agent in the cage is the adversary, so it must never
+/// be able to leave its own copy of an injected header alongside sbx's (which a permissive proxy
 /// would forward as a second, attacker-controlled value).
 fn reserialize_request(
     head: &Head,
@@ -3368,7 +3368,7 @@ fn reserialize_request(
         {
             continue;
         }
-        // strip any client copy of a header ops is about to inject (all spellings), so the
+        // strip any client copy of a header sbx is about to inject (all spellings), so the
         // injected value is the only one the upstream sees.
         if injections.iter().any(|(name, _)| header_name_eq(k, name)) {
             continue;
@@ -3712,7 +3712,7 @@ fn head_expects_continue(head: &Head) -> bool {
 
 /// Whether two header names denote the same header for stripping: case-insensitive, and
 /// treating `_` and `-` as equivalent (some servers fold `X_API_KEY` onto `X-Api-Key`). So a
-/// client cannot dodge the strip-and-replace with an alternate spelling of a header ops injects.
+/// client cannot dodge the strip-and-replace with an alternate spelling of a header sbx injects.
 fn header_name_eq(a: &str, b: &str) -> bool {
     let norm = |s: &str| -> Vec<u8> {
         s.bytes()
@@ -3788,7 +3788,7 @@ fn strip_port(authority: &str) -> String {
 }
 
 /// A `Read` adapter that adds every byte it yields to a shared counter — the live byte total the flow
-/// registry exposes for `ops net live`. Wrapping the *reader* (not the fd) is what lets one counter
+/// registry exposes for `sbx net live`. Wrapping the *reader* (not the fd) is what lets one counter
 /// cover the inspected L7/cleartext plaintext streams and the raw L4 splice uniformly. On the splice
 /// path this means `io::copy` no longer sees two bare fds, so it cannot take the kernel `splice(2)`
 /// fast-path std uses for socket→socket copies (falling back to a userspace loop). This is a deliberate
@@ -4078,7 +4078,7 @@ fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
     }
 }
 
-/// Compose one egress notice line: a bold-red `ops:` tag, the red `head`, then each yellow
+/// Compose one egress notice line: a bold-red `sbx:` tag, the red `head`, then each yellow
 /// `label: command` action (the first joined by ` — `, the rest by `  |  `). Pure over the
 /// palette so it is unit-testable in both the plain and colored forms; [`print_egress_notice`]
 /// wraps it with the stderr auto-detect. Used by the `ask`-mode park alert (the interactive
@@ -4086,7 +4086,7 @@ fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
 /// the `403` body, which the client already shows.
 fn egress_notice_line(p: &crate::style::Palette, head: &str, actions: &[(&str, &str)]) -> String {
     let mut line = format!(
-        "{err}ops:{rst} {err}{head}{rst}",
+        "{err}sbx:{rst} {err}{head}{rst}",
         err = p.err,
         rst = p.reset
     );
@@ -4109,26 +4109,26 @@ fn print_egress_notice(head: &str, actions: &[(&str, &str)]) {
     eprintln!("{}", egress_notice_line(&p, head, actions));
 }
 
-/// Write an ops-originated refusal: the status line, an `X-Ops-Egress-Reason` header carrying a
+/// Write an sbx-originated refusal: the status line, an `X-Sbx-Egress-Reason` header carrying a
 /// stable machine-readable category, and a short `text/plain` body repeating the human detail.
 /// A tool (and the agent it serves) can then tell an explicit policy refusal (`403`, category
 /// `denied-default`/`denied-by-rule`) from an unreachable host (`502`, `upstream-unreachable`/
 /// `dns-failure`) — these are the proxy's *own* statuses, distinct from a real upstream response
 /// it relays verbatim (a genuine `404` reaches the agent unchanged). The category is a fixed
-/// token, so it is safe in a header; the detail is ops-authored and only ever echoes what the
+/// token, so it is safe in a header; the detail is sbx-authored and only ever echoes what the
 /// agent already sent (its own host/port) or a category — never the injected credential, any
-/// host-side secret, or the policy's internal rule text (for which `ops test net` is the tool).
+/// host-side secret, or the policy's internal rule text (for which `sbx test net` is the tool).
 fn write_refusal<W: Write>(
     w: &mut W,
     status: &str,
     category: &str,
     detail: &str,
 ) -> io::Result<()> {
-    let body = format!("ops egress refused this request: {detail}\n");
+    let body = format!("sbx egress refused this request: {detail}\n");
     write!(
         w,
         "HTTP/1.1 {status}\r\n\
-         X-Ops-Egress-Reason: {category}\r\n\
+         X-Sbx-Egress-Reason: {category}\r\n\
          Content-Type: text/plain\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\r\n{body}",
@@ -4173,7 +4173,7 @@ mod tests {
 
     #[test]
     fn counting_reader_and_writer_tally_bytes() {
-        // The building block the relay uses to feed `ops net live`'s byte counters: every byte read
+        // The building block the relay uses to feed `sbx net live`'s byte counters: every byte read
         // or written is added to the shared atomic.
         let up = Arc::new(AtomicU64::new(0));
         let mut src = io::Cursor::new(vec![0u8; 5000]);
@@ -5569,7 +5569,7 @@ mod tests {
     #[test]
     fn a_session_http_overlay_opens_a_cleartext_host_for_an_allowlist_agent() {
         // The user's exact case: a session in **allowlist** mode (deny-by-default, NOT `ask`) whose
-        // config does not list the host. A live `ops net allow http://host --session` folds an
+        // config does not list the host. A live `sbx net allow http://host --session` folds an
         // `http://` allow into the effective policy, so a cleartext request to that host now proceeds
         // — the whole point of `--session` working outside `ask`. An unscoped overlay allow admits
         // every verb (it is a deliberate live grant), so a POST proceeds too, not just the GET a
@@ -5607,7 +5607,7 @@ mod tests {
 
     #[test]
     fn a_session_deny_blocks_a_config_allowed_host() {
-        // The reverse override: a live `ops net deny host --session` cuts a host the config allows.
+        // The reverse override: a live `sbx net deny host --session` cuts a host the config allows.
         // Deny wins in the effective policy, so the request is refused (denied-by-rule) even though the
         // allowlist permits it. The resolver panics if reached — a deny refuses before resolving.
         use crate::sandbox::control::{ManualRules, Verdict};
@@ -5642,7 +5642,7 @@ mod tests {
     fn a_cleartext_request_needs_an_explicit_http_rule() {
         // Cleartext is strictly opt-in: a bare (inspected-over-TLS) allow rule does NOT open the same
         // host in the clear. So a cleartext request to an https-allowed host is denied-default, and
-        // the suggestion names the `http://` scheme (a bare `ops net allow host` would add an https
+        // the suggestion names the `http://` scheme (a bare `sbx net allow host` would add an https
         // rule that still would not open the clear).
         let ctx = Arc::new(
             ProxyCtx::new(
@@ -5658,11 +5658,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            resp.contains(" 403 ") && resp.contains("X-Ops-Egress-Reason: denied-default"),
+            resp.contains(" 403 ") && resp.contains("X-Sbx-Egress-Reason: denied-default"),
             "cleartext must be denied without an http:// rule: {resp:?}"
         );
         assert!(
-            resp.contains("ops net allow http://upstream.test"),
+            resp.contains("sbx net allow http://upstream.test"),
             "the deny-default suggestion must name the http:// scheme: {resp:?}"
         );
     }
@@ -5728,9 +5728,9 @@ mod tests {
     }
 
     /// The live log captures the **upstream** HTTP status for a completed L7 request (the
-    /// `--with-status` data). Teeth: two requests ops permits identically (both `allow`) reach two
+    /// `--with-status` data). Teeth: two requests sbx permits identically (both `allow`) reach two
     /// upstreams that differ ONLY in their response status — so a recorded 200 vs 404 can come only
-    /// from reading the real response, never from ops's own verdict.
+    /// from reading the real response, never from sbx's own verdict.
     #[test]
     fn an_allowed_request_records_the_upstream_status_code() {
         use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
@@ -5771,7 +5771,7 @@ mod tests {
 
         let events = log.snapshot(None, None, false).events;
         assert_eq!(events.len(), 2, "one allow event per request: {events:?}");
-        // Both are `allow` (ops permitted both); only the captured upstream status differs.
+        // Both are `allow` (sbx permitted both); only the captured upstream status differs.
         assert!(events.iter().all(|e| e.verdict == LogVerdict::Allow));
         assert_eq!(
             events[0].status,
@@ -5781,7 +5781,7 @@ mod tests {
         assert_eq!(
             events[1].status,
             Some(404),
-            "the 404 is captured — distinct from ops's allow verdict"
+            "the 404 is captured — distinct from sbx's allow verdict"
         );
     }
 
@@ -5920,8 +5920,8 @@ mod tests {
     #[test]
     fn egress_notice_line_is_plain_or_colored() {
         let actions = [
-            ("allow", "ops net allow x.test"),
-            ("deny", "ops net deny x.test"),
+            ("allow", "sbx net allow x.test"),
+            ("deny", "sbx net deny x.test"),
         ];
         let plain = egress_notice_line(
             &crate::style::Palette::plain(),
@@ -5930,8 +5930,8 @@ mod tests {
         );
         assert_eq!(
             plain,
-            "ops: egress refused x.test:443 — allow: ops net allow x.test  |  \
-             deny: ops net deny x.test"
+            "sbx: egress refused x.test:443 — allow: sbx net allow x.test  |  \
+             deny: sbx net deny x.test"
         );
         let colored = egress_notice_line(
             &crate::style::Palette::colored(),
@@ -5949,18 +5949,18 @@ mod tests {
         assert!(colored.ends_with("\x1b[0m"), "the line resets its styling");
     }
 
-    /// The refusal body's `ops net allow` suggestion names the app when the launch is an
-    /// `ops app <name>` (so the rule is scoped to that app), and stays bare otherwise.
+    /// The refusal body's `sbx net allow` suggestion names the app when the launch is an
+    /// `sbx app <name>` (so the rule is scoped to that app), and stays bare otherwise.
     #[test]
     fn allow_suggestion_names_the_app_when_set() {
         let bare = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[])).unwrap();
-        assert_eq!(bare.allow_suggestion("h.test"), "ops net allow h.test");
+        assert_eq!(bare.allow_suggestion("h.test"), "sbx net allow h.test");
         let app = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
             .unwrap()
             .with_app(Some("claude-code".into()));
         assert_eq!(
             app.allow_suggestion("h.test"),
-            "ops net allow h.test --app claude-code"
+            "sbx net allow h.test --app claude-code"
         );
     }
 
@@ -5997,8 +5997,8 @@ mod tests {
         // The body carries the actionable hint (no app here → the bare form), so the human who
         // reads the response also sees how to permit it — no separate host-side message needed.
         assert!(
-            resp.contains("Allow it: ops net allow denied.test"),
-            "the denied-default body must suggest `ops net allow`: {resp:?}"
+            resp.contains("Allow it: sbx net allow denied.test"),
+            "the denied-default body must suggest `sbx net allow`: {resp:?}"
         );
     }
 
@@ -6604,7 +6604,7 @@ mod tests {
         );
     }
 
-    /// The full proactive-`--session` wire path, cage-free: `inject_rule` (the client `ops net allow
+    /// The full proactive-`--session` wire path, cage-free: `inject_rule` (the client `sbx net allow
     /// --session` drives) loads a rule over a real control `serve` into the overlay the proxy shares,
     /// so an otherwise-undecided ask request proceeds to the upstream **without parking**. There is no
     /// answerer thread and the default ask wait is indefinite, so a request that (wrongly) parked would
@@ -7074,7 +7074,7 @@ mod tests {
         );
     }
 
-    /// The recorded invariant: the proxy's live verdict agrees with what `ops test net` predicts,
+    /// The recorded invariant: the proxy's live verdict agrees with what `sbx test net` predicts,
     /// because both go through the same `EgressPolicy::explain` on the same canonicalized request.
     #[test]
     fn proxy_verdict_matches_the_tester() {
@@ -7082,7 +7082,7 @@ mod tests {
             vec![classify("host.test:*").unwrap()],
             vec![classify("host.test:*/secret").unwrap()],
         );
-        // what `ops test net` would report (via parse_url_target + explain) for these URLs
+        // what `sbx test net` would report (via parse_url_target + explain) for these URLs
         let denied = allowlist::parse_url_target("https://host.test:8443/secret").unwrap();
         assert!(
             !p.permits(&denied.0, denied.1, &denied.2),
@@ -7260,7 +7260,7 @@ mod tests {
 
     /// Drive one request through a proxy that allows `allow` and carries `injections`, to a
     /// loopback capturing upstream. Returns the client-visible response and the request head the
-    /// upstream received — so a test can assert exactly what was forwarded (which headers ops
+    /// upstream received — so a test can assert exactly what was forwarded (which headers sbx
     /// injected, and which client copies it stripped).
     fn run_with_injections(
         allow: &[&str],
@@ -7300,7 +7300,7 @@ mod tests {
         (resp, head)
     }
 
-    /// The headline: an allowed request to the scoped host gets ops's credential, and the
+    /// The headline: an allowed request to the scoped host gets sbx's credential, and the
     /// agent's own copy of the same header is stripped — the injected value is the only one the
     /// upstream sees, even though the cage never held the secret.
     #[test]
@@ -7310,7 +7310,7 @@ mod tests {
             vec![injection(
                 "host.test:*",
                 "Authorization",
-                "Bearer ops-secret",
+                "Bearer sbx-secret",
             )],
             "host.test",
             b"GET / HTTP/1.1\r\nHost: host.test\r\nauthorization: Bearer attacker\r\n\r\n",
@@ -7326,8 +7326,8 @@ mod tests {
             "exactly one Authorization header reaches the upstream: {head:?}"
         );
         assert!(
-            auth[0].contains("ops-secret"),
-            "ops's value must win: {head:?}"
+            auth[0].contains("sbx-secret"),
+            "sbx's value must win: {head:?}"
         );
         assert!(
             !head.contains("attacker"),
@@ -7344,7 +7344,7 @@ mod tests {
             vec![injection(
                 "secret.test:*",
                 "Authorization",
-                "Bearer ops-secret",
+                "Bearer sbx-secret",
             )],
             "other.test",
             b"GET / HTTP/1.1\r\nHost: other.test\r\n\r\n",
@@ -7364,7 +7364,7 @@ mod tests {
             vec![injection(
                 "host.test:*/api",
                 "Authorization",
-                "Bearer ops-secret",
+                "Bearer sbx-secret",
             )]
         };
         let (resp, head) = run_with_injections(
@@ -7376,7 +7376,7 @@ mod tests {
         assert!(resp.contains("200"));
         assert!(
             head.to_ascii_lowercase()
-                .contains("authorization: bearer ops-secret"),
+                .contains("authorization: bearer sbx-secret"),
             "the scoped path must be injected: {head:?}"
         );
         let (resp2, head2) = run_with_injections(
@@ -7401,7 +7401,7 @@ mod tests {
     }
 
     /// Strip-and-replace at the byte level: every spelling of an injected header (case, `_`/`-`,
-    /// duplicates) is removed and ops's value appended exactly once, while unrelated headers and
+    /// duplicates) is removed and sbx's value appended exactly once, while unrelated headers and
     /// the forced `Connection: close` survive.
     #[test]
     fn reserialize_strips_all_spellings_of_an_injected_header() {
@@ -7412,14 +7412,14 @@ mod tests {
         .unwrap();
         let out = reserialize_request(
             &head,
-            &[("Authorization", "Bearer ops"), ("X-Api-Key", "K")],
+            &[("Authorization", "Bearer sbx"), ("X-Api-Key", "K")],
             None,
         );
         let s = String::from_utf8(out).unwrap();
         assert_eq!(
-            s.matches("Authorization: Bearer ops").count(),
+            s.matches("Authorization: Bearer sbx").count(),
             1,
-            "ops's Authorization appears exactly once: {s:?}"
+            "sbx's Authorization appears exactly once: {s:?}"
         );
         assert!(s.contains("X-Api-Key: K"));
         assert!(
@@ -7820,7 +7820,7 @@ mod tests {
 
     /// Like [`run_with_injections`] but also carrying redaction needles, to a capturing upstream —
     /// so a test can assert a clean request still reaches the upstream (the tripwire scans only the
-    /// client head, never ops's own injection).
+    /// client head, never sbx's own injection).
     fn run_with_injections_and_redactions(
         injections: Vec<HeaderInjection>,
         needles: &[&str],
@@ -7864,7 +7864,7 @@ mod tests {
         (resp, head)
     }
 
-    /// The scan is on the pre-injection client head, so ops's own injected credential — whose value
+    /// The scan is on the pre-injection client head, so sbx's own injected credential — whose value
     /// equals a redaction needle — never self-trips: a clean client request is still proxied and
     /// receives the injection.
     #[test]
@@ -7873,9 +7873,9 @@ mod tests {
             vec![injection(
                 "host.test:*",
                 "Authorization",
-                "Bearer ops-secret-value",
+                "Bearer sbx-secret-value",
             )],
-            &["ops-secret-value"],
+            &["sbx-secret-value"],
             b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
         );
         assert!(
@@ -7884,8 +7884,8 @@ mod tests {
         );
         assert!(
             head.to_ascii_lowercase()
-                .contains("authorization: bearer ops-secret-value"),
-            "ops still injects its credential: {head:?}"
+                .contains("authorization: bearer sbx-secret-value"),
+            "sbx still injects its credential: {head:?}"
         );
     }
 
@@ -7900,24 +7900,24 @@ mod tests {
             vec![injection(
                 "host.test:*",
                 "Authorization",
-                "Bearer ops-secret-value",
+                "Bearer sbx-secret-value",
             )],
-            &["ops-secret-value"],
-            b"GET / HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer ops-secret-value\r\n\r\n",
+            &["sbx-secret-value"],
+            b"GET / HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer sbx-secret-value\r\n\r\n",
         );
         assert!(
             resp_a.contains("403") && resp_a.contains("outbound-secret"),
             "replaying the real secret must be refused, not stripped+reinjected: {resp_a:?}"
         );
 
-        // (b) a different client auth value → normal strip-and-replace, ops's value wins
+        // (b) a different client auth value → normal strip-and-replace, sbx's value wins
         let (resp_b, head_b) = run_with_injections_and_redactions(
             vec![injection(
                 "host.test:*",
                 "Authorization",
-                "Bearer ops-secret-value",
+                "Bearer sbx-secret-value",
             )],
-            &["ops-secret-value"],
+            &["sbx-secret-value"],
             b"GET / HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer attacker\r\n\r\n",
         );
         assert!(
@@ -7934,8 +7934,8 @@ mod tests {
             "exactly one Authorization reaches the upstream: {head_b:?}"
         );
         assert!(
-            auth[0].contains("ops-secret-value"),
-            "ops's value wins: {head_b:?}"
+            auth[0].contains("sbx-secret-value"),
+            "sbx's value wins: {head_b:?}"
         );
         assert!(
             !head_b.contains("attacker"),
@@ -7993,26 +7993,26 @@ mod tests {
     /// the agent gets the legitimate response with the secret struck out — never the plaintext.
     #[test]
     fn a_reflected_injected_secret_is_masked_in_the_response() {
-        // the injected header is `Authorization: Bearer ops-secret-value`; the upstream echoes the
+        // the injected header is `Authorization: Bearer sbx-secret-value`; the upstream echoes the
         // value in a JSON body (body is 43 bytes; same-length masking keeps Content-Length valid).
         let resp = run_reflecting(
             vec![injection(
                 "host.test:*",
                 "Authorization",
-                "Bearer ops-secret-value",
+                "Bearer sbx-secret-value",
             )],
-            &["ops-secret-value"],
+            &["sbx-secret-value"],
             b"HTTP/1.1 200 OK\r\nContent-Length: 43\r\nConnection: close\r\n\r\n\
-              {\"authorization\":\"Bearer ops-secret-value\"}",
+              {\"authorization\":\"Bearer sbx-secret-value\"}",
             b"GET /headers HTTP/1.1\r\nHost: host.test\r\n\r\n",
         );
         assert!(resp.contains("200"), "the response still flows: {resp:?}");
         assert!(
-            !resp.contains("ops-secret-value"),
+            !resp.contains("sbx-secret-value"),
             "the reflected secret must be masked out of the response: {resp:?}"
         );
         assert!(
-            resp.contains(&"*".repeat("ops-secret-value".len())),
+            resp.contains(&"*".repeat("sbx-secret-value".len())),
             "the secret is replaced by an equal-length mask: {resp:?}"
         );
         assert!(
@@ -8032,14 +8032,14 @@ mod tests {
             vec![injection(
                 "other.test:*",
                 "Authorization",
-                "Bearer ops-secret-value",
+                "Bearer sbx-secret-value",
             )],
-            &["ops-secret-value"],
-            b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nops-secret-value",
+            &["sbx-secret-value"],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nsbx-secret-value",
             b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
         );
         assert!(
-            resp.contains("ops-secret-value"),
+            resp.contains("sbx-secret-value"),
             "a non-injection host's response is streamed unmasked: {resp:?}"
         );
     }

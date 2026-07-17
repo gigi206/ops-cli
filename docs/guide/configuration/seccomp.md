@@ -61,13 +61,13 @@ allow = ["ptrace, unshare", "clone:newns"]
 
 ### Unknown or malformed entries
 
-An entry that names a syscall `ops` does not deny, or a bad/superfluous `:selector`, is
+An entry that names a syscall `sbx` does not deny, or a bad/superfluous `:selector`, is
 **dropped with a warning** (fail-closed — it loosens nothing). It never fails the launch.
 
 ## Cautions
 
 Some syscalls reopen a real escape surface, not just defense-in-depth. Lifting them is
-allowed (you are the trusted operator), but `ops` prints a **caution** naming what you
+allowed (you are the trusted operator), but `sbx` prints a **caution** naming what you
 opened:
 
 - **`clone`, `clone:newuser`, `clone3`** → reopens unprivileged **user-namespace
@@ -77,7 +77,7 @@ opened:
 - **`ioctl`, `ioctl:tiocsti`, `ioctl:tioclinux`** → reopens **terminal input injection**
   (writing into the controlling terminal's input queue).
 - **`umount2`** → reopens **tearing down a mount**. This is the one entry with a
-  launch-side interdependency: if you also bind `ops`'s control plane read-write, in-cage
+  launch-side interdependency: if you also bind `sbx`'s control plane read-write, in-cage
   code could unmount a pin and defeat a control-plane protection. Lift it only when you
   understand that interaction.
 
@@ -87,13 +87,13 @@ Cautions are informational — the token is still applied.
 
 Blocking the mount/namespace family removes the
 `userns → mount → overlayfs/pivot_root` kernel-LPE paths from the cage. Re-permitting
-them reduces that *defense-in-depth*, but the boundary does not rest on it: `ops` also
+them reduces that *defense-in-depth*, but the boundary does not rest on it: `sbx` also
 drops all capabilities and runs a single-uid user namespace, so a nested user namespace
 is already neutered (`unshare(CLONE_NEWUSER)` succeeds but the `uid_map` write is
 refused). Lifting a syscall is your informed, trusted-only choice.
 
 Re-permitting the mount/namespace family does **not** re-enable nix's own build sandbox
-— `ops` still runs in-cage `nix build` with `sandbox = false` (see
+— `sbx` still runs in-cage `nix build` with `sandbox = false` (see
 [Enforcement stack](../concepts/enforcement.md)).
 
 ## Per-app relaxation
@@ -112,23 +112,23 @@ allow = ["ptrace"]
 ## Viewing the effective relaxation
 
 ```sh
-ops config show            # a `seccomp allow:` line only when a syscall is re-permitted
-ops config show --app dbg  # an app's effective relaxation, tagged inherited or set
+sbx config show            # a `seccomp allow:` line only when a syscall is re-permitted
+sbx config show --app dbg  # an app's effective relaxation, tagged inherited or set
 ```
 
 The tokens render **canonically** (sorted, `:selector` form where narrow), derived from
-the same tables the parser uses — so what `ops config show` prints is exactly what the
+the same tables the parser uses — so what `sbx config show` prints is exactly what the
 cage enforces.
 
 ## Scope
 
 `[seccomp]` is a config-file field (global, project, or an app overlay). It is
 also a one-shot [override](overrides.md): `--seccomp <token[,token…]>` (repeatable) and
-`OPS_SECCOMP` relax the denylist for a single launch, following the same `allow` grammar.
-An override is **trusted by invocation** — the person running `ops` outranks any config
+`SBX_SECCOMP` relax the denylist for a single launch, following the same `allow` grammar.
+An override is **trusted by invocation** — the person running `sbx` outranks any config
 layer — so it may declare exactly the relaxation a *trusted* config already can, even though
 an untrusted project's `[seccomp]` is dropped (parity with the trusted config, not a new
 axis). Note a relaxation re-permits a syscall whose only containment was the filter, widening
-the in-cage kernel attack surface — so a stale `OPS_SECCOMP` is worth checking (its ambient
+the in-cage kernel attack surface — so a stale `SBX_SECCOMP` is worth checking (its ambient
 use prints a notice). A bad token is warned and skipped (less relaxation, fail-closed), never
 fatal.

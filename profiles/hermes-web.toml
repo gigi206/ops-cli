@@ -1,22 +1,22 @@
-# Hermes — NousResearch's open-source agent, served as a browser dashboard by ops.
+# Hermes — NousResearch's open-source agent, served as a browser dashboard by sbx.
 #
-#   ops app import profiles/hermes-web.toml
-#   ops app hermes-web        # then open http://127.0.0.1:9119 in your host browser
+#   sbx app import profiles/hermes-web.toml
+#   sbx app hermes-web        # then open http://127.0.0.1:9119 in your host browser
 #
-# A second way to run Hermes alongside `ops app hermes` (the terminal CLI). Hermes ships a
+# A second way to run Hermes alongside `sbx app hermes` (the terminal CLI). Hermes ships a
 # browser dashboard — `hermes dashboard` serves a FastAPI/React SPA (the built `web_dist/`
-# bundle, packaged inside the wheel) on 127.0.0.1:9119. ops serves it headless in the cage
+# bundle, packaged inside the wheel) on 127.0.0.1:9119. sbx serves it headless in the cage
 # (`--no-open`, no in-cage browser) and forwards the host's localhost:9119 into the cage, so
 # you reach the same agent in a real browser UI on the host: chat with streaming tool output,
 # side-by-side previews, a file browser, settings — no terminal.
 #
-# ops equips Hermes via the flake's `#default` output —
-# `flake:github:NousResearch/hermes-agent#default` in [packages] — so `ops upgrade flake` rolls it
+# sbx equips Hermes via the flake's `#default` output —
+# `flake:github:NousResearch/hermes-agent#default` in [packages] — so `sbx upgrade flake` rolls it
 # forward. That one package bundles the Python agent (uv2nix, its own interpreter), the node
 # front-ends, the web dashboard assets (`web_dist`), and every optional extra (web/voice/edge-tts/
 # mcp/…), all wired by the derivation's own wrapper (it sets HERMES_WEB_DIST / HERMES_TUI_DIR /
 # HERMES_NODE) — so the dashboard's server AND its `/chat` node terminal work with no manual
-# `nix:nodejs`/`HERMES_TUI_DIR` plumbing. ops builds the flake IN-CAGE with `nix build`: the FIRST
+# `nix:nodejs`/`HERMES_TUI_DIR` plumbing. sbx builds the flake IN-CAGE with `nix build`: the FIRST
 # launch is a multi-minute, ~2 GiB build (its PyPI + npm source fetches ride the allowlist below,
 # through nix's fetcher); later launches reuse the warm build offline.
 #
@@ -31,7 +31,7 @@
 # header "Authorization", type "bearer"). The dashboard itself may ask you to complete an auth
 # step in the browser (the same provider login, or a local dashboard password); that traffic
 # rides the allowlist below. If a request is blocked, the proxy reports the host it refused —
-# add it to `allow` (or check ahead with `ops test net <url>`).
+# add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = ["hermes", "dashboard", "--no-open"]
 
 # Forward the host's localhost:9119 into the cage so your host browser reaches the dashboard.
@@ -58,7 +58,7 @@ forward = [9119]
 audio = true
 
 [packages]
-# Hermes via the flake's `#default` output, built in-cage — so `ops upgrade flake` rolls it forward.
+# Hermes via the flake's `#default` output, built in-cage — so `sbx upgrade flake` rolls it forward.
 # One package supplies the interpreter, the node runtime, the web dashboard assets, the `/chat` tab's
 # embedded TUI, and every optional extra — so there is no separate `nix:uv`/`nix:python`/`nix:nodejs`
 # and no launch-time `pip install`, and the `/chat` node terminal that used to need a manual
@@ -70,8 +70,8 @@ audio = true
 # chat-platform / cloud SDKs), so every dashboard feature is available — heavier than the old curated
 # venv, but upgradeable and self-wiring. Some extras fetch runtime assets on FIRST USE — `voice`'s
 # Whisper model from Hugging Face, `edge-tts` from a Microsoft endpoint — which ARE in the allowlist
-# below (see the voice entries); a host the proxy refuses shows in `ops net log -a hermes-web`, add
-# it with `ops net allow -a hermes-web <url>`.
+# below (see the voice entries); a host the proxy refuses shows in `sbx net log -a hermes-web`, add
+# it with `sbx net allow -a hermes-web <url>`.
 hermes = "flake:github:NousResearch/hermes-agent#default"
 
 [network]
@@ -79,8 +79,8 @@ mode = "deny"
 # Silence the cloud-metadata probe (169.254.169.254 / AWS IMDS) that a cloud SDK in the closure
 # fires on startup to auto-discover credentials. There is nothing to discover off-cloud, and the
 # proxy refuses link-local/metadata addresses by construction (SSRF guard) — the verdict is
-# unchanged, this only drops the noisy denied line from the default `ops net log` (SELinux
-# dontaudit semantics). Still visible via `ops net log --all`.
+# unchanged, this only drops the noisy denied line from the default `sbx net log` (SELinux
+# dontaudit semantics). Still visible via `sbx net log --all`.
 mute = ["169.254.169.254"]
 allow = [
     # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter;
@@ -105,11 +105,11 @@ allow = [
     "{GET,HEAD} https://huggingface.co",
     "{GET,HEAD} https://*.xethub.hf.co",
     # Voice replies / read-aloud (edge-tts) — Microsoft's free online TTS, over a WebSocket. `{WS}` is
-    # the explicit WebSocket opt-in (ops gates a WS behind it) and `{GET}` covers the voice-list fetch.
-    # Two things make it work under the MITM allowlist: ops sets `wss_proxy` so the WS routes through
+    # the explicit WebSocket opt-in (sbx gates a WS behind it) and `{GET}` covers the voice-list fetch.
+    # Two things make it work under the MITM allowlist: sbx sets `wss_proxy` so the WS routes through
     # the proxy (a WS client resolves its proxy by URL scheme — `https_proxy` alone would not cover it,
     # and it would connect directly and fail DNS in the empty netns); and the audio hole's Python shim
-    # points certifi at ops's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
+    # points certifi at sbx's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
     "{GET,WS} https://speech.platform.bing.com",
     # Build-time (the in-cage `nix build` of the flake): the Python wheels + index for uv2nix, and
     # the npm registry for the node TUI/web front-ends — all fetched through nix's fetcher.
@@ -123,7 +123,7 @@ allow = [
     # names it; add it the same scoped way.
     "{POST} https://github.com/NousResearch/hermes-agent.git/git-upload-pack",
     # (cache.nixos.org + codeload/*.githubusercontent — the nix binary cache + tarball hosts — are
-    # already in ops's built-in nix-cache allow-set, so they need no entry here.)
+    # already in sbx's built-in nix-cache allow-set, so they need no entry here.)
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.
@@ -133,7 +133,7 @@ allow = [
 [env]
 # No HERMES_TUI_DIR needed — the flake's `#default` wrapper sets it (and HERMES_NODE / HERMES_WEB_DIST)
 # to the bundled TUI/web assets, so the `/chat` node terminal works out of the box.
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

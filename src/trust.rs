@@ -1,8 +1,8 @@
 //! The project-config trust store (the direnv model).
 //!
-//! A project's `.ops.toml` is attacker-controlled, so its security-relevant
+//! A project's `.sbx.toml` is attacker-controlled, so its security-relevant
 //! fields are honored only once the user has vouched for the file's *contents*.
-//! `ops trust` records a marker keyed by the config's canonical path, holding a
+//! `sbx trust` records a marker keyed by the config's canonical path, holding a
 //! SHA-256 of the whole file. Any later edit changes that hash, so the marker no
 //! longer matches and the project must be re-trusted — exactly like `direnv
 //! allow` re-arming when `.envrc` changes.
@@ -17,8 +17,8 @@
 //! attacker-controlled and drives host-side resolution once provisioning lands.
 //! So trust is the single authority over *both* declarative inputs: the recorded
 //! hash folds in the mise file's contents too, and editing either file re-arms
-//! the gate. The mise file is anchored on the `.ops.toml`: it is hashed (and
-//! later honored) only beside one, keyed by the `.ops.toml` path.
+//! the gate. The mise file is anchored on the `.sbx.toml`: it is hashed (and
+//! later honored) only beside one, keyed by the `.sbx.toml` path.
 
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -42,7 +42,7 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Candidate mise config filenames beside the `.ops.toml`, highest precedence
+/// Candidate mise config filenames beside the `.sbx.toml`, highest precedence
 /// first. Every one that exists is part of "the project's mise configuration" — all
 /// are folded into the trust hash. The set covers mise's *same-directory* discovery
 /// names: the local override, the two canonical config files, and the idiomatic
@@ -50,7 +50,7 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
 /// to read, or an unhashed file would reach resolution — which is why the wider
 /// reaches of mise's own discovery (parent-directory configs, the user-global config,
 /// env-specific `mise.<env>.toml`) are deliberately *out*: they live outside the
-/// project root the trust gate anchors on, so admitting them would let a file ops
+/// project root the trust gate anchors on, so admitting them would let a file sbx
 /// never hashed steer resolution.
 const MISE_CONFIG_NAMES: &[&str] = &[
     "mise.local.toml",
@@ -59,7 +59,7 @@ const MISE_CONFIG_NAMES: &[&str] = &[
     ".tool-versions",
 ];
 
-/// Every mise file beside `config_path` (the `.ops.toml`) that exists, in
+/// Every mise file beside `config_path` (the `.sbx.toml`) that exists, in
 /// precedence order — empty when the directory has none. *All* of them are folded
 /// into the trust hash, not just the first: the direnv "any change re-prompts"
 /// superset, so a tool entry hidden in a lower-precedence file cannot ride along
@@ -79,11 +79,11 @@ pub(crate) fn mise_files_for(config_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Read every mise file beside `config_path` through the same safety gate the
-/// `.ops.toml` uses, returning each as `(filename, bytes)` in precedence order for
+/// `.sbx.toml` uses, returning each as `(filename, bytes)` in precedence order for
 /// folding into the trust hash. Empty when the project has none; `Err` when any is
 /// present but unsafe or unreadable. The error is load-bearing: an unverifiable
 /// companion file means the project's trusted content cannot be confirmed, so every
-/// caller must fail closed rather than fall back to the `.ops.toml` alone.
+/// caller must fail closed rather than fall back to the `.sbx.toml` alone.
 pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
     let mut out = Vec::new();
     for path in mise_files_for(config_path) {
@@ -97,26 +97,26 @@ pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
     Ok(out)
 }
 
-/// The trust content hash for a project: the `.ops.toml` bytes alone when the
+/// The trust content hash for a project: the `.sbx.toml` bytes alone when the
 /// project has no mise file — so a project that never had one keeps a marker
 /// byte-identical to hashing the single file — or an unambiguous framing of the
-/// `.ops.toml` and *every* mise file when it has some. Each part is domain-tagged
+/// `.sbx.toml` and *every* mise file when it has some. Each part is domain-tagged
 /// (the mise parts by filename) and length-prefixed, never a bare concatenation, so
 /// among *has-mise* inputs no two distinct sets share an encoding: a change to any
 /// file — or moving an entry between files — always changes the hash.
 ///
 /// The no-mise fast path is an intentional exception (it hashes the raw file, for the
 /// backward-compatible marker). A cross-mode collision — a no-mise state hashing the same
-/// as a has-mise one — would require the trusted `.ops.toml` bytes to *begin with the internal
-/// framing header* (`ops.toml\0` + a length), which a real, user-reviewed TOML config never does
+/// as a has-mise one — would require the trusted `.sbx.toml` bytes to *begin with the internal
+/// framing header* (`sbx.toml\0` + a length), which a real, user-reviewed TOML config never does
 /// (it embeds a NUL), so the "any change re-arms trust" guarantee holds for every real input.
-pub(crate) fn content_hash(ops_bytes: &[u8], mise_inputs: &[(String, Vec<u8>)]) -> String {
+pub(crate) fn content_hash(sbx_bytes: &[u8], mise_inputs: &[(String, Vec<u8>)]) -> String {
     if mise_inputs.is_empty() {
-        return hash_bytes(ops_bytes);
+        return hash_bytes(sbx_bytes);
     }
     let extra: usize = mise_inputs.iter().map(|(n, b)| n.len() + b.len()).sum();
-    let mut buf = Vec::with_capacity(ops_bytes.len() + extra + 32);
-    frame(&mut buf, b"ops.toml", ops_bytes);
+    let mut buf = Vec::with_capacity(sbx_bytes.len() + extra + 32);
+    frame(&mut buf, b"sbx.toml", sbx_bytes);
     for (name, bytes) in mise_inputs {
         frame(&mut buf, name.as_bytes(), bytes);
     }
@@ -144,14 +144,14 @@ pub(crate) enum TrustState {
     Changed,
 }
 
-/// Default trust store dir: `$XDG_STATE_HOME/ops/trusted` when that is an
-/// absolute path, else `$HOME/.local/state/ops/trusted`. `None` when neither
+/// Default trust store dir: `$XDG_STATE_HOME/sbx/trusted` when that is an
+/// absolute path, else `$HOME/.local/state/sbx/trusted`. `None` when neither
 /// yields an absolute base.
 ///
 /// The absolute-path requirement is a security control, not a nicety: a relative
 /// base would resolve the store against the process's current directory, so a
-/// cloned repo could ship its own `…/ops/trusted/<key>` next to a malicious
-/// `.ops.toml` and pre-approve itself. A relative value is therefore ignored,
+/// cloned repo could ship its own `…/sbx/trusted/<key>` next to a malicious
+/// `.sbx.toml` and pre-approve itself. A relative value is therefore ignored,
 /// never trusted.
 pub(crate) fn default_store_dir() -> Option<PathBuf> {
     store_dir_from(
@@ -166,20 +166,20 @@ fn store_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> 
     if let Some(xdg) = xdg {
         let p = PathBuf::from(xdg);
         if p.is_absolute() {
-            return Some(p.join("ops").join("trusted"));
+            return Some(p.join("sbx").join("trusted"));
         }
     }
     let home = PathBuf::from(home?);
     if home.is_absolute() {
-        return Some(home.join(".local/state/ops/trusted"));
+        return Some(home.join(".local/state/sbx/trusted"));
     }
     None
 }
 
 /// Canonicalized path string used as the marker key. When the file itself cannot
 /// be canonicalized (typically: it no longer exists), its parent is canonicalized
-/// and the file name re-appended, so `ops trust` (file present) and a later
-/// `ops untrust` (file deleted) still derive the same key. Only when even the
+/// and the file name re-appended, so `sbx trust` (file present) and a later
+/// `sbx untrust` (file deleted) still derive the same key. Only when even the
 /// parent is gone does it fall back to the raw path. Never panics.
 fn canonical_string(config_path: &Path) -> String {
     let resolved = config_path.canonicalize().unwrap_or_else(|_| {
@@ -236,7 +236,7 @@ pub(crate) fn verdict_for_hash(
 /// file that is present but unsafe is also reported `Untrusted`: the trusted
 /// content folds in that file, and an unverifiable one cannot yield `Trusted`.
 pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
-    let ops_bytes = match crate::config::safety::read_safe_bytes(config_path) {
+    let sbx_bytes = match crate::config::safety::read_safe_bytes(config_path) {
         Ok(b) => b,
         Err(_) => return TrustState::Untrusted,
     };
@@ -247,19 +247,19 @@ pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
     verdict_for_hash(
         store_dir,
         config_path,
-        &content_hash(&ops_bytes, &mise_inputs),
+        &content_hash(&sbx_bytes, &mise_inputs),
     )
 }
 
 /// Record trust for `config_path`: hash the file's current contents — and those of
 /// a sibling mise file, when present — and write the marker. Every byte is read
-/// through the safety gate, so a world-writable or foreign-owned `.ops.toml` *or*
+/// through the safety gate, so a world-writable or foreign-owned `.sbx.toml` *or*
 /// mise file is refused rather than blessed, and the hash covers exactly the gated
 /// bytes of both.
 pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
-    let ops_bytes = crate::config::safety::read_safe_bytes(config_path)?;
+    let sbx_bytes = crate::config::safety::read_safe_bytes(config_path)?;
     let mise_inputs = mise_inputs_for(config_path)?;
-    let hash = content_hash(&ops_bytes, &mise_inputs);
+    let hash = content_hash(&sbx_bytes, &mise_inputs);
 
     // Create the store owner-only from the start, so a loose umask never leaves a
     // world-readable window between creation and tightening, and tighten a dir
@@ -309,17 +309,17 @@ mod tests {
     fn store_dir_prefers_absolute_xdg_then_absolute_home() {
         assert_eq!(
             store_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/xdg/ops/trusted"))
+            Some(PathBuf::from("/xdg/sbx/trusted"))
         );
         // a relative XDG is ignored (it must never resolve against the cwd); HOME
         // is used instead
         assert_eq!(
             store_dir_from(Some(OsStr::new("rel/xdg")), Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.local/state/ops/trusted"))
+            Some(PathBuf::from("/home/u/.local/state/sbx/trusted"))
         );
         assert_eq!(
             store_dir_from(None, Some(OsStr::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.local/state/ops/trusted"))
+            Some(PathBuf::from("/home/u/.local/state/sbx/trusted"))
         );
         // no absolute base anywhere ⇒ refuse rather than fall back to the cwd
         assert_eq!(
@@ -333,7 +333,7 @@ mod tests {
     fn trust_then_state_is_trusted_and_an_edit_makes_it_changed() {
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
 
         assert_eq!(state(store.path(), &cfg), TrustState::Untrusted);
@@ -354,7 +354,7 @@ mod tests {
     fn untrust_reports_whether_a_marker_existed_and_reverts_to_untrusted() {
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
 
         trust(store.path(), &cfg).unwrap();
@@ -374,7 +374,7 @@ mod tests {
         // when untrusted still derives the same marker key.
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
 
         trust(store.path(), &cfg).unwrap();
@@ -390,7 +390,7 @@ mod tests {
     fn a_malformed_marker_is_changed_not_untrusted() {
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
 
         // a marker with only the path line (hash line lost to a truncated write)
@@ -404,7 +404,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
 
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_without_a_mise_file_equals_hashing_the_ops_file() {
+    fn content_hash_without_a_mise_file_equals_hashing_the_sbx_file() {
         // A project that never had a mise file keeps a marker byte-identical to the
         // single-file hash, so no existing trust churns when the mise path lands.
         assert_eq!(content_hash(b"a = 1\n", &[]), hash_bytes(b"a = 1\n"));
@@ -431,10 +431,10 @@ mod tests {
     fn content_hash_with_a_mise_file_differs_and_is_unambiguous() {
         // Folding a mise file in changes the hash...
         assert_ne!(
-            content_hash(b"ops", &mise(b"mise")),
-            content_hash(b"ops", &[])
+            content_hash(b"sbx", &mise(b"mise")),
+            content_hash(b"sbx", &[])
         );
-        // ...and the framing is unambiguous: shifting a byte across the ops/mise
+        // ...and the framing is unambiguous: shifting a byte across the sbx/mise
         // boundary (a bare concatenation would collide here) hashes distinctly.
         assert_ne!(
             content_hash(b"ab", &mise(b"c")),
@@ -442,21 +442,21 @@ mod tests {
         );
         // Editing the mise file alone changes the hash.
         assert_ne!(
-            content_hash(b"ops", &mise(b"v1")),
-            content_hash(b"ops", &mise(b"v2"))
+            content_hash(b"sbx", &mise(b"v1")),
+            content_hash(b"sbx", &mise(b"v2"))
         );
         // The filename is bound in: the same bytes under a different candidate name
         // hash distinctly, so moving an entry between files re-arms.
         assert_ne!(
-            content_hash(b"ops", &[(".mise.toml".into(), b"x".to_vec())]),
-            content_hash(b"ops", &[("mise.toml".into(), b"x".to_vec())])
+            content_hash(b"sbx", &[(".mise.toml".into(), b"x".to_vec())]),
+            content_hash(b"sbx", &[("mise.toml".into(), b"x".to_vec())])
         );
     }
 
     #[test]
     fn mise_files_for_discovers_every_candidate_in_precedence_order() {
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         assert!(mise_files_for(&cfg).is_empty(), "no mise file yet");
 
         // the lowest-precedence name alone is found
@@ -487,7 +487,7 @@ mod tests {
         for name in ["mise.local.toml", ".tool-versions"] {
             let store = TmpDir::new();
             let proj = TmpDir::new();
-            let cfg = proj.join(".ops.toml");
+            let cfg = proj.join(".sbx.toml");
             std::fs::write(&cfg, b"x = 1\n").unwrap();
             std::fs::write(proj.join(name), b"node 20\n").unwrap();
 
@@ -509,7 +509,7 @@ mod tests {
         // lower-precedence file cannot be edited without re-arming the gate.
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
         std::fs::write(proj.join(".mise.toml"), b"[tools]\na = \"1\"\n").unwrap();
         std::fs::write(proj.join("mise.toml"), b"[tools]\nb = \"1\"\n").unwrap();
@@ -529,7 +529,7 @@ mod tests {
     fn a_mise_file_folds_into_trust_and_editing_either_file_re_arms() {
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         let mise = proj.join(".mise.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
         std::fs::write(&mise, b"[tools]\nnode = \"20\"\n").unwrap();
@@ -537,14 +537,14 @@ mod tests {
         trust(store.path(), &cfg).unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
 
-        // editing the mise file re-arms the gate, just like editing the .ops.toml
+        // editing the mise file re-arms the gate, just like editing the .sbx.toml
         std::fs::write(&mise, b"[tools]\nnode = \"22\"\n").unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Changed);
 
         trust(store.path(), &cfg).unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Trusted);
 
-        // editing the .ops.toml re-arms it too
+        // editing the .sbx.toml re-arms it too
         std::fs::write(&cfg, b"x = 2\n").unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Changed);
     }
@@ -553,7 +553,7 @@ mod tests {
     fn adding_or_removing_a_mise_file_re_arms_a_trusted_project() {
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         let mise = proj.join(".mise.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
 
@@ -577,7 +577,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let store = TmpDir::new();
         let proj = TmpDir::new();
-        let cfg = proj.join(".ops.toml");
+        let cfg = proj.join(".sbx.toml");
         let mise = proj.join(".mise.toml");
         std::fs::write(&cfg, b"x = 1\n").unwrap();
         std::fs::write(&mise, b"[tools]\nnode = \"20\"\n").unwrap();
@@ -588,7 +588,7 @@ mod tests {
             trust(store.path(), &cfg).is_err(),
             "must not trust a project whose mise file is world-writable"
         );
-        // ...and is never reported Trusted even if the .ops.toml was trusted earlier
+        // ...and is never reported Trusted even if the .sbx.toml was trusted earlier
         // (here it was not), failing closed on the unverifiable file.
         assert_eq!(state(store.path(), &cfg), TrustState::Untrusted);
     }

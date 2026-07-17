@@ -107,7 +107,7 @@ fn add_inner(
     if dest.exists() {
         return Err(format!(
             "a store named `{name}` is already configured — remove it first with \
-             `ops plugins store rm {name}`"
+             `sbx plugins store rm {name}`"
         ));
     }
 
@@ -171,7 +171,7 @@ fn add_inner(
             if dest.exists() {
                 Err(format!(
                     "a store named `{name}` appeared concurrently — remove it first with \
-                     `ops plugins store rm {name}`"
+                     `sbx plugins store rm {name}`"
                 ))
             } else {
                 Err(format!("could not place the store cache: {e}"))
@@ -209,7 +209,7 @@ pub(crate) struct Published {
 /// Sign a directory of resolver plugins into a store: produce the `catalogue.toml` (pinning each
 /// plugin by the digest of its own subdirectory), a detached `catalogue.toml.sig`, the store's
 /// `pubkey`, and a `.gitattributes` that keeps the signed bytes byte-exact across a clone. The
-/// operator then commits and hosts the result; ops does not touch git here. The producing
+/// operator then commits and hosts the result; sbx does not touch git here. The producing
 /// counterpart of [`add`]: it builds exactly what `add`/`update`/`install` later verify, reusing
 /// the very digest function the verifier reproduces so the two can never drift.
 pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<Published, String> {
@@ -324,7 +324,7 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
     let signature = keypair.sign(bytes.as_bytes());
 
     // The four store-root artifacts, overwriting any from a prior publish. These are the operator's
-    // repository files (to be committed), not ops's owner-only cache, so a plain write is correct.
+    // repository files (to be committed), not sbx's owner-only cache, so a plain write is correct.
     overwrite(&dir.join(CATALOGUE), bytes.as_bytes())?;
     overwrite(
         &dir.join(CATALOGUE_SIG),
@@ -335,7 +335,7 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
         crate::plugin_store::to_hex(&pubkey).as_bytes(),
     )?;
     // git must deliver the signed bytes verbatim: `* -text` disables end-of-line conversion so the
-    // catalogue a consumer clones is byte-identical to the one signed here. (ops's own fetch also
+    // catalogue a consumer clones is byte-identical to the one signed here. (sbx's own fetch also
     // nulls git's config, neutralizing this verifier-side; the attribute protects other clients.)
     overwrite(&dir.join(GITATTRIBUTES), b"* -text\n")?;
 
@@ -560,7 +560,7 @@ pub(crate) fn install_plugin(
     if !layout.store_path(store_name).exists() {
         return Err(format!(
             "no store named `{store_name}` is configured \
-             (configure one with `ops plugins store add`)"
+             (configure one with `sbx plugins store add`)"
         ));
     }
 
@@ -568,7 +568,7 @@ pub(crate) fn install_plugin(
     let entry = catalogue.plugins.get(plugin_name).ok_or_else(|| {
         format!(
             "store `{store_name}` lists no plugin named `{plugin_name}` \
-             (see `ops plugins store info {store_name}`)"
+             (see `sbx plugins store info {store_name}`)"
         )
     })?;
 
@@ -590,7 +590,7 @@ pub(crate) fn install_plugin(
     if !is_real_dir {
         return Err(format!(
             "store `{store_name}` lists plugin `{plugin_name}` at `{}`, but that directory is not \
-             in the cached checkout — try `ops plugins store update {store_name}`",
+             in the cached checkout — try `sbx plugins store update {store_name}`",
             entry.path
         ));
     }
@@ -806,7 +806,7 @@ fn decode_key(hex: &str) -> Result<[u8; 32], String> {
 }
 
 /// The most a store-root artifact (catalogue or signature) may be — a generous bound over any real
-/// catalogue, so a fetched store cannot make ops read an unbounded file (a symlink to `/dev/zero`)
+/// catalogue, so a fetched store cannot make sbx read an unbounded file (a symlink to `/dev/zero`)
 /// into memory before its signature is even checked.
 const STORE_FILE_MAX: u64 = 8 * 1024 * 1024;
 

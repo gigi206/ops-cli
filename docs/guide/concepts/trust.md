@@ -1,10 +1,10 @@
 # The trust gate
 
-Security-relevant fields in a project's `.ops.toml` apply only once you have
+Security-relevant fields in a project's `.sbx.toml` apply only once you have
 **trusted** the file. Trust is bound to the file's *contents*, on the
 [direnv](https://direnv.net/) model, so any edit re-arms the gate.
 
-See also: [`ops trust` / `untrust`](../cli/trust.md) · [Security model](security-model.md) · [Configuration overview](../configuration/README.md).
+See also: [`sbx trust` / `untrust`](../cli/trust.md) · [Security model](security-model.md) · [Configuration overview](../configuration/README.md).
 
 ## Free fields vs security fields
 
@@ -30,16 +30,16 @@ do, so it is honored only from a trusted source.
 
 There are two ways a config is trusted:
 
-- **Trusted by location.** The **global** `ops.toml`
-  ([`~/.config/ops/ops.toml`](directory-layout.md)) and **app profile files** under
-  `~/.config/ops/apps/` are trusted because *you* placed them there. They need no
-  `ops trust`.
-- **Trusted by content.** A project `.ops.toml` is trusted only when you run
-  [`ops trust`](../cli/trust.md), which records a hash of the file's current bytes.
+- **Trusted by location.** The **global** `sbx.toml`
+  ([`~/.config/sbx/sbx.toml`](directory-layout.md)) and **app profile files** under
+  `~/.config/sbx/apps/` are trusted because *you* placed them there. They need no
+  `sbx trust`.
+- **Trusted by content.** A project `.sbx.toml` is trusted only when you run
+  [`sbx trust`](../cli/trust.md), which records a hash of the file's current bytes.
 
 ## How content trust works
 
-`ops trust` records a **SHA-256 of the whole file** (not a parsed subset) under the
+`sbx trust` records a **SHA-256 of the whole file** (not a parsed subset) under the
 [trust store](directory-layout.md), keyed by the config's canonical path. When a
 launch loads the config, it recomputes the hash of the exact bytes it parses and
 compares:
@@ -52,16 +52,16 @@ compares:
 
 Because the hash covers the *whole file*, any edit — even to a free field — re-arms
 the gate. This is deliberate: after editing a trusted file, its security fields stop
-applying until you run `ops trust` again.
+applying until you run `sbx trust` again.
 
 When a project also has mise config files (`.mise.toml`, `mise.toml`,
-`.tool-versions`, `mise.local.toml`), they are hashed **together** with `.ops.toml`,
+`.tool-versions`, `mise.local.toml`), they are hashed **together** with `.sbx.toml`,
 so editing either re-arms the gate and a mise `[env]` cannot change under a trusted
 posture without re-trusting.
 
 ## Why the whole file
 
-Hashing a parsed subset would let an attacker add a security field a later `ops`
+Hashing a parsed subset would let an attacker add a security field a later `sbx`
 version understands without changing the recorded subset. Hashing the whole bytes
 keeps trust independent of the schema: whatever the file says, if it changed, it must
 be re-approved.
@@ -72,12 +72,12 @@ The config-editing commands warn when an edit re-arms trust and offer to re-trus
 one step:
 
 ```sh
-ops config set network ask --trust     # write, then re-trust
-ops config edit --trust                # edit, then re-trust as the editor closes
+sbx config set network ask --trust     # write, then re-trust
+sbx config edit --trust                # edit, then re-trust as the editor closes
 ```
 
 The global config and app profiles are trusted by location, so writing to either
-needs no re-trust. See [`ops config`](../cli/config.md).
+needs no re-trust. See [`sbx config`](../cli/config.md).
 
 ## The safety gate
 

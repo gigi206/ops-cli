@@ -1,13 +1,13 @@
-# Claude Code — Anthropic's agentic coding CLI, sandboxed by ops.
+# Claude Code — Anthropic's agentic coding CLI, sandboxed by sbx.
 #
-#   ops app import profiles/claude-code.toml
-#   ops app claude-code
+#   sbx app import profiles/claude-code.toml
+#   sbx app claude-code
 #
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls Anthropic's
 # standalone `claude` release binary) into the app's persistent home — no host
 # mutation, no nixpkgs lag, and none of the unfree-license gate nixpkgs imposes.
 # It is equipped at the latest upstream version on the first launch in a project, then pinned to
-# that version. Advance an already-installed version with `ops upgrade mise`: it runs `mise upgrade`
+# that version. Advance an already-installed version with `sbx upgrade mise`: it runs `mise upgrade`
 # in the app's own home and rolls the aqua package forward to the newest upstream release.
 cmd = "claude"
 
@@ -44,7 +44,7 @@ claude-code = "mise:aqua:anthropics/claude-code"
 # (account/connectivity check), and MCP proxy (JSON-RPC: POST/SSE/DELETE) hosts stay open to
 # every verb. The agent may run on untrusted project code, but it can only reach these. (If a
 # future `claude-code` release moves hosts or needs another verb, the proxy reports the refusal
-# — add it; check ahead with `ops test net <url>`.)
+# — add it; check ahead with `sbx test net <url>`.)
 # An app is read-by-default ({GET,HEAD}): the API/MCP hosts the agent POSTs to are opened to
 # all verbs with `{*}`; the pure download hosts stay `{GET,HEAD}` (least privilege).
 #
@@ -62,7 +62,7 @@ mode = "deny"
 allow = [
     # Claude API — the account/connectivity check plus the `/voice` speech-to-text WebSocket
     # (`api.anthropic.com/api/ws/speech_to_text/voice_stream`). `{*,WS}` = all HTTP verbs AND the
-    # WebSocket: ops requires an explicit `WS` opt-in that a plain `{*}` does NOT cover (a WS is an
+    # WebSocket: sbx requires an explicit `WS` opt-in that a plain `{*}` does NOT cover (a WS is an
     # unredactable bidirectional channel), so without the `WS` voice dictation reads `denied-method`.
     "{*,WS} https://api.anthropic.com",
     "{*} https://platform.claude.com",
@@ -85,7 +85,7 @@ allow = [
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 DISABLE_TELEMETRY = "1"
 DISABLE_ERROR_REPORTING = "1"
-# ANTHROPIC_API_KEY = "sk-ant-ops-placeholder-replaced-by-the-egress-proxy"
+# ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
 
 # [secret."api.anthropic.com"]
 # from = "env://ANTHROPIC_API_KEY"

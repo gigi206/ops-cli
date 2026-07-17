@@ -28,22 +28,22 @@
 //! tops up what is missing without disturbing anything the project's own nix has
 //! since written.
 //!
-//! The cage's nix reads and writes only this self-contained store; ops's own seed
+//! The cage's nix reads and writes only this self-contained store; sbx's own seed
 //! is the only reader of the shared store, and only ever reads its content paths
 //! (which stay byte-identical) — though `nix-store --dump-db` may checkpoint the
 //! shared database's write-ahead log, a benign fold-in that mutates no store path.
 //!
-//! Concurrency needs no lock of ops's own. Two sandboxes of the same project can
+//! Concurrency needs no lock of sbx's own. Two sandboxes of the same project can
 //! seed at once: each path is placed by atomic rename, so a lost race is just a
 //! redundant copy discarded — the winner's identical, content-addressed path is
 //! already in place — and the database registration goes through `nix-store
 //! --load-db`, whose concurrent merges serialise on the project database's own
 //! SQLite locking (and a lost lock race under heavy parallel load is retried, the
-//! merge being idempotent — so this needs no lock of ops's own here either). The
+//! merge being idempotent — so this needs no lock of sbx's own here either). The
 //! broader case — a seed racing a live in-cage `nix build`, or
 //! two agents building into one project store — rests on nix's own concurrent
 //! store-access guarantee (that database locking plus the per-store-path `.lock`
-//! files a build takes); it is nix's domain, not ops's, and is not exercised here.
+//! files a build takes); it is nix's domain, not sbx's, and is not exercised here.
 //! The only cost of not serialising the copies is wasted I/O: each concurrent *cold*
 //! seed copies the closure before its rename, so the losers' copies are thrown away
 //! — bounded by the base closure, and only on a project's first, cold launches (a
@@ -110,13 +110,13 @@ fn store_dir_for(layout: &Layout, project_id: &str) -> PathBuf {
 
 /// Whether `project_id` already has a seeded store on disk. A project that was never launched has
 /// none, so there is nothing to garbage-collect — and seeding one just to sweep it would be a heavy
-/// (possibly networked) side effect, which is what lets `ops gc` skip a never-launched directory
+/// (possibly networked) side effect, which is what lets `sbx gc` skip a never-launched directory
 /// rather than materialise a store for it.
 pub(crate) fn store_exists(layout: &Layout, project_id: &str) -> bool {
     store_dir_for(layout, project_id).exists()
 }
 
-/// An advisory lock serialising ops's reads of the **shared** store against the shared-store
+/// An advisory lock serialising sbx's reads of the **shared** store against the shared-store
 /// garbage collector. The seed below copies store paths out of the shared store *directly* — not
 /// as a nix process — so nothing in nix stops a concurrent `nix-store --gc <shared>` from deleting
 /// a path mid-copy and corrupting the project store it lands in. The seeder holds this **shared**
@@ -177,7 +177,7 @@ pub(crate) fn lock_exclusive(layout: &Layout) -> io::Result<SharedGcLock> {
     acquire_shared_gc_lock(layout, true)
 }
 
-/// Record the project's canonical path in a durable marker beside its store, so a later `ops gc`
+/// Record the project's canonical path in a durable marker beside its store, so a later `sbx gc`
 /// can recognise this tree (`<id>` alone is a one-way hash) and reclaim it once the project
 /// directory is gone. Atomic (temp + rename) and owner-only; overwritten each launch — the path is
 /// stable, so the write is idempotent. The path is stored as raw bytes, no newline, so even a
@@ -578,7 +578,7 @@ fn retry_transient<T>(
 /// A small backoff offset (0..40 ms), derived from the pid AND the thread id so it is stable within
 /// one caller yet distinct across concurrent ones — enough to desynchronise retriers that lost the
 /// same lock race, without a randomness source. The pid is essential: the real racers are separate
-/// `ops` processes seeding the same project, and each on its main thread would hash the same thread
+/// `sbx` processes seeding the same project, and each on its main thread would hash the same thread
 /// id and re-collide in lockstep; mixing the (process-unique) pid spreads them apart.
 fn backoff_jitter_ms() -> u64 {
     use std::hash::{Hash, Hasher};
@@ -656,15 +656,15 @@ mod tests {
 
     #[test]
     fn store_dir_is_under_the_project_runtime() {
-        let layout = Layout::under(Path::new("/data/ops"));
+        let layout = Layout::under(Path::new("/data/sbx"));
         assert_eq!(
             store_dir_for(&layout, "abc"),
-            PathBuf::from("/data/ops/projects/abc/store")
+            PathBuf::from("/data/sbx/projects/abc/store")
         );
         // the marker is a sibling of the store under the same runtime tree
         assert_eq!(
             project_dir(&layout, "abc").join(PROJECT_MARKER),
-            PathBuf::from("/data/ops/projects/abc/project")
+            PathBuf::from("/data/sbx/projects/abc/project")
         );
     }
 

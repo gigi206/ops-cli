@@ -5,7 +5,7 @@ config and referenced from a `[network]` allow/deny list with `@<name>`, so a se
 hosts is shared across apps instead of rewritten per profile.
 
 ```toml
-# ~/.config/ops/ops.toml
+# ~/.config/sbx/sbx.toml
 [net.groups]
 ci-hosts   = ["api.github.com", "codeload.github.com", "*.githubusercontent.com"]
 ai-vendors = ["api.anthropic.com", "api.openai.com"]
@@ -18,7 +18,7 @@ mode  = "deny"
 allow = ["@ci-hosts", "registry.npmjs.org"]
 ```
 
-See also: [Network modes](../networking/modes.md) · [Rule grammar](../networking/rules.md) · [Egress groups (networking)](../networking/groups.md) · [`ops net groups`](../cli/net.md).
+See also: [Network modes](../networking/modes.md) · [Rule grammar](../networking/rules.md) · [Egress groups (networking)](../networking/groups.md) · [`sbx net groups`](../cli/net.md).
 
 ## Global-only
 
@@ -45,21 +45,21 @@ group entry that will not resolve (malformed or nested) is flagged.
 ## Managing groups
 
 ```sh
-ops net groups                 # list every group and its entry count
-ops net groups ci-hosts        # resolve one group to its entries
-ops net allow @ci-hosts        # add a reference to a config's allow list
-ops net rules --expand         # show effective rules with groups unfolded
+sbx net groups                 # list every group and its entry count
+sbx net groups ci-hosts        # resolve one group to its entries
+sbx net allow @ci-hosts        # add a reference to a config's allow list
+sbx net rules --expand         # show effective rules with groups unfolded
 ```
 
 Groups move between machines as a portable `[net.groups]` fragment:
 
 ```sh
-ops net groups export > groups.toml           # or export named groups
-ops net groups import groups.toml             # merge into the global config
-ops net groups import groups.toml --force      # overwrite same-named groups
+sbx net groups export > groups.toml           # or export named groups
+sbx net groups import groups.toml             # merge into the global config
+sbx net groups import groups.toml --force      # overwrite same-named groups
 ```
 
 `import` merges into the global config (trusted by location), preserving existing
 groups and comments; a name clash is refused unless `--force`. Imported groups are
 inert until referenced by a `[network]` list. See
-[`ops net groups`](../cli/net.md) and [Egress groups](../networking/groups.md).
+[`sbx net groups`](../cli/net.md) and [Egress groups](../networking/groups.md).

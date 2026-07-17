@@ -1,22 +1,22 @@
 # The app framework
 
-An **app** is a named, reusable agent launcher — the flagship surface of `ops`. It
+An **app** is a named, reusable agent launcher — the flagship surface of `sbx`. It
 bundles a command with a security and tooling overlay so you can run an autonomous
 agent *on* untrusted code, safely and repeatably.
 
 ```sh
-ops app import profiles/claude-code.toml   # a deliberate trust act
-ops app claude-code                        # launch it, sandboxed
+sbx app import profiles/claude-code.toml   # a deliberate trust act
+sbx app claude-code                        # launch it, sandboxed
 ```
 
-See also: [`[app.<name>]` config](../configuration/apps.md) · [Per-app home](home.md) · [Portable profiles](profiles.md) · [Profile catalog](catalog.md) · [`ops app`](../cli/app.md).
+See also: [`[app.<name>]` config](../configuration/apps.md) · [Per-app home](home.md) · [Portable profiles](profiles.md) · [Profile catalog](catalog.md) · [`sbx app`](../cli/app.md).
 
 ## The two-layer model
 
 An app is an **overlay** over the sandbox baseline:
 
 ```
-sandbox baseline  +  [app.<name>] overlay  →  what `ops app <name>` launches
+sandbox baseline  +  [app.<name>] overlay  →  what `sbx app <name>` launches
 ```
 
 The baseline is your project's resolved config (global + project). The overlay adds the
@@ -52,11 +52,11 @@ under the app's posture), nor flip a trusted app's [`home_scope`](home.md) from
 
 ## Declaring an app
 
-- **Inline** — a `[app.<name>]` table in a project `.ops.toml` (or the global
-  `ops.toml`, though a *global* app is best kept as a profile file). See
+- **Inline** — a `[app.<name>]` table in a project `.sbx.toml` (or the global
+  `sbx.toml`, though a *global* app is best kept as a profile file). See
   [`[app.<name>]`](../configuration/apps.md).
 - **A profile file** — a standalone `apps/<name>.toml`, imported with
-  [`ops app import`](../cli/app.md). This is the portable form. See
+  [`sbx app import`](../cli/app.md). This is the portable form. See
   [Portable profiles](profiles.md).
 
 ## Where to go next

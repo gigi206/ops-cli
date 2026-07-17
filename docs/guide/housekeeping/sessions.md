@@ -1,16 +1,16 @@
 # Sessions
 
-`ops` keeps a **daemonless** on-disk registry of live sandbox sessions. There is no
+`sbx` keeps a **daemonless** on-disk registry of live sandbox sessions. There is no
 background process — a session writes a record, and reading the registry validates and
 prunes it.
 
-See also: [`ops session`](../cli/session.md) · [Directory layout](../concepts/directory-layout.md).
+See also: [`sbx session`](../cli/session.md) · [Directory layout](../concepts/directory-layout.md).
 
 ## The registry
 
 Each sandbox writes a record under [`<data>/sessions/`](../concepts/directory-layout.md).
 A record is a **liveness-validated hint**, never trusted to be cleaned up:
-[`ops session ls`](../cli/session.md#ls) prunes by liveness, so a crash or `SIGKILL` self-heals rather
+[`sbx session ls`](../cli/session.md#ls) prunes by liveness, so a crash or `SIGKILL` self-heals rather
 than leaving a stale entry.
 
 Liveness is `(pid, start_time)` — the process start time from `/proc/<pid>/stat`, which
@@ -24,28 +24,28 @@ derives its runtime id from — so the registry and the runtime never disagree.
 
 | Launch | Registers |
 |---|---|
-| [`ops run --detach`](../cli/run.md) | a background session |
-| [`ops app --detach`](../cli/app.md) | a background agent session |
-| [`ops shell`](../cli/shell.md) | while the shell runs (unlinked on exit) |
-| interactive [`ops app`](../cli/app.md) | while the app runs |
+| [`sbx run --detach`](../cli/run.md) | a background session |
+| [`sbx app --detach`](../cli/app.md) | a background agent session |
+| [`sbx shell`](../cli/shell.md) | while the shell runs (unlinked on exit) |
+| interactive [`sbx app`](../cli/app.md) | while the app runs |
 
 ## Listing, attaching, stopping
 
 ```sh
-ops ls                 # the live sessions (app sessions show their app name)
-ops attach <id>        # open a shell inside a session's live cage
-ops stop <id>          # SIGTERM, then SIGKILL after the grace delay
-ops stop --all         # every session
+sbx ls                 # the live sessions (app sessions show their app name)
+sbx attach <id>        # open a shell inside a session's live cage
+sbx stop <id>          # SIGTERM, then SIGKILL after the grace delay
+sbx stop --all         # every session
 ```
 
-- [`ops session attach <id>`](../cli/session.md#attach) joins the running cage and opens a shell **inside**
+- [`sbx session attach <id>`](../cli/session.md#attach) joins the running cage and opens a shell **inside**
   it (the agent's live processes, its real `/tmp`, its network) — like `docker exec -it`. The
   shell re-applies the cage's confinement (seccomp denylist, `no_new_privs`, dropped
   capabilities), so it is never a wider hole than the agent.
-- [`ops session stop`](../cli/session.md#stop) tears down the whole cage subtree (SIGTERM → SIGKILL after
+- [`sbx session stop`](../cli/session.md#stop) tears down the whole cage subtree (SIGTERM → SIGKILL after
   `--delay`, default 10s).
 
-The `<id>` is the PID `ops session ls` shows.
+The `<id>` is the PID `sbx session ls` shows.
 
 ## Background agents
 
@@ -54,14 +54,14 @@ The `<id>` is the PID `ops session ls` shows.
 another terminal:
 
 ```sh
-ops app claude-code --detach
-ops ls
-ops attach <id>       # look in
-ops stop <id>         # done
+sbx app claude-code --detach
+sbx ls
+sbx attach <id>       # look in
+sbx stop <id>         # done
 ```
 
 ## The "second terminal"
 
 Because a project's runtime is deterministic (derived from the canonical project path),
 a second sandbox launched in the same project shares its persistent `$HOME` — so opening
-a second `ops shell` in the same project "just works" without any session coordination.
+a second `sbx shell` in the same project "just works" without any session coordination.

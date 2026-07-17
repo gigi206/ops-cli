@@ -1,4 +1,4 @@
-//! `ops search <query>` — discovering the `nix:` tools (and `[packages]` attributes)
+//! `sbx search <query>` — discovering the `nix:` tools (and `[packages]` attributes)
 //! a project can declare, by querying nixhub.
 //!
 //! Host-side and read-only: it resolves nothing into the sandbox, mutates no store,
@@ -190,7 +190,7 @@ fn render(
     let mut out = String::new();
     if matches.is_empty() {
         out.push_str(&format!(
-            "{h}ops search{r} \"{query}\" — no packages found on nixhub\n"
+            "{h}sbx search{r} \"{query}\" — no packages found on nixhub\n"
         ));
         return out;
     }
@@ -202,10 +202,10 @@ fn render(
             versions,
         }) if !versions.is_empty() => {
             if summary.is_empty() {
-                out.push_str(&format!("{h}ops search{r} \"{query}\" — `{n}{pkg}{r}`\n\n"));
+                out.push_str(&format!("{h}sbx search{r} \"{query}\" — `{n}{pkg}{r}`\n\n"));
             } else {
                 out.push_str(&format!(
-                    "{h}ops search{r} \"{query}\" — `{n}{pkg}{r}`: {summary}\n\n"
+                    "{h}sbx search{r} \"{query}\" — `{n}{pkg}{r}`: {summary}\n\n"
                 ));
             }
             out.push_str(&format!("{h}versions for {system} (newest first):{r}\n"));
@@ -244,13 +244,13 @@ fn render(
         Some(Exact::Unavailable { pkg }) => {
             push_match_table(&mut out, query, matches, pal);
             out.push_str(&format!(
-                "\ncould not fetch versions for `{n}{pkg}{r}` — try `ops search {pkg}` again.\n"
+                "\ncould not fetch versions for `{n}{pkg}{r}` — try `sbx search {pkg}` again.\n"
             ));
         }
         None => {
             push_match_table(&mut out, query, matches, pal);
             out.push_str(&format!(
-                "\nname a package exactly to see its versions, e.g. `ops search {}`\n",
+                "\nname a package exactly to see its versions, e.g. `sbx search {}`\n",
                 matches[0].name
             ));
         }
@@ -263,7 +263,7 @@ fn render(
 fn push_match_table(out: &mut String, query: &str, matches: &[Match], pal: &Palette) {
     let (h, n, r) = (pal.head, pal.name, pal.reset);
     out.push_str(&format!(
-        "{h}ops search{r} \"{query}\" — {} match{} on nixhub\n\n",
+        "{h}sbx search{r} \"{query}\" — {} match{} on nixhub\n\n",
         matches.len(),
         if matches.len() == 1 { "" } else { "es" }
     ));

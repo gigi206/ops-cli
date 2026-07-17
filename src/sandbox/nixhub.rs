@@ -1,11 +1,11 @@
 //! Resolving a project's `nix:` mise tools to pinned nixpkgs references.
 //!
 //! mise's `[tools]` may name a tool through the `nix` backend as `nix:<pkg>` (e.g.
-//! `nix:nodejs`). For those, ops resolves each `(<pkg>, <version>)` to the *exact*
+//! `nix:nodejs`). For those, sbx resolves each `(<pkg>, <version>)` to the *exact*
 //! nixpkgs revision that shipped it — the same thing the mise-nix plugin does, but
-//! performed by ops so the realisation runs through ops's own provisioning path. The
+//! performed by sbx so the realisation runs through sbx's own provisioning path. The
 //! mapping `(<pkg>, <version>) -> <commit>#<attr>` is answered by a single nixhub GET,
-//! which ops fetches with nix's *own* fetcher — so no HTTP client dependency is added.
+//! which sbx fetches with nix's *own* fetcher — so no HTTP client dependency is added.
 //!
 //! Only the `nix:` prefix is in scope. The part after it is already the nixhub /
 //! nixpkgs package name (used verbatim), so there is no tool-name translation to do. A
@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
 
-/// The mise backend prefix ops resolves through nix; the remainder of the tool token
+/// The mise backend prefix sbx resolves through nix; the remainder of the tool token
 /// is the nixhub/nixpkgs package name.
 const NIX_PREFIX: &str = "nix:";
 
@@ -32,7 +32,7 @@ const NIX_PREFIX: &str = "nix:";
 const NIXHUB_BASE: &str = "https://search.devbox.sh/v2/pkg?name=";
 
 /// The nixhub fuzzy-search endpoint. A GET of `<base><url-encoded query>` returns the
-/// matching packages with a name and one-line summary each. Used by `ops search`.
+/// matching packages with a name and one-line summary each. Used by `sbx search`.
 pub(crate) const NIXHUB_SEARCH_BASE: &str = "https://search.devbox.sh/v2/search?q=";
 
 /// The idiomatic version file, which is line-oriented rather than TOML.
@@ -70,7 +70,7 @@ pub(crate) struct Pin {
 }
 
 /// A tool declared through a mise backend other than `nix:` (a backend prefix such as
-/// `aqua:`/`github:`/`npm:`, or a plain registry tool like `node`). ops does not
+/// `aqua:`/`github:`/`npm:`, or a plain registry tool like `node`). sbx does not
 /// host-provision these; the launcher auto-equips them in-cage via mise, so the token is
 /// kept exactly as written together with its requested version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,17 +81,17 @@ pub(crate) struct MiseTool {
     pub(crate) version: String,
 }
 
-/// A project's declared `[tools]`, split by how ops handles each: the valid `nix:` tools
+/// A project's declared `[tools]`, split by how sbx handles each: the valid `nix:` tools
 /// it resolves and host-provisions (in precedence order, the first declaration of a token
 /// winning); the tools for any other mise backend it auto-equips in-cage; and the `nix:`
 /// tokens it cannot resolve. Every token lands in exactly one bucket — none is dropped.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeclaredTools {
-    /// The `nix:` tools ops will resolve and provision, highest precedence first.
+    /// The `nix:` tools sbx will resolve and provision, highest precedence first.
     pub(crate) nix: Vec<NixTool>,
     /// Tools for another mise backend, auto-equipped in-cage (kept with their version).
     pub(crate) non_nix: Vec<MiseTool>,
-    /// `nix:` tokens ops cannot resolve (a malformed package name or version), reported so
+    /// `nix:` tokens sbx cannot resolve (a malformed package name or version), reported so
     /// the declaration can be fixed.
     pub(crate) malformed: Vec<String>,
 }
@@ -196,7 +196,7 @@ pub(crate) fn current_system() -> String {
     format!("{}-linux", std::env::consts::ARCH)
 }
 
-/// Provision a trusted project's declared `nix:` tools into ops's store and report the
+/// Provision a trusted project's declared `nix:` tools into sbx's store and report the
 /// `bin` directories to prepend to the sandbox PATH, plus a warning for any malformed
 /// `nix:` token. Resolution is cached in a per-project lock so nixhub is queried once
 /// per `(tool, version)` rather than on every launch — seeded then reused, like the
@@ -234,7 +234,7 @@ pub(crate) fn provision(
     if !trusted {
         for tool in &declared.nix {
             warnings.push(format!(
-                "withholding nix tool `{}` (project untrusted — run `ops trust`)",
+                "withholding nix tool `{}` (project untrusted — run `sbx trust`)",
                 tool.pkg
             ));
         }
@@ -277,7 +277,7 @@ pub(crate) fn provision(
                 // Persist each freshly-resolved pin at once, ADDITIVELY: re-read the on-disk lock,
                 // merge just this pin, and write. This way a later tool's provision failure does not
                 // discard the pins resolved so far (the old whole-loop write-at-the-end lost them),
-                // and a concurrent `ops upgrade mise` that rolled a *different* entry is merged in
+                // and a concurrent `sbx upgrade mise` that rolled a *different* entry is merged in
                 // rather than clobbered by a stale whole-lock rewrite.
                 let mut disk = ResolutionLock::read(&lock_path);
                 disk.insert(&tool.pkg, &tool.version, system, &pin);
@@ -313,7 +313,7 @@ pub(crate) fn provision(
 }
 
 /// The outcome of re-resolving one declared tool — or pruning a stale entry, or noting a
-/// token ops does not handle — during an explicit tools roll. Pure data, so the report is
+/// token sbx does not handle — during an explicit tools roll. Pure data, so the report is
 /// rendered and unit-tested without touching nix or the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolUpgrade {
@@ -348,14 +348,14 @@ pub(crate) enum ToolUpgrade {
     },
     /// A lock entry for a tool no longer declared on this system, dropped from the lock.
     Pruned { pkg: String, request: String },
-    /// A declared token `ops upgrade` does not roll, reported so it is never a silent
+    /// A declared token `sbx upgrade` does not roll, reported so it is never a silent
     /// omission. `mise_managed` distinguishes a tool for another mise backend (equipped
     /// in-cage, so mise tracks its freshness) from a malformed `nix:` token (unresolvable).
     Ignored { token: String, mise_managed: bool },
 }
 
 /// Re-resolve a trusted project's declared `nix:` tools against nixhub and rewrite the
-/// per-project resolution lock — the explicit roll-forward `ops upgrade mise` performs.
+/// per-project resolution lock — the explicit roll-forward `sbx upgrade mise` performs.
 /// Only the lock is rewritten; the new pins are realised on the next launch, exactly as a
 /// channel roll downloads its base on the next launch.
 ///
@@ -575,7 +575,7 @@ pub(crate) fn resolve(
 
 /// Fetch a package's nixhub metadata as JSON. `pkg` is re-validated here so a value
 /// that somehow reached this point cannot break out of the request URL, then the GET
-/// rides the shared fetcher. Exposed so `ops search` can show an exact match's versions.
+/// rides the shared fetcher. Exposed so `sbx search` can show an exact match's versions.
 pub(crate) fn fetch_metadata(
     nix: &Path,
     layout: &Layout,
@@ -596,7 +596,7 @@ pub(crate) fn fetch_metadata(
 
 /// Fetch a URL's body and parse it as JSON, using nix's `fetchurl` + `readFile` so the
 /// request rides nix's own HTTP+TLS fetcher (no added HTTP dependency) and the body
-/// lands in ops's own store, never the host's `/nix`. The `{ url; name; }` form gives
+/// lands in sbx's own store, never the host's `/nix`. The `{ url; name; }` form gives
 /// the store path a fixed name, so a URL carrying a query string — including
 /// percent-encoding, whose `%` is illegal in a derived store-path name — fetches
 /// cleanly. `url` must already be safe to place in a nix string literal: callers build
@@ -629,7 +629,7 @@ pub(crate) fn fetch_url_text(
 }
 
 /// Fetch a URL's body via nix's `fetchurl` + `readFile`, so the request rides nix's own HTTP+TLS
-/// fetcher (no added HTTP dependency) and the body lands in ops's own store, never the host's
+/// fetcher (no added HTTP dependency) and the body lands in sbx's own store, never the host's
 /// `/nix`. The `{ url; name; }` form gives the store path a fixed name, so a URL carrying a query
 /// string — including percent-encoding, whose `%` is illegal in a derived store-path name — fetches
 /// cleanly. `url` must already be safe to place in a nix string literal: callers build it from a
@@ -637,12 +637,12 @@ pub(crate) fn fetch_url_text(
 /// quote, `$`, or backslash to escape the expression.
 fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::Result<Vec<u8>> {
     let expr = format!(
-        "builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"ops-nixhub\"; }})"
+        "builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"sbx-nixhub\"; }})"
     );
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"]);
     // `builtins.fetchurl` caches by `tarball-ttl` (an hour by default), so a repeat within the
-    // window returns the OLD body. `ops upgrade` explicitly wants the newest metadata, so it forces
+    // window returns the OLD body. `sbx upgrade` explicitly wants the newest metadata, so it forces
     // a re-fetch with `tarball-ttl 0`; the launch/search paths keep the cache for speed.
     if fresh {
         cmd.args(["--option", "tarball-ttl", "0"]);
@@ -729,7 +729,7 @@ fn pick_by_version<'a>(
 }
 
 /// The platform entry of `release` whose `system` matches, or `None` when the release
-/// ships no build for it. Exposed so `ops search` reads a release's per-system commit
+/// ships no build for it. Exposed so `sbx search` reads a release's per-system commit
 /// and attribute through the same accessor the resolver uses (no shape drift).
 pub(crate) fn platform_for<'a>(
     release: &'a serde_json::Value,
@@ -1070,7 +1070,7 @@ mod resolve_tests {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         let proj = TmpDir::new();
-        // a `nix:` tool ops provisions, beside a non-`nix:` tool the launcher auto-equips
+        // a `nix:` tool sbx provisions, beside a non-`nix:` tool the launcher auto-equips
         // in-cage (so `provision` neither realises nor warns about it) and a malformed `nix:`
         // token it does warn about
         let files = vec![(
@@ -1140,7 +1140,7 @@ mod resolve_tests {
             b"[tools]\n\"nix:jq\" = \"latest\"\nnode = \"20\"\n\"nix:bad name\" = \"1\"\n".to_vec(),
         )];
         let out = provision(
-            Path::new("/nonexistent/ops-test-nix"),
+            Path::new("/nonexistent/sbx-test-nix"),
             &layout,
             proj.path(),
             &files,
@@ -1207,7 +1207,7 @@ mod resolve_tests {
                 .to_vec(),
         )];
 
-        let bogus_nix = Path::new("/nonexistent/ops-test-nix");
+        let bogus_nix = Path::new("/nonexistent/sbx-test-nix");
         let outcomes = upgrade_tools(bogus_nix, &layout, project.path(), &mise_files, &system)
             .expect("upgrade_tools rewrites the lock");
 

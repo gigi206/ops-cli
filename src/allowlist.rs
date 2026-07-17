@@ -25,8 +25,8 @@
 //! raw connection). A `tcp://` rule is host:port only: it carries no `/path` and no `{method}` prefix
 //! (a raw stream has no HTTP to inspect); an `http://` rule carries the full HTTP vocabulary (path,
 //! method) like the TLS default. `udp://` is not yet supported, and any other scheme is rejected (a
-//! scheme stays meaningful on a *request*, e.g. `ops test net https://…`, `ops test net http://…`, or
-//! `ops test net tcp://host:22`).
+//! scheme stays meaningful on a *request*, e.g. `sbx test net https://…`, `sbx test net http://…`, or
+//! `sbx test net tcp://host:22`).
 //! Any L7 entry may carry a leading **method prefix** `{VERB,VERB,...}` (uppercase verbs, e.g.
 //! `{GET,HEAD} github.com`) that scopes the rule to those HTTP methods only — a rule with no
 //! prefix applies to every verb. The leading `{` is an unambiguous sentinel (no rule kind starts
@@ -88,7 +88,7 @@ pub(crate) struct Rule {
     pub(crate) methods: Methods,
     pub(crate) layer: Layer,
     /// The `[net.groups]` group this rule was expanded from (`@<name>`), or `None` for a
-    /// directly-written or built-in rule. Display-only provenance for `ops net rules` — it names
+    /// directly-written or built-in rule. Display-only provenance for `sbx net rules` — it names
     /// where a rule came from, and is deliberately **excluded from equality** (a rule's identity is
     /// its match, not its origin), so adding it changes no matching, dedup, or policy-comparison
     /// behavior. It travels with the rule: `apply_default_methods` mutates methods in place and
@@ -341,7 +341,7 @@ impl Ports {
 /// request, so the target is percent-decoded, its `.`/`..` resolved, and its query split
 /// off **before** matching; otherwise a literal `deny /secret` is trivially dodged by
 /// `/secret?x`, `/secret/`, `%2f`, or `/foo/../secret`. The proxy that enforces the policy
-/// must build this *identically* to the `ops test net` tester, or the tester would mispredict.
+/// must build this *identically* to the `sbx test net` tester, or the tester would mispredict.
 pub(crate) struct Request {
     /// The request host, lowercased and (for an IP literal) canonicalized.
     host: String,
@@ -590,7 +590,7 @@ impl Eq for RuleKind {}
 /// always empty for L4), then a scheme that always names the layer, then its kind. The scheme is
 /// `tcp://` for [`Layer::L4`], `http://` for [`Layer::L7Clear`], and `https://` for an inspected-
 /// over-TLS host-level kind (`Ip`/`Host`/`Subdomain`/`Url`) — so the layer is visible wherever rules
-/// are listed (`ops net rules`, `ops config`). A `re:` regex carries its own scheme inside the
+/// are listed (`sbx net rules`, `sbx config`). A `re:` regex carries its own scheme inside the
 /// pattern (the matched URL is `https://…`), so it shows none. Every form round-trips through
 /// [`classify`]: a bare-typed host re-renders as `https://host` (the explicit equal form), and
 /// `{GET} https://h`, `http://h`, `tcp://h:port` reparse to themselves.
@@ -664,7 +664,7 @@ pub(crate) enum DefaultAction {
     Allow,
     /// No rule matched ⇒ park the request for a live decision (allow rules still auto-pass,
     /// deny rules still auto-fail). The proxy blocks the connection until a host-side
-    /// `ops net pending allow|deny` answers it or the configured timeout elapses (deny).
+    /// `sbx net pending allow|deny` answers it or the configured timeout elapses (deny).
     Ask,
 }
 
@@ -728,7 +728,7 @@ impl Http2Host {
         })
     }
 
-    /// The canonical entry text (for `ops config show`): `host`, `*.domain`, or the `:port` form.
+    /// The canonical entry text (for `sbx config show`): `host`, `*.domain`, or the `:port` form.
     pub(crate) fn display(&self) -> String {
         let host = if self.subdomain {
             format!("*.{}", self.host)
@@ -759,8 +759,8 @@ pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
     /// Log-suppression rules (SELinux `dontaudit`): a **denied** request matching one of these is
-    /// still refused and still counted in `ops net stats`, but its refusal is kept out of the
-    /// default `ops net log` view (`ops net log --all` shows it). Consulted only at logging time via
+    /// still refused and still counted in `sbx net stats`, but its refusal is kept out of the
+    /// default `sbx net log` view (`sbx net log --all` shows it). Consulted only at logging time via
     /// [`Self::muted`], never in [`Self::explain`] — so a mute entry can never change a verdict.
     mute: Vec<Rule>,
     default_action: DefaultAction,
@@ -796,7 +796,7 @@ impl EgressPolicy {
 
     /// Attach the log-suppression (`mute`) rules, returning the policy (builder style). A denied
     /// request matching one is refused as usual and counted in stats, but kept out of the default
-    /// `ops net log` view. Purely a logging filter — never consulted by [`Self::explain`].
+    /// `sbx net log` view. Purely a logging filter — never consulted by [`Self::explain`].
     pub(crate) fn with_mute(mut self, mute: Vec<Rule>) -> Self {
         self.mute = mute;
         self
@@ -818,7 +818,7 @@ impl EgressPolicy {
 
     /// Set whether the `ask`-mode park notice is printed to stderr (builder style). `true` (the
     /// default) shows it; `false` silences the inline alert — the request still parks, answerable
-    /// via `ops net pending`. Inert unless the default action is [`DefaultAction::Ask`].
+    /// via `sbx net pending`. Inert unless the default action is [`DefaultAction::Ask`].
     pub(crate) fn with_ask_notice(mut self, show: bool) -> Self {
         self.suppress_ask_notice = !show;
         self
@@ -860,7 +860,7 @@ impl EgressPolicy {
         self
     }
 
-    /// The configured HTTP/2 hosts (for `ops config show`).
+    /// The configured HTTP/2 hosts (for `sbx config show`).
     pub(crate) fn http2_hosts(&self) -> &[Http2Host] {
         &self.http2
     }
@@ -887,8 +887,8 @@ impl EgressPolicy {
 
     /// Whether a **denied** request to `host:port` for `path`/`method` matches a mute rule — a
     /// LOG-ONLY filter (SELinux `dontaudit`): it never affects the verdict (only [`Self::explain`]
-    /// does), only whether the refusal enters the default `ops net log` view. The proxy consults it
-    /// at logging time, after the verdict, and still counts a muted refusal in `ops net stats`.
+    /// does), only whether the refusal enters the default `sbx net log` view. The proxy consults it
+    /// at logging time, after the verdict, and still counts a muted refusal in `sbx net stats`.
     /// Matching is deliberately **port- and transport-agnostic** ([`Rule::matches_mute`]): a mute
     /// names a *host* to silence, so a bare-host mute suppresses that host's refusals on every port
     /// and scheme — its cleartext `http://…:80` noise (a component updater, an NTP-over-HTTP probe)
@@ -915,7 +915,7 @@ impl EgressPolicy {
     /// Whether a request to `host`:`port` for `path` is permitted: it must match some
     /// allow rule and no deny rule — **deny always wins**. A thin bool view over
     /// [`Self::explain`], for the verb `GET` (these tests exercise method-agnostic rules).
-    /// The filtering proxy and the `ops test net` tester both decide through [`Self::explain`]
+    /// The filtering proxy and the `sbx test net` tester both decide through [`Self::explain`]
     /// (they need the deciding rule and the request's actual method), so this convenience view is
     /// exercised only by tests.
     #[allow(dead_code)]
@@ -977,12 +977,12 @@ impl EgressPolicy {
     }
 
     /// Explain the verdict for a **cleartext** (`http://`) request — the plaintext sibling of
-    /// [`Self::explain`], used by the proxy's absolute-form handler and `ops test net http://…`.
+    /// [`Self::explain`], used by the proxy's absolute-form handler and `sbx test net http://…`.
     /// Cleartext is **strictly opt-in**, exactly like the [`Self::l4_decision`] splice: only an
     /// explicit `http://` ([`Layer::L7Clear`]) allow rule permits it, and the policy's **default
     /// action is never consulted** — so a `mode = "allow"` denylist does not silently open cleartext,
     /// and under `mode = "ask"` an unmatched cleartext request **denies rather than parks** (an
-    /// interactive `ops net pending` prompt cannot convey "this connection is unencrypted"; opening
+    /// interactive `sbx net pending` prompt cannot convey "this connection is unencrypted"; opening
     /// cleartext is a deliberate config act, not a live one). A regex or a bare/`https://` allow rule
     /// never opens cleartext (they are the inspected-over-TLS layer).
     ///
@@ -1057,7 +1057,7 @@ impl EgressPolicy {
     ///   rule against. To block a host outright, use a host-level deny, not a path deny.
     ///
     /// L4 allow rules carry no path or method, so only host:port is matched. The filtering proxy and
-    /// `ops test net tcp://…` both decide through this one function, so enforcement cannot drift from
+    /// `sbx test net tcp://…` both decide through this one function, so enforcement cannot drift from
     /// the tester.
     pub(crate) fn l4_decision(&self, host: &str, port: u16) -> L4Decision<'_> {
         let req = Request::new(host, port, "/");
@@ -1084,7 +1084,7 @@ impl EgressPolicy {
     /// `http://` (L7Clear) allow rule is HTTP-inspected too, so it must inherit the app's read-by-
     /// default posture; leaving it all-verbs would let a cleartext rule silently escape the
     /// `{GET,HEAD}` default a `default_methods` sets. Applied once, at app-policy resolution, so the
-    /// proxy, `ops test net`, and `ops net rules` all consume the same resolved policy and cannot
+    /// proxy, `sbx test net`, and `sbx net rules` all consume the same resolved policy and cannot
     /// diverge.
     pub(crate) fn apply_default_methods(&mut self, default: &Methods) {
         let Methods::Only(set) = default else { return };
@@ -1150,7 +1150,7 @@ pub(crate) enum L4Decision<'a> {
     /// connection takes the inspected L7 path (the MITM) instead, where the HTTP verdict — or, for a
     /// non-TLS stream, a failed handshake — decides it. Carries the deciding deny rule. The proxy
     /// treats this exactly like [`Self::NoMatch`] (it splices only on [`Self::Splice`]); the
-    /// distinction exists so `ops test net` can explain *why* a covered host did not splice.
+    /// distinction exists so `sbx test net` can explain *why* a covered host did not splice.
     Suppressed(&'a Rule),
     /// No `tcp://` allow opts this host:port into a splice: the connection takes the inspected L7
     /// path (the MITM), where the HTTP verdict decides it.
@@ -1158,7 +1158,7 @@ pub(crate) enum L4Decision<'a> {
 }
 
 /// The verdict [`EgressPolicy::explain`] reaches for one request, with the rule that
-/// decided it — for the `ops test net` URL tester. Deny wins, so `DeniedBy` can name a deny
+/// decided it — for the `sbx test net` URL tester. Deny wins, so `DeniedBy` can name a deny
 /// rule even when an allow rule also matched.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Decision<'a> {
@@ -1172,7 +1172,7 @@ pub(crate) enum Decision<'a> {
     /// rule, so the SSRF guard treats this like an unnamed host (private addresses refused).
     AllowedDefault,
     /// No rule matched, and the policy asks by default: the request parks for a live decision.
-    /// The proxy blocks until answered or the ask timeout elapses; the `ops test net` tester
+    /// The proxy blocks until answered or the ask timeout elapses; the `sbx test net` tester
     /// reports it as "would ask" since there is no static verdict.
     Ask,
 }
@@ -1544,7 +1544,7 @@ fn parse_port(s: &str) -> Result<u16, String> {
 /// explicit `:port` or the scheme default, `path` everything after the authority (the root `/`
 /// if none) **including any query string**. The host must be a hostname, an IPv4 literal, or a
 /// bracketed IPv6 literal (`https://[::1]:8080/x`). This is the *request* parser — a request is
-/// a concrete connection, so it keeps the scheme (which sets the port); the `ops test net`
+/// a concrete connection, so it keeps the scheme (which sets the port); the `sbx test net`
 /// tester is its only caller. Allow/deny *rules* are scheme-free and parsed by [`classify`].
 pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), String> {
     let Some((scheme_len, default_port)) = scheme_of(url) else {
@@ -1597,7 +1597,7 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
     Ok((canonical_host(host), port, path))
 }
 
-/// Parse a `tcp://host:port` target naming one **L4 request** (for `ops test net tcp://…`) into
+/// Parse a `tcp://host:port` target naming one **L4 request** (for `sbx test net tcp://…`) into
 /// `(host, port)`. The port is **required** — an L4 test names one concrete port (there is no scheme
 /// default to fall back on, and a raw splice has no notion of the web ports). The host is a hostname,
 /// an IPv4 literal, or a bracketed IPv6 literal (`tcp://[::1]:22`); a raw stream carries no path, so
@@ -2811,7 +2811,7 @@ mod tests {
             Some("/log"),
             None
         ));
-        // The mute set is surfaced for `ops net rules` / `ops config show`.
+        // The mute set is surfaced for `sbx net rules` / `sbx config show`.
         assert_eq!(policy.mute_rules().len(), 1);
     }
 
@@ -3283,7 +3283,7 @@ mod tests {
         // {80,443} bare default and the later {443} one, so these stay stable across that change.)
 
         // a host-level regex deny (no path) matches the synthetic URL → suppresses the splice, and
-        // the decision names the deciding deny (so `ops test net` can explain why it did not splice).
+        // the decision names the deciding deny (so `sbx test net` can explain why it did not splice).
         let p = EgressPolicy::new(
             vec![rule("tcp://evil.com:443")],
             vec![rule(r"re:^https://evil\.com")],

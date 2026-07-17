@@ -33,28 +33,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The global config file name, under `…/ops/`.
-const GLOBAL_CONFIG: &str = "ops.toml";
+/// The global config file name, under `…/sbx/`.
+const GLOBAL_CONFIG: &str = "sbx.toml";
 /// The project config file name, in the project root.
-pub(crate) const PROJECT_CONFIG: &str = ".ops.toml";
+pub(crate) const PROJECT_CONFIG: &str = ".sbx.toml";
 /// The source label a one-shot override's warnings carry, so a dropped/malformed override field
 /// reads as `override: …` rather than as coming from a config file.
 const OVERRIDE_SOURCE: &str = "override";
-/// The directory of imported app profiles, beside the global config (`…/ops/apps/`). A profile
+/// The directory of imported app profiles, beside the global config (`…/sbx/apps/`). A profile
 /// is a standalone TOML file (a top-level [`schema::RawApp`]) whose *filename* is the app name;
 /// it is trusted by location, exactly like the global config, so its apps join the global app
 /// layer. (Note: under the *config* root this `apps` directory holds profiles, while under the
 /// *data* root an `apps` directory holds each app's persistent home — two distinct trees.)
 const PROFILES_DIR: &str = "apps";
 
-/// The subcommand verbs of `ops app` (`ops app import`, `… export`, `… rm`, `… list`). They are
-/// reserved so they can never also be an app name: otherwise `ops app import` would be ambiguous
+/// The subcommand verbs of `sbx app` (`sbx app import`, `… export`, `… rm`, `… list`). They are
+/// reserved so they can never also be an app name: otherwise `sbx app import` would be ambiguous
 /// between the subcommand and launching an app literally named `import`, and such an app could be
 /// neither launched nor managed. Reserving them removes the ambiguity at the source — they are
 /// rejected as app names wherever one is resolved.
 pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list", "ls"];
 
-/// Whether `name` is a reserved `ops app` subcommand verb, and so may not be an app name.
+/// Whether `name` is a reserved `sbx app` subcommand verb, and so may not be an app name.
 pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
     RESERVED_APP_VERBS.contains(&name)
 }
@@ -69,7 +69,7 @@ pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
 /// locale / the resolver load by path (`GCONV_PATH`, `LOCPATH`, `NLSPATH`,
 /// `RESOLV_HOST_CONF`, `HOSTALIASES`), glibc's tunables (`GLIBC_TUNABLES`), and
 /// the shell startup hooks (`BASH_ENV`, `ENV`, `IFS`); plus the structural
-/// userland ops owns (`HOME`, `PATH`) and the loader the sandbox routes foreign
+/// userland sbx owns (`HOME`, `PATH`) and the loader the sandbox routes foreign
 /// binaries through (`NIX_LD`, `NIX_LD_LIBRARY_PATH` — the same `AT_SECURE` concern
 /// as `LD_*`, since they steer what code a foreign binary loads). A trusted config
 /// is exempt — vouching for it honors the whole schema, and overriding these harms
@@ -84,13 +84,13 @@ pub(crate) fn is_reserved_app_verb(name: &str) -> bool {
 /// protection applies, so it is closed for symmetry — completely, since a single
 /// missed pointer leaves the hole open.
 ///
-/// Under a network allowlist the cage's only egress is the ops-managed filtering
+/// Under a network allowlist the cage's only egress is the sbx-managed filtering
 /// proxy (Model B): the proxy-control variables (`http_proxy`/`https_proxy`/
 /// `all_proxy`/`no_proxy`, either case) and the CA-bundle variables the cage trusts
-/// ops's per-session CA through ([`crate::sandbox::egress::CA_FILE_ENV_KEYS`]) are
+/// sbx's per-session CA through ([`crate::sandbox::egress::CA_FILE_ENV_KEYS`]) are
 /// reserved for the same reason. In-cage a redirected proxy or a swapped CA only
-/// fails closed (empty netns, ops-minted certs), but the same Mode-A protection as
-/// `NIX_CONFIG` applies, and the keys ops *sets* are exactly the keys it protects.
+/// fails closed (empty netns, sbx-minted certs), but the same Mode-A protection as
+/// `NIX_CONFIG` applies, and the keys sbx *sets* are exactly the keys it protects.
 fn is_reserved_env_key(key: &str) -> bool {
     key.starts_with("LD_")
         || is_proxy_env_key(key)
@@ -112,7 +112,7 @@ fn is_reserved_env_key(key: &str) -> bool {
                 | "ENV"
                 // Interactive-shell code-exec hooks: bash runs `PROMPT_COMMAND` before each prompt
                 // and evaluates `$(...)` in `PS1`, so an untrusted `[env]` setting them would run
-                // code in the user's later Mode-A `ops shell`, exactly like `BASH_ENV`/`ENV`.
+                // code in the user's later Mode-A `sbx shell`, exactly like `BASH_ENV`/`ENV`.
                 | "PROMPT_COMMAND"
                 | "PS1"
                 | "IFS"
@@ -126,7 +126,7 @@ fn is_reserved_env_key(key: &str) -> bool {
                 // backend from these, so — like `LD_*`/`NIX_LD` — an untrusted `[env]` could aim a
                 // trusted GPU-enabled app's mesa at an attacker `.so` in the project tree and run
                 // code in the app's cage. Data-redirection vars (`FONTCONFIG_FILE`) stay free; these
-                // are code-load paths. ops sets them for `gpu = true`; a trusted config still may.
+                // are code-load paths. sbx sets them for `gpu = true`; a trusted config still may.
                 | "LIBGL_DRIVERS_PATH"
                 | "GBM_BACKENDS_PATH"
                 | "__EGL_VENDOR_LIBRARY_DIRS"
@@ -135,7 +135,7 @@ fn is_reserved_env_key(key: &str) -> bool {
 
 /// The proxy-control variables, matched case-insensitively (tools honor both
 /// `http_proxy` and `HTTP_PROXY`). `no_proxy`/`all_proxy` and the WebSocket variants
-/// (`ws_proxy`/`wss_proxy`, which ops sets so a WS client routes through the proxy too)
+/// (`ws_proxy`/`wss_proxy`, which sbx sets so a WS client routes through the proxy too)
 /// are reserved alongside the HTTP ones, so an untrusted project can neither redirect the
 /// cage's egress nor carve a hole around it.
 fn is_proxy_env_key(key: &str) -> bool {
@@ -151,7 +151,7 @@ fn is_proxy_env_key(key: &str) -> bool {
 /// package's source is always explicit and never silently mis-routed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Backend {
-    /// `nix:<attr>` — a nixpkgs attribute, provisioned host-side into ops's store
+    /// `nix:<attr>` — a nixpkgs attribute, provisioned host-side into sbx's store
     /// (seeded, offline-reusable). nixpkgs is curated, so building it host-side is
     /// justified; realising it can run a build, so it is honored only from a trusted
     /// source.
@@ -159,7 +159,7 @@ pub(crate) enum Backend {
     /// `mise:<token>` — a mise backend token (e.g. `aqua:openai/codex`, `opencode`,
     /// `npm:@scope/pkg`, or `nix:<pkg>` for nixhub), equipped in-cage globally via
     /// `mise use -g` (durable, on PATH, fetched at launch). The token after `mise:`
-    /// is passed to mise verbatim — ops adds no per-backend logic of its own.
+    /// is passed to mise verbatim — sbx adds no per-backend logic of its own.
     Mise(String),
     /// `flake:<ref>` — an arbitrary nix flake reference (e.g.
     /// `github:owner/repo#attr`), built **in-cage** with `nix build --out-link` into
@@ -170,14 +170,14 @@ pub(crate) enum Backend {
     Flake(String),
     /// A `[flakes.<name>]` inline flake — the full `flake.nix` source written directly in the
     /// config, plus the output attribute to build. Unlike [`Backend::Flake`] (a reference to an
-    /// external flake) the source is ours: ops stages it, binds it read-only into the cage, and
+    /// external flake) the source is ours: sbx stages it, binds it read-only into the cage, and
     /// builds `path:<dir>#<attr>` **in-cage**, so the same containment as `flake:` applies to
     /// arbitrary inline build code. The out-link is keyed by the source's content hash, so editing
     /// the flake in the config rebuilds at the next launch. It floats — no persisted lock, no
-    /// `ops upgrade` — so inputs are pinned inside the `flake.nix` for reproducibility.
+    /// `sbx upgrade` — so inputs are pinned inside the `flake.nix` for reproducibility.
     FlakeInline { content: String, attr: String },
     /// `deb:<url>` — a prebuilt Debian package (a `.deb`) at an `https://` URL, provisioned
-    /// **host-side** into ops's store (seeded, offline-reusable, like `nix:`): ops resolves the
+    /// **host-side** into sbx's store (seeded, offline-reusable, like `nix:`): sbx resolves the
     /// URL to a content hash, then builds a generated derivation that unpacks the `.deb` and
     /// `autoPatchelfHook`s it against a curated Electron/Chromium library set. Extraction runs no
     /// build script (`dontBuild`), so evaluating it host-side is safe (unlike a `flake:`). Meant
@@ -185,11 +185,11 @@ pub(crate) enum Backend {
     /// URL (a GitHub `…/releases/latest/download/<stable-name>.deb` URL already rolls forward), or
     /// `github:<owner>/<repo>` — which queries the repo's latest release and selects its linux
     /// `.deb` asset, so a project whose asset name embeds the version still rolls forward on
-    /// `ops upgrade`. The stored string is the raw locator (the URL or `github:<owner>/<repo>`);
+    /// `sbx upgrade`. The stored string is the raw locator (the URL or `github:<owner>/<repo>`);
     /// [`super::sandbox::deb`] dispatches on its shape.
     Deb(String),
     /// `appimage:<url>` — a prebuilt AppImage at an `https://` URL, provisioned **host-side** into
-    /// ops's store exactly like `deb:` (seeded, offline-reusable): ops resolves the URL to a content
+    /// sbx's store exactly like `deb:` (seeded, offline-reusable): sbx resolves the URL to a content
     /// hash, then builds a generated derivation that extracts the AppImage's squashfs and
     /// `autoPatchelfHook`s it against the same curated Electron/Chromium library set. Extraction runs
     /// no build script (`dontBuild`) — and, crucially, the AppImage is unpacked at BUILD time rather
@@ -197,7 +197,7 @@ pub(crate) enum Backend {
     /// seccomp denylist. Meant for a GUI/desktop app distributed only as an `.AppImage`. Two forms: a
     /// direct `https://…/….AppImage` URL, or `github:<owner>/<repo>` — which queries the repo's
     /// latest release and selects its linux `.AppImage` asset, so a project whose asset name embeds
-    /// the version still rolls forward on `ops upgrade`. The stored string is the raw locator (the URL
+    /// the version still rolls forward on `sbx upgrade`. The stored string is the raw locator (the URL
     /// or `github:<owner>/<repo>`); [`super::sandbox::appimage`] dispatches on its shape.
     AppImage(String),
 }
@@ -219,7 +219,7 @@ impl Backend {
         }
     }
 
-    /// A short label naming the provider, for `ops config` and warnings.
+    /// A short label naming the provider, for `sbx config` and warnings.
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Backend::Nix(_) => "nix",
@@ -318,7 +318,7 @@ pub(crate) enum GuiPolicy {
 /// injection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeaderSecret {
-    /// The resolver chain ops reads the plaintext from at launch — host-side, never inside the
+    /// The resolver chain sbx reads the plaintext from at launch — host-side, never inside the
     /// cage — tried in order, the first that resolves winning (a later one is a fallback).
     pub(crate) sources: Vec<SecretSource>,
     /// The concrete host (and optional path) the injection is scoped to: a request to
@@ -332,7 +332,7 @@ pub(crate) struct HeaderSecret {
 }
 
 impl HeaderSecret {
-    /// A human label for `ops config` — the resolver chain by locator (a variable name or file
+    /// A human label for `sbx config` — the resolver chain by locator (a variable name or file
     /// path), never a value. A single source reads as itself; a fallback chain is joined with
     /// `, then ` so the precedence is visible.
     pub(crate) fn describe_sources(&self) -> String {
@@ -344,7 +344,7 @@ impl HeaderSecret {
     }
 }
 
-/// One resolver ref in a secret's source chain — where ops reads the plaintext, host-side at
+/// One resolver ref in a secret's source chain — where sbx reads the plaintext, host-side at
 /// launch. Only the locator is kept here, never the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SecretSource {
@@ -367,7 +367,7 @@ pub(crate) enum SecretSource {
 }
 
 impl SecretSource {
-    /// A human label for `ops config` — the variable name, file path, or sops file/key, none of
+    /// A human label for `sbx config` — the variable name, file path, or sops file/key, none of
     /// which is the secret itself.
     pub(crate) fn describe(&self) -> String {
         match self {
@@ -426,7 +426,7 @@ impl HeaderShape {
         }
     }
 
-    /// A short label for `ops config` — the *effective* type, reconstructed from the
+    /// A short label for `sbx config` — the *effective* type, reconstructed from the
     /// shape, so `raw` with a `"Bearer "` prefix reads as `bearer` (the value is identical);
     /// a non-standard prefix is shown so the effective form is never hidden.
     pub(crate) fn describe(&self) -> String {
@@ -466,8 +466,8 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Where a resolved value came from — the provenance `ops config` surfaces so a value's origin
-/// is never a mystery. `Default` is ops's built-in; `Global`/`Project` are the two config files.
+/// Where a resolved value came from — the provenance `sbx config` surfaces so a value's origin
+/// is never a mystery. `Default` is sbx's built-in; `Global`/`Project` are the two config files.
 /// A later layer overrides an earlier one at the same key, so for a value this is the *winning*
 /// source. The launcher ignores it (provenance is a display affordance). Inheritance — an app
 /// field taking the baseline's value — is a *display* concept derived at view time (the resolution
@@ -475,14 +475,14 @@ fn base64_encode(input: &[u8]) -> String {
 /// here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum Provenance {
-    /// ops's built-in default — no config layer set this value.
+    /// sbx's built-in default — no config layer set this value.
     #[default]
     Default,
-    /// The global `ops.toml` (trusted by location).
+    /// The global `sbx.toml` (trusted by location).
     Global,
-    /// The project `.ops.toml`.
+    /// The project `.sbx.toml`.
     Project,
-    /// A one-shot command-line/environment override (`--config`/`--env`/`OPS_*`), trusted by
+    /// A one-shot command-line/environment override (`--config`/`--env`/`SBX_*`), trusted by
     /// invocation — the final word, applied over every config layer.
     Override,
 }
@@ -519,14 +519,14 @@ pub(crate) struct Resolved {
     /// one at the same key.
     pub(crate) env: Vec<(String, String)>,
     /// Which layer each `env` key's winning value came from. Keyed by the env key (stable, so
-    /// the lookup matches what `env` lists). A display affordance for `ops config`; only the
+    /// the lookup matches what `env` lists). A display affordance for `sbx config`; only the
     /// baseline resolution records it (an app overlay does not), and the launcher ignores it.
     pub(crate) env_layer: BTreeMap<String, Provenance>,
     /// Extra host paths to bind, each read-only or read-write.
     pub(crate) binds: Vec<Bind>,
     /// Which layer each effective bind came from, keyed by the *canonical* path `binds`
     /// lists (re-keyed after canonicalization in [`load`], so the lookup matches the displayed
-    /// path). A display affordance for `ops config`, recorded only at the baseline.
+    /// path). A display affordance for `sbx config`, recorded only at the baseline.
     pub(crate) bind_layer: BTreeMap<PathBuf, Provenance>,
     /// Declared tools, in declaration order, each tagged with its source's trust.
     /// Admission (and the nix work it implies) is the launcher's, not decided here.
@@ -539,7 +539,7 @@ pub(crate) struct Resolved {
     /// to its own source; an untrusted or changed project's value is dropped (it is a
     /// supply-chain-relevant choice), so this is never set from one.
     pub(crate) nixpkgs_project: Option<String>,
-    /// The project's mise file, when one is present beside a `.ops.toml`. Its tools
+    /// The project's mise file, when one is present beside a `.sbx.toml`. Its tools
     /// are resolved (trusted-only) by a later stage; here it records the file's
     /// presence and the gating verdict. Discovered in [`load`] (it is I/O), so the
     /// pure [`resolve`] always leaves it `None`.
@@ -549,13 +549,13 @@ pub(crate) struct Resolved {
     /// dropped with a warning — it may not narrow or widen the network.
     pub(crate) network: NetworkPolicy,
     /// Which layer supplied the winning `network` posture (`Default` when neither config set it).
-    /// A display affordance for `ops config`; the launcher ignores it.
+    /// A display affordance for `sbx config`; the launcher ignores it.
     pub(crate) network_origin: Provenance,
-    /// Whether the egress proxy records its per-host decision counters (`ops net stats`). On by
+    /// Whether the egress proxy records its per-host decision counters (`sbx net stats`). On by
     /// default; a trusted layer's `[network] stats = false` turns the audit off. Gated like the
     /// rest of `[network]` — an untrusted project's table (and so its `stats`) is dropped, so it
     /// cannot disable the auditing of its own egress. Baseline-only: a `stats` key inside an
-    /// `[app.<name>.network]` table is ignored (warned), and `ops config show --app` does not surface
+    /// `[app.<name>.network]` table is ignored (warned), and `sbx config show --app` does not surface
     /// the inherited value — the app inherits this baseline.
     pub(crate) egress_stats: bool,
     /// The resolved GUI posture: the default (`None`) unless the global config or a trusted
@@ -590,7 +590,7 @@ pub(crate) struct Resolved {
     pub(crate) forward: Vec<u16>,
     /// Which layer supplied the winning `forward` set. The union means a value here is the
     /// *highest-trust* layer that contributed any port (`Default` when none did). A display
-    /// affordance for `ops config`; the launcher ignores it.
+    /// affordance for `sbx config`; the launcher ignores it.
     pub(crate) forward_origin: Provenance,
     /// The resolved cgroup resource limits (anti-DoS): the built-in defaults, with any field a
     /// trusted `[limits]` table (global or project) overrode. A security field, gated like
@@ -598,7 +598,7 @@ pub(crate) struct Resolved {
     /// layered independently (global under a trusted project), like `env`.
     pub(crate) limits: crate::sandbox::cgroup::Limits,
     /// The per-field provenance of `limits`: which layer set each of the three, or `Default` for a
-    /// field no config overrode. A display affordance for `ops config`.
+    /// field no config overrode. A display affordance for `sbx config`.
     pub(crate) limits_origin: LimitsOrigin,
     /// The trusted relaxation of the cage's mandatory seccomp denylist (the built-in denylist plus
     /// any syscall a trusted `[seccomp] allow` re-permits). A security field, gated like
@@ -607,7 +607,7 @@ pub(crate) struct Resolved {
     pub(crate) seccomp: crate::sandbox::seccomp::SeccompPolicy,
     /// Which layer supplied the seccomp relaxation — the highest-trust layer that lifted anything
     /// (`Default` when neither config did), like `forward_origin`. A display affordance for
-    /// `ops config`; the launcher ignores it.
+    /// `sbx config`; the launcher ignores it.
     pub(crate) seccomp_origin: Provenance,
     /// Host device nodes granted into the cage from a trusted `[devices] allow` (each an absolute
     /// path under `/dev/`). A security field, gated like `network`/`seccomp` — an untrusted project
@@ -616,7 +616,7 @@ pub(crate) struct Resolved {
     pub(crate) devices: Vec<PathBuf>,
     /// Which layer supplied the device grant — the highest-trust layer that granted anything
     /// (`Default` when neither config did), like `forward_origin`. A display affordance for
-    /// `ops config`; the launcher ignores it.
+    /// `sbx config`; the launcher ignores it.
     pub(crate) devices_origin: Provenance,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
@@ -630,8 +630,8 @@ pub(crate) struct Resolved {
     /// `secrets`; only the per-app fold reads this.
     pub(crate) declared_secrets: Vec<HeaderSecret>,
     /// Named application launch profiles, each a gated overlay over this baseline. Keyed
-    /// by name; `ops app <name>` looks one up and folds it on with [`Resolved::merge_app`].
-    /// `ops run`/`ops shell` ignore them.
+    /// by name; `sbx app <name>` looks one up and folds it on with [`Resolved::merge_app`].
+    /// `sbx run`/`sbx shell` ignore them.
     pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
     pub(crate) warnings: Vec<String>,
@@ -654,7 +654,7 @@ pub(crate) enum AppHomeScope {
 /// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
 /// environment, binds, packages, network posture, and credentials it declares — each
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
-/// location, or a project layer by its verdict). `ops app <name>` folds this onto the
+/// location, or a project layer by its verdict). `sbx app <name>` folds this onto the
 /// baseline with [`Resolved::merge_app`].
 #[derive(Clone)]
 pub(crate) struct ResolvedApp {
@@ -712,10 +712,10 @@ pub(crate) struct ResolvedApp {
     /// The verbs this app's unscoped (`{...}`-less) allow rules default to — its read-by-default
     /// posture. Every Mode-B app defaults to `Only(["GET","HEAD"])`; an `[app.<name>.network]
     /// default_methods` override sets a different set (or `Any` for `["*"]`, all verbs). Applied to
-    /// the app's effective allowlist at [`merge_app`]; the baseline `ops run`/`ops shell` never gets
+    /// the app's effective allowlist at [`merge_app`]; the baseline `sbx run`/`sbx shell` never gets
     /// it (Mode A stays all-verbs).
     pub(crate) default_methods: crate::allowlist::Methods,
-    /// Per-field provenance of this app's *scalar* overlay fields, for the per-app `ops config`
+    /// Per-field provenance of this app's *scalar* overlay fields, for the per-app `sbx config`
     /// view — which app layer (`Global`/`Project`) set each. Read only when the app actually set
     /// the field; an unset scalar is shown as inherited from the baseline. `home_scope_origin` is
     /// `None` for the built-in default (`Global`), since the home scope is an app-only concept with
@@ -739,7 +739,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) devices_origin: Provenance,
     pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
-    /// launched, not on every `ops run`.
+    /// launched, not on every `sbx run`.
     pub(crate) warnings: Vec<String>,
 }
 
@@ -774,8 +774,8 @@ impl Resolved {
             self.network = network;
         }
         // Apply the app's read-by-default verb posture to its *effective* allowlist — the app's own
-        // (just merged) or, when the app set none, the inherited baseline. Only Mode-B `ops app`
-        // launches reach `merge_app`; `ops run`/`ops shell` (Mode A) never do, so they stay all-verbs.
+        // (just merged) or, when the app set none, the inherited baseline. Only Mode-B `sbx app`
+        // launches reach `merge_app`; `sbx run`/`sbx shell` (Mode A) never do, so they stay all-verbs.
         if let NetworkPolicy::Allowlist(policy) = &mut self.network {
             policy.apply_default_methods(&app.default_methods);
         }
@@ -804,7 +804,7 @@ impl Resolved {
         // the trusted baseline's (the same flagship property, holding for the same reason).
         union_devices(&mut self.devices, app.devices);
         // Drop the baseline secret-posture warning: it judged the *baseline* network, but the app's
-        // posture re-decides injection just below — keeping it would let `ops app <name>` both inject
+        // posture re-decides injection just below — keeping it would let `sbx app <name>` both inject
         // a credential and print "ignoring N HTTP-header secret(s)". The re-check re-emits it only if
         // the *merged* posture still drops them.
         self.warnings
@@ -854,8 +854,8 @@ impl Resolved {
     }
 
     /// Apply a one-shot override as the authoritative **final word** on this resolved configuration
-    /// — after the project layer (for `ops run`/`ops shell`) or after a named app's overlay (for
-    /// `ops app`), so it beats both. Consumes the override. The nixpkgs channel is handled earlier
+    /// — after the project layer (for `sbx run`/`sbx shell`) or after a named app's overlay (for
+    /// `sbx app`), so it beats both. Consumes the override. The nixpkgs channel is handled earlier
     /// by [`Resolved::apply_override_channel`] (the lock is already chosen by now), so it is skipped.
     ///
     /// Trusted **by invocation**: every field is honored, since the invoker owns the process argv
@@ -866,7 +866,7 @@ impl Resolved {
     /// already can. (Not the `network`/`binds` axis: relaxing the denylist re-permits a syscall whose
     /// only containment was the filter, widening the in-cage kernel attack surface.) Each field it
     /// sets is stamped
-    /// [`Provenance::Override`] for `ops config show`; its binds are canonicalized and its secret
+    /// [`Provenance::Override`] for `sbx config show`; its binds are canonicalized and its secret
     /// posture re-checked exactly as the layered fields are, so this is a faithful final layer, not
     /// a raw assignment. `[net.groups]`/`[app.*]` in an override are ignored (noticed at collection
     /// time), so they never reach here.
@@ -948,7 +948,7 @@ impl Resolved {
                 OVERRIDE_SOURCE,
                 binds,
             );
-            let roots = ops_control_plane_roots();
+            let roots = sbx_control_plane_roots();
             for bind in canonicalize_binds(resolved_binds, &roots, &mut self.warnings) {
                 self.bind_layer
                     .insert(bind.path.clone(), Provenance::Override);
@@ -1025,7 +1025,7 @@ impl Resolved {
         // syscall denylist and grant a host device for this launch. Both are additive collections
         // (union onto the resolved policy/set; a bad token/path is warned and skipped by
         // `apply_seccomp`/`apply_devices`, never fatal — the invoker can only *add* here). The origin
-        // stamps `Override` when the override contributed any, for `ops config show`.
+        // stamps `Override` when the override contributed any, for `sbx config show`.
         if seccomp.is_some() {
             let over = apply_seccomp(&mut self.warnings, OVERRIDE_SOURCE, seccomp);
             if !over.is_empty() {
@@ -1255,7 +1255,7 @@ fn resolve(
     if let Some(field) = global.network.as_ref() {
         warn_if_baseline_sets_default_methods(&mut warnings, GLOBAL_CONFIG, field);
     }
-    // The parent of the global layer is ops's built-in default (`Shared`): a global `[network]`
+    // The parent of the global layer is sbx's built-in default (`Shared`): a global `[network]`
     // table that omits `mode` has no lower posture to inherit, so it falls back to `deny`.
     let mut network = match global.network.and_then(|v| {
         validate_network(
@@ -1370,7 +1370,7 @@ fn resolve(
     let mut nixpkgs_project = None;
     // The secret resolver defaults a PROJECT-LOCAL app resolves against: the global defaults, plus
     // a trusted project's own `[secret.defaults]` (captured below), so an app declared in the
-    // project's `.ops.toml` honors the project's resolver order/bindings. A GLOBAL app keeps the
+    // project's `.sbx.toml` honors the project's resolver order/bindings. A GLOBAL app keeps the
     // global defaults, so a project can never steer how a globally-declared app's credentials
     // resolve. Stays global when there is no project or the project sets no `[secret.defaults]`.
     let mut project_secret_defaults = secret_defaults.clone();
@@ -1687,7 +1687,7 @@ fn network_default_methods_of(field: &NetworkField) -> Option<&Vec<String>> {
 
 /// The built-in app default: a Mode-B agent's unscoped allow rules default to `{GET,HEAD}` (read by
 /// default; declare `{*}`/`{POST}` per host, or `default_methods` per app, to write). The baseline
-/// `ops run`/`ops shell` (Mode A) never gets this — it stays all-verbs.
+/// `sbx run`/`sbx shell` (Mode A) never gets this — it stays all-verbs.
 fn builtin_app_default_methods() -> crate::allowlist::Methods {
     crate::allowlist::Methods::Only(vec!["GET".to_string(), "HEAD".to_string()])
 }
@@ -1715,7 +1715,7 @@ fn resolve_app_default_methods(
 }
 
 /// Warn when the **baseline** `[network]` carries a `default_methods`: it is an app-only posture
-/// (Mode-B agents read by default), and `ops run`/`ops shell` (Mode A) deliberately stay all-verbs,
+/// (Mode-B agents read by default), and `sbx run`/`sbx shell` (Mode A) deliberately stay all-verbs,
 /// so a baseline value is parsed but ignored. Surfacing it keeps a user from believing they made
 /// their interactive shell read-only when they did not.
 fn warn_if_baseline_sets_default_methods(
@@ -1726,7 +1726,7 @@ fn warn_if_baseline_sets_default_methods(
     if network_default_methods_of(field).is_some() {
         warnings.push(format!(
             "{source}: ignoring `default_methods` under the baseline `[network]` — it is an app-only \
-             posture; `ops run`/`ops shell` stay all-verbs. Set it on an `[app.<name>.network]`"
+             posture; `sbx run`/`sbx shell` stay all-verbs. Set it on an `[app.<name>.network]`"
         ));
     }
 }
@@ -2000,7 +2000,7 @@ fn validate_tasks_limit(
 
 /// The global config's resource limits, for `doctor` (host-level, with no project context). Reads
 /// the global config — trusted by location — and validates its `[limits]`, discarding warnings:
-/// `doctor` surfaces availability, while `ops config` is the project-aware, warning-bearing view.
+/// `doctor` surfaces availability, while `sbx config` is the project-aware, warning-bearing view.
 /// An absent or limit-free global config yields the built-in defaults (all-`None`).
 pub(crate) fn global_limits() -> crate::sandbox::cgroup::Limits {
     let mut warnings = Vec::new();
@@ -2075,7 +2075,7 @@ fn resolve_apps(
     for name in names {
         if is_reserved_app_verb(&name) {
             warnings.push(format!(
-                "ignoring app `{name}`: the name is a reserved `ops app` subcommand (rename it)"
+                "ignoring app `{name}`: the name is a reserved `sbx app` subcommand (rename it)"
             ));
             continue;
         }
@@ -2123,7 +2123,7 @@ pub(crate) fn is_valid_app_name(name: &str) -> bool {
 /// project layer overrides the global per field. Security fields (`binds`/`network`/`secret`)
 /// are honored only from a trusted source; `env` is free (denylisted for an untrusted
 /// project); the command may come from either (the project wins). Each app collects its own
-/// warnings, surfaced when the app is launched rather than on every `ops run`.
+/// warnings, surfaced when the app is launched rather than on every `sbx run`.
 #[allow(clippy::too_many_arguments)]
 fn resolve_app(
     name: &str,
@@ -2161,7 +2161,7 @@ fn resolve_app(
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
-    // — else `ops app claude` against an untrusted repo would silently run the repo's command
+    // — else `sbx app claude` against an untrusted repo would silently run the repo's command
     // under the trusted app's posture (an integrity-of-intent hijack).
     let mut cmd_trusted = false;
     // The persistent-home keying, defaulting to one global home per app. Integrity-gated by
@@ -2170,7 +2170,7 @@ fn resolve_app(
     // route the untrusted run into the home a trusted run shares.
     let mut home_scope = AppHomeScope::Global;
     let mut home_scope_trusted = false;
-    // Per-field provenance of the scalar overlay fields, for the per-app `ops config` view: which
+    // Per-field provenance of the scalar overlay fields, for the per-app `sbx config` view: which
     // app layer set each, recorded at the same point the value is. A scalar the overlay never sets
     // stays `Default` here and the view shows it inherited from the baseline; `home_scope_origin`
     // stays `None` for the built-in default.
@@ -2577,7 +2577,7 @@ fn apply_app_secret(
 }
 
 /// The warning source label for a field of `[app.<name>]` in a given config file — e.g.
-/// `".ops.toml [app.claude]"` — so a dropped app field reads as clearly as a baseline one.
+/// `".sbx.toml [app.claude]"` — so a dropped app field reads as clearly as a baseline one.
 fn app_source(config: &str, name: &str) -> String {
     format!("{config} [app.{name}]")
 }
@@ -2651,7 +2651,7 @@ fn apply_binds(
     binds: Vec<RawBind>,
 ) {
     // A leading `~`/`$HOME`/`$XDG_RUNTIME_DIR` is expanded from the environment of the user
-    // launching ops, so a portable config need not hard-code an absolute home path. Read once.
+    // launching sbx, so a portable config need not hard-code an absolute home path. Read once.
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     for b in binds {
@@ -2693,7 +2693,7 @@ fn apply_binds(
 }
 
 /// Expand a leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` in a `binds` source to an absolute host
-/// path, using the environment of the user launching ops (a config need not hard-code
+/// path, using the environment of the user launching sbx (a config need not hard-code
 /// `/home/<user>`). Only the head component — before the first `/` — is a variable; an
 /// unrecognized `$VAR` at the head is rejected (fail closed: no arbitrary environment
 /// interpolation into a mount source). A path with no recognized head is returned unchanged, and
@@ -2975,10 +2975,10 @@ pub(crate) fn is_valid_deb_github_locator(s: &str) -> bool {
 /// (so a hand-pinned URL goes stale). The `<packages-url>` is an `https://` URL restricted to the
 /// same injection-free character set as [`is_valid_deb_url`] (it is interpolated into a
 /// `builtins.fetchurl`), but it points at the index, not a `.deb`, so the `.deb` suffix is **not**
-/// required. ops fetches the index, selects the highest version's `.deb`, and **re-validates that
+/// required. sbx fetches the index, selects the highest version's `.deb`, and **re-validates that
 /// derived URL through [`is_valid_deb_url`]** before it is fetched or built — so the remote index
 /// cannot inject a bad URL. Scope (documented, not a gap): the index must be the **uncompressed**
-/// `Packages` (no `.gz`/`.xz` decompression), ops does **no** `InRelease`/GPG signature check, and it
+/// `Packages` (no `.gz`/`.xz` decompression), sbx does **no** `InRelease`/GPG signature check, and it
 /// expects a **single-application** repo — the same TLS-plus-unpack trust level as a direct `deb:`
 /// URL, not a general Debian mirror.
 pub(crate) fn is_valid_deb_apt_locator(s: &str) -> bool {
@@ -3013,11 +3013,11 @@ fn upsert_package(out: &mut Vec<Package>, name: String, backend: Backend, state:
 /// The actionable reason a project's security-relevant value is held back, phrased
 /// for the action it implies: a since-*changed* project points at re-approval, a
 /// never-trusted one at first approval. Shared by the package launcher and
-/// `ops config` so the two never phrase the same verdict differently.
+/// `sbx config` so the two never phrase the same verdict differently.
 pub(crate) fn untrusted_reason(state: TrustState) -> &'static str {
     match state {
-        TrustState::Changed => "changed since it was trusted — re-run `ops trust`",
-        _ => "untrusted — run `ops trust`",
+        TrustState::Changed => "changed since it was trusted — re-run `sbx trust`",
+        _ => "untrusted — run `sbx trust`",
     }
 }
 
@@ -3325,7 +3325,7 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
             }
             match crate::allowlist::classify(&entry) {
                 // Tag each rule with the group it came from, so a `@<name>` expansion carries its
-                // origin into the resolved policy for `ops net rules` to render (excluded from the
+                // origin into the resolved policy for `sbx net rules` to render (excluded from the
                 // rule's equality, so this affects only display).
                 Ok(mut rule) => {
                     rule.group = Some(name.clone());
@@ -3343,8 +3343,8 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
 
 /// Whether a `[net.groups]` name is a safe, referenceable identifier. A group name is not a path
 /// component (unlike an app name), so `.`/`..` are harmless; it is charset- and length-bounded so
-/// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `ops net`.
-/// Shared with the `ops net allow/deny` write path so a persisted `@<name>` reference is validated
+/// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `sbx net`.
+/// Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is validated
 /// by the same rule the resolver uses to name a group.
 pub(crate) fn is_valid_group_name(name: &str) -> bool {
     !name.is_empty()
@@ -3983,17 +3983,17 @@ fn dropped_binds_warning(state: TrustState, count: usize) -> String {
     match state {
         TrustState::Changed => format!(
             "{PROJECT_CONFIG} changed since it was trusted: dropping {count} bind(s) — \
-             re-run `ops trust` to re-approve"
+             re-run `sbx trust` to re-approve"
         ),
         _ => format!(
             "{PROJECT_CONFIG} is untrusted: dropping {count} bind(s) — \
-             run `ops trust` to apply them"
+             run `sbx trust` to apply them"
         ),
     }
 }
 
-/// Which configuration layers feed a resolution. `All` is what a launch and the full `ops config
-/// show` use; the restricted forms back the single-source `ops config show --global/--local/
+/// Which configuration layers feed a resolution. `All` is what a launch and the full `sbx config
+/// show` use; the restricted forms back the single-source `sbx config show --global/--local/
 /// --default` views, each showing what one layer contributes (over the built-in defaults) so the
 /// provenance tags read as that layer's own additions. Plugins and bind canonicalization are
 /// unaffected — only which config *files* are read changes.
@@ -4060,7 +4060,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     };
 
     // Capture the mise file, its verdict, and its validated bytes before `resolve`
-    // consumes the project layer. A mise file is anchored on the `.ops.toml`: with no
+    // consumes the project layer. A mise file is anchored on the `.sbx.toml`: with no
     // usable project config there is nothing to gate it, so it is only flagged, not
     // honored. The bytes travel into `MiseConfig` so the launcher maps exactly the
     // content the verdict covered, without a second read.
@@ -4080,12 +4080,12 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
 
     // Canonicalize the (already absolute) bind sources, dropping any that cannot be
     // resolved — so `binds` is the *effective* list, identical to what the
-    // launch will bind, and `ops config` cannot advertise a bind the launch would
+    // launch will bind, and `sbx config` cannot advertise a bind the launch would
     // silently skip. Following symlinks here also pins each source against a swap.
     // The bind's read-only/read-write mode carries through unchanged; the per-layer
     // provenance is re-keyed from the raw declared path to the canonical one as we go,
     // so a lookup against the displayed (canonical) path resolves.
-    let ops_roots = ops_control_plane_roots();
+    let sbx_roots = sbx_control_plane_roots();
     let declared = std::mem::take(&mut resolved.binds);
     let raw_layer = std::mem::take(&mut resolved.bind_layer);
     let mut canon_binds: Vec<Bind> = Vec::with_capacity(declared.len());
@@ -4094,14 +4094,14 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         let Some(canon) = canonicalize_one(&bind.path, &mut resolved.warnings) else {
             continue;
         };
-        // A read-write bind overlapping ops's own control plane is either forced read-only (a bind
+        // A read-write bind overlapping sbx's own control plane is either forced read-only (a bind
         // at or under a root — fail closed: writing there is host-side code execution or a forged
         // trust/config, beyond the accepted self-harm class) or kept read-write with its
         // control-plane paths pinned in place by the launcher (a bind that merely contains a root).
         let writable = control_plane_mode(
             canon.as_path(),
             bind.writable,
-            &ops_roots,
+            &sbx_roots,
             &mut resolved.warnings,
         );
         if let Some(layer) = raw_layer.get(&bind.path) {
@@ -4109,7 +4109,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         }
         // Merge by canonical path: the last declaration of a path wins (project over global),
         // updated in place so a destination is never mounted twice — matching how `merge_app`
-        // folds an app's binds, so `ops config` shows exactly what the launch mounts.
+        // folds an app's binds, so `sbx config` shows exactly what the launch mounts.
         if let Some(existing) = canon_binds.iter_mut().find(|b| b.path == canon) {
             existing.writable = writable;
         } else {
@@ -4135,7 +4135,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // app overlay also advertises only the binds the launch would actually make.
     for app in resolved.apps.values_mut() {
         let declared = std::mem::take(&mut app.binds);
-        app.binds = canonicalize_binds(declared, &ops_roots, &mut app.warnings);
+        app.binds = canonicalize_binds(declared, &sbx_roots, &mut app.warnings);
     }
 
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
@@ -4158,7 +4158,7 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
 }
 
 /// Canonicalize each bind source, dropping with a warning any that cannot be resolved; resolving a
-/// read-write bind that overlaps an ops control-plane root (forced read-only when it is at or under
+/// read-write bind that overlaps an sbx control-plane root (forced read-only when it is at or under
 /// one, kept read-write with its control-plane paths pinned when it merely contains one — see
 /// [`control_plane_mode`]); de-duplicating by canonical path (last wins); and warning (without
 /// dropping) any whose destination nests with a structural mount. The same treatment the baseline
@@ -4191,12 +4191,12 @@ fn canonicalize_binds(
     out
 }
 
-/// The ops-owned control-plane roots a read-write config bind must never expose to the cage: the
+/// The sbx-owned control-plane roots a read-write config bind must never expose to the cage: the
 /// data directory (its engine binaries are `execve`'d host-side; its plugin and store trees run
 /// host-side too), the trust-marker store (a forged marker would approve another project's config),
 /// and the global-config directory (trusted by location). Resolved from the environment like every
-/// other ops path; a component whose base does not resolve is simply omitted.
-fn ops_control_plane_roots() -> Vec<PathBuf> {
+/// other sbx path; a component whose base does not resolve is simply omitted.
+fn sbx_control_plane_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(layout) = crate::store::Layout::from_env() {
         roots.push(layout.data_dir().to_path_buf());
@@ -4216,7 +4216,7 @@ fn ops_control_plane_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Decide the read-write mode of a config bind `canon` that may overlap ops's control plane, and
+/// Decide the read-write mode of a config bind `canon` that may overlap sbx's control plane, and
 /// warn. Three cases, resolved in this order so the fail-closed one wins any ambiguity:
 ///
 /// - The bind is **at or under** a control-plane root: the whole bind is control plane, there is
@@ -4225,7 +4225,7 @@ fn ops_control_plane_roots() -> Vec<PathBuf> {
 ///   beyond the accepted (single-project, self-harm) class.
 /// - The bind **strictly contains** one or more roots: it stays **read-write** — the launcher pins
 ///   each contained root's path in place ([`control_plane_pins`]), so the cage cannot substitute
-///   what ops runs or trusts on the host while the rest of the bound tree stays writable. An
+///   what sbx runs or trusts on the host while the rest of the bound tree stays writable. An
 ///   informational note names the protected paths.
 /// - The bind is unrelated to the control plane: its mode is returned unchanged.
 ///
@@ -4244,8 +4244,8 @@ fn control_plane_mode(
     // At or under a root: the bind is entirely control plane → read-only.
     if let Some(root) = roots.iter().find(|r| canon.starts_with(r)) {
         warnings.push(format!(
-            "bind `{}` is read-write over ops's own control plane `{}` — binding it read-only \
-             instead (a writable bind there could alter what ops runs or trusts on the host)",
+            "bind `{}` is read-write over sbx's own control plane `{}` — binding it read-only \
+             instead (a writable bind there could alter what sbx runs or trusts on the host)",
             canon.display(),
             root.display()
         ));
@@ -4260,9 +4260,9 @@ fn control_plane_mode(
         .collect();
     if !contained.is_empty() {
         warnings.push(format!(
-            "bind `{}` is read-write and contains ops's own control plane ({}) — the tree stays \
+            "bind `{}` is read-write and contains sbx's own control plane ({}) — the tree stays \
              writable, but those paths are pinned read-only in place so the cage cannot alter what \
-             ops runs or trusts on the host",
+             sbx runs or trusts on the host",
             canon.display(),
             contained.join(", ")
         ));
@@ -4270,10 +4270,10 @@ fn control_plane_mode(
     true
 }
 
-/// The mountpoint-chain pins that protect ops's control plane from path substitution when a
+/// The mountpoint-chain pins that protect sbx's control plane from path substitution when a
 /// read-write bind strictly contains it. Without them a read-write ancestor bind lets in-cage code
 /// rename a writable parent directory to move a control-plane root aside and recreate a forged one
-/// at the same host path — which ops would then read or `execve` on its next run. Each root is
+/// at the same host path — which sbx would then read or `execve` on its next run. Each root is
 /// pinned by making every path component below the containing bind a mountpoint (a mountpoint
 /// cannot be renamed or removed — the kernel refuses with `EBUSY`): the intermediates read-write
 /// (the rest of the tree stays writable), the root itself read-only (its host contents cannot be
@@ -4286,7 +4286,7 @@ fn control_plane_mode(
 /// binding (a root the agent could otherwise create fresh). Iterates the same root set as
 /// [`control_plane_mode`], so a root added there is pinned here automatically.
 pub(crate) fn control_plane_pins(binds: &[Bind]) -> Vec<Bind> {
-    control_plane_pins_for(binds, &ops_control_plane_roots())
+    control_plane_pins_for(binds, &sbx_control_plane_roots())
 }
 
 /// The pure core of [`control_plane_pins`], taking the roots explicitly so it is testable without
@@ -4347,7 +4347,7 @@ fn read_global(warnings: &mut Vec<String>) -> RawConfig {
 /// The reusable egress groups declared in the global config (`[net.groups]`), as their raw authored
 /// entries keyed by name, plus any load warnings. Global-only — matching the resolver, which honors
 /// groups only from the global config — so this lists exactly the set a `@<name>` reference can
-/// resolve to. A read-only, network-free view for `ops net groups`; entries are returned verbatim
+/// resolve to. A read-only, network-free view for `sbx net groups`; entries are returned verbatim
 /// (unclassified), so the caller displays them as declared and may flag a malformed one on its own.
 pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let mut warnings = Vec::new();
@@ -4355,7 +4355,7 @@ pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     (global.net.groups, warnings)
 }
 
-/// Read a portable `[net.groups]` fragment from `path` (the file `ops net groups import` is given),
+/// Read a portable `[net.groups]` fragment from `path` (the file `sbx net groups import` is given),
 /// returning its groups. The file goes through the same safety gate as any config (owner-owned,
 /// non-world-writable, a plain regular file). An error names why: unsafe/unreadable, not valid TOML,
 /// or carrying no `[net.groups]` (the tell-tale of the wrong file). The entries are returned
@@ -4368,7 +4368,7 @@ pub(crate) fn read_net_groups_fragment(
     let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if raw.net.groups.is_empty() {
         return Err(format!(
-            "{} has no `[net.groups]` table to import (is it an export of `ops net groups export`?)",
+            "{} has no `[net.groups]` table to import (is it an export of `sbx net groups export`?)",
             path.display()
         ));
     }
@@ -4401,7 +4401,7 @@ fn read_project(
 
     // Fold a sibling mise file into the verdict — trust covers both declarative
     // inputs. A present-but-unsafe mise file is unverifiable, so it forces the
-    // project untrusted: its `.ops.toml` still parses (its free `env` applies under
+    // project untrusted: its `.sbx.toml` still parses (its free `env` applies under
     // untrusted rules), but its security fields drop. Verdict over the exact bytes
     // that will be parsed (closes the trust→parse window): hash these bytes —
     // framed with the mise bytes — and compare to the marker, never re-reading.
@@ -4439,10 +4439,10 @@ fn read_project(
 }
 
 /// The project's mise file, the verdict gating it, and its validated bytes, for
-/// `ops config` and the launcher's `[env]` mapping. `None` when the project declares
-/// none. A mise file present without a usable `.ops.toml` to anchor it is not honored
-/// — when there is no `.ops.toml` at all, the no-op is surfaced as a warning so it is
-/// never silent; an unsafe or unparseable `.ops.toml` already warned on its own
+/// `sbx config` and the launcher's `[env]` mapping. `None` when the project declares
+/// none. A mise file present without a usable `.sbx.toml` to anchor it is not honored
+/// — when there is no `.sbx.toml` at all, the no-op is surfaced as a warning so it is
+/// never silent; an unsafe or unparseable `.sbx.toml` already warned on its own
 /// account. `validated` carries the safety-gated `(filename, bytes)` read in
 /// [`read_project`] (empty when none was safely readable).
 fn mise_status(
@@ -4501,38 +4501,38 @@ fn read_layer(path: &Path, warnings: &mut Vec<String>) -> Option<RawConfig> {
     }
 }
 
-/// The global config path: `$XDG_CONFIG_HOME/ops/ops.toml` when that is absolute,
-/// else `$HOME/.config/ops/ops.toml`. `None` when neither yields an absolute base
+/// The global config path: `$XDG_CONFIG_HOME/sbx/sbx.toml` when that is absolute,
+/// else `$HOME/.config/sbx/sbx.toml`. `None` when neither yields an absolute base
 /// (the same fail-closed stance the trust store takes — never resolve against the
 /// current directory).
 fn global_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         let p = PathBuf::from(xdg);
         if p.is_absolute() {
-            return Some(p.join("ops").join(GLOBAL_CONFIG));
+            return Some(p.join("sbx").join(GLOBAL_CONFIG));
         }
     }
     let home = PathBuf::from(std::env::var_os("HOME")?);
     home.is_absolute()
-        .then(|| home.join(".config/ops").join(GLOBAL_CONFIG))
+        .then(|| home.join(".config/sbx").join(GLOBAL_CONFIG))
 }
 
-/// The imported-profiles directory (`…/ops/apps/`), a sibling of the global config. `None` when
-/// no config base resolves, like [`global_path`]; `ops app import`/`rm`/`list` and [`load`] all
+/// The imported-profiles directory (`…/sbx/apps/`), a sibling of the global config. `None` when
+/// no config base resolves, like [`global_path`]; `sbx app import`/`rm`/`list` and [`load`] all
 /// route through this one place so the location can never drift.
 pub(crate) fn profiles_dir() -> Option<PathBuf> {
     global_path().and_then(|p| p.parent().map(|d| d.join(PROFILES_DIR)))
 }
 
-/// The profile file for app `name` (`…/ops/apps/<name>.toml`), or `None` when no config base
+/// The profile file for app `name` (`…/sbx/apps/<name>.toml`), or `None` when no config base
 /// resolves. The counterpart of [`profiles_dir`] for a single app — the target an app-scoped
-/// global write (`ops net allow -a <name> --save -g`, `ops config … --app <name> -g`) reaches.
+/// global write (`sbx net allow -a <name> --save -g`, `sbx config … --app <name> -g`) reaches.
 pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
     profiles_dir().map(|d| d.join(format!("{name}.toml")))
 }
 
 /// The posture an importable app profile would grant, in human-readable lines — shown so the
-/// deliberate `ops app import` is informed (it is the consent act; an imported profile is then
+/// deliberate `sbx app import` is informed (it is the consent act; an imported profile is then
 /// honored even on an untrusted project, so what it grants must be visible).
 #[derive(Debug)]
 pub(crate) struct ProfilePreview {
@@ -4745,7 +4745,7 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
 }
 
 /// Make the imported profile apps the sole source of the global app layer. A global app lives only
-/// as a profile file under `apps/<name>.toml` — an inline `[app.<name>]` in `ops.toml` is forbidden
+/// as a profile file under `apps/<name>.toml` — an inline `[app.<name>]` in `sbx.toml` is forbidden
 /// (it used to shadow an entire imported profile: `cmd`/`packages`/`binds`/`env` and the profile's
 /// `[network]` all dropped, bricking the app). Any inline app present in the global config is
 /// therefore dropped inert with a loud, per-app migration warning, and the profiles take its place
@@ -4771,7 +4771,7 @@ fn merge_profile_apps(
             )
         } else {
             format!(
-                "migrate it with `ops app export {name} --out {apps_dir}/{name}.toml`, then delete \
+                "migrate it with `sbx app export {name} --out {apps_dir}/{name}.toml`, then delete \
                  the inline [app.{name}] from {GLOBAL_CONFIG}"
             )
         };
@@ -4787,10 +4787,10 @@ fn merge_profile_apps(
     }
 }
 
-/// Produce the portable profile bytes for `name`, for `ops app export`. An **imported profile**
-/// (`<config>/ops/apps/<name>.toml`) is emitted **verbatim**, so the author's comments and
+/// Produce the portable profile bytes for `name`, for `sbx app export`. An **imported profile**
+/// (`<config>/sbx/apps/<name>.toml`) is emitted **verbatim**, so the author's comments and
 /// formatting survive a round-trip through the store; otherwise an app declared **inline** — in the
-/// project `.ops.toml` (preferred, the local definition one would share) or the global `ops.toml` —
+/// project `.sbx.toml` (preferred, the local definition one would share) or the global `sbx.toml` —
 /// has its `RawApp` **serialized** to a minimal top-level profile. The app is exported **as
 /// authored**, security fields and all, regardless of trust: import is the trust act, not export.
 /// Returns the bytes to emit, or a human-readable reason none was found.
@@ -4799,7 +4799,7 @@ fn merge_profile_apps(
 /// the imported profile, whereas a launch drops an inline `[app.<name>]` in the global config
 /// (forbidden — see [`merge_profile_apps`]). They only diverge when one name is *both* an imported
 /// profile and an inline definition — a state the load-time migration warning already pushes the
-/// user to resolve — so `ops app export <name>` may emit the profile while `ops app <name>` would
+/// user to resolve — so `sbx app export <name>` may emit the profile while `sbx app <name>` would
 /// launch the profile (the inline is inert). Exporting the inline is itself the migration path off
 /// the forbidden form. Keep at most one definition per name.
 pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> {
@@ -5501,7 +5501,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_project_cannot_override_a_trusted_apps_command() {
-        // The integrity-of-intent guard: `ops app claude` against an untrusted repo must run
+        // The integrity-of-intent guard: `sbx app claude` against an untrusted repo must run
         // the trusted app's command, never one the repo substituted.
         let global = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
         let project = raw_with_app("claude", raw_app(&["evil"], &[], &[], &[], None));
@@ -5525,7 +5525,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_project_cannot_override_a_trusted_apps_package() {
-        // The package half of the integrity-of-intent guard (mirror of `cmd`): `ops app claude`
+        // The package half of the integrity-of-intent guard (mirror of `cmd`): `sbx app claude`
         // against an untrusted repo must keep the trusted app's tool, never one the repo
         // substituted — else the repo could deny the app its tool, or aim it at an attacker's.
         let global = raw_with_app(
@@ -6454,7 +6454,7 @@ mod tests {
     fn a_value_set_to_its_default_still_records_its_layer_not_default() {
         // The discriminating provenance property — the whole reason the feature exists. A layer
         // that sets a value *to the built-in default* is still recorded as the origin, so
-        // `ops config` distinguishes "shared because I chose it" from "shared because nothing set
+        // `sbx config` distinguishes "shared because I chose it" from "shared because nothing set
         // it". `network = "shared"` and `gui = "none"` ARE the defaults, and `tasks_max = 16384` is
         // the documented default task cap — all three, set explicitly, must read as `Global`, never
         // `Default`. (If `validate_network` ever normalized "shared" to "unset", this would fail.)
@@ -6609,7 +6609,7 @@ mod tests {
 
     #[test]
     fn a_reserved_subcommand_verb_is_rejected_as_an_app_name() {
-        // `import`/`export`/`rm`/`list` are `ops app` subcommands; an app of that name would be
+        // `import`/`export`/`rm`/`list` are `sbx app` subcommands; an app of that name would be
         // unreachable and unmanageable, so it is dropped at resolve time (the charset check would
         // otherwise pass — `rm` is a valid path component, hence the separate reserved check).
         for verb in RESERVED_APP_VERBS {
@@ -6674,7 +6674,7 @@ mod tests {
 
     #[test]
     fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
-        // A global app lives only as a profile file; an inline `[app.<name>]` in `ops.toml` is
+        // A global app lives only as a profile file; an inline `[app.<name>]` in `sbx.toml` is
         // forbidden and dropped inert with a migration warning, so it can never shadow an imported
         // profile of the same name. The profile takes the name; a non-colliding profile is added.
         let mut global = raw_with_app("demo-app", raw_app(&["inline"], &[], &[], &[], None));
@@ -6711,7 +6711,7 @@ mod tests {
             "the colliding inline must be told to delete the stub: {w}"
         );
         assert!(
-            !w.contains("ops app export"),
+            !w.contains("sbx app export"),
             "when a profile already exists, do not suggest export: {w}"
         );
     }
@@ -7040,7 +7040,7 @@ mod tests {
     fn a_baseline_default_methods_is_ignored_with_a_warning() {
         use crate::allowlist::{Decision, Methods};
         // `default_methods` is an app-only posture; on the baseline `[network]` it is parsed but
-        // ignored (Mode-A `ops run`/`ops shell` stays all-verbs), with a warning so it is not silent.
+        // ignored (Mode-A `sbx run`/`sbx shell` stays all-verbs), with a warning so it is not silent.
         let global = RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
@@ -7232,7 +7232,7 @@ mod tests {
         assert!(r.binds.is_empty());
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("untrusted"));
-        assert!(r.warnings[0].contains("run `ops trust`"));
+        assert!(r.warnings[0].contains("run `sbx trust`"));
     }
 
     #[test]
@@ -7243,7 +7243,7 @@ mod tests {
         );
         assert!(r.binds.is_empty());
         assert!(r.warnings[0].contains("changed since it was trusted"));
-        assert!(r.warnings[0].contains("re-run `ops trust`"));
+        assert!(r.warnings[0].contains("re-run `sbx trust`"));
     }
 
     /// A `RawConfig` whose only field is the given `binds` list (raw, un-canonicalized).
@@ -7376,23 +7376,23 @@ mod tests {
 
     #[test]
     fn control_plane_mode_forces_ro_at_or_under_a_root_and_keeps_rw_above_it() {
-        // A writable bind AT or UNDER an ops control-plane root is forced read-only (the whole bind
+        // A writable bind AT or UNDER an sbx control-plane root is forced read-only (the whole bind
         // is control plane). A writable bind that merely CONTAINS a root stays read-write (the
         // launcher pins the root in place). An unrelated writable bind is left alone; a read-only
         // bind is never touched. Pure, over explicit roots (no environment).
-        let roots = vec![PathBuf::from("/home/u/.config/ops")];
+        let roots = vec![PathBuf::from("/home/u/.config/sbx")];
         let mut warnings = Vec::new();
 
         // Exact match → forced read-only.
         assert!(!control_plane_mode(
-            Path::new("/home/u/.config/ops"),
+            Path::new("/home/u/.config/sbx"),
             true,
             &roots,
             &mut warnings
         ));
         // A descendant of the root (aiming straight at a trust marker) → forced read-only.
         assert!(!control_plane_mode(
-            Path::new("/home/u/.config/ops/apps"),
+            Path::new("/home/u/.config/sbx/apps"),
             true,
             &roots,
             &mut warnings
@@ -7418,21 +7418,21 @@ mod tests {
             "the contains-a-root case notes the pinning: {w2:?}"
         );
         assert!(
-            w2[0].contains("pinned read-only in place") && w2[0].contains("/home/u/.config/ops"),
+            w2[0].contains("pinned read-only in place") && w2[0].contains("/home/u/.config/sbx"),
             "the note names the protected path: {w2:?}"
         );
 
         // A sibling that merely shares a textual prefix is not a conflict, and warns nothing.
         let mut w3 = Vec::new();
         assert!(control_plane_mode(
-            Path::new("/home/u/.config/opsimposter"),
+            Path::new("/home/u/.config/sbximposter"),
             true,
             &roots,
             &mut w3
         ));
         // A read-only bind is never touched and never warns, even at the root itself.
         assert!(!control_plane_mode(
-            Path::new("/home/u/.config/ops"),
+            Path::new("/home/u/.config/sbx"),
             false,
             &roots,
             &mut w3
@@ -7447,9 +7447,9 @@ mod tests {
         // deduplicated (the shared `.local` appears once) and ordered shallow-to-deep so a parent is
         // always established before its child (a child bound first would be shadowed by the parent).
         let roots = vec![
-            PathBuf::from("/home/u/.local/share/ops"),
-            PathBuf::from("/home/u/.local/state/ops/trusted"),
-            PathBuf::from("/home/u/.config/ops"),
+            PathBuf::from("/home/u/.local/share/sbx"),
+            PathBuf::from("/home/u/.local/state/sbx/trusted"),
+            PathBuf::from("/home/u/.config/sbx"),
         ];
         let binds = vec![Bind {
             path: PathBuf::from("/home/u"),
@@ -7497,8 +7497,8 @@ mod tests {
     #[test]
     fn control_plane_pins_only_covers_roots_a_bind_strictly_contains() {
         let roots = vec![
-            PathBuf::from("/home/u/.local/share/ops"),
-            PathBuf::from("/home/u/.config/ops"),
+            PathBuf::from("/home/u/.local/share/sbx"),
+            PathBuf::from("/home/u/.config/sbx"),
         ];
 
         // A partial-ancestor bind covers only the root it contains, and its chain starts below the
@@ -7510,12 +7510,12 @@ mod tests {
         let pins = control_plane_pins_for(&partial, &roots);
         assert!(
             pins.iter()
-                .any(|p| p.path == Path::new("/home/u/.local/share/ops") && !p.writable),
+                .any(|p| p.path == Path::new("/home/u/.local/share/sbx") && !p.writable),
             "the contained root is pinned: {pins:?}"
         );
         assert!(
             pins.iter()
-                .all(|p| p.path != Path::new("/home/u/.config/ops")),
+                .all(|p| p.path != Path::new("/home/u/.config/sbx")),
             "an uncontained root is not pinned: {pins:?}"
         );
         assert!(
@@ -7526,7 +7526,7 @@ mod tests {
         // A descendant/exact bind (at or under a root) yields no pins — that bind is forced
         // read-only by `control_plane_mode`, so it is not writable here anyway.
         let under = vec![Bind {
-            path: PathBuf::from("/home/u/.config/ops/apps"),
+            path: PathBuf::from("/home/u/.config/sbx/apps"),
             writable: true,
         }];
         assert!(
@@ -7747,7 +7747,7 @@ mod tests {
             "GBM_BACKENDS_PATH",
             "__EGL_VENDOR_LIBRARY_DIRS",
             // proxy-control (either case) and the CA-bundle keys: under an allowlist
-            // the cage's only egress is ops's filtering proxy, so an untrusted project
+            // the cage's only egress is sbx's filtering proxy, so an untrusted project
             // may not redirect it or swap the CA it trusts.
             "http_proxy",
             "HTTPS_PROXY",
@@ -7882,11 +7882,11 @@ mod tests {
         assert_eq!(pkg(&r.packages, "node").unwrap().state, TrustState::Changed);
         assert_eq!(
             untrusted_reason(TrustState::Changed),
-            "changed since it was trusted — re-run `ops trust`"
+            "changed since it was trusted — re-run `sbx trust`"
         );
         assert_eq!(
             untrusted_reason(TrustState::Untrusted),
-            "untrusted — run `ops trust`"
+            "untrusted — run `sbx trust`"
         );
     }
 
@@ -9035,7 +9035,7 @@ mod tests {
     #[test]
     fn an_override_replaces_the_network_posture_and_beats_a_trusted_project() {
         // A trusted project sets an allowlist; the override forces `none`. The override wins, and the
-        // winning posture is stamped `Override` for `ops config show`.
+        // winning posture is stamped `Override` for `sbx config show`.
         let project = RawConfig {
             network: Some(net_field("deny", &["github.com"], &[])),
             ..RawConfig::default()
@@ -9056,7 +9056,7 @@ mod tests {
 
     #[test]
     fn an_override_beats_an_app_overlay() {
-        // The flagship: `ops app <name> --config network="shared"` must beat the app's own posture,
+        // The flagship: `sbx app <name> --config network="shared"` must beat the app's own posture,
         // because the override is applied *after* the app overlay merges.
         let app = raw_app(
             &["true"],
@@ -9322,7 +9322,7 @@ mod tests {
             r.egress_stats,
             "an app's stats toggle must not change the baseline (it is baseline-only)"
         );
-        // The warning lives on the app (surfaced when `ops app demo` launches, via `merge_app`
+        // The warning lives on the app (surfaced when `sbx app demo` launches, via `merge_app`
         // folding it into the baseline warnings), not on the baseline read.
         let demo = r.apps.get("demo").expect("the app resolves");
         assert!(

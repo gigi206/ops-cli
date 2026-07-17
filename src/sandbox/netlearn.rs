@@ -1,4 +1,4 @@
-//! Synthesize allowlist rules from a run's egress log — the pure core of `ops app <name> --net-learn`.
+//! Synthesize allowlist rules from a run's egress log — the pure core of `sbx app <name> --net-learn`.
 //!
 //! An app run under its real (unchanged) posture logs every destination it was refused for lack of a
 //! rule. `--net-learn` turns those refusals into the allowlist rules that would admit them, so they

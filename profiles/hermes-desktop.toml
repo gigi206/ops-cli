@@ -1,15 +1,15 @@
 # Hermes Desktop — NousResearch's native Electron desktop app, built from source in the cage.
 #
-#   ops app import profiles/hermes-desktop.toml
-#   ops app hermes-desktop
+#   sbx app import profiles/hermes-desktop.toml
+#   sbx app hermes-desktop
 #
-# A third way to run Hermes alongside `ops app hermes` (the terminal CLI) and `ops app hermes-web`
+# A third way to run Hermes alongside `sbx app hermes` (the terminal CLI) and `sbx app hermes-web`
 # (the browser dashboard). Hermes Desktop is the native Electron app — a real window with chat,
 # streaming tool output, side-by-side previews, a file browser, voice, and settings. Unlike
 # opencode-desktop (a prebuilt .deb), Hermes Desktop has NO prebuilt binary — but it IS a nix flake
-# output (`#desktop`), so ops builds it in-cage rather than from a downloaded foreign binary.
+# output (`#desktop`), so sbx builds it in-cage rather than from a downloaded foreign binary.
 #
-# HOW IT RUNS — the flake's `#desktop` output, rolled by `ops upgrade flake`. `#desktop` is nixpkgs'
+# HOW IT RUNS — the flake's `#desktop` output, rolled by `sbx upgrade flake`. `#desktop` is nixpkgs'
 # own Electron (already patchelf'd for the store — so none of the ~95 system libs a stock/foreign
 # Electron needs, which the hermetic cage lacks) wrapped around the from-source-built renderer, with
 # the Python backend WIRED IN: the derivation sets `HERMES_DESKTOP_HERMES` to the flake's own
@@ -59,15 +59,15 @@ case "$1" in
   http://*|https://*)
     exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
       --no-first-run --no-default-browser-check "$@" ;;
-  *) echo "ops: open on the host:" "$@" >&2; exit 0 ;;
+  *) echo "sbx: open on the host:" "$@" >&2; exit 0 ;;
 esac
 WRAP
 chmod +x "$HOME/.local/bin/xdg-open"
 export PATH="$HOME/.local/bin:$PATH"
-cat > "$HOME/.local/share/applications/ops-open-uri.desktop" <<EOF
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=ops URL handler
+Name=sbx URL handler
 Exec=$HOME/.local/bin/xdg-open %U
 MimeType=x-scheme-handler/http;x-scheme-handler/https;
 NoDisplay=true
@@ -75,9 +75,21 @@ Terminal=false
 EOF
 cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
 [Default Applications]
-x-scheme-handler/http=ops-open-uri.desktop
-x-scheme-handler/https=ops-open-uri.desktop
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
 MIMEAPPS
+
+# Declare a Nix install so Hermes stops warning "Unsupported install method". The backend
+# self-detects its platform from the code layout; the flake's uv2nix venv looks like a pip
+# site-packages tree, so it falls through to "pip" (an unsupported platform) and shows the banner on
+# every launch. A `.install_method` marker in HERMES_HOME is read *before* that fallback and names the
+# real method — `nixos`, a supported Tier-2 platform (and it also yields the correct nix update
+# hint). Unlike `HERMES_MANAGED=nixos`, this marker has NO managed-mode side effect (which would block
+# the app from writing its own config). Harmless regardless: sbx manages updates via `sbx upgrade
+# flake`, so Hermes' own self-updater never runs here.
+HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME_DIR"
+printf 'nixos\n' > "$HERMES_HOME_DIR/.install_method"
 
 # Launch the flake-built Electron app. `hermes-desktop` (from flake:#desktop) is nixpkgs' Electron
 # wrapped around the built renderer, with HERMES_DESKTOP_HERMES already pointing at the flake's own
@@ -99,7 +111,7 @@ dbus = true
 audio = true
 
 [packages]
-# Hermes Desktop via the flake's `#desktop` output, built in-cage — so `ops upgrade flake` rolls it
+# Hermes Desktop via the flake's `#desktop` output, built in-cage — so `sbx upgrade flake` rolls it
 # forward. That output is nixpkgs' Electron (patchelf'd for the store — no foreign binary needing the
 # system GTK/NSS stack) wrapped around the built renderer, with the Python backend wired IN
 # (the derivation sets `HERMES_DESKTOP_HERMES` to the flake's own fully-equipped `hermes`), so there
@@ -111,14 +123,14 @@ hermes-desktop = "flake:github:NousResearch/hermes-agent#desktop"
 # An in-cage Chromium for the OAuth device-code login (see the `cmd` wrapper): Nous Portal sign-in
 # opens a verification URL in a browser, and the hermetic cage has no host browser. HEAVY — pulls a
 # large nixpkgs closure into the project store on the first launch. It trusts the egress MITM CA via
-# the NSS db ops seeds (catrust, part of the GUI hole under an allowlist).
+# the NSS db sbx seeds (catrust, part of the GUI hole under an allowlist).
 chromium = "nix:chromium"
 
 # The BYOK placeholder (commented) — uncomment it together with the [secret] block below to enable
 # BYOK. (No ELECTRON_GET_USE_PROXY needed: the flake builds against nixpkgs' Electron, so there is no
 # @electron/get binary download at build or run time.)
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 [network]
 mode = "deny"
@@ -127,7 +139,7 @@ allow = [
     # The renderer's npm deps, the Python backend's PyPI wheels (uv2nix), and Electron's headers (to
     # compile the renderer's native addons against) — all fetched through nix's fetcher. github /
     # codeload / githubusercontent (the flake source + any npm-from-github deps) and cache.nixos.org
-    # (the Electron + toolchain binaries) ride ops's built-in nix-cache allow-set, so they need no
+    # (the Electron + toolchain binaries) ride sbx's built-in nix-cache allow-set, so they need no
     # entry here. (`voice`'s Whisper model and `edge-tts` fetch RUNTIME assets on first use — those
     # hosts are in the runtime section below.)
     "{GET} https://registry.npmjs.org",
@@ -146,6 +158,9 @@ allow = [
     # to the account's own API: portal is the OAuth token endpoint, inference-api serves the models.
     "{*} https://openrouter.ai",
     "{*} https://portal.nousresearch.com",
+    # The portal's static assets (landing figures, images, styles) served off Nous's asset host —
+    # they render on the sign-in page in the in-cage Chromium. Read-only, so {GET} (least privilege).
+    "{GET} https://web-assets.nousresearch.com",
     "{*} https://inference-api.nousresearch.com",
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
     "{*} https://hermes-agent.nousresearch.com",
@@ -161,18 +176,18 @@ allow = [
     "{GET,HEAD} https://huggingface.co",
     "{GET,HEAD} https://*.xethub.hf.co",
     # Voice replies / read-aloud (edge-tts) — Microsoft's free online TTS, over a WebSocket. `{WS}` is
-    # the explicit WebSocket opt-in (ops gates a WS behind it) and `{GET}` covers the voice-list fetch.
-    # Two things make it work under the MITM allowlist: ops sets `wss_proxy` so the WS routes through
+    # the explicit WebSocket opt-in (sbx gates a WS behind it) and `{GET}` covers the voice-list fetch.
+    # Two things make it work under the MITM allowlist: sbx sets `wss_proxy` so the WS routes through
     # the proxy (a WS client resolves its proxy by URL scheme — `https_proxy` alone would not cover it,
     # and it would connect directly and fail DNS in the empty netns); and the audio hole's Python shim
-    # points certifi at ops's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
+    # points certifi at sbx's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
     "{GET,WS} https://speech.platform.bing.com",
     # --- Login (Nous Portal sign-in, rendered in the in-cage Chromium) ---
     # Nous Portal authenticates with Privy (email / social / wallet). The device-code page, the Privy
     # auth modal, the Cloudflare Turnstile "checking you are human" gate, and — for "Continue with
     # Google" — the Google OAuth consent all render in the in-cage Chromium, so their hosts must be
     # reachable (live-verified end-to-end: a Google sign-in completed the device grant). If you sign
-    # in a different way, watch `ops net log -a hermes-desktop` for the refused host and add it.
+    # in a different way, watch `sbx net log -a hermes-desktop` for the refused host and add it.
     "{*} https://*.privy.io",                  # Privy auth API + embedded login modal
     "{*} https://privy.nousresearch.com",      # Nous's own Privy endpoint (a nousresearch.com subdomain, not *.privy.io)
     "{*} https://*.challenges.cloudflare.com", # Cloudflare Turnstile human-check (incl. the hagen.* interactive-challenge host)
@@ -188,16 +203,16 @@ allow = [
     "{GET} https://fonts.gstatic.com",
     "{GET} https://lh3.googleusercontent.com",
     # (cache.nixos.org — the nix binary cache for uv/Python/node/electron/chromium — is already in
-    # ops's built-in nix-cache allow-set, so it needs no entry here.)
+    # sbx's built-in nix-cache allow-set, so it needs no entry here.)
 ]
 
-# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): npm's audit check POSTs
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit check POSTs
 # the installed package list to registry.npmjs.org's security-advisories endpoint, but the install
 # itself only needs GET (packuments + tarballs), so registry.npmjs.org stays `{GET}` and the audit
 # POST is `denied-method` — non-essential to the build (it still succeeds) and noisy on every install.
-# A `mute` never changes the verdict (the audit is still refused) and never hides a count (`ops net
+# A `mute` never changes the verdict (the audit is still refused) and never hides a count (`sbx net
 # stats` still tallies it); it only keeps the line out of the default log. Run `npm audit` on the
-# host if you want the advisory report. Edit this list from the CLI with `ops net mute|unmute -a
+# host if you want the advisory report. Edit this list from the CLI with `sbx net mute|unmute -a
 # hermes-desktop`. Remove the entry here the day you decide to `allow` the POST.
 mute = [
     "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (advisory bulk lookup)

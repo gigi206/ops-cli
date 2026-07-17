@@ -1,4 +1,4 @@
-//! Integration tests for `ops net` — the egress-policy listing/management surface — exercising
+//! Integration tests for `sbx net` — the egress-policy listing/management surface — exercising
 //! the built binary end to end against redirected config/state/data dirs and a temp project as
 //! the working directory. Read-only and host-side: no launch, no nix, no network.
 
@@ -14,7 +14,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-net-it-{}-{n}", std::process::id()));
+        d.push(format!("sbx-net-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -49,33 +49,33 @@ impl Fixture {
     }
 
     fn write_global(&self, body: &str) {
-        let dir = self.config_home.path().join("ops");
+        let dir = self.config_home.path().join("sbx");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ops.toml"), body).unwrap();
+        std::fs::write(dir.join("sbx.toml"), body).unwrap();
     }
 
     /// Write an imported app profile `apps/<name>.toml` (a top-level `RawApp`) beside the global
-    /// config. Global apps live only as profile files — an inline `[app.<name>]` in `ops.toml` is
+    /// config. Global apps live only as profile files — an inline `[app.<name>]` in `sbx.toml` is
     /// forbidden — so any test that needs a global app routes through here.
     fn write_profile(&self, name: &str, body: &str) {
-        let dir = self.config_home.path().join("ops").join("apps");
+        let dir = self.config_home.path().join("sbx").join("apps");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
     }
 
     fn write_project(&self, body: &str) {
-        std::fs::write(self.proj.path().join(".ops.toml"), body).unwrap();
+        std::fs::write(self.proj.path().join(".sbx.toml"), body).unwrap();
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ops"))
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
             .args(args)
             .current_dir(self.proj.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("XDG_STATE_HOME", self.state_home.path())
             .env("XDG_DATA_HOME", self.data_home.path())
             .output()
-            .expect("spawn ops")
+            .expect("spawn sbx")
     }
 }
 
@@ -85,7 +85,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"github.com\", \"*.nixos.org\"]\ndeny = [\"evil.nixos.org\"]\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules"]);
     assert!(out.status.success());
@@ -143,7 +143,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
 fn net_rules_json_emits_the_mode_and_tagged_rules() {
     let fx = Fixture::new();
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules", "--source", "config", "--json"]);
     assert!(out.status.success());
@@ -159,7 +159,7 @@ fn net_rules_json_emits_the_mode_and_tagged_rules() {
 fn net_rules_under_a_non_filtering_posture_has_no_rules() {
     let fx = Fixture::new();
     fx.write_project("network = \"shared\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // No rules at all — not even the built-in set, which the proxy unions only under a filtering
@@ -172,7 +172,7 @@ fn net_rules_under_a_non_filtering_posture_has_no_rules() {
     );
 
     fx.write_project("network = \"none\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -222,7 +222,7 @@ fn net_rejects_an_unknown_subcommand_and_source() {
 
     // an unknown rule source (`config`/`builtin`/`session` are the known ones)
     fx.write_project("network = \"deny\"\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules", "--source", "bogus"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -280,7 +280,7 @@ fn net_pending_session_flag_without_a_live_session_is_refused() {
 #[test]
 fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
     let fx = Fixture::new();
-    // A fresh project (no .ops.toml): `allow` bootstraps a deny-by-default allowlist and re-trusts.
+    // A fresh project (no .sbx.toml): `allow` bootstraps a deny-by-default allowlist and re-trusts.
     let out = fx.run(&["net", "allow", "github.com"]);
     assert!(
         out.status.success(),
@@ -294,12 +294,12 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
             && stdout.contains("re-trusted"),
         "bootstrap must report the created posture and the re-trust:\n{stdout}"
     );
-    // The round-trip: the project is now trusted, so the rule is honored and `ops net rules` lists
+    // The round-trip: the project is now trusted, so the rule is honored and `sbx net rules` lists
     // it as a config rule (a re-trust failure would have left it untrusted and dropped).
     let rules = fx.run(&["net", "rules"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout).contains("allow https://github.com  (config)"),
-        "the persisted, re-trusted rule must appear in `ops net rules`:\n{}",
+        "the persisted, re-trusted rule must appear in `sbx net rules`:\n{}",
         String::from_utf8_lossy(&rules.stdout)
     );
 
@@ -330,12 +330,12 @@ fn net_mute_and_unmute_round_trip_through_config() {
         "mute must persist and re-trust:\n{stdout}"
     );
 
-    // It reloads and `ops net rules` lists it as a config mute rule (tagged `mute`, not allow/deny).
+    // It reloads and `sbx net rules` lists it as a config mute rule (tagged `mute`, not allow/deny).
     let rules = fx.run(&["net", "rules"]);
     assert!(
         String::from_utf8_lossy(&rules.stdout)
             .contains("mute  https://play.googleapis.com  (config)"),
-        "the persisted mute must appear in `ops net rules`:\n{}",
+        "the persisted mute must appear in `sbx net rules`:\n{}",
         String::from_utf8_lossy(&rules.stdout)
     );
 
@@ -389,7 +389,7 @@ fn net_mute_with_no_posture_is_refused() {
         String::from_utf8_lossy(&sess.stderr)
     );
     assert!(
-        !fx.proj.path().join(".ops.toml").exists(),
+        !fx.proj.path().join(".sbx.toml").exists(),
         "a --session mute must write no config file"
     );
 }
@@ -454,7 +454,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"tcp://api.example.com:443\"]\ndeny = [\"api.example.com/secret\"]\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["net", "rules"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -469,7 +469,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\", \"api.example.com\"]\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let clean = fx.run(&["net", "rules"]);
     assert!(
         !String::from_utf8_lossy(&clean.stderr).contains("splice is uninspected"),
@@ -485,7 +485,7 @@ fn net_deny_on_a_fresh_project_is_refused_with_guidance() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("posture") && stderr.contains("ops config set network"),
+        stderr.contains("posture") && stderr.contains("sbx config set network"),
         "a deny on a fresh project must refuse and point at setting a posture:\n{stderr}"
     );
 }
@@ -499,12 +499,12 @@ fn net_allow_refuses_an_untrusted_existing_project() {
     assert_eq!(out.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("not trusted")
-            && String::from_utf8_lossy(&out.stderr).contains("ops trust"),
-        "an untrusted existing config must be refused, pointing at `ops trust`:\n{}",
+            && String::from_utf8_lossy(&out.stderr).contains("sbx trust"),
+        "an untrusted existing config must be refused, pointing at `sbx trust`:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     // The file is untouched (b.com was never written).
-    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         !body.contains("b.com"),
         "a refused write must not touch the file:\n{body}"
@@ -522,7 +522,7 @@ fn net_allow_global_writes_the_global_config_without_a_trust_gate() {
         stdout.contains("global config") && !stdout.contains("re-trusted"),
         "{stdout}"
     );
-    let global = fx.config_home.path().join("ops").join("ops.toml");
+    let global = fx.config_home.path().join("sbx").join("sbx.toml");
     let body = std::fs::read_to_string(&global).unwrap();
     assert!(
         body.contains("[network]") && body.contains("cdn.example.com"),
@@ -543,7 +543,7 @@ fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
         "a group reference must be accepted: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let global = fx.config_home.path().join("ops").join("ops.toml");
+    let global = fx.config_home.path().join("sbx").join("sbx.toml");
     let body = std::fs::read_to_string(&global).unwrap();
     assert!(
         body.contains("\"@mcp\""),
@@ -769,7 +769,7 @@ fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
         "a second --app add must not re-refuse (the first re-trusted): {}",
         String::from_utf8_lossy(&second.stderr)
     );
-    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         body.contains("[app.claude.network]")
             && body.contains("api.anthropic.com")
@@ -787,7 +787,7 @@ fn net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields() {
     // A full claude-code-style profile: cmd, packages, binds, env, and an `[network] mode="ask"`
     // allowlist of 7 hosts. An app-scoped `--save -g` must AMEND the profile's allow array in place
     // — preserving mode/cmd/packages/binds/env — and must NOT write a shadowing `[app.claude-code…]`
-    // into the global ops.toml (the brick bug).
+    // into the global sbx.toml (the brick bug).
     fx.write_global("[network]\nmode = \"shared\"\n");
     fx.write_profile(
         "claude-code",
@@ -822,7 +822,7 @@ fn net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields() {
     let profile = std::fs::read_to_string(
         fx.config_home
             .path()
-            .join("ops")
+            .join("sbx")
             .join("apps")
             .join("claude-code.toml"),
     )
@@ -839,9 +839,9 @@ fn net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields() {
         "the profile's cmd/packages/env/binds must be preserved:\n{profile}"
     );
 
-    // The global ops.toml must NOT carry a shadowing `[app.claude-code…]` stub.
+    // The global sbx.toml must NOT carry a shadowing `[app.claude-code…]` stub.
     let global =
-        std::fs::read_to_string(fx.config_home.path().join("ops").join("ops.toml")).unwrap();
+        std::fs::read_to_string(fx.config_home.path().join("sbx").join("sbx.toml")).unwrap();
     assert!(
         !global.contains("[app.claude-code"),
         "no inline app stub must be written to the global config:\n{global}"
@@ -876,7 +876,7 @@ fn net_allow_app_save_global_creates_profile_when_absent() {
     let profile = std::fs::read_to_string(
         fx.config_home
             .path()
-            .join("ops")
+            .join("sbx")
             .join("apps")
             .join("newapp.toml"),
     )
@@ -896,11 +896,11 @@ fn net_allow_app_save_global_creates_profile_when_absent() {
 }
 
 #[test]
-fn inline_app_in_global_ops_toml_is_dropped_with_migration_guidance() {
+fn inline_app_in_global_sbx_toml_is_dropped_with_migration_guidance() {
     let fx = Fixture::new();
     // Simulate the pre-fix bad state: a hand-written `[app.foo]` in the global config. It must be
     // dropped inert (never shadow a profile of the same name) with a per-app migration warning, and
-    // `ops net rules --app foo` must report no such app rather than launch a half-stub.
+    // `sbx net rules --app foo` must report no such app rather than launch a half-stub.
     fx.write_global(
         "[app.foo]\ncmd = \"true\"\n\
          [app.foo.network]\nmode = \"deny\"\nallow = [\"api.foo.test\"]\n",
@@ -908,7 +908,7 @@ fn inline_app_in_global_ops_toml_is_dropped_with_migration_guidance() {
     let rules = fx.run(&["net", "rules"]);
     let stderr = String::from_utf8_lossy(&rules.stderr);
     assert!(
-        stderr.contains("app `foo`") && stderr.contains("ops app export foo"),
+        stderr.contains("app `foo`") && stderr.contains("sbx app export foo"),
         "the dropped inline must warn with migration guidance:\n{stderr}"
     );
     let bad = fx.run(&["net", "rules", "--app", "foo"]);
@@ -925,14 +925,14 @@ fn inline_app_in_global_ops_toml_is_dropped_with_migration_guidance() {
 }
 
 #[test]
-fn net_allow_app_save_local_still_writes_project_ops_toml() {
+fn net_allow_app_save_local_still_writes_project_sbx_toml() {
     let fx = Fixture::new();
     fx.write_global("[network]\nmode = \"shared\"\n");
     fx.write_profile(
         "claude",
         "cmd = \"claude\"\n[network]\nmode = \"ask\"\nallow = [\"api.anthropic.com\"]\n",
     );
-    // `--save -l -a <app>` targets the project `.ops.toml [app.<app>.network]` (a project overlay is
+    // `--save -l -a <app>` targets the project `.sbx.toml [app.<app>.network]` (a project overlay is
     // still allowed). Inc 1 leaves this path wholesale-replacing the profile's network at resolve
     // time — the Inc 2 deep-merge fixes that. Here we only pin that the write lands in the project.
     let out = fx.run(&["net", "allow", "h.com", "--app", "claude", "-l"]);
@@ -941,10 +941,10 @@ fn net_allow_app_save_local_still_writes_project_ops_toml() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let body = std::fs::read_to_string(fx.proj.path().join(".ops.toml")).unwrap();
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
         body.contains("[app.claude.network]") && body.contains("h.com"),
-        "the project overlay must land in .ops.toml:\n{body}"
+        "the project overlay must land in .sbx.toml:\n{body}"
     );
 }
 
@@ -953,7 +953,7 @@ fn net_allow_rejects_an_explicit_file_scope() {
     let fx = Fixture::new();
     // `-c <file>` is neither the trusted-by-location global nor the trust-gated project path, so a
     // write to it would be silently dropped at launch — refuse it outright.
-    let out = fx.run(&["net", "allow", "github.com", "-c", ".ops.toml"]);
+    let out = fx.run(&["net", "allow", "github.com", "-c", ".sbx.toml"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("--local"),
@@ -970,7 +970,7 @@ fn net_allow_rejects_an_invalid_rule_before_writing() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid rule"));
     assert!(
-        !fx.proj.path().join(".ops.toml").exists(),
+        !fx.proj.path().join(".sbx.toml").exists(),
         "an invalid rule must not create the config"
     );
 }
@@ -984,15 +984,15 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
     fx.write_project(
         "[network]\nmode = \"ask\"\nask_timeout = \"90s\"\nallow = [\"github.com\"]\ndeny = [\"evil.com\"]\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
-    // `ops config show` names the ask posture and surfaces the configured timeout.
+    // `sbx config show` names the ask posture and surfaces the configured timeout.
     let show = fx.run(&["config", "show"]);
     let s = String::from_utf8_lossy(&show.stdout);
     assert!(s.contains("network: ask"), "config show:\n{s}");
     assert!(s.contains("ask timeout: 90s"), "config show:\n{s}");
 
-    // `ops net rules` frames the ask posture and still tags the carve-out rules.
+    // `sbx net rules` frames the ask posture and still tags the carve-out rules.
     let rules = fx.run(&["net", "rules"]);
     let r = String::from_utf8_lossy(&rules.stdout);
     assert!(r.contains("network: ask"), "net rules:\n{r}");
@@ -1005,7 +1005,7 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
         "net rules:\n{r}"
     );
 
-    // `ops test net` reports an unmatched host as "would ask" (no static verdict).
+    // `sbx test net` reports an unmatched host as "would ask" (no static verdict).
     let test = fx.run(&["test", "net", "https://unlisted.example.com/x"]);
     let t = String::from_utf8_lossy(&test.stdout);
     assert!(t.contains("WOULD ASK"), "test net:\n{t}");
@@ -1144,7 +1144,7 @@ fn net_pending_all_save_local_refuses_an_untrusted_project_before_draining() {
     // An untrusted project config in the cwd: a `--local` bulk save must refuse UP FRONT — before the
     // irreversible drain — rather than answer everything then fail to save with nothing persisted.
     fx.write_project("[network]\nmode = \"ask\"\nallow = [\"x.test\"]\n");
-    let before = std::fs::read(fx.proj.path().join(".ops.toml")).unwrap();
+    let before = std::fs::read(fx.proj.path().join(".sbx.toml")).unwrap();
 
     let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--local"]);
     assert_eq!(out.status.code(), Some(2));
@@ -1155,7 +1155,7 @@ fn net_pending_all_save_local_refuses_an_untrusted_project_before_draining() {
     );
     // The untrusted config is byte-for-byte untouched — not silently blessed by the refused save.
     assert_eq!(
-        std::fs::read(fx.proj.path().join(".ops.toml")).unwrap(),
+        std::fs::read(fx.proj.path().join(".sbx.toml")).unwrap(),
         before,
         "the untrusted config must not be modified"
     );
@@ -1167,7 +1167,7 @@ fn net_pending_all_save_global_drains_and_persists_each_host() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let egress = fx.data_home.path().join("ops").join("egress");
+    let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 55555u32; // a fake session: --global drains every socket, no registry/project filter
     let socket = egress.join(format!("control-{pid}.sock"));
@@ -1203,7 +1203,7 @@ fn net_pending_all_save_global_drains_and_persists_each_host() {
 
     // The global config now carries the allow rule for the drained host (the durable half).
     let global =
-        std::fs::read_to_string(fx.config_home.path().join("ops").join("ops.toml")).unwrap();
+        std::fs::read_to_string(fx.config_home.path().join("sbx").join("sbx.toml")).unwrap();
     assert!(
         global.contains("blocked.example"),
         "the rule must be persisted to the global config:\n{global}"
@@ -1215,7 +1215,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     // The user's exact command: `net pending allow --all --save -g --app <name>`. The drained host
     // must land in the app's PROFILE file (`apps/<name>.toml`), amending its `[network].allow` with
     // `mode = "ask"` and every other field preserved — NOT a shadowing `[app.<name>.network]` stub in
-    // the global ops.toml (the brick bug) — and the summary must NAME the profile, never "the global
+    // the global sbx.toml (the brick bug) — and the summary must NAME the profile, never "the global
     // config under app <name>" (the stale line that lied about where the rule went).
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::ffi::OsStrExt;
@@ -1237,7 +1237,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     // Register THIS process as a live GlobalApp session of `claude-code` so the `--app` filter finds
     // it (liveness pruning keeps it — the process is alive and its start_ticks match). The record
     // format is session.rs's serializer: `runtime=global-app:<name>`, filename `<pid>-<start_ticks>`.
-    let data = fx.data_home.path().join("ops");
+    let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&egress).unwrap();
@@ -1316,7 +1316,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     let profile = std::fs::read_to_string(
         fx.config_home
             .path()
-            .join("ops")
+            .join("sbx")
             .join("apps")
             .join("claude-code.toml"),
     )
@@ -1328,9 +1328,9 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
         "the host must append to the profile's allowlist, preserving mode and cmd:\n{profile}"
     );
 
-    // No shadowing inline app stub was written to the global ops.toml.
+    // No shadowing inline app stub was written to the global sbx.toml.
     let global =
-        std::fs::read_to_string(fx.config_home.path().join("ops").join("ops.toml")).unwrap();
+        std::fs::read_to_string(fx.config_home.path().join("sbx").join("sbx.toml")).unwrap();
     assert!(
         !global.contains("[app.claude-code"),
         "no inline app stub must be written to the global config:\n{global}"
@@ -1340,7 +1340,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
 #[test]
 fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     // The headline, proven end to end: `--all --save --local` drains only THIS project's session and
-    // persists the host to THIS project's `.ops.toml`. The project filter needs a *live* registered
+    // persists the host to THIS project's `.sbx.toml`. The project filter needs a *live* registered
     // session, so register THIS test process (alive → survives liveness pruning) as a project session
     // of fx.proj, and bind its control socket; the child `fx.run` then drains it via the project
     // filter. The one coupling is the registry record format (session.rs's serializer): fields
@@ -1350,7 +1350,7 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let data = fx.data_home.path().join("ops");
+    let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&egress).unwrap();
@@ -1395,7 +1395,7 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
             .unwrap();
     });
 
-    // No initial `.ops.toml` → the precheck passes (absent is fine) and the local save bootstraps it.
+    // No initial `.sbx.toml` → the precheck passes (absent is fine) and the local save bootstraps it.
     let out = fx.run(&["net", "pending", "allow", "--all", "--save", "--local"]);
     server.join().unwrap();
     let _ = std::fs::remove_file(&socket);
@@ -1412,7 +1412,7 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
 
     // THIS project's config was created (and trusted) with the allow rule — the durable local half,
     // proving drain-filtered-to-project + persist-local composed correctly.
-    let cfg = std::fs::read_to_string(fx.proj.path().join(".ops.toml"))
+    let cfg = std::fs::read_to_string(fx.proj.path().join(".sbx.toml"))
         .expect("the project config must be created");
     assert!(
         cfg.contains("blocked.example"),
@@ -1469,10 +1469,10 @@ fn net_pending_all_accepts_an_app_filter_and_lists_accept_it_too() {
 #[test]
 fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
     // Hand-author session stat files keyed by this project's canonical path (the header
-    // `egress::start` writes), then prove `ops net stats` sums them for the project, scopes to an
+    // `egress::start` writes), then prove `sbx net stats` sums them for the project, scopes to an
     // app, carries the counts in `--json`, and `--reset` clears only this project's files.
     let fx = Fixture::new();
-    let egress = fx.data_home.path().join("ops").join("egress");
+    let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let proj = fx.proj.path().canonicalize().unwrap();
     let proj = proj.display().to_string();
@@ -1567,10 +1567,10 @@ fn net_pending_all_drains_a_live_session_through_the_socket() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    // The control socket lives at <data>/egress/control-<pid>.sock, and <data> is $XDG_DATA_HOME/ops
+    // The control socket lives at <data>/egress/control-<pid>.sock, and <data> is $XDG_DATA_HOME/sbx
     // (the dir `fx.run` redirects). Binding it at the right place is itself the proof the path wiring
     // is correct — a wrong path yields an empty drain ("no pending requests") and the assert fails.
-    let egress = fx.data_home.path().join("ops").join("egress");
+    let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 33333u32; // not in the session registry → the `(unregistered)` header path
     let socket = egress.join(format!("control-{pid}.sock"));
@@ -1624,7 +1624,7 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let data = fx.data_home.path().join("ops");
+    let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&egress).unwrap();
@@ -1694,7 +1694,7 @@ fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let egress = fx.data_home.path().join("ops").join("egress");
+    let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 44444u32;
     let socket = egress.join(format!("control-{pid}.sock"));
@@ -1713,7 +1713,7 @@ fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
     assert!(
         !stdout.contains("no pending requests")
             && stdout.contains("44444")
-            && stdout.contains("older ops")
+            && stdout.contains("older sbx")
             && stdout.contains("relaunch the agent"),
         "the drain must surface the older session, not claim emptiness:\n{stdout}"
     );
@@ -1727,7 +1727,7 @@ fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let egress = fx.data_home.path().join("ops").join("egress");
+    let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 45454u32;
     let socket = egress.join(format!("control-{pid}.sock"));
@@ -1744,7 +1744,7 @@ fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
     server.join().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("older ops") && stdout.contains("relaunch the agent"),
+        stdout.contains("older sbx") && stdout.contains("relaunch the agent"),
         "the --save drain must name the older session:\n{stdout}"
     );
     assert!(
@@ -1753,7 +1753,7 @@ fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
     );
     // The global config must not have been written (no rule to persist).
     assert!(
-        !fx.config_home.path().join("ops").join("ops.toml").exists(),
+        !fx.config_home.path().join("sbx").join("sbx.toml").exists(),
         "an unsupported-only drain must not write any config"
     );
 }
@@ -1761,14 +1761,14 @@ fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
 #[test]
 fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
     // `-a <app>` on the by-id path is a session scope (the natural carry-over from
-    // `ops net pending -a <app>`), honored without `--save`: it answers the id when the registry
+    // `sbx net pending -a <app>`), honored without `--save`: it answers the id when the registry
     // confirms that session is that app, and refuses when the id belongs to a *different* app.
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let data = fx.data_home.path().join("ops");
+    let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&egress).unwrap();
@@ -1853,13 +1853,13 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
     use std::os::unix::net::UnixListener;
 
     let fx = Fixture::new();
-    let egress = fx.data_home.path().join("ops").join("egress");
+    let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 44444u32; // not registered → the `(unregistered)` header path; irrelevant to grouping
     let socket = egress.join(format!("control-{pid}.sock"));
     let listener = UnixListener::bind(&socket).unwrap();
 
-    // Two LISTs are served (one per `ops net pending` invocation below): three parked rows each — two
+    // Two LISTs are served (one per `sbx net pending` invocation below): three parked rows each — two
     // identical retries of one URL (seqs 1 and 4) plus a different destination (seq 2).
     let server = std::thread::spawn(move || {
         for _ in 0..2 {
@@ -1904,14 +1904,14 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
     assert_eq!(dl["waiting_secs"], 80, "{v}");
 }
 
-// ── `ops test net` enrichments: app targeting, launch fidelity, scheme-optional ─────────────────
+// ── `sbx test net` enrichments: app targeting, launch fidelity, scheme-optional ─────────────────
 
 #[test]
 fn test_net_targets_an_app_effective_policy() {
     let fx = Fixture::new();
-    // A global config (trusted by location, so no `ops trust` needed): a baseline allowlist that
+    // A global config (trusted by location, so no `sbx trust` needed): a baseline allowlist that
     // does NOT list the app's host. The app itself lives as an imported profile `apps/demo.toml`
-    // (a global app is a profile file, never an inline `[app.demo]` in `ops.toml`), whose own
+    // (a global app is a profile file, never an inline `[app.demo]` in `sbx.toml`), whose own
     // overlay allows the host and injects a key.
     fx.write_global("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     fx.write_profile(
@@ -2082,7 +2082,7 @@ fn test_net_reflects_the_built_in_set_both_directions() {
     let fx = Fixture::new();
     // A trusted project allowlist that lists one host which is ALSO a built-in self-equip host.
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // A built-in host the user did NOT list: allowed only by the built-in union, and tagged so.
     let cache = fx.run(&["test", "net", "https://cache.nixos.org/nix-cache-info"]);
@@ -2109,7 +2109,7 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
     let fx = Fixture::new();
     // a GET/HEAD-only allow for the host
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // the prefix is shown in the rule listing, with the implicit scheme (443 is the default → bare)
     let rules = fx.run(&["net", "rules", "--source", "config"]);
@@ -2141,7 +2141,7 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
     let fx = Fixture::new();
     // a tcp:// (raw L4) allow for a specific host:port
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\"]\n");
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // the rule listing shows the `tcp://` scheme, so the layer (the proto) is visible
     let rules = fx.run(&["net", "rules", "--source", "config"]);
@@ -2183,7 +2183,7 @@ fn test_net_reports_a_deny_suppressed_splice() {
         "[network]\nmode = \"deny\"\n\
          allow = [\"tcp://evil.com:443\"]\ndeny = [\"re:^https://evil\\\\.com\"]\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx.run(&["test", "net", "tcp://evil.com:443"]);
     let o = String::from_utf8_lossy(&out.stdout);
@@ -2195,15 +2195,15 @@ fn test_net_reports_a_deny_suppressed_splice() {
 
 #[test]
 fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
-    // The Mode-A vs Mode-B contrast: a trusted baseline allowlist is all-verbs for `ops run`/`ops
+    // The Mode-A vs Mode-B contrast: a trusted baseline allowlist is all-verbs for `sbx run`/`sbx
     // shell` (Mode A), but an app (Mode B) that inherits that same allowlist is read-by-default
-    // ({GET,HEAD}) — so a POST the bare `ops test net` allows is denied under `--app`.
+    // ({GET,HEAD}) — so a POST the bare `sbx test net` allows is denied under `--app`.
     let fx = Fixture::new();
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"shared.test\"]\n\
          [app.agent]\ncmd = \"true\"\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // Baseline (no --app): all verbs — a POST is allowed.
     let base_post = fx.run(&["test", "net", "-X", "POST", "https://shared.test/x"]);
@@ -2252,7 +2252,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
         "[app.agent]\ncmd = \"true\"\n\
          [app.agent.network]\nmode = \"deny\"\nallow = [\"read.test\", \"{*} write.test\"]\n",
     );
-    assert!(fx.run(&["trust", ".ops.toml"]).status.success());
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // `net rules --app` shows the unscoped host narrowed and the {*} host kept.
     let rules = fx.run(&["net", "rules", "--app", "agent"]);
@@ -2336,11 +2336,11 @@ fn net_allow_session_validates_flags_and_reports_when_no_session_is_reachable() 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("no reachable session with egress filtering for this project")
-            && stdout.contains("ops net allow github.com"),
+            && stdout.contains("sbx net allow github.com"),
         "the no-session load must explain and point at the config write: {stdout}"
     );
     assert!(
-        !fx.proj.path().join(".ops.toml").exists(),
+        !fx.proj.path().join(".sbx.toml").exists(),
         "a --session load must not write the project config"
     );
 }

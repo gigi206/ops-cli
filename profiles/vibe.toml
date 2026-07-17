@@ -1,11 +1,11 @@
-# Mistral Vibe — Mistral's minimal open-source coding agent (CLI), sandboxed by ops.
+# Mistral Vibe — Mistral's minimal open-source coding agent (CLI), sandboxed by sbx.
 #
-#   ops app import profiles/vibe.toml
-#   ops app vibe
+#   sbx app import profiles/vibe.toml
+#   sbx app vibe
 #
 # Vibe (github.com/mistralai/mistral-vibe) is a Python coding agent published to PyPI as the
-# `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). ops equips it via
-# mise's pipx backend — `mise:pipx:mistral-vibe` in [packages] — so `ops upgrade mise` rolls it
+# `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). sbx equips it via
+# mise's pipx backend — `mise:pipx:mistral-vibe` in [packages] — so `sbx upgrade mise` rolls it
 # forward (it is a real backend-managed tool, not a one-shot install). mise's pipx backend runs
 # `uv tool install` because `nix:uv` puts uv on PATH (a supported Python comes from `nix:python312`),
 # resolving the wheels from PyPI on the first launch (a few tens of MiB, seconds) and reusing them
@@ -22,14 +22,14 @@
 #
 # The browser is a real Chromium provisioned into the cage (see [packages] + `gui`/`gpu` below).
 # Two details make it work: (1) Vibe's `webbrowser.open` BLOCKS on an unknown browser command (it
-# `wait()`s for the process), so `BROWSER` points at the `ops-open` wrapper written by `cmd`, which
+# `wait()`s for the process), so `BROWSER` points at the `sbx-open` wrapper written by `cmd`, which
 # launches Chromium in the background with `nohup … &` (the cage ships no `setsid`) and returns
 # immediately, so the TUI never freezes; (2) under a filtering posture on a `gui = "wayland"` cage,
-# ops seeds its per-session MITM CA into the cage's NSS db automatically (Chromium ignores the
+# sbx seeds its per-session MITM CA into the cage's NSS db automatically (Chromium ignores the
 # CA-file env vars other tools honour), so HTTPS to console.mistral.ai succeeds — `--use-system-ca`
 # tells Chromium to consult that store, and `--password-store=basic` keeps the SSO cookies in a file
 # store (no keyring in the cage) so the session survives a relaunch. Chromium's output is logged to
-# `~/ops-browser.log` in the isolated home, in case a launch ever fails.
+# `~/sbx-browser.log` in the isolated home, in case a launch ever fails.
 #
 # API-KEY (BYOK) is available as an alternative to the browser sign-in — see the [env]/[secret]
 # blocks at the bottom of this file.
@@ -42,15 +42,15 @@ mkdir -p "$HOME/.local/bin"
 # vibe opens the sign-in URL via Python's webbrowser, which BLOCKS on an unknown command; this
 # wrapper backgrounds an in-cage Chromium (nohup, since the cage has no setsid) and exits 0
 # immediately, so the TUI never freezes. Chromium's output is captured for troubleshooting.
-cat > "$HOME/.local/bin/ops-open" <<'WRAP'
+cat > "$HOME/.local/bin/sbx-open" <<'WRAP'
 #!/bin/sh
 nohup chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
   --use-system-ca --password-store=basic --no-first-run --no-default-browser-check \
-  "$@" >"$HOME/ops-browser.log" 2>&1 &
+  "$@" >"$HOME/sbx-browser.log" 2>&1 &
 exit 0
 WRAP
-chmod +x "$HOME/.local/bin/ops-open"
-export BROWSER="$HOME/.local/bin/ops-open"
+chmod +x "$HOME/.local/bin/sbx-open"
+export BROWSER="$HOME/.local/bin/sbx-open"
 exec vibe "$@"
 ''',
     "vibe",
@@ -61,7 +61,7 @@ exec vibe "$@"
 # offered. Isolation is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway,
 # hyprland) expose screen-capture/input-injection to ordinary clients (see
 # docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa into
-# ops's own store, the render node under /dev/dri, the minimal /sys DRM subtree the driver needs);
+# sbx's own store, the render node under /dev/dri, the minimal /sys DRM subtree the driver needs);
 # without it a Chromium window on Wayland often produces no buffer and never maps. mesa covers
 # Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (renders, slower). Both are
 # security fields, honored only because this profile lives in your trusted config dir.
@@ -78,7 +78,7 @@ gpu = true
 #]
 
 [packages]
-# Vibe itself via mise's pipx backend, so `ops upgrade mise` rolls it forward. mise runs
+# Vibe itself via mise's pipx backend, so `sbx upgrade mise` rolls it forward. mise runs
 # `uv tool install mistral-vibe` because `nix:uv` puts uv on PATH; `nix:python312` supplies a
 # supported interpreter. `chromium` is the in-cage browser for the SSO sign-in (see the
 # AUTHENTICATION note). HEAVY — it pulls a large nixpkgs closure into the project store on the first
@@ -124,12 +124,12 @@ allow = [
     "{GET} https://files.pythonhosted.org",
     "{GET} https://pypi.org",
     # (cache.nixos.org + github.com — the nix binary cache for uv/Python/chromium — are already in
-    # ops's built-in nix-cache allow-set, so they need no entry here.)
+    # sbx's built-in nix-cache allow-set, so they need no entry here.)
 ]
 
-# Keep Chromium's own denied telemetry out of the default `ops net log` (still denied, still counted
-# in `ops net stats`; see them with `--all`). These are the usual Chromium background hosts; watch
-# `ops net log -a vibe` on your first sign-in and add any other host it hammers.
+# Keep Chromium's own denied telemetry out of the default `sbx net log` (still denied, still counted
+# in `sbx net stats`; see them with `--all`). These are the usual Chromium background hosts; watch
+# `sbx net log -a vibe` on your first sign-in and add any other host it hammers.
 mute = [
     "www.google.com",             # Chromium: omnibox / async requests (observed on sign-in)
     "*.gvt1.com",                 # Chromium: spellcheck dictionary + component downloads (observed)
@@ -143,7 +143,7 @@ mute = [
     "accounts.youtube.com",       # Google cross-domain CheckConnection, recurs each login (desktop profiles mute it too)
 ]
 # NOT muted on purpose (refused by the allowlist, but only ONE hit — not spam, so keeping it VISIBLE in
-# `ops net log` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not
+# `sbx net log` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not
 # used from the CLI). (`experiments.mistral.services` is now ALLOWED above — Mistral's first-party flags.)
 
 # API-KEY (BYOK) alternative to the SSO sign-in above. The real key is read on the HOST and injected
@@ -152,7 +152,7 @@ mute = [
 # substitutes the real key on the wire to api.mistral.ai. (With this path you can drop `chromium` +
 # the `gui`/`gpu` lines for a much lighter cage.)
 [env]
-#MISTRAL_API_KEY = "ops-placeholder-replaced-by-the-egress-proxy"
+#MISTRAL_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."api.mistral.ai"]
 #from = "env://MISTRAL_API_KEY"

@@ -1,13 +1,13 @@
-# `ops plugins`
+# `sbx plugins`
 
 ```
-ops plugins <subcommand> [args...]
-ops plugins store <subcommand> [args...]
+sbx plugins <subcommand> [args...]
+sbx plugins store <subcommand> [args...]
 ```
 
 Inspect and manage **resolver plugins** and **plugin stores**. Host-level — reads the
 data directory, not a project's config. A resolver plugin declares a `scheme://`
-`ops` can route a secret [`from`](../configuration/secret.md) reference to.
+`sbx` can route a secret [`from`](../configuration/secret.md) reference to.
 
 See also: [Resolver plugins and stores](../secrets/plugins.md) · [Resolvers](../secrets/resolvers.md) · [Secrets architecture](../secrets/README.md).
 
@@ -29,13 +29,13 @@ A **remote signed store** is a git repository whose catalogue is verified agains
 pinned Ed25519 public key, with anti-rollback on the revision.
 
 ```
-ops plugins store list
-ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
-ops plugins store update [name]
-ops plugins store install <store> <plugin>
-ops plugins store info <name>
-ops plugins store rm <name>
-ops plugins store publish <dir> --key <key-file> [--rev <n>]
+sbx plugins store list
+sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
+sbx plugins store update [name]
+sbx plugins store install <store> <plugin>
+sbx plugins store info <name>
+sbx plugins store rm <name>
+sbx plugins store publish <dir> --key <key-file> [--rev <n>]
 ```
 
 | Subcommand | Purpose |

@@ -1,8 +1,8 @@
 //! Provisioning and driving the mise engine.
 //!
-//! A trusted project may declare its tools (and environment) in a mise file. ops
+//! A trusted project may declare its tools (and environment) in a mise file. sbx
 //! uses mise as a *front-end*: it drives mise as a subprocess to map those into the
-//! sandbox. mise itself is provisioned via nix into ops's own user-owned store —
+//! sandbox. mise itself is provisioned via nix into sbx's own user-owned store —
 //! never the host's mise — and run from that store, so the engine is reproducible
 //! and independent of whatever the host happens to have installed.
 //!
@@ -17,16 +17,16 @@
 //!   still gets a current engine to drive its provisioning.
 //!
 //! - **It never mutates the host.** `HOME` and every `MISE_*_DIR` are redirected
-//!   into ops's data directory, and the run is wrapped in a minimal bubblewrap that
-//!   exposes only ops's store (read-only) and that private home (read-write) — so
+//!   into sbx's data directory, and the run is wrapped in a minimal bubblewrap that
+//!   exposes only sbx's store (read-only) and that private home (read-write) — so
 //!   mise reads and writes nothing under the user's real `~/.config/mise` or
 //!   `~/.local/share/mise`.
 //!
 //! Running a relocated-store binary: a nix-built binary hard-codes its interpreter
-//! and library paths under `/nix/store/…`, which on the host live under ops's store
-//! root instead. Binding ops's store at `/nix` inside a mount namespace makes those
+//! and library paths under `/nix/store/…`, which on the host live under sbx's store
+//! root instead. Binding sbx's store at `/nix` inside a mount namespace makes those
 //! logical paths resolve — the same mechanism the sandbox uses for its userland,
-//! applied to a tool ops runs itself.
+//! applied to a tool sbx runs itself.
 
 use crate::store::{self, Layout};
 use std::ffi::OsString;
@@ -41,9 +41,9 @@ const MISE_ATTR: &str = "mise";
 /// the bin-bearing output of the realised derivation.
 const MISE_BIN: &str = "bin/mise";
 
-/// In-sandbox mount point for ops's private mise home. `HOME` and every
+/// In-sandbox mount point for sbx's private mise home. `HOME` and every
 /// `MISE_*_DIR` live under it, so mise's reads and writes are confined to the one
-/// directory ops binds read-write — never the user's real mise state.
+/// directory sbx binds read-write — never the user's real mise state.
 const MISE_HOME: &str = "/mise";
 
 /// In-sandbox directory holding the project's mise file(s) when mise reads a
@@ -65,7 +65,7 @@ struct ProjectBind {
     dest: PathBuf,
 }
 
-/// Provision the mise engine into ops's store against `engine_ref` (the **dedicated
+/// Provision the mise engine into sbx's store against `engine_ref` (the **dedicated
 /// engine channel** — see the module note on why mise does not follow a project pin, and
 /// [`crate::store::LockTarget::engine`] on why it has its own lock) and return its logical
 /// store **root** (`/nix/store/…`, which resolves once the store is bound at `/nix`). The
@@ -93,7 +93,7 @@ pub(crate) fn bin(root: &Path) -> PathBuf {
 }
 
 /// A bubblewrap command that runs the provisioned `mise_bin` with `args`, hermetic
-/// and offline: ops's store read-only at `/nix`, a private writable home, an
+/// and offline: sbx's store read-only at `/nix`, a private writable home, an
 /// isolated network namespace, and an environment cleared and rebuilt from exactly
 /// the keys mise needs. `project_binds` exposes the authorized project mise files
 /// (empty for a config-free invocation such as `--version`). Ensures the private
@@ -214,7 +214,7 @@ fn project_env_from_json(value: &serde_json::Value, authorized: &[&Path]) -> Vec
         .collect()
 }
 
-/// The host directory backing ops's private mise home, under the data directory.
+/// The host directory backing sbx's private mise home, under the data directory.
 fn home_dir(layout: &Layout) -> PathBuf {
     layout.data_dir().join("mise")
 }
@@ -233,7 +233,7 @@ fn ensure_home(layout: &Layout) -> io::Result<PathBuf> {
 }
 
 /// Build the bubblewrap argument list that runs mise hermetically. Pure: the whole
-/// invocation is one auditable argv, like the sandbox's own. It binds ops's store
+/// invocation is one auditable argv, like the sandbox's own. It binds sbx's store
 /// read-only (so the relocated binary's logical paths resolve), binds the private
 /// home read-write (the **only** writable mount), isolates every namespace
 /// including the network, clears the environment, and rebuilds it from keys that
@@ -271,7 +271,7 @@ fn bwrap_argv(
         a.push(lit(ns));
     }
     // Start from a clean environment and die with the launcher, so no host variable
-    // leaks into mise and no helper outlives ops.
+    // leaks into mise and no helper outlives sbx.
     a.push(lit("--clearenv"));
     a.push(lit("--die-with-parent"));
     // The same unconditional capability drop the main cage's `to_argv` applies (bwrap then also
@@ -346,7 +346,7 @@ fn bwrap_argv(
 }
 
 /// Join in-sandbox paths into a single `:`-separated `OsString`, for
-/// `MISE_TRUSTED_CONFIG_PATHS`. The paths are ops-constructed under [`MISE_PROJECT`]
+/// `MISE_TRUSTED_CONFIG_PATHS`. The paths are sbx-constructed under [`MISE_PROJECT`]
 /// (ASCII), so a colon separator is unambiguous.
 fn join_paths<'a>(paths: impl Iterator<Item = &'a Path>) -> OsString {
     let mut out = OsString::new();
@@ -453,10 +453,10 @@ mod tests {
     fn ensure_home_creates_the_private_home_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
 
         let home = ensure_home(&layout).unwrap();
-        assert_eq!(home, base.join("ops/mise"));
+        assert_eq!(home, base.join("sbx/mise"));
         let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "the private mise home must be owner-only");
         // idempotent
@@ -585,15 +585,15 @@ mod tests {
 
 /// Provisioning and running real mise needs a real nix, a real bwrap, and a
 /// capability-bearing user namespace, so this is an integration check: it skips
-/// (does not fail) where any is absent, and otherwise proves mise runs from ops's
-/// own store, hermetically, writing only into ops's data directory.
+/// (does not fail) where any is absent, and otherwise proves mise runs from sbx's
+/// own store, hermetically, writing only into sbx's data directory.
 #[cfg(test)]
 mod run_tests {
     use super::*;
     use crate::testutil::TmpDir;
 
     #[test]
-    fn runs_mise_from_ops_store_hermetically_and_writes_only_into_ops_data() {
+    fn runs_mise_from_sbx_store_hermetically_and_writes_only_into_sbx_data() {
         let Some(nix) = store::resolve_nix(None) else {
             eprintln!("skipping mise run: no nix on PATH");
             return;
@@ -608,12 +608,12 @@ mod run_tests {
         }
 
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         let nixpkgs = store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve the global channel");
 
-        // the engine is provisioned into ops's own store, never the host's mise
+        // the engine is provisioned into sbx's own store, never the host's mise
         let mise_bin = bin(&provision_engine(&nix, &layout, &nixpkgs).expect("provision mise"));
         assert!(
             mise_bin.starts_with("/nix/store") && mise_bin.ends_with("bin/mise"),
@@ -622,7 +622,7 @@ mod run_tests {
         );
         assert!(
             store::physical_path(&layout, &mise_bin).exists(),
-            "mise missing from ops's store: {}",
+            "mise missing from sbx's store: {}",
             mise_bin.display()
         );
         // it is rooted per channel revision, so a store GC cannot collect it
@@ -632,7 +632,7 @@ mod run_tests {
             .join(store::revision_of(&nixpkgs));
         assert!(rev_root.is_dir(), "per-revision mise gcroot missing");
 
-        // run `mise --version` from ops's store, hermetic and offline
+        // run `mise --version` from sbx's store, hermetic and offline
         let out = command(
             &bwrap,
             &layout,
@@ -671,12 +671,12 @@ mod run_tests {
             "the driver left the working directory unpinned: {stderr}"
         );
 
-        // host-write hygiene: mise's writes landed in ops's private home, and that
+        // host-write hygiene: mise's writes landed in sbx's private home, and that
         // home is the only writable mount (asserted structurally above), so nothing
         // touched the user's real mise state
         assert!(
             home_dir(&layout).join("data").exists() || home_dir(&layout).join("cache").exists(),
-            "mise wrote nothing into ops's private home"
+            "mise wrote nothing into sbx's private home"
         );
     }
 
@@ -696,7 +696,7 @@ mod run_tests {
         }
 
         let base = TmpDir::new();
-        let layout = Layout::under(&base.join("ops"));
+        let layout = Layout::under(&base.join("sbx"));
         let nixpkgs = store::LockTarget::global(&layout, None)
             .resolve(&nix, &layout)
             .expect("resolve the global channel");
@@ -711,7 +711,7 @@ mod run_tests {
         let parent = TmpDir::new();
         let proj = parent.join("project");
         std::fs::create_dir(&proj).unwrap();
-        std::fs::write(proj.join(".ops.toml"), b"").unwrap();
+        std::fs::write(proj.join(".sbx.toml"), b"").unwrap();
         std::fs::write(
             proj.join(".mise.toml"),
             b"[env]\nFOO = \"bar\"\nGREETING = \"hello world\"\n",
@@ -726,7 +726,7 @@ mod run_tests {
 
         // the trust-hashed set is exactly the same-directory files — it includes the
         // local override (now honored) and excludes the parent-directory config
-        let files = crate::trust::mise_inputs_for(&proj.join(".ops.toml"))
+        let files = crate::trust::mise_inputs_for(&proj.join(".sbx.toml"))
             .expect("read the authorized mise files");
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert!(

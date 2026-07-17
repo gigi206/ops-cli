@@ -1,10 +1,10 @@
-# Auggie — Augment Code's terminal coding agent (augmentcode.com), sandboxed by ops.
+# Auggie — Augment Code's terminal coding agent (augmentcode.com), sandboxed by sbx.
 #
-#   ops app import profiles/auggie.toml
-#   ops app auggie
+#   sbx app import profiles/auggie.toml
+#   sbx app auggie
 #
 # Auggie ships as an npm package (`@augmentcode/auggie`), a genuine terminal CLI that
-# runs anywhere Node.js runs — so ops equips it in-cage with a node runtime (Node 20+
+# runs anywhere Node.js runs — so sbx equips it in-cage with a node runtime (Node 20+
 # is required) plus mise's npm backend. Unlike the `cline`/`droid` profiles (whose npm
 # packages deliver a self-contained native binary), Auggie is a **pure-node** CLI: node
 # is needed at RUNTIME, not only to install. The cage synthesises `/usr/bin/env`, so its
@@ -15,24 +15,24 @@
 # CREDENTIAL POSTURE — Augment ACCOUNT, NOT a header-injectable provider key. Auggie
 # authenticates to your Augment account and routes all model traffic through Augment's own
 # tenant backend (`<tenant>.api.augmentcode.com`), so there is no per-provider HTTP header
-# for ops's `[secret]` broker to strip-and-inject, and this profile ships **no `[secret]`
+# for sbx's `[secret]` broker to strip-and-inject, and this profile ships **no `[secret]`
 # block** (contrast the BYOK profiles like `cline`/`opencode`). There are two ways in:
 #
 #   1. HEADLESS (recommended for the cage) — a session token from a HOST login.
 #      On the HOST, once:  auggie login   (opens your browser, one-time)
 #                          auggie token print   → a session JSON {accessToken, tenantURL, scopes}
 #      Then inject it for a single caged launch WITHOUT baking it into this file:
-#          ops app auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"
+#          sbx app auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"
 #      (`--env` is an authoritative one-shot override read on the host; the value reaches the
 #      cage env for that launch only, so the secret never lands in the committed profile. You
-#      can also pass it as $OPS_ENV_AUGMENT_SESSION_AUTH.) Auggie also accepts the pair
+#      can also pass it as $SBX_ENV_AUGMENT_SESSION_AUTH.) Auggie also accepts the pair
 #      AUGMENT_API_TOKEN + AUGMENT_API_URL as an equivalent; either works. Headless runs use
 #      `auggie --print "<task>"` (a.k.a. `-p`) with `--quiet` for clean, pipeable output.
 #
 #   2. INTERACTIVE in-cage `auggie login` — CAVEAT, may not complete inside the cage. The
 #      login starts a localhost OAuth-callback server and expects your browser to redirect to
-#      `http://localhost:<port>`. Under ops that server binds the CAGE's loopback (the cage
-#      runs in an empty network namespace; ops synthesises `/etc/hosts` so `localhost`
+#      `http://localhost:<port>`. Under sbx that server binds the CAGE's loopback (the cage
+#      runs in an empty network namespace; sbx synthesises `/etc/hosts` so `localhost`
 #      resolves in-cage), but the HOST browser's redirect hits the HOST's loopback, not the
 #      cage's — so the loopback callback likely cannot complete across the namespace boundary.
 #      Prefer path 1. If you try path 1's `auggie login` FLOW in-cage anyway, uncomment the
@@ -43,7 +43,7 @@
 # way the sandbox + the egress allowlist bound everything the agent can reach.
 #
 # If a request is blocked, the proxy reports the host it refused — add it to `allow` (or
-# check ahead with `ops test net <url>`).
+# check ahead with `sbx test net <url>`).
 cmd = "auggie"
 
 # Your host Auggie config/credential dir, mounted read-write at its real absolute path.
@@ -67,7 +67,7 @@ auggie = "mise:npm:@augmentcode/auggie"
 [network]
 mode = "deny"
 allow = [
-    # Install: the npm packument (version resolution / `ops upgrade`) and the package tarball —
+    # Install: the npm packument (version resolution / `sbx upgrade`) and the package tarball —
     # npm spreads these across sibling paths under the registry, so the host is opened read-only
     # as a whole (like the other npm-backed profiles), not path-scoped.
     "{GET} https://registry.npmjs.org",
@@ -76,7 +76,7 @@ allow = [
     # subdomain wildcard covers whichever one your `tenantURL` names. Opened to all verbs (request
     # bodies: completions + indexed workspace uploads).
     "{*} https://*.api.augmentcode.com",
-    # GitHub (PR workflows / repository indexing) rides ops's built-in nix-cache allow-set
+    # GitHub (PR workflows / repository indexing) rides sbx's built-in nix-cache allow-set
     # (github.com / api.github.com / githubusercontent) — no extra `allow` needed here.
     #
     # OAuth login server — REQUIRED for the auth flow. Confirmed by a real caged run: without it,
@@ -90,17 +90,17 @@ allow = [
     #"{*} https://app.augmentcode.com",
 ]
 
-# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): a `mute` never changes
-# the verdict (the host is still denied) and never hides a count (`ops net stats` still tallies it);
-# it only keeps the line out of the default log. See it anytime with `ops net log --all`, and edit
-# this list from the CLI with `ops net mute|unmute <host> -a auggie`. Augment's own telemetry, if
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): a `mute` never changes
+# the verdict (the host is still denied) and never hides a count (`sbx net stats` still tallies it);
+# it only keeps the line out of the default log. See it anytime with `sbx net log --all`, and edit
+# this list from the CLI with `sbx net mute|unmute <host> -a auggie`. Augment's own telemetry, if
 # any, is refused by construction in `deny` mode (nothing outside `allow` gets out); add its host
 # here the day the proxy names it, to keep the log clean.
 mute = [
     "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
     # Auggie's own telemetry — refused by construction (deny mode) and NOT needed at runtime (verified:
     # auth, model fetch and workspace indexing all succeed while these are blocked). Muted to keep the
-    # log clean; still counted in `ops net stats`, still denied. Confirmed against the package source.
+    # log clean; still counted in `sbx net stats`, still denied. Confirmed against the package source.
     "{POST} https://api.segment.io",            # Segment product analytics (@segment/analytics-node -> /v1/batch)
     "{POST} https://*.ingest.us.sentry.io",      # Sentry crash/error telemetry (.../envelope/)
 ]
@@ -113,10 +113,10 @@ mute = [
 [env]
 # REQUIRED — Auggie is a pure-Node CLI and reaches its OAuth server AND its tenant API through
 # Node's built-in fetch (undici), which — unlike npm and mise — does NOT honour the
-# http_proxy/https_proxy variables ops injects. In the Model-B cage (empty network namespace, no
+# http_proxy/https_proxy variables sbx injects. In the Model-B cage (empty network namespace, no
 # DNS resolver) a fetch that bypasses the proxy resolves the host itself and dies with
 # `EAI_AGAIN: getaddrinfo <host>` — the failure you get if this is unset, and it never even reaches
-# the proxy (so it shows as 0 deny in `ops net stats`, not a refusal). NODE_USE_ENV_PROXY (Node 24+,
+# the proxy (so it shows as 0 deny in `sbx net stats`, not a refusal). NODE_USE_ENV_PROXY (Node 24+,
 # which `nix:nodejs` provides — verified v24.18) makes fetch route through the proxy, so every
 # runtime request is subject to the allowlist above.
 NODE_USE_ENV_PROXY = "1"

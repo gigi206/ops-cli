@@ -1,18 +1,18 @@
 //! A cage's human-readable name, derived once and shown consistently on every face
 //! it surfaces through: the systemd scope (`systemctl --user`, `ps`, `systemd-cgls`),
 //! the in-cage hostname (a shell prompt, `hostname`, `uname -n`), and the session
-//! listing (`ops session ls`, `ops net … --session`). All three read the same slug so a cage
+//! listing (`sbx session ls`, `sbx net … --session`). All three read the same slug so a cage
 //! reads the same everywhere, instead of the opaque `run-p<pid>-i<pid>.scope` systemd
 //! picks and the fixed `sandbox` hostname every cage otherwise shares.
 //!
-//! The slug comes from the launch's own identity — the app name for `ops app <name>`,
+//! The slug comes from the launch's own identity — the app name for `sbx app <name>`,
 //! else the project's directory name — never from anything an untrusted project can
 //! set, so naming grants no new influence over the host.
 
 use std::path::Path;
 
 /// The longest slug kept before the composed forms add their prefix/suffix. A hostname
-/// label is capped at 63 bytes and `ops-` takes four, so 50 leaves comfortable room while
+/// label is capped at 63 bytes and `sbx-` takes four, so 50 leaves comfortable room while
 /// staying readable; the scope unit name has a far larger ceiling, so this bounds both.
 const MAX_SLUG: usize = 50;
 
@@ -83,7 +83,7 @@ pub(crate) fn sanitize_label(input: &str) -> String {
     out
 }
 
-/// The bare slug for a cage: the app name for an `ops app <name>` launch, otherwise the
+/// The bare slug for a cage: the app name for an `sbx app <name>` launch, otherwise the
 /// project directory's own name. Sanitized to the safe, bounded token every face reuses.
 pub(crate) fn cage_slug(app: Option<&str>, project: &Path) -> String {
     let source = app
@@ -97,27 +97,27 @@ pub(crate) fn cage_slug(app: Option<&str>, project: &Path) -> String {
     sanitize_label(&source)
 }
 
-/// The in-cage hostname for a slug: `ops-<slug>`, so `$HOSTNAME`, `uname -n`, and a
+/// The in-cage hostname for a slug: `sbx-<slug>`, so `$HOSTNAME`, `uname -n`, and a
 /// `\h`-based shell prompt name the cage and distinguish it per project/app — while still
 /// never revealing the *host's* own hostname (the fresh UTS namespace's whole point).
 pub(crate) fn cage_hostname(slug: &str) -> String {
-    format!("ops-{slug}")
+    format!("sbx-{slug}")
 }
 
-/// The full display name for a cage — `ops-<slug>` — straight from its app/project identity.
-/// The one function a session listing (`ops session ls`, `ops net … --session`) renders from, so the
+/// The full display name for a cage — `sbx-<slug>` — straight from its app/project identity.
+/// The one function a session listing (`sbx session ls`, `sbx net … --session`) renders from, so the
 /// name it shows is *identical* to the cage's hostname and systemd scope (they share this
 /// slug), and cannot drift from them.
 pub(crate) fn cage_name(app: Option<&str>, project: &Path) -> String {
     cage_hostname(&cage_slug(app, project))
 }
 
-/// The transient systemd scope's unit name for a slug: `ops-<slug>-<pid>.scope`. The pid
+/// The transient systemd scope's unit name for a slug: `sbx-<slug>-<pid>.scope`. The pid
 /// is the launcher's, present only to keep the name unique among concurrently live scopes
 /// (two cages of one project share a slug); systemd requires a live unit name be unique
 /// and `--collect` frees it on exit, so a finished cage never blocks the next.
 pub(crate) fn scope_unit(slug: &str, pid: u32) -> String {
-    format!("ops-{slug}-{pid}.scope")
+    format!("sbx-{slug}-{pid}.scope")
 }
 
 #[cfg(test)]
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn sanitize_lowercases_and_replaces_unsafe_bytes() {
-        assert_eq!(sanitize_label("Ops-CLI"), "ops-cli");
+        assert_eq!(sanitize_label("Sbx-CLI"), "sbx-cli");
         assert_eq!(sanitize_label("my project.v2"), "my-project-v2");
         assert_eq!(sanitize_label("a__b  c"), "a-b-c");
     }
@@ -185,17 +185,17 @@ mod tests {
     }
 
     #[test]
-    fn a_cage_hostname_carries_the_ops_prefix() {
-        assert_eq!(cage_hostname("ops-cli"), "ops-ops-cli");
-        assert_eq!(cage_hostname("claude-code"), "ops-claude-code");
+    fn a_cage_hostname_carries_the_sbx_prefix() {
+        assert_eq!(cage_hostname("ops-cli"), "sbx-ops-cli");
+        assert_eq!(cage_hostname("claude-code"), "sbx-claude-code");
     }
 
     #[test]
-    fn a_scope_unit_carries_the_ops_prefix_and_pid() {
+    fn a_scope_unit_carries_the_sbx_prefix_and_pid() {
         assert_eq!(
             scope_unit("claude-code", 4089496),
-            "ops-claude-code-4089496.scope"
+            "sbx-claude-code-4089496.scope"
         );
-        assert_eq!(scope_unit("ops-cli", 62727), "ops-ops-cli-62727.scope");
+        assert_eq!(scope_unit("ops-cli", 62727), "sbx-ops-cli-62727.scope");
     }
 }

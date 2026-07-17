@@ -1,6 +1,6 @@
 //! The on-disk session registry (no daemon).
 //!
-//! Each running sandbox writes a small record under `<data>/sessions/`; `ops session ls`
+//! Each running sandbox writes a small record under `<data>/sessions/`; `sbx session ls`
 //! reads them back. Without a daemon nothing guarantees a record is removed when
 //! its sandbox dies, so a record is a **liveness-validated hint**, never trusted
 //! to be cleaned up: [`Registry::list`] re-checks every record and prunes the
@@ -12,7 +12,7 @@
 //! ambiguous because the kernel reuses pids. The process start time (clock ticks
 //! since boot, from `/proc/<pid>/stat`) pins one *incarnation* of a pid, so a
 //! reused pid no longer masquerades as a live session. The start time survives
-//! `execve`, so registering just before `ops run` execs into bubblewrap is safe:
+//! `execve`, so registering just before `sbx run` execs into bubblewrap is safe:
 //! the record keeps matching the same pid after it becomes the sandbox.
 //!
 //! The recorded project path is the **canonical** project root (the same path the
@@ -31,9 +31,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// What kind of sandbox a record describes. Both are tracked: `ops run` is the
+/// What kind of sandbox a record describes. Both are tracked: `sbx run` is the
 /// autonomous-agent path (the sandboxes the registry most needs to surface) and
-/// `ops shell` the interactive one.
+/// `sbx shell` the interactive one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Run,
@@ -57,9 +57,9 @@ impl Kind {
     }
 }
 
-/// Which persistent home a session runs in — the bit `ops session attach` needs to reproduce the same
-/// environment. A plain `ops run`/`ops shell` uses the project's default home (`Project`); an
-/// `ops app` uses its own isolated home, keyed by the app name and its scope (`GlobalApp` shared
+/// Which persistent home a session runs in — the bit `sbx session attach` needs to reproduce the same
+/// environment. A plain `sbx run`/`sbx shell` uses the project's default home (`Project`); an
+/// `sbx app` uses its own isolated home, keyed by the app name and its scope (`GlobalApp` shared
 /// across projects, `ProjectApp` per project). Owned (unlike the borrowing launch-side `Runtime`),
 /// so a record outlives the launch that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +109,7 @@ pub(crate) enum StopOutcome {
 
 /// One registered sandbox. The `(pid, start_ticks)` pair identifies the live
 /// process; `project` is the canonical project root (display and identity); `runtime` is the home
-/// it runs in, so `ops session attach` can reproduce it.
+/// it runs in, so `sbx session attach` can reproduce it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Session {
     pub(crate) project: PathBuf,
@@ -158,7 +158,7 @@ impl Session {
         }
     }
 
-    /// The app this session runs as (`ops app <name>`), or `None` for a plain project shell/run — so
+    /// The app this session runs as (`sbx app <name>`), or `None` for a plain project shell/run — so
     /// a listing or an action can be scoped to one app's session(s).
     pub(crate) fn app(&self) -> Option<&str> {
         match &self.runtime {
@@ -354,7 +354,7 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    /// The registry under ops's data directory.
+    /// The registry under sbx's data directory.
     pub(crate) fn at(data_dir: &Path) -> Self {
         Self {
             dir: data_dir.join("sessions"),
@@ -393,9 +393,9 @@ impl Registry {
 
     /// Re-validate every record against its running process: return the live sessions (sorted for
     /// stable display) and the count of dead or unparseable records reaped. Pruning happens only
-    /// here, so the directory is bounded by how often this runs: `ops shell` self-cleans on exit via
-    /// [`RecordGuard`], an `ops run` record (no post-exec hook) lingers until the next `ops session ls` or
-    /// `ops gc` reaps it. `ops gc` calls this directly to report the prune; `ops session ls` and the gc
+    /// here, so the directory is bounded by how often this runs: `sbx shell` self-cleans on exit via
+    /// [`RecordGuard`], an `sbx run` record (no post-exec hook) lingers until the next `sbx session ls` or
+    /// `sbx gc` reaps it. `sbx gc` calls this directly to report the prune; `sbx session ls` and the gc
     /// reaper take the live half through [`list`](Self::list).
     pub(crate) fn housekeep(&self) -> io::Result<(Vec<Session>, usize)> {
         let entries = match std::fs::read_dir(&self.dir) {
@@ -409,7 +409,7 @@ impl Registry {
         let mut pruned = 0;
         for entry in entries {
             // A single unreadable directory entry must not abort the whole listing: the caller's
-            // live-session guard (used by `ops gc` to skip a project with a running session) would
+            // live-session guard (used by `sbx gc` to skip a project with a running session) would
             // then see zero live sessions and could collect an in-use one. Skip the bad entry so
             // every other live record still appears — a far smaller exposure than losing them all.
             let Ok(entry) = entry else { continue };
@@ -438,7 +438,7 @@ impl Registry {
     }
 
     /// Remove a specific session's record (best-effort), so a session just stopped disappears from
-    /// `ops session ls` at once rather than lingering until liveness pruning catches it — which it would
+    /// `sbx session ls` at once rather than lingering until liveness pruning catches it — which it would
     /// not do immediately anyway while the killed process is still a zombie reading as alive. A
     /// missing record is fine; liveness pruning remains the real cleanup.
     pub(crate) fn reap(&self, session: &Session) {
@@ -447,7 +447,7 @@ impl Registry {
 }
 
 /// Removes a session record when dropped — the eager, best-effort cleanup for a
-/// supervised session (`ops shell`). It covers normal/error/panic exits; a
+/// supervised session (`sbx shell`). It covers normal/error/panic exits; a
 /// `SIGKILL` skips it, which is exactly why [`Registry::list`] does not rely on
 /// it and prunes by liveness instead.
 pub(crate) struct RecordGuard {
@@ -517,7 +517,7 @@ fn parse_record(path: &Path) -> Option<Session> {
 /// success means *a* process holds the pid, which is not enough, so the decisive
 /// test is always the start-time match: only the original incarnation has it.
 ///
-/// One harmless transient: a just-exited `ops run` not yet reaped by its parent is
+/// One harmless transient: a just-exited `sbx run` not yet reaped by its parent is
 /// a zombie whose `/proc/<pid>/stat` still carries the original start time, so it
 /// reads as alive for that brief window. Treating the zombie state as dead would
 /// remove it, but the window is short and self-clears on the next listing.

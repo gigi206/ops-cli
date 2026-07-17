@@ -42,18 +42,18 @@ const CAGE_PROXY_PORT: u16 = 18043;
 /// Where the bound egress socket appears in the cage. Under the `/tmp` tmpfs (a writable
 /// mountpoint — a bind onto the read-only root would fail); the forwarder `UNIX-CONNECT`s
 /// to it. The cage cannot unlink it (a bind-mount target is busy) or reach anything else.
-const CAGE_UDS: &str = "/tmp/ops-egress.sock";
+const CAGE_UDS: &str = "/tmp/sbx-egress.sock";
 
-/// Where the proxy's CA certificate appears in the cage, read-only. Under `/opt/ops`
+/// Where the proxy's CA certificate appears in the cage, read-only. Under `/opt/sbx`
 /// (already a cage directory for the mise plugin and shell rc), so the agent cannot
 /// rewrite the trust anchor.
-pub(crate) const CAGE_CA: &str = "/opt/ops/egress-ca.pem";
+pub(crate) const CAGE_CA: &str = "/opt/sbx/egress-ca.pem";
 
-/// The CA-bundle environment variables ops sets so the cage's toolchains trust its
+/// The CA-bundle environment variables sbx sets so the cage's toolchains trust its
 /// per-session CA, and — being the keys it sets — exactly the keys an untrusted project
 /// is forbidden to set (see `config::is_reserved_env_key`, which consumes this list so
 /// the two can never drift). All are *file*-valued and point at [`CAGE_CA`], whose bundle is
-/// the per-session MITM CA followed by the base root bundle: every cage connection is ops-minted
+/// the per-session MITM CA followed by the base root bundle: every cage connection is sbx-minted
 /// under the empty netns, so the MITM CA alone verifies the wire, but a bundle of a single cert
 /// is unusual and trips tools that reject a "too small" CA file, so it is paired with the normal
 /// roots to stay a full, ordinary bundle (the extra roots are inert for egress). A tool that reads
@@ -70,8 +70,8 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 ];
 
 /// A running egress session's host-side resources: the bound proxy socket, the CA file, and the
-/// control socket a host-side `ops net pending`/`ops net log` reaches. The proxy and control threads
-/// are detached and die when ops exits (right after the cage); this guard only owns the on-disk
+/// control socket a host-side `sbx net pending`/`sbx net log` reaches. The proxy and control threads
+/// are detached and die when sbx exits (right after the cage); this guard only owns the on-disk
 /// artifacts, unlinking them when the launch ends. The control socket is deliberately not among the
 /// cage's binds (see [`start`]).
 pub(crate) struct Egress {
@@ -82,11 +82,11 @@ pub(crate) struct Egress {
     control_uds: Option<PathBuf>,
     /// The session's per-host decision counters, when stats are on. The guard owns a flush on a
     /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
-    /// persists for `ops net stats` to aggregate after the session ends (cleared by `--reset`).
+    /// persists for `sbx net stats` to aggregate after the session ends (cleared by `--reset`).
     stats: Option<Arc<super::egress_stats::EgressStats>>,
     /// The live egress event ring, shared with the proxy and control threads. Held here so a
     /// supervised launch can snapshot the run's decisions after the cage exits — the source
-    /// `ops app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
+    /// `sbx app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
     /// read handle.
     log: Arc<super::control::LogRing>,
 }
@@ -126,9 +126,9 @@ pub(crate) struct Wiring {
 /// Wrap `cmd` so the cage starts the forwarder before running it: a static bash that
 /// backgrounds `socat` (stdio detached so it never touches the terminal) and then
 /// `exec`s the real command — which therefore stays the cage's main process, leaving
-/// `ops shell`'s pty job control unchanged. The command rides `"$@"` positionally, so
+/// `sbx shell`'s pty job control unchanged. The command rides `"$@"` positionally, so
 /// nothing the agent controls is ever interpolated into the script (no shell injection,
-/// non-UTF-8 argv preserved); only ops-owned ASCII store paths and the fixed port/socket
+/// non-UTF-8 argv preserved); only sbx-owned ASCII store paths and the fixed port/socket
 /// go into the script string.
 pub(crate) fn wrap_command(socat: &Path, bash: &Path, cmd: Vec<OsString>) -> Vec<OsString> {
     let preamble = format!(
@@ -138,14 +138,14 @@ pub(crate) fn wrap_command(socat: &Path, bash: &Path, cmd: Vec<OsString>) -> Vec
         port = CAGE_PROXY_PORT,
         uds = CAGE_UDS,
     );
-    wrap_background(bash, &preamble, "ops-egress-forward", cmd)
+    wrap_background(bash, &preamble, "sbx-egress-forward", cmd)
 }
 
 /// Assemble the `bash -c '<preamble> exec "$@"'` forwarder wrapper shared by the egress and
 /// the host→cage forward ([`super::forward`]) socat bridges: `preamble` backgrounds the socat(s) (it must end
 /// with a trailing `& `), `label` is the `$0`, and `cmd` rides `"$@"` **positionally** so nothing
 /// the agent controls is ever interpolated into the script (no shell injection, non-UTF-8 argv
-/// preserved). `exec` keeps the inner command the cage's main process, leaving `ops shell`'s pty
+/// preserved). `exec` keeps the inner command the cage's main process, leaving `sbx shell`'s pty
 /// job control unchanged.
 pub(super) fn wrap_background(
     bash: &Path,
@@ -199,7 +199,7 @@ pub(crate) fn start(
     // Resolve the credentials before standing anything up, so a missing secret fails the
     // launch cleanly rather than after a socket and a thread are live. The redaction needles
     // come from the same resolved values, so they cannot disagree with the injections. A
-    // relative `sops` file resolves against the project root (the `.ops.toml`'s directory). A
+    // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
     let (injections, redactions) = resolve_injections(secrets, project_root, bwrap)?;
 
@@ -221,7 +221,7 @@ pub(crate) fn start(
         .unwrap_or_else(|| pid.to_string());
 
     // Per-host decision counters for this session, keyed by the project's canonical path (the same
-    // identity `ops net stats` derives from a cwd, so a launch's record and a later read agree).
+    // identity `sbx net stats` derives from a cwd, so a launch's record and a later read agree).
     // Disabled by `[network] stats = false`; otherwise best-effort — a project that cannot be
     // canonicalised simply records no stats, never a launch failure. The proxy flushes the file
     // after each decision (robust to a killed session); it persists after the session for aggregation.
@@ -244,13 +244,13 @@ pub(crate) fn start(
         .with_redactions(redactions)
         .with_app(app.map(str::to_string));
 
-    // Stand up the control socket the host-side `ops net pending`/`ops net log`/`ops net allow
+    // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
     // into the cage (only the proxy socket and the CA cross in) — in Mode B the in-cage agent must not
     // answer its own asks, read its own log, or load its own rules. One pending queue + manual-rule
     // overlay + event ring are shared between the proxy and the control thread. The overlay is wired
     // into the proxy for **every** filtering posture (not only `ask`): the proxy folds it into its
-    // effective policy per request, so `ops net allow|deny --session` takes effect on an allowlist or
+    // effective policy per request, so `sbx net allow|deny --session` takes effect on an allowlist or
     // denylist session too, not just `ask`. Only `ask` ever parks into the pending queue, but wiring
     // it unconditionally is harmless (a non-ask posture never parks), and the ring is always wired so
     // every proxy session has a live log.
@@ -264,13 +264,13 @@ pub(crate) fn start(
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
         // The live flow registry — the proxy and the control thread share the same `Arc` (the proxy
-        // registers a flow per open tunnel; `ops net live` reads them over the control socket).
+        // registers a flow per open tunnel; `sbx net live` reads them over the control socket).
         let flows = Arc::new(super::control::FlowRegistry::new());
         ctx = ctx.with_control(pending.clone(), manual.clone());
         ctx = ctx.with_log(log.clone());
         ctx = ctx.with_flows(flows.clone());
         // Bind+listen here, before the serving thread, so the control plane is reachable the moment
-        // the launch is up — never a race with the first `ops net pending`/`ops net log`.
+        // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
         let control_log = log.clone();
         std::thread::spawn(move || {
@@ -285,7 +285,7 @@ pub(crate) fn start(
 
     // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
     // agent gets a trust anchor it cannot rewrite. The bundle is the per-session MITM CA FOLLOWED BY
-    // the base root bundle (`ca_bundle`, the same Mozilla roots ops binds at /etc/ssl): every allowed
+    // the base root bundle (`ca_bundle`, the same Mozilla roots sbx binds at /etc/ssl): every allowed
     // egress is MITM'd and so presents the MITM CA, but a bundle of a single cert is unusual and trips
     // tools that heuristically reject a "too small" CA file (e.g. a client that sanity-checks
     // `certifi`), so pairing it with the normal roots keeps the file a full, ordinary bundle. The
@@ -321,7 +321,7 @@ pub(crate) fn start(
     // Exempt loopback from the proxy: an agent's own in-cage service (a dev server, a test
     // harness on `127.0.0.1`) is intra-cage under the empty netns — never egress — so routing
     // it through the proxy would only get it refused (the proxy rejects an IP-literal CONNECT).
-    // ops sets `no_proxy` itself; it being reserved-for-untrusted does not stop that.
+    // sbx sets `no_proxy` itself; it being reserved-for-untrusted does not stop that.
     let no_proxy = "localhost,127.0.0.1,::1".to_string();
     let mut env = vec![
         ("http_proxy".to_string(), proxy_url.clone()),
@@ -331,7 +331,7 @@ pub(crate) fn start(
         // WebSocket proxy vars. A client library resolves a proxy per URL *scheme*, so a `ws://` or
         // `wss://` connection does NOT match `http_proxy`/`https_proxy` — without a `ws_proxy`/
         // `wss_proxy` it connects directly, which in the empty netns fails at DNS ("Temporary failure
-        // in name resolution"). The ops proxy is an HTTP CONNECT proxy, which is exactly what a WS
+        // in name resolution"). The sbx proxy is an HTTP CONNECT proxy, which is exactly what a WS
         // client tunnels through, so it is the correct value here too. Agnostic — any WebSocket client
         // that honors these (aiohttp `trust_env`, etc.) then routes through the proxy.
         ("ws_proxy".to_string(), proxy_url.clone()),
@@ -519,7 +519,7 @@ fn read_source(
     }
 }
 
-/// Resolve a sops file path: a relative one against the project root (the `.ops.toml`'s directory),
+/// Resolve a sops file path: a relative one against the project root (the `.sbx.toml`'s directory),
 /// an absolute one as-is.
 fn sops_path(file: &Path, project_root: &Path) -> PathBuf {
     if file.is_absolute() {
@@ -635,7 +635,7 @@ mod tests {
             !script.contains("jq"),
             "the command must not be interpolated into the script"
         );
-        assert_eq!(argv[3], OsString::from("ops-egress-forward"));
+        assert_eq!(argv[3], OsString::from("sbx-egress-forward"));
         assert_eq!(argv[4], OsString::from("jq"));
         assert_eq!(argv[5], OsString::from("--version"));
     }
@@ -650,7 +650,7 @@ mod tests {
         let roots = data.path().join("roots.pem");
         std::fs::write(
             &roots,
-            "# ops-test-base-roots\n-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+            "# sbx-test-base-roots\n-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
 
@@ -732,13 +732,13 @@ mod tests {
         // it is a full bundle: the per-session MITM CA PLUS the base roots (a lone cert trips tools
         // that reject a "too small" CA bundle).
         assert!(
-            ca_pem.contains("# ops-test-base-roots"),
+            ca_pem.contains("# sbx-test-base-roots"),
             "the CA file must append the base root bundle to the MITM CA"
         );
 
         let (host_uds, ca_file) = (guard.host_uds.clone(), guard.ca_file.clone());
         // Every proxy posture — even this allowlist (non-ask) one — now stands up the control
-        // socket, because it also serves the live egress log (`ops net logs`). It lives host-side…
+        // socket, because it also serves the live egress log (`sbx net logs`). It lives host-side…
         let control = guard
             .control_uds
             .clone()
@@ -1032,7 +1032,7 @@ mod tests {
     fn a_missing_sops_file_is_absent_and_falls_through() {
         // a sops source whose file does not exist is a clean absent: the chain falls through to a
         // set env fallback (no sops is ever invoked, so this is hermetic).
-        std::env::set_var("OPS_TEST_EGRESS_SOPS_FB", "fallback-token-value");
+        std::env::set_var("SBX_TEST_EGRESS_SSBX_FB", "fallback-token-value");
         let dir = TmpDir::new();
         let (injs, _n) = resolve_injections(
             &[secret_chain(
@@ -1041,7 +1041,7 @@ mod tests {
                         file: PathBuf::from("does-not-exist.enc.yaml"),
                         key: Some("k".into()),
                     },
-                    SecretSource::Env("OPS_TEST_EGRESS_SOPS_FB".into()),
+                    SecretSource::Env("SBX_TEST_EGRESS_SSBX_FB".into()),
                 ],
                 "h.test",
                 "Authorization",
@@ -1051,7 +1051,7 @@ mod tests {
             Path::new(UNUSED_BWRAP),
         )
         .unwrap();
-        std::env::remove_var("OPS_TEST_EGRESS_SOPS_FB");
+        std::env::remove_var("SBX_TEST_EGRESS_SSBX_FB");
         assert_eq!(injs[0].value, "Bearer fallback-token-value");
     }
 
@@ -1086,15 +1086,15 @@ mod tests {
 
     #[test]
     fn resolve_injections_reads_env_and_shapes_the_value() {
-        std::env::set_var("OPS_TEST_EGRESS_TOKEN", "s3cret-token-value");
+        std::env::set_var("SBX_TEST_EGRESS_TOKEN", "s3cret-token-value");
         let s = secret(
-            SecretSource::Env("OPS_TEST_EGRESS_TOKEN".into()),
+            SecretSource::Env("SBX_TEST_EGRESS_TOKEN".into()),
             "api.github.com",
             "Authorization",
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        std::env::remove_var("OPS_TEST_EGRESS_TOKEN");
+        std::env::remove_var("SBX_TEST_EGRESS_TOKEN");
         assert_eq!(injs.len(), 1);
         assert_eq!(injs[0].header, "Authorization");
         assert_eq!(injs[0].value, "Bearer s3cret-token-value");
@@ -1111,14 +1111,14 @@ mod tests {
     #[test]
     fn a_missing_env_source_fails_closed_naming_the_source() {
         let s = secret(
-            SecretSource::Env("OPS_TEST_EGRESS_DEFINITELY_UNSET".into()),
+            SecretSource::Env("SBX_TEST_EGRESS_DEFINITELY_UNSET".into()),
             "h.test",
             "Authorization",
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let err = resolve_injections_at_root(&[s]).unwrap_err().to_string();
         assert!(
-            err.contains("OPS_TEST_EGRESS_DEFINITELY_UNSET"),
+            err.contains("SBX_TEST_EGRESS_DEFINITELY_UNSET"),
             "the error must name the missing source: {err}"
         );
     }
@@ -1127,15 +1127,15 @@ mod tests {
     fn an_empty_source_fails_closed() {
         // a value that is only a newline trims to empty → a clean "absent"; with no other source
         // the whole chain resolves nothing, which fails closed naming the secret.
-        std::env::set_var("OPS_TEST_EGRESS_EMPTY", "\n");
+        std::env::set_var("SBX_TEST_EGRESS_EMPTY", "\n");
         let s = secret(
-            SecretSource::Env("OPS_TEST_EGRESS_EMPTY".into()),
+            SecretSource::Env("SBX_TEST_EGRESS_EMPTY".into()),
             "h.test",
             "H",
             crate::config::HeaderShape::new("", false),
         );
         let err = resolve_injections_at_root(&[s]).unwrap_err().to_string();
-        std::env::remove_var("OPS_TEST_EGRESS_EMPTY");
+        std::env::remove_var("SBX_TEST_EGRESS_EMPTY");
         assert!(
             err.contains("no source resolved") && err.contains('H'),
             "an empty source must fail closed naming the secret: {err}"
@@ -1145,13 +1145,13 @@ mod tests {
     #[test]
     fn a_fallback_chain_uses_the_first_resolved_source() {
         // first source absent (unset var) → falls through to the second (a file)
-        std::env::remove_var("OPS_TEST_EGRESS_FALLBACK");
+        std::env::remove_var("SBX_TEST_EGRESS_FALLBACK");
         let dir = TmpDir::new();
         let file = dir.join("tok");
         std::fs::write(&file, "tok3n-from-the-file\n").unwrap();
         let (injs, _n) = resolve_injections_at_root(&[secret_chain(
             vec![
-                SecretSource::Env("OPS_TEST_EGRESS_FALLBACK".into()),
+                SecretSource::Env("SBX_TEST_EGRESS_FALLBACK".into()),
                 SecretSource::File(file.clone()),
             ],
             "h.test",
@@ -1162,10 +1162,10 @@ mod tests {
         assert_eq!(injs[0].value, "Bearer tok3n-from-the-file");
 
         // once the first source IS set, it wins — the file fallback is not consulted
-        std::env::set_var("OPS_TEST_EGRESS_FALLBACK", "tok3n-from-the-env");
+        std::env::set_var("SBX_TEST_EGRESS_FALLBACK", "tok3n-from-the-env");
         let (injs, _n) = resolve_injections_at_root(&[secret_chain(
             vec![
-                SecretSource::Env("OPS_TEST_EGRESS_FALLBACK".into()),
+                SecretSource::Env("SBX_TEST_EGRESS_FALLBACK".into()),
                 SecretSource::File(file),
             ],
             "h.test",
@@ -1173,7 +1173,7 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         )])
         .unwrap();
-        std::env::remove_var("OPS_TEST_EGRESS_FALLBACK");
+        std::env::remove_var("SBX_TEST_EGRESS_FALLBACK");
         assert_eq!(injs[0].value, "Bearer tok3n-from-the-env");
     }
 
@@ -1184,20 +1184,20 @@ mod tests {
         // proving a hard error is never silently downgraded to the fallback.
         let dir = TmpDir::new();
         std::env::set_var(
-            "OPS_TEST_EGRESS_HARD_FALLBACK",
+            "SBX_TEST_EGRESS_HARD_FALLBACK",
             "would-resolve-if-consulted",
         );
         let s = secret_chain(
             vec![
                 SecretSource::File(dir.path().to_path_buf()),
-                SecretSource::Env("OPS_TEST_EGRESS_HARD_FALLBACK".into()),
+                SecretSource::Env("SBX_TEST_EGRESS_HARD_FALLBACK".into()),
             ],
             "h.test",
             "Authorization",
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let err = resolve_injections_at_root(&[s]).map(|_| ());
-        std::env::remove_var("OPS_TEST_EGRESS_HARD_FALLBACK");
+        std::env::remove_var("SBX_TEST_EGRESS_HARD_FALLBACK");
         assert!(
             err.is_err(),
             "an unreadable first source must fail closed, not fall through to the set second source"
@@ -1239,15 +1239,15 @@ mod tests {
 
     #[test]
     fn a_basic_secret_redacts_both_the_pair_and_its_base64() {
-        std::env::set_var("OPS_TEST_EGRESS_BASIC", "alice:correct-horse");
+        std::env::set_var("SBX_TEST_EGRESS_BASIC", "alice:correct-horse");
         let s = secret(
-            SecretSource::Env("OPS_TEST_EGRESS_BASIC".into()),
+            SecretSource::Env("SBX_TEST_EGRESS_BASIC".into()),
             "h.test",
             "Authorization",
             crate::config::HeaderShape::new("Basic ", true),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        std::env::remove_var("OPS_TEST_EGRESS_BASIC");
+        std::env::remove_var("SBX_TEST_EGRESS_BASIC");
         // basic carries the base64 on the wire, so BOTH the raw user:pass and its base64 are
         // needles — a reflecting upstream echoes the base64, the raw pair is the underlying secret.
         let raw = b"alice:correct-horse".to_vec();
@@ -1312,15 +1312,15 @@ mod tests {
 
     #[test]
     fn a_short_secret_is_injected_but_not_redacted() {
-        std::env::set_var("OPS_TEST_EGRESS_SHORT", "abc"); // 3 bytes, below REDACT_MIN_LEN
+        std::env::set_var("SBX_TEST_EGRESS_SHORT", "abc"); // 3 bytes, below REDACT_MIN_LEN
         let s = secret(
-            SecretSource::Env("OPS_TEST_EGRESS_SHORT".into()),
+            SecretSource::Env("SBX_TEST_EGRESS_SHORT".into()),
             "h.test",
             "Authorization",
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        std::env::remove_var("OPS_TEST_EGRESS_SHORT");
+        std::env::remove_var("SBX_TEST_EGRESS_SHORT");
         assert_eq!(injs[0].value, "Bearer abc", "the injection still applies");
         assert!(
             needles.is_empty(),

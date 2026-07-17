@@ -2,7 +2,7 @@
 //!
 //! A hermetic cage carries no fonts and no `/etc/fonts`, so a graphical app renders
 //! boxes instead of text. When `gui = "wayland"` is open, the hole provisions a base
-//! font set into ops's own store and generates a self-contained fontconfig
+//! font set into sbx's own store and generates a self-contained fontconfig
 //! configuration pointing at it (named to the cage's fontconfig via `FONTCONFIG_FILE`),
 //! so text renders without the user declaring anything.
 //!
@@ -36,11 +36,11 @@ const GUI_FONTS: &[(&str, &str, &str)] = &[
 /// Where the cage's fontconfig keeps its on-disk cache: a path on the cage's private tmpfs
 /// `/tmp`, always writable and self-contained (no dependency on the home layout). The cache
 /// is rebuilt each launch from the handful of provisioned fonts — negligible.
-const FONT_CACHE_DIR: &str = "/tmp/.ops-fontconfig";
+const FONT_CACHE_DIR: &str = "/tmp/.sbx-fontconfig";
 
 /// Where the generated fontconfig configuration is bound read-only in the cage. Under
-/// `/opt/ops`, beside the mise plugin and the shell rc, colliding with no structural mount.
-pub(crate) const FONTS_CONF_INCAGE: &str = "/opt/ops/fonts.conf";
+/// `/opt/sbx`, beside the mise plugin and the shell rc, colliding with no structural mount.
+pub(crate) const FONTS_CONF_INCAGE: &str = "/opt/sbx/fonts.conf";
 
 /// The provisioned font set: the store roots whose closures the project store must seed,
 /// and the font directories the generated configuration lists.
@@ -52,7 +52,7 @@ pub(crate) struct FontLayer {
     pub(crate) dirs: Vec<PathBuf>,
 }
 
-/// Provision the GUI font set into ops's store against the pinned `nixpkgs`. The gcroots are
+/// Provision the GUI font set into sbx's store against the pinned `nixpkgs`. The gcroots are
 /// keyed by revision (`<data>/gcroots/gui/<rev>/`), so the set is shared across every project
 /// on the same channel — like the base userland — rather than copied per project.
 pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<FontLayer> {
@@ -77,7 +77,7 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 ///
 /// Self-contained on purpose: `FONTCONFIG_FILE` makes fontconfig read *only* this file, so it
 /// must not rely on the host's `/etc/fonts` (absent in the cage). Every interpolated value is
-/// ops-controlled — nix store paths (the unreserved character set) and fixed strings — so
+/// sbx-controlled — nix store paths (the unreserved character set) and fixed strings — so
 /// there is no XML metacharacter to escape. Pure, so it is unit-tested.
 pub(crate) fn fonts_conf(dirs: &[PathBuf], cache_dir: &str) -> String {
     let mut s = String::new();
@@ -114,7 +114,7 @@ pub(crate) fn fonts_conf_for(layer: &FontLayer) -> String {
     fonts_conf(&layer.dirs, FONT_CACHE_DIR)
 }
 
-/// Materialize the generated configuration into ops's data directory and return the host
+/// Materialize the generated configuration into sbx's data directory and return the host
 /// file (ready to bind read-only at [`FONTS_CONF_INCAGE`]).
 ///
 /// Content-keyed and atomic, like the staged mise plugin: the filename is a hash of the
@@ -182,14 +182,14 @@ mod tests {
             PathBuf::from("/nix/store/aaa-dejavu-fonts-2.37/share/fonts"),
             PathBuf::from("/nix/store/bbb-noto-fonts/share/fonts"),
         ];
-        let conf = fonts_conf(&dirs, "/tmp/.ops-fontconfig");
+        let conf = fonts_conf(&dirs, "/tmp/.sbx-fontconfig");
 
         // a <dir> per provisioned font directory — the logical store paths the cage reads
         // through `/nix`, so fontconfig finds exactly what the hole seeded
         assert!(conf.contains("<dir>/nix/store/aaa-dejavu-fonts-2.37/share/fonts</dir>"));
         assert!(conf.contains("<dir>/nix/store/bbb-noto-fonts/share/fonts</dir>"));
         // a writable cache directory on the cage tmpfs
-        assert!(conf.contains("<cachedir>/tmp/.ops-fontconfig</cachedir>"));
+        assert!(conf.contains("<cachedir>/tmp/.sbx-fontconfig</cachedir>"));
         // generic-family aliases to a concrete face (the functional effect is not isolable
         // with a single provisioned family; their presence is what is asserted here)
         assert!(conf.contains("<family>sans-serif</family>"));

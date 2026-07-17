@@ -1,7 +1,7 @@
-//! Integration tests for `ops session stop`.
+//! Integration tests for `sbx session stop`.
 //!
 //! The headline property: stopping a **supervised** session (the `network = "deny"` path,
-//! where the registered pid is the ops supervisor rather than bubblewrap itself) tears the whole
+//! where the registered pid is the sbx supervisor rather than bubblewrap itself) tears the whole
 //! cage down — the supervisor exits *and* no in-cage process is left orphaned. That is the path
 //! where teardown is non-trivial: it relies on bubblewrap dying with its parent. The exec path
 //! (default posture, registered pid == bubblewrap) is trivially correct and covered by the unit
@@ -12,14 +12,14 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-fn ops() -> Command {
-    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/ops` so an e2e never depends on
-    // the developer's global ops config; default it to a fixed empty dir under the test tree
+fn sbx() -> Command {
+    // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
+    // the developer's global sbx config; default it to a fixed empty dir under the test tree
     // (no test here writes a global config, so a shared empty dir is race-free).
     let mut cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     cfg.push("target/test-tmp/isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ops"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.env("XDG_CONFIG_HOME", cfg);
     cmd
 }
@@ -32,7 +32,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-stop-it-{tag}-{}-{n}", std::process::id()));
+        d.push(format!("sbx-stop-it-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -78,7 +78,7 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Parse the detached session id out of `ops`'s startup message ("...detached session <pid>...").
+/// Parse the detached session id out of `sbx`'s startup message ("...detached session <pid>...").
 fn parse_detach_pid(stderr: &[u8]) -> Option<u32> {
     let text = String::from_utf8_lossy(stderr);
     let after = text.split("detached session ").nth(1)?;
@@ -122,23 +122,23 @@ impl Drop for FingerprintCleanup {
 fn stop_with_no_or_bad_arguments_is_a_usage_error() {
     let data = TmpDir::new("usage");
     // No id: usage error, exit 2.
-    let no_id = ops()
+    let no_id = sbx()
         .arg("session")
         .arg("stop")
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops session stop");
+        .expect("spawn sbx session stop");
     assert_eq!(no_id.status.code(), Some(2), "no-id stop must exit 2");
     assert!(String::from_utf8_lossy(&no_id.stderr).contains("usage"));
 
     // A non-numeric --delay: usage error, exit 2 (caught before any signalling).
-    let bad_delay = ops()
+    let bad_delay = sbx()
         .args(["session", "stop", "--delay", "soon", "123"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops session stop");
+        .expect("spawn sbx session stop");
     assert_eq!(bad_delay.status.code(), Some(2), "bad --delay must exit 2");
     assert!(String::from_utf8_lossy(&bad_delay.stderr).contains("whole number"));
 }
@@ -146,12 +146,12 @@ fn stop_with_no_or_bad_arguments_is_a_usage_error() {
 #[test]
 fn stop_an_unknown_id_reports_and_exits_two() {
     let data = TmpDir::new("noid");
-    let out = ops()
+    let out = sbx()
         .args(["session", "stop", "999999"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops session stop");
+        .expect("spawn sbx session stop");
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -169,12 +169,12 @@ fn stop_all_together_with_an_id_is_a_usage_error() {
     // `--all` and explicit ids are mutually exclusive: passing both is ambiguous, so it is rejected
     // before any signalling (exit 2), not silently resolved one way.
     let data = TmpDir::new("all-and-id");
-    let out = ops()
+    let out = sbx()
         .args(["session", "stop", "--all", "123"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops session stop");
+        .expect("spawn sbx session stop");
     assert_eq!(out.status.code(), Some(2), "--all with an id must exit 2");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("either explicit ids or --all"),
@@ -186,14 +186,14 @@ fn stop_all_together_with_an_id_is_a_usage_error() {
 #[test]
 fn stop_all_with_no_sessions_is_a_no_op_success() {
     // Stopping every session when there are none is not an error — there is simply nothing to do,
-    // like `ops gc` with nothing to reclaim. No sandbox is needed (the registry is just empty).
+    // like `sbx gc` with nothing to reclaim. No sandbox is needed (the registry is just empty).
     let data = TmpDir::new("all-empty");
-    let out = ops()
+    let out = sbx()
         .args(["session", "stop", "--all"])
         .env("XDG_DATA_HOME", data.path())
         .stdin(Stdio::null())
         .output()
-        .expect("spawn ops session stop");
+        .expect("spawn sbx session stop");
     assert!(
         out.status.success(),
         "stop --all with no sessions must exit 0: {}",
@@ -206,30 +206,30 @@ fn stop_all_with_no_sessions_is_a_no_op_success() {
     );
 }
 
-/// Run `ops <args>` to completion in `project` with isolated data/state, returning its output.
-fn ops_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::process::Output {
-    ops()
+/// Run `sbx <args>` to completion in `project` with isolated data/state, returning its output.
+fn sbx_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::process::Output {
+    sbx()
         .args(args)
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .env("XDG_STATE_HOME", state)
         .stdin(Stdio::null())
         .output()
-        .expect("run ops")
+        .expect("run sbx")
 }
 
 /// Whether the host can launch a sandbox (also warms the userland cache so later launches start
 /// promptly, and seeds the project store once).
 fn host_can_sandbox(project: &Path, data: &Path, state: &Path) -> bool {
-    ops_run(project, data, state, &["run", "--", "true"])
+    sbx_run(project, data, state, &["run", "--", "true"])
         .status
         .success()
 }
 
-/// The session record file for `pid`, once it appears under `<data>/ops/sessions/`. `None` if it
+/// The session record file for `pid`, once it appears under `<data>/sbx/sessions/`. `None` if it
 /// does not show up before the deadline.
 fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf> {
-    let dir = data.join("ops").join("sessions");
+    let dir = data.join("sbx").join("sessions");
     let prefix = format!("{pid}-");
     while Instant::now() < deadline {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -244,10 +244,10 @@ fn wait_for_session(data: &Path, pid: u32, deadline: Instant) -> Option<PathBuf>
     None
 }
 
-/// Whether a per-session egress socket exists under `<data>/ops/egress/` — present only when the
+/// Whether a per-session egress socket exists under `<data>/sbx/egress/` — present only when the
 /// allowlist (supervised) launch path ran, so it confirms the fixture exercises that path.
 fn egress_socket_exists(data: &Path) -> bool {
-    std::fs::read_dir(data.join("ops").join("egress"))
+    std::fs::read_dir(data.join("sbx").join("egress"))
         .map(|d| {
             d.flatten().any(|e| {
                 e.path()
@@ -288,9 +288,9 @@ fn wait_until(deadline: Instant, mut cond: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn stop_tears_down_a_supervised_app_session() {
-    // A trusted app with a network allowlist runs supervised: the registered pid is the ops
+    // A trusted app with a network allowlist runs supervised: the registered pid is the sbx
     // supervisor, and the cage (bubblewrap + the `sleep`) is its child, kept alive only by
-    // `--die-with-parent`. `ops session stop` of that pid must take the whole thing down. Teeth: the
+    // `--die-with-parent`. `sbx session stop` of that pid must take the whole thing down. Teeth: the
     // in-cage `sleep 31337` is running before the stop and gone after — an orphan would survive
     // only if the supervisor were killed without the cage following, the failure mode this path
     // alone can exhibit. The unusual sleep duration is a unique fingerprint in the host's process
@@ -299,7 +299,7 @@ fn stop_tears_down_a_supervised_app_session() {
     let data = TmpDir::new("sup-data");
     let state = TmpDir::new("sup-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[app.probe]\n\
          cmd = [\"sleep\", \"31337\"]\n\
          [app.probe.network]\n\
@@ -309,29 +309,29 @@ fn stop_tears_down_a_supervised_app_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping ops stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!("skipping sbx stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
     // Trust so the app's allowlist takes effect — otherwise the network field is dropped, the app
     // falls back to the default posture, and the launch would take the exec path instead of the
     // supervised one this test exists to exercise.
-    let trusted = ops_run(
+    let trusted = sbx_run(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     // Launch the app in the background: under the allowlist it registers a session whose pid is the
     // supervisor and supervises the cage running `sleep`.
     let mut agent = KillOnDrop(
-        ops()
+        sbx()
             .args(["app", "probe"])
             .current_dir(project.path())
             .env("XDG_DATA_HOME", data.path())
@@ -340,12 +340,12 @@ fn stop_tears_down_a_supervised_app_session() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn ops app probe"),
+            .expect("spawn sbx app probe"),
     );
     let pid = agent.0.id();
 
     if wait_for_session(data.path(), pid, Instant::now() + Duration::from_secs(60)).is_none() {
-        eprintln!("skipping ops stop supervised e2e: the app session never registered");
+        eprintln!("skipping sbx stop supervised e2e: the app session never registered");
         return;
     }
 
@@ -360,12 +360,12 @@ fn stop_tears_down_a_supervised_app_session() {
     if !wait_until(Instant::now() + Duration::from_secs(30), || {
         process_with_arg("31337")
     }) {
-        eprintln!("skipping ops stop supervised e2e: the cage's sleep never started");
+        eprintln!("skipping sbx stop supervised e2e: the cage's sleep never started");
         return;
     }
 
     // Stop the session by its pid.
-    let stopped = ops_run(
+    let stopped = sbx_run(
         project.path(),
         data.path(),
         state.path(),
@@ -373,7 +373,7 @@ fn stop_tears_down_a_supervised_app_session() {
     );
     assert!(
         stopped.status.success(),
-        "ops session stop must exit 0: {}",
+        "sbx session stop must exit 0: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
 
@@ -387,8 +387,8 @@ fn stop_tears_down_a_supervised_app_session() {
         "the cage's `sleep` was orphaned — stopping the supervisor did not tear the cage down"
     );
 
-    // The stopped session no longer appears in `ops session ls` (its record was reaped).
-    let ls = ops_run(
+    // The stopped session no longer appears in `sbx session ls` (its record was reaped).
+    let ls = sbx_run(
         project.path(),
         data.path(),
         state.path(),
@@ -396,15 +396,15 @@ fn stop_tears_down_a_supervised_app_session() {
     );
     assert!(
         !String::from_utf8_lossy(&ls.stdout).contains(&pid.to_string()),
-        "the stopped session still shows in `ops session ls`"
+        "the stopped session still shows in `sbx session ls`"
     );
 }
 
 #[test]
 fn stop_all_stops_every_session() {
-    // `ops session stop --all` must tear down *every* live session at once, not just one. Two background
+    // `sbx session stop --all` must tear down *every* live session at once, not just one. Two background
     // agents are started with `--detach` (so each is a first-class registry session); a single
-    // `ops session stop --all` must leave neither running. The unusual sleep durations are unique
+    // `sbx session stop --all` must leave neither running. The unusual sleep durations are unique
     // fingerprints in the host's process table. Both apps use the default posture (the exec path),
     // which keeps the fixture to one provisioning and is enough to prove the fan-out — the
     // supervised teardown itself is covered by `stop_tears_down_a_supervised_app_session`.
@@ -412,7 +412,7 @@ fn stop_all_stops_every_session() {
     let data = TmpDir::new("all-data");
     let state = TmpDir::new("all-state");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         "[app.one]\n\
          cmd = [\"sleep\", \"31341\"]\n\
          [app.two]\n\
@@ -421,22 +421,22 @@ fn stop_all_stops_every_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping ops stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!("skipping sbx stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
-    let trusted = ops_run(
+    let trusted = sbx_run(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".ops.toml"],
+        &["trust", ".sbx.toml"],
     );
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    // Backstop: SIGKILL either agent if an assertion panics before `ops session stop --all` runs (a detached
+    // Backstop: SIGKILL either agent if an assertion panics before `sbx session stop --all` runs (a detached
     // daemon is reparented to init and cannot be reaped by the test).
     let _cleanup = FingerprintCleanup(vec!["31341", "31342"]);
 
@@ -444,7 +444,7 @@ fn stop_all_stops_every_session() {
     // its session pid.
     let mut pids = Vec::new();
     for app in ["one", "two"] {
-        let started = ops_run(
+        let started = sbx_run(
             project.path(),
             data.path(),
             state.path(),
@@ -452,7 +452,7 @@ fn stop_all_stops_every_session() {
         );
         assert!(
             started.status.success(),
-            "ops app {app} --detach must exit 0: {}",
+            "sbx app {app} --detach must exit 0: {}",
             String::from_utf8_lossy(&started.stderr)
         );
         let pid = parse_detach_pid(&started.stderr).unwrap_or_else(|| {
@@ -469,11 +469,11 @@ fn stop_all_stops_every_session() {
         wait_until(Instant::now() + Duration::from_secs(30), || {
             process_with_arg("31341") && process_with_arg("31342")
         }),
-        "both detached agents should be running before `ops session stop --all`"
+        "both detached agents should be running before `sbx session stop --all`"
     );
 
-    // `ops session ls` lists both sessions.
-    let ls = ops_run(
+    // `sbx session ls` lists both sessions.
+    let ls = sbx_run(
         project.path(),
         data.path(),
         state.path(),
@@ -488,7 +488,7 @@ fn stop_all_stops_every_session() {
     }
 
     // One command stops them all.
-    let stopped = ops_run(
+    let stopped = sbx_run(
         project.path(),
         data.path(),
         state.path(),
@@ -496,7 +496,7 @@ fn stop_all_stops_every_session() {
     );
     assert!(
         stopped.status.success(),
-        "ops session stop --all must exit 0: {}",
+        "sbx session stop --all must exit 0: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
 
@@ -505,11 +505,11 @@ fn stop_all_stops_every_session() {
         wait_until(Instant::now() + Duration::from_secs(10), || {
             !process_with_arg("31341") && !process_with_arg("31342")
         }),
-        "`ops session stop --all` left an agent running"
+        "`sbx session stop --all` left an agent running"
     );
 
-    // And `ops session ls` no longer lists either (records reaped).
-    let ls = ops_run(
+    // And `sbx session ls` no longer lists either (records reaped).
+    let ls = sbx_run(
         project.path(),
         data.path(),
         state.path(),
@@ -519,7 +519,7 @@ fn stop_all_stops_every_session() {
     for pid in &pids {
         assert!(
             !listing.contains(&pid.to_string()),
-            "session {pid} still shows in `ops session ls` after stop --all:\n{listing}"
+            "session {pid} still shows in `sbx session ls` after stop --all:\n{listing}"
         );
     }
 }

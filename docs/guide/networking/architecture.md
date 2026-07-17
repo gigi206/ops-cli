@@ -22,7 +22,7 @@ When the cage runs under `deny`, `allow`, or `ask`:
    └──────────────────────────┼───────────────────────────────────────────────────┘
                               │ (Unix-domain socket)
                               ▼
-        ┌──────────── host-side ops MITM CONNECT proxy ────────────┐
+        ┌──────────── host-side sbx MITM CONNECT proxy ────────────┐
         │  • terminates TLS with a per-session, cage-only CA        │
         │  • checks host / port / path / method / regex vs policy   │
         │  • CONNECT authority == SNI == decrypted Host             │
@@ -38,7 +38,7 @@ The cage has an **empty network namespace** — loopback and nothing else. The o
 path out is a Unix-domain socket bound into the cage's tmpfs; an in-cage `socat`
 listens on `127.0.0.1:18043` and forwards to that socket, so tools set the standard
 `http_proxy`/`https_proxy` env vars to `127.0.0.1:18043` and comply unchanged. On
-the host side of the socket sits the `ops`-owned MITM CONNECT proxy that does all the
+the host side of the socket sits the `sbx`-owned MITM CONNECT proxy that does all the
 real work.
 
 ---
@@ -96,7 +96,7 @@ socat TCP-LISTEN:18043,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/…/proxy.soc
 
 It is provisioned by **nix** into the base userland (so its glibc matches the cage's
 by construction) and launched by absolute store path. The launched command runs as
-the cage's main process, so `ops shell`'s job control is unchanged, and no forwarder
+the cage's main process, so `sbx shell`'s job control is unchanged, and no forwarder
 lingers after the command exits (the cage's PID-1 reaper tears the netns down).
 
 Security does **not** depend on the forwarder's integrity — it is pure ergonomics.
@@ -179,9 +179,9 @@ same proxy the egress policy runs on, which is why they are inert on a `tcp://` 
 ## Refusal reasons
 
 Every refusal the proxy issues carries a stable reason category (an
-`X-Ops-Egress-Reason` header plus a short body), so an agent can tell an explicit
+`X-Sbx-Egress-Reason` header plus a short body), so an agent can tell an explicit
 policy refusal from a host that does not respond from a name that does not resolve.
-The categories surface in [`ops net logs`](observability.md#ops-net-logs) as the
+The categories surface in [`sbx net logs`](observability.md#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical — the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,

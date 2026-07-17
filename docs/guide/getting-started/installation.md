@@ -1,30 +1,30 @@
 # Installation
 
-`ops` is a single binary. The shipping artifact is a **static musl binary** with no
+`sbx` is a single binary. The shipping artifact is a **static musl binary** with no
 runtime dependency on a system libc; a normal `cargo build` also works for
 development.
 
-See also: [`ops doctor` and prerequisites](doctor.md) · [Quick start](quickstart.md).
+See also: [`sbx doctor` and prerequisites](doctor.md) · [Quick start](quickstart.md).
 
 ## Runtime prerequisites
 
-Before `ops` can launch anything it needs:
+Before `sbx` can launch anything it needs:
 
 - **Capability-bearing unprivileged user namespaces** — the security boundary
-  everything rests on. Without them there is no boundary, so `ops doctor`
+  everything rests on. Without them there is no boundary, so `sbx doctor`
   **hard-fails** rather than falling back to a weaker mechanism.
 - **The bubblewrap engine** (`bwrap`) — the sandbox itself. A release can embed its
   own static `bwrap`; otherwise the host's is used.
 - **The `nix` binary** — drives the user-owned store. A release can embed its own
   static `nix`; otherwise the host's is used.
 
-Run [`ops doctor`](doctor.md) to check all of these at once. On a restricted
+Run [`sbx doctor`](doctor.md) to check all of these at once. On a restricted
 Ubuntu 24.04+ host, user namespaces may exist but be stripped of capabilities;
 `doctor` checks specifically for the capability-bearing case.
 
 ## Development build
 
-For iterating on `ops` itself:
+For iterating on `sbx` itself:
 
 ```sh
 cargo build
@@ -50,7 +50,7 @@ host.
 A release can embed its **own** static `nix` and `bwrap` so it does not depend on
 host-installed engines. These are opt-in build features (`bundled-nix`,
 `bundled-bwrap`); the default build uses host engines so CI stays lean. When built
-this way, `ops doctor` reports which engine it would use and why. See
+this way, `sbx doctor` reports which engine it would use and why. See
 [Provisioning](../concepts/provisioning.md) for how the engines are materialized and
 verified.
 

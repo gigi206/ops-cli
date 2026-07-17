@@ -3,7 +3,7 @@
 //!
 //! `doctor` used to decide the security boundary from a stand-in — a raw
 //! `unshare` in a forked child (still kept, as a fast launch gate and a failure
-//! classifier). The decisive test is the one ops itself performs at launch: feed
+//! classifier). The decisive test is the one sbx itself performs at launch: feed
 //! [`super::argv::to_argv`] to the real `bwrap` and read `/proc/self/status` from
 //! inside. A successful launch reporting `CapEff=0` and `NoNewPrivs=1` proves the
 //! user namespace is capability-bearing more conclusively than the stand-in can —
@@ -156,7 +156,7 @@ impl ScratchDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        dir.push(format!("ops-doctor-smoke-{}-{n}", std::process::id()));
+        dir.push(format!("sbx-doctor-smoke-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         Ok(ScratchDir(dir))
     }

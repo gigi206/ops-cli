@@ -1,19 +1,19 @@
 # opencode web — opencode's browser UI, served headless in the cage, opened in your HOST browser.
 #
-#   ops app import profiles/opencode-web.toml
-#   ops app opencode-web
+#   sbx app import profiles/opencode-web.toml
+#   sbx app opencode-web
 #   # then open http://127.0.0.1:4096 in your browser
 #
 # This is the third face of opencode (alongside the `opencode` CLI/TUI and the `opencode-desktop`
 # Electron app). `opencode web` runs the SAME opencode server the desktop app wraps, but serves
 # its web UI over plain HTTP on the loopback instead of embedding a Chromium — so there is NO
 # Electron, NO `gui = "wayland"` hole, and no multi-minute in-cage build. It is the lightest way
-# to get the graphical opencode experience under ops: the exact same `mise:opencode` binary as
+# to get the graphical opencode experience under sbx: the exact same `mise:opencode` binary as
 # the CLI profile, just launched with the `web` subcommand.
 #
 # HOW THE BROWSER REACHES IT. The cage runs in an empty network namespace (Model B), so a port
 # the server binds on the cage's `127.0.0.1` is NOT reachable from the host by default — that is
-# the boundary. `forward = [4096]` is the inbound hole (a security field, trusted-only): ops binds
+# the boundary. `forward = [4096]` is the inbound hole (a security field, trusted-only): sbx binds
 # `127.0.0.1:4096` on the HOST and bridges it to the cage's `127.0.0.1:4096`, so your host browser
 # opening `http://127.0.0.1:4096` reaches the in-cage server. The host port and the cage port must
 # be the SAME number, so if you change one, change BOTH: the `--port` in `cmd` AND the `forward`
@@ -21,7 +21,7 @@
 # silently ignored.
 #
 # `opencode web` binds `127.0.0.1` (IPv4 loopback) by default, which is what the forwarder bridges
-# to — do NOT pass `--hostname 0.0.0.0` (that exposes it to your LAN and ops still only forwards
+# to — do NOT pass `--hostname 0.0.0.0` (that exposes it to your LAN and sbx still only forwards
 # loopback). The server may try to auto-open a browser; in the hermetic cage there is none, so it
 # just serves — open the URL yourself. For a shared machine you can require a login by setting
 # OPENCODE_SERVER_PASSWORD (and optionally OPENCODE_SERVER_USERNAME, default `opencode`) in [env];
@@ -52,8 +52,8 @@ mode = "deny"
 # Same runtime egress as the `opencode` CLI profile — the web server is the same opencode server.
 # models.dev is the read-only model catalogue; opencode.ai is the gateway ("Zen") plus auth and
 # the config/theme schemas, opened to every verb with `{*}`. registry.npmjs.org equips opencode
-# via mise. If a request is refused, the proxy names the host — watch `ops net logs -a opencode-web`
-# and add it here (or check with `ops test net <url>`). For a DIRECT provider instead of the
+# via mise. If a request is refused, the proxy names the host — watch `sbx net logs -a opencode-web`
+# and add it here (or check with `sbx test net <url>`). For a DIRECT provider instead of the
 # gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
 # `{*} https://openrouter.ai`) and fill the [secret] block below.
 allow = [
@@ -75,7 +75,7 @@ allow = [
 # openrouter.ai. (For a direct provider add its host to `allow` above and keep this block; for
 # Anthropic/OpenAI change the host, header, and env var — see the `opencode` CLI profile.)
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 # Optional: require a login on the web UI (recommended on a shared machine).
 #OPENCODE_SERVER_PASSWORD = "change-me"
 

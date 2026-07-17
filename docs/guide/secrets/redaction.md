@@ -1,9 +1,9 @@
 # Redaction — the secret tripwires
 
 The never-in-cage invariant keeps a secret's plaintext on the host. But a secret
-`ops` injects on the wire could, in principle, leak back the other way — an agent
+`sbx` injects on the wire could, in principle, leak back the other way — an agent
 that somehow *already* holds a token could try to re-send it, or a cooperating
-allowed upstream could reflect an injected header into its response body. `ops`
+allowed upstream could reflect an injected header into its response body. `sbx`
 adds two byte-exact tripwires, one per direction, as **backstops**. Be clear on
 what they are and are not: they catch the naive verbatim leak; they are **not the
 boundary**.
@@ -15,7 +15,7 @@ for any configured secret value. If a secret appears verbatim, the proxy
 **refuses the whole request** — it blocks, it does not strip:
 
 - category **`outbound-secret`**, HTTP **`403`**;
-- scanned on the **pre-injection** client bytes, so `ops`'s own injection never
+- scanned on the **pre-injection** client bytes, so `sbx`'s own injection never
   trips its own scanner;
 - checked **before** the egress verdict.
 
@@ -27,7 +27,7 @@ clear `403` refusal.
 
 The scan has a minimum length: **`REDACT_MIN_LEN = 8`**. A secret shorter than 8
 bytes is still injected, but it is **not** added to the outbound scan set, and
-`ops` **warns loudly**. A very short value produces too many false-positive
+`sbx` **warns loudly**. A very short value produces too many false-positive
 matches against ordinary request bytes to scan safely. The lesson is practical:
 use secrets of reasonable length (real tokens already are).
 
@@ -43,12 +43,12 @@ left to the structural boundary below.
 
 The one place a configured secret can legitimately re-enter the cage is a
 response **from an injection-target host** — a cooperating or misconfigured
-upstream that echoes the header `ops` injected. For those responses only, the
+upstream that echoes the header `sbx` injected. For those responses only, the
 proxy **masks** every verbatim occurrence of the secret value as it streams the
 response back, replacing it with an **equal-length run of `*`**:
 
 - **mask, not block** — unlike the outbound case, the response also carries
-  legitimate content the agent needs, so `ops` masks the secret in place rather
+  legitimate content the agent needs, so `sbx` masks the secret in place rather
   than dropping the whole response;
 - **equal-length** — the `*` run is the same byte length as the secret, so
   `Content-Length`/chunked framing stays intact and `*` never introduces a
@@ -58,7 +58,7 @@ response back, replacing it with an **equal-length run of `*`**:
 
 ### Scoped to injection-target responses only
 
-Inbound masking runs **only** on responses from a host `ops` injects a secret
+Inbound masking runs **only** on responses from a host `sbx` injects a secret
 into — the only place a configured secret can reflect. The always-on nix-cache
 lane and every non-target response stream through untouched, so a coincidental
 byte match in unrelated traffic cannot corrupt it. The trade-off: masking mutates
@@ -70,7 +70,7 @@ it is confined to the one host.
 
 Both tripwires are **byte-exact**. They catch a secret sent or reflected
 *verbatim*. They do **not** catch a secret that is re-encoded first — base64,
-gzip, chunk-splitting, or any transform defeats a byte-exact scan. `ops` does not
+gzip, chunk-splitting, or any transform defeats a byte-exact scan. `sbx` does not
 pretend otherwise.
 
 The actual guarantee is structural, and it is the trio you should rely on:

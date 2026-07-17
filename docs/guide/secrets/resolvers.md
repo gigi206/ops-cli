@@ -13,7 +13,7 @@ plugins](plugins.md).
 
 ## Built-in schemes
 
-`ops` implements three resolvers itself. A plugin can never claim these names —
+`sbx` implements three resolvers itself. A plugin can never claim these names —
 the built-in always wins.
 
 ### `env://` — a host environment variable
@@ -25,7 +25,7 @@ header = "Authorization"
 type   = "bearer"
 ```
 
-`env://VAR` reads the named variable **from `ops`'s host process environment** at
+`env://VAR` reads the named variable **from `sbx`'s host process environment** at
 launch. The value is read host-side and never exported into the cage — the cage's
 environment is built separately and does not inherit it. Use this for a token
 your shell or CI runner already holds.
@@ -131,7 +131,7 @@ header = "Authorization"
 type   = "bearer"
 ```
 
-`ops` tries `env://GH_TOKEN`; if that variable is unset it falls back to the SOPS
+`sbx` tries `env://GH_TOKEN`; if that variable is unset it falls back to the SOPS
 key. The first ref that resolves at launch wins; the rest are fallbacks. This is
 how a developer's local `env://` overrides a shared `sops://` default without
 editing the file.
@@ -152,7 +152,7 @@ to exactly those resolvers, in that order.
 
 ## Everything is host-side
 
-Whichever scheme and form you use, the resolution runs in `ops`'s host process
+Whichever scheme and form you use, the resolution runs in `sbx`'s host process
 before the cage exists. The plaintext lives briefly in host memory, is consumed
 by the broker, and is discarded. It is never an argument to a cage process, never
 a cage file, never a cage variable. A resolver *plugin* also runs host-side (in

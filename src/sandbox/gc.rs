@@ -8,7 +8,7 @@
 //! re-points — but a flake revision rolled forward, and a flake package removed outright, leave
 //! the previous build unreferenced. This reclaims those.
 //!
-//! Two steps. First [`prune_flake_roots`] drops the `ops-flake-<name>` roots of removed packages
+//! Two steps. First [`prune_flake_roots`] drops the `sbx-flake-<name>` roots of removed packages
 //! (a roll's overwrite self-cleans, but a removal cannot reach itself). Then a plain `nix-store
 //! --gc` against the project store sweeps: every live build carries a root whose target is a
 //! `/nix/store/<hash>` path, which the relocated store resolves host-side, so the sweep keeps the
@@ -29,13 +29,13 @@ pub(crate) struct GcReport {
     pub(crate) bytes: u64,
 }
 
-/// Remove the host-resolvable `ops-flake-<name>` gc roots whose package is no longer declared.
+/// Remove the host-resolvable `sbx-flake-<name>` gc roots whose package is no longer declared.
 ///
 /// A `flake:` build registers a root keyed by package name, overwritten each launch — so a roll
 /// (same name, new build) self-cleans, but a *removed* package's root lingers, pointing at a build
 /// nothing wants. This drops those roots so the following sweep reclaims their builds. `current` is
 /// the set of currently-declared flake package names across the project's runtimes; any
-/// `ops-flake-<name>` root whose `<name>` is not in it is stale. Read-only unless `prune` (a dry
+/// `sbx-flake-<name>` root whose `<name>` is not in it is stale. Read-only unless `prune` (a dry
 /// run lists what it would remove without touching anything). Returns the stale roots.
 pub(crate) fn prune_flake_roots(
     store_dir: &Path,
@@ -52,7 +52,7 @@ pub(crate) fn prune_flake_roots(
         let file_name = entry.file_name();
         let Some(name) = file_name
             .to_str()
-            .and_then(|n| n.strip_prefix("ops-flake-"))
+            .and_then(|n| n.strip_prefix("sbx-flake-"))
         else {
             continue;
         };
@@ -239,7 +239,7 @@ pub(crate) struct UnidentifiedTree {
 ///
 /// A tree with no usable marker is **never** reclaimed on deadness, because its path is unknown and
 /// deadness cannot be verified. It is reclaimed only under the explicit `prune_unidentified` opt-in
-/// — a fail-closed escape hatch (`ops projects rm --markerless --yes`) that reaps markerless trees
+/// — a fail-closed escape hatch (`sbx projects rm --markerless --yes`) that reaps markerless trees
 /// *without* a deadness proof, after the live-session guard has already excluded any tree a running
 /// session holds. The caller owns that risk: a markerless tree belonging to a project still in use
 /// (a pre-marker launch, or a marker write that failed) would be lost, so the flag is never the
@@ -341,7 +341,7 @@ pub(crate) enum ReapOneOutcome {
 
 /// Whether `id` is safe to use as a project-tree directory name — a single, ordinary path
 /// component with no separator, no `.`/`..`, and no absolute form. This is the anti-traversal
-/// guard for `ops gc --id`: the id is joined onto `projects/` and fed to a recursive delete, so a
+/// guard for `sbx gc --id`: the id is joined onto `projects/` and fed to a recursive delete, so a
 /// value like `/etc` (which `Path::join` treats as absolute and *replaces* the base with) or
 /// `../x` (which escapes the tree) must never reach the `join`. A real id is a 16-hex hash, but the
 /// check does not hard-code that — any legitimate directory name under `projects/` is one normal
@@ -418,7 +418,7 @@ impl AppPurgeReport {
 /// across projects) and each per-project home `<data>/projects/<id>/apps/<name>/`. These hold the
 /// app's mise data (the tools its `mise:` backends installed), its config, and its login/session
 /// state — all app-exclusive, so removing them frees that state immediately. The shared per-project
-/// nix store, which backs *every* app in a project, is deliberately **not** touched here; `ops gc`
+/// nix store, which backs *every* app in a project, is deliberately **not** touched here; `sbx gc`
 /// owns its reclamation (a purged app's `nix:`/`flake:` closures become collectable there).
 ///
 /// `name` reaches [`force_remove_dir_all`], so the same single-ordinary-component guard the reap
@@ -455,7 +455,7 @@ pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
 }
 
 /// One app that has isolated runtime state on disk — its home(s) under the data directory. The
-/// read-only counterpart of [`purge_app_homes`], for the `ops app list` view: it lets a user see
+/// read-only counterpart of [`purge_app_homes`], for the `sbx app list` view: it lets a user see
 /// which apps have installed tools/login state (even ones with no imported profile) before deciding
 /// what to purge. An app may have a global home (shared across projects), per-project homes, or both.
 pub(crate) struct InstalledApp {
@@ -469,7 +469,7 @@ pub(crate) struct InstalledApp {
 }
 
 impl InstalledApp {
-    /// Total disk a full `ops app rm <name> --purge` would free (global + every per-project home).
+    /// Total disk a full `sbx app rm <name> --purge` would free (global + every per-project home).
     pub(crate) fn total_bytes(&self) -> u64 {
         self.global_bytes.unwrap_or(0) + self.project_bytes
     }
@@ -533,10 +533,10 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
         .collect()
 }
 
-/// The state of one project tree, for `ops path`'s per-project annotation. The non-destructive,
+/// The state of one project tree, for `sbx path`'s per-project annotation. The non-destructive,
 /// finer-grained counterpart of [`reap_dead_projects`] (which folds `Live` and `Idle` into "keep"):
 /// `Live` (a running session holds it), `Idle` (no session, the marker points at a project
-/// directory that still exists), `Dead` (the marker points at a gone path — reclaimable by `ops gc
+/// directory that still exists), `Dead` (the marker points at a gone path — reclaimable by `sbx gc
 /// --all`), or `Markerless` (no marker — a pre-marker orphan, identity unknown).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TreeState {
@@ -547,7 +547,7 @@ pub(crate) enum TreeState {
 }
 
 impl TreeState {
-    /// The short tag rendered beside a project's path by `ops path`.
+    /// The short tag rendered beside a project's path by `sbx path`.
     pub(crate) fn label(self) -> &'static str {
         match self {
             TreeState::Live => "live",
@@ -558,7 +558,7 @@ impl TreeState {
     }
 }
 
-/// A project tree's classification plus the last time it was touched, for `ops path`'s per-project
+/// A project tree's classification plus the last time it was touched, for `sbx path`'s per-project
 /// annotation. `last_used` is the marker file's mtime when present (the last launch, since the
 /// marker is rewritten each seed), else the tree directory's mtime — the best available proxy for
 /// "when was this last used". `UNIX_EPOCH` is the fallback when even the dir's mtime is unreadable.
@@ -740,7 +740,7 @@ mod tests {
         let gcroots = store.path().join("nix/var/nix/gcroots");
         std::fs::create_dir_all(&gcroots).unwrap();
         // two flake roots, plus a base/tool root and nix's own auto dir that must be untouched
-        for name in ["ops-flake-hello", "ops-flake-gone", "abcd-coreutils"] {
+        for name in ["sbx-flake-hello", "sbx-flake-gone", "abcd-coreutils"] {
             std::os::unix::fs::symlink("/nix/store/x", gcroots.join(name)).unwrap();
         }
         std::fs::create_dir(gcroots.join("auto")).unwrap();
@@ -750,14 +750,14 @@ mod tests {
         // a dry run lists the stale root without removing it
         let listed = prune_flake_roots(store.path(), &current, false);
         assert_eq!(listed.len(), 1);
-        assert!(gcroots.join("ops-flake-gone").symlink_metadata().is_ok());
+        assert!(gcroots.join("sbx-flake-gone").symlink_metadata().is_ok());
 
         // a prune removes exactly the removed package's root
         let removed = prune_flake_roots(store.path(), &current, true);
         assert_eq!(removed.len(), 1);
-        assert!(gcroots.join("ops-flake-gone").symlink_metadata().is_err());
+        assert!(gcroots.join("sbx-flake-gone").symlink_metadata().is_err());
         // the current flake root, the base root, and nix's auto dir are all left alone
-        assert!(gcroots.join("ops-flake-hello").symlink_metadata().is_ok());
+        assert!(gcroots.join("sbx-flake-hello").symlink_metadata().is_ok());
         assert!(gcroots.join("abcd-coreutils").symlink_metadata().is_ok());
         assert!(gcroots.join("auto").is_dir());
     }
@@ -942,7 +942,7 @@ mod tests {
     }
 
     /// `is_safe_tree_id` accepts a single ordinary component (a real id) and refuses every path-ish
-    /// form — the anti-traversal guard for `ops gc --id`.
+    /// form — the anti-traversal guard for `sbx gc --id`.
     #[test]
     fn is_safe_tree_id_rejects_traversal_and_absolute_ids() {
         // Real ids (16-hex) and any single component are fine.

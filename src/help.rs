@@ -1,4 +1,4 @@
-//! `ops --help` / `ops help <command> [subcommand...]` — the usage surface.
+//! `sbx --help` / `sbx help <command> [subcommand...]` — the usage surface.
 //!
 //! One table of [`Page`]s is the single source of truth: every top-level command
 //! *and* every subcommand has a page carrying its argument grammar (`synopsis`),
@@ -7,7 +7,7 @@
 //! it, so help text and error text cannot drift.
 //!
 //! Help is dispatched centrally: [`maybe_help`] resolves the deepest command path a
-//! `--help`/`-h` flag asks about, so `ops plugins store add --help` shows that exact
+//! `--help`/`-h` flag asks about, so `sbx plugins store add --help` shows that exact
 //! page. The top-level command list and each subcommand listing are both sorted
 //! alphabetically.
 //!
@@ -43,7 +43,7 @@ const PAGES: &[Page] = &[
     // ---- top-level commands -------------------------------------------------------
     Page {
         path: &["doctor"],
-        synopsis: "ops doctor",
+        synopsis: "sbx doctor",
         summary: "verify the runtime prerequisites before anything can run",
         options: &[],
         details: "Checks the load-bearing requirements: capability-bearing unprivileged user\n\
@@ -55,18 +55,18 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["shell"],
-        synopsis: "ops shell [override flags]",
+        synopsis: "sbx shell [override flags]",
         summary: "open an interactive sandboxed shell in the current project",
         options: &[
             (
                 "--config <toml|@file>",
                 "one-shot config override for this launch: inline TOML (or @file) shaped like an \
-                 ops.toml; repeatable, later wins",
+                 sbx.toml; repeatable, later wins",
             ),
             (
                 "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
                  --seccomp / --device / --gpu / --audio / --dbus",
-                "typed one-shot overrides for a single field each; see `ops help run`",
+                "typed one-shot overrides for a single field each; see `sbx help run`",
             ),
         ],
         details:
@@ -74,21 +74,21 @@ const PAGES: &[Page] = &[
             synthetic identity. The project's trusted config drives the environment; the\n\
             host home and the rest of the host filesystem are absent (confidentiality by\n\
             absence).\n\n\
-            A one-shot override (`--config` or the typed flags, and their `OPS_*` environment\n\
-            equivalents) is the final word for this launch — see `ops help run` for the rules.",
+            A one-shot override (`--config` or the typed flags, and their `SBX_*` environment\n\
+            equivalents) is the final word for this launch — see `sbx help run` for the rules.",
     },
     Page {
         path: &["run"],
-        synopsis: "ops run [--detach] [override flags] [--] <command> [args...]",
+        synopsis: "sbx run [--detach] [override flags] [--] <command> [args...]",
         summary: "run a command inside the project sandbox",
         options: &[
             (
                 "--detach",
-                "run in the background as a session `ops session ls` can see",
+                "run in the background as a session `sbx session ls` can see",
             ),
             (
                 "--config <toml|@file>",
-                "one-shot config override: inline TOML (or @file) shaped like an ops.toml, setting \
+                "one-shot config override: inline TOML (or @file) shaped like an sbx.toml, setting \
                  any field; repeatable, later wins",
             ),
             (
@@ -138,25 +138,25 @@ const PAGES: &[Page] = &[
                 "--dbus[=true|false]",
                 "one-shot in-cage desktop portal (bare --dbus means true)",
             ),
-            ("--", "end ops's own flags; everything after runs literally"),
+            ("--", "end sbx's own flags; everything after runs literally"),
         ],
         details:
             "Runs <command> inside the project sandbox and propagates its exit status. A `--`\n\
-            separates ops's flags from the command's, so `ops run -- --detach` runs the\n\
+            separates sbx's flags from the command's, so `sbx run -- --detach` runs the\n\
             literal `--detach`.\n\n\
             One-shot overrides let you change any configuration field for a single launch without\n\
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
-            exactly like an `ops.toml`, so it can set any field; the typed flags\n\
+            exactly like an `sbx.toml`, so it can set any field; the typed flags\n\
             `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/`--seccomp`/\n\
             `--device`/`--gpu`/`--audio`/`--dbus` are ergonomic shorthands for one field each. The\n\
             booleans `--gpu`/`--audio`/`--dbus` are optional-value (bare means `true`, or\n\
             `=true`/`=false`); the rest take a\n\
             value. Every flag has an environment\n\
-            equivalent — `OPS_CONFIG`, `OPS_ENV_<KEY>`, `OPS_NET`, `OPS_GUI`, `OPS_NIXPKGS`, `OPS_BIND`,\n\
-            `OPS_FORWARD`, `OPS_LIMIT_<key>`, `OPS_PACKAGE_<name>`, `OPS_SECCOMP`, `OPS_DEVICE`,\n\
-            `OPS_GPU`, `OPS_AUDIO`, `OPS_DBUS`.\n\
+            equivalent — `SBX_CONFIG`, `SBX_ENV_<KEY>`, `SBX_NET`, `SBX_GUI`, `SBX_NIXPKGS`, `SBX_BIND`,\n\
+            `SBX_FORWARD`, `SBX_LIMIT_<key>`, `SBX_PACKAGE_<name>`, `SBX_SECCOMP`, `SBX_DEVICE`,\n\
+            `SBX_GPU`, `SBX_AUDIO`, `SBX_DBUS`.\n\
             Precedence, lowest to highest:\n\
-            `OPS_CONFIG < OPS_* typed < --config < --* typed` — the command line always beats the\n\
+            `SBX_CONFIG < SBX_* typed < --config < --* typed` — the command line always beats the\n\
             environment, and a typed flag beats the blob. Scalars\n\
             (`net`/`gui`/`nixpkgs`/`gpu`/`audio`/`dbus`)\n\
             replace;\n\
@@ -165,30 +165,30 @@ const PAGES: &[Page] = &[
             `--seccomp`/`--device`, which relax the denylist and grant a device a config file gates\n\
             trusted-only (the invoker outranks any config layer, so it may set exactly what a trusted\n\
             config already can — note `--seccomp` widens the in-cage kernel attack surface, so an\n\
-            ambient `OPS_SECCOMP` is worth checking). A malformed override is a hard error (it never\n\
+            ambient `SBX_SECCOMP` is worth checking). A malformed override is a hard error (it never\n\
             silently launches a different posture); a security field set from the environment prints a\n\
             notice.",
     },
     Page {
         path: &["mise"],
-        synopsis: "ops mise <args...>",
+        synopsis: "sbx mise <args...>",
         summary: "run the in-cage mise to self-equip a project's toolchain",
         options: &[],
         details:
             "Passes its arguments through to the mise that runs inside the cage, so an agent\n\
             can self-equip a project's tools into the project's own store, e.g.\n\
-            `ops mise install nix:jq` or `ops mise use -g aqua:BurntSushi/ripgrep`.\n\
-            For mise's own help, run `ops mise help`.",
+            `sbx mise install nix:jq` or `sbx mise use -g aqua:BurntSushi/ripgrep`.\n\
+            For mise's own help, run `sbx mise help`.",
     },
     Page {
         path: &["app"],
-        synopsis: "ops app <name> [--detach] [--net-learn[=level] [-g|--local] [--dry-run]] \
+        synopsis: "sbx app <name> [--detach] [--net-learn[=level] [-g|--local] [--dry-run]] \
                    [override flags] [-- <args>...]",
         summary: "launch or manage named application profiles",
         options: &[
             (
                 "--detach",
-                "launch the app in the background as a session `ops session ls` can see",
+                "launch the app in the background as a session `sbx session ls` can see",
             ),
             (
                 "--net-learn[=domain|path|exact]",
@@ -207,31 +207,31 @@ const PAGES: &[Page] = &[
             (
                 "--config <toml|@file>",
                 "one-shot config override for this launch, beating the app's own posture; \
-                 repeatable (see `ops help run`)",
+                 repeatable (see `sbx help run`)",
             ),
             (
                 "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
                  --seccomp / --device / --gpu / --audio / --dbus",
                 "typed one-shot overrides for a single field each, beating the app's posture; \
-                 see `ops help run`",
+                 see `sbx help run`",
             ),
         ],
         details:
-            "`ops app <name>` launches a named application profile (a project [app.<name>] overlay,\n\
+            "`sbx app <name>` launches a named application profile (a project [app.<name>] overlay,\n\
             or an imported apps/<name>.toml profile — a global app lives as a profile file, not\n\
-            inline in ops.toml) inside the project sandbox, each with its own persistent isolated\n\
+            inline in sbx.toml) inside the project sandbox, each with its own persistent isolated\n\
             home.\n\n\
             Arguments after a `--` are appended to the app's declared command, so you can pass a\n\
-            flag to the launched program without editing the profile — e.g. `ops app claude-code\n\
+            flag to the launched program without editing the profile — e.g. `sbx app claude-code\n\
             -- -c` runs the profile's `claude` command with `-c` (resume the previous session).\n\
             They are ordinary launch-time arguments; the app's posture (network, binds, secrets,\n\
             home) is fixed by the profile and unchanged.\n\n\
-            A one-shot override (`--config` or a typed flag, and their `OPS_*` environment\n\
+            A one-shot override (`--config` or a typed flag, and their `SBX_*` environment\n\
             equivalents) is applied *after* the app's overlay, so it is the final word — e.g.\n\
-            `ops app claude-code --net none` cuts the app's network for one run. Note that\n\
+            `sbx app claude-code --net none` cuts the app's network for one run. Note that\n\
             overriding an app's network drops its read-by-default verb filter (an override posture is\n\
             all-verbs, like a Mode-A launch); scope it with `{GET,HEAD}` rules in a `--config`\n\
-            `[network]` if you need to keep it. See `ops help run` for the full precedence rules.\n\n\
+            `[network]` if you need to keep it. See `sbx help run` for the full precedence rules.\n\n\
             `--net-learn` discovers an app's egress needs: it runs the app under its own (unchanged)\n\
             posture — nothing is opened, so a request the allowlist refuses stays refused — and turns\n\
             each such refusal into the allow rule that would have admitted it, writing them to the\n\
@@ -244,13 +244,13 @@ const PAGES: &[Page] = &[
             `path` its first path section (`{*} https://host/v1/*`), `exact` the one endpoint\n\
             (`{POST} https://host/v1/chat`). It is foreground-only (not with `--detach`).\n\n\
             The rules land in the project config by default (`--local`), or in the app's global\n\
-            profile with `-g` — which, for an app defined only inline in a project ops.toml, writes a\n\
+            profile with `-g` — which, for an app defined only inline in a project sbx.toml, writes a\n\
             partial apps/<name>.toml the inline table then shadows on load; prefer `-g` for an app\n\
             that is already an imported profile.",
     },
     Page {
         path: &["search"],
-        synopsis: "ops search <query>",
+        synopsis: "sbx search <query>",
         summary: "discover the nix: tools a project can declare, via nixhub",
         options: &[],
         details: "Queries nixhub for tools to declare. A fuzzy query lists matches; a query that\n\
@@ -260,16 +260,16 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["test"],
-        synopsis: "ops test <subcommand> <target>",
+        synopsis: "sbx test <subcommand> <target>",
         summary: "check whether an access would be allowed, and why",
         options: &[],
         details:
-            "A diagnostic surface meant to grow with ops's access controls. No launch, no nix,\n\
+            "A diagnostic surface meant to grow with sbx's access controls. No launch, no nix,\n\
             no network — it reports a verdict against the resolved policy.",
     },
     Page {
         path: &["net"],
-        synopsis: "ops net <subcommand> [args...]",
+        synopsis: "sbx net <subcommand> [args...]",
         summary: "inspect the egress policy, its rules, and parked `ask` requests",
         options: &[],
         details:
@@ -280,34 +280,34 @@ const PAGES: &[Page] = &[
             lists and answers requests parked by the `ask` posture; `stats` reports the per-host\n\
             allow/deny/blocked decision counters launches recorded; `logs` is the live, per-request\n\
             egress log of a running session; and `live` is a `top`-style view of the egress tunnels\n\
-            currently open. Host-side — no launch, no nix. (Distinct from `ops test net <url>`, which\n\
+            currently open. Host-side — no launch, no nix. (Distinct from `sbx test net <url>`, which\n\
             tests one URL against the policy.)",
     },
     Page {
         path: &["plugins"],
-        synopsis: "ops plugins <subcommand> [args...]",
+        synopsis: "sbx plugins <subcommand> [args...]",
         summary: "inspect and manage resolver plugins and plugin stores",
         options: &[],
         details:
             "Host-level — reads the data directory, not a project's config. A resolver plugin\n\
-            declares a `scheme://` ops can route a secret `from` reference to.",
+            declares a `scheme://` sbx can route a secret `from` reference to.",
     },
     Page {
         path: &["session"],
-        synopsis: "ops session <subcommand> [args...]",
+        synopsis: "sbx session <subcommand> [args...]",
         summary: "inspect and control the live sandbox sessions",
         options: &[],
         details:
-            "A session is a live sandbox cage. `ops session ls` lists them, `ops session attach`\n\
-            runs a shell or a command inside one, and `ops session stop` ends them. Host-side —\n\
-            reads the on-disk session registry (daemonless), launches nothing. `ops sessions` is\n\
+            "A session is a live sandbox cage. `sbx session ls` lists them, `sbx session attach`\n\
+            runs a shell or a command inside one, and `sbx session stop` ends them. Host-side —\n\
+            reads the on-disk session registry (daemonless), launches nothing. `sbx sessions` is\n\
             an alias.\n\
             \n\
             Run one of the subcommands below.",
     },
     Page {
         path: &["session", "ls"],
-        synopsis: "ops session ls",
+        synopsis: "sbx session ls",
         summary: "list the live sandbox sessions",
         options: &[],
         details:
@@ -318,10 +318,10 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["session", "attach"],
-        synopsis: "ops session attach <id> [-- command [args...]]",
+        synopsis: "sbx session attach <id> [-- command [args...]]",
         summary: "run a shell or a command inside a running session's live cage",
         options: &[
-            ("<id>", "the PID `ops session ls` shows for the session"),
+            ("<id>", "the PID `sbx session ls` shows for the session"),
             (
                 "-- command [args...]",
                 "run this command in the cage instead of an interactive shell",
@@ -333,20 +333,20 @@ const PAGES: &[Page] = &[
             terminal); with `-- command` it runs that command: through a pty when stdin is a\n\
             terminal (interactive, job control), through inherited stdio when it is a pipe or\n\
             script (clean bytes, so it composes with pipes and redirection). The command's exit\n\
-            status becomes ops's. Either way it re-applies the cage's confinement — the same\n\
+            status becomes sbx's. Either way it re-applies the cage's confinement — the same\n\
             seccomp denylist, no_new_privs, and dropped capabilities — so it is never a wider\n\
             hole than the agent. Provisions nothing and reads no config; needs a live session\n\
-            (run `ops session ls`). A bare shell keeps running until you type `exit`; the agent\n\
+            (run `sbx session ls`). A bare shell keeps running until you type `exit`; the agent\n\
             keeps running either way.",
     },
     Page {
         path: &["session", "stop"],
-        synopsis: "ops session stop <id>...|--all [--delay <secs>]",
+        synopsis: "sbx session stop <id>...|--all [--delay <secs>]",
         summary: "stop running sessions",
         options: &[
             (
                 "<id>...",
-                "the PIDs `ops session ls` shows for the sessions to stop",
+                "the PIDs `sbx session ls` shows for the sessions to stop",
             ),
             (
                 "--all",
@@ -363,10 +363,10 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["trust"],
-        synopsis: "ops trust [path] | ops trust --show [path]",
+        synopsis: "sbx trust [path] | sbx trust --show [path]",
         summary: "vouch for a project config's current contents",
         options: &[
-            ("[path]", "the config to act on (default ./.ops.toml)"),
+            ("[path]", "the config to act on (default ./.sbx.toml)"),
             ("--show", "report the trust state without changing it"),
         ],
         details: "Vouches for a config's current contents, so its security-relevant fields are\n\
@@ -375,34 +375,34 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["untrust"],
-        synopsis: "ops untrust [path]",
+        synopsis: "sbx untrust [path]",
         summary: "revoke a project config's trust",
-        options: &[("[path]", "the config to act on (default ./.ops.toml)")],
+        options: &[("[path]", "the config to act on (default ./.sbx.toml)")],
         details:
             "Revokes a config's trust, so its security-relevant fields stop applying until it\n\
             is trusted again.",
     },
     Page {
         path: &["config"],
-        synopsis: "ops config <subcommand>",
+        synopsis: "sbx config <subcommand>",
         summary: "inspect and edit the project configuration",
         options: &[],
         details:
-            "Inspect or edit the configuration for the current project. `ops config show` prints\n\
+            "Inspect or edit the configuration for the current project. `sbx config show` prints\n\
             the resolved, trust-gated view a launch would use (add --json for the machine-readable\n\
             model); get/set/unset read and edit a single raw layer file; path prints which file a\n\
             scope targets; and edit opens it in your editor.\n\
             \n\
-            Run `ops config show` for the resolved configuration, or one of the subcommands below.",
+            Run `sbx config show` for the resolved configuration, or one of the subcommands below.",
     },
     Page {
         path: &["config", "get"],
-        synopsis: "ops config get <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>]",
+        synopsis: "sbx config get <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>]",
         summary: "read a value from a single config file",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or nixpkgs"),
-            ("-l, --local", "the project .ops.toml (the default)"),
-            ("-g, --global", "the global ops.toml"),
+            ("-l, --local", "the project .sbx.toml (the default)"),
+            ("-g, --global", "the global sbx.toml"),
             ("-c <file>", "an explicit config file"),
             (
                 "-a, --app <name>",
@@ -411,24 +411,24 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Prints the value declared at a dotted key in one layer file. This is the raw declared\n\
-            value in that file — for the effective resolved value across layers, use `ops config\n\
-            show` (or `ops config show --json`). An unset key exits 1; an array or table value is\n\
-            edited with `ops config edit`, not read as a single value.\n\
+            value in that file — for the effective resolved value across layers, use `sbx config\n\
+            show` (or `sbx config show --json`). An unset key exits 1; an array or table value is\n\
+            edited with `sbx config edit`, not read as a single value.\n\
             \n\
-            --app <name> addresses an app's config: inline (a project .ops.toml) it reads\n\
+            --app <name> addresses an app's config: inline (a project .sbx.toml) it reads\n\
             app.<name>.<key>; with -g it reads the top-level key from the app's profile file\n\
-            (apps/<name>.toml). An app name containing a `.` is edited with `ops config edit`\n\
+            (apps/<name>.toml). An app name containing a `.` is edited with `sbx config edit`\n\
             instead.",
     },
     Page {
         path: &["config", "set"],
-        synopsis: "ops config set <key> <value> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
+        synopsis: "sbx config set <key> <value> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
         summary: "set a value in a config file (comments preserved)",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or network"),
             ("<value>", "the string value to set"),
-            ("-l, --local", "the project .ops.toml (the default)"),
-            ("-g, --global", "the global ops.toml"),
+            ("-l, --local", "the project .sbx.toml (the default)"),
+            ("-g, --global", "the global sbx.toml"),
             ("-c <file>", "an explicit config file"),
             (
                 "-a, --app <name>",
@@ -443,27 +443,27 @@ const PAGES: &[Page] = &[
             "Writes a string value at a dotted key, preserving the file's other keys, comments,\n\
             and formatting. Creates the file and intermediate tables as needed.\n\
             \n\
-            --app <name> addresses an app's config: inline (a project .ops.toml) it writes\n\
+            --app <name> addresses an app's config: inline (a project .sbx.toml) it writes\n\
             app.<name>.<key>; with -g it writes the top-level key into the app's profile file\n\
             (apps/<name>.toml, created if absent). So `set network ask --app demo -g` sets a\n\
             global app's posture, and `set network.mode ask --app demo -g` tunes its table. An\n\
-            app name containing a `.` is edited with `ops config edit` instead.\n\
+            app name containing a `.` is edited with `sbx config edit` instead.\n\
             \n\
             The trust gate hashes the whole file, so any edit re-arms it: after writing a project\n\
-            file you had trusted, its security fields stop applying until you run `ops trust`. Pass\n\
+            file you had trusted, its security fields stop applying until you run `sbx trust`. Pass\n\
             --trust to re-trust in one step (this blesses the whole current file). The global config\n\
             and app profiles are trusted by location, so a write to either needs no trust. A free\n\
             env value needs no trust. Array and table fields (binds, an allowlist, secrets, apps)\n\
-            are edited with `ops config edit`.",
+            are edited with `sbx config edit`.",
     },
     Page {
         path: &["config", "unset"],
-        synopsis: "ops config unset <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
+        synopsis: "sbx config unset <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
         summary: "remove a key from a config file",
         options: &[
             ("<key>", "a dotted key to remove, e.g. env.FOO"),
-            ("-l, --local", "the project .ops.toml (the default)"),
-            ("-g, --global", "the global ops.toml"),
+            ("-l, --local", "the project .sbx.toml (the default)"),
+            ("-g, --global", "the global sbx.toml"),
             ("-c <file>", "an explicit config file"),
             (
                 "-a, --app <name>",
@@ -477,36 +477,36 @@ const PAGES: &[Page] = &[
             file re-arms its trust gate, the same as `set` (the global config and app profiles\n\
             are trusted by location, so a removal there needs no re-trust).\n\
             \n\
-            --app <name> addresses an app's config: inline (a project .ops.toml) it removes\n\
+            --app <name> addresses an app's config: inline (a project .sbx.toml) it removes\n\
             app.<name>.<key>; with -g it removes the top-level key from the app's profile file\n\
             (apps/<name>.toml). So `unset network.mode --app demo -g` drops a global app's mode,\n\
             leaving a table that inherits it from the parent layer. An app name containing a `.`\n\
-            is edited with `ops config edit` instead.",
+            is edited with `sbx config edit` instead.",
     },
     Page {
         path: &["config", "path"],
-        synopsis: "ops config path [-l|--local|-g|--global|-c <file>]",
+        synopsis: "sbx config path [-l|--local|-g|--global|-c <file>]",
         summary: "show the config files in resolution order, or one scope's path",
         options: &[
             ("(no flag)", "list every config layer in resolution order, marking which exist"),
-            ("-l, --local", "print only the project .ops.toml path"),
-            ("-g, --global", "print only the global ops.toml path"),
+            ("-l, --local", "print only the project .sbx.toml path"),
+            ("-g, --global", "print only the global sbx.toml path"),
             ("-c <file>", "print only this explicit config file path"),
         ],
         details:
-            "With no scope flag, lists the config files a launch resolves — the global ops.toml\n\
-            (the base) then the project .ops.toml (which overlays it) — and whether each exists,\n\
-            so it is clear where ops looks even before any file is created. With a scope flag,\n\
+            "With no scope flag, lists the config files a launch resolves — the global sbx.toml\n\
+            (the base) then the project .sbx.toml (which overlays it) — and whether each exists,\n\
+            so it is clear where sbx looks even before any file is created. With a scope flag,\n\
             prints just that file's path (the one get/set/unset/edit would touch) — for scripting\n\
-            and for locating the global config. For resolved values, see `ops config show`.",
+            and for locating the global config. For resolved values, see `sbx config show`.",
     },
     Page {
         path: &["config", "edit"],
-        synopsis: "ops config edit [-l|--local|-g|--global|-c <file>] [--trust]",
+        synopsis: "sbx config edit [-l|--local|-g|--global|-c <file>] [--trust]",
         summary: "open a config file in your editor",
         options: &[
-            ("-l, --local", "the project .ops.toml (the default)"),
-            ("-g, --global", "the global ops.toml"),
+            ("-l, --local", "the project .sbx.toml (the default)"),
+            ("-g, --global", "the global sbx.toml"),
             ("-c <file>", "an explicit config file"),
             ("--trust", "re-trust the file after editing"),
         ],
@@ -519,18 +519,18 @@ const PAGES: &[Page] = &[
             `$XDG_RUNTIME_DIR` is expanded from your environment, so a portable config need not\n\
             hard-code an absolute home path; any other `$VAR` is refused. `binds` is a security\n\
             field, honored only\n\
-            from a trusted source. ops's own state (its data, trust, and config directories) is\n\
+            from a trusted source. sbx's own state (its data, trust, and config directories) is\n\
             protected either way: a read-write bind aimed at or inside one of them is forced\n\
             read-only with a warning, while a broad read-write bind that merely contains them (e.g.\n\
             `mode = \"rw\"` on your whole home) stays read-write with those directories pinned\n\
             read-only in place — so the rest of the tree is writable but the agent still cannot\n\
-            alter what ops runs or trusts.\n\
+            alter what sbx runs or trusts.\n\
             An edit that changes a file you had trusted re-arms its trust gate, so it warns to\n\
-            re-run `ops trust`; pass --trust to re-trust as the editor closes.",
+            re-run `sbx trust`; pass --trust to re-trust as the editor closes.",
     },
     Page {
         path: &["config", "show"],
-        synopsis: "ops config show [--json] [--details] [-a|--app <name>] [-g|--global|-l|--local|-d|--default]",
+        synopsis: "sbx config show [--json] [--details] [-a|--app <name>] [-g|--global|-l|--local|-d|--default]",
         summary: "show the resolved configuration for the current project",
         options: &[
             (
@@ -549,7 +549,7 @@ const PAGES: &[Page] = &[
                 "-g, --global",
                 "show only what the global config (and imported profiles) contributes",
             ),
-            ("-l, --local", "show only what the project .ops.toml contributes"),
+            ("-l, --local", "show only what the project .sbx.toml contributes"),
             ("-d, --default", "show the built-in defaults alone (no config)"),
         ],
         details:
@@ -565,7 +565,7 @@ const PAGES: &[Page] = &[
             A single-source flag restricts the view to one layer (over the built-in defaults),\n\
             so the provenance tags read as that layer's own additions: --global shows what the\n\
             global config plus any imported app profiles set (the project is ignored), --local\n\
-            what the project .ops.toml sets (the global config and profiles ignored), and\n\
+            what the project .sbx.toml sets (the global config and profiles ignored), and\n\
             --default the built-in defaults alone. The flags are mutually exclusive; with none,\n\
             the full layered configuration is shown. Each has a short form — -g, -l, -d, and -a\n\
             for --app; note -d is --default, so --details has no short form.\n\
@@ -580,9 +580,9 @@ const PAGES: &[Page] = &[
             to each full backend line (a withheld one marked, the same line the baseline packages\n\
             section renders), its allowlist to the individual allow/deny rules plus the\n\
             always-allowed built-in hosts, and its injected credentials to each by destination and\n\
-            source — so what `ops app <name>` adds, can reach, and injects is visible at a glance.\n\
+            source — so what `sbx app <name>` adds, can reach, and injects is visible at a glance.\n\
             An env value is the in-cage placeholder, a free field; the credential value is never\n\
-            shown — ops reads it host-side at launch.\n\
+            shown — sbx reads it host-side at launch.\n\
             \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
             included as a field) — the machine-readable form the human output renders, already\n\
@@ -590,7 +590,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "ops upgrade [all|nix|mise|flake|deb|appimage]",
+        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             ("all", "roll every managed channel (the default)"),
@@ -607,12 +607,12 @@ const PAGES: &[Page] = &[
             ("appimage", "the project's and apps' appimage: packages"),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
-            versions advance only here, never on an ops binary update.",
+            versions advance only here, never on an sbx binary update.",
     },
     Page {
         path: &["gc"],
-        synopsis: "ops gc [--all] [--prune]",
-        summary: "reclaim ops's nix store space",
+        synopsis: "sbx gc [--all] [--prune]",
+        summary: "reclaim sbx's nix store space",
         options: &[
             (
                 "--all",
@@ -631,25 +631,25 @@ const PAGES: &[Page] = &[
             locked channel revision still roots — under an exclusive lock.\n\
             \n\
             Removing whole per-project runtime *trees* (a project whose directory is gone, or a\n\
-            markerless legacy tree) is `ops projects rm` — see `ops help projects`. After a tree\n\
-            is removed, its store closures are reclaimed by `ops gc --all --prune`, or in one step\n\
-            with `ops projects rm <id> --gc`.",
+            markerless legacy tree) is `sbx projects rm` — see `sbx help projects`. After a tree\n\
+            is removed, its store closures are reclaimed by `sbx gc --all --prune`, or in one step\n\
+            with `sbx projects rm <id> --gc`.",
     },
     Page {
         path: &["projects"],
-        synopsis: "ops projects [list] [--json]\n       \
-                   ops projects rm <id>... [--dead] [--markerless] [-n] [-y] [--gc] [-f]",
+        synopsis: "sbx projects list [--json]\n       \
+                   sbx projects rm <id>... [--dead] [--markerless] [-n] [-y] [--gc] [-f]",
         summary: "list and remove per-project runtime trees",
         options: &[
             (
                 "list",
-                "list every runtime tree with its state, size, and last-used date (the default)",
+                "list every runtime tree with its state, size, and last-used date",
             ),
             ("--json", "with list, emit the trees as a JSON document"),
             (
                 "rm <id>...",
-                "remove one or more named trees; the id is what `ops projects` lists. Immediate —\n\
-                 naming it is consent. A live-held tree is refused (run `ops session stop` first); the\n\
+                "remove one or more named trees; the id is what `sbx projects list` shows. Immediate —\n\
+                 naming it is consent. A live-held tree is refused (run `sbx session stop` first); the\n\
                  current project is refused without --force.",
             ),
             (
@@ -673,42 +673,42 @@ const PAGES: &[Page] = &[
         ],
         details:
             "The per-project runtime trees live under `<data>/projects/<id>` and hold each\n\
-            project's writable store, isolated home, and locks. `ops projects` lists them (richer\n\
-            than `ops path`'s projects section — it adds each tree's on-disk size); `ops projects\n\
-            rm` removes them.\n\
+            project's writable store, isolated home, and locks. `sbx projects list` lists them\n\
+            (richer than `sbx path`'s projects section — it adds each tree's on-disk size); `sbx\n\
+            projects rm` removes them.\n\
             \n\
             A named `rm <id>` removes immediately (you named it, so it is not an accident); pass\n\
             `--dry-run` to preview first. The bulk selectors `--dead` and `--markerless` preview\n\
             by default and require `--yes` to apply, since they act on more than one tree. A tree\n\
-            a live session holds is always refused — stop it with `ops session stop` first — and the\n\
+            a live session holds is always refused — stop it with `sbx session stop` first — and the\n\
             current project is refused without `--force`.\n\
             \n\
-            Removing a tree is host-side only and leaves its store closures for `ops gc` to\n\
+            Removing a tree is host-side only and leaves its store closures for `sbx gc` to\n\
             reclaim; `--gc` runs that shared-store collection in the same command.",
     },
     Page {
         path: &["path"],
-        synopsis: "ops path [--json]",
-        summary: "show every directory ops uses on disk, grouped by XDG base",
+        synopsis: "sbx path [--json]",
+        summary: "show every directory sbx uses on disk, grouped by XDG base",
         options: &[
             ("--json", "emit the layout as a JSON document for scripting"),
         ],
         details:
-            "Lists the on-disk locations ops owns — the data, config, and state trees — and\n\
-            marks which exist, so it is clear where ops puts things even before any file is\n\
+            "Lists the on-disk locations sbx owns — the data, config, and state trees — and\n\
+            marks which exist, so it is clear where sbx puts things even before any file is\n\
             created. Under `projects/` it enumerates each project's runtime tree and annotates it\n\
             with a liveness state — `live` (a running session holds it), `idle` (the project\n\
             directory still exists, just not active), `dead` (the project is gone — removable\n\
-            by `ops projects rm --dead`), or `markerless` (a legacy tree pre-dating marker\n\
-            recording) — plus the last-used date, and (via `ops projects`) its size. Under `apps/`\n\
+            by `sbx projects rm --dead`), or `markerless` (a legacy tree pre-dating marker\n\
+            recording) — plus the last-used date, and (via `sbx projects list`) its size. Under `apps/`\n\
             it lists each global app home, and under the config\n\
             `apps/` each imported profile. Read-only: no trust gate, no network. For the config\n\
-            files in resolution order, see `ops config path`.",
+            files in resolution order, see `sbx config path`.",
     },
     // ---- app subcommands ----------------------------------------------------------
     Page {
         path: &["app", "import"],
-        synopsis: "ops app import <file> [--as <name>] [--force]",
+        synopsis: "sbx app import <file> [--as <name>] [--force]",
         summary: "place a portable app profile (trusted by location)",
         options: &[
             (
@@ -723,12 +723,12 @@ const PAGES: &[Page] = &[
         ],
         details:
             "The deliberate command IS the consent — an agent in the cage cannot run it, and the\n\
-            profile stays inert until `ops app <name>` launches it. The granted posture is\n\
+            profile stays inert until `sbx app <name>` launches it. The granted posture is\n\
             printed so the act is informed. The bytes are copied verbatim.",
     },
     Page {
         path: &["app", "export"],
-        synopsis: "ops app export <name> [--out <file>]",
+        synopsis: "sbx app export <name> [--out <file>]",
         summary: "write a named app out as a portable profile",
         options: &[
             ("<name>", "the app to export"),
@@ -744,7 +744,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "rm"],
-        synopsis: "ops app rm <name> [--purge] [--gc]",
+        synopsis: "sbx app rm <name> [--purge] [--gc]",
         summary: "remove an imported profile (and, with --purge, the app's home + tools)",
         options: &[
             ("<name>", "the app to remove"),
@@ -758,33 +758,33 @@ const PAGES: &[Page] = &[
             ),
         ],
         details: "Without --purge, removes only an imported profile (a file in the profiles\n\
-            directory); a project [app.<name>] overlay lives in that project's .ops.toml and is\n\
+            directory); a project [app.<name>] overlay lives in that project's .sbx.toml and is\n\
             yours to edit there. With --purge it also removes the app's per-app home(s) — the\n\
             global one and any per-project ones — which hold the tools its mise: backends\n\
             installed, its config, and its login state; those are freed immediately. A missing\n\
             profile is tolerated under --purge (the homes may still exist). The shared per-project\n\
             nix store is not touched by --purge alone: add --gc to sweep the current project's\n\
-            store in the same command (equivalent to `ops gc --prune` there), or run that yourself\n\
+            store in the same command (equivalent to `sbx gc --prune` there), or run that yourself\n\
             in each project the app used to reclaim its nix:/flake: closures. A purge refuses while\n\
             a session of the app is still running.",
     },
     Page {
         path: &["app", "list"],
-        synopsis: "ops app list  (alias: ops app ls)",
+        synopsis: "sbx app list  (alias: sbx app ls)",
         summary: "list apps with their profile and installed home",
         options: &[],
         details:
             "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
             whether it has an installed home on disk (its mise tools + login state, with disk size)\n\
-            — which `ops app rm <name> --purge` removes. An app can have a profile with no home yet\n\
+            — which `sbx app rm <name> --purge` removes. An app can have a profile with no home yet\n\
             (never launched), or a home with no profile (launched from an inline/project app, or a\n\
-            profile since removed). `ops app ls` is the same command. The full resolved app set —\n\
-            inline, project, and profile apps with their gating — is `ops config show`.",
+            profile since removed). `sbx app ls` is the same command. The full resolved app set —\n\
+            inline, project, and profile apps with their gating — is `sbx config show`.",
     },
     // ---- test subcommands ---------------------------------------------------------
     Page {
         path: &["test", "net"],
-        synopsis: "ops test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>",
+        synopsis: "sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>",
         summary: "test a URL (or an http:///tcp:// target) against the resolved network policy",
         options: &[
             ("<url>", "the URL (or a bare host, completed to https) to test. `http://host` tests the inspected-cleartext path (opt-in — only an `http://` rule opens it); `tcp://host:port` tests a raw L4 splice instead"),
@@ -808,7 +808,7 @@ const PAGES: &[Page] = &[
     // ---- net subcommands ----------------------------------------------------------
     Page {
         path: &["net", "rules"],
-        synopsis: "ops net rules [-a|--app <name>] [-s|--source config|builtin|session] [-f|--filter <substr>] [-e|--expand] [--json]",
+        synopsis: "sbx net rules [-a|--app <name>] [-s|--source config|builtin|session] [-f|--filter <substr>] [-e|--expand] [--json]",
         summary: "list the effective egress rules by source",
         options: &[
             (
@@ -817,7 +817,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "-s, --source <src>",
-                "show only one source: config (the .ops.toml/global rules), builtin (the always-allowed self-equip set), or session (live `--session` rules; `manual` is accepted as an alias)",
+                "show only one source: config (the .sbx.toml/global rules), builtin (the always-allowed self-equip set), or session (live `--session` rules; `manual` is accepted as an alias)",
             ),
             (
                 "-f, --filter <substr>",
@@ -837,16 +837,16 @@ const PAGES: &[Page] = &[
             `tcp://`; a `re:` regex shows neither (its pattern carries its own).\n\
             A rule that came from a `[net.groups]` group shows as a single `@<name>` reference;\n\
             `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
-            directly with `ops net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
-            <name>` shows what `ops app <name>` would launch with — the same effective policy `ops\n\
+            directly with `sbx net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
+            <name>` shows what `sbx app <name>` would launch with — the same effective policy `sbx\n\
             test net --app` tests a URL against. `--source session` instead queries the live sessions\n\
-            for the rules loaded into their overlay with `ops net allow|deny --session` (or a `net\n\
+            for the rules loaded into their overlay with `sbx net allow|deny --session` (or a `net\n\
             pending … --session` answer) — this project's sessions by default, or `-a <app>`'s\n\
             session(s). No launch, no nix.",
     },
     Page {
         path: &["net", "groups"],
-        synopsis: "ops net groups [<name>…] [--json] | ops net groups export|import …",
+        synopsis: "sbx net groups [<name>…] [--json] | sbx net groups export|import …",
         summary: "list reusable egress groups, or resolve one to its entries",
         options: &[
             (
@@ -859,14 +859,14 @@ const PAGES: &[Page] = &[
             "A `[net.groups]` group is a named set of egress entries declared once in the global\n\
             config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts\n\
             is shared across apps instead of rewritten per profile. Groups are global-only, so this\n\
-            command has no scope flag — it always reads the global config. `ops net groups` lists the\n\
-            groups; `ops net groups <name>` shows what `@<name>` expands to; `export`/`import` move\n\
+            command has no scope flag — it always reads the global config. `sbx net groups` lists the\n\
+            groups; `sbx net groups <name>` shows what `@<name>` expands to; `export`/`import` move\n\
             groups between machines. A malformed or nested entry is flagged. Add a reference with\n\
-            `ops net allow @<name>`. Read-only (except `import`), no launch.",
+            `sbx net allow @<name>`. Read-only (except `import`), no launch.",
     },
     Page {
         path: &["net", "groups", "export"],
-        synopsis: "ops net groups export [<name>…] [-o|--out <file>]",
+        synopsis: "sbx net groups export [<name>…] [-o|--out <file>]",
         summary: "write egress groups as a portable [net.groups] fragment",
         options: &[
             ("<name>…", "export only the named group(s) (default: every group)"),
@@ -874,15 +874,15 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Emits the reusable egress groups as a portable `[net.groups]` TOML fragment — to stdout\n\
-            by default (`ops net groups export > groups.toml`), or to `--out <file>`. The inverse of\n\
+            by default (`sbx net groups export > groups.toml`), or to `--out <file>`. The inverse of\n\
             `import`. Source comments are not carried (a group is data). Read-only, no launch.",
     },
     Page {
         path: &["net", "groups", "import"],
-        synopsis: "ops net groups import <file> [-f|--force]",
+        synopsis: "sbx net groups import <file> [-f|--force]",
         summary: "merge a [net.groups] fragment into the global config",
         options: &[
-            ("<file>", "a `[net.groups]` fragment (e.g. from `ops net groups export`)"),
+            ("<file>", "a `[net.groups]` fragment (e.g. from `sbx net groups export`)"),
             ("-f, --force", "overwrite a group whose name already exists (default: refuse)"),
         ],
         details:
@@ -891,18 +891,18 @@ const PAGES: &[Page] = &[
             which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
             cannot run it), so there is no prompt. A name that already exists is refused unless\n\
             `--force`; the merge is all-or-nothing. A group carrying an entry that will not resolve (a\n\
-            malformed or nested one) is flagged after the import — inspect it with `ops net groups\n\
+            malformed or nested one) is flagged after the import — inspect it with `sbx net groups\n\
             <name>`. Imported groups are inert until referenced by a `[network]` allow/deny with\n\
             `@<name>`.",
     },
     Page {
         path: &["net", "allow"],
-        synopsis: "ops net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        synopsis: "sbx net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist an allow rule to a config file (or load it live with --session)",
         options: &[
             ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
-            ("-l, --local", "write the project .ops.toml (the default)"),
-            ("-g, --global", "write the global ops.toml"),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)"),
             ("--session", "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default"),
             ("--all", "with `--session`, widen the live load to every reachable session (all projects), not just the current one"),
@@ -915,7 +915,7 @@ const PAGES: &[Page] = &[
             `--session` instead loads the rule into the **live overlay** of the running session(s), which\n\
             the proxy folds into its effective policy — so it takes effect immediately, on an allowlist\n\
             or denylist session as well as `ask` (a `--session allow` opens an otherwise-denied host, a\n\
-            `--session deny` cuts an allowed one; deny wins). It is the proactive sibling of `ops net\n\
+            `--session deny` cuts an allowed one; deny wins). It is the proactive sibling of `sbx net\n\
             pending allow <id> --session`, which decides a request that already parked. It writes no\n\
             file — so, unlike a config write, it never re-trusts the project — and dies with the session.\n\
             The config-scope flags (`-l`/`-g`/`-c`) do not apply with `--session`; scope the sessions\n\
@@ -924,12 +924,12 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "deny"],
-        synopsis: "ops net deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        synopsis: "sbx net deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist a deny rule to a config file (or load it live with --session)",
         options: &[
             ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
-            ("-l, --local", "write the project .ops.toml (the default)"),
-            ("-g, --global", "write the global ops.toml"),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)"),
             ("--session", "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default"),
             ("--all", "with `--session`, widen the live load to every reachable session (all projects), not just the current one"),
@@ -947,27 +947,27 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "mute"],
-        synopsis: "ops net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        synopsis: "sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "suppress a denied request's log line without changing the verdict (SELinux `dontaudit`)",
         options: &[
-            ("<rule>", "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `ops net log`"),
-            ("-l, --local", "write the project .ops.toml (the default)"),
-            ("-g, --global", "write the global ops.toml"),
+            ("<rule>", "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `sbx net log`"),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
             ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]` (e.g. an imported profile); with `--session`, scope the live load to that app's session(s)"),
             ("--session", "load the mute into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); it takes effect immediately and dies with the session. Scopes to the current project by default"),
             ("--all", "with `--session`, widen the live load to every reachable session (all projects)"),
         ],
         details:
             "Adds a `mute` (`dontaudit`) rule: a request matching it is still **denied** and still\n\
-            **counted** in `ops net stats` — only its line is kept out of the default `ops net log`\n\
-            (see it with `ops net log --all`). It is a log filter, never a verdict: it cannot open\n\
+            **counted** in `sbx net stats` — only its line is kept out of the default `sbx net log`\n\
+            (see it with `sbx net log --all`). It is a log filter, never a verdict: it cannot open\n\
             egress. Use it to quiet the refusals you have deliberately left denied (telemetry, feature\n\
             flags, an optional CDN) so the actionable ones stand out.\n\
             \n\
             A config write needs an existing filtering posture (there is nothing to suppress under\n\
             `shared`/`none`), so set one first on a fresh config; it re-trusts the project config (it\n\
             must be absent or already trusted first), while the global config and app profiles are\n\
-            trusted by location. Remove a rule with `ops net unmute`.\n\
+            trusted by location. Remove a rule with `sbx net unmute`.\n\
             \n\
             `--session` instead loads the mute into the **live overlay** of the running session(s),\n\
             which the proxy folds into its effective policy — so it quiets the log immediately, on\n\
@@ -977,16 +977,16 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "unmute"],
-        synopsis: "ops net unmute <rule> [-l|--local|-g|--global] [-a|--app <name>]",
-        summary: "remove a mute rule from a config file (the inverse of `ops net mute`)",
+        synopsis: "sbx net unmute <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove a mute rule from a config file (the inverse of `sbx net mute`)",
         options: &[
             ("<rule>", "the mute rule to remove — an exact-string match of what was muted"),
-            ("-l, --local", "edit the project .ops.toml (the default)"),
-            ("-g, --global", "edit the global ops.toml"),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
             ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
         ],
         details:
-            "Removes a `mute` rule added by `ops net mute`. Idempotent: unmuting a rule that is not\n\
+            "Removes a `mute` rule added by `sbx net mute`. Idempotent: unmuting a rule that is not\n\
             present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
             when something actually changed); the global config and app profiles are trusted by\n\
             location.",
@@ -994,7 +994,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "pending"],
         synopsis:
-            "ops net pending [-a <app>] [--json] | ops net pending allow|deny <id>|--all [-a <app>] [--save ...] | ops net pending watch [-i <secs>]",
+            "sbx net pending [-a <app>] [--json] | sbx net pending allow|deny <id>|--all [-a <app>] [--save ...] | sbx net pending watch [-i <secs>]",
         summary: "list and answer egress requests parked by the `ask` posture",
         options: &[
             ("-a, --app <name>", "limit the listing / `--all` drain to one app's session(s)"),
@@ -1010,31 +1010,31 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending", "watch"],
-        synopsis: "ops net pending watch [-i|--interval <secs>] [-a|--app <name>]",
+        synopsis: "sbx net pending watch [-i|--interval <secs>] [-a|--app <name>]",
         summary: "redraw the parked-request listing live until interrupted",
         options: &[
             ("-i, --interval <secs>", "seconds between refreshes (default 2)"),
             ("-a, --app <name>", "limit the listing to one app's session(s)"),
         ],
         details:
-            "Polls the same live control sockets as `ops net pending` and redraws the listing in\n\
+            "Polls the same live control sockets as `sbx net pending` and redraws the listing in\n\
             place every few seconds (top-style — the terminal scrollback is preserved), so a parked\n\
             request appears as soon as an agent triggers it. Answer it from another shell with\n\
-            `ops net pending allow|deny <id>`; the watch picks up the change on the next refresh.\n\
+            `sbx net pending allow|deny <id>`; the watch picks up the change on the next refresh.\n\
             Ctrl-C quits. Needs a terminal — for a pipe or a script use the one-shot listing (`--json`).\n\
             No launch, no nix, no network.",
     },
     Page {
         path: &["net", "pending", "allow"],
-        synopsis: "ops net pending allow <id> [-a <app>] [--session] [--save [-l|-g]] | ops net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
+        synopsis: "sbx net pending allow <id> [-a <app>] [--session] [--save [-l|-g]] | sbx net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
-            ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
+            ("<id>", "the `<pid>.<seq>` id from `sbx net pending` or the launch notice"),
             ("--all", "allow every parked request at once (every session, or with `-a <app>` only that app's)"),
             ("--session", "also remember the host:port for this live session, so it is not re-asked"),
             ("--save", "also persist an allow rule per answered host (scope below; by id or in bulk with --all)"),
-            ("-l, --local", "with --save: write the project .ops.toml (the default; with --all, drains only this project)"),
-            ("-g, --global", "with --save: write the global ops.toml"),
+            ("-l, --local", "with --save: write the project .sbx.toml (the default; with --all, drains only this project)"),
+            ("-g, --global", "with --save: write the global sbx.toml"),
             ("-a, --app <name>", "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`"),
         ],
         details:
@@ -1055,15 +1055,15 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "pending", "deny"],
-        synopsis: "ops net pending deny <id> [-a <app>] [--session] [--save [-l|-g]] | ops net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
+        synopsis: "sbx net pending deny <id> [-a <app>] [--session] [--save [-l|-g]] | sbx net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
-            ("<id>", "the `<pid>.<seq>` id from `ops net pending` or the launch notice"),
+            ("<id>", "the `<pid>.<seq>` id from `sbx net pending` or the launch notice"),
             ("--all", "deny every parked request at once (every session, or with `-a <app>` only that app's)"),
             ("--session", "also remember the host:port as denied for this live session, so it is not re-asked"),
             ("--save", "also persist a deny rule per answered host (scope below; by id or in bulk with --all)"),
-            ("-l, --local", "with --save: write the project .ops.toml (the default; with --all, drains only this project)"),
-            ("-g, --global", "with --save: write the global ops.toml"),
+            ("-l, --local", "with --save: write the project .sbx.toml (the default; with --all, drains only this project)"),
+            ("-g, --global", "with --save: write the global sbx.toml"),
             ("-a, --app <name>", "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`"),
         ],
         details:
@@ -1082,7 +1082,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "stats"],
-        synopsis: "ops net stats [-a|--app <name>] [--reset] [--json]",
+        synopsis: "sbx net stats [-a|--app <name>] [--reset] [--json]",
         summary: "per-host egress decision counters (allow / deny / blocked)",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
@@ -1101,7 +1101,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "logs"],
-        synopsis: "ops net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
+        synopsis: "sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
                    [-n <N>] [--all] [--with-query] [--with-status] [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
         options: &[
@@ -1110,7 +1110,7 @@ const PAGES: &[Page] = &[
             ("--verdict <v>", "only events with this verdict: allow, deny, blocked, or error"),
             ("-n <N>", "show only the most recent N events (per session)"),
             ("--all", "also show refusals a `[network] mute` rule suppressed (tagged `muted`); the \
-                       default view omits them (they stay counted in `ops net stats`)"),
+                       default view omits them (they stay counted in `sbx net stats`)"),
             ("--with-query", "keep the URL query in the shown path (dropped by default; already \
                               secret-redacted)"),
             ("--with-status", "show the upstream HTTP status (200/404/…) — completed L7 requests \
@@ -1122,19 +1122,19 @@ const PAGES: &[Page] = &[
         ],
         details:
             "A chronological, per-request record of every egress decision the proxy made this\n\
-            session — the session id (the PID `ops session ls` shows), the local `hh:mm:ss` time, host:port,\n\
+            session — the session id (the PID `sbx session ls` shows), the local `hh:mm:ss` time, host:port,\n\
             method, path, verdict, and the reason category. It is read from the same control sockets\n\
-            `ops net pending` uses, and `log` is an accepted alias.\n\
+            `sbx net pending` uses, and `log` is an accepted alias.\n\
             \n\
             LIVE-ONLY: the log lives in the running session's memory and is NEVER written to disk;\n\
             once the session exits, nothing remains. It shows a session while it runs (watch it\n\
             from another terminal), not after. Only a filtering posture (`deny`/`allow`/`ask`) has a\n\
             proxy, so only those sessions have a log.\n\
             \n\
-            Verdicts are a superset of `ops net stats`: allow, deny, blocked (a security/protocol\n\
+            Verdicts are a superset of `sbx net stats`: allow, deny, blocked (a security/protocol\n\
             guard), and `error` — a request that was allowed but did not complete (DNS failure, an\n\
             unreachable host, a rejected certificate). `error` is diagnostic and is NOT one of the\n\
-            stats counters, so the log's lines do not reconcile with `ops net stats` totals.\n\
+            stats counters, so the log's lines do not reconcile with `sbx net stats` totals.\n\
             \n\
             `--with-status` adds the upstream HTTP status (200/404/5xx) the server answered — for a\n\
             completed L7 (inspected `https://`) request only; an L4 (`tcp://`) splice, a refusal, or\n\
@@ -1151,7 +1151,7 @@ const PAGES: &[Page] = &[
             \n\
             MUTE (SELinux `dontaudit`): a `[network] mute` rule suppresses a *denied* request's line\n\
             from this view — never its verdict (the request is still refused) and never its count\n\
-            (`ops net stats` still records it). Muted refusals live in a separate ring, so a chatty\n\
+            (`sbx net stats` still records it). Muted refusals live in a separate ring, so a chatty\n\
             muted host (telemetry, feature flags) can never evict a real event; `--all` folds them\n\
             back in, each tagged `muted`. Use it to keep the log focused on the refusals worth acting\n\
             on while still being able to see everything on demand.\n\
@@ -1168,7 +1168,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "live"],
-        synopsis: "ops net live [-a|--app <name>] [-i|--interval <secs>] [--json]",
+        synopsis: "sbx net live [-a|--app <name>] [-i|--interval <secs>] [--json]",
         summary: "a live view of the egress tunnels currently open (a `top` for connections)",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
@@ -1180,10 +1180,10 @@ const PAGES: &[Page] = &[
             "Shows the egress tunnels open RIGHT NOW — one line per flow: destination host:port, the\n\
             transport (`https` inspected TLS, `http` inspected cleartext, `tcp` raw L4 splice), how\n\
             long it has been open, and the bytes transferred each way (`↑` client→upstream,\n\
-            `↓` upstream→client). Rows are grouped by session (the PID `ops session ls` shows) so several\n\
+            `↓` upstream→client). Rows are grouped by session (the PID `sbx session ls` shows) so several\n\
             agents are told apart. Redrawn in place on the interval until Ctrl-C, like `top`.\n\
             \n\
-            This is the OPEN CONNECTIONS, distinct from `ops net logs` (the history of decided\n\
+            This is the OPEN CONNECTIONS, distinct from `sbx net logs` (the history of decided\n\
             requests). Because the proxy closes each inspected request after one response, short API\n\
             calls flash by in well under a second; the durable rows are raw `tcp://` tunnels (SSH, a\n\
             database wire), WebSockets, and large L7 transfers in progress (a download, a streamed\n\
@@ -1196,13 +1196,13 @@ const PAGES: &[Page] = &[
             \n\
             The redraw needs a terminal; use `--json` to script it (one snapshot object per tick,\n\
             each flow carrying its session, destination, transport, age, and byte totals). Read live\n\
-            from the same control sockets `ops net logs` uses — host-side, no launch, no nix, no\n\
+            from the same control sockets `sbx net logs` uses — host-side, no launch, no nix, no\n\
             network.",
     },
     // ---- plugins subcommands ------------------------------------------------------
     Page {
         path: &["plugins", "list"],
-        synopsis: "ops plugins list",
+        synopsis: "sbx plugins list",
         summary: "list installed resolver plugins and built-in schemes",
         options: &[],
         details: "Shows the reserved built-in schemes and every installed resolver plugin — its\n\
@@ -1210,7 +1210,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "info"],
-        synopsis: "ops plugins info <scheme>",
+        synopsis: "sbx plugins info <scheme>",
         summary: "show a plugin's manifest and sandbox grant",
         options: &[("<scheme>", "the resolver scheme to detail")],
         details:
@@ -1219,7 +1219,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "install"],
-        synopsis: "ops plugins install <name|dir>",
+        synopsis: "sbx plugins install <name|dir>",
         summary: "install a built-in or local resolver plugin",
         options: &[
             (
@@ -1236,7 +1236,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "rm"],
-        synopsis: "ops plugins rm <name>",
+        synopsis: "sbx plugins rm <name>",
         summary: "remove an installed resolver plugin",
         options: &[(
             "<name>",
@@ -1246,7 +1246,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store"],
-        synopsis: "ops plugins store <subcommand> [args...]",
+        synopsis: "sbx plugins store <subcommand> [args...]",
         summary: "manage signed plugin stores",
         options: &[],
         details:
@@ -1256,7 +1256,7 @@ const PAGES: &[Page] = &[
     // ---- plugins store subcommands ------------------------------------------------
     Page {
         path: &["plugins", "store", "list"],
-        synopsis: "ops plugins store list",
+        synopsis: "sbx plugins store list",
         summary: "list the built-in store and configured remote stores",
         options: &[],
         details: "The resolver plugins bundled in the binary, then every configured remote store\n\
@@ -1264,7 +1264,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store", "add"],
-        synopsis: "ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)",
+        synopsis: "sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)",
         summary: "configure and fetch a remote signed store",
         options: &[
             ("--name <n>", "a local name for the store"),
@@ -1285,7 +1285,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store", "publish"],
-        synopsis: "ops plugins store publish <dir> --key <key-file> [--rev <n>]",
+        synopsis: "sbx plugins store publish <dir> --key <key-file> [--rev <n>]",
         summary: "sign a directory of plugins into a store",
         options: &[
             ("<dir>", "a directory of resolver plugins to sign"),
@@ -1305,7 +1305,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store", "update"],
-        synopsis: "ops plugins store update [name]",
+        synopsis: "sbx plugins store update [name]",
         summary: "re-fetch one or all configured stores",
         options: &[(
             "[name]",
@@ -1317,7 +1317,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store", "install"],
-        synopsis: "ops plugins store install <store> <plugin>",
+        synopsis: "sbx plugins store install <store> <plugin>",
         summary: "install a plugin a configured store lists",
         options: &[
             ("<store>", "the configured store"),
@@ -1328,7 +1328,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store", "info"],
-        synopsis: "ops plugins store info <name>",
+        synopsis: "sbx plugins store info <name>",
         summary: "detail a configured remote store",
         options: &[("<name>", "the configured store to detail")],
         details:
@@ -1337,7 +1337,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "store", "rm"],
-        synopsis: "ops plugins store rm <name>",
+        synopsis: "sbx plugins store rm <name>",
         summary: "remove a configured remote store",
         options: &[("<name>", "the configured store to remove")],
         details: "",
@@ -1364,7 +1364,7 @@ fn children(path: &[&str]) -> Vec<&'static Page> {
 /// print this on an argument error so the grammar lives in exactly one place. An unknown
 /// path (only an internal caller can pass one) yields a generic fallback.
 pub fn synopsis_of(path: &[&str]) -> &'static str {
-    find(path).map_or("ops <command>", |p| p.synopsis)
+    find(path).map_or("sbx <command>", |p| p.synopsis)
 }
 
 /// The argument grammar for a top-level command, e.g. `synopsis("shell")`.
@@ -1381,22 +1381,22 @@ pub fn is_command(name: &str) -> bool {
 /// For an unknown top-level command that is really a subcommand verb, the full path to
 /// suggest. Verbs with a *single* parent are listed; a genuinely ambiguous verb (`rm`,
 /// `list`, `info`, `install` each belong to more than one parent) would misdirect, so it
-/// falls through to the generic `ops --help` pointer instead. `ls` is a deliberate
-/// exception: it is an alias of both `session` and `projects`, but `ops ls` historically
-/// meant the session list, so pointing its old spelling at `ops session ls` is the least
+/// falls through to the generic `sbx --help` pointer instead. `ls` is a deliberate
+/// exception: it is an alias of both `session` and `projects`, but `sbx ls` historically
+/// meant the session list, so pointing its old spelling at `sbx session ls` is the least
 /// surprising migration aid.
 pub fn subcommand_hint(name: &str) -> Option<&'static str> {
     Some(match name {
         // The session verbs used to be top-level; point their old spellings at the namespace.
-        "ls" => "ops session ls",
-        "attach" => "ops session attach",
-        "stop" => "ops session stop",
-        "import" => "ops app import",
-        "export" => "ops app export",
-        "publish" => "ops plugins store publish",
-        "add" => "ops plugins store add",
-        "update" => "ops plugins store update",
-        "store" => "ops plugins store",
+        "ls" => "sbx session ls",
+        "attach" => "sbx session attach",
+        "stop" => "sbx session stop",
+        "import" => "sbx app import",
+        "export" => "sbx app export",
+        "publish" => "sbx plugins store publish",
+        "add" => "sbx plugins store add",
+        "update" => "sbx plugins store update",
+        "store" => "sbx plugins store",
         _ => return None,
     })
 }
@@ -1468,15 +1468,15 @@ fn paint_inline_code(text: &str, pal: &Palette) -> String {
     out
 }
 
-/// Render the top-level command list — the body of `ops --help` and the no-command usage.
+/// Render the top-level command list — the body of `sbx --help` and the no-command usage.
 /// Top-level commands are sorted alphabetically, like each subcommand listing.
 fn top_level(pal: &Palette) -> String {
-    let mut out = String::from("ops — a sandbox launcher (bubblewrap + daemonless nix)\n\n");
+    let mut out = String::from("sbx — a sandbox launcher (bubblewrap + daemonless nix)\n\n");
     out.push_str(&format!(
         "{}Usage:{}\n  {}\n\n",
         pal.head,
         pal.reset,
-        paint_synopsis("ops <command> [arguments]", pal)
+        paint_synopsis("sbx <command> [arguments]", pal)
     ));
     out.push_str(&format!("{}Commands:{}\n", pal.head, pal.reset));
     let mut tops: Vec<&Page> = PAGES.iter().filter(|p| p.path.len() == 1).collect();
@@ -1493,7 +1493,7 @@ fn top_level(pal: &Palette) -> String {
         );
     }
     out.push_str(&paint_inline_code(
-        "\nRun `ops help <command>` (or `ops <command> --help`) for usage and details.\n",
+        "\nRun `sbx help <command>` (or `sbx <command> --help`) for usage and details.\n",
         pal,
     ));
     out
@@ -1503,7 +1503,7 @@ fn top_level(pal: &Palette) -> String {
 fn render(page: &Page, pal: &Palette) -> String {
     let joined = page.path.join(" ");
     let mut out = format!(
-        "{}ops {}{} — {}\n\n",
+        "{}sbx {}{} — {}\n\n",
         pal.name,
         joined,
         pal.reset,
@@ -1550,7 +1550,7 @@ fn render(page: &Page, pal: &Palette) -> String {
             );
         }
         out.push_str(&paint_inline_code(
-            &format!("\nRun `ops help {joined} <subcommand>` for a subcommand's options.\n"),
+            &format!("\nRun `sbx help {joined} <subcommand>` for a subcommand's options.\n"),
             pal,
         ));
     }
@@ -1572,7 +1572,7 @@ pub fn show(path: &[&str]) -> ExitCode {
         }
         None => {
             eprintln!(
-                "ops: no help for `ops {}` — run `ops --help` for the list of commands.",
+                "sbx: no help for `sbx {}` — run `sbx --help` for the list of commands.",
                 path.join(" ")
             );
             ExitCode::from(2)
@@ -1581,8 +1581,8 @@ pub fn show(path: &[&str]) -> ExitCode {
 }
 
 /// The deepest command path a help request is about: the command, then each following
-/// non-flag token that extends it to a known subcommand. `ops plugins store add --help`
-/// resolves to `["plugins","store","add"]`; `ops session stop --all --help` to `["session","stop"]`.
+/// non-flag token that extends it to a known subcommand. `sbx plugins store add --help`
+/// resolves to `["plugins","store","add"]`; `sbx session stop --all --help` to `["session","stop"]`.
 fn resolve_path<'a>(cmd: &'a str, rest: &'a [OsString]) -> Vec<&'a str> {
     let mut path = vec![cmd];
     for arg in rest {
@@ -1606,8 +1606,8 @@ fn resolve_path<'a>(cmd: &'a str, rest: &'a [OsString]) -> Vec<&'a str> {
 /// caller restricts this to known commands (an unknown command keeps its own diagnosis) and
 /// excludes `run`/`mise`, which handle a leading help flag themselves.
 ///
-/// A `--` ends ops's own options: anything after it belongs to a launched command (e.g.
-/// `ops app <name> -- --help` passes `--help` through to that command), so the help scan stops
+/// A `--` ends sbx's own options: anything after it belongs to a launched command (e.g.
+/// `sbx app <name> -- --help` passes `--help` through to that command), so the help scan stops
 /// at the first `--` — the same rule the `run` arm applies to its command.
 pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
     let asks_help = rest
@@ -1617,7 +1617,7 @@ pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
     asks_help.then(|| show(&resolve_path(cmd, rest)))
 }
 
-/// `ops help [command [subcommand...]]` / `ops --help` / `ops -h`: the top-level list, or
+/// `sbx help [command [subcommand...]]` / `sbx --help` / `sbx -h`: the top-level list, or
 /// the page for the full command path given after the verb.
 pub fn dispatch(args: Vec<OsString>) -> ExitCode {
     let path: Vec<&str> = args
@@ -1641,8 +1641,8 @@ pub fn top_level_usage() -> String {
 }
 
 /// Render a command's page to a string for a no-subcommand usage error — the caller writes it to
-/// stderr and exits non-zero, the way bare `ops` writes [`top_level_usage`]. The page lists the
-/// command's subcommands, so `ops config` reveals `show`/`get`/… instead of silently acting. An
+/// stderr and exits non-zero, the way bare `sbx` writes [`top_level_usage`]. The page lists the
+/// command's subcommands, so `sbx config` reveals `show`/`get`/… instead of silently acting. An
 /// unknown path (only an internal caller can pass one) yields `None`. Color is decided for stderr.
 pub fn page_usage(path: &[&str]) -> Option<String> {
     find(path).map(|page| render(page, &Palette::for_stream(std::io::stderr().is_terminal())))
@@ -1692,14 +1692,14 @@ mod tests {
         use std::ffi::OsString;
         let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
 
-        // A leading help flag — or one after a subcommand, or after a non-`--` flag — is ops's.
+        // A leading help flag — or one after a subcommand, or after a non-`--` flag — is sbx's.
         assert!(maybe_help("app", &v(&["--help"])).is_some());
         assert!(maybe_help("app", &v(&["-h"])).is_some());
         assert!(maybe_help("app", &v(&["import", "--help"])).is_some());
         assert!(maybe_help("stop", &v(&["--all", "--help"])).is_some());
 
-        // A help flag *after* a `--` belongs to the launched command — `ops app <name> -- --help`
-        // passes `--help` through, so ops does not intercept it.
+        // A help flag *after* a `--` belongs to the launched command — `sbx app <name> -- --help`
+        // passes `--help` through, so sbx does not intercept it.
         assert!(maybe_help("app", &v(&["claude", "--", "--help"])).is_none());
         assert!(maybe_help("app", &v(&["claude", "--", "-h"])).is_none());
         // No help flag at all runs the command.
@@ -1718,7 +1718,7 @@ mod tests {
     #[test]
     fn paint_synopsis_wraps_only_metavariables() {
         let pal = Palette::colored();
-        let painted = paint_synopsis("ops session stop <id>...|--all [--delay <secs>]", &pal);
+        let painted = paint_synopsis("sbx session stop <id>...|--all [--delay <secs>]", &pal);
         // Each `<…>` span (angle brackets included) is wrapped; literals stay untouched.
         assert!(painted.contains("\x1b[1m<id>\x1b[0m"));
         assert!(painted.contains("\x1b[1m<secs>\x1b[0m"));
@@ -1727,12 +1727,12 @@ mod tests {
 
         // A plain palette returns the input byte-for-byte.
         assert_eq!(
-            paint_synopsis("ops session stop <id>...|--all", &Palette::plain()),
-            "ops session stop <id>...|--all"
+            paint_synopsis("sbx session stop <id>...|--all", &Palette::plain()),
+            "sbx session stop <id>...|--all"
         );
 
         // An unterminated `<` is emitted verbatim — never a dangling open span.
-        let weird = paint_synopsis("ops x <unterminated", &pal);
+        let weird = paint_synopsis("sbx x <unterminated", &pal);
         assert!(weird.ends_with("<unterminated"));
         assert!(!weird.trim_end().ends_with("\x1b["));
     }
@@ -1740,9 +1740,9 @@ mod tests {
     #[test]
     fn paint_inline_code_strips_backticks_and_wraps_the_content() {
         let pal = Palette::colored();
-        let painted = paint_inline_code("run `ops help run` for the `--config` reference", &pal);
+        let painted = paint_inline_code("run `sbx help run` for the `--config` reference", &pal);
         // Backticks are dropped; the inner token is wrapped in the code style + reset.
-        assert!(painted.contains("\x1b[36mops help run\x1b[0m"));
+        assert!(painted.contains("\x1b[36msbx help run\x1b[0m"));
         assert!(painted.contains("\x1b[36m--config\x1b[0m"));
         assert!(
             !painted.contains('`'),
@@ -1750,13 +1750,13 @@ mod tests {
         );
 
         // A metavariable inside a code span stays literal text (only the whole span is styled).
-        let meta = paint_inline_code("Run `ops help <command>` for details", &pal);
-        assert!(meta.contains("\x1b[36mops help <command>\x1b[0m"));
+        let meta = paint_inline_code("Run `sbx help <command>` for details", &pal);
+        assert!(meta.contains("\x1b[36msbx help <command>\x1b[0m"));
 
         // Color off: the string is returned byte-for-byte, backticks kept.
         assert_eq!(
-            paint_inline_code("run `ops help run`", &Palette::plain()),
-            "run `ops help run`"
+            paint_inline_code("run `sbx help run`", &Palette::plain()),
+            "run `sbx help run`"
         );
 
         // A lone backtick is emitted verbatim — never a dangling open span.

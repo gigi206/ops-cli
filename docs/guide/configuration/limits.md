@@ -1,7 +1,7 @@
 # `[limits]` — cgroup resource limits
 
 Override the cage's cgroup v2 resource limits (the anti-DoS control), which otherwise
-use `ops`'s built-in defaults.
+use `sbx`'s built-in defaults.
 
 ```toml
 [limits]
@@ -45,7 +45,7 @@ value is **dropped with a warning** (falling back to the default) rather than re
 
 A **bare** memory number is *bytes*, so `memory_max = 90` means 90 **bytes** — a
 percentage written without its `%`, below the kernel floor, which would brick every
-launch. `ops` catches a bare small memory integer (< 1 MiB) at config time, dropping it
+launch. `sbx` catches a bare small memory integer (< 1 MiB) at config time, dropping it
 with a `did you mean "90%"?` hint and falling back to the default. (A bare `tasks_max`
 integer is a valid task count, not bytes.)
 
@@ -75,22 +75,22 @@ tasks_max = 4096
 ## Viewing the effective limits
 
 ```sh
-ops config show            # a `limits:` line only when a field is overridden
-ops config show --app cap  # an app's effective limits, tagged inherited or set
-ops doctor                 # the host's resource-limiting capability
+sbx config show            # a `limits:` line only when a field is overridden
+sbx config show --app cap  # an app's effective limits, tagged inherited or set
+sbx doctor                 # the host's resource-limiting capability
 ```
 
 ## One-shot override
 
 To tune a single limit for one launch without editing the file, use `--limit
-<key>=<value>` (repeatable) or `OPS_LIMIT_<key>`:
+<key>=<value>` (repeatable) or `SBX_LIMIT_<key>`:
 
 ```sh
-ops run --limit tasks_max=8192 -- ./build.sh
-OPS_LIMIT_MEMORY_MAX=16G ops shell
+sbx run --limit tasks_max=8192 -- ./build.sh
+SBX_LIMIT_MEMORY_MAX=16G sbx shell
 ```
 
-The key is one of `memory_high` / `memory_max` / `tasks_max` (the `OPS_LIMIT_` suffix
+The key is one of `memory_high` / `memory_max` / `tasks_max` (the `SBX_LIMIT_` suffix
 is case-insensitive). A one-shot limit tunes that field without dropping the others.
 The command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides.md).

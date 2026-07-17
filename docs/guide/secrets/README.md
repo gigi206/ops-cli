@@ -1,15 +1,15 @@
 # Secrets
 
-`ops` lets an agent *authenticate* to a host without ever handing it the
+`sbx` lets an agent *authenticate* to a host without ever handing it the
 credential. A GitHub token, an API key, a registry password — the plaintext is
 read **on the host**, injected into the matching outbound request **on the
 wire**, and torn down when the cage exits. The agent makes the HTTPS call it was
-going to make anyway; `ops` brokers the credential onto it. The secret's bytes
+going to make anyway; `sbx` brokers the credential onto it. The secret's bytes
 never enter the sandbox.
 
 ## The invariant: no plaintext secret in the cage
 
-> **`ops` never places a plaintext secret inside the cage.** Every resolution is
+> **`sbx` never places a plaintext secret inside the cage.** Every resolution is
 > host-side, before the cage starts. The agent receives a *capability*
 > (authenticate to an allowed host), never the secret's bytes.
 
@@ -22,7 +22,7 @@ by construction* rather than merely present-but-discouraged:
 - A **secret** is permanent and portable — exfiltrate it once, reuse it forever,
   anywhere.
 
-Holding a capability is not holding the secret. `ops` blocks
+Holding a capability is not holding the secret. `sbx` blocks
 **extraction/portability**, not in-session use (granting the use is the whole
 point). The irreducible lever is therefore **least privilege at the source**: a
 fine-scoped token or a read-only account is only as dangerous as its own
@@ -37,7 +37,7 @@ A secret declaration composes two orthogonal halves, and **both run host-side**:
 | **Resolver** (SOURCE) | fetch the plaintext | *where does the value come from?* | [resolvers.md](resolvers.md) |
 | **Broker** (SINK) | expose only a capability to the cage | *how does the agent use it without seeing it?* | [injection.md](injection.md) |
 
-The resolver fetches the plaintext into `ops`'s own host process (from an
+The resolver fetches the plaintext into `sbx`'s own host process (from an
 environment variable, a file, a SOPS-encrypted store, or a resolver plugin). The
 broker — today, HTTP-header injection — consumes that plaintext host-side and
 puts only a capability in front of the cage. The plaintext is used and discarded
@@ -46,7 +46,7 @@ on the host; only ciphertext (if any) and capabilities ever cross into the cage.
 ```
 host side                                    │ cage (empty netns)
   resolver.fetch(ref) ── plaintext ──▶ broker ── capability ──▶ agent's tool
-   (env / file / sops / plugin)   (in ops mem)   (header inject)   (curl, git…)
+   (env / file / sops / plugin)   (in sbx mem)   (header inject)   (curl, git…)
 ```
 
 The two layers compose freely: any source with any broker. Resolvers are the
@@ -65,7 +65,7 @@ nothing unless the cage's network is one of:
 
 Under `network = "shared"` (the open host network) or `network = "none"` (an
 empty, uplink-less namespace) there is no proxy on the wire, so a `[secret]`
-**injects nothing**. `ops` warns loudly rather than silently sending an
+**injects nothing**. `sbx` warns loudly rather than silently sending an
 unauthenticated request — an agent that got a `401` should never have to guess
 that the cause was a missing filtering posture. Likewise, a secret's destination
 host must itself be reachable under the policy (present in the `allow` list, or
@@ -118,7 +118,7 @@ that a credential is bound to *one* destination host. See
   [../networking/modes.md](../networking/modes.md) — the filtering posture that
   makes injection effective.
 - [../concepts/security-model.md](../concepts/security-model.md) — where the
-  never-in-cage invariant sits among `ops`'s hard lines.
+  never-in-cage invariant sits among `sbx`'s hard lines.
 - [../concepts/trust.md](../concepts/trust.md) — the trust gate that admits a
   project's `[secret]` section.
 - [../../bwrap-secrets-architecture.md](../../bwrap-secrets-architecture.md) —

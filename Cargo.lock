@@ -572,33 +572,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "ops"
-version = "2.0.0-alpha.0"
-dependencies = [
- "async-channel",
- "async-io",
- "bytes",
- "futures-util",
- "h2",
- "http",
- "libc",
- "rcgen",
- "regex",
- "ring",
- "rustls",
- "seccompiler",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-rustls",
- "toml",
- "toml_edit 0.22.27",
- "webpki-roots",
- "zbus",
-]
-
-[[package]]
 name = "ordered-stream"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -803,6 +776,33 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "sbx"
+version = "2.0.0-alpha.0"
+dependencies = [
+ "async-channel",
+ "async-io",
+ "bytes",
+ "futures-util",
+ "h2",
+ "http",
+ "libc",
+ "rcgen",
+ "regex",
+ "ring",
+ "rustls",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "toml_edit 0.22.27",
+ "webpki-roots",
+ "zbus",
+]
 
 [[package]]
 name = "seccompiler"

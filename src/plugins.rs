@@ -1,7 +1,7 @@
 //! Secret-resolver plugin registry.
 //!
 //! A resolver plugin turns a secret *reference* (`scheme://locator`) into the secret's
-//! plaintext, host-side. ops discovers installed plugins under `<data>/plugins/<name>/`,
+//! plaintext, host-side. sbx discovers installed plugins under `<data>/plugins/<name>/`,
 //! validates each manifest, and exposes the result as a scheme → plugin map the secret
 //! validator consults: a `from = "scheme://…"` whose scheme a plugin claims resolves to a
 //! [`ResolverPlugin`] the launcher later runs under least privilege.
@@ -11,7 +11,7 @@
 //! `0700`, so a project (which writes only the project directory) cannot plant one. That
 //! owner-only guarantee is what the *runner* must establish before it execs a resolver host-side
 //! in the trusted computing base; loading a manifest here neither runs nor provisions anything.
-//! A project's `.ops.toml` may only *reference* a scheme; whether it may do so is the existing
+//! A project's `.sbx.toml` may only *reference* a scheme; whether it may do so is the existing
 //! secret trust gate (an untrusted project's whole `[secret]` section is dropped before any
 //! scheme is looked up).
 //!
@@ -24,11 +24,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// The resolver schemes ops implements itself; a plugin can never claim one of these (the
+/// The resolver schemes sbx implements itself; a plugin can never claim one of these (the
 /// built-in always wins). Kept in sync with [`crate::config`]'s `parse_secret_ref`.
 const BUILTIN_SCHEMES: &[&str] = &["env", "file", "sops"];
 
-/// The resolver schemes ops implements itself — for `ops plugins`, so a user sees the full
+/// The resolver schemes sbx implements itself — for `sbx plugins`, so a user sees the full
 /// namespace and why these can never be a plugin.
 pub(crate) fn builtin_schemes() -> &'static [&'static str] {
     BUILTIN_SCHEMES
@@ -53,7 +53,7 @@ pub(crate) struct ResolverPlugin {
     pub(crate) exec: PathBuf,
     /// The least-privilege grant the runner gives the plugin.
     pub(crate) sandbox: SandboxGrant,
-    /// The manifest's declared version, if any. Display-only: ops never compares or acts on it
+    /// The manifest's declared version, if any. Display-only: sbx never compares or acts on it
     /// (version semantics belong to the plugin store's update mechanism).
     pub(crate) version: Option<String>,
     /// The manifest's one-line description, if any. Display-only.
@@ -63,11 +63,11 @@ pub(crate) struct ResolverPlugin {
 impl ResolverPlugin {
     /// Whether the executable would be accepted by the runner at launch: a regular file owned by
     /// us and not writable by group or other. A plugin can pass [`PluginRegistry::load`] (the
-    /// manifest is well-formed) yet fail this — so `ops plugins` surfaces the gap, using the very
+    /// manifest is well-formed) yet fail this — so `sbx plugins` surfaces the gap, using the very
     /// check the runner enforces. Returns the refusal reason on failure.
     pub(crate) fn check_exec(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
-        // The reason carries no path: callers (`ops plugins`, the runner) already name the plugin
+        // The reason carries no path: callers (`sbx plugins`, the runner) already name the plugin
         // or its executable, so prefixing it here would print the path twice.
         let meta = std::fs::metadata(&self.exec).map_err(|e| e.to_string())?;
         let euid = unsafe { libc::geteuid() };
@@ -76,7 +76,7 @@ impl ResolverPlugin {
 }
 
 /// Pure ownership/mode decision for a plugin executable, shared by the runner (which refuses to
-/// launch a failing one) and `ops plugins` (which flags it). Refuses a non-regular file, one not
+/// launch a failing one) and `sbx plugins` (which flags it). Refuses a non-regular file, one not
 /// owned by us, or one writable by group or other — stricter than the config-file safety gate,
 /// because this is code about to run in the trusted computing base. Split from the I/O so the
 /// foreign-owner branch is unit-testable without a file owned by another uid.
@@ -183,7 +183,7 @@ impl PluginRegistry {
         self.resolvers.get(scheme)
     }
 
-    /// The installed resolver plugins, ordered by scheme (the `BTreeMap` key) — for `ops plugins`.
+    /// The installed resolver plugins, ordered by scheme (the `BTreeMap` key) — for `sbx plugins`.
     pub(crate) fn resolvers(&self) -> impl Iterator<Item = &ResolverPlugin> {
         self.resolvers.values()
     }
@@ -287,7 +287,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
 }
 
 /// Validate a ref scheme: a lowercase URI scheme (`[a-z][a-z0-9+.-]*`) that is not one of the
-/// built-in schemes ops resolves itself. Lowercase-only keeps the comparison against a ref's
+/// built-in schemes sbx resolves itself. Lowercase-only keeps the comparison against a ref's
 /// scheme unambiguous, and the built-in guard means a plugin can never shadow `env`/`file`/`sops`.
 pub(crate) fn validate_scheme(scheme: &str) -> Result<(), String> {
     if scheme.is_empty() {
@@ -418,7 +418,7 @@ fn is_valid_env_key(key: &str) -> bool {
 }
 
 /// What a successful [`install`] placed — surfaced to the user so the report names the plugin's
-/// own identity (its `name`, the token `ops plugins rm` takes) and the scheme it now claims.
+/// own identity (its `name`, the token `sbx plugins rm` takes) and the scheme it now claims.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Installed {
     pub(crate) name: String,
@@ -516,7 +516,7 @@ fn install_inner(
     if dest.exists() {
         return Err(format!(
             "a plugin named `{name}` is already installed — remove it first with \
-             `ops plugins rm {name}`"
+             `sbx plugins rm {name}`"
         ));
     }
 
@@ -524,7 +524,7 @@ fn install_inner(
     // drop *both* as ambiguous, so the install would "succeed" into a silently dead plugin. This
     // guards against a *cleanly resolving* prior claimant; a scheme already claimed by two or more
     // plugins resolves to nothing, so this lets a further claimant in — that scheme is already
-    // broken and the user must `ops plugins rm` the duplicates regardless (the next `list`/`info`
+    // broken and the user must `sbx plugins rm` the duplicates regardless (the next `list`/`info`
     // explains the conflict).
     let mut warnings = Vec::new();
     let installed = PluginRegistry::load_with(&plugins_dir, &exp, &mut warnings);
@@ -532,7 +532,7 @@ fn install_inner(
         if other.dir != dest {
             return Err(format!(
                 "scheme `{}://` is already claimed by the installed plugin `{}` — remove it first \
-                 with `ops plugins rm {}`",
+                 with `sbx plugins rm {}`",
                 probe.scheme, other.name, other.name
             ));
         }
@@ -586,7 +586,7 @@ fn install_inner(
             if dest.exists() {
                 Err(format!(
                     "a plugin named `{name}` appeared concurrently — remove it first with \
-                     `ops plugins rm {name}`"
+                     `sbx plugins rm {name}`"
                 ))
             } else {
                 Err(format!("could not place the plugin: {e}"))
@@ -759,8 +759,8 @@ fn unique() -> u64 {
 // the binary so a built-in install needs no fetch, network, or signature — trust is the binary.
 include!(concat!(env!("OUT_DIR"), "/store_plugin_files.rs"));
 
-/// One plugin in the built-in store, for `ops plugins store list`. `name` is the token
-/// `ops plugins install` takes; a build-time check keeps it equal to the manifest `name`, so the
+/// One plugin in the built-in store, for `sbx plugins store list`. `name` is the token
+/// `sbx plugins install` takes; a build-time check keeps it equal to the manifest `name`, so the
 /// install (which keys on the manifest name) lands where `store list` says it will.
 pub(crate) struct StoreEntry {
     pub(crate) name: String,
@@ -777,7 +777,7 @@ pub(crate) fn embedded_names() -> Vec<&'static str> {
     names
 }
 
-/// The built-in store entries with their manifest metadata, for `ops plugins store list`.
+/// The built-in store entries with their manifest metadata, for `sbx plugins store list`.
 pub(crate) fn embedded_listing() -> Vec<StoreEntry> {
     embedded_names()
         .into_iter()
@@ -821,7 +821,7 @@ pub(crate) fn install_embedded(
         .collect();
     if files.is_empty() {
         return Err(format!(
-            "no built-in plugin named `{name}` (see `ops plugins store list`)"
+            "no built-in plugin named `{name}` (see `sbx plugins store list`)"
         ));
     }
 
@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     /// Build a source plugin directory (a `plugin.toml` and an owner-owned `resolve` executable at
-    /// `mode`) under `root`, returning its path — the kind of directory `ops plugins install` takes.
+    /// `mode`) under `root`, returning its path — the kind of directory `sbx plugins install` takes.
     fn source_plugin(root: &Path, dirname: &str, manifest: &str, exec_mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = root.join(dirname);
@@ -1565,7 +1565,7 @@ mod tests {
     /// validation the registry applies, then make its `exec` runnable and run the very `check_exec`
     /// the install (and the runner) enforces. This is the regression net the built-in store
     /// advertises: a malformed manifest, a missing/renamed `exec`, or a non-runnable executable in a
-    /// bundled plugin is a build-time bug that fails CI here, not the user's `ops plugins install`.
+    /// bundled plugin is a build-time bug that fails CI here, not the user's `sbx plugins install`.
     /// It covers `pass` too (the install-path integration test uses `vault` to dodge `$XDG_RUNTIME_DIR`).
     #[test]
     fn every_built_in_plugin_is_installable() {

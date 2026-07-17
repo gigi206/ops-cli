@@ -1,11 +1,11 @@
-# Cline — the autonomous coding agent's standalone CLI, sandboxed by ops.
+# Cline — the autonomous coding agent's standalone CLI, sandboxed by sbx.
 #
-#   ops app import profiles/cline.toml
-#   ops app cline
+#   sbx app import profiles/cline.toml
+#   sbx app cline
 #
 # Cline ships a genuine terminal CLI on npm (the `cline` package), distributed as a
 # self-contained native binary resolved through platform-specific optional dependencies
-# — so ops equips it in-cage with a node runtime (for the npm install) plus mise's npm
+# — so sbx equips it in-cage with a node runtime (for the npm install) plus mise's npm
 # backend. The native binary needs no node at runtime; the install fetches it (and the
 # package's deps) from registry.npmjs.org, so the first launch in a project needs the
 # network and the allowlist below.
@@ -23,7 +23,7 @@
 # Cline stores its config + credentials under ~/.cline in the app's persistent isolated home.
 # (Cline probes the host name at startup; `hostname` is declared in `[packages]` below since the
 # hermetic cage ships none.) If a request is blocked, the proxy reports the host it refused —
-# add it to `allow` (or check ahead with `ops test net <url>`).
+# add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = "cline"
 
 # Your host Cline config, mounted read-write at its real absolute path. `binds` is a security
@@ -50,7 +50,7 @@ hostname = "nix:hostname"
 [network]
 mode = "deny"
 allow = [
-    # Install: the packument (`npm view`/version resolution hits `/cline`, as does `ops upgrade`),
+    # Install: the packument (`npm view`/version resolution hits `/cline`, as does `sbx upgrade`),
     # the tarball (`/cline/-/…`), and the platform binary (an optional dependency published at its
     # own top-level path) — npm spreads these across sibling paths, so the registry host is opened
     # read-only as a whole (like the other npm-backed profiles), not path-scoped.
@@ -69,12 +69,12 @@ allow = [
     #"{*} https://openrouter.ai",
 ]
 
-# Refusals to keep OUT of the default `ops net log` (SELinux `dontaudit`): hosts we deliberately
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
 # leave DENIED — here Cline's OpenTelemetry telemetry sink (POST /v1/logs), which a live run hammers
 # every few seconds and whose `denied-default` lines would drown the ones worth acting on. A `mute`
-# never changes the verdict (the telemetry is still refused) and never hides a count (`ops net stats`
+# never changes the verdict (the telemetry is still refused) and never hides a count (`sbx net stats`
 # still tallies it); it only keeps the line out of the default log. See it anytime with
-# `ops net log --all`, and edit this list from the CLI with `ops net mute|unmute <host> -a cline`.
+# `sbx net log --all`, and edit this list from the CLI with `sbx net mute|unmute <host> -a cline`.
 # Remove the entry here the day you decide to allow the endpoint (uncomment the `{*} https://otel.cline.bot`
 # line above instead).
 mute = [
@@ -86,7 +86,7 @@ mute = [
 # The in-cage placeholder lets Cline start and issue the request; the proxy strips it and
 # substitutes the real key on the wire to openrouter.ai.
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

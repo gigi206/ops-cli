@@ -1,5 +1,5 @@
 <!--
-Thank you for contributing to ops. Please skim this template before
+Thank you for contributing to sbx. Please skim this template before
 submitting. Every item that applies to your change should be ticked.
 -->
 

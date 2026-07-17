@@ -3,12 +3,12 @@
 //! A Chromium/Electron app on Linux opens its file chooser through the desktop portal
 //! (`org.freedesktop.portal.FileChooser`). Under the filtered *host* bus (`dbus = true`) that
 //! portal is the **host's**, whose dialog is a host-privileged file manager the cage must not be
-//! able to summon — so ops refuses the FileChooser interface, and the app's "browse for a folder"
+//! able to summon — so sbx refuses the FileChooser interface, and the app's "browse for a folder"
 //! then fails (recent Chromium commits to the portal and no longer falls back to its in-process
 //! GTK dialog once a portal advertises a new-enough version).
 //!
 //! `dbus = true` gives the cage its **own** portal instead: a private D-Bus session bus runs
-//! inside the cage carrying ops-provisioned `xdg-desktop-portal` with the reference GTK backend
+//! inside the cage carrying sbx-provisioned `xdg-desktop-portal` with the reference GTK backend
 //! (`xdg-desktop-portal-gtk`). The app probes *that* portal, gets a real version, and the file
 //! chooser it opens is rendered **in-cage** by the GTK backend — a dialog that by construction sees
 //! only the cage's own filesystem (the app's isolated home, the project, the `[binds]` mounts),
@@ -19,11 +19,11 @@
 //!
 //! The bus carries only in-cage services and never connects to the host session bus, so — unlike
 //! the filtered host bus — it is unaffected by the network posture. Its socket, however, lives on a
-//! host directory ops bind-mounts into the cage (at [`CAGE_DIR`]): the in-cage `dbus-daemon` creates
+//! host directory sbx bind-mounts into the cage (at [`CAGE_DIR`]): the in-cage `dbus-daemon` creates
 //! it there, so a host-side process can reach the private bus. That is what lets the desktop
 //! notifications relay (`org.freedesktop.Notifications`, forwarded to the host daemon) attach to the
-//! bus. The exposure is benign under ops's same-uid model: the directory is owner-only (0700), the
-//! only host process that connects is ops's own relay, and every portal backend on the bus is
+//! bus. The exposure is benign under sbx's same-uid model: the directory is owner-only (0700), the
+//! only host process that connects is sbx's own relay, and every portal backend on the bus is
 //! confined to the cage (the socket carries no reach the user's own uid does not already have). The
 //! host light/dark theme is seeded into the cage at launch (read host-side, best-effort) so both the
 //! app and the file dialog open in the right theme, and a later host switch is followed live by the
@@ -52,7 +52,7 @@ use std::process::Command;
 /// carry, gcroot name)`. `dbus` supplies the session-bus daemon (and `dbus-send`, used host-side to
 /// read the theme); `xdg-desktop-portal` is the portal front-end; `xdg-desktop-portal-gtk` is the
 /// GTK backend that renders the file dialog. They share the revision-keyed `gui` gcroot directory
-/// with the fonts/certutil/GUI data (all GUI-hole provisions on the same channel), so `ops gc`
+/// with the fonts/certutil/GUI data (all GUI-hole provisions on the same channel), so `sbx gc`
 /// keeps or drops them together.
 const PACKAGES: &[(&str, &str, &str)] = &[
     ("dbus", "bin/dbus-daemon", "dbus"),
@@ -68,15 +68,15 @@ const PACKAGES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The cage-side mount point of the portal runtime directory: ops bind-mounts a host directory here
+/// The cage-side mount point of the portal runtime directory: sbx bind-mounts a host directory here
 /// (read-write), so the private bus socket the in-cage `dbus-daemon` creates under it is reachable
-/// from the host (the notifications relay connects to it). Under `/run/ops-portal` — ops's own path,
+/// from the host (the notifications relay connects to it). Under `/run/sbx-portal` — sbx's own path,
 /// not `$XDG_RUNTIME_DIR` (which holds the pulse/gpg/ssh sockets) — it holds the generated bus config
 /// and the socket.
-pub(crate) const CAGE_DIR: &str = "/run/ops-portal";
+pub(crate) const CAGE_DIR: &str = "/run/sbx-portal";
 /// The private session-bus socket, at its cage path. Through the bind this is the same file as
 /// [`HostDir::socket`] on the host.
-const CAGE_SOCK: &str = "/run/ops-portal/bus";
+const CAGE_SOCK: &str = "/run/sbx-portal/bus";
 
 /// The host directory bind-mounted into the cage at [`CAGE_DIR`]. Per-launch (the pid keeps
 /// concurrent launches from colliding), under `<data>/portal`.
@@ -141,7 +141,7 @@ pub(crate) struct Provision {
     pub(crate) gtk_root: PathBuf,
 }
 
-/// Provision the three portal packages into ops's store against the pinned `nixpkgs`, sharing the
+/// Provision the three portal packages into sbx's store against the pinned `nixpkgs`, sharing the
 /// revision-keyed `gui` gcroot directory with the other GUI-hole provisions.
 pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<Provision> {
     let base = layout
@@ -194,7 +194,7 @@ pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
 /// The private session-bus configuration: listen on the cage-tmpfs socket, activate the portal
 /// services from the two portal packages' `share/dbus-1/services`, and default-allow (every peer on
 /// this bus is the same uid inside the same cage — one trust domain). Every interpolated value is an
-/// ops-controlled store path or a fixed literal, so the document carries nothing to escape. Pure.
+/// sbx-controlled store path or a fixed literal, so the document carries nothing to escape. Pure.
 fn session_conf(sock: &str, xdp_root: &Path, gtk_root: &Path) -> String {
     format!(
         "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \
@@ -259,7 +259,7 @@ fn gtk_theme_for(color_scheme: &str) -> &'static str {
 /// config and `portals.conf`, seed the host theme (when `color_scheme` is `Some`), start
 /// `dbus-daemon --fork` (which blocks until the socket is ready, then returns — no race), and
 /// `exec "$@"`. The command rides `"$@"` positionally, so nothing from it is re-parsed by the shell;
-/// every value baked into the script is an ops-controlled store path or a fixed literal. The heredoc
+/// every value baked into the script is an sbx-controlled store path or a fixed literal. The heredoc
 /// bodies use a quoted delimiter so the shell performs no expansion on the (already-substituted)
 /// config. Pure over its inputs, so the shape is unit-tested without launching a cage.
 pub(crate) fn wrap_command(
@@ -281,26 +281,26 @@ pub(crate) fn wrap_command(
             let kf_parent = KEYFILE_REL.rsplit_once('/').map_or(KEYFILE_REL, |(p, _)| p);
             format!(
                 "mkdir -p \"$HOME/{kf_parent}\" 2>/dev/null\n\
-                 cat > \"$HOME/{KEYFILE_REL}\" <<'OPSPORTALKF' 2>/dev/null || true\n\
-                 {keyfile}OPSPORTALKF\n",
+                 cat > \"$HOME/{KEYFILE_REL}\" <<'SBXPORTALKF' 2>/dev/null || true\n\
+                 {keyfile}SBXPORTALKF\n",
                 keyfile = keyfile_body(scheme),
             )
         }
         None => String::new(),
     };
-    // A quoted heredoc delimiter (`'OPSPORTALCF'`) disables every shell expansion, so the config —
+    // A quoted heredoc delimiter (`'SBXPORTALCF'`) disables every shell expansion, so the config —
     // already fully substituted host-side — is written verbatim.
     let preamble = format!(
         "mkdir -p {dir}/xdg-desktop-portal 2>/dev/null\n\
-         cat > {dir}/session.conf <<'OPSPORTALCF'\n{session}OPSPORTALCF\n\
-         cat > {dir}/xdg-desktop-portal/portals.conf <<'OPSPORTALPF'\n{portals}OPSPORTALPF\n\
+         cat > {dir}/session.conf <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
+         cat > {dir}/xdg-desktop-portal/portals.conf <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
          {seed}\
          {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n",
         dir = CAGE_DIR,
         daemon = dbus_daemon.display(),
         portals = PORTALS_CONF,
     );
-    super::egress::wrap_background(bash, &preamble, "ops-incage-portal", cmd)
+    super::egress::wrap_background(bash, &preamble, "sbx-incage-portal", cmd)
 }
 
 /// Read the host's light/dark preference, best-effort, by running the provisioned `dbus-send`
@@ -370,8 +370,8 @@ mod tests {
             Path::new("/nix/store/aaa-xdg-desktop-portal"),
             Path::new("/nix/store/bbb-xdg-desktop-portal-gtk"),
         );
-        // listens on the portal runtime socket (a host dir bound into the cage at /run/ops-portal)
-        assert!(conf.contains("<listen>unix:path=/run/ops-portal/bus</listen>"));
+        // listens on the portal runtime socket (a host dir bound into the cage at /run/sbx-portal)
+        assert!(conf.contains("<listen>unix:path=/run/sbx-portal/bus</listen>"));
         // both portal packages' service dirs are activation sources
         assert!(conf.contains("/nix/store/aaa-xdg-desktop-portal/share/dbus-1/services"));
         assert!(conf.contains("/nix/store/bbb-xdg-desktop-portal-gtk/share/dbus-1/services"));
@@ -389,14 +389,14 @@ mod tests {
         let get = |k: &str| env.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
         assert_eq!(
             get("DBUS_SESSION_BUS_ADDRESS").as_deref(),
-            Some("unix:path=/run/ops-portal/bus")
+            Some("unix:path=/run/sbx-portal/bus")
         );
         assert_eq!(get("GSETTINGS_BACKEND").as_deref(), Some("keyfile"));
         assert_eq!(
             get("XDG_DESKTOP_PORTAL_DIR").as_deref(),
             Some("/nix/store/bbb-xdg-desktop-portal-gtk/share/xdg-desktop-portal/portals")
         );
-        assert_eq!(get("XDG_CONFIG_DIRS").as_deref(), Some("/run/ops-portal"));
+        assert_eq!(get("XDG_CONFIG_DIRS").as_deref(), Some("/run/sbx-portal"));
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         let script = argv[2].to_string_lossy();
         // the daemon is started with --fork (blocks until the socket is ready), config from the cage
         assert!(script.contains(
-            "/nix/store/ddd-dbus/bin/dbus-daemon --config-file=/run/ops-portal/session.conf --fork"
+            "/nix/store/ddd-dbus/bin/dbus-daemon --config-file=/run/sbx-portal/session.conf --fork"
         ));
         // portals.conf selects the gtk backend
         assert!(script.contains("default=gtk"));
@@ -431,7 +431,7 @@ mod tests {
         assert!(script.contains("\n/nix/store/ddd-dbus/bin/dbus-daemon --config-file="));
         // the command runs as "$@", never spliced into the script text
         assert!(script.trim_end().ends_with("exec \"$@\""));
-        assert_eq!(argv[3], OsString::from("ops-incage-portal"));
+        assert_eq!(argv[3], OsString::from("sbx-incage-portal"));
         assert_eq!(argv[4], OsString::from("claude-desktop"));
         assert_eq!(argv[5], OsString::from("--flag"));
     }
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn host_dir_create_makes_an_owner_only_dir_and_drop_removes_it() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!("ops-portal-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sbx-portal-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let layout = Layout::under(&tmp);
         let path;

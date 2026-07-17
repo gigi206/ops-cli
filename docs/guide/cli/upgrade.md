@@ -1,11 +1,11 @@
-# `ops upgrade`
+# `sbx upgrade`
 
 ```
-ops upgrade [all|nix|mise|flake|deb]
+sbx upgrade [all|nix|mise|flake|deb]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
-advance **only here**, never on an `ops` binary update.
+advance **only here**, never on an `sbx` binary update.
 
 | Target | Rolls |
 |---|---|
@@ -19,22 +19,22 @@ See also: [Upgrading toolchains](../housekeeping/upgrade.md) · [Provisioning](.
 
 ## Behavior
 
-`ops upgrade` is **context-aware** — it re-resolves the source the current directory
+`sbx upgrade` is **context-aware** — it re-resolves the source the current directory
 tracks and rewrites *that* lock (a trusted project pin → the per-project lock, else the
 global one). This is the only way a *channel* pin (`nixos-23.11`) advances within
 itself. Lock writes are atomic (a reader sees old-or-new, never torn).
 
-- `ops upgrade nix` rolls the base channel, leaving the mise engine lock untouched.
-- `ops upgrade mise` rolls the mise engine + the project's `nix:` tools + `mise:`
+- `sbx upgrade nix` rolls the base channel, leaving the mise engine lock untouched.
+- `sbx upgrade mise` rolls the mise engine + the project's `nix:` tools + `mise:`
   packages (an in-cage `mise upgrade` per home), leaving `nixpkgs.lock` intact.
-- `ops upgrade flake` re-pins the project's and apps' `flake:` packages.
+- `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
 
 ## Examples
 
 ```sh
-ops upgrade              # roll everything
-ops upgrade nix          # just the nixpkgs channel
-ops upgrade mise         # the mise engine + tools/packages
+sbx upgrade              # roll everything
+sbx upgrade nix          # just the nixpkgs channel
+sbx upgrade mise         # the mise engine + tools/packages
 ```
 
 See [Upgrading toolchains](../housekeeping/upgrade.md) for the lock model and the

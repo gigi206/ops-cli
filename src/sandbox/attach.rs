@@ -1,4 +1,4 @@
-//! Real `ops session attach`: join a *running* cage's namespaces and either open an interactive
+//! Real `sbx session attach`: join a *running* cage's namespaces and either open an interactive
 //! shell or run one command inside it — the agent's live processes, its real `/tmp`, its network —
 //! the way `docker exec` / `docker exec -it` works, not a fresh cage that only shares the home on
 //! disk. A command from a terminal takes the pty path ([`TtyMode::Pty`], job control); a command
@@ -26,7 +26,7 @@
 //! Two residuals, both named and accepted:
 //! - **cgroup resource limits are not shared.** `setns(CLONE_NEWCGROUP)` joins the cgroup
 //!   *namespace* (the `/proc/self/cgroup` view) but not the cage's cgroup *membership*, so the
-//!   attached process runs in `ops session attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
+//!   attached process runs in `sbx session attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
 //!   This is deliberate — an interactive inspection shell should not share the agent's OOM
 //!   ceiling — and it is not a confinement hole (a runaway there is bounded by the host, and the
 //!   security controls above are all re-applied).
@@ -55,16 +55,16 @@ pub(super) struct CageHandle {
     mask: libc::c_int,
 }
 
-/// How the entered command connects to a terminal. A bare `ops session attach` (interactive
+/// How the entered command connects to a terminal. A bare `sbx session attach` (interactive
 /// shell) and a command run from a terminal take [`Pty`](TtyMode::Pty) — the shell owns the pty
 /// slave as its controlling terminal, so job control and resize work. A command run with no
-/// terminal on stdin (a pipe or a script) takes [`Inherit`](TtyMode::Inherit) — it keeps ops's own
+/// terminal on stdin (a pipe or a script) takes [`Inherit`](TtyMode::Inherit) — it keeps sbx's own
 /// stdin/stdout/stderr, so bytes pass through clean (no pty `\n`→`\r\n` translation) for scripting.
 #[derive(Clone, Copy)]
 pub(super) enum TtyMode {
     /// Take this pty slave fd as the controlling terminal via `login_tty`.
     Pty(libc::c_int),
-    /// Inherit ops's own stdin/stdout/stderr descriptors unchanged.
+    /// Inherit sbx's own stdin/stdout/stderr descriptors unchanged.
     Inherit,
 }
 
@@ -158,7 +158,7 @@ pub(super) fn build_env(environ: &[u8], term: Option<&str>) -> Vec<CString> {
 }
 
 /// Locate a live process *inside* the cage of session `session_pid`. The recorded pid
-/// is the cage's host-side anchor — bubblewrap on the exec path, the ops supervisor on
+/// is the cage's host-side anchor — bubblewrap on the exec path, the sbx supervisor on
 /// the egress path — and the cage processes are always its descendants (verified on
 /// both paths). Among the descendants, one in a *child* user namespace is inside the
 /// cage; the payload (not bubblewrap itself) is preferred so its `environ` is the cage
@@ -334,13 +334,13 @@ unsafe fn confine_and_exec(
 ) -> ! {
     match tty {
         // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
-        // same `login_tty` the `ops shell` supervisor uses, so job control works inside.
+        // same `login_tty` the `sbx shell` supervisor uses, so job control works inside.
         TtyMode::Pty(slave) => {
             if libc::login_tty(slave) != 0 {
                 libc::_exit(127);
             }
         }
-        // A non-interactive command: keep ops's own stdin/stdout/stderr so bytes pass
+        // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass
         // through unmodified (no controlling terminal, no pty line translation).
         TtyMode::Inherit => {}
     }
@@ -412,7 +412,7 @@ mod tests {
         let host = "user:[4026531837]".to_string();
         let candidates = vec![
             (100, Some(host.clone()), Some("bwrap".to_string())),
-            (200, Some(host.clone()), Some("ops".to_string())),
+            (200, Some(host.clone()), Some("sbx".to_string())),
             (300, None, None),
         ];
         assert_eq!(choose_cage_pid(&candidates, &host), None);

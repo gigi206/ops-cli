@@ -1,13 +1,13 @@
 # Resolver plugins and signed stores
 
 The secret-source space is open-ended — Vault, a cloud KMS, 1Password, a
-keyring — so `ops` keeps the **resolver** (SOURCE) layer *pluggable*. A resolver
+keyring — so `sbx` keeps the **resolver** (SOURCE) layer *pluggable*. A resolver
 plugin adds a new `scheme://` that a secret's `from` reference can route to. The
 **broker** (SINK) layer, which terminates TLS and injects on the wire, stays
 first-party — a broker bug is a boundary breach, so it is never a plugin.
 
 A resolver plugin still obeys the invariant: it runs **host-side, sandboxed under
-bubblewrap, never in the cage**, and returns the plaintext to `ops`'s host
+bubblewrap, never in the cage**, and returns the plaintext to `sbx`'s host
 process, which hands it to the broker. Because a resolver sees plaintext, it is
 in the trusted computing base — which is exactly why installing one, or trusting
 a store to install from, is a deliberate act.
@@ -16,7 +16,7 @@ a store to install from, is a deliberate act.
 
 A plugin is a directory containing a `plugin.toml` manifest and an executable.
 Run with a `scheme://locator` reference as its single argument, the executable
-prints the secret's plaintext to stdout. `ops` discovers installed plugins under
+prints the secret's plaintext to stdout. `sbx` discovers installed plugins under
 its owner-only data directory (`<data>/plugins/<name>/`) and builds a
 `scheme → plugin` map the secret validator consults.
 
@@ -41,7 +41,7 @@ network     = false                # true = reach the network; false = empty net
 - `scheme` cannot be a built-in (`env`, `file`, `sops`) — the built-in always
   wins, and a plugin claiming one is dropped.
 - `exec` is resolved against the plugin directory and must be traversal-free.
-- `version`/`description` are display-only — `ops` never compares or acts on the
+- `version`/`description` are display-only — `sbx` never compares or acts on the
   version.
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
@@ -60,29 +60,29 @@ Loading is **infallible and fail-closed**. A malformed manifest, an unsupported
 type, a reserved or ill-formed scheme, or **two plugins claiming one scheme**
 (both are dropped — the scheme is ambiguous, never an arbitrary winner) produces
 a warning and skips the offending plugin — never a failed launch, and never a
-silently-honored bad plugin. A project's `.ops.toml` may only *reference* a
+silently-honored bad plugin. A project's `.sbx.toml` may only *reference* a
 scheme, and only if the project is trusted (an untrusted project's whole
 `[secret]` section is dropped before any scheme is looked up).
 
 ## Managing plugins
 
 ```
-ops plugins list              # built-in schemes + every installed plugin
+sbx plugins list              # built-in schemes + every installed plugin
                               #   (scheme, name, version, network grant, runnable?)
-ops plugins info <scheme>     # a plugin's manifest and sandbox grant
+sbx plugins info <scheme>     # a plugin's manifest and sandbox grant
                               #   (a built-in scheme is reported as such)
-ops plugins install <name|dir>  # install a bundled plugin by name, or copy a local ./dir
-ops plugins rm <name>         # remove an installed plugin
+sbx plugins install <name|dir>  # install a bundled plugin by name, or copy a local ./dir
+sbx plugins rm <name>         # remove an installed plugin
 ```
 
 Installing is **a deliberate user act** — an agent inside the cage cannot run it.
 The staged copy is validated exactly as the launcher will validate it and
-refused, fail-closed, on any flaw. `ops plugins` is host-level: it reads the data
+refused, fail-closed, on any flaw. `sbx plugins` is host-level: it reads the data
 directory, not a project's config.
 
 ## Signed plugin stores
 
-A **remote plugin store** is a git repository of resolver plugins that `ops`
+A **remote plugin store** is a git repository of resolver plugins that `sbx`
 fetches on your behalf. Because you do not inspect what is fetched, authenticity
 cannot come from the transport — git moves bytes and checks their *integrity*,
 never their *origin*. It comes from a signature.
@@ -110,13 +110,13 @@ downgraded to an older, superseded catalogue (anti-rollback).
 ### Managing stores
 
 ```
-ops plugins store list                # the built-in store + configured stores (rev, plugin count)
-ops plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
-ops plugins store update [name]       # re-fetch one or all; re-verify + anti-rollback + atomic swap
-ops plugins store install <store> <plugin>   # install a plugin the store lists (verifies its hash)
-ops plugins store info <name>         # origin URL, pinned key, accepted rev, listed plugins
-ops plugins store rm <name>           # remove a configured store
-ops plugins store publish <dir> --key <key-file> [--rev <n>]   # the signer (operator tool)
+sbx plugins store list                # the built-in store + configured stores (rev, plugin count)
+sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
+sbx plugins store update [name]       # re-fetch one or all; re-verify + anti-rollback + atomic swap
+sbx plugins store install <store> <plugin>   # install a plugin the store lists (verifies its hash)
+sbx plugins store info <name>         # origin URL, pinned key, accepted rev, listed plugins
+sbx plugins store rm <name>           # remove a configured store
+sbx plugins store publish <dir> --key <key-file> [--rev <n>]   # the signer (operator tool)
 ```
 
 **Adding a store requires a key.** Exactly one of `--key` or `--trust` is
@@ -126,7 +126,7 @@ fail-closed:
 - `--key <hex|@file>` **pins a public key you obtained out of band** — the strong
   form.
 - `--trust` accepts the key the store ships **on first use** (trust-on-first-use)
-  — weaker; `ops` prints the pinned key's fingerprint so you can verify it out of
+  — weaker; `sbx` prints the pinned key's fingerprint so you can verify it out of
   band afterward.
 
 **`store install`** uses only the cached, verified catalogue: it re-verifies the
@@ -163,7 +163,7 @@ leaves the operator's host**; the public key it prints is what consumers pin wit
   schemes a plugin extends.
 - [README.md](README.md) — the never-in-cage invariant and why brokers stay
   first-party while resolvers are pluggable.
-- [../cli/plugins.md](../cli/plugins.md) — the `ops plugins` command reference.
+- [../cli/plugins.md](../cli/plugins.md) — the `sbx plugins` command reference.
 - [../concepts/security-model.md](../concepts/security-model.md) /
   [../concepts/trust.md](../concepts/trust.md) — the TCB and trust gates a plugin
   and a store rest on.

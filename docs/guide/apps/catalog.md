@@ -1,12 +1,12 @@
 # Profile catalog
 
 The repository's [`profiles/`](../../../profiles/) directory ships importable starter
-profiles for popular coding agents. `ops` ships **no built-in apps** — you import each
+profiles for popular coding agents. `sbx` ships **no built-in apps** — you import each
 deliberately:
 
 ```sh
-ops app import profiles/claude-code.toml
-ops app claude-code
+sbx app import profiles/claude-code.toml
+sbx app claude-code
 ```
 
 See also: [Portable profiles](profiles.md) · [The app framework](README.md) · [Secrets](../secrets/README.md) · the repository [`profiles/README.md`](../../../profiles/README.md).
@@ -65,7 +65,7 @@ The `mise:` prefix means a tool is equipped **in-cage from upstream directly**, 
 the **latest upstream** version — not whatever nixpkgs packaged. A `mise:` (or `flake:`)
 tool **fetches at first launch**, so a profile's *first* launch in a given project needs
 the network; a `nix:` tool is seeded and reusable offline. Advancing an already-installed
-`mise:`/`flake:` version via `ops upgrade` is supported — see
+`mise:`/`flake:` version via `sbx upgrade` is supported — see
 [Upgrading](../housekeeping/upgrade.md).
 
 ## Adjusting the allowlist
@@ -75,7 +75,7 @@ profile's `allow` (a write verb may need a `{*}`/`{POST}` prefix). Check a URL's
 ahead of time:
 
 ```sh
-ops test net https://api.example.com --method POST
+sbx test net https://api.example.com --method POST
 ```
 
 ## Status and honest scope

@@ -22,7 +22,7 @@ posture for a headless agent or a CLI tool.
 
 ## `wayland`
 
-`ops` binds the host's Wayland compositor socket **read-only** into the cage (the
+`sbx` binds the host's Wayland compositor socket **read-only** into the cage (the
 socket *file*, `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — never `$XDG_RUNTIME_DIR` itself,
 which holds other agents' sockets), sets `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`, and
 provisions fonts + a fontconfig so text renders. A graphical app can then map a window
@@ -72,11 +72,11 @@ gui = "wayland"
 ## One-shot override
 
 To set the display posture for a single launch without editing the file, use `--gui`
-or `OPS_GUI`:
+or `SBX_GUI`:
 
 ```sh
-ops run --gui wayland -- some-electron-app
-OPS_GUI=none ops shell
+sbx run --gui wayland -- some-electron-app
+SBX_GUI=none sbx shell
 ```
 
 `--gui` takes `none | wayland`. The command line beats the environment, and both beat

@@ -14,7 +14,7 @@ See also: [Secrets architecture](../secrets/README.md) · [Resolvers](../secrets
 
 ## The invariant
 
-`ops` **never places a plaintext secret in the cage**. The value is read **host-side**
+`sbx` **never places a plaintext secret in the cage**. The value is read **host-side**
 and injected into the matching outbound request on the wire; the plaintext never
 enters the sandbox. So a credential belongs in `[secret]`, **not** in
 [`env`](env.md) (which is visible inside the cage).
@@ -100,7 +100,7 @@ cage. See [`[app.<name>]`](apps.md) and [the app framework](../apps/README.md).
 ## Viewing
 
 ```sh
-ops config show           # "secrets: N injected host-side" (the value is never shown)
-ops config show --details # each credential by destination host and source
-ops test net <url>        # notes a declared injection for that host (by header/source)
+sbx config show           # "secrets: N injected host-side" (the value is never shown)
+sbx config show --details # each credential by destination host and source
+sbx test net <url>        # notes a declared injection for that host (by header/source)
 ```

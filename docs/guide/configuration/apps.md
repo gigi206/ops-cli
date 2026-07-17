@@ -1,23 +1,23 @@
 # `[app.<name>]` — named launch profiles
 
 A `[app.<name>]` table declares a named, reusable launcher — a command plus a
-security/tooling overlay over the sandbox baseline. `ops app <name>` launches it. This
+security/tooling overlay over the sandbox baseline. `sbx app <name>` launches it. This
 page documents the **config shape**; for the framework (isolated homes, profiles,
 credential injection) see the [Apps](../apps/README.md) section.
 
 `[app.<name>]` fields are gated exactly like the baseline: the security ones honored
 only from a trusted source.
 
-See also: [The app framework](../apps/README.md) · [Per-app home](../apps/home.md) · [Portable profiles](../apps/profiles.md) · [`ops app`](../cli/app.md).
+See also: [The app framework](../apps/README.md) · [Per-app home](../apps/home.md) · [Portable profiles](../apps/profiles.md) · [`sbx app`](../cli/app.md).
 
 ## Two ways to declare an app
 
-- **Inline** in a project `.ops.toml` (or the global `ops.toml`) as `[app.<name>]`.
-- **As a profile file** under [`~/.config/ops/apps/<name>.toml`](../concepts/directory-layout.md)
+- **Inline** in a project `.sbx.toml` (or the global `sbx.toml`) as `[app.<name>]`.
+- **As a profile file** under [`~/.config/sbx/apps/<name>.toml`](../concepts/directory-layout.md)
   — a standalone top-level app definition (its fields directly, no `[app.<name>]`
   wrapper), the filename being the app name. Imported with
-  [`ops app import`](../cli/app.md). A global app lives **only** as a profile file, not
-  inline in the global `ops.toml`.
+  [`sbx app import`](../cli/app.md). A global app lives **only** as a profile file, not
+  inline in the global `sbx.toml`.
 
 ## The fields
 
@@ -97,7 +97,7 @@ names.
 ## Viewing an app
 
 ```sh
-ops config show                 # a compact per-app roster
-ops config show --details       # each app's env, binds, packages, rules, credentials
-ops config show --app review    # one app's effective config, each field tagged inherited or set
+sbx config show                 # a compact per-app roster
+sbx config show --details       # each app's env, binds, packages, rules, credentials
+sbx config show --app review    # one app's effective config, each field tagged inherited or set
 ```

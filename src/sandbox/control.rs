@@ -1,11 +1,11 @@
 //! The `ask`-posture control plane: the pending-decision queue plus the per-session Unix control
-//! socket a host-side `ops net pending` reaches to list and answer parked egress requests.
+//! socket a host-side `sbx net pending` reaches to list and answer parked egress requests.
 //!
 //! Under `[network] mode = "ask"`, the proxy parks a request that no rule decides and blocks until
 //! a human answers it (allow/deny) or the configured timeout elapses (deny — fail-closed). The
 //! answer arrives out-of-band: a launch binds a control socket at
 //! `<data>/egress/control-<pid>.sock` (under the `0700` data dir, owner-only) and serves it on a
-//! thread alongside the proxy; a separate `ops net pending allow|deny` process connects to it.
+//! thread alongside the proxy; a separate `sbx net pending allow|deny` process connects to it.
 //!
 //! Security: the control socket is **never** bound into the cage — only the proxy socket and the CA
 //! cross in (see [`super::egress`]). In Mode B the in-cage agent is the adversary, so letting it
@@ -207,7 +207,7 @@ impl PendingState {
 
 /// The live, per-session manual egress rules a user adds at runtime — either by answering an `ask`
 /// with `--session` (an exact `host:port` for the answered request) or by loading a rule ahead of
-/// time with `ops net allow|deny <rule> --session` (any egress rule). A runtime overlay distinct
+/// time with `sbx net allow|deny <rule> --session` (any egress rule). A runtime overlay distinct
 /// from the (immutable) config policy, shared via `Arc` between the proxy serve threads and the
 /// control thread (which appends to it). The proxy consults it by **folding these rules into the
 /// effective policy** it evaluates per request — so an overlay allow/deny is enforced through the
@@ -241,7 +241,7 @@ impl ManualRules {
     }
 
     /// Add an arbitrary egress `rule` to the overlay as a manual allow or deny — the proactive
-    /// `ops net allow|deny <rule> --session` path. Deduped, so re-loading the same rule does not
+    /// `sbx net allow|deny <rule> --session` path. Deduped, so re-loading the same rule does not
     /// stack. A deny takes precedence over an allow at decision time (deny wins in the policy).
     pub(crate) fn remember_rule(&self, verdict: Verdict, rule: Rule) {
         let mut inner = self.inner.write().unwrap();
@@ -254,7 +254,7 @@ impl ManualRules {
         }
     }
 
-    /// Add an egress `rule` to the live **mute** overlay — the `ops net mute <rule> --session` path.
+    /// Add an egress `rule` to the live **mute** overlay — the `sbx net mute <rule> --session` path.
     /// A `dontaudit` log filter: a denied request matching it is still refused (and still counted),
     /// only its log line is suppressed for this session. Deduped, so re-loading does not stack. Kept
     /// off [`Verdict`] deliberately — a mute is not a park answer, so it never touches the
@@ -290,17 +290,17 @@ impl ManualRules {
 
 // ── The live egress event log ─────────────────────────────────────────────────────────────────
 //
-// A bounded, in-memory ring of the decisions the proxy makes, read live by `ops net log` over the
+// A bounded, in-memory ring of the decisions the proxy makes, read live by `sbx net log` over the
 // same per-session control socket. It is **never written to disk and never crosses into the cage**:
 // it lives in the launch process's owner-only RAM for the session's lifetime and dies with it, at
 // the same trust level as the injected secret the proxy already holds. The proxy redacts a request's
 // query against the configured secret needles *before* pushing, so even in RAM the ring never holds a
-// raw configured secret; the default `ops net log` display drops the query entirely.
+// raw configured secret; the default `sbx net log` display drops the query entirely.
 
 /// The default number of recent egress events a session retains for the live log.
 pub(crate) const LOG_RING_CAP: usize = 1000;
 
-/// The verdict class of a logged egress decision. A superset of the `ops net stats` taxonomy
+/// The verdict class of a logged egress decision. A superset of the `sbx net stats` taxonomy
 /// (allow/deny/blocked): the log is a diagnostic record, not a counter, so it also carries `error` —
 /// a request the policy permitted but that could not complete (DNS failed, the host was unreachable,
 /// its certificate was rejected). Keeping `error` distinct from `blocked` (a *refusal*) is the point:
@@ -350,7 +350,7 @@ impl LogVerdict {
 /// WebSocket over TLS) is [`Https`](Self::Https); an inspected cleartext `http://` absolute-form is
 /// [`Http`](Self::Http); a raw `tcp://` L4 splice is [`Tcp`](Self::Tcp). [`Other`](Self::Other) is
 /// the honest fallback for a request refused before its transport was known (a malformed `CONNECT`
-/// line, a non-routable non-`CONNECT` request). Shown as a column in `ops net logs` because the port
+/// line, a non-routable non-`CONNECT` request). Shown as a column in `sbx net logs` because the port
 /// alone is ambiguous — a `tcp://` splice can ride 443, and an inspected host can ride any port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Proto {
@@ -523,7 +523,7 @@ pub(crate) struct LogEvent {
     /// Whether this refusal was suppressed from the default `sbx net log` view by a `mute`
     /// (SELinux `dontaudit`) rule. A muted event is still counted in `sbx net stats` and lives in a
     /// **separate** ring (so a muted flood never evicts a real event); it appears only under
-    /// `ops net log --all`, tagged. Only ever `true` for a `deny` (mute suppresses refusals, never
+    /// `sbx net log --all`, tagged. Only ever `true` for a `deny` (mute suppresses refusals, never
     /// an allow, a security-guard `blocked`, or a downstream `error`).
     pub(crate) muted: bool,
     /// The upstream HTTP status code (200/404/…), for a **completed L7** request only — filled in by
@@ -553,7 +553,7 @@ pub(crate) struct LogSnapshot {
 
 /// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
 /// (via `Arc`) between the proxy serve threads (which [`push`](LogRing::push)) and the control serve
-/// thread (which [`snapshot`](LogRing::snapshot)s for `ops net log`). Sequence numbers start at 1 and
+/// thread (which [`snapshot`](LogRing::snapshot)s for `sbx net log`). Sequence numbers start at 1 and
 /// never repeat within a session, so a `--follow` cursor of 0 means "from the beginning" and can
 /// never collide with a real event.
 pub(crate) struct LogRing {
@@ -569,7 +569,7 @@ struct LogInner {
     events: VecDeque<LogEvent>,
     /// Muted refusals, kept out of the default view. A **separate** ring with the same cap so a
     /// chatty muted host can never evict a real event from `events`; merged in (by `seq`) only when
-    /// a reader passes `include_muted` (`ops net log --all`). Shares `next_seq` with `events`, so the
+    /// a reader passes `include_muted` (`sbx net log --all`). Shares `next_seq` with `events`, so the
     /// two interleave in one monotonic order.
     muted: VecDeque<LogEvent>,
 }
@@ -710,7 +710,7 @@ impl LogRing {
 
 // ── The live active-flow registry ─────────────────────────────────────────────────────────────
 //
-// The set of egress tunnels currently OPEN through the proxy, read live by `ops net live` over the
+// The set of egress tunnels currently OPEN through the proxy, read live by `sbx net live` over the
 // same per-session control socket. Unlike the event log (a *history* of decisions), this is volatile
 // state: a flow appears when its tunnel is established and vanishes when it closes. It is never
 // persisted and never crosses into the cage — it lives in the launch process's owner-only RAM for the
@@ -720,7 +720,7 @@ impl LogRing {
 // `Arc<AtomicU64>` the relay increments per read/write; the registry mutex is taken only at
 // register / deregister / snapshot — never per byte — so the hot relay path stays unlocked.
 
-/// One open tunnel captured for `ops net live`: where it goes, how it is carried, when it opened, and
+/// One open tunnel captured for `sbx net live`: where it goes, how it is carried, when it opened, and
 /// how much has flowed each way so far. `up`/`down` are byte totals — application-plaintext bytes on
 /// an inspected L7/cleartext path, raw ciphertext bytes on a `tcp://` L4 splice (the proxy sees only
 /// the encrypted stream there).
@@ -746,7 +746,7 @@ struct FlowEntry {
 
 /// The set of currently-open egress tunnels. Shared (via `Arc`) between the proxy serve threads
 /// (which [`register`](FlowRegistry::register) a flow for the tunnel's lifetime) and the control serve
-/// thread (which [`snapshot`](FlowRegistry::snapshot)s for `ops net live`). Ids start at 1 and never
+/// thread (which [`snapshot`](FlowRegistry::snapshot)s for `sbx net live`). Ids start at 1 and never
 /// repeat within a session, so the snapshot order is stable (oldest-open first).
 pub(crate) struct FlowRegistry {
     inner: Mutex<FlowInner>,
@@ -1047,7 +1047,7 @@ fn dispatch(
                 } else if let Some(v) = token.strip_prefix("amended=") {
                     after_amend = v.parse().ok();
                 } else if token == "all" {
-                    // `ops net log --all` — fold the muted (`dontaudit`) ring into the view.
+                    // `sbx net log --all` — fold the muted (`dontaudit`) ring into the view.
                     include_muted = true;
                 }
             }
@@ -1134,7 +1134,7 @@ fn format_event_line(ev: &LogEvent) -> String {
     line
 }
 
-// ── Client side (the `ops net pending` process) ───────────────────────────────────────────────
+// ── Client side (the `sbx net pending` process) ───────────────────────────────────────────────
 
 /// The egress control directory under the data dir, where the per-session control sockets live.
 pub(crate) fn control_dir(data_dir: &Path) -> PathBuf {
@@ -1146,7 +1146,7 @@ pub(crate) fn control_socket(data_dir: &Path, pid: u32) -> PathBuf {
     control_dir(data_dir).join(format!("control-{pid}.sock"))
 }
 
-/// One reachable session's pending requests, for `ops net pending`.
+/// One reachable session's pending requests, for `sbx net pending`.
 pub(crate) struct SessionPending {
     pub(crate) pid: u32,
     pub(crate) rows: Vec<PendingRow>,
@@ -1255,9 +1255,9 @@ fn parse_pending_line(line: &str) -> Option<PendingRow> {
     })
 }
 
-// The client half of the event log — the reader the `ops net logs` command connects through.
+// The client half of the event log — the reader the `sbx net logs` command connects through.
 
-/// One reachable session's recent egress events, for `ops net logs`.
+/// One reachable session's recent egress events, for `sbx net logs`.
 pub(crate) struct SessionLog {
     pub(crate) pid: u32,
     pub(crate) snapshot: LogSnapshot,
@@ -1332,7 +1332,7 @@ pub(crate) fn log_all(data_dir: &Path, include_muted: bool) -> Vec<SessionLog> {
     sessions
 }
 
-/// One reachable session's currently-open flows, for `ops net live`.
+/// One reachable session's currently-open flows, for `sbx net live`.
 pub(crate) struct SessionFlows {
     pub(crate) pid: u32,
     pub(crate) flows: Vec<FlowSnapshot>,
@@ -1342,7 +1342,7 @@ pub(crate) struct SessionFlows {
 /// socket is gone (a dead/stale launch) fails the connect and the caller skips it.
 pub(crate) fn read_flows(socket: &Path) -> io::Result<Vec<FlowSnapshot>> {
     let stream = UnixStream::connect(socket)?;
-    // A short timeout: `ops net live` polls every session sequentially on a ~1s redraw, so a single
+    // A short timeout: `sbx net live` polls every session sequentially on a ~1s redraw, so a single
     // stuck session must not freeze the whole frame for long (a dead one is skipped on the connect).
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -1542,7 +1542,7 @@ pub(crate) enum DrainOutcome {
     /// healthy but had nothing parked.
     Drained(Vec<String>),
     /// The session's control server did not understand the bulk-drain command (it replied `err …`) —
-    /// it was launched by an `ops` predating `--all`. Its requests are still parked; only relaunching
+    /// it was launched by an `sbx` predating `--all`. Its requests are still parked; only relaunching
     /// the agent with the current binary lets `--all` reach them. (Answering by id is *not* a fallback:
     /// destination-grouping is server-side, so an old server's `ALLOW <seq>` wakes one connection of
     /// the group, leaving the retries parked.)
@@ -1620,7 +1620,7 @@ pub(crate) enum InjectOutcome {
 }
 
 /// Load a proactive egress `rule` into one session's live manual overlay (`REMEMBER ALLOW|DENY
-/// <rule>`) — the `ops net allow|deny <rule> --session` path. A connect error (the session is gone,
+/// <rule>`) — the `sbx net allow|deny <rule> --session` path. A connect error (the session is gone,
 /// or a stale socket) propagates so the caller skips that session.
 pub(crate) fn inject_rule(
     data_dir: &Path,
@@ -1636,8 +1636,8 @@ pub(crate) fn inject_rule(
 }
 
 /// Load a proactive **mute** (`dontaudit`) `rule` into one session's live overlay — the
-/// `ops net mute <rule> --session` path. A denied request matching it has its log line suppressed
-/// for this session; the verdict and the `ops net stats` count are untouched. Same wire shape as
+/// `sbx net mute <rule> --session` path. A denied request matching it has its log line suppressed
+/// for this session; the verdict and the `sbx net stats` count are untouched. Same wire shape as
 /// [`inject_rule`], with the `MUTE` verb.
 pub(crate) fn inject_mute(data_dir: &Path, pid: u32, rule: &str) -> io::Result<InjectOutcome> {
     send_remember(data_dir, pid, "MUTE", rule)
@@ -1969,7 +1969,7 @@ mod tests {
             !manual.is_empty(),
             "a loaded mute makes the overlay non-empty"
         );
-        // …and `RULES` reports it as a `manual mute` line, so `ops net rules --source session` lists
+        // …and `RULES` reports it as a `manual mute` line, so `sbx net rules --source session` lists
         // a live mute (distinct from the allow/deny lines).
         assert!(
             dispatch("RULES", &state, &manual, &log, &flows)

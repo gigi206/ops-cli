@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Scope reminder: `ops` is a sandbox launcher (a static Rust binary) that
+        Scope reminder: `sbx` is a sandbox launcher (a static Rust binary) that
         runs tools and AI agents inside a bubblewrap + daemonless-nix sandbox.
         Requests that fit the sandbox model stay in scope.
 
@@ -14,7 +14,7 @@ body:
     id: problem
     attributes:
       label: Problem statement
-      description: What are you trying to do that ops makes hard today?
+      description: What are you trying to do that sbx makes hard today?
     validations:
       required: true
 
@@ -39,6 +39,6 @@ body:
     attributes:
       label: Scope fit
       options:
-        - label: Fits the sandbox-launcher model (does not turn ops into a container / orchestration manager).
+        - label: Fits the sandbox-launcher model (does not turn sbx into a container / orchestration manager).
         - label: Respects the security model (least privilege, fail-closed, no weakening of the sandbox boundary).
         - label: Can be covered by a test.

@@ -12,6 +12,6 @@ description  = "Read a secret from the pass(1) password store: pass://<path> (th
 # the secret keys and does the decryption; the client writes nothing).
 allow_paths = ["~/.password-store", "~/.gnupg", "$XDG_RUNTIME_DIR/gnupg"]
 # GNUPGHOME for a non-default store; XDG_RUNTIME_DIR so gpg locates the agent socket. Each is
-# passed through only when set in ops's environment (an unset one is simply omitted).
+# passed through only when set in sbx's environment (an unset one is simply omitted).
 allow_env   = ["GNUPGHOME", "XDG_RUNTIME_DIR"]
 network     = false

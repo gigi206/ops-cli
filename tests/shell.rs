@@ -1,5 +1,5 @@
-//! Integration test for `ops shell`: drive the interactive shell through a pty
-//! and assert the *property* that separates it from `ops run` — the sandbox gets
+//! Integration test for `sbx shell`: drive the interactive shell through a pty
+//! and assert the *property* that separates it from `sbx run` — the sandbox gets
 //! a controlling terminal, so job control works (not merely "a command ran").
 //! Skipped, not failed, where the host cannot sandbox.
 //!
@@ -16,8 +16,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-fn ops() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ops"))
+fn sbx() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_sbx"))
 }
 
 /// A unique temp dir removed on drop.
@@ -72,7 +72,7 @@ fn force_remove(path: &Path) {
 /// Whether the host can launch a sandbox (also warms the userland cache so the
 /// shell starts promptly).
 fn host_can_sandbox(project: &Path, data: &Path) -> bool {
-    ops()
+    sbx()
         .arg("run")
         .arg("--")
         .arg("true")
@@ -90,11 +90,11 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping ops shell smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!("skipping sbx shell smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
-    // `ops shell` needs a tty on stdin; give it a pty and drive it through the
+    // `sbx shell` needs a tty on stdin; give it a pty and drive it through the
     // master end.
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -111,7 +111,7 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
 
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them
     // as stdin/out/err.
-    let mut child = ops()
+    let mut child = sbx()
         .arg("shell")
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -119,7 +119,7 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
         .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
         .spawn()
-        .expect("spawn ops shell");
+        .expect("spawn sbx shell");
     unsafe { libc::close(slave) };
 
     // The script. `( : < /dev/tty )` succeeds only when the shell has a
@@ -175,7 +175,7 @@ fn shell_gives_the_sandbox_a_controlling_terminal() {
 
 #[test]
 fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
-    // The reported bug: `ops app <name>` launched interactively "stays small" when the terminal
+    // The reported bug: `sbx app <name>` launched interactively "stays small" when the terminal
     // goes fullscreen. An interactive app now runs under the pty supervisor, so it must (1) get a
     // private controlling terminal and (2) see a resize propagate live. The faithful proxy for a
     // caching TUI (like claude-code) is not "stty reports the new size" but "the inner process is
@@ -190,17 +190,17 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     let project = TmpDir::new("appterm-proj");
     let data = TmpDir::new("appterm-data");
     std::fs::write(
-        project.path().join(".ops.toml"),
+        project.path().join(".sbx.toml"),
         b"[app.term]\ncmd = [\"bash\", \"--norc\", \"-i\"]\n",
     )
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping ops app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!("skipping sbx app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
         return;
     }
 
-    // An outer pty sized 24x80. ops runs on the slave; the test drives the master.
+    // An outer pty sized 24x80. sbx runs on the slave; the test drives the master.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     ws.ws_row = 24;
     ws.ws_col = 80;
@@ -217,14 +217,14 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     };
     assert_eq!(rc, 0, "openpty failed");
 
-    // Make ops itself own the *outer* pty as its controlling terminal, faithfully reproducing
-    // production: in a real run ops holds the launching terminal (Warp's), so resizing that
-    // terminal delivers SIGWINCH to ops *naturally* — no explicit signal. A `pre_exec` runs in the
-    // forked ops (after its stdio is set to the slave, before exec): `setsid` starts a fresh
-    // session, then `ioctl(TIOCSCTTY)` claims fd 0's terminal as ops's ctty. The cage's inner child
-    // later gets its own private ctty via `login_tty`, leaving ops the outer pty's foreground group.
+    // Make sbx itself own the *outer* pty as its controlling terminal, faithfully reproducing
+    // production: in a real run sbx holds the launching terminal (Warp's), so resizing that
+    // terminal delivers SIGWINCH to sbx *naturally* — no explicit signal. A `pre_exec` runs in the
+    // forked sbx (after its stdio is set to the slave, before exec): `setsid` starts a fresh
+    // session, then `ioctl(TIOCSCTTY)` claims fd 0's terminal as sbx's ctty. The cage's inner child
+    // later gets its own private ctty via `login_tty`, leaving sbx the outer pty's foreground group.
     // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
-    let mut command = ops();
+    let mut command = sbx();
     command
         .arg("app")
         .arg("term")
@@ -245,7 +245,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
             Ok(())
         });
     }
-    let mut child = command.spawn().expect("spawn ops app term");
+    let mut child = command.spawn().expect("spawn sbx app term");
     unsafe { libc::close(slave) };
 
     // Arm the resize trap, confirm the controlling terminal, and print the initial size. The
@@ -294,8 +294,8 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
         }
 
         // After the controlling terminal is confirmed and the initial 24x80 is seen, resize the
-        // *outer* pty. Because ops holds it as its ctty (the pre_exec above), the kernel delivers
-        // SIGWINCH to ops naturally — the exact production trigger of dragging Warp to fullscreen,
+        // *outer* pty. Because sbx holds it as its ctty (the pre_exec above), the kernel delivers
+        // SIGWINCH to sbx naturally — the exact production trigger of dragging Warp to fullscreen,
         // not a simulated signal. No explicit `kill`.
         if sent_setup && !resized && text.contains("CTTY=YES") && text.contains("24 80") {
             let mut big: libc::winsize = unsafe { std::mem::zeroed() };

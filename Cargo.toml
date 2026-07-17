@@ -1,5 +1,5 @@
 [package]
-name = "ops"
+name = "sbx"
 version = "2.0.0-alpha.0"
 edition = "2021"
 description = "Sandbox launcher for reproducible dev environments and encapsulated AI agents (bubblewrap + daemonless nix)"
@@ -7,31 +7,31 @@ license = "Apache-2.0"
 repository = "https://github.com/gigi206/ops-cli"
 
 [[bin]]
-name = "ops"
+name = "sbx"
 path = "src/main.rs"
 
 [features]
-# Embed a statically-linked `nix` engine inside the ops binary, so the shipped
+# Embed a statically-linked `nix` engine inside the sbx binary, so the shipped
 # binary drives its own store with no host nix. Off by default — development and
-# CI builds resolve nix from `OPS_NIX_BIN`/`PATH` and stay fast and offline. On
+# CI builds resolve nix from `SBX_NIX_BIN`/`PATH` and stay fast and offline. On
 # only in the release build (`mise run build-bundled`), which supplies the engine
-# via `OPS_BUNDLED_NIX`.
+# via `SBX_BUNDLED_NIX`.
 bundled-nix = []
 
-# Embed a statically-linked `bwrap` (bubblewrap) engine inside the ops binary, so the
+# Embed a statically-linked `bwrap` (bubblewrap) engine inside the sbx binary, so the
 # shipped binary launches its own sandbox with no host bubblewrap on most hosts, and
-# pins a known-good version (every flag ops relies on is present). Off by default, like
-# `bundled-nix`; on in the release build, which supplies the engine via `OPS_BUNDLED_BWRAP`.
+# pins a known-good version (every flag sbx relies on is present). Off by default, like
+# `bundled-nix`; on in the release build, which supplies the engine via `SBX_BUNDLED_BWRAP`.
 # Note: on a host enforcing AppArmor unprivileged-userns restriction the embedded engine
 # cannot create a user namespace (the kernel grants that only to the path-profiled
-# `/usr/bin/bwrap`), so ops prefers the host engine there — see `store::resolve_bwrap`.
+# `/usr/bin/bwrap`), so sbx prefers the host engine there — see `store::resolve_bwrap`.
 bundled-bwrap = []
 
 [dependencies]
 # The in-cage desktop notifications relay (`dbus = true`): bridges the cage's private D-Bus bus
 # to the host `org.freedesktop.Notifications`. The async runtime is the pure-Rust `async-io` backend
 # (NOT tokio), driven by `async_io::block_on` on a single dedicated thread inside `notify_relay`, so
-# nothing async leaks into ops's std-thread world (the egress proxy stays sync std threads).
+# nothing async leaks into sbx's std-thread world (the egress proxy stays sync std threads).
 async-channel = "2"
 async-io = "2"
 # The egress proxy's HTTP/2 (gRPC) man-in-the-middle path. `h2` is tokio-based, so a designated

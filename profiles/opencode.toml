@@ -1,18 +1,18 @@
-# opencode — a terminal AI coding agent (multi-provider), sandboxed by ops.
+# opencode — a terminal AI coding agent (multi-provider), sandboxed by sbx.
 #
-#   ops app import profiles/opencode.toml
-#   ops app opencode
+#   sbx app import profiles/opencode.toml
+#   sbx app opencode
 #
 # The tool is equipped fresh from upstream (mise's registry resolves `opencode` to
 # its standalone release binary) — no nixpkgs lag. It is equipped at the latest
 # upstream version on the first launch in a project; advancing an already-installed
-# version is not yet automated by `ops upgrade`.
+# version is not yet automated by `sbx upgrade`.
 #
 # opencode is MULTI-PROVIDER, so its egress depends on the model you use. This
 # template is set up for Anthropic; for another provider, change the allowlist and
 # the [secret] block (e.g. OpenAI: allow "api.openai.com", header "Authorization",
 # type "bearer", env OPENAI_API_KEY). If a request is blocked, the proxy reports
-# the host it refused — add it to `allow` (or check with `ops test net <url>`).
+# the host it refused — add it to `allow` (or check with `sbx test net <url>`).
 cmd = "opencode"
 
 # Your host opencode config, mounted read-write at its real absolute path. `binds` is a security
@@ -48,7 +48,7 @@ allow = [
   # transport, and it targets the OpenAI provider's OWN base host: `api.openai.com` for a direct
   # key, or your gateway host if you route OpenAI through one. A WebSocket is a distinct capability
   # a plain `{*}` does NOT grant (a bidirectional, uninspected channel), so it must be named with
-  # `{WS}`. To pin the exact host: run `ops net logs -a opencode` while opencode runs and look for a
+  # `{WS}`. To pin the exact host: run `sbx net logs -a opencode` while opencode runs and look for a
   # `WS` row — a refused one reads `deny … WS … (denied-default|denied-method)` with NO `ws` marker;
   # an established one is flagged `ws` (that marker shows only on a successful `101` upgrade). Then
   # uncomment the line below and set it to that host.
@@ -65,7 +65,7 @@ allow = [
 # `{*} https://openrouter.ai` — and keep this block; for Anthropic/OpenAI change the host,
 # header, and env var instead.)
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

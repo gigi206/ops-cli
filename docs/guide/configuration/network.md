@@ -51,10 +51,10 @@ for the full semantics.
 | `mode` | the egress mode; **absent** = inherit a filtering mode from the parent layer |
 | `allow` | egress rules that may reach (under `deny`) / auto-pass (under `ask`) |
 | `deny` | egress rules that may not reach (under `allow`) / auto-fail (under `ask`) |
-| `mute` | egress rules whose **denied** requests are kept out of the default [`ops net log`](../networking/observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit) (SELinux `dontaudit`) — a log filter, never a verdict change; still counted in `stats`, shown by `ops net log --all` |
+| `mute` | egress rules whose **denied** requests are kept out of the default [`sbx net log`](../networking/observability.md#muting-noisy-refusals--network-mute-selinux-dontaudit) (SELinux `dontaudit`) — a log filter, never a verdict change; still counted in `stats`, shown by `sbx net log --all` |
 | `ask_timeout` | a duration (`"90s"`, `"5m"`) bounding a parked `ask` request; absent = indefinite |
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
-| `stats` | `false` turns off the per-host decision counters ([`ops net stats`](../networking/observability.md)) |
+| `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability.md)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1 — see below |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
@@ -104,7 +104,7 @@ Notes:
 
 - **`{POST}` is required.** gRPC uses `POST`, but a bare `allow = ["grpc.example.com"]` is
   read-by-default (`{GET,HEAD}`) for an **app**, so every RPC would be refused. Prefix the rule with
-  `{POST}` (or `{*}`). (`ops run`/`ops shell` are all-verbs, so the baseline is less strict — but be
+  `{POST}` (or `{*}`). (`sbx run`/`sbx shell` are all-verbs, so the baseline is less strict — but be
   explicit.)
 - **`http2` selects the transport, not the verdict.** A host must still be permitted by an `allow`
   rule; `http2` only decides HTTP/2-vs-HTTP/1.1. It is `host` or `host:port` (a bare host matches any
@@ -127,18 +127,18 @@ Notes:
 
 Under `mode = "deny"`, a request to a host **no allow rule matched** is refused with a
 `403` whose body names the host and suggests how to permit it — e.g.
-`… is not allowed by the network policy. Allow it: ops net allow github.com`. The hint
+`… is not allowed by the network policy. Allow it: sbx net allow github.com`. The hint
 rides the response the client already receives (scoped `--app <name>` under an
-[`ops app`](../cli/app.md) launch), so it reaches whoever made the request. It appears only
+[`sbx app`](../cli/app.md) launch), so it reaches whoever made the request. It appears only
 for a host nothing allowed — an **explicit** `deny` rule or a security refusal (an SSRF
 target, a leaked credential) never suggests allowing it.
 
 A refused request is *not* a rule, so it does **not** appear in
-[`ops net rules`](../cli/net.md) (which lists the policy). To see what was refused, use
-[`ops net logs`](../networking/observability.md) (each request and its verdict) or
-[`ops net stats`](../networking/observability.md) (per-host deny counters) — both take
-`-a <app>`. Once you run the suggested `ops net allow`, the host becomes an allow rule and
-*then* shows in `ops net rules`.
+[`sbx net rules`](../cli/net.md) (which lists the policy). To see what was refused, use
+[`sbx net logs`](../networking/observability.md) (each request and its verdict) or
+[`sbx net stats`](../networking/observability.md) (per-host deny counters) — both take
+`-a <app>`. Once you run the suggested `sbx net allow`, the host becomes an allow rule and
+*then* shows in `sbx net rules`.
 
 ## Mode inheritance
 
@@ -153,29 +153,29 @@ profile add rules without re-declaring the mode.
 A Mode-B app's unscoped (`{...}`-less) `allow` rules default to `["GET", "HEAD"]` — an
 agent reads but does not write unless a rule opts a host out with `{*}`/`{VERB}`. This
 field overrides that default for the app (e.g. `["GET", "POST"]`, or `["*"]` for all
-verbs). It is **ignored on the baseline `[network]`** — `ops run`/`ops shell` (Mode A)
+verbs). It is **ignored on the baseline `[network]`** — `sbx run`/`sbx shell` (Mode A)
 stay all-verbs.
 
 ## Editing
 
-`network` as a table is edited with [`ops config edit`](../cli/config.md), or a rule
-is added with [`ops net allow`/`deny`](../cli/net.md):
+`network` as a table is edited with [`sbx config edit`](../cli/config.md), or a rule
+is added with [`sbx net allow`/`deny`](../cli/net.md):
 
 ```sh
-ops net allow api.github.com          # bootstrap a deny-by-default allowlist
-ops net deny evil.example.com --global
-ops config edit --trust               # edit the table by hand, then re-trust
+sbx net allow api.github.com          # bootstrap a deny-by-default allowlist
+sbx net deny evil.example.com --global
+sbx config edit --trust               # edit the table by hand, then re-trust
 ```
 
 ## One-shot override
 
 To set the posture for a single launch without editing the file, use `--net` or
-`OPS_NET`:
+`SBX_NET`:
 
 ```sh
-ops run --net none -- ./build.sh                # cut the network for one run
-ops run --net allow=api.github.com -- ./ci.sh   # a one-shot allowlist
-OPS_NET=shared ops shell
+sbx run --net none -- ./build.sh                # cut the network for one run
+sbx run --net allow=api.github.com -- ./ci.sh   # a one-shot allowlist
+SBX_NET=shared sbx shell
 ```
 
 `--net` takes `none | shared | ask | allow=h1,h2 | deny=h1,h2` (a bare `allow`/`deny`

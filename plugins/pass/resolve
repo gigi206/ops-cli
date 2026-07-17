@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ops resolver plugin: pass(1) password store.
-# Contract: ops passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
+# sbx resolver plugin: pass(1) password store.
+# Contract: sbx passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
 #   Ref:  pass://<path>   e.g.  pass://github/token   (returns the first line — the password)
 set -euo pipefail
 

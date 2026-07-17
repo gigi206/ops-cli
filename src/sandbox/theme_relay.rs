@@ -2,7 +2,7 @@
 //!
 //! The in-cage portal ([`super::portal`]) seeds the host light/dark theme into the cage **once** at
 //! launch (so the app opens in the right scheme), but does not follow a host theme switch made
-//! afterwards. This relay closes that gap. It runs **host-side** (ops's own trusted infrastructure,
+//! afterwards. This relay closes that gap. It runs **host-side** (sbx's own trusted infrastructure,
 //! like the notifications relay and the egress proxy), connects to the real host session bus,
 //! subscribes to the desktop portal's `org.freedesktop.portal.Settings.SettingChanged` signal for
 //! the `org.freedesktop.appearance` `color-scheme` key, and on each change **rewrites the in-cage
@@ -60,7 +60,7 @@ impl ThemeRelay {
     pub(crate) fn start(keyfile: PathBuf) -> ThemeRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
         let handle = std::thread::Builder::new()
-            .name("ops-theme-relay".to_string())
+            .name("sbx-theme-relay".to_string())
             .spawn(move || {
                 if let Err(e) = async_io::block_on(run(keyfile, rx)) {
                     // A connection error is almost always the session ending (the host bus went away)
@@ -137,7 +137,7 @@ fn write_keyfile(keyfile: &Path, scheme: &str) {
     if let Some(parent) = keyfile.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = keyfile.with_extension("ops-tmp");
+    let tmp = keyfile.with_extension("sbx-tmp");
     if std::fs::write(&tmp, super::portal::keyfile_body(scheme)).is_ok() {
         let _ = std::fs::rename(&tmp, keyfile);
     } else {
@@ -177,6 +177,6 @@ mod tests {
             std::fs::read_to_string(&keyfile).unwrap(),
             super::super::portal::keyfile_body("prefer-light")
         );
-        assert!(!keyfile.with_extension("ops-tmp").exists());
+        assert!(!keyfile.with_extension("sbx-tmp").exists());
     }
 }

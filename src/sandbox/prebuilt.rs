@@ -104,7 +104,7 @@ pub(crate) fn is_sri(s: &str) -> bool {
 
 /// Resolve a concrete `https://` URL to its SRI content hash via `nix store prefetch-file`, which
 /// follows redirects (so a `…/releases/latest/download/…` URL resolves to the current asset) and
-/// adds the file to ops's store. Pure fetch — no code runs.
+/// adds the file to sbx's store. Pure fetch — no code runs.
 pub(crate) fn prefetch_hash(nix: &Path, layout: &Layout, url: &str) -> io::Result<String> {
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])

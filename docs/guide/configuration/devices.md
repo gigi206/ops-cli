@@ -51,7 +51,7 @@ device is bound at its own path **with device access**, over the minimal `/dev`.
 
 - It **binds the device node** into the cage. Whether a process may then *use* it is still
   governed by the device's own file permissions and the host uid the cage runs as
-  (same-uid) — exactly as on the host. `ops` grants visibility, not new privilege.
+  (same-uid) — exactly as on the host. `sbx` grants visibility, not new privilege.
 - Some devices need more than the node. **`/dev/fuse`** additionally needs the `mount`
   syscall, which the mandatory [seccomp](seccomp.md) denylist refuses — so a FUSE tool
   needs `[seccomp] allow = ["mount"]` as well. **`/dev/net/tun`** is most useful under
@@ -81,8 +81,8 @@ allow = ["/dev/dri"]
 ## Viewing the effective grant
 
 ```sh
-ops config show               # a `devices:` line only when a device is granted
-ops config show --app render  # an app's effective grant, tagged inherited or set
+sbx config show               # a `devices:` line only when a device is granted
+sbx config show --app render  # an app's effective grant, tagged inherited or set
 ```
 
 The paths render sorted, the same set the cage binds.
@@ -90,9 +90,9 @@ The paths render sorted, the same set the cage binds.
 ## Scope
 
 `[devices]` is a config-file field (global, project, or an app overlay). It is also a
-one-shot [override](overrides.md): `--device <path>` (repeatable) and `OPS_DEVICE` grant a
+one-shot [override](overrides.md): `--device <path>` (repeatable) and `SBX_DEVICE` grant a
 host device for a single launch. An override is **trusted by invocation** — the person
-running `ops` outranks any config layer — so it may grant exactly the device a *trusted*
+running `sbx` outranks any config layer — so it may grant exactly the device a *trusted*
 config already can, even though an untrusted project's `[devices]` is dropped (parity with
 the trusted config). `--device` takes **one path per flag** (repeatable); it is not
 comma-split, so `--device /dev/a,/dev/b` is a single, non-existent path (silently skipped),

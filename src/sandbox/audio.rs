@@ -4,19 +4,19 @@
 //! cannot open a capture or playback stream — its microphone and sound are silently unavailable.
 //! When `audio = true` a trusted config opens audio, covering the kinds of Linux audio client:
 //!
-//! 1. **A native PulseAudio client** (Chromium/Electron): ops provisions the PulseAudio client
+//! 1. **A native PulseAudio client** (Chromium/Electron): sbx provisions the PulseAudio client
 //!    library (`libpulse.so.0`, absent from an autoPatchelf'd app's closure, which carries only
 //!    ALSA) and puts it on the app's loader path (`LD_LIBRARY_PATH`); the client connects to the
 //!    bound socket named by `PULSE_SERVER`.
 //! 2. **An ALSA client** (a CLI tool using `cpal`/`arecord`, e.g. a terminal agent's voice mode):
-//!    these speak the ALSA API (`libasound`) and do **not** honor `PULSE_SERVER`, so ops adds the
+//!    these speak the ALSA API (`libasound`) and do **not** honor `PULSE_SERVER`, so sbx adds the
 //!    standard ALSA→PulseAudio compatibility shim — `alsa-plugins` (the `pcm_pulse`/`ctl_pulse`
 //!    plugins) plus an `asound.conf` routing the default PCM/CTL to `pulse` — so an ALSA `default`
 //!    capture/playback is transparently routed to the same PulseAudio socket. `libasound` itself is
 //!    provisioned too (on `LD_LIBRARY_PATH`) for a CLI binary that does not carry its own.
 //! 3. **A PortAudio client** (e.g. a Python tool such as `sounddevice`): PortAudio speaks ALSA under
 //!    the hood, so it rides the shim from (2) — but the tool must first `dlopen`
-//!    `libportaudio.so.2`, which the cage lacks, so ops provisions `portaudio` onto
+//!    `libportaudio.so.2`, which the cage lacks, so sbx provisions `portaudio` onto
 //!    `LD_LIBRARY_PATH`.
 //!
 //! Delivery is **runtime-agnostic**: putting the client libraries (libpulse, libasound, portaudio) on
@@ -25,7 +25,7 @@
 //! (`arecord`), C++ (Electron/libpulse), and Rust (`cpal`/libasound). **Python is the one exception**:
 //! `ctypes.util.find_library(name)` does NOT consult `LD_LIBRARY_PATH` — on Linux it shells out to
 //! `ldconfig`/`gcc`/`ld`, none of which a hermetic cage carries, so it always returns `None` and
-//! `sounddevice` cannot locate PortAudio. So ops additionally stages a `sitecustomize.py` (on
+//! `sounddevice` cannot locate PortAudio. So sbx additionally stages a `sitecustomize.py` (on
 //! `PYTHONPATH`) that makes `find_library` fall back to scanning `LD_LIBRARY_PATH`. This is **not**
 //! Python favoritism — it is a targeted patch for a Python-specific discovery defect; it is inert for
 //! any non-Python runtime (`PYTHONPATH` is a no-op for them), generic across ctypes consumers, and
@@ -73,7 +73,7 @@ const PORTAUDIO: (&str, &str, &str) = ("portaudio", "lib/libportaudio.so.2", "po
 
 /// The fixed cage path the `find_library` shim directory is bound at, placed on `PYTHONPATH` so its
 /// `sitecustomize.py` runs at interpreter startup (parity with the other fixed cage paths).
-pub(crate) const PYSHIM_INCAGE: &str = "/opt/ops/audio-pyshim";
+pub(crate) const PYSHIM_INCAGE: &str = "/opt/sbx/audio-pyshim";
 
 /// A `sitecustomize.py` for the Python voice stack, patching two ecosystem quirks a hermetic MITM
 /// cage exposes. **(1)** `ctypes.util.find_library` falls back to scanning `LD_LIBRARY_PATH` for a
@@ -82,10 +82,10 @@ pub(crate) const PYSHIM_INCAGE: &str = "/opt/ops/audio-pyshim";
 /// library by name, notably `sounddevice`, which resolves PortAudio via `find_library('portaudio')`.
 /// Its full path is then `dlopen`ed directly. **(2)** `certifi.where()` returns `SSL_CERT_FILE` when
 /// set: a certifi-pinned TLS client (edge-tts's read-aloud) verifies against certifi's Mozilla bundle
-/// and ignores `SSL_CERT_FILE`, so under the egress allowlist it rejects ops's per-session MITM CA;
-/// this makes it trust the same CA ops already exports to every other client. Both patches are
+/// and ignores `SSL_CERT_FILE`, so under the egress allowlist it rejects sbx's per-session MITM CA;
+/// this makes it trust the same CA sbx already exports to every other client. Both patches are
 /// additive/conditional (find_library only extends the stock lookup; certifi only when SSL_CERT_FILE
-/// is set) and generic (any ctypes / any certifi consumer benefits). Fixed and ops-controlled (no
+/// is set) and generic (any ctypes / any certifi consumer benefits). Fixed and sbx-controlled (no
 /// interpolation), so it is safe to stage verbatim.
 ///
 /// A `sitecustomize` on `PYTHONPATH` shadows one an app might ship (Python imports only the first on
@@ -96,14 +96,14 @@ pub(crate) const PYSHIM_INCAGE: &str = "/opt/ops/audio-pyshim";
 const SITECUSTOMIZE: &str = include_str!("audio_sitecustomize.py");
 
 /// The fixed cage path the host PulseAudio socket is bound at (parity with the portal and dbus
-/// sockets under `/run/ops-*`), named through `PULSE_SERVER` — so audio does not depend on the
+/// sockets under `/run/sbx-*`), named through `PULSE_SERVER` — so audio does not depend on the
 /// Wayland hole's `XDG_RUNTIME_DIR`, and a project `[env]` re-pointing `PULSE_SERVER` only self-DoSes.
-pub(crate) const CAGE_SOCK: &str = "/run/ops-pulse";
+pub(crate) const CAGE_SOCK: &str = "/run/sbx-pulse";
 /// The in-cage path the generated `asound.conf` is bound at. The base `alsa.conf` (from `alsa-lib`,
 /// located via `ALSA_CONFIG_DIR`) includes this file, so its `default`→`pulse` routing takes effect.
 pub(crate) const ASOUND_CONF_INCAGE: &str = "/etc/asound.conf";
 
-/// The ALSA configuration routing the default PCM and control to PulseAudio. Fixed and ops-controlled
+/// The ALSA configuration routing the default PCM and control to PulseAudio. Fixed and sbx-controlled
 /// (no interpolation), so it is safe to bind verbatim.
 const ASOUND_CONF: &str = "pcm.!default {\n    type pulse\n}\nctl.!default {\n    type pulse\n}\n";
 
@@ -141,7 +141,7 @@ pub(crate) struct AudioLayer {
     pub(crate) pyshim: Option<PathBuf>,
 }
 
-/// Provision the audio userspace into ops's store against the pinned `nixpkgs`. The gcroots are keyed
+/// Provision the audio userspace into sbx's store against the pinned `nixpkgs`. The gcroots are keyed
 /// by revision (`<data>/gcroots/audio/<rev>/…`), shared across every project on the same channel —
 /// like mesa and the fonts.
 ///
@@ -254,7 +254,7 @@ fn stage_pyshim(data_dir: &Path) -> io::Result<PathBuf> {
 }
 
 /// Atomically stage `content` at `dir/name` (temp + `rename`), creating `dir`. Re-stages whenever the
-/// on-disk bytes differ from `content` — the content is fixed within one ops build but CHANGES across
+/// on-disk bytes differ from `content` — the content is fixed within one sbx build but CHANGES across
 /// releases (a new binary ships an updated shim/config), so a skip-if-present would pin a stale file
 /// forever. An atomic `rename` replaces in place; a concurrent launch writing the identical bytes is
 /// harmless (last writer wins with the same content). Returns the staged file path.
@@ -397,7 +397,7 @@ mod tests {
         // The client connects to the fixed cage socket path, not the host's XDG_RUNTIME_DIR.
         assert_eq!(
             get(&full, "PULSE_SERVER").as_deref(),
-            Some("unix:/run/ops-pulse")
+            Some("unix:/run/sbx-pulse")
         );
         // All three client libraries (native libpulse + ALSA libasound + PortAudio) are on the loader
         // path — the last so `sounddevice`'s `find_library` shim can resolve `libportaudio.so.2` — then
@@ -428,7 +428,7 @@ mod tests {
         let bare = env(None, &base);
         assert_eq!(
             get(&bare, "PULSE_SERVER").as_deref(),
-            Some("unix:/run/ops-pulse")
+            Some("unix:/run/sbx-pulse")
         );
         assert_eq!(get(&bare, "LD_LIBRARY_PATH"), None);
         assert_eq!(get(&bare, "ALSA_PLUGIN_DIR"), None);
@@ -478,19 +478,19 @@ mod tests {
         // original first), and scans `LD_LIBRARY_PATH` for the library, so PortAudio is found in a
         // toolchain-less cage. It is valid, executable Python (parsed by an interpreter at startup).
         assert!(SITECUSTOMIZE.contains("import ctypes.util"));
-        assert!(SITECUSTOMIZE.contains("_ops_orig_find_library = ctypes.util.find_library"));
+        assert!(SITECUSTOMIZE.contains("_sbx_orig_find_library = ctypes.util.find_library"));
         assert!(SITECUSTOMIZE.contains("os.environ.get(\"LD_LIBRARY_PATH\""));
-        assert!(SITECUSTOMIZE.contains("ctypes.util.find_library = _ops_find_library"));
-        // Part 2: certifi.where() is redirected to SSL_CERT_FILE (ops's MITM CA), conditionally — so a
+        assert!(SITECUSTOMIZE.contains("ctypes.util.find_library = _sbx_find_library"));
+        // Part 2: certifi.where() is redirected to SSL_CERT_FILE (sbx's MITM CA), conditionally — so a
         // certifi-pinned voice TTS client (edge-tts) trusts the same CA as every other client under the
         // allowlist, and is untouched when SSL_CERT_FILE is unset (no MITM).
         assert!(SITECUSTOMIZE.contains("os.environ.get(\"SSL_CERT_FILE\")"));
-        assert!(SITECUSTOMIZE.contains("certifi.where = lambda: _ops_ca"));
+        assert!(SITECUSTOMIZE.contains("certifi.where = lambda: _sbx_ca"));
     }
 
     #[test]
     fn stage_atomically_rewrites_a_stale_file_when_the_content_changes() {
-        // A new ops release ships an updated shim; the staged file must be replaced, not kept stale.
+        // A new sbx release ships an updated shim; the staged file must be replaced, not kept stale.
         // (This is the bug that left the pre-certifi sitecustomize on disk after an upgrade.)
         let dir = crate::testutil::TmpDir::new();
         let d = dir.path().join("audio");

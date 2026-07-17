@@ -1,5 +1,5 @@
 //! The bundled mise "nix" backend plugin: embedded in the binary, materialized
-//! into ops's data directory, and registered for the in-cage mise so an agent
+//! into sbx's data directory, and registered for the in-cage mise so an agent
 //! can self-equip a project's `nix:` tools (`mise install nix:<pkg>`) into the
 //! project's own writable store.
 //!
@@ -8,7 +8,7 @@
 //! still gets a complete, version-matched plugin. It is staged read-only outside
 //! every writable mount and bound into the cage; the registration that wires it
 //! to mise is a symlink in the cage's writable mise data directory, recreated on
-//! every launch so an ops upgrade (which changes the embedded tree) re-points it.
+//! every launch so an sbx upgrade (which changes the embedded tree) re-points it.
 
 include!(concat!(env!("OUT_DIR"), "/mise_plugin_files.rs"));
 
@@ -21,15 +21,15 @@ use std::path::{Path, PathBuf};
 pub(crate) const PLUGIN_NAME: &str = "nix";
 
 /// Where the staged plugin tree is bound read-only inside the cage, and the target
-/// the registration symlink points at. An ops-owned path that collides with no
+/// the registration symlink points at. An sbx-owned path that collides with no
 /// structural mount.
-pub(crate) const INCAGE_DIR: &str = "/opt/ops/mise-nix-plugin";
+pub(crate) const INCAGE_DIR: &str = "/opt/sbx/mise-nix-plugin";
 
-/// Materialize the embedded plugin tree into ops's data directory and return the
+/// Materialize the embedded plugin tree into sbx's data directory and return the
 /// host directory holding it (ready to bind read-only at [`INCAGE_DIR`]).
 ///
 /// Content-keyed: the directory name is a hash of the embedded bytes, so a given
-/// ops binary always stages to the same path (idempotent — re-materializing is
+/// sbx binary always stages to the same path (idempotent — re-materializing is
 /// skipped) while a different build stages beside it. The tree is written into a
 /// unique temp sibling and `rename`d into place, so a concurrent launch of the
 /// same project never observes a half-written plugin (a lost rename race just
@@ -225,7 +225,7 @@ mod tests {
         let target = std::fs::read_link(&link).expect("the registration is a symlink");
         assert_eq!(target, Path::new(INCAGE_DIR));
 
-        // idempotent: a second registration (e.g. after an ops upgrade) replaces the
+        // idempotent: a second registration (e.g. after an sbx upgrade) replaces the
         // link without error
         register(&plugins).expect("re-register the plugin");
         assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(INCAGE_DIR));

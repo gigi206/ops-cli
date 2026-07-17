@@ -25,9 +25,9 @@ See also: [`gui`](gui.md) · [`gpu`](gpu.md) · [Enforcement stack](../concepts/
 
 A recent Chromium/Electron app opens its file chooser through the desktop portal
 (`org.freedesktop.portal.FileChooser`). If that portal were the **host's**, its dialog would be a
-host-privileged file manager the cage must not be able to summon — so ops does not expose the host
+host-privileged file manager the cage must not be able to summon — so sbx does not expose the host
 bus at all. Instead it stands up a **private** D-Bus session bus **inside** the cage carrying
-ops-provisioned `xdg-desktop-portal` with the reference **GTK backend** (`xdg-desktop-portal-gtk`).
+sbx-provisioned `xdg-desktop-portal` with the reference **GTK backend** (`xdg-desktop-portal-gtk`).
 The app probes *that* portal and gets three things:
 
 - **File chooser** — the dialog is **rendered in-cage** by the GTK backend, so by construction it can
@@ -44,7 +44,7 @@ The app probes *that* portal and gets three things:
   the host notifications daemon, so the app's desktop notifications work end to end (including
   click-to-focus and dismiss).
 
-The keyring (`org.freedesktop.secrets`) is **never** exposed — the private bus carries only ops's own
+The keyring (`org.freedesktop.secrets`) is **never** exposed — the private bus carries only sbx's own
 portal and relays, and touches no host socket.
 
 This posture:
@@ -91,11 +91,11 @@ dbus = true
 
 ## One-shot override
 
-To set the D-Bus posture for a single launch without editing the file, use `--dbus` or `OPS_DBUS`:
+To set the D-Bus posture for a single launch without editing the file, use `--dbus` or `SBX_DBUS`:
 
 ```sh
-ops app opencode-desktop --dbus=false   # no portal for this launch
-ops run --dbus -- some-gtk-app          # bare --dbus means true (the in-cage portal)
+sbx app opencode-desktop --dbus=false   # no portal for this launch
+sbx run --dbus -- some-gtk-app          # bare --dbus means true (the in-cage portal)
 ```
 
 Bare `--dbus` means `true`; the inline forms are `--dbus=true` and `--dbus=false` (it never takes a
@@ -106,8 +106,8 @@ the config file. See [One-shot overrides](overrides.md).
 ## Viewing the effective posture
 
 ```sh
-ops config show                # a `dbus:` line only when it is enabled
-ops config show --app desktop  # an app's effective posture, tagged inherited or set
+sbx config show                # a `dbus:` line only when it is enabled
+sbx config show --app desktop  # an app's effective posture, tagged inherited or set
 ```
 
 ## Scope

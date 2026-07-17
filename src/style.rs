@@ -13,7 +13,7 @@ pub(crate) struct Palette {
     /// Placeholder metavariables in a usage synopsis (`<name>`, `<file>`).
     pub(crate) arg: &'static str,
     /// Inline code spans in prose — the backtick-quoted tokens of help text
-    /// (`--flag`, `ops help run`, `.ops.toml`). The backticks themselves are
+    /// (`--flag`, `sbx help run`, `.sbx.toml`). The backticks themselves are
     /// dropped when this style is active; kept verbatim when color is off.
     pub(crate) code: &'static str,
     /// Section headers (`Usage:`, `Options:`, `env:`, …).

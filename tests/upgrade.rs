@@ -1,11 +1,11 @@
-//! Integration tests for `ops upgrade`, exercising the built binary end to end.
+//! Integration tests for `sbx upgrade`, exercising the built binary end to end.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-fn ops() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ops"))
+fn sbx() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_sbx"))
 }
 
 /// A unique temp dir removed on drop, so the binary's lock writes land in a throwaway
@@ -17,7 +17,7 @@ impl TmpDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("ops-upgrade-it-{}-{n}", std::process::id()));
+        d.push(format!("sbx-upgrade-it-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -56,10 +56,10 @@ fn force_remove(path: &Path) {
 fn upgrade_rejects_an_unknown_target() {
     // The target is parsed before anything else, so this needs neither nix nor a data
     // directory.
-    let out = ops()
+    let out = sbx()
         .args(["upgrade", "bogus"])
         .output()
-        .expect("spawn ops upgrade");
+        .expect("spawn sbx upgrade");
     assert_eq!(out.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("unknown upgrade target"),
@@ -71,7 +71,7 @@ fn upgrade_rejects_an_unknown_target() {
 /// The revision the per-project flake lock records for `reference`, if any. The lock lives under
 /// the single project's directory; each line is `<reference>\t<rev>\t<locked-ref>`.
 fn flake_lock_rev(data: &Path, reference: &str) -> Option<String> {
-    let projects = data.join("ops").join("projects");
+    let projects = data.join("sbx").join("projects");
     for entry in std::fs::read_dir(&projects).ok()?.flatten() {
         let lock = entry.path().join("flake-packages.lock");
         if let Ok(text) = std::fs::read_to_string(&lock) {
@@ -88,7 +88,7 @@ fn flake_lock_rev(data: &Path, reference: &str) -> Option<String> {
 
 #[test]
 fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
-    // A real resolution of a declared `flake:` package: `ops upgrade flake` resolves the floating
+    // A real resolution of a declared `flake:` package: `sbx upgrade flake` resolves the floating
     // reference to its current immutable revision with `nix flake metadata` and writes the
     // per-project flake lock — a host-side lock rewrite (the new pin builds in-cage at the next
     // launch). Teeth: the lock records a 40-hex revision for the declared reference, and a second
@@ -99,33 +99,33 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
     let state = TmpDir::new();
     let reference = "github:numtide/flake-utils";
     std::fs::write(
-        proj.path().join(".ops.toml"),
+        proj.path().join(".sbx.toml"),
         format!("[packages]\nfutil = \"flake:{reference}\"\n"),
     )
     .unwrap();
 
     // The flake package is a trusted-only field, so the project must be trusted to be rolled.
-    let trusted = ops()
-        .args(["trust", ".ops.toml"])
+    let trusted = sbx()
+        .args(["trust", ".sbx.toml"])
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops trust");
+        .expect("spawn sbx trust");
     assert!(
         trusted.status.success(),
-        "ops trust failed: {}",
+        "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
     );
 
     let run = || {
-        ops()
+        sbx()
             .args(["upgrade", "flake"])
             .current_dir(proj.path())
             .env("XDG_DATA_HOME", data.path())
             .env("XDG_STATE_HOME", state.path())
             .output()
-            .expect("spawn ops upgrade flake")
+            .expect("spawn sbx upgrade flake")
     };
 
     let first = run();
@@ -150,20 +150,20 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
         "the lock revision must be 40-hex, got {rev1}"
     );
 
-    // `ops config show` surfaces the pin the upgrade just wrote — host-side, no nix, no network.
+    // `sbx config show` surfaces the pin the upgrade just wrote — host-side, no nix, no network.
     // This is the make-or-break for the display: the lock key the upgrade wrote must be the
     // locator the view looks up by, or no rev would ever show. The project is trusted, so the
     // flake package is admitted (not withheld).
-    let shown = ops()
+    let shown = sbx()
         .args(["config", "show"])
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", data.path())
         .env("XDG_STATE_HOME", state.path())
         .output()
-        .expect("spawn ops config show");
+        .expect("spawn sbx config show");
     assert!(
         shown.status.success(),
-        "ops config show failed: {}",
+        "sbx config show failed: {}",
         String::from_utf8_lossy(&shown.stderr)
     );
     let out = String::from_utf8_lossy(&shown.stdout);
@@ -172,7 +172,7 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
         out.contains(&format!("futil -> flake:{reference}"))
             && out.contains(&format!("@ {short}"))
             && out.contains("pinned"),
-        "ops config show must display the pinned flake revision {short}:\n{out}"
+        "sbx config show must display the pinned flake revision {short}:\n{out}"
     );
 
     // A second upgrade moments later resolves the same HEAD — an idempotent no-op.
@@ -193,16 +193,16 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
 #[test]
 fn upgrade_resolves_and_locks_the_default_channel() {
     // A real resolution of the rolling channel: needs nix and the network. Skipped
-    // (not failed) where the first `ops upgrade` cannot run.
+    // (not failed) where the first `sbx upgrade` cannot run.
     let data = TmpDir::new();
     let proj = TmpDir::new();
     let run = || {
-        ops()
+        sbx()
             .args(["upgrade", "nix"])
             .current_dir(proj.path())
             .env("XDG_DATA_HOME", data.path())
             .output()
-            .expect("spawn ops upgrade")
+            .expect("spawn sbx upgrade")
     };
 
     let first = run();
@@ -221,7 +221,7 @@ fn upgrade_resolves_and_locks_the_default_channel() {
     );
     // the first resolution writes the global lock
     assert!(
-        data.path().join("ops/nixpkgs.lock").is_file(),
+        data.path().join("sbx/nixpkgs.lock").is_file(),
         "upgrade must write the global lock"
     );
 

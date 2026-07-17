@@ -1,6 +1,6 @@
 # Enforcement stack
 
-The **primary** security control in `ops` is the bind layout. Because the cage
+The **primary** security control in `sbx` is the bind layout. Because the cage
 runs as *your* uid (same-uid), confidentiality comes from a secret being **absent**
 from the cage, not from any in-kernel permission check — see
 [Security model](security-model.md). Everything on this page is **defense in depth
@@ -10,7 +10,7 @@ layer is not the whole boundary.
 
 See also: [Security model](security-model.md) · [`limits`](../configuration/limits.md) · [Networking](../networking/README.md).
 
-Every launch — `ops run`, `ops shell`, `ops app`, and even the `ops doctor`
+Every launch — `sbx run`, `sbx shell`, `sbx app`, and even the `sbx doctor`
 smoke — goes through the same three always-on layers:
 
 1. **bubblewrap** — namespaces, `no_new_privs`, all capabilities dropped.
@@ -36,7 +36,7 @@ there is no setuid binary to attack. The hardening flags below are emitted
   (`TIOCSTI`) at the source.
 
 > **The `--new-session` nuance.** `--new-session` is the default and is used by
-> `ops run`. `ops shell` omits it because an interactive shell needs a controlling
+> `sbx run`. `sbx shell` omits it because an interactive shell needs a controlling
 > terminal for job control: the pty supervisor establishes the session itself and
 > keeps the pty master, so the launching terminal stays unreachable either way.
 
@@ -47,11 +47,11 @@ a VPN tunnel, KVM, or FUSE can bind a specific device node with a trusted
 trusted-only surface reduction undone, not a change to the namespace/capability boundary.
 
 The absence of a capability-bearing user namespace is a **hard failure**, never a
-silent fallback to a weaker engine. See [`ops doctor`](../getting-started/doctor.md).
+silent fallback to a weaker engine. See [`sbx doctor`](../getting-started/doctor.md).
 
 ## 2. The seccomp denylist (Posture A)
 
-bwrap ships no default seccomp filter; `ops` compiles its own with
+bwrap ships no default seccomp filter; `sbx` compiles its own with
 [`seccompiler`](https://crates.io/crates/seccompiler) (pure Rust, so the static
 binary stays self-contained) and hands it to bwrap as **two cBPF filters** via
 `--add-seccomp-fd`. The policy is **default-allow with a denylist** — pragmatic for
@@ -112,7 +112,7 @@ An agent self-equips by running `nix build` / `mise install` **inside** the cage
 and nix's own build sandbox wants exactly the `unshare` / `clone(NEWNS)` / `mount` /
 `pivot_root` syscalls this filter refuses. Because seccomp is process-wide and
 inherited, one filter cannot allow those for nix yet deny them for the agent. So
-`ops` forces nix's `sandbox = false` and `filter-syscalls = false` (via a
+`sbx` forces nix's `sandbox = false` and `filter-syscalls = false` (via a
 `NIX_CONFIG` that a project cannot smuggle, since those keys are on the
 untrusted-only environment denylist). The cage — not nix's inner build sandbox — is
 the boundary, and the agent already runs arbitrary code in it, so this is within the
@@ -141,13 +141,13 @@ these three reachable.
 
 The filters target `x86_64` and `aarch64`. On a host without `CONFIG_SECCOMP` the
 filter cannot load, and the launch **fails closed** — seccomp is a mandatory control
-here, not best-effort. It is loaded on every launch path, including the `ops doctor`
+here, not best-effort. It is loaded on every launch path, including the `sbx doctor`
 smoke, so `doctor` proves the real launch path *with* the filter active.
 
 ## 3. cgroup v2 resource limits (anti-DoS)
 
 Nothing in the namespace, seccomp, or egress layers bounds *resource consumption* —
-an in-cage agent could fork-bomb, exhaust memory, or peg the CPU. `ops` wraps the
+an in-cage agent could fork-bomb, exhaust memory, or peg the CPU. `sbx` wraps the
 cage in a **transient systemd user scope**
 (`systemd-run --user --scope`) carrying cgroup v2 limits. `systemd-run` exec-chains
 into the cage (it registers the scope, moves itself in, then execs), so it behaves
@@ -174,7 +174,7 @@ Resource limits are hardening, not the security boundary — so unlike the
 namespace / seccomp / egress layers, they **never hard-fail**. Where there is no
 cgroup v2, no reachable systemd user session, no `systemd-run`, or an
 undelegated controller, the cage launches **without** limits rather than regressing
-where it previously worked. `ops doctor` reports whether it could create a limited
+where it previously worked. `sbx doctor` reports whether it could create a limited
 scope on this host.
 
 ### Overriding the limits

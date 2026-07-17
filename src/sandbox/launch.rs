@@ -2,10 +2,10 @@
 //! process.
 //!
 //! Two launch models, by terminal policy:
-//! - `ops run` is non-interactive: it execs bwrap and lets it *replace* the ops
+//! - `sbx run` is non-interactive: it execs bwrap and lets it *replace* the sbx
 //!   process, so the command inherits the real stdio and its exit status becomes
-//!   ops's. The spec uses [`TerminalPolicy::NewSession`].
-//! - `ops shell` is interactive: ops stays alive as a **pty supervisor**. It
+//!   sbx's. The spec uses [`TerminalPolicy::NewSession`].
+//! - `sbx shell` is interactive: sbx stays alive as a **pty supervisor**. It
 //!   gives the sandbox a private controlling terminal (so job control works
 //!   inside) and relays bytes to and from the real terminal (which the sandbox
 //!   therefore cannot reach). The spec uses [`TerminalPolicy::PrivateTty`], which
@@ -15,7 +15,7 @@
 //! The supervisor also relays terminal resizes: it catches `SIGWINCH` on the real
 //! terminal and pushes the new window size onto the pty master, so the kernel
 //! delivers `SIGWINCH` to the cage's foreground process group and an interactive
-//! TUI reflows live. Interactive `ops app` launches ride this same supervisor.
+//! TUI reflows live. Interactive `sbx app` launches ride this same supervisor.
 //!
 //! Known gaps in the supervisor (named, not silent):
 //! - terminal-state restore is a RAII guard, so it covers normal/error/panic
@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
-/// the engine, ops's store layout, the current directory, the resolved
+/// the engine, sbx's store layout, the current directory, the resolved
 /// configuration, the effective nixpkgs reference for this launch, and the base
 /// userland (provisioned against that same reference).
 ///
@@ -69,7 +69,7 @@ struct Prepared {
     /// the project's tools. **Not** the reference for the mise engine — see `engine`.
     nixpkgs: String,
     /// The reference for the mise engine, from its dedicated lock (it tracks the global
-    /// channel but rolls independently via `ops upgrade mise`). mise runs in its own
+    /// channel but rolls independently via `sbx upgrade mise`). mise runs in its own
     /// store view, free of the one-channel rule, so it may sit on a different revision
     /// than `nixpkgs`. Drives both the in-cage mise (the base userland) and the
     /// host-side `[env]` driver.
@@ -77,18 +77,18 @@ struct Prepared {
     userland: Userland,
 }
 
-/// `ops run [--] <cmd>`: run a command inside the project sandbox, replacing the
-/// ops process so the command's exit status becomes ops's.
+/// `sbx run [--] <cmd>`: run a command inside the project sandbox, replacing the
+/// sbx process so the command's exit status becomes sbx's.
 pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override) -> ExitCode {
     if cmd.is_empty() {
-        eprintln!("ops: usage: {}", crate::help::synopsis("run"));
+        eprintln!("sbx: usage: {}", crate::help::synopsis("run"));
         return ExitCode::from(2);
     }
     let mut prep = match prepare_with(&ov) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    // The override is the authoritative final word over the resolved baseline (`ops run`/`ops
+    // The override is the authoritative final word over the resolved baseline (`sbx run`/`sbx
     // shell` have no app overlay, so here is that final point).
     if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
         return code;
@@ -113,7 +113,7 @@ fn apply_launch_override(
 ) -> Result<(), ExitCode> {
     cfg.apply_override(ov).map_err(|errs| {
         for e in errs {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
         }
         ExitCode::from(2)
     })
@@ -150,14 +150,14 @@ fn warn_ask_under_detach(network: &crate::config::NetworkPolicy) {
             crate::diag::warn(
                 "`ask` egress under --detach with no `ask_timeout`: a background session has no \
                  terminal to prompt, so an undecided request parks indefinitely. Set \
-                 `[network] ask_timeout`, or answer it with `ops net pending`.",
+                 `[network] ask_timeout`, or answer it with `sbx net pending`.",
             );
         }
     }
 }
 
 /// Run the cage in the foreground: this process becomes the cage (exec) or supervises it
-/// (allowlist), and its exit status becomes ops's.
+/// (allowlist), and its exit status becomes sbx's.
 fn launch_foreground(
     prep: Prepared,
     runtime: binds::Runtime,
@@ -172,17 +172,17 @@ fn launch_foreground(
     register(prep.layout.data_dir(), &spec, kind, runtime);
 
     match guard {
-        // The default postures: exec-replace, so the command's exit status becomes ops's.
+        // The default postures: exec-replace, so the command's exit status becomes sbx's.
         // The pid and its start time survive the exec, so the registry record keeps matching
         // the sandbox and is reclaimed by liveness pruning once it exits.
         None => {
             // On success this never returns; reaching past it means exec itself failed.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
-            eprintln!("ops: failed to launch the sandbox: {err}");
+            eprintln!("sbx: failed to launch the sandbox: {err}");
             ExitCode::FAILURE
         }
         // A network allowlist, a forward forwarder, a filtered D-Bus proxy, or an in-cage portal:
-        // ops cannot exec-replace, because a host thread or child (the filtering proxy, the forward
+        // sbx cannot exec-replace, because a host thread or child (the filtering proxy, the forward
         // accept pumps, the `xdg-dbus-proxy` process) must outlive the cage, and the in-cage portal's
         // host runtime directory must be cleaned up when the launch ends rather than leaked. Supervise
         // instead — fork bwrap, wait, propagate the exit status — keeping them alive and the guard
@@ -225,7 +225,7 @@ fn launch_detached(
     // eventual `exec` of bwrap.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         eprintln!(
-            "ops: cannot create the detach pipe: {}",
+            "sbx: cannot create the detach pipe: {}",
             io::Error::last_os_error()
         );
         return ExitCode::FAILURE;
@@ -241,7 +241,7 @@ fn launch_detached(
                 libc::close(write_fd);
             }
             eprintln!(
-                "ops: cannot start the detached session: {}",
+                "sbx: cannot start the detached session: {}",
                 io::Error::last_os_error()
             );
             ExitCode::FAILURE
@@ -294,7 +294,7 @@ fn detached_child(
         Ok(f) => f,
         Err(e) => {
             eprintln!(
-                "ops: cannot open the session log {}: {e}",
+                "sbx: cannot open the session log {}: {e}",
                 log_path.display()
             );
             fail_detached(write_fd);
@@ -312,7 +312,7 @@ fn detached_child(
         None => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
-            eprintln!("ops: failed to launch the sandbox: {err}");
+            eprintln!("sbx: failed to launch the sandbox: {err}");
             std::process::exit(1);
         }
         Some(guard) => {
@@ -345,12 +345,12 @@ fn detach_parent(
     if matches!(pipe.read(&mut byte), Ok(1) if byte[0] == DETACH_READY) {
         let log = detach_log_path(data_dir, child as u32);
         eprintln!(
-            "ops: started `{label}` as detached session {child} (logs: {})",
+            "sbx: started `{label}` as detached session {child} (logs: {})",
             log.display()
         );
         eprintln!(
-            "ops: `ops session ls` lists it, `ops session attach {child}` opens a shell inside its live cage, \
-             `ops session stop {child}` ends it."
+            "sbx: `sbx session ls` lists it, `sbx session attach {child}` opens a shell inside its live cage, \
+             `sbx session stop {child}` ends it."
         );
         ExitCode::SUCCESS
     } else {
@@ -358,7 +358,7 @@ fn detach_parent(
         // error is already on this terminal). Reap it.
         // SAFETY: `waitpid` on our own child.
         unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
-        eprintln!("ops: the detached session failed to start (see the error above).");
+        eprintln!("sbx: the detached session failed to start (see the error above).");
         ExitCode::FAILURE
     }
 }
@@ -428,12 +428,12 @@ fn redirect_to_log(log: &File) {
     }
 }
 
-/// `ops app <name>`: launch the named application profile — the project sandbox baseline
+/// `sbx app <name>`: launch the named application profile — the project sandbox baseline
 /// plus the app's gated overlay, running the command the app declares. Apps run in the same
-/// locked-down posture as `ops run`; the overlay's security fields took effect only if their
+/// locked-down posture as `sbx run`; the overlay's security fields took effect only if their
 /// source was trusted (the global config or a trusted project), so launching an app on
-/// untrusted code is as safe as `ops run` there.
-/// The result of an `ops app <name>` launch: the exit code, plus — for a `--net-learn` run — the
+/// untrusted code is as safe as `sbx run` there.
+/// The result of an `sbx app <name>` launch: the exit code, plus — for a `--net-learn` run — the
 /// rules synthesized from the egress the run was refused. The caller (`app_cmd`) writes them to the
 /// chosen profile (or prints them under `--dry-run`); keeping the write in `main` keeps the trust
 /// gating and re-trust out of the sandbox module.
@@ -463,19 +463,19 @@ pub(crate) fn app(
         Err(code) => return AppOutcome::plain(code),
     };
     let Some(app) = prep.cfg.apps.remove(name) else {
-        eprintln!("ops: no app named `{name}`.{}", available_apps(&prep.cfg));
+        eprintln!("sbx: no app named `{name}`.{}", available_apps(&prep.cfg));
         return AppOutcome::plain(ExitCode::from(2));
     };
     if app.cmd.is_empty() {
         eprintln!(
-            "ops: app `{name}` declares no command — add a `cmd` to its `[app.{name}]` table."
+            "sbx: app `{name}` declares no command — add a `cmd` to its `[app.{name}]` table."
         );
         return AppOutcome::plain(ExitCode::FAILURE);
     }
     // The argv and the home scope are owned by the app; read them before the overlay is folded
     // in (which moves the app but does not touch them). The scope keys this app's persistent
     // home: one shared across projects (`Global`) or one per project (`Project`). Any trailing
-    // `ops app <name> -- <args>` are appended to the declared `cmd`, so the caller can pass a flag
+    // `sbx app <name> -- <args>` are appended to the declared `cmd`, so the caller can pass a flag
     // to the launched program (e.g. `-c` to resume) without editing the profile.
     let mut cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
     cmd.extend(extra);
@@ -483,10 +483,10 @@ pub(crate) fn app(
         crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
         crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
     };
-    eprintln!("ops: launching app `{name}`");
+    eprintln!("sbx: launching app `{name}`");
     prep.cfg.merge_app(app);
     // The override is the authoritative final word — applied *after* the app overlay so a one-shot
-    // `ops app <name> --config …`/`OPS_*` beats the app's own posture, not the other way round.
+    // `sbx app <name> --config …`/`SBX_*` beats the app's own posture, not the other way round.
     if let Err(code) = apply_launch_override(&mut prep.cfg, ov) {
         return AppOutcome::plain(code);
     }
@@ -503,7 +503,7 @@ pub(crate) fn app(
             crate::config::NetworkPolicy::Allowlist(p) => p.clone(),
             other => {
                 eprintln!(
-                    "ops: --net-learn needs a filtering network posture (mode allow/deny/ask); \
+                    "sbx: --net-learn needs a filtering network posture (mode allow/deny/ask); \
                      app `{name}` has `{}` — nothing logs egress to learn from.",
                     network_posture_name(other)
                 );
@@ -531,7 +531,7 @@ pub(crate) fn app(
 
     // An interactive foreground launch (a real terminal on stdin) runs under the pty supervisor:
     // the agent's TUI gets a private controlling terminal and live terminal-resize propagation
-    // (the same isolation `ops shell` uses — the real terminal stays unreachable). A detached
+    // (the same isolation `sbx shell` uses — the real terminal stays unreachable). A detached
     // agent has no terminal, and a piped/non-tty invocation must not be handed one, so both keep
     // the exec-replace / supervised `NewSession` path.
     let code = if interactive {
@@ -552,8 +552,8 @@ fn network_posture_name(network: &crate::config::NetworkPolicy) -> &'static str 
     }
 }
 
-/// Run an `ops app` launch in the foreground and return the egress it logged, for `--net-learn`.
-/// Interactive launches use the pty supervisor (a private controlling terminal, like `ops shell`);
+/// Run an `sbx app` launch in the foreground and return the egress it logged, for `--net-learn`.
+/// Interactive launches use the pty supervisor (a private controlling terminal, like `sbx shell`);
 /// a non-tty one supervises directly. Either way the egress guard is held for the whole run, then
 /// its log is snapshotted before the guard is dropped — so the returned events are the run's full
 /// record. A `build()` failure is `Err(code)`, distinct from a clean run with no denials (`Ok` with
@@ -581,7 +581,7 @@ fn launch_foreground_learning(
         match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
             Ok(c) => ExitCode::from(c as u8),
             Err(e) => {
-                eprintln!("ops: sandbox session failed: {e}");
+                eprintln!("sbx: sandbox session failed: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -609,24 +609,24 @@ fn available_apps(cfg: &crate::config::Resolved) -> String {
     }
 }
 
-/// `ops mise [args...]`: run mise inside the project's open cage, where it can
-/// self-equip the project's `nix:` tools (`ops mise install nix:<pkg>`) into the
-/// project's own writable store. Sugar over `ops run -- mise [args...]`: mise is
+/// `sbx mise [args...]`: run mise inside the project's open cage, where it can
+/// self-equip the project's `nix:` tools (`sbx mise install nix:<pkg>`) into the
+/// project's own writable store. Sugar over `sbx run -- mise [args...]`: mise is
 /// present in every cage with the `nix:` backend plugin registered, so the only
 /// thing this adds is sparing the `run --` prefix.
 ///
 /// A tool the agent *activates* (`mise use [-g] nix:<pkg>`) is on PATH in later
-/// launches — through the shims dir on PATH for `ops run`, and `mise activate` for the
-/// `ops shell` — and persists in the project's store. A bare `mise install` (not
+/// launches — through the shims dir on PATH for `sbx run`, and `mise activate` for the
+/// `sbx shell` — and persists in the project's store. A bare `mise install` (not
 /// activated) persists too and `mise exec`/`mise which` resolve it, but it is not on
 /// PATH, matching mise's own install-vs-use split. This path is intentionally open — it
 /// works whether or not the project is trusted, the agent-self-equip posture — unlike
-/// `ops run`'s host-side `nix:` provisioning, which stays trusted-only and is a parallel
+/// `sbx run`'s host-side `nix:` provisioning, which stays trusted-only and is a parallel
 /// path that does not share state with what mise installs here.
 pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
     let mut cmd = vec![OsString::from("mise")];
     cmd.extend(args);
-    // `ops mise` is a passthrough — every argument is mise's, so it takes no one-shot override.
+    // `sbx mise` is a passthrough — every argument is mise's, so it takes no one-shot override.
     run(cmd, false, crate::config::Override::none())
 }
 
@@ -634,7 +634,7 @@ pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
 /// group can outlive the config it was derived from. Mirrors [`binds::Runtime`], which borrows
 /// the name; [`GroupHome::runtime`] rebuilds the borrowing form at launch.
 enum GroupHome {
-    /// The project's default shell home — where `ops run`/`ops shell` equip baseline tools.
+    /// The project's default shell home — where `sbx run`/`sbx shell` equip baseline tools.
     ProjectDefault,
     /// An app's home shared across projects (`home_scope = "global"`).
     GlobalApp(String),
@@ -668,7 +668,7 @@ struct MiseGroup {
 }
 
 /// The `mise:` `[packages]` groups to roll forward — generic over every declared group: the
-/// project baseline (equipped in its default home by `ops run`/`ops shell`) and each app
+/// project baseline (equipped in its default home by `sbx run`/`sbx shell`) and each app
 /// (equipped in its own home, keyed by `home_scope`), each with its merged trusted `mise:`
 /// token set. A group with no trusted `mise:` token — and an app with no command — is omitted,
 /// so a project or app without any produces no cage, and no app is special-cased. Trusted-only
@@ -715,7 +715,7 @@ fn mise_package_groups(cfg: &crate::config::Resolved) -> Vec<MiseGroup> {
 
 /// How many declared `mise:` packages are withheld for being untrusted — across the project
 /// baseline and each app's own overlay. Only a count: the per-package withholding reason is
-/// already warned on the launch path, so `ops upgrade` just needs to not read as "none declared".
+/// already warned on the launch path, so `sbx upgrade` just needs to not read as "none declared".
 fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
     let untrusted_mise = |pkgs: &[crate::config::Package]| {
         pkgs.iter()
@@ -745,7 +745,7 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
 /// Unlike the host-side lock rewrites (`nix:`, the engine, `nix:` tools), the roll needs the
 /// sandbox — but only when there is something to roll: the groups are computed from the
 /// already-resolved `cfg` first, so a project with no `mise:` package costs nothing here and
-/// `ops upgrade nix`/`all` keeps its cheap, sandbox-free common path. With work to do, a host
+/// `sbx upgrade nix`/`all` keeps its cheap, sandbox-free common path. With work to do, a host
 /// that cannot sandbox warns and rolls nothing rather than failing (best-effort, like the
 /// cgroup limits).
 pub(crate) fn upgrade_mise_packages(
@@ -753,14 +753,14 @@ pub(crate) fn upgrade_mise_packages(
     pal: &crate::style::Palette,
 ) -> bool {
     let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
-    println!("{h}ops upgrade — mise packages{r}");
+    println!("{h}sbx upgrade — mise packages{r}");
     let groups = mise_package_groups(cfg);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
     // read as "nothing declared" — parity with the `nix:` tools path, which warns the same.
     let withheld = withheld_mise_packages(cfg);
     if withheld > 0 {
         println!(
-            "  {warn}{withheld} mise: package(s) withheld (untrusted){r} — not rolled; run `ops trust`."
+            "  {warn}{withheld} mise: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
         );
     }
     if groups.is_empty() {
@@ -775,7 +775,7 @@ pub(crate) fn upgrade_mise_packages(
         Ok(p) => p,
         Err(_) => {
             // prepare() already printed the pointed reason (missing bwrap/userns/nix).
-            crate::diag::warn("mise packages: skipped — no usable sandbox; see `ops doctor`");
+            crate::diag::warn("mise packages: skipped — no usable sandbox; see `sbx doctor`");
             return true;
         }
     };
@@ -828,14 +828,14 @@ pub(crate) fn upgrade_mise_packages(
     ok
 }
 
-/// `ops gc [--all] [--prune]`: reclaim ops's store space.
+/// `sbx gc [--all] [--prune]`: reclaim sbx's store space.
 ///
 /// By default it sweeps the **current** project's store (see [`sweep_current`]). With `--all` it
 /// also, across all projects: reaps whole runtime trees whose project directory is gone (see
 /// [`reap_dead_trees`]), then garbage-collects the **shared** store — the channel revisions left
-/// behind by `ops upgrade` and the tools of reaped projects (see [`shared_store_gc`]). The
+/// behind by `sbx upgrade` and the tools of reaped projects (see [`shared_store_gc`]). The
 /// cross-project passes run **first** and are independent of the sandbox/nix prerequisites the
-/// current-project sweep needs — so `ops gc --all` reclaims even from a directory that is not a
+/// current-project sweep needs — so `sbx gc --all` reclaims even from a directory that is not a
 /// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
 /// the destructive form.
 pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCode {
@@ -843,13 +843,13 @@ pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCod
         match crate::store::Layout::from_env() {
             Some(layout) => {
                 // Prune stale session records, then collect the shared store. Reaping whole
-                // per-project runtime *trees* is `ops projects rm`; `--all` here is purely the
+                // per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the
                 // nix-store side — the shared store's orphaned closures across every project.
                 let _ = session_housekeeping(&layout, pal);
                 shared_store_gc(&layout, prune, pal);
             }
             None => eprintln!(
-                "ops gc: cannot locate ops's data directory; skipping the shared-store housekeeping."
+                "sbx gc: cannot locate sbx's data directory; skipping the shared-store housekeeping."
             ),
         }
     }
@@ -861,7 +861,7 @@ pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCod
         // code is flattened.
         Err(_) if all => {
             eprintln!(
-                "ops gc: the current project's store was not swept (see above); the shared-store collection ran."
+                "sbx gc: the current project's store was not swept (see above); the shared-store collection ran."
             );
             ExitCode::SUCCESS
         }
@@ -870,7 +870,7 @@ pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCod
 }
 
 /// Prune dead session records and report it (the dedicated housekeeping pass the registry deferred:
-/// an `ops run` record with no post-exec hook lingered until the next `ops session ls`). Returns the ids of
+/// an `sbx run` record with no post-exec hook lingered until the next `sbx session ls`). Returns the ids of
 /// projects with a *live* session — hashing each recorded canonical path — so the dead-tree reap
 /// can skip a tree a session still holds without scanning the registry a second time.
 fn session_housekeeping(
@@ -881,7 +881,7 @@ fn session_housekeeping(
         Ok((live, pruned)) => {
             if pruned > 0 {
                 println!(
-                    "{}ops:{} pruned {}{pruned}{} stale session record(s); {} live.",
+                    "{}sbx:{} pruned {}{pruned}{} stale session record(s); {} live.",
                     pal.head,
                     pal.reset,
                     pal.name,
@@ -895,7 +895,7 @@ fn session_housekeeping(
         }
         Err(e) => {
             eprintln!(
-                "ops gc: cannot read the session registry ({e}); skipping session housekeeping."
+                "sbx gc: cannot read the session registry ({e}); skipping session housekeeping."
             );
             std::collections::BTreeSet::new()
         }
@@ -909,7 +909,7 @@ fn session_housekeeping(
 /// session holds it. Markerless trees (their project path unknown) are listed for a manual decision
 /// by default; `prune_unidentified` opts into reaping them without a deadness proof (the
 /// `--markerless` escape hatch). Pure host-side filesystem work — no sandbox, no nix. This drives
-/// the bulk `ops projects rm --dead` / `--markerless` sweeps.
+/// the bulk `sbx projects rm --dead` / `--markerless` sweeps.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
@@ -924,7 +924,7 @@ fn reap_dead_trees(
         && report.unidentified.is_empty()
         && report.reaped_unidentified.is_empty()
     {
-        println!("{h}ops projects rm:{r} {dim}no dead project trees to reclaim.{r}");
+        println!("{h}sbx projects rm:{r} {dim}no dead project trees to reclaim.{r}");
         return;
     }
 
@@ -946,14 +946,14 @@ fn reap_dead_trees(
     if !report.dead.is_empty() {
         if prune {
             println!(
-                "{h}ops projects rm:{r} reclaimed {} dead project tree(s), freed up to {}.",
+                "{h}sbx projects rm:{r} reclaimed {} dead project tree(s), freed up to {}.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
         } else {
             println!(
-                "{h}ops projects rm:{r} {} dead project tree(s) reclaimable (up to {}) — \
-                 run `ops projects rm --dead --yes` to reclaim.",
+                "{h}sbx projects rm:{r} {} dead project tree(s) reclaimable (up to {}) — \
+                 run `sbx projects rm --dead --yes` to reclaim.",
                 report.dead.len(),
                 super::gc::human_bytes(freed)
             );
@@ -974,7 +974,7 @@ fn reap_dead_trees(
     }
     if !report.reaped_unidentified.is_empty() {
         println!(
-            "{h}ops projects rm --markerless:{r} reclaimed {} markerless tree(s), freed up to {}.",
+            "{h}sbx projects rm --markerless:{r} reclaimed {} markerless tree(s), freed up to {}.",
             report.reaped_unidentified.len(),
             super::gc::human_bytes(ufreed)
         );
@@ -985,7 +985,7 @@ fn reap_dead_trees(
     // at the apply form, the default still points at a by-hand removal (the fail-closed stance).
     for tree in &report.unidentified {
         let hint = if prune_unidentified {
-            "run `ops projects rm --markerless --yes` to reclaim (no deadness proof)"
+            "run `sbx projects rm --markerless --yes` to reclaim (no deadness proof)"
         } else {
             "remove by hand if unwanted"
         };
@@ -997,10 +997,10 @@ fn reap_dead_trees(
     }
 }
 
-/// One per-project runtime tree, classified and sized, for `ops projects [list]`.
+/// One per-project runtime tree, classified and sized, for `sbx projects [list]`.
 #[derive(serde::Serialize)]
 struct ProjectTreeView {
-    /// The tree's directory name under `<data>/projects/` — the id `ops projects rm` takes.
+    /// The tree's directory name under `<data>/projects/` — the id `sbx projects rm` takes.
     id: String,
     /// `live` (a running session holds it), `idle` (its project still exists), `dead` (the project
     /// directory is gone), or `markerless` (a legacy tree pre-dating marker recording).
@@ -1019,7 +1019,7 @@ struct ProjectTreeView {
 }
 
 /// The project id of the current working directory, so the tree you are standing in can be marked
-/// `*` in the listing and guarded against an accidental `ops projects rm <that-id>`. Best-effort:
+/// `*` in the listing and guarded against an accidental `sbx projects rm <that-id>`. Best-effort:
 /// `None` when the cwd cannot be read or canonicalized. Hashed the way a launch hashes its cwd, so
 /// the value matches the runtime tree's directory name.
 fn current_tree_id() -> Option<String> {
@@ -1029,8 +1029,8 @@ fn current_tree_id() -> Option<String> {
 }
 
 /// Gather the per-project runtime trees under `<data>/projects/`, classified and sized, sorted by
-/// id — the shared core of `ops projects [list]` (text or JSON). Live ids come from the session
-/// registry (the same self-healing housekeep `ops session ls` runs), so a tree in use reads `live`. Pure
+/// id — the shared core of `sbx projects [list]` (text or JSON). Live ids come from the session
+/// registry (the same self-healing housekeep `sbx session ls` runs), so a tree in use reads `live`. Pure
 /// host-side filesystem work — no sandbox, no nix.
 fn collect_project_trees(
     layout: &crate::store::Layout,
@@ -1065,12 +1065,12 @@ fn collect_project_trees(
     rows
 }
 
-/// List the per-project runtime trees — `ops projects` / `ops projects list`. A read-only overview
-/// (richer than `ops path`'s projects section: it adds each tree's on-disk size), in aligned text
+/// List the per-project runtime trees — `sbx projects` / `sbx projects list`. A read-only overview
+/// (richer than `sbx path`'s projects section: it adds each tree's on-disk size), in aligned text
 /// or `--json`.
 pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("ops projects: cannot locate ops's data directory.");
+        eprintln!("sbx projects: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
     let rows = collect_project_trees(&layout, pal);
@@ -1082,7 +1082,7 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("ops projects: failed to serialize: {e}");
+                eprintln!("sbx projects: failed to serialize: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -1090,12 +1090,12 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
 
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     if rows.is_empty() {
-        println!("{h}ops projects{r} {dim}— no per-project runtime trees.{r}");
+        println!("{h}sbx projects{r} {dim}— no per-project runtime trees.{r}");
         return ExitCode::SUCCESS;
     }
     let total: u64 = rows.iter().map(|row| row.bytes).sum();
     println!(
-        "{h}ops projects{r} {dim}({} tree(s), {}){r}",
+        "{h}sbx projects{r} {dim}({} tree(s), {}){r}",
         rows.len(),
         super::gc::human_bytes(total)
     );
@@ -1117,12 +1117,12 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         );
     }
     println!(
-        "{dim}remove one with `ops projects rm <id>`; sweep dead trees with `ops projects rm --dead --yes`.{r}"
+        "{dim}remove one with `sbx projects rm <id>`; sweep dead trees with `sbx projects rm --dead --yes`.{r}"
     );
     ExitCode::SUCCESS
 }
 
-/// Decide whether `ops projects rm` applies the removal or only previews it. A *targeted* removal
+/// Decide whether `sbx projects rm` applies the removal or only previews it. A *targeted* removal
 /// (ids named, no bulk selector) applies immediately — naming the id is the intent, like `rm`; a
 /// *bulk* selector (`--dead`/`--markerless`) previews by default and requires `--yes`. `--dry-run`
 /// forces a preview, `--yes` forces apply; the two together are contradictory (`None`).
@@ -1139,14 +1139,14 @@ pub(crate) fn rm_apply(targeted: bool, bulk: bool, dry_run: bool, yes: bool) -> 
     Some(targeted && !bulk)
 }
 
-/// Whether `ops projects rm <id>` must refuse `id` because it is the tree of the current working
+/// Whether `sbx projects rm <id>` must refuse `id` because it is the tree of the current working
 /// directory — deleting the store and home you are standing in — unless `--force` overrides it.
 /// `current` is [`current_tree_id`]; `None` (cwd unresolvable) never guards.
 fn rm_refuses_current(id: &str, current: Option<&str>, force: bool) -> bool {
     !force && current == Some(id)
 }
 
-/// Remove named project trees and/or sweep the dead/markerless ones — `ops projects rm`. Each named
+/// Remove named project trees and/or sweep the dead/markerless ones — `sbx projects rm`. Each named
 /// id is reaped through the shared [`super::gc::reap_one`] (no deadness proof — naming the id is the
 /// proof), the bulk selectors through [`reap_dead_trees`]; a live-held tree is always refused, and
 /// the current project is refused without `--force`. `apply` gates the actual deletion (a preview
@@ -1164,7 +1164,7 @@ pub(crate) fn projects_rm(
 ) -> ExitCode {
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("ops projects rm: cannot locate ops's data directory.");
+        eprintln!("sbx projects rm: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
     let live_ids = session_housekeeping(&layout, pal);
@@ -1175,8 +1175,8 @@ pub(crate) fn projects_rm(
     for id in ids {
         if !super::gc::is_safe_tree_id(id) {
             eprintln!(
-                "ops projects rm: invalid project id `{id}` — expected a single tree name \
-                 (an id `ops projects` lists), not a path."
+                "sbx projects rm: invalid project id `{id}` — expected a single tree name \
+                 (an id `sbx projects` lists), not a path."
             );
             had_error = true;
             continue;
@@ -1185,7 +1185,7 @@ pub(crate) fn projects_rm(
         // exact id would delete the store and home of this very directory. `--force` is the opt-in.
         if rm_refuses_current(id, current.as_deref(), force) {
             eprintln!(
-                "ops projects rm: {n}{id}{r} is the current project — refusing without {n}--force{r}."
+                "sbx projects rm: {n}{id}{r} is the current project — refusing without {n}--force{r}."
             );
             had_error = true;
             continue;
@@ -1193,15 +1193,15 @@ pub(crate) fn projects_rm(
         match super::gc::reap_one(&projects_dir, id, &live_ids, apply) {
             super::gc::ReapOneOutcome::NotFound => {
                 eprintln!(
-                    "ops projects rm: no project tree for id `{id}` under {}.",
+                    "sbx projects rm: no project tree for id `{id}` under {}.",
                     projects_dir.display()
                 );
                 had_error = true;
             }
             super::gc::ReapOneOutcome::Live => {
                 eprintln!(
-                    "ops projects rm: project tree {n}{id}{r} is held by a live session — \
-                     stop it first with {n}ops stop{r}, then `ops projects rm {id}`."
+                    "sbx projects rm: project tree {n}{id}{r} is held by a live session — \
+                     stop it first with {n}sbx stop{r}, then `sbx projects rm {id}`."
                 );
                 had_error = true;
             }
@@ -1218,8 +1218,8 @@ pub(crate) fn projects_rm(
                 );
                 if !apply {
                     println!(
-                        "{h}ops projects rm:{r} {n}{id}{r} removable ({}) — \
-                         run `ops projects rm {id}` (without `--dry-run`) to remove.",
+                        "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) — \
+                         run `sbx projects rm {id}` (without `--dry-run`) to remove.",
                         super::gc::human_bytes(bytes)
                     );
                 }
@@ -1236,7 +1236,7 @@ pub(crate) fn projects_rm(
             shared_store_gc(&layout, true, pal);
         } else {
             eprintln!(
-                "ops projects rm: {dim}--gc runs the shared-store collection only when the removal \
+                "sbx projects rm: {dim}--gc runs the shared-store collection only when the removal \
                  is applied (add --yes, or drop --dry-run).{r}"
             );
         }
@@ -1295,13 +1295,13 @@ mod projects_rm_tests {
 /// just-created gc root pruned (it was not in the live-set snapshot) and its closure collected,
 /// after which the launch's seed cache-misses or fails. That is **recoverable** — a re-run
 /// re-provisions, and nix's own gc lock still stops the build itself from racing the collector, so
-/// it is never corruption. Widening the ops lock to cover provisioning would make this collector
+/// it is never corruption. Widening the sbx lock to cover provisioning would make this collector
 /// wait behind minutes-long builds, so the narrow lock plus this named residual is the deliberate
 /// trade.
 fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
     let (h, r) = (pal.head, pal.reset);
     let Some(nix_store) = crate::store::resolve_nix_store(Some(layout)) else {
-        eprintln!("ops gc: nix-store not found; skipping the shared-store gc.");
+        eprintln!("sbx gc: nix-store not found; skipping the shared-store gc.");
         return;
     };
 
@@ -1310,7 +1310,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
     let _lock = match super::projectstore::lock_exclusive(layout) {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!("ops gc: cannot lock the shared store ({e}); skipping the shared-store gc.");
+            eprintln!("sbx gc: cannot lock the shared store ({e}); skipping the shared-store gc.");
             return;
         }
     };
@@ -1331,14 +1331,14 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
     let report = match super::gc::collect(&nix_store, &layout.store_dir(), prune) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("ops gc: shared-store gc failed: {e}");
+            eprintln!("sbx gc: shared-store gc failed: {e}");
             return;
         }
     };
 
     if prune {
         println!(
-            "{h}ops gc:{r} shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
+            "{h}sbx gc:{r} shared store — dropped {} stale gc root(s), collected {} store path(s), freed {}.",
             stale.len(),
             report.paths,
             super::gc::human_bytes(report.bytes)
@@ -1348,8 +1348,8 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
         // yet counted as collectable; the count of stale roots is the signal, and `--prune` frees
         // their closures on top of the orphans reported here (a lower bound).
         println!(
-            "{h}ops gc:{r} shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
-             reclaimable now ({}). Run `ops gc --all --prune` to drop the roots and reclaim their closures.",
+            "{h}sbx gc:{r} shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
+             reclaimable now ({}). Run `sbx gc --all --prune` to drop the roots and reclaim their closures.",
             stale.len(),
             report.paths,
             super::gc::human_bytes(report.bytes)
@@ -1360,7 +1360,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
 /// Reclaim the current project's own writable store.
 ///
 /// The agent self-equips into a per-project store — `flake:` builds, in-cage installs — and over
-/// time a flake revision rolled forward by `ops upgrade flake` (or a package removed outright)
+/// time a flake revision rolled forward by `sbx upgrade flake` (or a package removed outright)
 /// leaves the previous build behind. This reclaims it. Everything the project still needs is
 /// gc-rooted by a **host-resolvable** root (one whose target is a `/nix/store/<hash>` path, which
 /// the relocated store reads both in-cage and host-side): the seeded base and `nix:` tools are
@@ -1380,7 +1380,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
 /// which the caller treats as fatal — except under `--all`, where the reap has already run.
 ///
 /// Limitation (a follow-up): a build the agent roots only by an in-cage path — a raw `nix build
-/// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`ops mise`,
+/// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`sbx mise`,
 /// `nix profile`, declared `flake:` packages) — is not seen host-side and would be collected. The
 /// supported self-equip paths all root by store path, so they survive.
 fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
@@ -1390,17 +1390,17 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     let (id, project) = match binds::project_identity(&prep.cwd) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ops gc: cannot resolve the project directory: {e}");
+            eprintln!("sbx gc: cannot resolve the project directory: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
 
     // A project that was never launched has no store to reclaim. Seeding one here — just to gc it —
     // would be a heavy, possibly networked side effect, so skip instead. This is what makes
-    // `ops gc --all` safe to run from any directory: a non-project cwd is skipped, never seeded.
+    // `sbx gc --all` safe to run from any directory: a non-project cwd is skipped, never seeded.
     if !super::projectstore::store_exists(&prep.layout, &id) {
         println!(
-            "{h}ops gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
+            "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
             project.display()
         );
         return Ok(());
@@ -1411,7 +1411,7 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
         if sessions.iter().any(|s| s.project == project) {
             eprintln!(
-                "ops gc: a sandbox is running in this project — stop it first (see `ops session ls`)."
+                "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`)."
             );
             return Err(ExitCode::FAILURE);
         }
@@ -1428,12 +1428,12 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     let store = equip_for_gc(&prep)?;
     let store_dir = store.store_dir().to_path_buf();
 
-    // Drop the `ops-flake-<name>` roots of removed packages. A roll self-cleans (its root is
+    // Drop the `sbx-flake-<name>` roots of removed packages. A roll self-cleans (its root is
     // overwritten onto the new build), but a removal leaves the root pointing at an unwanted build;
     // this prunes those so the sweep reclaims them. The current set spans every runtime — the
     // baseline and each app's merged packages — so a flake package declared only in an app keeps
     // its root.
-    // Inline `[flakes.<name>]` flakes register the same `ops-flake-<name>` gcroot as a `flake:`
+    // Inline `[flakes.<name>]` flakes register the same `sbx-flake-<name>` gcroot as a `flake:`
     // package, so their names belong in the keep-set too, or the sweep would prune a live inline
     // flake's root.
     let flake_root_names = |pkgs: &[crate::config::Package]| {
@@ -1455,11 +1455,11 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     }
     let pruned = super::gc::prune_flake_roots(&store_dir, &flake_names, prune).len();
 
-    println!("{h}ops gc{r} — {n}{}{r}", project.display());
+    println!("{h}sbx gc{r} — {n}{}{r}", project.display());
     let report = match super::gc::collect(&prep.nix_store, &store_dir, prune) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("ops gc: {e}");
+            eprintln!("sbx gc: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
@@ -1478,7 +1478,7 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
         // A dry run cannot size the removed-package builds (their roots still hold them, so they are
         // not yet in the dead set), so report their count separately from the currently-dead total.
         println!(
-            "  {dim}{} store path(s) collectable now, {} would be freed — run `ops gc --prune` to reclaim.{r}",
+            "  {dim}{} store path(s) collectable now, {} would be freed — run `sbx gc --prune` to reclaim.{r}",
             report.paths,
             super::gc::human_bytes(report.bytes)
         );
@@ -1511,7 +1511,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         &prep.cfg.packages,
     )
     .map_err(|e| {
-        eprintln!("ops gc: {e}");
+        eprintln!("sbx gc: {e}");
         ExitCode::FAILURE
     })?;
     for warning in &packages.warnings {
@@ -1532,7 +1532,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ) {
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
-                eprintln!("ops gc: cannot provision deb package `{name}` ({url}): {e}");
+                eprintln!("sbx gc: cannot provision deb package `{name}` ({url}): {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -1550,7 +1550,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ) {
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
-                eprintln!("ops gc: cannot provision appimage package `{name}` ({url}): {e}");
+                eprintln!("sbx gc: cannot provision appimage package `{name}` ({url}): {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -1602,19 +1602,19 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
     }
 
     seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots).map_err(|e| {
-        eprintln!("ops gc: cannot prepare the project's store: {e}");
+        eprintln!("sbx gc: cannot prepare the project's store: {e}");
         ExitCode::FAILURE
     })
 }
 
-/// `ops shell`: an interactive shell inside the project sandbox, under a pty
+/// `sbx shell`: an interactive shell inside the project sandbox, under a pty
 /// supervisor so job control works.
 pub(crate) fn shell(ov: crate::config::Override) -> ExitCode {
     // SAFETY: `isatty` only inspects fd 0. An interactive shell needs a real
     // terminal to make raw; refuse cleanly rather than corrupt a pipe.
     if unsafe { libc::isatty(0) } != 1 {
         eprintln!(
-            "ops: `ops shell` needs a terminal on stdin (use `ops run` for non-interactive use)."
+            "sbx: `sbx shell` needs a terminal on stdin (use `sbx run` for non-interactive use)."
         );
         return ExitCode::from(2);
     }
@@ -1629,11 +1629,11 @@ pub(crate) fn shell(ov: crate::config::Override) -> ExitCode {
 }
 
 /// Launch an interactive shell in the cage for `runtime`, under a pty supervisor so job control
-/// works — the shared body of `ops shell` (the project's default home) and `ops session attach` (which
+/// works — the shared body of `sbx shell` (the project's default home) and `sbx session attach` (which
 /// reproduces a session's home, including an app's isolated one). The command is the resolved
 /// interactive shell started with `--rcfile` at the synthetic in-cage rc, which activates mise so
 /// the project's activated tools (`mise use`) manage PATH/env in the interactive shell — mise's
-/// documented interactive mechanism. (`ops run` instead reaches activated tools through the shims
+/// documented interactive mechanism. (`sbx run` instead reaches activated tools through the shims
 /// dir on PATH, with no shell to hook.) Assumes stdin is a terminal (the callers check).
 fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCode {
     let cmd = vec![
@@ -1646,11 +1646,11 @@ fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCod
 
 /// Launch `cmd` under the pty supervisor: the cage gets a *private* controlling terminal (so job
 /// control and terminal-resize propagation work inside), while the real launching terminal stays
-/// unreachable — ops holds the pty master and never execs. Shared by `ops shell`, `ops session attach`,
-/// and interactive `ops app`.
+/// unreachable — sbx holds the pty master and never execs. Shared by `sbx shell`, `sbx session attach`,
+/// and interactive `sbx app`.
 ///
 /// The session is registered and its record held by a [`RecordGuard`] that unlinks it when the
-/// session ends (ops stays alive as the supervisor, so the record is cleaned promptly rather than
+/// session ends (sbx stays alive as the supervisor, so the record is cleaned promptly rather than
 /// left for liveness pruning). The egress guard is held for the whole session too: under a network
 /// allowlist the host filtering proxy runs on a thread alongside the supervisor, and the guard
 /// unlinks its socket and CA on exit.
@@ -1662,7 +1662,7 @@ fn launch_pty_supervised(
 ) -> ExitCode {
     // A graphical app's real interface is its window, not this terminal — Ctrl+C is forwarded
     // faithfully but a GUI app may ignore it — so note how to stop it. Only for a foreground app
-    // launch (`Kind::Run`) with a display; a shell (`ops shell`/`ops session attach`, `Kind::Shell`) uses
+    // launch (`Kind::Run`) with a display; a shell (`sbx shell`/`sbx session attach`, `Kind::Shell`) uses
     // Ctrl+C normally and needs no hint. Computed before `cmd`/`runtime` move into `build`.
     let stop_hint = (matches!(kind, Kind::Run)
         && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland))
@@ -1678,7 +1678,7 @@ fn launch_pty_supervised(
     let _guard = guard;
 
     // The registered pid is this supervisor's own (`Session::current` records `std::process::id()`),
-    // which is exactly what `ops session ls` shows and `ops session stop` accepts, so the hint names the real id.
+    // which is exactly what `sbx session ls` shows and `sbx session stop` accepts, so the hint names the real id.
     if let Some(name) = stop_hint {
         let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
         eprintln!("{}", render_gui_stop_hint(&name, std::process::id(), &epal));
@@ -1688,25 +1688,25 @@ fn launch_pty_supervised(
     match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("ops: sandbox session failed: {e}");
+            eprintln!("sbx: sandbox session failed: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Render the line `ops session attach` prints before entering a live cage (stderr). Attaching is an
+/// Render the line `sbx session attach` prints before entering a live cage (stderr). Attaching is an
 /// announcement, not a completed change, so the verb stays plain; the session pid and label are the
 /// identifier (cyan) and the parenthetical is secondary detail (dim).
 fn render_attaching(pid: u32, label: &str, pal: &crate::style::Palette) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
     format!(
-        "ops: attaching to session {n}{pid}{r} ({n}{label}{r}) {dim}\
+        "sbx: attaching to session {n}{pid}{r} ({n}{label}{r}) {dim}\
          (a shell in its live cage — type `exit` to leave the agent running){r}"
     )
 }
 
-/// The name a launch shows in the graphical-app stop hint: the app name for an `ops app`, else the
-/// program's own basename for a plain `ops run` into a GUI project. Falls back to a generic word if
+/// The name a launch shows in the graphical-app stop hint: the app name for an `sbx app`, else the
+/// program's own basename for a plain `sbx run` into a GUI project. Falls back to a generic word if
 /// the command is somehow empty, so the hint is always well-formed.
 fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) -> String {
     match runtime {
@@ -1727,20 +1727,20 @@ fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) -> String {
 /// The line a foreground graphical launch prints (stderr) so the user knows how to stop it: its UI
 /// is the window, and a single Ctrl+C — though forwarded — is ignored by a GUI app (and a tray-backed
 /// window may not quit on close), so the escape hatches are named: a double Ctrl+C force-quits the
-/// session, and `ops session stop <pid>` works from any other terminal. The app name is the identifier
+/// session, and `sbx session stop <pid>` works from any other terminal. The app name is the identifier
 /// (cyan); the rest is plain, matching the restraint of the attach announcements.
 fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> String {
     let (n, r) = (pal.name, pal.reset);
     format!(
-        "ops: {n}{name}{r} is graphical — press Ctrl+C twice here to quit (closing its window may only \
-         hide it — a tray app keeps running); `ops session stop {pid}` also stops it."
+        "sbx: {n}{name}{r} is graphical — press Ctrl+C twice here to quit (closing its window may only \
+         hide it — a tray app keeps running); `sbx session stop {pid}` also stops it."
     )
 }
 
-/// `ops session attach <id> [-- command [args...]]`: join a *running* session's cage and either
+/// `sbx session attach <id> [-- command [args...]]`: join a *running* session's cage and either
 /// open an interactive shell **inside** it or run one command there — the agent's live processes,
 /// its real `/tmp`, its network — the way `docker exec` / `docker exec -it` works. `<id>` is the
-/// PID `ops session ls` shows. With no command it opens the interactive rc shell (needs a terminal);
+/// PID `sbx session ls` shows. With no command it opens the interactive rc shell (needs a terminal);
 /// with `-- command` it runs that command, driven through a pty when stdin is a terminal (so an
 /// interactive tool keeps job control) or through inherited stdio when it is a pipe/script (so bytes
 /// pass through clean for scripting). Unlike a launch, this enters namespaces bubblewrap already
@@ -1750,13 +1750,13 @@ fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> St
 /// inherent residual (the command binary comes from the agent's own mount namespace).
 pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let Some(layout) = Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ops session attach: cannot read the session registry: {e}");
+            eprintln!("sbx session attach: cannot read the session registry: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1764,7 +1764,7 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     // the terminal check, so an unknown id is reported even without a tty.
     let Some(target) = sessions.into_iter().find(|s| s.pid.to_string() == id) else {
         eprintln!(
-            "ops session attach: no live session '{id}' — run `ops session ls` to list them."
+            "sbx session attach: no live session '{id}' — run `sbx session ls` to list them."
         );
         return ExitCode::from(2);
     };
@@ -1773,24 +1773,24 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     // has one, inherited stdio otherwise — so it imposes no terminal requirement.
     let stdin_tty = unsafe { libc::isatty(0) } == 1;
     if cmd.is_empty() && !stdin_tty {
-        eprintln!("ops: `ops session attach` needs a terminal on stdin (or pass `-- command`).");
+        eprintln!("sbx: `sbx session attach` needs a terminal on stdin (or pass `-- command`).");
         return ExitCode::from(2);
     }
 
     // Locate a live process inside the cage (the session pid is the cage's host-side anchor). A
-    // `None` here means the cage has no in-namespace process left — it exited between `ops session ls` and
+    // `None` here means the cage has no in-namespace process left — it exited between `sbx session ls` and
     // now, or the host has no user namespaces (then it never had a cage).
     let Some(cage_pid) = super::attach::find_cage_pid(target.pid) else {
         eprintln!(
-            "ops session attach: session '{id}' has no live process to enter — it may have just exited \
-             (run `ops session ls`)."
+            "sbx session attach: session '{id}' has no live process to enter — it may have just exited \
+             (run `sbx session ls`)."
         );
         return ExitCode::FAILURE;
     };
     let cage = match super::attach::open_cage_handle(cage_pid) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("ops session attach: cannot open a handle to session '{id}''s cage: {e}");
+            eprintln!("sbx session attach: cannot open a handle to session '{id}''s cage: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1801,13 +1801,13 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let argv_owned = match attach_argv(&cmd) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("ops session attach: {e}");
+            eprintln!("sbx session attach: {e}");
             return ExitCode::FAILURE;
         }
     };
 
     // Only the interactive shell announces itself ("type `exit` to leave"); a command is silent
-    // like `ops run`, so its stdout/stderr are exactly the command's.
+    // like `sbx run`, so its stdout/stderr are exactly the command's.
     if cmd.is_empty() {
         let epal = crate::style::Palette::for_stream(io::stderr().is_terminal());
         eprintln!("{}", render_attaching(target.pid, &target.label(), &epal));
@@ -1824,14 +1824,14 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("ops: attach session failed: {e}");
+            eprintln!("sbx: attach session failed: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
 /// Build the in-cage argv for an attach. With no command this is the interactive shell reading the
-/// in-cage rc (mise activation + the `(ops-<slug>)` prompt), exactly like `ops shell`. With a
+/// in-cage rc (mise activation + the `(sbx-<slug>)` prompt), exactly like `sbx shell`. With a
 /// command it is `bash -c 'exec "$@"' bash <cmd> [args…]`: bash resolves `<cmd>` on the cage PATH
 /// (from the cage environment passed as its `envp`) and execs it **in place**, so the command's
 /// exit status propagates; the command is passed **positionally** (`"$@"`), so no argument is ever
@@ -1954,9 +1954,9 @@ fn supervise_attach(
 }
 
 /// Run an attach command with **inherited** stdio (no pty): fork a child that joins the cage's
-/// namespaces and execs the confined `argv_owned` inside it, keeping ops's own stdin/stdout/stderr,
+/// namespaces and execs the confined `argv_owned` inside it, keeping sbx's own stdin/stdout/stderr,
 /// then wait and mirror its exit status. This is the pipe/script path — bytes pass through clean
-/// (no pty `\n`→`\r\n` translation), so `ops session attach <id> -- cmd` composes with pipes and
+/// (no pty `\n`→`\r\n` translation), so `sbx session attach <id> -- cmd` composes with pipes and
 /// redirection. Only reached when stdin is not a terminal (a command from a terminal takes the pty
 /// path in [`supervise_attach`] for interactive job control).
 fn run_attach_direct(
@@ -1971,7 +1971,7 @@ fn run_attach_direct(
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
     argv.push(std::ptr::null());
 
-    // envp: the agent's own cage environment (PATH/proxy/CA), TERM carried through from ops.
+    // envp: the agent's own cage environment (PATH/proxy/CA), TERM carried through from sbx.
     let term = std::env::var("TERM").ok();
     let envp_owned = super::attach::build_env(environ, term.as_deref());
     let mut envp: Vec<*const libc::c_char> = envp_owned.iter().map(|c| c.as_ptr()).collect();
@@ -1980,7 +1980,7 @@ fn run_attach_direct(
     // SAFETY: between fork and exec the child touches only async-signal-safe code
     // (`attach::enter_and_exec` — raw syscalls only) with the prebuilt argv/envp/filters/pidfd. The
     // parent is single-threaded here (attach starts no egress proxy thread). The child inherits
-    // ops's stdin/stdout/stderr (`TtyMode::Inherit`), so the command's I/O passes through clean.
+    // sbx's stdin/stdout/stderr (`TtyMode::Inherit`), so the command's I/O passes through clean.
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(io::Error::last_os_error());
@@ -2021,15 +2021,15 @@ fn run_attach_direct(
     }
 }
 
-/// Render the `ops session stop --all` line for an empty registry (stdout): nothing to stop is a no-op
+/// Render the `sbx session stop --all` line for an empty registry (stdout): nothing to stop is a no-op
 /// success, so the message is secondary detail (dim).
 fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
     let (dim, r) = (pal.dim, pal.reset);
-    format!("ops session stop: {dim}no active sessions to stop.{r}")
+    format!("sbx session stop: {dim}no active sessions to stop.{r}")
 }
 
-/// `ops session stop <id>...` / `ops session stop --all`: stop running sessions. With ids, stop the named ones (the
-/// pids `ops session ls` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
+/// `sbx session stop <id>...` / `sbx session stop --all`: stop running sessions. With ids, stop the named ones (the
+/// pids `sbx session ls` shows); with `all`, stop every live session. Each session is sent SIGTERM, then
 /// SIGKILL if it has not exited within `grace`. Targets are resolved through the same
 /// liveness-validated registry `attach` uses, so a stale or reused pid is never signalled. For ids,
 /// reports each and exits 2 if any matched no live session, else 0; for `--all`, stopping nothing is
@@ -2041,23 +2041,23 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///   `<data>/egress/` on disk — the same leak any crash or `SIGKILL` of that process already
 ///   produces; a future sweep of stale egress artefacts (alongside the session housekeeping) is the
 ///   clean fix.
-/// - stopping an `ops shell` session signals its pty supervisor, whose terminal-state restore is
-///   also a RAII guard, so the owner's terminal (where that `ops shell` runs) is left in raw mode
+/// - stopping an `sbx shell` session signals its pty supervisor, whose terminal-state restore is
+///   also a RAII guard, so the owner's terminal (where that `sbx shell` runs) is left in raw mode
 ///   and needs a `reset`. Stopping a backgrounded agent — the verb's purpose — is unaffected; this
 ///   only bites the unusual case of stopping an interactive shell from another terminal. `--all`
 ///   targets *every* session, interactive shells included (a deliberate choice — "all" means all,
-///   matching how `ops session stop <id>` already treats a shell), so it can trip this residual on a shell
+///   matching how `sbx session stop <id>` already treats a shell), so it can trip this residual on a shell
 ///   open elsewhere; stop a single agent by pid to avoid it.
 pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return ExitCode::FAILURE;
     };
     let registry = session::Registry::at(layout.data_dir());
     let sessions = match registry.list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ops session stop: cannot read the session registry: {e}");
+            eprintln!("sbx session stop: cannot read the session registry: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2085,7 +2085,7 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     for id in ids {
         let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
             eprintln!(
-                "ops session stop: no live session '{id}' — run `ops session ls` to list them."
+                "sbx session stop: no live session '{id}' — run `sbx session ls` to list them."
             );
             any_missing = true;
             continue;
@@ -2114,15 +2114,15 @@ fn render_stop_outcome(
     match outcome {
         session::StopOutcome::AlreadyGone => {
             format!(
-                "ops session stop: session {n}{pid}{r} ({n}{label}{r}) {dim}had already exited{r}."
+                "sbx session stop: session {n}{pid}{r} ({n}{label}{r}) {dim}had already exited{r}."
             )
         }
         session::StopOutcome::Terminated => {
-            format!("ops session stop: {ok}stopped{r} session {n}{pid}{r} ({n}{label}{r}).")
+            format!("sbx session stop: {ok}stopped{r} session {n}{pid}{r} ({n}{label}{r}).")
         }
         session::StopOutcome::Killed => {
             format!(
-                "ops session stop: session {n}{pid}{r} ({n}{label}{r}) did not exit within {}s — \
+                "sbx session stop: session {n}{pid}{r} ({n}{label}{r}) did not exit within {}s — \
                  {warn}sent SIGKILL{r}.",
                 grace.as_secs()
             )
@@ -2131,7 +2131,7 @@ fn render_stop_outcome(
 }
 
 /// Stop one resolved session and reap its record: SIGTERM, then SIGKILL after `grace`, report the
-/// outcome by pid and label, and drop the record so `ops session ls` is clean at once rather than waiting
+/// outcome by pid and label, and drop the record so `sbx session ls` is clean at once rather than waiting
 /// for the killed process to stop reading as a zombie.
 fn stop_session(
     registry: &session::Registry,
@@ -2159,14 +2159,14 @@ fn prepare() -> Result<Prepared, ExitCode> {
 
 /// [`prepare`] with a one-shot override applied. The override's **nixpkgs channel** is applied to
 /// the loaded config *before* the lock target is chosen (the channel decides which lock the whole
-/// launch resolves against), so a `-o nixpkgs=…` / `OPS_CONFIG` channel takes effect. The rest of
+/// launch resolves against), so a `-o nixpkgs=…` / `SBX_CONFIG` channel takes effect. The rest of
 /// the override (env, binds, network, gui, limits, secret) is applied by the caller with
 /// [`crate::config::Resolved::apply_override`] — after any app overlay merges, so it beats that too.
 fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
-    // The data directory is resolved first: it is where ops looks for (and, under the
+    // The data directory is resolved first: it is where sbx looks for (and, under the
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
     let Some(layout) = Layout::from_env() else {
-        eprintln!("ops: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
         return Err(ExitCode::FAILURE);
     };
     let Some(bwrap) = crate::store::resolve_bwrap(Some(&layout)).map(|c| c.path) else {
@@ -2174,7 +2174,7 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     };
     if !matches!(crate::probe_userns(), crate::Userns::Ok) {
         eprintln!(
-            "ops: no capability-bearing user namespace — the sandbox cannot run. See `ops doctor`."
+            "sbx: no capability-bearing user namespace — the sandbox cannot run. See `sbx doctor`."
         );
         return Err(ExitCode::FAILURE);
     }
@@ -2187,7 +2187,7 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("ops: cannot read the current directory: {e}");
+            eprintln!("sbx: cannot read the current directory: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
@@ -2195,7 +2195,7 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     // The override's nixpkgs channel must land before the lock target is chosen below. A set-but-
     // invalid channel is a hard error (no safe baseline fallback for a supply-chain field).
     if let Err(e) = cfg.apply_override_channel(ov) {
-        eprintln!("ops: {e}");
+        eprintln!("sbx: {e}");
         return Err(ExitCode::from(2));
     }
     // Reject a mistyped scalar security value (network/gui/limits) now — before the expensive
@@ -2203,7 +2203,7 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     // full override (this plus the additive fields) is applied at the launch's final point.
     if let Err(errs) = cfg.validate_override(ov) {
         for e in errs {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
         }
         return Err(ExitCode::from(2));
     }
@@ -2212,12 +2212,12 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
         match effective_lock_target(&cwd, &layout, &cfg).and_then(|t| t.resolve(&nix, &layout)) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("ops: cannot resolve the nixpkgs channel: {e}");
+                eprintln!("sbx: cannot resolve the nixpkgs channel: {e}");
                 return Err(ExitCode::FAILURE);
             }
         };
     // The mise engine resolves against its own dedicated lock (the global channel source,
-    // rolled independently by `ops upgrade mise`), never this launch's possibly-pinned
+    // rolled independently by `sbx upgrade mise`), never this launch's possibly-pinned
     // base reference. Resolved *after* the base so its lock can be seeded from the base's
     // on first use (no network, and a binary update never bumps the engine — see
     // `resolve_engine_ref`). Threaded to both mise consumers: the in-cage engine (the base
@@ -2226,14 +2226,14 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
         match crate::store::resolve_engine_ref(&nix, &layout, cfg.nixpkgs_global.as_deref()) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("ops: cannot resolve the mise engine channel: {e}");
+                eprintln!("sbx: cannot resolve the mise engine channel: {e}");
                 return Err(ExitCode::FAILURE);
             }
         };
     let userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &engine_ref) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("ops: cannot resolve the sandbox userland: {e}");
+            eprintln!("sbx: cannot resolve the sandbox userland: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
@@ -2251,8 +2251,8 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
 }
 
 /// The single channel decision for the current directory — the one place that picks
-/// "which source, which lock", so the launch (resolve), `ops upgrade` (refresh), and
-/// `ops config` (display) all act on the same lock and can never drift.
+/// "which source, which lock", so the launch (resolve), `sbx upgrade` (refresh), and
+/// `sbx config` (display) all act on the same lock and can never drift.
 ///
 /// A trusted per-project `nixpkgs` pin takes precedence (its own lock); otherwise the
 /// global channel — a global-config override, else the default. Only the pinned case
@@ -2276,14 +2276,14 @@ pub(crate) fn effective_lock_target(
 }
 
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
-/// configuration resolved in [`prepare`] drives this: a trust-gated `.ops.toml` adds
+/// configuration resolved in [`prepare`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
 /// fields honored only once trusted)
 /// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
 /// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
 /// since it is a stated requirement.
-/// Establish the mountpoint-chain pins that protect ops's control plane: create each pin's host
-/// path (they are ops's own directories — creating a not-yet-existent root here is what stops the
+/// Establish the mountpoint-chain pins that protect sbx's control plane: create each pin's host
+/// path (they are sbx's own directories — creating a not-yet-existent root here is what stops the
 /// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. On the first
 /// path that cannot be created, return the error so the caller can fail the launch closed: a pin
 /// that cannot be established would leave the containing read-write bind unprotected.
@@ -2305,7 +2305,7 @@ fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<
 /// proxy, an forward loopback forwarder, or both — returned by [`build`] and held by the
 /// supervisor paths ([`run_supervised`], the `--detach` child) so the proxy/forwarder threads
 /// outlive the cage. `None` means no such resource: the launcher exec-replaces (the command's
-/// exit status becomes ops's). Dropping the guard drops both, unlinking the on-disk artifacts and
+/// exit status becomes sbx's). Dropping the guard drops both, unlinking the on-disk artifacts and
 /// closing the listeners; the threads are detached and exit when their listener closes.
 pub(crate) struct LaunchGuard {
     pub(crate) egress: Option<egress::Egress>,
@@ -2373,7 +2373,7 @@ fn build(
         crate::diag::warn(warning);
     }
 
-    // Provision the project's declared tools into ops's store, against the project's
+    // Provision the project's declared tools into sbx's store, against the project's
     // effective nixpkgs reference; their bin dirs are prepended to PATH below. A
     // withheld (untrusted) tool only warns; an admitted tool that fails to realise is
     // fatal.
@@ -2386,7 +2386,7 @@ fn build(
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ops: {e}");
+            eprintln!("sbx: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
@@ -2404,9 +2404,9 @@ fn build(
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
 
-    // `deb:` packages are provisioned host-side too (like `nix:`, not in-cage like `flake:`): ops
+    // `deb:` packages are provisioned host-side too (like `nix:`, not in-cage like `flake:`): sbx
     // resolves the `.deb` URL to a hash (pinned in the per-project lock), builds the generated
-    // unpack+autoPatchelf derivation into ops's store, prepends its bin to PATH, and seeds its
+    // unpack+autoPatchelf derivation into sbx's store, prepends its bin to PATH, and seeds its
     // closure (its root joins `packages.roots`). A declared package is a requirement — a
     // provisioning failure aborts the launch naming it, never runs without it.
     for (name, url) in super::packages::deb_packages(&prep.cfg.packages) {
@@ -2423,7 +2423,7 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("ops: cannot provision deb package `{name}` ({url}): {e}");
+                eprintln!("sbx: cannot provision deb package `{name}` ({url}): {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2432,7 +2432,7 @@ fn build(
     // `appimage:` packages are provisioned host-side too (the exact `deb:` shape — the AppImage's
     // squashfs is extracted at build time, never self-mounted at runtime, which the seccomp cage
     // forbids): resolve the URL to a hash (pinned in the per-project lock), build the generated
-    // extract+autoPatchelf derivation into ops's store, prepend its bin to PATH, and seed its
+    // extract+autoPatchelf derivation into sbx's store, prepend its bin to PATH, and seed its
     // closure. A declared package is a requirement — a provisioning failure aborts the launch.
     for (name, url) in super::packages::appimage_packages(&prep.cfg.packages) {
         match super::appimage::provision(
@@ -2448,7 +2448,7 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("ops: cannot provision appimage package `{name}` ({url}): {e}");
+                eprintln!("sbx: cannot provision appimage package `{name}` ({url}): {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2461,14 +2461,14 @@ fn build(
     // out-link is keyed by the (validated) package name under the persistent home.
     let flake_pkgs = super::packages::flake_packages(&prep.cfg.packages);
     // Consult the per-project flake lock: a pinned package builds its locked (immutable) ref into
-    // an out-link keyed by that revision, so an `ops upgrade flake` that moved the pin rebuilds at
+    // an out-link keyed by that revision, so an `sbx upgrade flake` that moved the pin rebuilds at
     // this launch (the rev-keyed path does not yet exist). An unpinned package floats — it builds
     // the declared ref into a name-keyed out-link, the v1 behaviour kept for a project that never
-    // ran `ops upgrade flake`.
+    // ran `sbx upgrade flake`.
     let flake_lock = read_flake_lock(prep, &flake_pkgs);
     // Each triple carries the build ref, the out-link, and the package name — the name keys the
     // host-resolvable gc root the build registers, so a roll re-points one root and a host-side
-    // `ops gc` keeps the current build while collecting the rolled-away one.
+    // `sbx gc` keeps the current build while collecting the rolled-away one.
     let mut flake_pairs: Vec<(String, PathBuf, String)> = Vec::with_capacity(flake_pkgs.len());
     for (name, reference) in &flake_pkgs {
         // A pinned package builds its locked (immutable) ref; an unpinned one the declared ref.
@@ -2482,7 +2482,7 @@ fn build(
     }
 
     // Inline `[flakes.<name>]` flakes: stage each `flake.nix` to a content-keyed directory on disk,
-    // bind it read-only into the cage at `/opt/ops/flakes/<name>`, and build `path:<dir>#<attr>`
+    // bind it read-only into the cage at `/opt/sbx/flakes/<name>`, and build `path:<dir>#<attr>`
     // through the *same* in-cage wrap as a `flake:` package (appended to `flake_pairs`). The out-link
     // is keyed by the source's content hash, so editing the flake in the config rebuilds at the next
     // launch — a fresh hash the warm short-circuit misses — while an unchanged flake reuses the warm
@@ -2629,8 +2629,8 @@ fn build(
     });
 
     // CA trust for a Chromium/Electron GUI app under a filtering posture: Chromium ignores the
-    // CA-file env vars ops sets and reads its own NSS db, so under the egress MITM it rejects
-    // ops's per-session CA and a graphical app's UI cannot load. When the cage is BOTH `gui =
+    // CA-file env vars sbx sets and reads its own NSS db, so under the egress MITM it rejects
+    // sbx's per-session CA and a graphical app's UI cannot load. When the cage is BOTH `gui =
     // "wayland"` AND a filtering allowlist, provision `certutil` (part of the GUI hole, like the
     // fonts) so the command wrap below can import the bound CA into the cage's NSS db. Gated to
     // exactly those cages — a CLI tool needs nothing (its env-reading TLS already trusts the CA),
@@ -2716,13 +2716,13 @@ fn build(
     // resolves through `/nix` — the base userland, every provisioned tool, and (under the
     // GUI hole) the fonts and certutil — then back `/nix` with it read-write. The cage reads and
     // writes only its own store, so an agent that installs a toolchain writes into the project's
-    // copy and the shared store is never in the cage. Which store backs `/nix` is ops's
+    // copy and the shared store is never in the cage. Which store backs `/nix` is sbx's
     // decision, not a configurable field, so an untrusted project cannot keep the shared
     // store mounted or widen its access.
     let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ops: cannot prepare the project's store: {e}");
+            eprintln!("sbx: cannot prepare the project's store: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
@@ -2761,7 +2761,7 @@ fn build(
         } else {
             if !auto_equip.is_empty() {
                 eprintln!(
-                    "ops: equipping non-nix tools in-cage via mise: {} (each backend's host must \
+                    "sbx: equipping non-nix tools in-cage via mise: {} (each backend's host must \
                      be in [network].allow under an allowlist)",
                     auto_equip.join(", ")
                 );
@@ -2773,7 +2773,7 @@ fn build(
                     cmd,
                 );
                 // Tell the in-cage mise to trust the project config so the installed tools
-                // resolve. This applies for the whole launch, so an agent's own `ops mise` in a
+                // resolve. This applies for the whole launch, so an agent's own `sbx mise` in a
                 // project that declares non-`nix:` tools also trusts the project config — a
                 // conscious, slightly wider reach than autoequip alone, and consistent with the
                 // open self-equip posture. A distinct key, so its position in the env layering is
@@ -2785,7 +2785,7 @@ fn build(
             }
             if !global_mise.is_empty() {
                 eprintln!(
-                    "ops: equipping app packages in-cage via mise use -g: {}",
+                    "sbx: equipping app packages in-cage via mise use -g: {}",
                     global_mise.join(", ")
                 );
                 cmd = wrap_mise_equip(
@@ -2815,7 +2815,7 @@ fn build(
             ));
         } else {
             eprintln!(
-                "ops: building flake packages in-cage via nix build: {} (each flake's fetch \
+                "sbx: building flake packages in-cage via nix build: {} (each flake's fetch \
                  host must be in [network].allow under an allowlist)",
                 flake_pkgs
                     .iter()
@@ -2871,7 +2871,7 @@ fn build(
         } else {
             let (guard, wiring) =
                 forward::start(&prep.layout, prep.cfg.forward.clone()).map_err(|e| {
-                    eprintln!("ops: {e}");
+                    eprintln!("sbx: {e}");
                     ExitCode::FAILURE
                 })?;
             cmd = forward::wrap_command(
@@ -2885,7 +2885,7 @@ fn build(
         }
     }
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
-        // An `ops app <name>` launch tags its egress stats with the app, so `ops net stats --app`
+        // An `sbx app <name>` launch tags its egress stats with the app, so `sbx net stats --app`
         // can scope to it; a plain `run`/`shell` records under the project with no app tag.
         let app = match &runtime {
             binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => Some(*name),
@@ -2904,11 +2904,11 @@ fn build(
             Some(prep.userland.ca_bundle_src.as_path()),
         )
         .map_err(|e| {
-            eprintln!("ops: cannot start the egress filtering proxy: {e}");
+            eprintln!("sbx: cannot start the egress filtering proxy: {e}");
             ExitCode::FAILURE
         })?;
         cmd = egress::wrap_command(&prep.userland.socat_bin, &prep.userland.shell_bin, cmd);
-        // For a GUI cage, import ops's MITM CA into the cage's NSS db before the app runs, so a
+        // For a GUI cage, import sbx's MITM CA into the cage's NSS db before the app runs, so a
         // Chromium/Electron app trusts the egress proxy (it ignores the CA-file env vars). This
         // is the outermost wrap — it runs, then execs the egress-wrapped command. Only present
         // when `ca_trust` was provisioned (gui = "wayland" under this allowlist).
@@ -2927,9 +2927,9 @@ fn build(
     // also holds the dbus session bus, pulse, and the gpg/ssh agents, which binding the directory
     // would hand to the cage. Best-effort: with no compositor socket found, warn and run without
     // it (the app fails on its own) — not binding is the fail-closed direction for a display hole.
-    // The cage env (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) is fixed here by ops; an untrusted
+    // The cage env (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) is fixed here by sbx; an untrusted
     // `[env]` could only mispoint a client at a nonexistent socket (self-DoS), never redirect the
-    // bind, whose source path is set by ops — so these keys need no denylist entry.
+    // bind, whose source path is set by sbx — so these keys need no denylist entry.
     let mut gui_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut gui_env: Vec<(String, String)> = Vec::new();
     if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
@@ -2959,7 +2959,7 @@ fn build(
         // fontconfig at them so text renders rather than boxes. Independent of the socket
         // above (a missing display already warned; the fonts are harmless either way) and
         // best-effort (a staging failure warns, the app runs without fonts). `FONTCONFIG_FILE`
-        // is fixed by ops; a project `[env]` could override it (highest precedence), but that
+        // is fixed by sbx; a project `[env]` could override it (highest precedence), but that
         // only re-points the agent's own in-cage fontconfig at its own config — self-sabotage,
         // not an escape (it already controls what runs in the cage) — so the key needs no
         // denylist entry, exactly like `WAYLAND_DISPLAY`.
@@ -2987,7 +2987,7 @@ fn build(
         // GUI data: point the cage's glib/GTK at the provisioned, seeded schemas + themes via one
         // `XDG_DATA_DIRS` entry, so a GTK dialog finds `org.gtk.Settings.FileChooser` (else it
         // aborts) and the in-cage portal's file dialog finds the named `Adwaita-dark` theme. An
-        // app's own launcher prepends its GTK data dirs, so ops's entry (carrying the themes) stays
+        // app's own launcher prepends its GTK data dirs, so sbx's entry (carrying the themes) stays
         // reachable at the tail. `XDG_DATA_DIRS` is a data path, not a code-load path (unlike the
         // mesa driver vars), so it needs no untrusted-`[env]` denylist entry — a project that
         // re-points it only sabotages its own cage's schema/theme lookup.
@@ -3022,7 +3022,7 @@ fn build(
     // the same firm-`--ro-bind`-after-`.exists()` shape the Wayland socket uses — so a device
     // vanishing between enumeration and exec (a GPU hot-unplug) would fail the launch, an accepted
     // rarity, not "never fails".
-    // The driver-path env vars mesa `dlopen`s from are ops-controlled *and* reserved against an
+    // The driver-path env vars mesa `dlopen`s from are sbx-controlled *and* reserved against an
     // untrusted `[env]` (they load code, so `is_reserved_env_key` denylists them alongside `LD_*`);
     // a *trusted* config may still override them — self-harm on its own cage, not an escape.
     if prep.cfg.gpu {
@@ -3107,17 +3107,17 @@ fn build(
     }
 
     // The launcher's extra binds, emitted after the structural mounts: the egress machinery
-    // (socket + CA) and the GUI socket. Their destinations are ops's or the host's, never a
+    // (socket + CA) and the GUI socket. Their destinations are sbx's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(inline_flake_binds);
 
-    // Pin ops's own control plane in place whenever a read-write bind contains it: each root's host
+    // Pin sbx's own control plane in place whenever a read-write bind contains it: each root's host
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
     // code cannot rename a writable parent to move a control-plane root aside and recreate a forged
-    // one at the same path — which ops would otherwise read or `execve` on its next run. The bind
+    // one at the same path — which sbx would otherwise read or `execve` on its next run. The bind
     // stays read-write; only these specific host paths are protected. Appended last, so the pins
     // are the final word on those paths (nothing structural touches them).
     //
@@ -3129,17 +3129,17 @@ fn build(
         Err(e) => {
             // Fail closed: if a pin cannot be established the containing read-write bind would be
             // unprotected, so abort the launch rather than run with a gap. An extreme case — a
-            // mkdir failing in ops's own data/config tree.
+            // mkdir failing in sbx's own data/config tree.
             eprintln!(
-                "ops: cannot protect ops's control plane ({e}) — a read-write bind contains it"
+                "sbx: cannot protect sbx's control plane ({e}) — a read-write bind contains it"
             );
             return Err(ExitCode::FAILURE);
         }
     }
 
-    // Environment, lowest precedence first: host passthrough, then ops's hermetic CA bundle, then
+    // Environment, lowest precedence first: host passthrough, then sbx's hermetic CA bundle, then
     // the Wayland GUI keys, then the non-nix auto-equip variable, then a trusted project's mise
-    // `[env]`, then the egress machinery (proxy + CA), then the `.ops.toml` `[env]` (the ops-native
+    // `[env]`, then the egress machinery (proxy + CA), then the `.sbx.toml` `[env]` (the sbx-native
     // config has the final say). The structural
     // HOME/PATH/... are added by the assembler, which upserts all of these over them. An
     // untrusted config has already lost its reserved keys upstream — including the proxy and
@@ -3184,16 +3184,16 @@ fn build(
         net_policy(&prep.cfg.network),
         &egress_contract,
         // The trusted seccomp relaxation from the resolved (post-`merge_app`) config, so an app's
-        // `[seccomp] allow` union is in effect for `ops app`, exactly like its limits.
+        // `[seccomp] allow` union is in effect for `sbx app`, exactly like its limits.
         prep.cfg.seccomp.clone(),
         // The trusted device grant from the resolved (post-`merge_app`) config, plus the GPU
-        // render node under `gpu = true`, so an app's `[devices]` union is in effect for `ops app`,
+        // render node under `gpu = true`, so an app's `[devices]` union is in effect for `sbx app`,
         // exactly like its seccomp relaxation.
         &devices,
         cmd,
     )
     .map_err(|e| {
-        eprintln!("ops: cannot prepare the sandbox: {e}");
+        eprintln!("sbx: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
     let guard = if egress_guard.is_some() || forward_guard.is_some() || portal_host.is_some() {
@@ -3274,7 +3274,7 @@ fn seed_project_store(
     let (id, canonical) = binds::project_identity(&prep.cwd)?;
     let roots = collect_roots(&prep.userland, pkg_roots, tool_roots, font_roots);
     let store = super::projectstore::prepare(&prep.nix_store, &prep.layout, &id, &roots)?;
-    // Record the project's canonical path so a later `ops gc` can recognise this tree and reclaim
+    // Record the project's canonical path so a later `sbx gc` can recognise this tree and reclaim
     // it once the project is gone. Best-effort: a housekeeping marker must never fail a launch.
     if let Err(e) = super::projectstore::write_marker(&prep.layout, &id, &canonical) {
         crate::diag::warn(&format!("could not record the project marker: {e}"));
@@ -3318,7 +3318,7 @@ fn read_flake_lock(
 
 /// The out-link a `flake:` package builds into, given the project's flake lock: a pinned
 /// package's revision-keyed path, an unpinned one's name-keyed path. The single place that
-/// choice is made, so the launch (which builds the out-link) and `ops gc` (which decides
+/// choice is made, so the launch (which builds the out-link) and `sbx gc` (which decides
 /// whether an out-link on disk is a current root or a rolled-away leftover) never diverge.
 fn flake_out_link_for(
     name: &str,
@@ -3335,7 +3335,7 @@ fn flake_out_link_for(
 /// the project declares no mise file, or it is withheld — an untrusted or changed
 /// mise file only warns (its `[env]` is held back, like its security fields).
 ///
-/// mise is provisioned via nix and driven from ops's store against the **engine**
+/// mise is provisioned via nix and driven from sbx's store against the **engine**
 /// channel — never this launch's possibly-pinned base reference (mise runs in its own
 /// store view, free of the one-channel rule; see [`Prepared::engine_ref`]). The files
 /// it reads are materialized from the bytes trust validated, outside any writable
@@ -3357,14 +3357,14 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
     // The same engine reference the in-cage mise uses, already resolved in `prepare`.
     let mise_root = super::mise::provision_engine(&prep.nix, &prep.layout, &prep.engine_ref)
         .map_err(|e| {
-            eprintln!("ops: cannot provision the mise engine: {e}");
+            eprintln!("sbx: cannot provision the mise engine: {e}");
             ExitCode::FAILURE
         })?;
     let mise_bin = super::mise::bin(&mise_root);
     // Stage the authorized files in a per-project directory that sits outside every
     // writable mount (a sibling of the writable home, like the synthetic identity).
     let id = binds::project_runtime_id(&prep.cwd).map_err(|e| {
-        eprintln!("ops: cannot identify the project: {e}");
+        eprintln!("sbx: cannot identify the project: {e}");
         ExitCode::FAILURE
     })?;
     let stage = prep
@@ -3381,12 +3381,12 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
         &stage,
     )
     .map_err(|e| {
-        eprintln!("ops: mise [env] resolution failed: {e}");
+        eprintln!("sbx: mise [env] resolution failed: {e}");
         ExitCode::FAILURE
     })
 }
 
-/// Provision a trusted project's declared `nix:` mise tools into ops's store and report
+/// Provision a trusted project's declared `nix:` mise tools into sbx's store and report
 /// the `bin` directories to prepend to PATH, plus warnings. Empty when the project
 /// declares no mise file. An untrusted project's `nix:` tools are withheld (warned); a tool
 /// for another backend is auto-equipped in-cage instead (see [`auto_equip_tokens`]), not
@@ -3410,7 +3410,7 @@ fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode>
         &super::nixhub::current_system(),
     )
     .map_err(|e| {
-        eprintln!("ops: {e}");
+        eprintln!("sbx: {e}");
         ExitCode::FAILURE
     })
 }
@@ -3437,10 +3437,10 @@ fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// Wrap `cmd` so the cage equips a set of mise tools before running it: a static bash that runs
 /// `mise <verb> <tokens>` (its stdout redirected to stderr so a piped command's stdout stays
 /// clean) and then `exec`s the real command — which therefore stays the cage's main process,
-/// leaving `ops shell`'s pty job control unchanged. The `verb` is an ops-chosen literal
+/// leaving `sbx shell`'s pty job control unchanged. The `verb` is an sbx-chosen literal
 /// (`install` for the project's local `.mise.toml` tools, `use -g` for the app's `[packages]
 /// mise:` ones); the tokens and the command ride `"$@"` positionally, so only the absolute mise
-/// path, the ops-chosen verb, and the integer token count are interpolated into the script — a
+/// path, the sbx-chosen verb, and the integer token count are interpolated into the script — a
 /// token from an untrusted config can never inject shell. Best-effort: a failed equip does not
 /// abort the command (the missing tool surfaces when it is used), matching the self-equip
 /// posture rather than the host `nix:` hard-fail guarantee.
@@ -3461,7 +3461,7 @@ fn wrap_mise_equip(
         OsString::from("-c"),
         OsString::from(script),
         // `$0` — a label; the tokens are `$1..$n`, the command is what remains after `shift`.
-        OsString::from("ops-mise-equip"),
+        OsString::from("sbx-mise-equip"),
     ];
     out.extend(tokens.iter().map(OsString::from));
     out.extend(cmd);
@@ -3472,7 +3472,7 @@ fn wrap_mise_equip(
 /// that, for each `(ref, out-link, key)` triple, runs `nix build <ref> --no-write-lock-file
 /// --out-link <out-link>` unless the out-link is already realised, registers a host-resolvable gc
 /// root for the build,
-/// then `exec`s the real command (which stays the cage's main process, leaving `ops shell`'s pty
+/// then `exec`s the real command (which stays the cage's main process, leaving `sbx shell`'s pty
 /// job control unchanged). Only the absolute `nix` path, the out-link parent directory, and the
 /// integer triple count are interpolated into the script — the refs, out-links, and keys ride
 /// `"$@"` positionally, so a value from config can never inject shell. The short-circuit
@@ -3485,7 +3485,7 @@ fn wrap_mise_equip(
 /// (the relocated store reads it both in-cage and host-side), unlike the in-cage `--out-link`
 /// indirect root nix also creates, whose `/home/sandbox/…` target dangles host-side. Keyed by the
 /// **package name** and overwritten (`ln -sfn`) every launch: a roll re-points the one root to the
-/// new build, dropping the old store path, so a host-side `ops gc` keeps the current build and
+/// new build, dropping the old store path, so a host-side `sbx gc` keeps the current build and
 /// collects the rolled-away one with no per-home enumeration. Written unconditionally (warm or
 /// fresh) so an older store missing the root self-heals. Best-effort: a failed build leaves no
 /// out-link, so the `readlink` yields nothing and no root is written (the missing tool surfaces
@@ -3508,7 +3508,7 @@ fn wrap_flake_equip(
          [ -e \"$out/bin\" ] || '{nix}' build \"$1\" --no-write-lock-file --out-link \"$out\" 1>&2\n\
          sp=$(readlink -f \"$out\" 2>/dev/null)\n\
          [ -n \"$sp\" ] && mkdir -p /nix/var/nix/gcroots \
-         && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/ops-flake-$3\"\n\
+         && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$3\"\n\
          shift 3\n\
          n=$((n - 1))\n\
          done\n\
@@ -3521,7 +3521,7 @@ fn wrap_flake_equip(
         OsString::from("-c"),
         OsString::from(script),
         // `$0` — a label; the triples are `$1..$3n`, the command is what remains after the shifts.
-        OsString::from("ops-flake-equip"),
+        OsString::from("sbx-flake-equip"),
     ];
     for (reference, out_link, key) in triples {
         out.push(OsString::from(reference));
@@ -3532,7 +3532,7 @@ fn wrap_flake_equip(
     out
 }
 
-/// Record this sandbox in the on-disk registry so `ops session ls` can list it. Best
+/// Record this sandbox in the on-disk registry so `sbx session ls` can list it. Best
 /// effort: the registry is observability, not a security control, so a failure to
 /// register degrades visibility but never blocks the sandbox. The session is keyed
 /// on `spec.workdir` — the canonical project root, the same identity the runtime
@@ -3549,7 +3549,7 @@ fn register(
 }
 
 /// The owned [`session::SessionRuntime`] for a launch's borrowing [`binds::Runtime`], so the
-/// record can outlive the launch and let `ops session attach` reproduce the same home.
+/// record can outlive the launch and let `sbx session attach` reproduce the same home.
 fn session_runtime(runtime: binds::Runtime) -> session::SessionRuntime {
     match runtime {
         binds::Runtime::ProjectDefault => session::SessionRuntime::Project,
@@ -3558,7 +3558,7 @@ fn session_runtime(runtime: binds::Runtime) -> session::SessionRuntime {
     }
 }
 
-/// Run the cage as a child and propagate its exit status, keeping ops alive for the
+/// Run the cage as a child and propagate its exit status, keeping sbx alive for the
 /// whole session. Required by the network-allowlist posture, whose host filtering proxy
 /// runs on a thread that an exec-replace would discard; `run` uses this exactly when an
 /// egress guard is present. `Command::status` forks, waits, and yields the child's code;
@@ -3575,7 +3575,7 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
     let (argv, _seccomp) = match seccomp_argv(spec) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ops: failed to prepare the seccomp filter: {e}");
+            eprintln!("sbx: failed to prepare the seccomp filter: {e}");
             return 1;
         }
     };
@@ -3583,7 +3583,7 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
     match Command::new(prog).args(args).status() {
         Ok(status) => status_code(status),
         Err(e) => {
-            eprintln!("ops: failed to launch the sandbox: {e}");
+            eprintln!("sbx: failed to launch the sandbox: {e}");
             1
         }
     }
@@ -3631,7 +3631,7 @@ fn exec(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io:
     Command::new(prog).args(args).exec()
 }
 
-/// Run `spec` under a pty supervisor and return its exit status code. ops opens
+/// Run `spec` under a pty supervisor and return its exit status code. sbx opens
 /// a pty, launches bwrap with the *slave* as its controlling terminal (via
 /// `login_tty`), keeps the *master* itself, puts the real terminal in raw mode,
 /// and relays bytes both ways until the session ends.
@@ -3723,7 +3723,7 @@ fn supervise(
     // Parent: keep the master, drop the slave, go raw, relay.
     unsafe { libc::close(slave) };
     let _raw = RawMode::enable(0)?;
-    // Install the resize relay *after* the fork so the child never inherits the handler. ops keeps
+    // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
     // the real controlling terminal (only the child `setsid`'d, via `login_tty`), so it receives
     // `SIGWINCH` from the launching terminal naturally; the handler wakes `pump` to copy the new
     // size onto the pty master. Best effort: if it cannot be installed the session still runs, only
@@ -3853,14 +3853,14 @@ fn pump(
                     let now = Instant::now();
                     match classify_ctrl_c(chunk, last_ctrl_c, now) {
                         CtrlC::Escalate => {
-                            let _ = write_all(2, b"\r\nops: force-quitting the session.\r\n");
+                            let _ = write_all(2, b"\r\nsbx: force-quitting the session.\r\n");
                             return terminate_and_reap(child);
                         }
                         CtrlC::Arm => {
                             last_ctrl_c = Some(now);
                             let _ = write_all(
                                 2,
-                                b"\r\nops: press Ctrl+C again to force-quit this graphical session.\r\n",
+                                b"\r\nsbx: press Ctrl+C again to force-quit this graphical session.\r\n",
                             );
                         }
                         CtrlC::None => {}
@@ -3899,7 +3899,7 @@ fn exit_code(status: libc::c_int) -> i32 {
 }
 
 /// Force-terminate a supervised cage and reap it, returning its exit-status code — `SIGTERM`, a
-/// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `ops session stop` uses. Invoked
+/// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `sbx session stop` uses. Invoked
 /// from the pty relay when a graphical session is force-quit with a double Ctrl+C.
 fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
     unsafe { libc::kill(child, libc::SIGTERM) };
@@ -4104,14 +4104,14 @@ fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
         .collect()
 }
 
-/// Layer the cage's extra environment, lowest precedence first: host passthrough, then ops's
+/// Layer the cage's extra environment, lowest precedence first: host passthrough, then sbx's
 /// hermetic CA bundle, then the Wayland GUI hole, then the non-`nix:` auto-equip variable, then a
-/// trusted project's mise `[env]`, then the egress machinery, then the `.ops.toml` `[env]`. The
+/// trusted project's mise `[env]`, then the egress machinery, then the `.sbx.toml` `[env]`. The
 /// assembler upserts these over the structural defaults and takes the last occurrence of a key,
 /// so a later layer wins: the egress proxy's per-session CA overrides the structural cacert under
 /// an allowlist, and a trusted config has the final say (self-harm only). The CA bundle sits
 /// above passthrough on purpose — passthrough is a separate channel, not filtered by the
-/// untrusted-config denylist, so a host CA variable could otherwise clobber ops's hermetic
+/// untrusted-config denylist, so a host CA variable could otherwise clobber sbx's hermetic
 /// bundle. The GUI keys (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) collide with nothing else, so their
 /// position is immaterial; they sit here for a single, documented precedence order.
 fn extra_cage_env(
@@ -4134,7 +4134,7 @@ fn extra_cage_env(
 }
 
 fn missing(what: &str) -> ExitCode {
-    eprintln!("ops: {what} not found — the sandbox cannot run. See `ops doctor`.");
+    eprintln!("sbx: {what} not found — the sandbox cannot run. See `sbx doctor`.");
     ExitCode::FAILURE
 }
 
@@ -4197,7 +4197,7 @@ mod tests {
 
     #[test]
     fn session_runtime_maps_each_launch_runtime_to_its_owned_form() {
-        // The owned record runtime `ops session attach` reads back must mirror the launch-side runtime, so
+        // The owned record runtime `sbx session attach` reads back must mirror the launch-side runtime, so
         // an app session is reproduced in the app's home rather than the project's default.
         assert_eq!(
             session_runtime(binds::Runtime::ProjectDefault),
@@ -4216,26 +4216,26 @@ mod tests {
     #[test]
     fn session_verb_confirmations_are_plain_text_when_uncolored() {
         // A plain palette must leave every confirmation byte-for-byte plain, so a captured stream
-        // (and the existing `ops session stop --all` substring assertion) stays unchanged.
+        // (and the existing `sbx session stop --all` substring assertion) stays unchanged.
         let p = crate::style::Palette::plain();
         let grace = Duration::from_secs(10);
         assert_eq!(
             render_attaching(4242, "app:demo-app", &p),
-            "ops: attaching to session 4242 (app:demo-app) \
+            "sbx: attaching to session 4242 (app:demo-app) \
              (a shell in its live cage — type `exit` to leave the agent running)"
         );
         assert_eq!(
             render_no_active_sessions(&p),
-            "ops session stop: no active sessions to stop."
+            "sbx session stop: no active sessions to stop."
         );
         assert_eq!(
             render_gui_stop_hint("opencode-desktop", 4242, &p),
-            "ops: opencode-desktop is graphical — press Ctrl+C twice here to quit (closing its window may only \
-             hide it — a tray app keeps running); `ops session stop 4242` also stops it."
+            "sbx: opencode-desktop is graphical — press Ctrl+C twice here to quit (closing its window may only \
+             hide it — a tray app keeps running); `sbx session stop 4242` also stops it."
         );
         assert_eq!(
             render_stop_outcome(4242, "run", &session::StopOutcome::Terminated, grace, &p),
-            "ops session stop: stopped session 4242 (run)."
+            "sbx session stop: stopped session 4242 (run)."
         );
         assert_eq!(
             render_stop_outcome(
@@ -4245,17 +4245,17 @@ mod tests {
                 grace,
                 &p
             ),
-            "ops session stop: session 7 (app:agent) had already exited."
+            "sbx session stop: session 7 (app:agent) had already exited."
         );
         assert_eq!(
             render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p),
-            "ops session stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
+            "sbx session stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
         );
     }
 
     #[test]
     fn launch_display_name_prefers_the_app_then_the_program_basename() {
-        // An `ops app` launch names the app; a plain `ops run` into a GUI project names the
+        // An `sbx app` launch names the app; a plain `sbx run` into a GUI project names the
         // program by its basename (never a store path); an empty command falls back cleanly.
         assert_eq!(
             launch_display_name(&binds::Runtime::GlobalApp("opencode-desktop"), &[]),
@@ -4313,7 +4313,7 @@ mod tests {
         // The graphical stop hint colors only its app-name identifier (cyan) and names the pid.
         let hint = render_gui_stop_hint("demo-app", 4242, &p);
         assert!(hint.contains(&format!("{}demo-app{}", p.name, p.reset)));
-        assert!(hint.contains("ops session stop 4242"));
+        assert!(hint.contains("sbx session stop 4242"));
 
         assert!(render_no_active_sessions(&p).contains(p.dim));
     }
@@ -4644,7 +4644,7 @@ mod tests {
     fn egress_ca_overrides_the_structural_cacert() {
         // The assembler upserts the overlay env on last-occurrence, so the winner for a key is
         // its last entry in this layering. Under a network allowlist the cage must trust the
-        // egress proxy's per-session CA, not ops's root bundle: egress is layered after cacert,
+        // egress proxy's per-session CA, not sbx's root bundle: egress is layered after cacert,
         // so it wins. A trusted config, layered last, still has the final say (self-harm only).
         let winner = |env: &[(String, String)]| {
             env.iter()
@@ -4657,7 +4657,7 @@ mod tests {
             "SSL_CERT_FILE".into(),
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
-        let egress = vec![("SSL_CERT_FILE".into(), "/opt/ops/egress-ca.pem".into())];
+        let egress = vec![("SSL_CERT_FILE".into(), "/opt/sbx/egress-ca.pem".into())];
         let env = extra_cage_env(
             vec![],
             cacert.clone(),
@@ -4669,7 +4669,7 @@ mod tests {
         );
         assert_eq!(
             winner(&env).as_deref(),
-            Some("/opt/ops/egress-ca.pem"),
+            Some("/opt/sbx/egress-ca.pem"),
             "egress CA must override the structural cacert"
         );
 
@@ -4751,7 +4751,7 @@ mod tests {
             "a hostile token must never be interpolated into the script: {script}"
         );
         // label, then the tokens, then the command — all positional
-        assert_eq!(argv[3], OsString::from("ops-mise-equip"));
+        assert_eq!(argv[3], OsString::from("sbx-mise-equip"));
         assert_eq!(argv[4], OsString::from("aqua:BurntSushi/ripgrep@latest"));
         assert_eq!(argv[5], OsString::from("node@20; rm -rf /"));
         assert_eq!(argv[6], OsString::from("demo-app"));
@@ -4761,7 +4761,7 @@ mod tests {
     #[test]
     fn wrap_mise_equip_uses_the_global_verb_for_app_packages() {
         // The app's `[packages] mise:` tools are equipped globally (`mise use -g`), so the verb
-        // is interpolated literally (an ops-chosen constant, never config) while the token stays
+        // is interpolated literally (an sbx-chosen constant, never config) while the token stays
         // positional — proving the same no-shell-injection shape for the global lane.
         let mise = PathBuf::from("/nix/store/mise/bin/mise");
         let bash = PathBuf::from("/nix/store/bash/bin/bash");
@@ -4787,17 +4787,17 @@ mod tests {
         // positional, never interpolated) are all present.
         let nix = PathBuf::from("/nix/store/nix/bin/nix");
         let bash = PathBuf::from("/nix/store/bash/bin/bash");
-        let dir = PathBuf::from("/home/sandbox/.local/state/ops/flake");
+        let dir = PathBuf::from("/home/sandbox/.local/state/sbx/flake");
         let triples = vec![
             (
                 "github:example/flake-tool#tui".to_string(),
-                PathBuf::from("/home/sandbox/.local/state/ops/flake/flake-tool"),
+                PathBuf::from("/home/sandbox/.local/state/sbx/flake/flake-tool"),
                 "flake-tool".to_string(),
             ),
             // a hostile ref must stay a single positional arg, never reach the script
             (
                 "github:evil/x#bin; rm -rf /".to_string(),
-                PathBuf::from("/home/sandbox/.local/state/ops/flake/evil"),
+                PathBuf::from("/home/sandbox/.local/state/sbx/flake/evil"),
                 "evil".to_string(),
             ),
         ];
@@ -4815,10 +4815,10 @@ mod tests {
             "[ -e \"$out/bin\" ] || '/nix/store/nix/bin/nix' build \"$1\" \
              --no-write-lock-file --out-link \"$out\""
         ));
-        assert!(script.contains("mkdir -p '/home/sandbox/.local/state/ops/flake'"));
+        assert!(script.contains("mkdir -p '/home/sandbox/.local/state/sbx/flake'"));
         // the gc root is keyed by the `$3` positional (the package name), targeting the build's
         // store path resolved by `readlink -f` — host-resolvable, overwritten each launch
-        assert!(script.contains("ln -sfn \"$sp\" \"/nix/var/nix/gcroots/ops-flake-$3\""));
+        assert!(script.contains("ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$3\""));
         assert!(script.contains("shift 3"));
         assert!(script.trim_end().ends_with("exec \"$@\""));
         assert!(
@@ -4826,17 +4826,17 @@ mod tests {
             "a hostile ref must never be interpolated into the script: {script}"
         );
         // label, then interleaved (ref, out-link, key) triples, then the command — all positional
-        assert_eq!(argv[3], OsString::from("ops-flake-equip"));
+        assert_eq!(argv[3], OsString::from("sbx-flake-equip"));
         assert_eq!(argv[4], OsString::from("github:example/flake-tool#tui"));
         assert_eq!(
             argv[5],
-            OsString::from("/home/sandbox/.local/state/ops/flake/flake-tool")
+            OsString::from("/home/sandbox/.local/state/sbx/flake/flake-tool")
         );
         assert_eq!(argv[6], OsString::from("flake-tool"));
         assert_eq!(argv[7], OsString::from("github:evil/x#bin; rm -rf /"));
         assert_eq!(
             argv[8],
-            OsString::from("/home/sandbox/.local/state/ops/flake/evil")
+            OsString::from("/home/sandbox/.local/state/sbx/flake/evil")
         );
         assert_eq!(argv[9], OsString::from("evil"));
         assert_eq!(argv[10], OsString::from("flake-tool"));
@@ -4927,8 +4927,8 @@ mod tests {
     fn detach_log_path_is_keyed_by_pid_under_logs() {
         // The daemon and the reporting parent must agree on the log location; both derive it from
         // the session pid, so this is the single source of that name.
-        let path = detach_log_path(Path::new("/var/lib/ops"), 4242);
-        assert_eq!(path, PathBuf::from("/var/lib/ops/logs/4242.log"));
+        let path = detach_log_path(Path::new("/var/lib/sbx"), 4242);
+        assert_eq!(path, PathBuf::from("/var/lib/sbx/logs/4242.log"));
     }
 
     /// The C strings an `attach_argv` result carries, as UTF-8 for assertion.
@@ -4940,8 +4940,8 @@ mod tests {
 
     #[test]
     fn attach_argv_with_no_command_is_the_interactive_rc_shell() {
-        // A bare attach reuses the same rc shell as `ops shell`, so the joined shell gets mise
-        // activation and the `(ops-<slug>)` prompt.
+        // A bare attach reuses the same rc shell as `sbx shell`, so the joined shell gets mise
+        // activation and the `(sbx-<slug>)` prompt.
         let argv = attach_argv(&[]).expect("shell argv builds");
         assert_eq!(
             argv_strings(&argv),

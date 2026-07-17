@@ -6,10 +6,10 @@
 //! never maps. When `gpu = true` a trusted config opens hardware-accelerated rendering
 //! by supplying the three pieces the driver needs:
 //!
-//! 1. mesa's DRI drivers, provisioned into ops's own store and pointed at through
+//! 1. mesa's DRI drivers, provisioned into sbx's own store and pointed at through
 //!    `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS` — so the
 //!    driver path never depends on the host (`/run/opengl-driver` on NixOS, absent
-//!    elsewhere) and does not drift across `ops upgrade` (same pinned nixpkgs as the
+//!    elsewhere) and does not drift across `sbx upgrade` (same pinned nixpkgs as the
 //!    app → same mesa, no ABI skew with the app's own libgbm/libEGL);
 //! 2. the render node(s) under `/dev/dri`, granted through the device-bind mechanism;
 //! 3. the minimal `/sys` DRM subtree the driver reads to enumerate the device,
@@ -44,7 +44,7 @@ pub(crate) struct GpuLayer {
     pub(crate) env: Vec<(String, String)>,
 }
 
-/// Provision mesa into ops's store against the pinned `nixpkgs` and derive the driver-path env.
+/// Provision mesa into sbx's store against the pinned `nixpkgs` and derive the driver-path env.
 /// The gcroot is keyed by revision (`<data>/gcroots/gpu/<rev>/mesa`), shared across every project
 /// on the same channel — like the fonts and the base userland — rather than copied per project.
 pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<GpuLayer> {

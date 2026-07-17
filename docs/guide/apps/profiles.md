@@ -1,10 +1,10 @@
 # Portable profiles
 
-An app **profile** is a standalone, portable file that defines one app. `ops` ships
+An app **profile** is a standalone, portable file that defines one app. `sbx` ships
 **no built-in apps** — every profile is a separate artifact you import deliberately, so
 importing is a conscious trust act.
 
-See also: [The app framework](README.md) · [Profile catalog](catalog.md) · [`ops app`](../cli/app.md) · [`[app.<name>]`](../configuration/apps.md).
+See also: [The app framework](README.md) · [Profile catalog](catalog.md) · [`sbx app`](../cli/app.md) · [`[app.<name>]`](../configuration/apps.md).
 
 ## The profile file shape
 
@@ -30,18 +30,18 @@ type   = "bearer"
 ```
 
 Imported profiles live under
-[`~/.config/ops/apps/<name>.toml`](../concepts/directory-layout.md) and are **trusted by
+[`~/.config/sbx/apps/<name>.toml`](../concepts/directory-layout.md) and are **trusted by
 location** — honored even when the project you launch in is untrusted (the point: run an
 agent *on* untrusted code, safely).
 
 ## Import
 
 ```sh
-ops app import <file> [--as <name>] [--force]
+sbx app import <file> [--as <name>] [--force]
 ```
 
 - The **deliberate command is the consent** — an agent in the cage cannot run it, and
-  the profile stays **inert until `ops app <name>`** launches it.
+  the profile stays **inert until `sbx app <name>`** launches it.
 - The **granted posture is printed** (command, home scope, packages, binds, network,
   and each credential by destination + source — never a plaintext value).
 - The file must have a `cmd` (an empty parse is the tell-tale of a wrongly
@@ -53,7 +53,7 @@ ops app import <file> [--as <name>] [--force]
 ## Export
 
 ```sh
-ops app export <name> [--out <file>]
+sbx app export <name> [--out <file>]
 ```
 
 Writes a named app out as a portable profile — to **stdout** by default (composable and
@@ -62,20 +62,20 @@ clobber-safe), or `--out <file>`. An imported profile is emitted **verbatim**; a
 all — import is the trust act, not export). The exported file re-imports identically.
 
 ```sh
-ops app export claude-code > my-claude.toml
+sbx app export claude-code > my-claude.toml
 ```
 
 ## Manage
 
 ```sh
-ops app list          # the imported profiles, by name
-ops app rm <name>     # remove an imported profile (not an inline [app.<name>])
+sbx app list          # the imported profiles, by name
+sbx app rm <name>     # remove an imported profile (not an inline [app.<name>])
 ```
 
-`ops app rm` manages only **imported** profiles (files in the profiles directory). A
-project `[app.<name>]` overlay lives in that project's `.ops.toml` and is edited there.
+`sbx app rm` manages only **imported** profiles (files in the profiles directory). A
+project `[app.<name>]` overlay lives in that project's `.sbx.toml` and is edited there.
 For the full resolved app set (inline, project, and profile apps with their gating), use
-[`ops config show`](../cli/config.md).
+[`sbx config show`](../cli/config.md).
 
 ## The trust act
 

@@ -2,7 +2,7 @@
 //!
 //! A project (or the global config) names tools as `name = "<backend>:<locator>"`. This
 //! module handles the **`nix:`** ones — realising each admitted nixpkgs attribute against
-//! the pinned nixpkgs into ops's store and reporting the `bin` directories to prepend to
+//! the pinned nixpkgs into sbx's store and reporting the `bin` directories to prepend to
 //! the sandbox `PATH`. The **`mise:`** and **`flake:`** ones are not realised here: they
 //! are equipped in-cage at launch — [`mise_packages`] collects the mise tokens (`mise use
 //! -g`), [`flake_packages`] the `(name, ref)` of the flake packages (`nix build
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// contract is its executables, so the output carrying `bin/` is the one to expose.
 const BIN: &str = "bin";
 
-/// One layer of tools realised into ops's store. `bins` are the `bin` directories to
+/// One layer of tools realised into sbx's store. `bins` are the `bin` directories to
 /// prepend to the sandbox `PATH`; `roots` are the logical store paths whose closures
 /// back them, surfaced so a project's own store can be seeded with exactly those
 /// closures (rather than reconstructing them by stripping the `bin` suffix back off);
@@ -44,7 +44,7 @@ pub(crate) struct Provisioned {
 /// Split declared packages into the ones admitted for provisioning and the warnings
 /// for those withheld. A package is admitted when the layer that supplied its value
 /// is trusted; an untrusted project's tools are held back with an actionable hint.
-/// Pure, so `ops config` could show the same verdict without touching nix.
+/// Pure, so `sbx config` could show the same verdict without touching nix.
 fn admit(packages: &[Package]) -> (Vec<&Package>, Vec<String>) {
     let mut admitted = Vec::new();
     let mut warnings = Vec::new();
@@ -64,7 +64,7 @@ fn admit(packages: &[Package]) -> (Vec<&Package>, Vec<String>) {
     (admitted, warnings)
 }
 
-/// Provision every admitted package into ops's store against `nixpkgs`, rooting
+/// Provision every admitted package into sbx's store against `nixpkgs`, rooting
 /// each under the project's identity so housekeeping can later reclaim a project's
 /// tools with the rest of its runtime. Returns the `bin` directories to prepend to
 /// the sandbox `PATH` (in declaration order), the logical store roots whose closures
@@ -160,7 +160,7 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
 /// The `(name, url)` of the *admitted* `deb:` packages — the ones the launcher provisions
 /// host-side (resolve the URL to a hash, then build a generated unpack+autoPatchelf derivation).
 /// Trusted-only, exactly like the other backends: an untrusted project's `deb:` package is dropped
-/// here. The name keys the per-package gcroot; the url is the `.deb` source ops resolves and fetches.
+/// here. The name keys the per-package gcroot; the url is the `.deb` source sbx resolves and fetches.
 pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
     packages
         .iter()
@@ -180,7 +180,7 @@ pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
 /// host-side (resolve the URL to a hash, then build a generated squashfs-extract+autoPatchelf
 /// derivation). Trusted-only, exactly like the other backends: an untrusted project's `appimage:`
 /// package is dropped here. The name keys the per-package gcroot; the url is the `.AppImage` source
-/// ops resolves and fetches.
+/// sbx resolves and fetches.
 pub(crate) fn appimage_packages(packages: &[Package]) -> Vec<(String, String)> {
     packages
         .iter()
@@ -200,7 +200,7 @@ pub(crate) fn appimage_packages(packages: &[Package]) -> Vec<(String, String)> {
 /// stages, binds read-only into the cage, and builds `path:<dir>#<attr>` in-cage. Trusted-only,
 /// exactly like [`flake_packages`] and the other backends: an untrusted project's inline flake is
 /// dropped here. The name keys the per-package out-link (with the content hash) and the
-/// `ops-flake-<name>` gcroot; the content is the `flake.nix` source staged to a file, the attr the
+/// `sbx-flake-<name>` gcroot; the content is the `flake.nix` source staged to a file, the attr the
 /// output to build.
 pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String, String)> {
     packages
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(warnings.len(), 2, "one warning per withheld tool");
         // the never-trusted one points at first approval...
         let py = warnings.iter().find(|w| w.contains("python")).unwrap();
-        assert!(py.contains("untrusted") && py.contains("ops trust"));
+        assert!(py.contains("untrusted") && py.contains("sbx trust"));
         // ...the changed one at re-approval (the distinction the bool collapsed).
         let go = warnings.iter().find(|w| w.contains("`go`")).unwrap();
         assert!(go.contains("changed since it was trusted") && go.contains("re-run"));

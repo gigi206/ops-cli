@@ -1,7 +1,7 @@
-# `ops doctor` and prerequisites
+# `sbx doctor` and prerequisites
 
 ```
-ops doctor
+sbx doctor
 ```
 
 `doctor` verifies the load-bearing runtime requirements **before** anything can run,
@@ -14,7 +14,7 @@ See also: [Installation](installation.md) · [Security model](../concepts/securi
 ## What it checks
 
 - **Capability-bearing unprivileged user namespaces.** This is the security
-  boundary everything else rests on. `ops` decides this with a *live* bubblewrap
+  boundary everything else rests on. `sbx` decides this with a *live* bubblewrap
   launch that reads `/proc/self/status` from inside the cage: a launch with all
   capabilities dropped and `no_new_privs` set proves the namespace is
   capability-bearing more conclusively than a probe could.
@@ -35,12 +35,12 @@ See also: [Installation](installation.md) · [Security model](../concepts/securi
   host that cannot provide it gets a warning, not a failure — the launch still runs,
   just without the anti-DoS limits. See [Enforcement stack](../concepts/enforcement.md).
 
-- **The store location and channel revision.** Where `ops`'s user-owned store lives
+- **The store location and channel revision.** Where `sbx`'s user-owned store lives
   and which nixpkgs revision the base userland is pinned to.
 
 ## Why it hard-fails
 
-`ops`'s entire security model depends on the unprivileged user namespace being
+`sbx`'s entire security model depends on the unprivileged user namespace being
 capability-bearing. There is no safe degraded mode: an emulation layer (such as
 proot) provides isolation without a real boundary, which would be worse than an
 honest failure because it *looks* sandboxed. So when the requirement is absent,
@@ -57,7 +57,7 @@ If `doctor` reports that user namespaces are missing or non-capability-bearing:
   (`kernel.apparmor_restrict_unprivileged_userns`) can grant the capability only to
   a binary carrying a matching profile. A release that pins the host's
   path-profiled `/usr/bin/bwrap` works there; a bwrap materialized elsewhere would
-  match no profile. See [Provisioning](../concepts/provisioning.md) for how `ops`
+  match no profile. See [Provisioning](../concepts/provisioning.md) for how `sbx`
   chooses its bwrap engine on such a host.
 
 The remediation hint `doctor` prints is specific to what it found.

@@ -1,34 +1,34 @@
-# opencode desktop — the Electron GUI of opencode, sandboxed by ops (with a Wayland display).
+# opencode desktop — the Electron GUI of opencode, sandboxed by sbx (with a Wayland display).
 #
-#   ops app import profiles/opencode-desktop.toml
-#   ops app opencode-desktop
+#   sbx app import profiles/opencode-desktop.toml
+#   sbx app opencode-desktop
 #
 # This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
 # `opencode-web` (the same server in your browser). opencode ships a native desktop app built with
 # Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`, neither of which installs in
-# the hermetic cage. ops packages it with the `deb:` backend.
+# the hermetic cage. sbx packages it with the `deb:` backend.
 #
-# THE `deb:` BACKEND (no third party, tracks upstream). ops fetches opencode's **prebuilt `.deb`**
+# THE `deb:` BACKEND (no third party, tracks upstream). sbx fetches opencode's **prebuilt `.deb`**
 # directly from its GitHub releases, resolves it to a content hash, and builds a generated
 # derivation that `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the Electron binaries against a
 # curated library set — no bun, no from-source build (opencode's own flake builds from source and
 # needs a bun newer than nixpkgs ships, which fails; a `.deb` sidesteps that entirely). The build is
 # HOST-SIDE (like `nix:`), not in-cage: a `.deb` runs no build script, so evaluating it host-side is
 # safe, and the result is seeded into the store and offline-reusable. The `…/releases/latest/…` URL
-# means the first launch tracks upstream, and `ops upgrade deb` re-resolves it forward — no
+# means the first launch tracks upstream, and `sbx upgrade deb` re-resolves it forward — no
 # dependency on any community flake.
 #
 # FIRST LAUNCH resolves the `.deb` (pinning its hash in the per-project deb lock) and builds it
 # host-side, pulling the Electron closure (hundreds of MiB) — a couple of minutes, over your host
 # network (the build does NOT use the cage allowlist). Later launches reuse the pinned build
-# offline. `ops upgrade deb` re-resolves the latest `.deb` and rewrites the lock (the new build
+# offline. `sbx upgrade deb` re-resolves the latest `.deb` and rewrites the lock (the new build
 # lands at the next launch).
 #
-# CA TRUST (why `--use-system-ca`). Under the allowlist ops runs a TLS-terminating proxy with a
-# per-session CA. Electron/Chromium ignores the CA-file env vars ops sets and trusts its own NSS
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
 # database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
 # `ERR_CERT_AUTHORITY_INVALID` and its UI could not load. For a `gui = "wayland"` cage under a
-# filtering posture, **ops now seeds its MITM CA into the cage's NSS db automatically** (part of
+# filtering posture, **sbx now seeds its MITM CA into the cage's NSS db automatically** (part of
 # the GUI hole, like fonts), so the app trusts the proxy and egress stays filtered — no per-profile
 # shim needed. The app only has to be told to consult that store, hence `--use-system-ca`.
 #
@@ -36,7 +36,7 @@
 # provisions fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation
 # is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
 # screen-capture/input-injection to ordinary clients (see docs/guide/configuration/gui.md).
-# `gpu = true` opens hardware-accelerated rendering: ops provisions mesa's drivers into its own
+# `gpu = true` opens hardware-accelerated rendering: sbx provisions mesa's drivers into its own
 # store, grants the render node under `/dev/dri`, and read-only-binds the minimal `/sys` DRM subtree
 # the driver needs (see docs/guide/configuration/gpu.md). Without it a Chromium/Electron app on
 # Wayland often fails to produce a buffer and no window maps, so it is on by default here. mesa
@@ -86,8 +86,8 @@ mode = "deny"
 # is a RUNTIME fetch — opencode pulls its `@opencode-ai/plugin` package at startup (and the app
 # checks GitHub releases for updates, already covered by the built-in github allow-set).
 #
-# If a request is refused, the proxy names the host — watch `ops net logs -a opencode-desktop` and
-# add it here (or check ahead with `ops test net <url>`). For a DIRECT provider instead of the
+# If a request is refused, the proxy names the host — watch `sbx net logs -a opencode-desktop` and
+# add it here (or check ahead with `sbx test net <url>`). For a DIRECT provider instead of the
 # gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
 # `{*} https://openrouter.ai`) and fill the [secret] block below.
 allow = [
@@ -106,7 +106,7 @@ allow = [
 ]
 # Silence the denied telemetry: the desktop app POSTs crash/usage envelopes to Sentry, which the
 # allowlist already refuses (`denied-default`). `mute` keeps those refusals out of the default
-# `ops net logs` (still denied, still counted in `ops net stats`; see them with `--all`).
+# `sbx net logs` (still denied, still counted in `sbx net stats`; see them with `--all`).
 mute = ["*.sentry.io"]
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage. Provide
@@ -116,7 +116,7 @@ mute = ["*.sentry.io"]
 # direct provider add its host to `allow` above and keep this block; for Anthropic/OpenAI change
 # the host, header, and env var instead — see the `opencode` CLI profile.)
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

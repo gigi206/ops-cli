@@ -1,12 +1,12 @@
-# Pi — a minimal, provider-agnostic (BYOK) terminal coding agent, sandboxed by ops.
+# Pi — a minimal, provider-agnostic (BYOK) terminal coding agent, sandboxed by sbx.
 #
-#   ops app import profiles/pi.toml
-#   ops app pi
+#   sbx app import profiles/pi.toml
+#   sbx app pi
 #
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls the standalone
 # `pi` release binary from GitHub) — no nixpkgs lag, no node runtime needed. It is
 # equipped at the latest upstream version on the first launch in a project; advancing
-# an already-installed version is not yet automated by `ops upgrade`.
+# an already-installed version is not yet automated by `sbx upgrade`.
 #
 # Pi is MULTI-PROVIDER (it speaks each provider's native API directly), so its egress
 # depends on the provider you key it to. This template is set up for Anthropic; for
@@ -15,7 +15,7 @@
 # query-parameter key, which the header-injection model below cannot broker — use
 # Anthropic or OpenAI for the sandboxed credential boundary.) If a request is blocked,
 # the proxy reports the host it refused — add it to `allow` (or check ahead with
-# `ops test net <url>`).
+# `sbx test net <url>`).
 cmd = "pi"
 
 # Your host Pi config, mounted read-write at its real absolute path. `binds` is a security field,
@@ -44,7 +44,7 @@ allow = [
 # issue the request; the proxy strips it and substitutes the real key on the wire to
 # openrouter.ai.
 [env]
-#OPENROUTER_API_KEY = "sk-or-ops-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]
 #from = "env://OPENROUTER_API_KEY"

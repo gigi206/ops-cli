@@ -3,7 +3,7 @@
 //! The in-cage portal ([`super::portal`]) gives a Chromium/Electron app its own private D-Bus bus so
 //! its file chooser renders in-cage. That private bus carries the portal, but nothing serves
 //! `org.freedesktop.Notifications` on it, so the app cannot raise a desktop notification. This relay
-//! bridges the gap: it runs **host-side** (ops's own trusted infrastructure, like the egress and
+//! bridges the gap: it runs **host-side** (sbx's own trusted infrastructure, like the egress and
 //! filtered-D-Bus proxies), connects both to the private bus (through the socket the portal exposes
 //! on a host path) and to the real host session bus, **owns `org.freedesktop.Notifications` on the
 //! private bus**, and forwards every call to the host daemon — re-emitting the host's `ActionInvoked`
@@ -148,7 +148,7 @@ impl NotifyRelay {
     pub(crate) fn start(private_socket: PathBuf) -> NotifyRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
         let handle = std::thread::Builder::new()
-            .name("ops-notify-relay".to_string())
+            .name("sbx-notify-relay".to_string())
             .spawn(move || {
                 if let Err(e) = async_io::block_on(run(private_socket, rx)) {
                     // A connection error to the private bus is almost always the cage tearing down

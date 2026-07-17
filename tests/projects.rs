@@ -1,4 +1,4 @@
-//! Integration tests for `ops projects`: the built binary lists and removes the per-project
+//! Integration tests for `sbx projects`: the built binary lists and removes the per-project
 //! runtime trees under `<data>/projects/<id>`. Pure host-side filesystem work — no sandbox, no
 //! nix, no network — so the tests run everywhere against redirected XDG dirs and fabricated trees
 //! (a directory with a `project` marker whose recorded path is present = `idle`, absent = `dead`,
@@ -20,7 +20,7 @@ impl TmpDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
-        d.push(format!("ops-projects-{}-{n}", std::process::id()));
+        d.push(format!("sbx-projects-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -53,8 +53,8 @@ impl Fixture {
         }
     }
 
-    fn ops(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_ops"))
+    fn sbx(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
             .args(args)
             .current_dir(self.proj.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
@@ -63,11 +63,11 @@ impl Fixture {
             .env("LC_ALL", "C.UTF-8")
             .env_remove("LANG")
             .output()
-            .expect("spawn ops")
+            .expect("spawn sbx")
     }
 
     fn projects_dir(&self) -> PathBuf {
-        self.data_home.path().join("ops/projects")
+        self.data_home.path().join("sbx/projects")
     }
 
     /// Fabricate a project runtime tree with some on-disk content (so it has a size). `marker` is
@@ -96,8 +96,12 @@ fn list_classifies_and_sizes_each_tree() {
     fx.make_tree("bbbbbbbbbbbbbbbb", Some(&fx.proj.path().join("gone"))); // dead: parent present
     fx.make_tree("cccccccccccccccc", None); // markerless
 
-    let out = fx.ops(&["projects"]);
-    assert!(out.status.success(), "ops projects failed: {}", text(&out));
+    let out = fx.sbx(&["projects", "list"]);
+    assert!(
+        out.status.success(),
+        "sbx projects list failed: {}",
+        text(&out)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     for id in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"] {
         assert!(s.contains(id), "listing is missing tree {id}:\n{s}");
@@ -116,14 +120,48 @@ fn list_classifies_and_sizes_each_tree() {
 }
 
 #[test]
+fn bare_projects_prints_the_page_and_does_not_list() {
+    let fx = Fixture::new();
+    fx.make_tree("aaaaaaaaaaaaaaaa", Some(fx.proj.path()));
+
+    // Bare `sbx projects` (no subcommand) prints the help page and exits 2 — it does NOT list, so
+    // it never runs the sweep, mirroring bare `sbx app`/`sbx session`.
+    let out = fx.sbx(&["projects"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bare `sbx projects` should exit 2: {}",
+        text(&out)
+    );
+    let s = text(&out);
+    assert!(
+        s.contains("sbx projects list"),
+        "the page should show the `list` synopsis:\n{s}"
+    );
+    assert!(
+        !s.contains("aaaaaaaaaaaaaaaa"),
+        "bare `sbx projects` must not list any tree:\n{s}"
+    );
+
+    // A leading flag with no subcommand (e.g. `--json`) also prints the page rather than listing.
+    let out = fx.sbx(&["projects", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "`sbx projects --json` (no subcommand) should exit 2: {}",
+        text(&out)
+    );
+}
+
+#[test]
 fn list_json_is_an_array_carrying_state_and_size() {
     let fx = Fixture::new();
     fx.make_tree("deadfeeddeadfeed", Some(&fx.proj.path().join("gone")));
 
-    let out = fx.ops(&["projects", "list", "--json"]);
+    let out = fx.sbx(&["projects", "list", "--json"]);
     assert!(
         out.status.success(),
-        "ops projects --json failed: {}",
+        "sbx projects --json failed: {}",
         text(&out)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
@@ -147,7 +185,7 @@ fn list_json_is_an_array_carrying_state_and_size() {
 #[test]
 fn list_is_empty_when_there_are_no_trees() {
     let fx = Fixture::new();
-    let out = fx.ops(&["projects"]);
+    let out = fx.sbx(&["projects", "list"]);
     assert!(out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("no per-project runtime trees"),
@@ -161,7 +199,7 @@ fn rm_a_named_tree_removes_it_immediately() {
     let fx = Fixture::new();
     let dir = fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
 
-    let out = fx.ops(&["projects", "rm", "1234567890abcdef"]);
+    let out = fx.sbx(&["projects", "rm", "1234567890abcdef"]);
     assert!(out.status.success(), "rm failed: {}", text(&out));
     assert!(!dir.exists(), "the tree should be gone:\n{}", text(&out));
     assert!(
@@ -176,7 +214,7 @@ fn rm_dry_run_previews_without_removing() {
     let fx = Fixture::new();
     let dir = fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
 
-    let out = fx.ops(&["projects", "rm", "1234567890abcdef", "--dry-run"]);
+    let out = fx.sbx(&["projects", "rm", "1234567890abcdef", "--dry-run"]);
     assert!(out.status.success(), "dry-run rm failed: {}", text(&out));
     assert!(
         dir.exists(),
@@ -197,7 +235,7 @@ fn rm_dead_previews_by_default_and_reaps_with_yes() {
     let idle = fx.make_tree("keepkeepkeepkeep", Some(fx.proj.path())); // idle: must survive
 
     // Default is a preview — nothing removed.
-    let preview = fx.ops(&["projects", "rm", "--dead"]);
+    let preview = fx.sbx(&["projects", "rm", "--dead"]);
     assert!(preview.status.success());
     assert!(
         dead.exists(),
@@ -206,7 +244,7 @@ fn rm_dead_previews_by_default_and_reaps_with_yes() {
     );
 
     // --yes applies, reaping only the dead tree.
-    let apply = fx.ops(&["projects", "rm", "--dead", "--yes"]);
+    let apply = fx.sbx(&["projects", "rm", "--dead", "--yes"]);
     assert!(
         apply.status.success(),
         "--dead --yes failed: {}",
@@ -230,7 +268,7 @@ fn rm_markerless_needs_yes_and_leaves_marked_trees() {
     let markerless = fx.make_tree("nomarkernomarker", None);
     let idle = fx.make_tree("keepkeepkeepkeep", Some(fx.proj.path()));
 
-    let out = fx.ops(&["projects", "rm", "--markerless", "--yes"]);
+    let out = fx.sbx(&["projects", "rm", "--markerless", "--yes"]);
     assert!(
         out.status.success(),
         "--markerless --yes failed: {}",
@@ -251,7 +289,7 @@ fn rm_markerless_needs_yes_and_leaves_marked_trees() {
 #[test]
 fn rm_with_no_target_is_a_usage_error() {
     let fx = Fixture::new();
-    let out = fx.ops(&["projects", "rm"]);
+    let out = fx.sbx(&["projects", "rm"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -268,7 +306,7 @@ fn rm_with_no_target_is_a_usage_error() {
 fn rm_dry_run_and_yes_together_are_contradictory() {
     let fx = Fixture::new();
     fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
-    let out = fx.ops(&["projects", "rm", "1234567890abcdef", "--dry-run", "--yes"]);
+    let out = fx.sbx(&["projects", "rm", "1234567890abcdef", "--dry-run", "--yes"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -285,7 +323,7 @@ fn rm_dry_run_and_yes_together_are_contradictory() {
 fn rm_an_unknown_id_fails_without_touching_other_trees() {
     let fx = Fixture::new();
     let keep = fx.make_tree("keepkeepkeepkeep", Some(fx.proj.path()));
-    let out = fx.ops(&["projects", "rm", "0000000000000000"]);
+    let out = fx.sbx(&["projects", "rm", "0000000000000000"]);
     assert_eq!(out.status.code(), Some(1), "an unknown id is a failure");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no project tree for id"),
@@ -303,7 +341,7 @@ fn rm_an_unknown_id_fails_without_touching_other_trees() {
 fn rm_rejects_a_path_shaped_id() {
     let fx = Fixture::new();
     // A traversal id must be refused before any join reaches a recursive delete.
-    let out = fx.ops(&["projects", "rm", "../escape"]);
+    let out = fx.sbx(&["projects", "rm", "../escape"]);
     assert_eq!(out.status.code(), Some(1), "a path-shaped id is refused");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("invalid project id"),
@@ -317,7 +355,7 @@ fn gc_is_inert_on_a_dry_run() {
     let fx = Fixture::new();
     let dir = fx.make_tree("1234567890abcdef", Some(&fx.proj.path().join("gone")));
     // --gc with a preview must not run the shared-store collection; it says so and removes nothing.
-    let out = fx.ops(&["projects", "rm", "1234567890abcdef", "--dry-run", "--gc"]);
+    let out = fx.sbx(&["projects", "rm", "1234567890abcdef", "--dry-run", "--gc"]);
     assert!(out.status.success(), "dry-run --gc failed: {}", text(&out));
     assert!(dir.exists(), "a dry run must not remove:\n{}", text(&out));
     assert!(

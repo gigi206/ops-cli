@@ -39,7 +39,7 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
         a.push(lit("--unshare-net"));
     }
     // A fresh UTS namespace inherits the host's hostname at creation, so set the cage's own —
-    // `ops-<slug>`, naming the cage after its app/project. It still never reveals the *host's*
+    // `sbx-<slug>`, naming the cage after its app/project. It still never reveals the *host's*
     // hostname (the reason the UTS namespace is unshared), and it makes `$HOSTNAME`, `uname -n`,
     // and a `\h`-based shell prompt identify which cage this is instead of a shared `sandbox`.
     a.push(lit("--hostname"));
@@ -49,7 +49,7 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
 
     // Free hardening — pure removals, always emitted: start from a clean
     // environment (before anything is set into it), drop every capability, and
-    // die with the launcher so no sandbox outlives ops.
+    // die with the launcher so no sandbox outlives sbx.
     a.push(lit("--clearenv"));
     a.push(lit("--die-with-parent"));
     a.push(lit("--cap-drop"));
@@ -171,10 +171,10 @@ mod tests {
         // capabilities are dropped as a pair
         let i = index_of(&argv, "--cap-drop").expect("--cap-drop present");
         assert_eq!(argv[i + 1], OsString::from("ALL"));
-        // the cage's own hostname is set as a pair (`ops-<slug>`, here the default-slug spec's
-        // `ops-cage`), so the fresh UTS namespace never inherits — nor reveals — the host's
+        // the cage's own hostname is set as a pair (`sbx-<slug>`, here the default-slug spec's
+        // `sbx-cage`), so the fresh UTS namespace never inherits — nor reveals — the host's
         let h = index_of(&argv, "--hostname").expect("--hostname present");
-        assert_eq!(argv[h + 1], OsString::from("ops-cage"));
+        assert_eq!(argv[h + 1], OsString::from("sbx-cage"));
     }
 
     #[test]
@@ -182,7 +182,7 @@ mod tests {
         let s = spec(vec![], vec![], NetPolicy::Shared).with_cage_slug("demo-app".to_string());
         let argv = to_argv(&s);
         let h = index_of(&argv, "--hostname").expect("--hostname present");
-        assert_eq!(argv[h + 1], OsString::from("ops-demo-app"));
+        assert_eq!(argv[h + 1], OsString::from("sbx-demo-app"));
     }
 
     #[test]
