@@ -174,6 +174,114 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
 }
 
 #[test]
+fn an_interactive_observed_run_records_events_for_proc_logs() {
+    // Close the one observation assembly the other tests leave uncovered: the interactive pty
+    // supervisor WITH `--observe`. On a pty, `sbx run --observe` takes the pty path (not the non-tty
+    // foreground path the `--observe` stderr e2e covers, nor the detached one), so its observer must
+    // populate the ring + control socket even though nothing echoes to the TUI-owned terminal. Drive
+    // the shell to spawn a recognizable `sleep`, then read it back with `sbx proc logs` from this
+    // process. Skipped, not failed, where the host cannot sandbox.
+    let project = TmpDir::new("obs-proj");
+    let data = TmpDir::new("obs-data");
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping interactive-observe smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        return;
+    }
+
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+
+    // SAFETY: each Stdio owns its own dup of the slave; the child inherits them as stdin/out/err.
+    let mut child = sbx()
+        .arg("run")
+        .arg("--observe")
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .spawn()
+        .expect("spawn sbx run --observe");
+    unsafe { libc::close(slave) };
+    // The observer roots on, and the control socket is keyed by, this sbx supervisor's pid — the same
+    // one `sbx proc logs` resolves the session by.
+    let pid = child.id();
+
+    // Wait for the shell prompt, then spawn a long-lived, recognizable child inside the cage.
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut sent = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 300) } > 0 {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break; // EIO/EOF: session over
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        if !sent && out.contains(&b'$') {
+            unsafe { libc::write(master, b"sleep 20\n".as_ptr().cast(), 9) };
+            sent = true;
+            break;
+        }
+    }
+    assert!(
+        sent,
+        "never reached the shell prompt to spawn a child:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+
+    // Read the ring back from THIS process: the socket must be populated even with no inline feed —
+    // the whole point of the interactive path (its terminal belongs to the agent). Poll while `sleep`
+    // is still running.
+    let logs_deadline = Instant::now() + Duration::from_secs(20);
+    let mut ok = false;
+    let mut last = String::new();
+    while Instant::now() < logs_deadline {
+        let o = sbx()
+            .arg("proc")
+            .arg("logs")
+            .arg(pid.to_string())
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run sbx proc logs");
+        last = String::from_utf8_lossy(&o.stdout).into_owned();
+        if o.status.code() == Some(0) && last.contains("sleep") {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) };
+    unsafe { libc::close(master) };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        ok,
+        "the interactive observed session's `sleep` must appear in `sbx proc logs` — the ring is \
+         populated over the control socket even with no inline feed. Last output:\n{last}"
+    );
+}
+
+#[test]
 fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     // The reported bug: `sbx app <name>` launched interactively "stays small" when the terminal
     // goes fullscreen. An interactive app now runs under the pty supervisor, so it must (1) get a

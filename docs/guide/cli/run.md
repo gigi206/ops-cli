@@ -61,15 +61,19 @@ With no command, `sbx run` opens the project shell:
 
 ### Observing a run (`--observe`)
 
-`--observe` streams a live `[sbx:exec]` line to **stderr** for each process the command spawns
-inside the cage — so you see what the agent runs as it runs. It is read-only, host-side, and
-**unprivileged** (it polls `/proc`; no `CAP_BPF`, no root), and it forces the supervised launch
-path so a host-side observer can watch the cage for its lifetime.
+`--observe` records each process the command spawns inside the cage — so you see what the agent
+runs as it runs. It is read-only, host-side, and **unprivileged** (it polls `/proc`; no `CAP_BPF`,
+no root), and it forces the supervised launch path so a host-side observer can watch the cage for
+its lifetime. Every observed event goes into a per-session ring you can read with
+[`sbx proc logs`](proc.md#logs); on a **non-interactive foreground run** each event is *also*
+echoed inline to **stderr** as a `[sbx:exec]` line.
 
-- Scope: **non-interactive runs** (a piped/`--` command). For an **interactive terminal** the
-  inline feed would fight a TUI for the screen, so `--observe` there just points you at
-  [`sbx proc live`](proc.md) — watch the session from another terminal instead. `--observe` is
-  also ignored under `--detach`.
+- Scope: observation runs on any launch — a non-interactive run, an **interactive terminal**, or a
+  **detached** (`--detach`) one. Only the inline stderr echo is limited to the non-interactive
+  foreground run (an interactive `[sbx:exec]` stream would fight a TUI for the screen, and a
+  detached session has no terminal at all). In both those cases watch the session from another
+  terminal with [`sbx proc logs <id> -f`](proc.md#logs) — which, for a detached run, is the only
+  way to see what it spawns.
 - Honest limit: polling only catches a process that outlives a tick (~300 ms), so very
   short-lived commands are missed. Precise per-spawn capture (and blocking) is a later increment.
 

@@ -67,6 +67,7 @@ const PATHS: &[&[&str]] = &[
     &["proc"],
     &["proc", "ls"],
     &["proc", "live"],
+    &["proc", "logs"],
     &["plugins", "list"],
     &["plugins", "info"],
     &["plugins", "install"],

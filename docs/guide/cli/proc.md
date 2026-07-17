@@ -3,12 +3,15 @@
 ```
 sbx proc ls   [<id>] [--json]
 sbx proc live [<id>] [-i|--interval <secs>] [--json]
+sbx proc logs [<id>] [-f|--follow] [--json]
 ```
 
 Observe what a running sandbox is doing **inside its cage** — the observability sibling of
 [`sbx net`](net.md). `sbx proc ls` snapshots a session's **process tree** (the programs the
-agent has spawned); `sbx proc live` watches it redraw in real time. Read-only and host-side —
-it reads `/proc` with no privilege and no cooperation from the cage, and launches nothing.
+agent has spawned) and `sbx proc live` watches it redraw in real time — both always available,
+reading `/proc` with no privilege and no cooperation from the cage, launching nothing.
+`sbx proc logs` is the **exec-event feed**: the processes the agent spawns, in order, for a
+session started with observation on ([`sbx run --observe`](run.md#observing-a-run-observe)).
 
 See also: [`sbx net`](net.md) · [`sbx session`](session.md).
 
@@ -71,3 +74,43 @@ sbx proc live --json 12345 | jq .tree   # one snapshot object per tick
 
 The human view **requires a terminal** (the frame redraws in place); use `--json` to script it.
 Like `ls` it is read-only, host-side, and unprivileged — it just polls `/proc` on each tick.
+
+## `logs`
+
+```
+sbx proc logs [<id>] [-f|--follow] [--json]
+```
+
+The **exec-event feed** — the processes an agent spawns inside its cage, in order, each stamped
+with the time it was first seen. Where `ls`/`live` snapshot the *current* tree of any session,
+`logs` reads a recorded event stream, so the session must have been launched with **observation
+on**: [`sbx run --observe`](run.md#observing-a-run-observe) or
+[`sbx app run <name> --observe`](app.md). A session without it is reported as *unobserved*, not
+shown empty.
+
+| Operand / option | Meaning |
+|---|---|
+| `<id>` | the PID [`sbx session ls`](session.md) shows; omit it when only one session is live |
+| `-f`, `--follow` | stream new events until the session ends (`Ctrl-C` to stop) |
+| `--json` | emit one object per event (NDJSON) — works in a pipe |
+
+```sh
+sbx run --detach --observe -- claude   # a background agent, observed
+sbx proc logs 12345 -f                  # …watch what it spawns, from here
+# process feed — session 12345 [run] /home/me/web
+#   14:02:11  12346  node /nix/store/…/claude
+#   14:02:13  12400  rg --json TODO src/
+#   14:02:14  12511  git commit -m "…"
+
+sbx proc logs 12345 --json | jq .command   # machine-readable
+```
+
+This is the way to watch an observed session **from another terminal** — and the **only** way to
+watch a [detached](run.md) (`--detach`) one, which has no terminal for the inline `[sbx:exec]`
+feed. The events are held in the supervisor's memory for the session's lifetime, read over a
+per-session control socket that is never exposed inside the cage; nothing is written to disk or
+kept after the session exits.
+
+Honest limit: the feed is populated by a short-interval `/proc` poll, so a process that starts and
+exits within one tick can be missed. Precise per-spawn capture — and the ability to **block** a
+spawn — is a later increment (seccomp user-notification); this is the cheap, unprivileged first cut.

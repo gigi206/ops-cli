@@ -108,16 +108,17 @@ pub(crate) fn run(
     // SAFETY: `isatty` only inspects fd 0.
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
 
-    // The inline `--observe` feed rides the non-tty foreground path; an interactive terminal is
-    // pointed at `sbx proc live` instead (see `resolve_observe_interactive`).
-    let observe = resolve_observe_interactive(observe, interactive);
+    // Observation runs on any path where a parent sbx survives the cage. Its inline stderr feed rides
+    // only the non-tty foreground path; an interactive terminal (which would fight a TUI for the
+    // screen) is warned and watched out-of-band with `sbx proc logs`/`sbx proc live` instead.
+    warn_observe_interactive(observe, interactive);
 
     if cmd.is_empty() {
         // No command: open the project shell. Interactive gets the full pty shell (mise activation
         // and the `(sbx-<slug>)` prompt via the synthetic rc); a piped stdin runs a non-interactive
         // shell reading its script from stdin, reaching activated tools through the shims on PATH.
         return if interactive {
-            launch_interactive_shell(&prep, binds::Runtime::ProjectDefault)
+            launch_interactive_shell(&prep, binds::Runtime::ProjectDefault, observe)
         } else {
             let shell = vec![prep.userland.shell_bin.clone().into_os_string()];
             launch(
@@ -133,7 +134,13 @@ pub(crate) fn run(
     }
 
     if interactive {
-        launch_pty_supervised(&prep, binds::Runtime::ProjectDefault, Kind::Run, cmd)
+        launch_pty_supervised(
+            &prep,
+            binds::Runtime::ProjectDefault,
+            Kind::Run,
+            cmd,
+            observe,
+        )
     } else {
         launch(
             prep,
@@ -147,18 +154,19 @@ pub(crate) fn run(
     }
 }
 
-/// Reconcile `--observe` with interactivity: the inline exec feed rides the non-tty foreground path
-/// only, so an interactive terminal (which would fight a TUI for the screen) is warned and pointed
-/// at `sbx proc live` instead. Returns whether the inline feed should run. Shared by `run`/`app`.
-fn resolve_observe_interactive(observe: bool, interactive: bool) -> bool {
+/// Warn that `--observe`'s inline stderr feed is not shown for an interactive terminal (it would
+/// fight a TUI for the screen), pointing at the out-of-band viewers instead. Observation itself still
+/// runs — the ring and its control socket are populated so `sbx proc logs`/`sbx proc live` can watch
+/// this session from another terminal; only the inline echo is suppressed, and that decision is made
+/// per launch path where the observer is started (interactive/detached never echo inline). Shared by
+/// `run`/`app`.
+fn warn_observe_interactive(observe: bool, interactive: bool) {
     if observe && interactive {
         crate::diag::warn(
-            "--observe is not shown inline for an interactive terminal — run `sbx proc live` in \
-             another terminal to watch this session",
+            "--observe's inline feed is not shown for an interactive terminal — watch this session \
+             with `sbx proc logs`/`sbx proc live` from another terminal",
         );
-        return false;
     }
-    observe
 }
 
 /// Apply the (non-channel) part of a one-shot override to a prepared config, aborting the launch
@@ -193,13 +201,7 @@ fn launch(
 ) -> ExitCode {
     if detach {
         warn_ask_under_detach(&prep.cfg.network);
-        if observe {
-            crate::diag::warn(
-                "--observe is ignored under --detach: a background session has no terminal for the \
-                 inline feed — inspect it with `sbx proc live`/`sbx proc ls` instead",
-            );
-        }
-        launch_detached(prep, runtime, kind, cmd, label)
+        launch_detached(prep, runtime, kind, cmd, label, observe)
     } else {
         launch_foreground(prep, runtime, kind, cmd, observe)
     }
@@ -251,14 +253,15 @@ fn launch_foreground(
         // Supervise instead of exec-replace — fork bwrap, wait, propagate the exit status — whenever
         // a host-side thing must outlive the cage. That is a guard (a network allowlist's filtering
         // proxy, a forward forwarder, a filtered D-Bus proxy, or an in-cage portal whose runtime dir
-        // must be cleaned up), OR `--observe`: the exec-activity feed runs in a host thread that
-        // needs a live parent for the cage's lifetime, so observation forces supervision even with no
-        // guard. The observer roots on this supervisor's own pid — the cage is its descendant in host
-        // pid-space — and stops + joins on drop, before the guard is released.
+        // must be cleaned up), OR observation: the observer runs in a host thread that needs a live
+        // parent for the cage's lifetime, so observation forces supervision even with no guard. The
+        // observer roots on this supervisor's own pid — the cage is its descendant in host pid-space —
+        // and its socket + poll thread are torn down on drop, before the guard is released. `inline`
+        // is true here: this is the non-tty foreground path, the one place the `[sbx:exec]` feed
+        // streams to stderr (as well as into the ring `sbx proc logs` reads).
         maybe_guard => {
-            let observer = observe.then(|| {
-                super::observe_feed::ExecObserver::start(std::process::id(), OBSERVE_POLL_INTERVAL)
-            });
+            let observer =
+                observe.then(|| super::observe_feed::ProcObs::start(prep.layout.data_dir(), true));
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(observer);
             drop(maybe_guard);
@@ -266,11 +269,6 @@ fn launch_foreground(
         }
     }
 }
-
-/// How often the `--observe` feed polls `/proc` for new cage processes. Short enough to catch most
-/// of what an agent spawns, long enough that the walk's cost is negligible; a command shorter than
-/// this between ticks is missed (the polling limit, closed by the seccomp user-notification path).
-const OBSERVE_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// The byte the detached child writes to the readiness pipe once the cage is built, registered,
 /// and its log is open — the parent treats any other outcome (a closed pipe, no byte) as failure.
@@ -295,6 +293,7 @@ fn launch_detached(
     kind: Kind,
     cmd: Vec<OsString>,
     label: &str,
+    observe: bool,
 ) -> ExitCode {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe2` fills the two-element array; `O_CLOEXEC` so neither end leaks into the
@@ -325,7 +324,7 @@ fn launch_detached(
         0 => {
             // Child: the parent's read end is not ours.
             unsafe { libc::close(read_fd) };
-            detached_child(prep, runtime, kind, cmd, write_fd)
+            detached_child(prep, runtime, kind, cmd, write_fd, observe)
         }
         child => {
             // Parent: the child's write end is not ours.
@@ -339,13 +338,15 @@ fn launch_detached(
 /// its output still on the terminal (so setup errors are visible), signals readiness, then
 /// redirects to the session log and runs the cage. Never returns: every path ends in `exec`
 /// (which replaces the process) or [`std::process::exit`], so the parent's tail logic can never
-/// run a second time in the child.
+/// run a second time in the child. With `observe`, it also stands up the process observer — which,
+/// like a guard, forces the supervised (fork+wait) path so a live parent outlives the cage.
 fn detached_child(
     prep: Prepared,
     runtime: binds::Runtime,
     kind: Kind,
     cmd: Vec<OsString>,
     write_fd: libc::c_int,
+    observe: bool,
 ) -> ! {
     // A new session with no controlling terminal: closing the launching terminal will not SIGHUP
     // the daemon, and it is no longer in that terminal's foreground process group.
@@ -384,20 +385,29 @@ fn detached_child(
     // The log fd is now duplicated onto 1/2; the owning handle is no longer needed.
     drop(log);
 
+    // Enable process observation (best-effort). A detached session has no terminal for an inline
+    // feed, so the ring + control socket `sbx proc logs` reads are the ONLY way to watch it — and,
+    // like a guard, the observer needs a live parent, so it forces the supervised path below even
+    // with no guard (a would-be exec-replace becomes fork+wait). `inline` is false: nothing streams
+    // to the redirected stderr (the session log).
+    let observer =
+        observe.then(|| super::observe_feed::ProcObs::start(prep.layout.data_dir(), false));
+
     match guard {
-        None => {
+        None if !observe => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             eprintln!("sbx: failed to launch the sandbox: {err}");
             std::process::exit(1);
         }
-        Some(guard) => {
-            // Supervise: this daemon is the long-lived parent the proxy/forwarder threads and
-            // bwrap (`--die-with-parent`) hang from. Drop the guard explicitly before exiting — a
-            // bare `process::exit` runs no destructors, so the sockets and CA would otherwise leak
-            // even on a clean exit.
+        maybe_guard => {
+            // Supervise: this daemon is the long-lived parent the proxy/forwarder threads, the
+            // observer, and bwrap (`--die-with-parent`) hang from. Drop the guard and observer
+            // explicitly before exiting — a bare `process::exit` runs no destructors, so their
+            // sockets would otherwise leak even on a clean exit.
             let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
-            drop(guard);
+            drop(observer);
+            drop(maybe_guard);
             std::process::exit(code);
         }
     }
@@ -571,7 +581,7 @@ pub(crate) fn app(
 
     // SAFETY: `isatty` only inspects fd 0.
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
-    let observe = resolve_observe_interactive(observe, interactive);
+    warn_observe_interactive(observe, interactive);
 
     // `--net-learn`: run the app under its real (unchanged) posture, capture the egress it was
     // refused for lack of a rule, and hand the synthesized rules back for the caller to write. It is
@@ -614,7 +624,7 @@ pub(crate) fn app(
     // agent has no terminal, and a piped/non-tty invocation must not be handed one, so both keep
     // the exec-replace / supervised `NewSession` path.
     let code = if interactive {
-        launch_pty_supervised(&prep, runtime, Kind::Run, cmd)
+        launch_pty_supervised(&prep, runtime, Kind::Run, cmd, observe)
     } else {
         launch(prep, runtime, Kind::Run, cmd, detach, name, observe)
     };
@@ -2094,13 +2104,13 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
 /// shell — mise's documented interactive mechanism. (A non-interactive `sbx run` instead reaches
 /// activated tools through the shims dir on PATH, with no shell to hook.) Assumes stdin is a terminal
 /// (the callers check).
-fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime) -> ExitCode {
+fn launch_interactive_shell(prep: &Prepared, runtime: binds::Runtime, observe: bool) -> ExitCode {
     let cmd = vec![
         prep.userland.shell_bin.clone().into_os_string(),
         OsString::from("--rcfile"),
         OsString::from(binds::SHELL_RC_INCAGE),
     ];
-    launch_pty_supervised(prep, runtime, Kind::Shell, cmd)
+    launch_pty_supervised(prep, runtime, Kind::Shell, cmd, observe)
 }
 
 /// Launch `cmd` under the pty supervisor: the cage gets a *private* controlling terminal (so job
@@ -2118,6 +2128,7 @@ fn launch_pty_supervised(
     runtime: binds::Runtime,
     kind: Kind,
     cmd: Vec<OsString>,
+    observe: bool,
 ) -> ExitCode {
     // A graphical app's real interface is its window, not this terminal — Ctrl+C is forwarded
     // faithfully but a GUI app may ignore it — so note how to stop it. Only for a foreground app
@@ -2135,6 +2146,11 @@ fn launch_pty_supervised(
     let _record = register(prep.layout.data_dir(), &spec, kind, runtime).map(RecordGuard::new);
     // Hold the guard (egress proxy / forward forwarder threads) for the whole pty session.
     let _guard = guard;
+    // With observation on, populate the exec ring + control socket so `sbx proc logs`/`sbx proc live`
+    // can watch this interactive session from another terminal; held for the whole pty session and
+    // torn down on exit. Never inline — this terminal belongs to the agent's TUI.
+    let _observer =
+        observe.then(|| super::observe_feed::ProcObs::start(prep.layout.data_dir(), false));
 
     // The registered pid is this supervisor's own (`Session::current` records `std::process::id()`),
     // which is exactly what `sbx session ls` shows and `sbx session stop` accepts, so the hint names the real id.

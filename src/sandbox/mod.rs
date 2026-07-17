@@ -38,6 +38,7 @@ mod observe_feed;
 mod packages;
 mod portal;
 mod prebuilt;
+pub(crate) mod proc_control;
 mod projectstore;
 mod proxy;
 mod resolver;

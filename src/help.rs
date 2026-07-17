@@ -296,8 +296,10 @@ const PAGES: &[Page] = &[
         options: &[],
         details:
             "The in-cage observability surface, sibling of `sbx net`. `sbx proc ls` snapshots a\n\
-            session's process tree — what the agent has spawned. Read-only and host-side: it reads\n\
-            `/proc` with no privilege and no cooperation from the cage, and launches nothing.\n\
+            session's process tree and `sbx proc live` watches it redrawn — both read-only, host-side,\n\
+            and always available (they read `/proc` with no privilege, no cage cooperation, no\n\
+            launch). `sbx proc logs` is the exec-event feed: the processes the agent has spawned, in\n\
+            order — available for a session launched with observation on (`sbx run --observe`).\n\
             \n\
             Run one of the subcommands below.",
     },
@@ -341,6 +343,38 @@ const PAGES: &[Page] = &[
             its cage, redrawn in place on an interval until the session ends or you interrupt, so you\n\
             see processes start and finish in real time. Requires a terminal; `--json` streams one\n\
             snapshot per tick and works in a pipe. Read-only and host-side — it just polls `/proc`.",
+    },
+    Page {
+        path: &["proc", "logs"],
+        synopsis: "sbx proc logs [<id>] [-f|--follow] [--json]",
+        summary: "the exec-event feed of an observed session",
+        options: &[
+            (
+                "<id>",
+                "the PID `sbx session ls` shows; omit it when only one session is live",
+            ),
+            (
+                "-f, --follow",
+                "stream new events until the session ends (Ctrl+C to stop)",
+            ),
+            (
+                "--json",
+                "emit one object per event (NDJSON), for a pipe",
+            ),
+        ],
+        details:
+            "The exec-event feed — the processes an agent spawns inside its cage, in order, with the\n\
+            time each was first seen. Unlike `sbx proc ls`/`live` (which snapshot the tree of any\n\
+            session), this reads a recorded event stream, so the session must have been launched with\n\
+            observation on: `sbx run --observe` (or `sbx app run <name> --observe`). A session without\n\
+            it is reported as unobserved, not empty.\n\
+            \n\
+            It is the way to watch an observed session from another terminal — and the only way to\n\
+            watch a detached (`--detach`) one, which has no terminal for the inline feed. With no id\n\
+            the sole live session is used; otherwise name one by its PID.\n\
+            \n\
+            Honest limit: the feed is populated by a short-interval `/proc` poll, so a process shorter\n\
+            than one tick can be missed. Precise per-spawn capture (and blocking) is a later increment.",
     },
     Page {
         path: &["plugins"],

@@ -1,6 +1,8 @@
-//! Integration tests for `sbx proc ls` — the process-tree snapshot's CLI wiring: session
-//! resolution and the error paths, exercised through the built binary against an isolated (empty)
-//! data directory. No sandbox, no nix, no network — the registry read is all this slice needs.
+//! Integration tests for `sbx proc` — the process-observation CLI wiring: session resolution and the
+//! error paths for `ls`/`live`/`logs`, plus cage-backed e2e for the `/proc` walk (`ls`), the inline
+//! `--observe` feed (`run`/`app run`), and the detached exec-event ring read over the control socket
+//! (`logs`). The pure error paths run against an isolated (empty) data directory (no sandbox); the
+//! cage-backed ones skip where the host cannot sandbox.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -193,6 +195,128 @@ fn write_session_record(data: &Path, pid: u32, project: &Path) {
         .collect();
     let rec = format!("kind=run\npid={pid}\nstart={start}\nruntime=project\nproject={hex}\n");
     std::fs::write(dir.join(format!("{pid}-{start}")), rec).unwrap();
+}
+
+#[test]
+fn proc_logs_with_no_sessions_reports_none_and_exits_2() {
+    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let out = sbx(&["proc", "logs"], data.path(), proj.path());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("no active sandbox sessions"), "got: {err}");
+}
+
+#[test]
+fn proc_logs_rejects_a_second_id() {
+    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let out = sbx(&["proc", "logs", "1", "2"], data.path(), proj.path());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("at most one session id"), "got: {err}");
+}
+
+#[test]
+fn proc_logs_reports_an_unobserved_session() {
+    // A live session that was NOT launched with observation has no control socket, so `proc logs`
+    // reports it as unobserved (exit 2) rather than showing an empty feed. Fabricate a record
+    // pointing at a plain live process (a `sleep`) — no cage, no socket — to isolate the
+    // socket-missing path from the launch machinery. No sandbox needed.
+    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    write_session_record(data.path(), pid, project.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["proc", "logs", &pid.to_string()])
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run sbx proc logs");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(
+        err.contains("is not being observed"),
+        "an unobserved session should be named as such, not shown empty: {err}"
+    );
+}
+
+/// Extract the pid from the detached-launch line `sbx: started `run` as detached session <pid> …`.
+fn parse_detached_pid(msg: &str) -> Option<u32> {
+    let after = msg.split("detached session ").nth(1)?;
+    after
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|s| !s.is_empty())?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn detached_observe_records_exec_events_for_proc_logs() {
+    // The load-bearing property of this increment: a DETACHED session — which has no terminal for an
+    // inline feed — still records exec events, readable from a separate process via `sbx proc logs`
+    // over the per-session control socket. Launch a detached observed run that spawns a recognizable
+    // child, then read its ring back and assert the child appears. This exercises the whole chain the
+    // inline `--observe` feed cannot cover: force-supervision on the detached path, the ring, the
+    // bound socket, and the `sbx proc logs` client. Skipped, not failed, where the host cannot
+    // sandbox.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping detached --observe e2e: host cannot sandbox");
+        return;
+    }
+
+    // Detached + observed: spawns `sleep 30`, which lives well past the poll tick and our reads.
+    let started = sbx_isolated()
+        .args(["run", "--detach", "--observe", "--", "sh", "-c", "sleep 30"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run --detach --observe");
+    let msg = String::from_utf8_lossy(&started.stderr).into_owned();
+    assert!(started.status.success(), "detached launch failed:\n{msg}");
+    let pid =
+        parse_detached_pid(&msg).unwrap_or_else(|| panic!("no detached session pid in:\n{msg}"));
+
+    // Poll `sbx proc logs <pid>` until the spawned `sleep` appears in the ring — read over the socket,
+    // the ONLY channel for a detached session. A stunted observer never converges and the assertion
+    // below fires with the last output.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    let mut ok = false;
+    while Instant::now() < deadline {
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(["proc", "logs", &pid.to_string()])
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run sbx proc logs");
+        last = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.code() == Some(0) && last.contains("sleep") {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // Stop the detached session before asserting, so a failure never leaks a background cage.
+    let _ = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["session", "stop", &pid.to_string()])
+        .env("XDG_DATA_HOME", data.path())
+        .output();
+
+    assert!(
+        ok,
+        "the detached observed session's spawned `sleep` must appear in `sbx proc logs` (read over \
+         the control socket — a detached session has no inline feed). Last output:\n{last}"
+    );
 }
 
 #[test]

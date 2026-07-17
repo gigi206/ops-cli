@@ -21,7 +21,7 @@ See also: [The app framework](../apps/README.md) · [`[app.<name>]`](../configur
 | Option | Meaning |
 |---|---|
 | `--detach` | launch in the background as a session [`sbx session`](session.md) can see |
-| `--observe` | stream a `[sbx:exec]` feed of the processes the app spawns (non-interactive runs; use [`sbx proc live`](proc.md) for an interactive terminal) — see [`sbx run`](run.md#observing-a-run-observe) |
+| `--observe` | record the processes the app spawns — read them with [`sbx proc logs`](proc.md#logs) (and, on a non-interactive foreground run, streamed inline to stderr); works for interactive and detached launches too — see [`sbx run`](run.md#observing-a-run-observe) |
 | `--config` / `--env` / `--net` / `--gui` / `--nixpkgs` / `--bind` / `--limit` / `--package` | one-shot [overrides](../configuration/overrides.md), applied **after** the app's overlay (the final word) |
 | `-- <args>...` | appended to the app's declared command |
 
