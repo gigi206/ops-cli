@@ -26,6 +26,7 @@ mod forward;
 mod gc;
 mod gpu;
 mod guidata;
+pub(crate) mod inspect;
 mod launch;
 mod mise;
 mod miseplugin;
@@ -60,10 +61,10 @@ pub(crate) use flake::{
     withheld as withheld_flake_packages, FlakeUpgrade,
 };
 pub(crate) use gc::{
-    classify_tree, human_bytes, installed_app_homes, purge_app_homes, InstalledApp,
+    classify_tree, human_bytes, installed_app_homes, purge_app_homes, tree_size, InstalledApp,
 };
 pub(crate) use launch::{
-    app, attach, effective_lock_target, gc, projects_list, projects_rm,
+    app, attach, effective_lock_target, gc, projects_list, projects_rm, projects_show,
     rm_apply as projects_rm_apply, run, run_mise, shell, stop, superseded_reclaimable_hint,
     upgrade_mise_packages,
 };

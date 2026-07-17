@@ -1065,6 +1065,328 @@ fn collect_project_trees(
     rows
 }
 
+/// The realized nix store roots of a project tree, grouped by backend, for `sbx projects show`.
+#[derive(serde::Serialize, Default)]
+struct StoreRootsView {
+    /// `nix:` packages and hole provisions — the gcroot names that are not a prebuilt build output.
+    nix: Vec<String>,
+    /// `deb:` build outputs (the `deb-` gcroots, prefix stripped).
+    deb: Vec<String>,
+    /// `appimage:` build outputs (the `appimage-` gcroots, prefix stripped).
+    appimage: Vec<String>,
+}
+
+/// A mise tool realized in the project's own home, for `sbx projects show`.
+#[derive(serde::Serialize)]
+struct ProjToolView {
+    /// The on-disk (munged) tool directory name.
+    name: String,
+    versions: Vec<String>,
+}
+
+/// A declared item the project has not realized yet — `sbx projects show`'s "declared but not built"
+/// section — distinguishing an untrusted `withheld` item (a launch would not provision it) from a
+/// trusted one simply not built yet (an offline first launch equips it).
+#[derive(serde::Serialize)]
+struct UnbuiltView {
+    /// `nix`/`deb`/`appimage`/`flake`/`mise` for a `[packages]` backend, or `nix tool`/`mise tool`
+    /// for a mise `[tools]` entry.
+    kind: String,
+    locator: String,
+    withheld: bool,
+}
+
+/// The nixpkgs channel/revision a project resolves against, for `sbx projects show`.
+#[derive(serde::Serialize)]
+struct NixpkgsView {
+    source: String,
+    rev: String,
+    /// `true` when the tree carries its own pin, `false` when it tracks the global channel.
+    per_project: bool,
+}
+
+/// The `sbx projects show` model — serialized directly for `--json`.
+#[derive(serde::Serialize)]
+struct ProjectShowView {
+    id: String,
+    state: &'static str,
+    /// The canonical project path the tree belongs to, when it carries a marker.
+    project: Option<String>,
+    last_used: String,
+    total_bytes: u64,
+    store_bytes: u64,
+    home_bytes: u64,
+    other_bytes: u64,
+    nixpkgs: Option<NixpkgsView>,
+    store_roots: StoreRootsView,
+    mise_tools: Vec<ProjToolView>,
+    unbuilt: Vec<UnbuiltView>,
+    /// Whether the project directory still exists, so its declared config could be read (a dead tree
+    /// shows realized state only — there is nothing left to compare against).
+    config_available: bool,
+}
+
+/// Show one project runtime tree's realized-on-disk detail — `sbx projects show <id>`. Reports the
+/// tree's state and size (broken down store/home/other), the nixpkgs pin it resolves against, the
+/// store roots realized in its (shared) store grouped by backend, the mise tools in its own home,
+/// and — when the project directory still exists — the project's declared packages/tools that are
+/// **not** built yet (an untrusted one flagged `withheld`). Read-only: no sandbox, no nix, no
+/// network. The counterpart of `sbx app show` for a project rather than an app.
+pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -> ExitCode {
+    use crate::config::Backend;
+
+    let Some(layout) = crate::store::Layout::from_env() else {
+        eprintln!("sbx projects show: cannot locate sbx's data directory.");
+        return ExitCode::FAILURE;
+    };
+    let data = layout.data_dir();
+    let dir = data.join("projects").join(id);
+    if !dir.is_dir() {
+        eprintln!(
+            "sbx projects show: no runtime tree `{id}` — run `sbx projects list` to see them."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let live_ids = session_housekeeping(&layout, pal);
+    let class = super::gc::classify_tree(&dir, &live_ids);
+
+    let total_bytes = super::gc::tree_size(&dir);
+    let store_bytes = super::gc::tree_size(&dir.join("store"));
+    let home_bytes = super::gc::tree_size(&dir.join("home"));
+    let other_bytes = total_bytes
+        .saturating_sub(store_bytes)
+        .saturating_sub(home_bytes);
+
+    // Realized signals, read once from the tree.
+    let gcroots = super::inspect::gcroot_names(data, id);
+    let gcroot_set: std::collections::BTreeSet<&str> = gcroots.iter().map(String::as_str).collect();
+    let tools_locked = super::inspect::nix_tools_locked(&dir);
+    let home_tools = super::inspect::mise_installed(&dir.join("home"));
+    let home_munged: std::collections::BTreeSet<&str> =
+        home_tools.iter().map(|t| t.name.as_str()).collect();
+    let nixpkgs =
+        super::inspect::nixpkgs_pin(&dir, data).map(|(source, rev, per_project)| NixpkgsView {
+            source,
+            rev,
+            per_project,
+        });
+
+    // Group the store roots: `deb-`/`appimage-` are prebuilt build outputs; everything else is a
+    // `nix:` package (or a hole provision realized into the shared store).
+    let mut store_roots = StoreRootsView::default();
+    for name in &gcroots {
+        if let Some(rest) = name.strip_prefix("deb-") {
+            store_roots.deb.push(rest.to_string());
+        } else if let Some(rest) = name.strip_prefix("appimage-") {
+            store_roots.appimage.push(rest.to_string());
+        } else {
+            store_roots.nix.push(name.clone());
+        }
+    }
+
+    let mise_tools: Vec<ProjToolView> = home_tools
+        .iter()
+        .map(|t| ProjToolView {
+            name: t.name.clone(),
+            versions: super::inspect::concrete_versions(t),
+        })
+        .collect();
+
+    // "Declared but not built": the project's own declared packages + mise tools that no realized
+    // signal accounts for. Only computable when the project directory still exists (a dead tree has
+    // no config to read). Untrusted declarations read `withheld` — a launch would not provision them.
+    let project = class.project_path.as_ref().map(|p| p.display().to_string());
+    let config_available = class
+        .project_path
+        .as_deref()
+        .map(Path::is_dir)
+        .unwrap_or(false);
+    let mut unbuilt = Vec::new();
+    if let Some(ppath) = class.project_path.as_deref().filter(|p| p.is_dir()) {
+        let resolved = crate::config::load(ppath);
+        for pkg in &resolved.packages {
+            let realized = match &pkg.backend {
+                Backend::Mise(token) => {
+                    home_munged.contains(super::inspect::mise_munge(token).as_str())
+                }
+                Backend::Nix(_) => gcroot_set.contains(pkg.name.as_str()),
+                Backend::Deb(_) => gcroot_set.contains(format!("deb-{}", pkg.name).as_str()),
+                Backend::AppImage(_) => {
+                    gcroot_set.contains(format!("appimage-{}", pkg.name).as_str())
+                }
+                Backend::Flake(reference) => {
+                    super::inspect::prebuilt_pin_in(&dir, "flake-packages.lock", reference)
+                        .is_some()
+                }
+                Backend::FlakeInline { .. } => gcroot_set.contains(pkg.name.as_str()),
+            };
+            if !realized {
+                unbuilt.push(UnbuiltView {
+                    kind: pkg.backend.label().to_string(),
+                    locator: format!("{} = {}", pkg.name, pkg.backend.locator()),
+                    withheld: pkg.state != crate::trust::TrustState::Trusted,
+                });
+            }
+        }
+        // Declared mise `[tools]`: a `nix:` tool is host-provisioned (trusted-only), recorded in
+        // tools.lock; any other backend is auto-equipped in-cage into the project home. A withheld
+        // `nix:` tool is one the (untrusted) mise config would not have provisioned.
+        if let Some(mise) = resolved.mise.as_ref() {
+            let mise_trusted = mise.state == crate::trust::TrustState::Trusted;
+            let declared = super::nixhub::parse_nix_tools(&mise.files);
+            for tool in &declared.nix {
+                if !tools_locked.contains_key(&tool.pkg) {
+                    unbuilt.push(UnbuiltView {
+                        kind: "nix tool".to_string(),
+                        locator: format!("nix:{} = {}", tool.pkg, tool.version),
+                        withheld: !mise_trusted,
+                    });
+                }
+            }
+            for tool in &declared.non_nix {
+                if !home_munged.contains(super::inspect::mise_munge(&tool.token).as_str()) {
+                    unbuilt.push(UnbuiltView {
+                        kind: "mise tool".to_string(),
+                        locator: format!("{} = {}", tool.token, tool.version),
+                        withheld: false,
+                    });
+                }
+            }
+        }
+    }
+
+    let view = ProjectShowView {
+        id: id.to_string(),
+        state: class.state.label(),
+        project,
+        last_used: crate::paths::civil_date(class.last_used),
+        total_bytes,
+        store_bytes,
+        home_bytes,
+        other_bytes,
+        nixpkgs,
+        store_roots,
+        mise_tools,
+        unbuilt,
+        config_available,
+    };
+
+    if json {
+        return match serde_json::to_string_pretty(&view) {
+            Ok(doc) => {
+                println!("{doc}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sbx projects show: failed to serialize: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    print!("{}", render_project_show(&view, pal));
+    ExitCode::SUCCESS
+}
+
+/// Render the `sbx projects show` model — a pure presenter (every color span is empty under a
+/// non-terminal, so captured output is the plain text the tests pin).
+fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> String {
+    use std::fmt::Write;
+    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    let mut s = String::new();
+    let _ = writeln!(s, "{h}project{r} {n}{}{r}  {}", v.id, v.state);
+    match &v.project {
+        Some(p) => {
+            let _ = writeln!(s, "  path:     {p}");
+        }
+        None => {
+            let _ = writeln!(s, "  path:     {dim}(no marker — project path unknown){r}");
+        }
+    }
+    let _ = writeln!(s, "  last:     {dim}{}{r}", v.last_used);
+    let _ = writeln!(
+        s,
+        "  disk:     {}  {dim}(store {} · home {} · other {}){r}",
+        super::gc::human_bytes(v.total_bytes),
+        super::gc::human_bytes(v.store_bytes),
+        super::gc::human_bytes(v.home_bytes),
+        super::gc::human_bytes(v.other_bytes),
+    );
+    match &v.nixpkgs {
+        Some(np) => {
+            let scope = if np.per_project {
+                "per-project pin"
+            } else {
+                "global channel"
+            };
+            let _ = writeln!(
+                s,
+                "  nixpkgs:  {} @ {}  {dim}({scope}){r}",
+                np.source, np.rev
+            );
+        }
+        None => {
+            let _ = writeln!(s, "  nixpkgs:  {dim}(no lock recorded){r}");
+        }
+    }
+    // Store roots realized in the (shared) per-project store.
+    let roots_empty = v.store_roots.nix.is_empty()
+        && v.store_roots.deb.is_empty()
+        && v.store_roots.appimage.is_empty();
+    if roots_empty {
+        let _ = writeln!(s, "  store roots: {dim}none{r}");
+    } else {
+        let _ = writeln!(
+            s,
+            "  store roots {dim}(built in this project's store, shared by its apps):{r}"
+        );
+        let mut row = |label: &str, items: &[String]| {
+            if !items.is_empty() {
+                let _ = writeln!(s, "    {label:<9} {n}{}{r}", items.join(", "));
+            }
+        };
+        row("nix", &v.store_roots.nix);
+        row("deb", &v.store_roots.deb);
+        row("appimage", &v.store_roots.appimage);
+    }
+    // mise tools in the project's own home.
+    if !v.mise_tools.is_empty() {
+        let _ = writeln!(s, "  mise tools {dim}(project home):{r}");
+        for t in &v.mise_tools {
+            let versions = t.versions.join(", ");
+            let suffix = if versions.is_empty() {
+                String::new()
+            } else {
+                format!("  {dim}{versions}{r}")
+            };
+            let _ = writeln!(s, "    {n}{}{r}{suffix}", t.name);
+        }
+    }
+    // Declared-but-not-built (the useful direction of declared-vs-installed).
+    if !v.config_available {
+        let _ = writeln!(
+            s,
+            "  {dim}(project directory is gone — showing realized state only){r}"
+        );
+    } else if v.unbuilt.is_empty() {
+        let _ = writeln!(
+            s,
+            "  declared: {ok}all declared packages/tools are built{r}"
+        );
+    } else {
+        let _ = writeln!(s, "  declared but not built:");
+        for u in &v.unbuilt {
+            let (tag, hue) = if u.withheld {
+                ("withheld (untrusted — run `sbx trust`)", warn)
+            } else {
+                ("not built yet", dim)
+            };
+            let _ = writeln!(s, "    {n}{}{r} {}  {hue}{tag}{r}", u.kind, u.locator);
+        }
+    }
+    s
+}
+
 /// List the per-project runtime trees — `sbx projects` / `sbx projects list`. A read-only overview
 /// (richer than `sbx path`'s projects section: it adds each tree's on-disk size), in aligned text
 /// or `--json`.

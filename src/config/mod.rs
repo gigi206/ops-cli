@@ -52,7 +52,7 @@ const PROFILES_DIR: &str = "apps";
 /// between the subcommand and launching an app literally named `import`, and such an app could be
 /// neither launched nor managed. Reserving them removes the ambiguity at the source — they are
 /// rejected as app names wherever one is resolved.
-pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list", "ls"];
+pub(crate) const RESERVED_APP_VERBS: &[&str] = &["import", "export", "rm", "list", "ls", "show"];
 
 /// Whether `name` is a reserved `sbx app` subcommand verb, and so may not be an app name.
 pub(crate) fn is_reserved_app_verb(name: &str) -> bool {

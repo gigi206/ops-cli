@@ -2865,6 +2865,7 @@ fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(&args[1..]),
         Some("list" | "ls") => app_list(),
+        Some("show") => app_show(&args[1..]),
         // Otherwise a single non-flag token names an app to launch; `--detach` runs it in the
         // background as a session `sbx session ls` can see. Tokens after a `--` are passed
         // through to the app's command (see `parse_app_launch`).
@@ -3714,6 +3715,393 @@ fn app_list() -> ExitCode {
          sbx app rm <name> --purge){r}"
     );
     ExitCode::SUCCESS
+}
+
+/// `sbx app show <name>`: the realized-on-disk detail for one app — its profile source, its
+/// isolated home(s) with size (and the mise-data breakdown), and each declared package annotated
+/// with whether it is **actually installed**: a `mise:` tool is read from the app home; a `deb:` /
+/// `appimage:` / `flake:` build lives in the per-project store, so it is reported from the per-tree
+/// pins ("pinned in N tree(s)"); a `nix:` package is built per-project (`sbx projects show` details
+/// it). A package declared by an untrusted layer reads `withheld`, distinct from `not installed`, so
+/// it is not mistaken for a failed provision. Read-only: no trust gate, no launch, no network.
+/// `--json` emits the same model.
+fn app_show(args: &[OsString]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut json = false;
+    for a in args {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some("--help") | Some("-h") => return help::show(&["app", "show"]),
+            Some(flag) if flag.starts_with('-') => {
+                eprintln!("sbx: app show: unknown flag `{flag}`");
+                eprintln!("       run `sbx help app show` for usage.");
+                return ExitCode::from(2);
+            }
+            Some(other) if name.is_none() => name = Some(other),
+            Some(extra) => {
+                eprintln!("sbx: app show: unexpected extra argument `{extra}`");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("sbx: app show: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!(
+            "sbx: app show: name an app — usage: {}",
+            help::synopsis_of(&["app", "show"])
+        );
+        return ExitCode::from(2);
+    };
+    let cwd = match config_cwd() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: app show: cannot locate sbx's data directory.");
+        return ExitCode::FAILURE;
+    };
+
+    let resolved = config::load(&cwd);
+    let app = resolved.apps.get(name);
+    let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
+    // An app that is neither declared for this directory nor has an installed home on disk does not
+    // exist — surface the declared set, like `config show --app`.
+    if app.is_none() && homes.is_empty() {
+        eprintln!("sbx: app show: no app named {name:?}");
+        let declared: Vec<String> = resolved.apps.keys().cloned().collect();
+        if declared.is_empty() {
+            eprintln!("sbx: no apps are declared for this directory");
+        } else {
+            eprintln!("sbx: declared apps: {}", declared.join(", "));
+        }
+        return ExitCode::FAILURE;
+    }
+
+    let view = build_app_show(name, app, &resolved.network, &homes, layout.data_dir());
+    if json {
+        return match serde_json::to_string_pretty(&view) {
+            Ok(doc) => {
+                println!("{doc}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sbx: app show: cannot serialize: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    print!("{}", render_app_show(&view, &pal));
+    ExitCode::SUCCESS
+}
+
+/// The realized state of one declared package for `sbx app show`.
+#[derive(serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum PackageInstalled {
+    /// A `mise:` tool present in the app home, or a prebuilt pinned in project tree(s).
+    Installed { detail: String },
+    /// A trusted, launchable package with no realized state yet (offline first launch equips it).
+    NotInstalled,
+    /// A `nix:`/inline-flake package whose build lives in the per-project store — `sbx projects
+    /// show` reports it per tree.
+    PerProject,
+    /// Declared by an untrusted or changed layer, so a launch would not provision it.
+    Withheld,
+}
+
+/// One declared package plus where it is realized, for `sbx app show`.
+#[derive(serde::Serialize)]
+struct PackageShow {
+    backend: &'static str,
+    locator: String,
+    installed: PackageInstalled,
+}
+
+/// One isolated home an app has on disk, sized with its mise-data share broken out, for `sbx app
+/// show`.
+#[derive(serde::Serialize)]
+struct AppHomeShow {
+    /// `global`, or `project <id>`.
+    location: String,
+    bytes: u64,
+    /// Bytes under the mise data dir (the installed tools) — the rest is config/login/state.
+    tools_bytes: u64,
+}
+
+/// A mise tool present in a home but not matched to any declared package — the literal
+/// "everything actually installed" that the declared-package list does not name (a leftover from a
+/// removed profile, or a tool a `mise:` backend pulled in as a dependency).
+#[derive(serde::Serialize)]
+struct OrphanTool {
+    /// The on-disk (munged) tool directory name, e.g. `aqua-openai-codex`.
+    name: String,
+    versions: Vec<String>,
+}
+
+/// The full `sbx app show` model — serialized directly for `--json`.
+#[derive(serde::Serialize)]
+struct AppShow {
+    name: String,
+    /// The imported profile path, when the app comes from one.
+    profile: Option<String>,
+    /// The app's home key: `global` (shared across projects) or `per-project`.
+    home_scope: Option<&'static str>,
+    /// The effective network posture label, when the app is declared.
+    network: Option<&'static str>,
+    homes: Vec<AppHomeShow>,
+    total_bytes: u64,
+    packages: Vec<PackageShow>,
+    /// Installed mise tools that no declared package accounts for.
+    orphans: Vec<OrphanTool>,
+}
+
+/// Assemble the [`AppShow`] model from the resolved app (its declared packages/posture) and the
+/// on-disk homes. `app` is `None` for a home-only app (installed, no current declaration) — then
+/// only the realized state is shown. Pure over its inputs; the disk reads happen in
+/// [`sandbox::inspect`].
+fn build_app_show(
+    name: &str,
+    app: Option<&config::ResolvedApp>,
+    baseline_network: &config::NetworkPolicy,
+    homes: &[sandbox::inspect::AppHome],
+    data_dir: &Path,
+) -> AppShow {
+    use crate::config::Backend;
+
+    // The mise tools realized across every home of this app — the authoritative installed set for
+    // `mise:` packages (which are app-home-scoped, unlike the per-project prebuilt backends).
+    let installed_tools: Vec<sandbox::inspect::InstalledTool> = homes
+        .iter()
+        .flat_map(|h| sandbox::inspect::mise_installed(&h.dir))
+        .collect();
+
+    let home_views: Vec<AppHomeShow> = homes
+        .iter()
+        .map(|h| {
+            // Size the app's own directory (the parent of `home`), matching `sbx app list`; the mise
+            // data dir is broken out so the tools' share of the home is visible.
+            let app_dir = h.dir.parent().unwrap_or(&h.dir);
+            let bytes = sandbox::tree_size(app_dir);
+            let tools_bytes = sandbox::tree_size(&h.dir.join(".local/share/mise"));
+            AppHomeShow {
+                location: if h.global {
+                    "global".to_string()
+                } else {
+                    format!("project {}", h.project_id.as_deref().unwrap_or("?"))
+                },
+                bytes,
+                tools_bytes,
+            }
+        })
+        .collect();
+    let total_bytes = home_views.iter().map(|h| h.bytes).sum();
+
+    let packages = app
+        .map(|a| {
+            a.packages
+                .iter()
+                .map(|pkg| {
+                    let backend = pkg.backend.label();
+                    let locator = pkg.backend.locator().to_string();
+                    let installed = if pkg.state != trust::TrustState::Trusted {
+                        PackageInstalled::Withheld
+                    } else if let Backend::Mise(token) = &pkg.backend {
+                        let munged = sandbox::inspect::mise_munge(token);
+                        match installed_tools.iter().find(|t| t.name == munged) {
+                            Some(t) => {
+                                let versions = sandbox::inspect::concrete_versions(t).join(", ");
+                                PackageInstalled::Installed {
+                                    detail: if versions.is_empty() {
+                                        "installed".to_string()
+                                    } else {
+                                        format!("installed {versions}")
+                                    },
+                                }
+                            }
+                            None => PackageInstalled::NotInstalled,
+                        }
+                    } else if let Some(lockfile) = sandbox::inspect::prebuilt_lockfile(&pkg.backend)
+                    {
+                        let hits =
+                            sandbox::inspect::prebuilt_pin_trees(data_dir, lockfile, &locator);
+                        match hits.first() {
+                            Some((_, short)) => PackageInstalled::Installed {
+                                detail: format!("pinned in {} ({short})", plural_trees(hits.len())),
+                            },
+                            None => PackageInstalled::NotInstalled,
+                        }
+                    } else {
+                        // nix: and inline-flake build into the per-project store.
+                        PackageInstalled::PerProject
+                    };
+                    PackageShow {
+                        backend,
+                        locator,
+                        installed,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Orphans: installed mise tools no declared `mise:` package accounts for (matched through the
+    // same munge). A home-only app (nothing declared) surfaces its whole installed set here — the
+    // literal "everything actually installed". Deduped by name across homes, versions unioned.
+    let declared_munged: std::collections::HashSet<String> = app
+        .map(|a| {
+            a.packages
+                .iter()
+                .filter_map(|p| match &p.backend {
+                    Backend::Mise(token) => Some(sandbox::inspect::mise_munge(token)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut orphan_versions: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for tool in &installed_tools {
+        if declared_munged.contains(&tool.name) {
+            continue;
+        }
+        orphan_versions
+            .entry(tool.name.clone())
+            .or_default()
+            .extend(sandbox::inspect::concrete_versions(tool));
+    }
+    let orphans: Vec<OrphanTool> = orphan_versions
+        .into_iter()
+        .map(|(name, versions)| OrphanTool {
+            name,
+            versions: versions.into_iter().collect(),
+        })
+        .collect();
+
+    let profile = config::profiles_dir()
+        .map(|d| d.join(format!("{name}.toml")))
+        .filter(|p| p.is_file())
+        .map(|p| p.display().to_string());
+
+    AppShow {
+        name: name.to_string(),
+        profile,
+        home_scope: app.map(|a| match a.home_scope {
+            config::AppHomeScope::Global => "global",
+            config::AppHomeScope::Project => "per-project",
+        }),
+        // The effective posture: the app's own when it set one, else the baseline it inherits. The
+        // label matches `config show` exactly (a filtering posture is its mode word `deny`/`allow`/
+        // `ask` — deny = allowlist, allow = denylist — not a single "allowlist"), so the two views
+        // never disagree.
+        network: app.map(|a| match a.network.as_ref().unwrap_or(baseline_network) {
+            config::NetworkPolicy::Shared => "shared",
+            config::NetworkPolicy::Isolated => "none",
+            config::NetworkPolicy::Allowlist(pol) => net_mode_word(pol.default_action().into()),
+        }),
+        homes: home_views,
+        total_bytes,
+        packages,
+        orphans,
+    }
+}
+
+/// `1 tree` / `N trees` for the pinned-in count.
+fn plural_trees(n: usize) -> String {
+    if n == 1 {
+        "1 tree".to_string()
+    } else {
+        format!("{n} trees")
+    }
+}
+
+/// Render the `sbx app show` model — a pure presenter (every color span is empty under a
+/// non-terminal, so captured output is the plain text the tests pin).
+fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
+    use std::fmt::Write;
+    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    let mut s = String::new();
+    let _ = writeln!(s, "{h}app{r} {n}{}{r}", v.name);
+    match &v.profile {
+        Some(p) => {
+            let _ = writeln!(s, "  profile:  {p}");
+        }
+        None if v.home_scope.is_some() => {
+            let _ = writeln!(s, "  profile:  {dim}inline (no imported profile){r}");
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "  profile:  {dim}— (installed home only, no declaration){r}"
+            );
+        }
+    }
+    if let Some(scope) = v.home_scope {
+        let phrase = match scope {
+            "global" => "global (shared across projects)",
+            _ => "per-project",
+        };
+        let _ = writeln!(s, "  home:     {phrase}");
+    }
+    if let Some(net) = v.network {
+        let _ = writeln!(s, "  network:  {net}");
+    }
+    // On-disk usage: the total, then one breakdown line per home (its mise-tools share vs the rest).
+    if v.homes.is_empty() {
+        let _ = writeln!(s, "  disk:     {dim}— (not launched yet){r}");
+    } else {
+        let _ = writeln!(s, "  disk:     {}", sandbox::human_bytes(v.total_bytes));
+        for home in &v.homes {
+            let state = home.bytes.saturating_sub(home.tools_bytes);
+            let _ = writeln!(
+                s,
+                "    {} · {}  {dim}(tools {} · state {}){r}",
+                home.location,
+                sandbox::human_bytes(home.bytes),
+                sandbox::human_bytes(home.tools_bytes),
+                sandbox::human_bytes(state),
+            );
+        }
+    }
+    // Packages, each `backend:locator` (the declaration syntax) with its realized state.
+    if v.packages.is_empty() {
+        let _ = writeln!(s, "  packages: {dim}none declared{r}");
+    } else {
+        let _ = writeln!(s, "  packages:");
+        for p in &v.packages {
+            let (tag, hue) = match &p.installed {
+                PackageInstalled::Installed { detail } => (detail.clone(), ok),
+                PackageInstalled::NotInstalled => ("not installed".to_string(), warn),
+                PackageInstalled::PerProject => {
+                    ("built per-project (sbx projects show)".to_string(), dim)
+                }
+                PackageInstalled::Withheld => {
+                    ("withheld (untrusted — run `sbx trust`)".to_string(), warn)
+                }
+            };
+            let _ = writeln!(s, "    {n}{}:{}{r}  {hue}{tag}{r}", p.backend, p.locator);
+        }
+    }
+    // Installed mise tools no declared package accounts for — a leftover profile or a mise-pulled
+    // dependency. Named by their on-disk (munged) directory, since there is no declaration to map back.
+    if !v.orphans.is_empty() {
+        let _ = writeln!(s, "  installed (undeclared):");
+        for t in &v.orphans {
+            let versions = t.versions.join(", ");
+            let suffix = if versions.is_empty() {
+                String::new()
+            } else {
+                format!("  {dim}{versions}{r}")
+            };
+            let _ = writeln!(s, "    {n}{}{r}{suffix}", t.name);
+        }
+    }
+    s
 }
 
 /// A compact description of where an app's installed homes live — `global`, `N project home(s)`, or
@@ -8381,6 +8769,7 @@ fn projects_cmd(args: Vec<OsString>) -> ExitCode {
     }
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => projects_list_cmd(&args[1..]),
+        Some("show") => projects_show_cmd(&args[1..]),
         Some("rm") | Some("remove") => projects_rm_cmd(&args[1..]),
         // Bare `sbx projects`, or only flags (e.g. `--json`) with no subcommand: print the page so
         // its subcommand list guides, like bare `sbx app`/`sbx session`.
@@ -8419,6 +8808,41 @@ fn projects_list_cmd(args: &[OsString]) -> ExitCode {
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     sandbox::projects_list(json, &pal)
+}
+
+/// `sbx projects show <id>`: the realized-on-disk detail for one runtime tree.
+fn projects_show_cmd(args: &[OsString]) -> ExitCode {
+    let mut id: Option<&str> = None;
+    let mut json = false;
+    for a in args {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some("--help") | Some("-h") => return help::show(&["projects", "show"]),
+            Some(flag) if flag.starts_with('-') => {
+                eprintln!("sbx: projects show: unknown flag `{flag}`");
+                eprintln!("       run `sbx help projects show` for usage.");
+                return ExitCode::from(2);
+            }
+            Some(other) if id.is_none() => id = Some(other),
+            Some(extra) => {
+                eprintln!("sbx: projects show: unexpected extra argument `{extra}`");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("sbx: projects show: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(id) = id else {
+        eprintln!(
+            "sbx: projects show: name a tree id — usage: {}",
+            help::synopsis_of(&["projects", "show"])
+        );
+        return ExitCode::from(2);
+    };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    sandbox::projects_show(id, json, &pal)
 }
 
 fn projects_rm_cmd(args: &[OsString]) -> ExitCode {

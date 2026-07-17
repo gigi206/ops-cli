@@ -781,6 +781,44 @@ const PAGES: &[Page] = &[
             profile since removed). `sbx app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `sbx config show`.",
     },
+    Page {
+        path: &["projects", "show"],
+        synopsis: "sbx projects show <id> [--json]",
+        summary: "show one runtime tree's realized-on-disk detail (store roots, tools, size)",
+        options: &[
+            ("<id>", "the tree id (as `sbx projects list` shows it)"),
+            ("--json", "emit the detail as a JSON document for scripting"),
+        ],
+        details:
+            "The realized-on-disk detail for one per-project runtime tree: its state and size (broken\n\
+            down store / home / other), the nixpkgs channel or pin it resolves against, the store\n\
+            roots built in its (shared) store grouped by backend — `nix`, `deb`, `appimage` — the\n\
+            mise tools in its own home, and, when the project directory still exists, the project's\n\
+            declared packages/tools that are **not** built yet (an untrusted one flagged `withheld`,\n\
+            distinct from a trusted one simply not equipped yet). The store is shared by the project\n\
+            and every app launched in it, so the roots include app packages. A dead tree (its project\n\
+            directory gone) shows realized state only. Read-only: no sandbox, no nix, no network. For\n\
+            an app rather than a tree, see `sbx app show <name>`.",
+    },
+    Page {
+        path: &["app", "show"],
+        synopsis: "sbx app show <name> [--json]",
+        summary: "show one app's realized-on-disk detail (installed tools, packages, home size)",
+        options: &[
+            ("<name>", "the app to inspect"),
+            ("--json", "emit the detail as a JSON document for scripting"),
+        ],
+        details:
+            "The realized-on-disk detail for one app: its profile source, its isolated home(s) with\n\
+            on-disk size (and the mise-tools share broken out), and each declared package annotated\n\
+            with whether it is actually installed. A `mise:` tool is read from the app's home; a\n\
+            `deb:`/`appimage:`/`flake:` build lives in the per-project nix store, so it is reported\n\
+            as pinned in N project tree(s) (see `sbx projects show`); a `nix:` package is built\n\
+            per-project. A package a launch would not provision because an untrusted layer declared\n\
+            it reads `withheld`, distinct from `not installed`. Read-only: no trust gate, no launch,\n\
+            no network. For the app's *declared* configuration with provenance, see `sbx config show\n\
+            --app <name>`; for the full realized state of a project tree, `sbx projects show <id>`.",
+    },
     // ---- test subcommands ---------------------------------------------------------
     Page {
         path: &["test", "net"],

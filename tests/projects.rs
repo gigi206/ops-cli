@@ -83,6 +83,18 @@ impl Fixture {
         }
         dir
     }
+
+    /// Fabricate a store gcroot `<data>/sbx/gcroots/projects/<tree_id>/<name>` — the realized-package
+    /// signal `sbx projects show` reads.
+    fn make_gcroot(&self, tree_id: &str, name: &str) {
+        let dir = self
+            .data_home
+            .path()
+            .join("sbx/gcroots/projects")
+            .join(tree_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
 }
 
 fn text(out: &std::process::Output) -> String {
@@ -116,6 +128,135 @@ fn list_classifies_and_sizes_each_tree() {
     assert!(
         s.contains("KiB"),
         "the size column should show a KiB figure:\n{s}"
+    );
+}
+
+#[test]
+fn show_reports_store_roots_and_declared_but_not_built() {
+    let fx = Fixture::new();
+    let proj = fx.proj.path().canonicalize().unwrap();
+    // A tree that belongs to the project directory (idle), with one realized nix package.
+    let tree = "1111111111111111";
+    fx.make_tree(tree, Some(&proj));
+    fx.make_gcroot(tree, "built"); // the `built` package's gcroot
+                                   // The project declares two nix packages: one is realized (`built`), one is not (`absent`).
+    std::fs::write(
+        proj.join(".sbx.toml"),
+        "[packages]\nbuilt = \"nix:hello\"\nabsent = \"nix:missing\"\n",
+    )
+    .unwrap();
+    // Trust the config so its packages resolve as trusted (declared, not withheld).
+    let out = fx.sbx(&["trust"]);
+    assert!(out.status.success(), "trust failed: {}", text(&out));
+
+    let out = fx.sbx(&["projects", "show", tree]);
+    assert!(out.status.success(), "projects show failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    // The realized package shows as a store root; the size breakdown is present.
+    assert!(
+        s.contains("store roots") && s.contains("built"),
+        "the realized package should be a store root:\n{s}"
+    );
+    assert!(
+        s.contains("store ") && s.contains("home "),
+        "size breakdown:\n{s}"
+    );
+    // The unrealized declared package shows as `not built yet` (trusted, so not `withheld`).
+    assert!(
+        s.contains("declared but not built:") && s.contains("absent"),
+        "the unrealized package should be listed:\n{s}"
+    );
+    assert!(
+        s.contains("not built yet") && !s.contains("withheld"),
+        "a trusted unbuilt package reads `not built yet`, not `withheld`:\n{s}"
+    );
+
+    // --json carries the same distinction.
+    let out = fx.sbx(&["projects", "show", tree, "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert!(v["store_roots"]["nix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x == "built"));
+    let unbuilt = v["unbuilt"].as_array().expect("unbuilt array");
+    assert_eq!(unbuilt.len(), 1, "one unbuilt package: {v}");
+    assert!(unbuilt[0]["locator"].as_str().unwrap().contains("absent"));
+    assert_eq!(unbuilt[0]["withheld"], false);
+}
+
+#[test]
+fn show_marks_an_untrusted_declaration_withheld() {
+    let fx = Fixture::new();
+    let proj = fx.proj.path().canonicalize().unwrap();
+    let tree = "2222222222222222";
+    fx.make_tree(tree, Some(&proj));
+    // Declared, but the config is never trusted.
+    std::fs::write(
+        proj.join(".sbx.toml"),
+        "[packages]\nabsent = \"nix:missing\"\n",
+    )
+    .unwrap();
+
+    let out = fx.sbx(&["projects", "show", tree]);
+    assert!(out.status.success(), "projects show failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("absent") && s.contains("withheld"),
+        "an untrusted declaration should read `withheld`:\n{s}"
+    );
+}
+
+#[test]
+fn show_of_a_dead_tree_reports_realized_state_only() {
+    let fx = Fixture::new();
+    // A marker pointing at a project directory that no longer exists.
+    let tree = "3333333333333333";
+    fx.make_tree(tree, Some(&fx.proj.path().join("gone")));
+    fx.make_gcroot(tree, "somepkg");
+
+    let out = fx.sbx(&["projects", "show", tree]);
+    assert!(out.status.success(), "projects show failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    // Realized state (the gcroot) is shown…
+    assert!(s.contains("somepkg"), "realized root should show:\n{s}");
+    // …but with no config to compare against, there is no declared section — just the note.
+    assert!(
+        s.contains("project directory is gone") && !s.contains("declared but not built"),
+        "a dead tree shows realized state only:\n{s}"
+    );
+
+    let out = fx.sbx(&["projects", "show", tree, "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(v["config_available"], false);
+    assert!(v["unbuilt"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn show_of_an_unknown_tree_fails() {
+    let fx = Fixture::new();
+    let out = fx.sbx(&["projects", "show", "deadbeefdeadbeef"]);
+    assert_eq!(out.status.code(), Some(1), "unknown tree should fail 1");
+    assert!(
+        text(&out).contains("no runtime tree"),
+        "missing not-found message:\n{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn show_without_an_id_is_a_usage_error() {
+    let fx = Fixture::new();
+    let out = fx.sbx(&["projects", "show"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bare `projects show` should exit 2"
+    );
+    assert!(
+        text(&out).contains("sbx projects show <id>"),
+        "should print the synopsis:\n{}",
+        text(&out)
     );
 }
 

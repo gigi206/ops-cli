@@ -6,6 +6,7 @@ sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
 sbx app rm <name> [--purge] [--gc]
 sbx app list
+sbx app show <name> [--json]
 ```
 
 `sbx app <name>` launches a named application profile — a project `[app.<name>]`
@@ -63,6 +64,29 @@ there — reclaiming the app's now-unreferenced `nix:`/`flake:` closures. For a 
 used in several projects, run the sweep in each of them (one command covers the current
 project only). Use `sbx app list` to see which apps have an installed home to purge.
 
+## Inspecting an app
+
+`sbx app show <name>` reports one app's **realized-on-disk** detail — the counterpart to
+[`sbx config show --app <name>`](config.md), which shows what the app *declares*. It lists
+the profile source, the app's isolated home(s) with on-disk size (and the mise-tools share
+broken out), and each declared package annotated with whether it is **actually installed**:
+
+| Package | Installed reads |
+|---|---|
+| `mise:` | `installed <version>` (read from the app's home) or `not installed` |
+| `deb:` / `appimage:` / `flake:` | `pinned in N tree(s) (<hash>)` — the build lives in the [per-project store](../concepts/directory-layout.md); see [`sbx projects show`](projects.md) — or `not built` |
+| `nix:` | `built per-project` |
+
+A package a launch would not provision because an untrusted layer declared it reads
+`withheld` (distinct from `not installed`, so it is not mistaken for a failed provision).
+
+If the home holds mise tools that **no declared package accounts for** — a leftover from a
+removed profile, or a dependency a `mise:` backend pulled in — they are listed under
+`installed (undeclared)`, so the report shows everything that is actually installed, not only
+what the profile names.
+
+Read-only: no trust gate, no launch, no network. `--json` emits the same model for scripting.
+
 ## Examples
 
 ```sh
@@ -71,6 +95,7 @@ sbx app claude-code                    # launch with its own isolated home
 sbx app claude-code -- -c              # resume the previous session
 sbx app claude-code --net none         # one run with no network
 sbx app list                           # imported profiles + installed homes
+sbx app show claude-code               # what this app has actually installed on disk
 sbx app export claude-code > my-claude.toml
 sbx app rm claude-code --purge         # remove the profile, home, and tools
 sbx app rm claude-code --purge --gc    # …and sweep this project's nix store too

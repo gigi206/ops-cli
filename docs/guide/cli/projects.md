@@ -2,13 +2,14 @@
 
 ```
 sbx projects list [--json]
+sbx projects show <id> [--json]
 sbx projects rm <id>... [--dead] [--markerless] [--dry-run] [--yes] [--gc] [--force]
 ```
 
-List and remove the **per-project runtime trees** — the directories under
+List, inspect, and remove the **per-project runtime trees** — the directories under
 `<data>/projects/<id>` that hold each project's writable nix store, isolated home, and
-locks. `sbx projects list` shows them; `sbx projects rm` removes them. Bare `sbx projects`
-prints this page.
+locks. `sbx projects list` shows them; `sbx projects show` details one; `sbx projects rm`
+removes them. Bare `sbx projects` prints this page.
 
 Removing a tree is host-side only (no sandbox, no nix). Its nix store closures are left for
 [`sbx gc`](gc.md) to reclaim — or add `--gc` to do both at once.
@@ -31,6 +32,24 @@ Each tree's **state**:
 | `markerless` | a legacy tree pre-dating marker recording (its project path is unknown) |
 
 `--json` emits the trees as a JSON array for scripting.
+
+## `show`
+
+`sbx projects show <id>` reports one tree's **realized-on-disk** detail:
+
+- its **state** and **size**, broken down `store` / `home` / `other`;
+- the **nixpkgs** channel or per-project pin it resolves against;
+- the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`) —
+  the store is **shared** by the project and every app launched in it, so the roots include
+  app packages;
+- the **mise tools** in the project's own home;
+- when the project directory still exists, the project's declared packages/tools that are
+  **not built yet** — an untrusted declaration is flagged `withheld` (a launch would not
+  provision it), distinct from a trusted one simply not equipped yet. A dead tree shows
+  realized state only.
+
+Read-only (no sandbox, no nix, no network). `--json` emits the same model. For an app rather
+than a tree, see [`sbx app show`](app.md).
 
 ## `rm`
 
@@ -58,6 +77,7 @@ Two trees are always protected:
 ```sh
 sbx projects list                    # list every runtime tree with its state and size
 sbx projects list --json             # the same, as JSON
+sbx projects show 1a2b3c4d5e6f7a8b   # one tree's realized detail (store roots, tools, size)
 
 sbx projects rm 1a2b3c4d5e6f7a8b     # remove one named tree now
 sbx projects rm 1a2b… --dry-run      # preview it first
