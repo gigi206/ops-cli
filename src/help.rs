@@ -309,6 +309,30 @@ const PAGES: &[Page] = &[
             id the sole live session is used; otherwise name one by its PID.",
     },
     Page {
+        path: &["proc", "live"],
+        synopsis: "sbx proc live [<id>] [-i|--interval <secs>] [--json]",
+        summary: "watch a running session's process tree, redrawn live",
+        options: &[
+            (
+                "<id>",
+                "the PID `sbx session ls` shows; omit it when only one session is live",
+            ),
+            (
+                "-i, --interval <secs>",
+                "redraw interval in seconds (default 1)",
+            ),
+            (
+                "--json",
+                "emit one snapshot object per tick (NDJSON), for a pipe",
+            ),
+        ],
+        details:
+            "The `top`-style live view of `sbx proc ls`: the process tree an agent has spawned inside\n\
+            its cage, redrawn in place on an interval until the session ends or you interrupt, so you\n\
+            see processes start and finish in real time. Requires a terminal; `--json` streams one\n\
+            snapshot per tick and works in a pipe. Read-only and host-side — it just polls `/proc`.",
+    },
+    Page {
         path: &["plugins"],
         synopsis: "sbx plugins <subcommand> [args...]",
         summary: "inspect and manage resolver plugins and plugin stores",

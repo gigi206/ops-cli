@@ -113,6 +113,39 @@ fn proc_unknown_subcommand_is_an_error() {
     assert!(err.contains("unknown subcommand"), "got: {err}");
 }
 
+#[test]
+fn proc_live_needs_a_terminal_without_json() {
+    // Captured stdout is a pipe, not a tty, so the human redraw is refused with a pointer to --json.
+    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let out = sbx(&["proc", "live"], data.path(), proj.path());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("needs a terminal"), "got: {err}");
+}
+
+#[test]
+fn proc_live_json_with_no_session_exits_2() {
+    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let out = sbx(&["proc", "live", "--json"], data.path(), proj.path());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("no active sandbox sessions"), "got: {err}");
+}
+
+#[test]
+fn proc_live_rejects_a_zero_interval() {
+    // The interval is parsed before anything else, so a zero busy-loop is refused up front.
+    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let out = sbx(
+        &["proc", "live", "--json", "-i", "0"],
+        data.path(),
+        proj.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("at least 1 second"), "got: {err}");
+}
+
 /// A `Command` for the built binary with an isolated global config dir, so the cage-launching e2e
 /// never depends on the developer's `~/.config/sbx`.
 fn sbx_isolated() -> Command {

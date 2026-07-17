@@ -546,6 +546,7 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
     }
     match args.first().and_then(|a| a.to_str()) {
         Some("ls") | Some("list") => proc_ls(&args[1..]),
+        Some("live") => proc_live(&args[1..]),
         None => {
             eprint!("{}", help::page_usage(&["proc"]).unwrap_or_default());
             ExitCode::from(2)
@@ -555,6 +556,41 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
             eprintln!("       run `sbx help proc` for usage.");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Resolve the session a `proc` subcommand acts on: an explicit PID (a 0-or-1 match among the live
+/// set), or the sole live session when no id is given. On ambiguity or absence it prints guidance
+/// and returns the exit code the caller should propagate.
+fn resolve_proc_target<'a>(
+    sessions: &'a [session::Session],
+    id: Option<&str>,
+) -> Result<&'a session::Session, ExitCode> {
+    match id {
+        Some(id) => sessions
+            .iter()
+            .find(|s| s.pid.to_string() == id)
+            .ok_or_else(|| {
+                eprintln!("sbx: proc: no live session '{id}' — run `sbx session ls` to list them.");
+                ExitCode::from(2)
+            }),
+        None => match sessions {
+            [one] => Ok(one),
+            [] => {
+                eprintln!("sbx: no active sandbox sessions.");
+                Err(ExitCode::from(2))
+            }
+            many => {
+                eprintln!(
+                    "sbx: proc: {} live sessions — name one by its PID:",
+                    many.len()
+                );
+                for s in many {
+                    eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
+                }
+                Err(ExitCode::from(2))
+            }
+        },
     }
 }
 
@@ -598,34 +634,9 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
         }
     };
 
-    // Resolve the target: an explicit PID (0-or-1 match among the live set), or the sole session.
-    let target = match id {
-        Some(id) => match sessions.iter().find(|s| s.pid.to_string() == id) {
-            Some(s) => s,
-            None => {
-                eprintln!(
-                    "sbx: proc ls: no live session '{id}' — run `sbx session ls` to list them."
-                );
-                return ExitCode::from(2);
-            }
-        },
-        None => match sessions.as_slice() {
-            [one] => one,
-            [] => {
-                eprintln!("sbx: no active sandbox sessions.");
-                return ExitCode::from(2);
-            }
-            many => {
-                eprintln!(
-                    "sbx: proc ls: {} live sessions — name one by its PID:",
-                    many.len()
-                );
-                for s in many {
-                    eprintln!("       {}  [{}]  {}", s.pid, s.label(), s.project.display());
-                }
-                return ExitCode::from(2);
-            }
-        },
+    let target = match resolve_proc_target(&sessions, id) {
+        Ok(t) => t,
+        Err(code) => return code,
     };
 
     let Some(tree) = observe::tree(target.pid) else {
@@ -659,6 +670,138 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
     );
     print!("{}", observe::render_human(&tree));
     ExitCode::SUCCESS
+}
+
+/// Parsed `sbx proc live` arguments. The parser is pure (no I/O) so its reject paths are
+/// unit-testable without a terminal.
+#[derive(Debug)]
+struct ProcLiveArgs {
+    id: Option<String>,
+    interval: Duration,
+    json: bool,
+}
+
+/// Parse `live [<id>] [-i|--interval <secs>] [--json]`. The refresh defaults to 1 second; a
+/// zero/non-numeric interval, an unknown flag, or a second id is an error.
+fn parse_proc_live_args(args: &[OsString]) -> Result<ProcLiveArgs, String> {
+    let mut interval_secs: u64 = 1;
+    let mut json = false;
+    let mut id: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_str() {
+            Some("-i") | Some("--interval") => {
+                let v = it.next().ok_or("`--interval` needs a value in seconds")?;
+                let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                    format!(
+                        "invalid interval `{}` — expected a whole number of seconds",
+                        v.to_string_lossy()
+                    )
+                })?;
+                if secs == 0 {
+                    return Err("interval must be at least 1 second".into());
+                }
+                interval_secs = secs;
+            }
+            Some("--json") => json = true,
+            Some(s) if !s.starts_with('-') => {
+                if id.is_some() {
+                    return Err("at most one session id".into());
+                }
+                id = Some(s.to_string());
+            }
+            _ => return Err(format!("usage: {}", help::synopsis_of(&["proc", "live"]))),
+        }
+    }
+    Ok(ProcLiveArgs {
+        id,
+        interval: Duration::from_secs(interval_secs),
+        json,
+    })
+}
+
+/// `sbx proc live [<id>] [-i|--interval <secs>] [--json]`: watch a running session's process tree,
+/// redrawn in place on an interval (default 1s) until the session ends or you interrupt — the
+/// `top`-style live view of `sbx proc ls`, so you see the agent spawn and finish processes in real
+/// time. Requires a terminal; `--json` emits one snapshot object per tick and works in a pipe. No
+/// launch / nix / network — it just polls `/proc`.
+fn proc_live(args: &[OsString]) -> ExitCode {
+    use std::io::Write as _;
+    let parsed = match parse_proc_live_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sbx: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let is_tty = std::io::stdout().is_terminal();
+    if !parsed.json && !is_tty {
+        eprintln!(
+            "sbx: `proc live` needs a terminal — use `--json` to script it (one snapshot per tick)"
+        );
+        return ExitCode::from(2);
+    }
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sbx: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let target = match resolve_proc_target(&sessions, parsed.id.as_deref()) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    // Resolve once, then poll `/proc` by pid — the record is not needed again. When the pid's tree
+    // vanishes the session has ended, so the loop exits cleanly.
+    let (pid, label, project) = (target.pid, target.label(), target.project.clone());
+    let pal = style::Palette::for_stream(is_tty);
+    let (dim, r) = (pal.dim, pal.reset);
+    let secs = parsed.interval.as_secs();
+    loop {
+        let tree = observe::tree(pid);
+        let mut out = std::io::stdout().lock();
+        let wrote = match &tree {
+            Some(tree) if parsed.json => {
+                let obj = serde_json::json!({
+                    "session": {
+                        "pid": pid,
+                        "label": label.as_str(),
+                        "project": project.display().to_string(),
+                    },
+                    "tree": observe::to_json(tree),
+                });
+                writeln!(out, "{obj}").and_then(|_| out.flush())
+            }
+            Some(tree) => {
+                let body = observe::render_human(tree);
+                write!(
+                    out,
+                    "\x1b[H{dim}live process tree · session {pid} [{label}] · refresh {secs}s · Ctrl-C to quit{r}\n{project}\n{body}\x1b[J",
+                    project = project.display()
+                )
+                .and_then(|_| out.flush())
+            }
+            None => {
+                // The session ended: stop cleanly rather than spin on an empty tree.
+                drop(out);
+                if !parsed.json {
+                    println!("session {pid} ended.");
+                }
+                return ExitCode::SUCCESS;
+            }
+        };
+        drop(out);
+        if wrote.is_err() {
+            // A broken downstream pipe (`… | head`) ends the view cleanly.
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(parsed.interval);
+    }
 }
 
 /// `sbx session attach <id> [-- command [args...]]`: enter a running session's live cage. With no
@@ -10233,6 +10376,50 @@ mod tests {
         );
         assert!(parse_live_args(&osv(&["-a"])).is_err(), "missing app value");
         assert!(parse_live_args(&osv(&["--nope"])).is_err(), "unknown flag");
+    }
+
+    #[test]
+    fn parse_proc_live_args_defaults_id_and_flags() {
+        let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+
+        // No args → 1s default, no id, human output.
+        let d = parse_proc_live_args(&[]).expect("bare proc live parses");
+        assert_eq!(d.interval, Duration::from_secs(1));
+        assert!(d.id.is_none());
+        assert!(!d.json);
+
+        // A positional id plus both flag spellings.
+        let a = parse_proc_live_args(&osv(&["12345", "-i", "2", "--json"])).unwrap();
+        assert_eq!(a.id.as_deref(), Some("12345"));
+        assert_eq!(a.interval, Duration::from_secs(2));
+        assert!(a.json);
+        let b = parse_proc_live_args(&osv(&["--interval", "4"])).unwrap();
+        assert_eq!(b.interval, Duration::from_secs(4));
+        assert!(b.id.is_none());
+    }
+
+    #[test]
+    fn parse_proc_live_args_rejects_bad_input() {
+        let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(
+            parse_proc_live_args(&osv(&["-i", "0"])).is_err(),
+            "zero interval busy-loops"
+        );
+        assert!(parse_proc_live_args(&osv(&["-i", "soon"]))
+            .unwrap_err()
+            .contains("soon"));
+        assert!(
+            parse_proc_live_args(&osv(&["-i"])).is_err(),
+            "missing value"
+        );
+        assert!(
+            parse_proc_live_args(&osv(&["--nope"])).is_err(),
+            "unknown flag"
+        );
+        assert!(
+            parse_proc_live_args(&osv(&["1", "2"])).is_err(),
+            "at most one id"
+        );
     }
 
     #[test]
