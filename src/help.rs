@@ -55,12 +55,17 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["run"],
-        synopsis: "sbx run [--detach] [override flags] [--] [command [args...]]",
+        synopsis: "sbx run [--detach] [--observe] [override flags] [--] [command [args...]]",
         summary: "run a command inside the project sandbox, or open its shell",
         options: &[
             (
                 "--detach",
                 "run in the background as a session `sbx session ls` can see",
+            ),
+            (
+                "--observe",
+                "stream a `[sbx:exec]` feed of the processes the command spawns, on stderr \
+                 (non-interactive runs only; watch an interactive terminal with `sbx proc live`)",
             ),
             (
                 "--config <toml|@file>",
@@ -178,13 +183,18 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "run"],
-        synopsis: "sbx app run <name> [--detach] [--net-learn[=level] [-g|--local] [--dry-run]] \
-                   [override flags] [-- <args>...]",
+        synopsis: "sbx app run <name> [--detach] [--observe] [--net-learn[=level] [-g|--local] \
+                   [--dry-run]] [override flags] [-- <args>...]",
         summary: "launch a named application profile in the project sandbox",
         options: &[
             (
                 "--detach",
                 "launch the app in the background as a session `sbx session ls` can see",
+            ),
+            (
+                "--observe",
+                "stream a `[sbx:exec]` feed of the processes the app spawns, on stderr \
+                 (non-interactive runs only; watch an interactive terminal with `sbx proc live`)",
             ),
             (
                 "--net-learn[=domain|path|exact]",

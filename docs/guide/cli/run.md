@@ -1,7 +1,7 @@
 # `sbx run`
 
 ```
-sbx run [--detach] [override flags] [--] [command [args...]]
+sbx run [--detach] [--observe] [override flags] [--] [command [args...]]
 ```
 
 Run `<command>` inside the project sandbox and propagate its exit status — or, with no
@@ -15,6 +15,7 @@ See also: [Quick start](../getting-started/quickstart.md) · [`sbx app`](app.md)
 | Option | Meaning |
 |---|---|
 | `--detach` | run in the background as a session [`sbx session`](session.md) can see |
+| `--observe` | stream a `[sbx:exec]` feed of the processes the command spawns (see [Observing a run](#observing-a-run-observe)) |
 | `--config <toml\|@file>` | one-shot config override (any field); repeatable, later wins |
 | `--env KEY=VALUE` | one-shot override of a single cage environment variable; repeatable |
 | `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow=h1,h2` \| `deny=h1,h2` |
@@ -58,6 +59,27 @@ With no command, `sbx run` opens the project shell:
 - A **piped/non-tty** stdin, or `--detach`, keeps inherited stdio and propagates the
   exit status — the shape you want for scripts and CI.
 
+### Observing a run (`--observe`)
+
+`--observe` streams a live `[sbx:exec]` line to **stderr** for each process the command spawns
+inside the cage — so you see what the agent runs as it runs. It is read-only, host-side, and
+**unprivileged** (it polls `/proc`; no `CAP_BPF`, no root), and it forces the supervised launch
+path so a host-side observer can watch the cage for its lifetime.
+
+- Scope: **non-interactive runs** (a piped/`--` command). For an **interactive terminal** the
+  inline feed would fight a TUI for the screen, so `--observe` there just points you at
+  [`sbx proc live`](proc.md) — watch the session from another terminal instead. `--observe` is
+  also ignored under `--detach`.
+- Honest limit: polling only catches a process that outlives a tick (~300 ms), so very
+  short-lived commands are missed. Precise per-spawn capture (and blocking) is a later increment.
+
+```sh
+sbx run --observe -- ./build.sh
+# [sbx:exec] sh -c ./build.sh
+# [sbx:exec] cc -c main.c
+# [sbx:exec] ld -o app …
+```
+
 ## Examples
 
 ```sh
@@ -67,5 +89,6 @@ sbx run -- cargo test
 echo 'rg --version' | sbx run          # a non-interactive shell reading stdin
 sbx run --net none -- ./offline-build.sh
 sbx run --bind /opt/data:rw -- ./process.sh
+sbx run --observe -- ./build.sh        # stream a [sbx:exec] feed of what it spawns
 sbx run --detach -- ./long-task.sh     # background; see `sbx session ls`
 ```

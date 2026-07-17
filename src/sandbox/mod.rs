@@ -34,6 +34,7 @@ mod naming;
 pub(crate) mod netlearn;
 mod nixhub;
 mod notify_relay;
+mod observe_feed;
 mod packages;
 mod portal;
 mod prebuilt;

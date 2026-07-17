@@ -77,11 +77,16 @@ fn main() -> ExitCode {
             // command's. The `--` is consumed before scanning the command, so `sbx run -- --detach`
             // (or `-- --help`) runs the literal argument.
             let mut detach = false;
+            let mut observe = false;
             let mut cli = config::CliOverrides::default();
             while let Some(raw) = cmd.first().and_then(|a| a.to_str()) {
                 match flag_name(raw) {
                     "--detach" => {
                         detach = true;
+                        cmd.remove(0);
+                    }
+                    "--observe" => {
+                        observe = true;
                         cmd.remove(0);
                     }
                     "--help" | "-h" => return help::show(&["run"]),
@@ -101,7 +106,7 @@ fn main() -> ExitCode {
                 Ok(ov) => ov,
                 Err(c) => return c,
             };
-            sandbox::run(cmd, detach, ov)
+            sandbox::run(cmd, detach, observe, ov)
         }
         "mise" => {
             // A passthrough, so a help flag is only sbx's when it leads: `sbx mise --help`
@@ -3130,6 +3135,7 @@ fn app_run(args: &[OsString]) -> ExitCode {
             let outcome = sandbox::app(
                 &launch.name,
                 launch.detach,
+                launch.observe,
                 launch.tail,
                 ov,
                 launch.net_learn.as_ref().map(|nl| nl.gran),
@@ -3227,6 +3233,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         None => (args.to_vec(), Vec::new()),
     };
     let mut detach = false;
+    let mut observe = false;
     let mut name: Option<String> = None;
     let mut cli = config::CliOverrides::default();
     // `--net-learn` state: the granularity (once seen), the write scope, and whether to only preview.
@@ -3248,6 +3255,10 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         match flag_name(&raw) {
             "--detach" => {
                 detach = true;
+                head.remove(0);
+            }
+            "--observe" => {
+                observe = true;
                 head.remove(0);
             }
             // `--net-learn[=domain|path|exact]`: the value after `=` picks the granularity; a bare
@@ -3331,6 +3342,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
     Ok(AppLaunch {
         name,
         detach,
+        observe,
         tail,
         cli,
         net_learn,
@@ -3342,6 +3354,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
 struct AppLaunch {
     name: String,
     detach: bool,
+    observe: bool,
     tail: Vec<OsString>,
     cli: config::CliOverrides,
     net_learn: Option<NetLearn>,
@@ -11202,6 +11215,12 @@ mod tests {
         let a = parse_app_launch(&v(&["claude", "--detach"])).unwrap();
         assert_eq!((a.name.as_str(), a.detach), ("claude", true));
         assert!(a.tail.is_empty());
+        assert!(!a.observe, "no --observe by default");
+
+        // `--observe` sets the feed flag and leaves the name intact.
+        let a = parse_app_launch(&v(&["claude", "--observe"])).unwrap();
+        assert_eq!((a.name.as_str(), a.observe), ("claude", true));
+        assert!(!a.detach);
 
         // `--` separates sbx's args from the passthrough tail, appended verbatim.
         let a = parse_app_launch(&v(&["claude", "--", "-c"])).unwrap();

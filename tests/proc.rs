@@ -254,3 +254,92 @@ fn proc_ls_shows_a_real_cage_process_tree() {
          boundary would miss it. Last output:\n{last}"
     );
 }
+
+#[test]
+fn run_observe_streams_exec_events() {
+    // `sbx run --observe` forces the supervised path and streams a `[sbx:exec]` line to stderr for
+    // each process the command spawns. Teeth: the same run WITHOUT `--observe` (the exec-replace
+    // path, no observer) emits no feed. Non-interactive (stdin null) so it takes the foreground
+    // path, not the pty one. Skipped, not failed, where the host cannot sandbox.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping run --observe e2e: host cannot sandbox");
+        return;
+    }
+
+    // A command that spawns a recognizable child living well past the ~300ms poll tick.
+    let observed = sbx_isolated()
+        .args(["run", "--observe", "--", "sh", "-c", "sleep 1"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run --observe");
+    let err = String::from_utf8_lossy(&observed.stderr);
+    assert!(
+        err.contains("[sbx:exec]"),
+        "the observe feed is missing from stderr:\n{err}"
+    );
+    assert!(
+        err.contains("sleep"),
+        "the spawned `sleep` should appear in the feed:\n{err}"
+    );
+
+    // Teeth: no `--observe`, no feed.
+    let plain = sbx_isolated()
+        .args(["run", "--", "sh", "-c", "sleep 1"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    let err2 = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !err2.contains("[sbx:exec]"),
+        "a run without --observe must emit no feed:\n{err2}"
+    );
+}
+
+#[test]
+fn app_run_observe_streams_exec_events() {
+    // The feed reaches the primary target — agents launched via `sbx app run`. `--observe` threads
+    // through the app path the same way, forcing supervision and streaming `[sbx:exec]`. Teeth: the
+    // same app run without `--observe` emits no feed. Skipped, not failed, where the host cannot
+    // sandbox.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[app.probe]\ncmd = [\"sh\", \"-c\", \"sleep 1\"]\n",
+    )
+    .unwrap();
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping app run --observe e2e: host cannot sandbox");
+        return;
+    }
+
+    let observed = sbx_isolated()
+        .args(["app", "run", "--observe", "probe"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("app run --observe");
+    let err = String::from_utf8_lossy(&observed.stderr);
+    assert!(
+        err.contains("[sbx:exec]") && err.contains("sleep"),
+        "the app's spawned `sleep` should appear in the feed:\n{err}"
+    );
+
+    // Teeth: no `--observe`, no feed.
+    let plain = sbx_isolated()
+        .args(["app", "run", "probe"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("app run");
+    assert!(
+        !String::from_utf8_lossy(&plain.stderr).contains("[sbx:exec]"),
+        "an app run without --observe must emit no feed"
+    );
+}

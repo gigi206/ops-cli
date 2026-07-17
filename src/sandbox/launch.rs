@@ -83,7 +83,12 @@ struct Prepared {
 /// interactively under the pty supervisor, so a shell or a TUI gets a private controlling terminal
 /// with job control; a piped/non-tty stdin, or `--detach`, keeps the exec-replace / supervised path
 /// (stdio inherited, exit status propagated).
-pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override) -> ExitCode {
+pub(crate) fn run(
+    cmd: Vec<OsString>,
+    detach: bool,
+    observe: bool,
+    ov: crate::config::Override,
+) -> ExitCode {
     // With no command, `sbx run` opens the project shell — which needs a terminal, so a detached
     // no-command launch is refused rather than started into the void.
     if cmd.is_empty() && detach {
@@ -103,6 +108,10 @@ pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override)
     // SAFETY: `isatty` only inspects fd 0.
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
 
+    // The inline `--observe` feed rides the non-tty foreground path; an interactive terminal is
+    // pointed at `sbx proc live` instead (see `resolve_observe_interactive`).
+    let observe = resolve_observe_interactive(observe, interactive);
+
     if cmd.is_empty() {
         // No command: open the project shell. Interactive gets the full pty shell (mise activation
         // and the `(sbx-<slug>)` prompt via the synthetic rc); a piped stdin runs a non-interactive
@@ -118,6 +127,7 @@ pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override)
                 shell,
                 false,
                 "run",
+                observe,
             )
         };
     }
@@ -132,8 +142,23 @@ pub(crate) fn run(cmd: Vec<OsString>, detach: bool, ov: crate::config::Override)
             cmd,
             detach,
             "run",
+            observe,
         )
     }
+}
+
+/// Reconcile `--observe` with interactivity: the inline exec feed rides the non-tty foreground path
+/// only, so an interactive terminal (which would fight a TUI for the screen) is warned and pointed
+/// at `sbx proc live` instead. Returns whether the inline feed should run. Shared by `run`/`app`.
+fn resolve_observe_interactive(observe: bool, interactive: bool) -> bool {
+    if observe && interactive {
+        crate::diag::warn(
+            "--observe is not shown inline for an interactive terminal — run `sbx proc live` in \
+             another terminal to watch this session",
+        );
+        return false;
+    }
+    observe
 }
 
 /// Apply the (non-channel) part of a one-shot override to a prepared config, aborting the launch
@@ -156,6 +181,7 @@ fn apply_launch_override(
 /// supervises the cage) or detached into a background daemon. The single seam `run`, `app`, and
 /// the mise passthrough share, so the build → register → launch sequence is identical on both
 /// paths and lives in one place. `label` names the session in the detached startup message.
+#[allow(clippy::too_many_arguments)]
 fn launch(
     prep: Prepared,
     runtime: binds::Runtime,
@@ -163,12 +189,19 @@ fn launch(
     cmd: Vec<OsString>,
     detach: bool,
     label: &str,
+    observe: bool,
 ) -> ExitCode {
     if detach {
         warn_ask_under_detach(&prep.cfg.network);
+        if observe {
+            crate::diag::warn(
+                "--observe is ignored under --detach: a background session has no terminal for the \
+                 inline feed — inspect it with `sbx proc live`/`sbx proc ls` instead",
+            );
+        }
         launch_detached(prep, runtime, kind, cmd, label)
     } else {
-        launch_foreground(prep, runtime, kind, cmd)
+        launch_foreground(prep, runtime, kind, cmd, observe)
     }
 }
 
@@ -196,6 +229,7 @@ fn launch_foreground(
     runtime: binds::Runtime,
     kind: Kind,
     cmd: Vec<OsString>,
+    observe: bool,
 ) -> ExitCode {
     let (spec, guard) = match build(&prep, runtime, cmd) {
         Ok(v) => v,
@@ -205,29 +239,38 @@ fn launch_foreground(
     register(prep.layout.data_dir(), &spec, kind, runtime);
 
     match guard {
-        // The default postures: exec-replace, so the command's exit status becomes sbx's.
-        // The pid and its start time survive the exec, so the registry record keeps matching
-        // the sandbox and is reclaimed by liveness pruning once it exits.
-        None => {
+        // The default postures with no observation: exec-replace, so the command's exit status
+        // becomes sbx's. The pid and its start time survive the exec, so the registry record keeps
+        // matching the sandbox and is reclaimed by liveness pruning once it exits.
+        None if !observe => {
             // On success this never returns; reaching past it means exec itself failed.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             eprintln!("sbx: failed to launch the sandbox: {err}");
             ExitCode::FAILURE
         }
-        // A network allowlist, a forward forwarder, a filtered D-Bus proxy, or an in-cage portal:
-        // sbx cannot exec-replace, because a host thread or child (the filtering proxy, the forward
-        // accept pumps, the `xdg-dbus-proxy` process) must outlive the cage, and the in-cage portal's
-        // host runtime directory must be cleaned up when the launch ends rather than leaked. Supervise
-        // instead — fork bwrap, wait, propagate the exit status — keeping them alive and the guard
-        // (which unlinks the sockets/CA, kills the dbus proxy, and removes the portal directory) held
-        // for the whole session.
-        Some(guard) => {
+        // Supervise instead of exec-replace — fork bwrap, wait, propagate the exit status — whenever
+        // a host-side thing must outlive the cage. That is a guard (a network allowlist's filtering
+        // proxy, a forward forwarder, a filtered D-Bus proxy, or an in-cage portal whose runtime dir
+        // must be cleaned up), OR `--observe`: the exec-activity feed runs in a host thread that
+        // needs a live parent for the cage's lifetime, so observation forces supervision even with no
+        // guard. The observer roots on this supervisor's own pid — the cage is its descendant in host
+        // pid-space — and stops + joins on drop, before the guard is released.
+        maybe_guard => {
+            let observer = observe.then(|| {
+                super::observe_feed::ExecObserver::start(std::process::id(), OBSERVE_POLL_INTERVAL)
+            });
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
-            drop(guard);
+            drop(observer);
+            drop(maybe_guard);
             code
         }
     }
 }
+
+/// How often the `--observe` feed polls `/proc` for new cage processes. Short enough to catch most
+/// of what an agent spawns, long enough that the walk's cost is negligible; a command shorter than
+/// this between ticks is missed (the polling limit, closed by the seccomp user-notification path).
+const OBSERVE_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// The byte the detached child writes to the readiness pipe once the cage is built, registered,
 /// and its log is open — the parent treats any other outcome (a closed pipe, no byte) as failure.
@@ -484,9 +527,11 @@ impl AppOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn app(
     name: &str,
     detach: bool,
+    observe: bool,
     extra: Vec<OsString>,
     ov: crate::config::Override,
     net_learn: Option<super::Granularity>,
@@ -526,6 +571,7 @@ pub(crate) fn app(
 
     // SAFETY: `isatty` only inspects fd 0.
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
+    let observe = resolve_observe_interactive(observe, interactive);
 
     // `--net-learn`: run the app under its real (unchanged) posture, capture the egress it was
     // refused for lack of a rule, and hand the synthesized rules back for the caller to write. It is
@@ -570,7 +616,7 @@ pub(crate) fn app(
     let code = if interactive {
         launch_pty_supervised(&prep, runtime, Kind::Run, cmd)
     } else {
-        launch(prep, runtime, Kind::Run, cmd, detach, name)
+        launch(prep, runtime, Kind::Run, cmd, detach, name, observe)
     };
     AppOutcome::plain(code)
 }
@@ -660,7 +706,7 @@ pub(crate) fn run_mise(args: Vec<OsString>) -> ExitCode {
     let mut cmd = vec![OsString::from("mise")];
     cmd.extend(args);
     // `sbx mise` is a passthrough — every argument is mise's, so it takes no one-shot override.
-    run(cmd, false, crate::config::Override::none())
+    run(cmd, false, false, crate::config::Override::none())
 }
 
 /// Which persistent home a `mise:` package group is equipped in, owning its app name so a

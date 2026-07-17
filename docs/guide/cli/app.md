@@ -1,7 +1,7 @@
 # `sbx app`
 
 ```
-sbx app run <name> [--detach] [override flags] [-- <args>...]
+sbx app run <name> [--detach] [--observe] [override flags] [-- <args>...]
 sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
 sbx app rm <name> [--purge] [--gc]
@@ -21,6 +21,7 @@ See also: [The app framework](../apps/README.md) · [`[app.<name>]`](../configur
 | Option | Meaning |
 |---|---|
 | `--detach` | launch in the background as a session [`sbx session`](session.md) can see |
+| `--observe` | stream a `[sbx:exec]` feed of the processes the app spawns (non-interactive runs; use [`sbx proc live`](proc.md) for an interactive terminal) — see [`sbx run`](run.md#observing-a-run-observe) |
 | `--config` / `--env` / `--net` / `--gui` / `--nixpkgs` / `--bind` / `--limit` / `--package` | one-shot [overrides](../configuration/overrides.md), applied **after** the app's overlay (the final word) |
 | `-- <args>...` | appended to the app's declared command |
 
