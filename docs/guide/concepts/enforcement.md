@@ -200,6 +200,14 @@ Landlock ruleset would mostly re-police paths that are not mounted at all. It ma
 added later as an extra layer, but the shipped enforcement stack is the three layers
 above.
 
+A feasibility spike also confirmed the feature that would have justified it — a
+read-only subdirectory (`.git/`, lockfiles) *inside* the read-write project tree — is
+**not expressible**: Landlock resolves an access by the *union* of every matching
+ancestor rule, so a child rule can only add access, never carve it out. Landlock can
+whitelist which trees are writable and restrict per-operation rights (deny delete /
+symlink / rename), but it cannot protect a subtree of a directory the agent is meant
+to write. See the [Landlock spike](../../bwrap-landlock-spike-2026-07-18.md).
+
 ## GUI exposure is Wayland-only
 
 When a cage opens the optional GUI hole, exposure is **Wayland, never X11**. A
