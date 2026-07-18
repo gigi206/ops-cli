@@ -52,6 +52,15 @@ deliberately rejected — a same-uid write through a hard link would poison the 
 base for every other project — so the seed gives each project a private copy that an
 in-cage write can only affect locally.
 
+**Disk cost, in practice.** On a copy-on-write filesystem (btrfs, or xfs with
+reflinks) the seed shares blocks with the shared store, so a project's store costs
+almost nothing on disk until the cage writes into it — many projects seeded from the
+same base together take roughly one copy of it. On **ext4** (no reflinks) each
+project's store is a full, byte-for-byte copy of its closure, so *N* projects that
+share a base each carry their own copy of it. Reclaim a project's store with
+[`sbx gc`](../cli/gc.md); if per-project duplication matters on your host, putting
+`<data>` on a CoW filesystem makes every new per-project seed near-free.
+
 The net effect:
 
 > An agent that self-equips writes **only** into its project's own store. The shared
