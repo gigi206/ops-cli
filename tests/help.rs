@@ -69,6 +69,8 @@ const PATHS: &[&[&str]] = &[
     &["proc", "live"],
     &["proc", "logs"],
     &["proc", "pending"],
+    &["proc", "allow"],
+    &["proc", "deny"],
     &["fs"],
     &["fs", "logs"],
     &["plugins", "list"],

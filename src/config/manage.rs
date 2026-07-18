@@ -61,6 +61,20 @@ pub(crate) enum ManageError {
     /// An egress-group import named one or more groups that already exist and `--force` was not
     /// given — nothing was written, so the user can decide (overwrite with `--force`, or rename).
     GroupCollision(Vec<String>),
+    /// An `allow` proc rule was added but the `[proc]` mode is not `ask` — an allow rule only takes
+    /// effect under `ask` (under `enforce` everything not denied already runs, so the rule would be
+    /// inert). Refuse rather than write a rule that does nothing.
+    ProcAllowNeedsPosture,
+    /// A proc rule was added but the `[proc]` mode is `off`/`observe` — a non-enforcing mode ignores
+    /// the allow/deny lists, so the rule would be inert; set an enforcing mode first.
+    ProcNonEnforcingPosture(String),
+    /// A `deny` proc rule was added to an existing `[proc]` table that carries no `mode` — its
+    /// effective mode is ambiguous to a file writer (it may inherit a baseline), so refuse and let
+    /// the user set one explicitly.
+    ProcNeedsMode,
+    /// The `proc` field is neither a mode string nor a table (a malformed config) — refuse rather
+    /// than guess.
+    MalformedProc(String),
 }
 
 /// Which egress list a rule is added to.
@@ -79,6 +93,22 @@ impl EgressList {
             EgressList::Allow => "allow",
             EgressList::Deny => "deny",
             EgressList::Mute => "mute",
+        }
+    }
+}
+
+/// Which process/exec list a rule is added to (`[proc].allow` / `[proc].deny`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcList {
+    Allow,
+    Deny,
+}
+
+impl ProcList {
+    fn key(self) -> &'static str {
+        match self {
+            ProcList::Allow => "allow",
+            ProcList::Deny => "deny",
         }
     }
 }
@@ -138,6 +168,25 @@ impl std::fmt::Display for ManageError {
                 if names.len() == 1 { "group" } else { "groups" },
                 names.join(", ")
             ),
+            ManageError::ProcAllowNeedsPosture => write!(
+                f,
+                "an `allow` rule only takes effect under `[proc] mode = \"ask\"` (under `enforce` \
+                 everything not denied already runs) — set `mode = \"ask\"` first with \
+                 `sbx config edit`, or use `deny`"
+            ),
+            ManageError::ProcNonEnforcingPosture(m) => write!(
+                f,
+                "the `[proc]` mode is `{m}`, which ignores allow/deny rules — set `mode = \"enforce\"` \
+                 (or `\"ask\"`) first with `sbx config edit`"
+            ),
+            ManageError::ProcNeedsMode => write!(
+                f,
+                "the `[proc]` table has no `mode` — set `mode = \"enforce\"` (or `\"ask\"`) first with \
+                 `sbx config edit` so the rule takes effect"
+            ),
+            ManageError::MalformedProc(s) => {
+                write!(f, "the `proc` field is malformed ({s}) — edit it with `sbx config edit`")
+            }
         }
     }
 }
@@ -362,7 +411,7 @@ pub(crate) fn add_egress_rule(
     }
 
     let mut doc = read_or_empty(path)?;
-    let parent = network_parent(&mut doc, app)?;
+    let parent = layer_parent(&mut doc, app)?;
     let case = match parent.get("network") {
         None => NetCase::Absent,
         Some(Item::Value(v)) if v.is_str() => {
@@ -441,6 +490,130 @@ pub(crate) fn add_egress_rule(
 
     write_doc(path, &doc)?;
     Ok(outcome)
+}
+
+/// Add a process/exec `rule` to the `[proc]` `list` of the target file (baseline or `[app.<name>]`).
+///
+/// The posture guard mirrors `[network]`'s, adapted to `[proc]`'s denylist-by-default. With no
+/// `[proc]` field, a `deny` bootstraps `mode = "enforce"` (a denylist — the rule takes effect at
+/// once) while an `allow` is refused (an allow is inert without `mode = "ask"`). A bare-string
+/// `proc = "<mode>"` is promoted to the table form keeping its mode, subject to the same per-list
+/// guard. An existing `[proc]` table (regular or inline) has the rule appended after the guard,
+/// idempotent on the exact string. Preserves comments/formatting and writes atomically. The outcome
+/// names any mode it created (only the `deny`-bootstrap does).
+pub(crate) fn add_proc_rule(
+    path: &Path,
+    app: Option<&str>,
+    list: ProcList,
+    rule: &str,
+) -> Result<AddOutcome, ManageError> {
+    enum ProcCase {
+        Absent,
+        BareMode(String),
+        Table,
+        Inline,
+        Malformed(String),
+    }
+
+    let mut doc = read_or_empty(path)?;
+    let parent = layer_parent(&mut doc, app)?;
+    let case = match parent.get("proc") {
+        None => ProcCase::Absent,
+        Some(Item::Value(v)) if v.is_str() => {
+            ProcCase::BareMode(v.as_str().unwrap_or_default().to_string())
+        }
+        Some(Item::Table(_)) => ProcCase::Table,
+        Some(Item::Value(v)) if v.is_inline_table() => ProcCase::Inline,
+        Some(_) => ProcCase::Malformed("not a mode string or table".into()),
+    };
+
+    let outcome = match case {
+        ProcCase::Absent => match list {
+            // A `deny` bootstraps the denylist posture (`enforce`) so the rule takes effect at once;
+            // an `allow` is inert without `mode = "ask"`, so refuse rather than write a no-op.
+            ProcList::Deny => {
+                parent.insert("proc", Item::Table(new_proc_table("enforce", list, rule)));
+                AddOutcome::Added {
+                    created_mode: Some("enforce".into()),
+                }
+            }
+            ProcList::Allow => return Err(ManageError::ProcAllowNeedsPosture),
+        },
+        ProcCase::BareMode(mode) => {
+            // Promote the bare-string mode to the table form keeping its mode, with the rule — but
+            // only if that mode makes the rule live (the guard refuses an inert allow/deny).
+            guard_proc_mode(Some(&mode), list)?;
+            parent.insert("proc", Item::Table(new_proc_table(&mode, list, rule)));
+            AddOutcome::Added { created_mode: None }
+        }
+        ProcCase::Malformed(m) => return Err(ManageError::MalformedProc(m)),
+        ProcCase::Table => {
+            let t = parent["proc"]
+                .as_table_mut()
+                .expect("inspected as a regular table");
+            guard_proc_mode(t.get("mode").and_then(Item::as_str), list)?;
+            let arr = t
+                .entry(list.key())
+                .or_insert_with(|| value(Array::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    ManageError::MalformedProc(format!("`{}` is not an array", list.key()))
+                })?;
+            push_outcome(arr, rule)
+        }
+        ProcCase::Inline => {
+            let it = parent["proc"]
+                .as_value_mut()
+                .and_then(Value::as_inline_table_mut)
+                .expect("inspected as an inline table");
+            guard_proc_mode(it.get("mode").and_then(Value::as_str), list)?;
+            let arr = it
+                .entry(list.key())
+                .or_insert_with(|| Value::Array(Array::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    ManageError::MalformedProc(format!("`{}` is not an array", list.key()))
+                })?;
+            push_outcome(arr, rule)
+        }
+    };
+
+    write_doc(path, &doc)?;
+    Ok(outcome)
+}
+
+/// Guard the `mode` of a `[proc]` table/bare-string before appending an allow/deny rule to it. A
+/// `deny` is live under an enforcing mode (`enforce`/`ask`) and inert under `off`/`observe`; an
+/// `allow` is live **only** under `ask` (under `enforce` everything not denied already runs, so an
+/// allow changes nothing). A mode-less table is ambiguous to a writer (it may inherit a baseline),
+/// and an unknown mode is dropped at resolution — both are refused rather than accept an inert rule.
+fn guard_proc_mode(mode: Option<&str>, list: ProcList) -> Result<(), ManageError> {
+    match (list, mode) {
+        (ProcList::Deny, Some("enforce" | "ask")) => Ok(()),
+        (ProcList::Deny, Some(m @ ("off" | "observe"))) => {
+            Err(ManageError::ProcNonEnforcingPosture(m.to_string()))
+        }
+        (ProcList::Allow, Some("ask")) => Ok(()),
+        (ProcList::Allow, Some("enforce" | "off" | "observe")) => {
+            Err(ManageError::ProcAllowNeedsPosture)
+        }
+        // A mode-less field: an allow needs `ask` specifically; a deny is ambiguous (it may inherit).
+        (ProcList::Allow, None) => Err(ManageError::ProcAllowNeedsPosture),
+        (ProcList::Deny, None) => Err(ManageError::ProcNeedsMode),
+        (_, Some(other)) => Err(ManageError::MalformedProc(format!(
+            "unknown mode {other:?}"
+        ))),
+    }
+}
+
+/// A fresh `[proc]` table carrying `mode` and one `rule` in `list`.
+fn new_proc_table(mode: &str, list: ProcList, rule: &str) -> Table {
+    let mut t = Table::new();
+    t.insert("mode", value(mode));
+    let mut arr = Array::new();
+    arr.push(rule);
+    t.insert(list.key(), value(arr));
+    t
 }
 
 /// The result of removing an egress rule.
@@ -555,9 +728,9 @@ fn refuse_non_filtering(mode: Option<&str>) -> Result<(), ManageError> {
     }
 }
 
-/// The table where the `network` key lives: the document root for the baseline, or the
-/// `[app.<name>]` table (created if absent) for an app overlay.
-fn network_parent<'a>(
+/// The table where a baseline-or-app field (`network`, `proc`, …) lives: the document root for the
+/// baseline, or the `[app.<name>]` table (created if absent) for an app overlay.
+fn layer_parent<'a>(
     doc: &'a mut DocumentMut,
     app: Option<&str>,
 ) -> Result<&'a mut Table, ManageError> {
@@ -1302,5 +1475,136 @@ mod tests {
                 .contains("b.example.com"),
             "force must overwrite the entry"
         );
+    }
+
+    #[test]
+    fn add_proc_rule_bootstraps_enforce_for_a_deny_on_a_fresh_config() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        let out = add_proc_rule(&p, None, ProcList::Deny, "curl").unwrap();
+        assert_eq!(
+            out,
+            AddOutcome::Added {
+                created_mode: Some("enforce".into())
+            }
+        );
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("[proc]"), "{body}");
+        assert!(body.contains("mode = \"enforce\""), "{body}");
+        assert!(body.contains("deny = [\"curl\"]"), "{body}");
+    }
+
+    #[test]
+    fn add_proc_rule_refuses_an_allow_with_no_posture_without_writing() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        assert!(matches!(
+            add_proc_rule(&p, None, ProcList::Allow, "git"),
+            Err(ManageError::ProcAllowNeedsPosture)
+        ));
+        // A fresh file must not be created by a refused write.
+        assert!(!p.exists() || std::fs::read_to_string(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_proc_rule_refuses_an_inert_allow_under_enforce() {
+        // The load-bearing guard: an `allow` is inert under `enforce` (everything not denied already
+        // runs), so appending one would silently do nothing — refuse it, exactly as under off/observe.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n",
+        );
+        assert!(matches!(
+            add_proc_rule(&p, None, ProcList::Allow, "git"),
+            Err(ManageError::ProcAllowNeedsPosture)
+        ));
+        // The deny still appends fine under enforce.
+        assert_eq!(
+            add_proc_rule(&p, None, ProcList::Deny, "ssh").unwrap(),
+            AddOutcome::Added { created_mode: None }
+        );
+    }
+
+    #[test]
+    fn add_proc_rule_appends_an_allow_under_ask() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[proc]\nmode = \"ask\"\n");
+        assert_eq!(
+            add_proc_rule(&p, None, ProcList::Allow, "git").unwrap(),
+            AddOutcome::Added { created_mode: None }
+        );
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .contains("allow = [\"git\"]"));
+    }
+
+    #[test]
+    fn add_proc_rule_refuses_a_rule_on_a_non_enforcing_mode() {
+        for mode in ["off", "observe"] {
+            let tmp = crate::testutil::TmpDir::new();
+            let p = doc_at(tmp.path(), &format!("[proc]\nmode = \"{mode}\"\n"));
+            assert!(
+                matches!(
+                    add_proc_rule(&p, None, ProcList::Deny, "curl"),
+                    Err(ManageError::ProcNonEnforcingPosture(_))
+                ),
+                "a deny into a `{mode}` table must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn add_proc_rule_promotes_a_bare_string_mode_keeping_it() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "proc = \"enforce\"\n");
+        let out = add_proc_rule(&p, None, ProcList::Deny, "curl").unwrap();
+        assert_eq!(out, AddOutcome::Added { created_mode: None });
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("[proc]"), "{body}");
+        assert!(body.contains("mode = \"enforce\""), "{body}");
+        assert!(body.contains("deny = [\"curl\"]"), "{body}");
+    }
+
+    #[test]
+    fn add_proc_rule_appends_to_a_table_and_is_idempotent() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n",
+        );
+        assert_eq!(
+            add_proc_rule(&p, None, ProcList::Deny, "ssh").unwrap(),
+            AddOutcome::Added { created_mode: None }
+        );
+        assert_eq!(
+            add_proc_rule(&p, None, ProcList::Deny, "ssh").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+    }
+
+    #[test]
+    fn add_proc_rule_refuses_a_mode_less_table_for_a_deny() {
+        // A `[proc]` table with no `mode` has an ambiguous effective mode to a writer (it may inherit
+        // a baseline), so a deny is refused rather than written into a possibly-inert table.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[proc]\nallow = [\"git\"]\n");
+        assert!(matches!(
+            add_proc_rule(&p, None, ProcList::Deny, "curl"),
+            Err(ManageError::ProcNeedsMode)
+        ));
+    }
+
+    #[test]
+    fn add_proc_rule_writes_an_apps_own_proc_table_with_implicit_parents() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        add_proc_rule(&p, Some("claude"), ProcList::Deny, "ssh").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("[app.claude.proc]"), "{body}");
+        assert!(body.contains("mode = \"enforce\""), "{body}");
+        assert!(body.contains("deny = [\"ssh\"]"), "{body}");
+        // The `[app]` / `[app.claude]` parents are implicit — no bare empty header.
+        assert!(!body.contains("[app]\n"), "no empty [app] header:\n{body}");
     }
 }

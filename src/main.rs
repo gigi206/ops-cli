@@ -560,6 +560,8 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
         Some("live") => proc_live(&args[1..]),
         Some("logs") | Some("log") => proc_logs(&args[1..]),
         Some("pending") => proc_pending(&args[1..]),
+        Some("allow") => proc_add_rule(config::manage::ProcList::Allow, &args[1..]),
+        Some("deny") => proc_add_rule(config::manage::ProcList::Deny, &args[1..]),
         None => {
             eprint!("{}", help::page_usage(&["proc"]).unwrap_or_default());
             ExitCode::from(2)
@@ -568,6 +570,63 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
             eprintln!("sbx: proc: unknown subcommand `{other}`");
             eprintln!("       run `sbx help proc` for usage.");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `sbx proc allow|deny <rule> [--local|--global|-c <file>] [-a <app>]`: add a process/exec rule to a
+/// config file's `[proc]` allow/deny list. On a fresh project a `deny` bootstraps `mode = "enforce"`
+/// (the denylist posture) so it takes effect at once; an `allow` requires `mode = "ask"` (it is inert
+/// otherwise). A project `.sbx.toml` write is trust-gated and re-trusted, exactly like
+/// `sbx net allow|deny`.
+fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode {
+    let verb = match list {
+        config::manage::ProcList::Allow => "allow",
+        config::manage::ProcList::Deny => "deny",
+    };
+    let parsed = match split_scope(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sbx: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let rule = match parsed.positionals.as_slice() {
+        [r] => r.trim().to_string(),
+        [] => {
+            eprintln!("sbx: usage: {}", help::synopsis_of(&["proc", verb]));
+            return ExitCode::from(2);
+        }
+        _ => {
+            eprintln!("sbx: proc {verb}: expected exactly one rule");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(name) = &parsed.app {
+        if !config::is_valid_app_name(name) {
+            eprintln!("sbx: invalid app name '{name}'");
+            return ExitCode::from(2);
+        }
+    }
+    if let Err(e) = proc_policy::validate_rule(&rule) {
+        eprintln!("sbx: invalid rule {rule:?}: {e}");
+        return ExitCode::from(2);
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sbx: cannot read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match persist_proc_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => {
+            eprintln!("sbx: {message}");
+            ExitCode::from(code)
         }
     }
 }
@@ -8637,6 +8696,105 @@ fn persist_egress_rule(
                 Some(mode) => {
                     format!("set network mode `{mode}` and added {verb} {rule} to {target}")
                 }
+                None => format!("added {verb} {rule} to {target}"),
+            };
+            if gated {
+                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
+            }
+            msg
+        }
+    })
+}
+
+/// Persist a process/exec `rule` to the scoped config file's `[proc]` list, trust-gating a project
+/// write and re-trusting it after — the proc sibling of [`persist_egress_rule`]. Returns the success
+/// line to print, or `(exit-code, message)`: a refusal (a `-c` file scope, an untrusted project
+/// config, a non-enforcing/inert posture) is code `2`; an operational failure (no trust store, an
+/// unwritable path, a re-trust failure) is code `1`. The scope/app resolution and trust interaction
+/// are shared with the egress path ([`egress_write_target`] / [`local_save_permitted`]).
+fn persist_proc_rule(
+    list: config::manage::ProcList,
+    rule: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage::{self, AddOutcome, ProcList, Scope};
+    let verb = match list {
+        ProcList::Allow => "allow",
+        ProcList::Deny => "deny",
+    };
+    if matches!(scope, Scope::File(_)) {
+        return Err((
+            2,
+            format!(
+                "`sbx proc {verb}` does not take `-c <file>` — use --local, --global, or --app"
+            ),
+        ));
+    }
+    if let Some(name) = app {
+        if !config::is_valid_app_name(name) {
+            return Err((2, format!("`{name}` is not a valid app name")));
+        }
+    }
+    let (path, app_key, target) = egress_write_target(scope, app, base)?;
+
+    // A write to the project `.sbx.toml` is trust-gated; the global config and the app profiles under
+    // `apps/` are trusted by location.
+    let gated = matches!(scope, Scope::Local);
+    let store =
+        if gated {
+            Some(trust::default_store_dir().ok_or((
+            1,
+            "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be \
+             written but could not be trusted, so it would not take effect — use --global, or set \
+             the trust store"
+                .to_string(),
+        ))?)
+        } else {
+            None
+        };
+
+    // Pre-check: an existing-but-untrusted project config must not be silently blessed by an append.
+    if let Some(store) = &store {
+        if !local_save_permitted(path.exists(), trust::state(store, &path)) {
+            return Err((
+                2,
+                format!(
+                    "{} is not trusted — review it and run `sbx trust {}`, then retry",
+                    path.display(),
+                    config::PROJECT_CONFIG
+                ),
+            ));
+        }
+    }
+
+    let outcome =
+        manage::add_proc_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
+
+    // Re-trust after the write; the ordering is fail-safe (a crash between leaves a correct-but-
+    // untrusted file the next launch drops — the rule does not take effect, never a security hole).
+    if let Some(store) = &store {
+        trust::trust(store, &path).map_err(|e| {
+            (
+                1,
+                format!(
+                    "wrote the rule but could not re-trust {}: {e} — run `sbx trust {}` so it \
+                     takes effect",
+                    path.display(),
+                    config::PROJECT_CONFIG
+                ),
+            )
+        })?;
+    }
+
+    Ok(match outcome {
+        AddOutcome::AlreadyPresent => {
+            format!("{verb} {rule} is already present in {target} — no change")
+        }
+        AddOutcome::Added { created_mode } => {
+            let mut msg = match created_mode {
+                Some(mode) => format!("set proc mode `{mode}` and added {verb} {rule} to {target}"),
                 None => format!("added {verb} {rule} to {target}"),
             };
             if gated {

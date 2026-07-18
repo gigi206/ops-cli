@@ -104,6 +104,26 @@ impl ProcRule {
     }
 }
 
+/// Validate a rule string before it is persisted to a config file or injected into a live session.
+/// [`ProcRule::new`] is total (any string compiles), so this is the fail-closed gate the write and
+/// `--session` paths share: a rule must be non-empty after trimming and carry no control character —
+/// a newline would break the line-based control-socket framing, and a control byte has no place in an
+/// exec path or basename — and stay within a sane length. Returns a human reason on refusal.
+pub(crate) fn validate_rule(rule: &str) -> Result<(), String> {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() {
+        return Err("a rule must not be empty".to_string());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("a rule must not contain control characters (including newlines)".to_string());
+    }
+    const MAX: usize = 256;
+    if trimmed.chars().count() > MAX {
+        return Err(format!("a rule must be at most {MAX} characters"));
+    }
+    Ok(())
+}
+
 /// The pure verdict for one exec target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {

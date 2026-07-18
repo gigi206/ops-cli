@@ -300,7 +300,8 @@ const PAGES: &[Page] = &[
             and always available (they read `/proc` with no privilege, no cage cooperation, no\n\
             launch). `sbx proc logs` is the exec-event feed: the processes the agent has spawned, in\n\
             order, each with its enforcement verdict when the session is enforcing. `sbx proc pending`\n\
-            lists — and decides — the execs an `ask`-mode session has parked.\n\
+            lists — and decides — the execs an `ask`-mode session has parked. `sbx proc allow`/`deny`\n\
+            persist an exec rule to a config file's `[proc]` list (the sibling of `sbx net allow`/`deny`).\n\
             \n\
             Enforcement is configured by `[proc]` (a trusted-only security field): `enforce` blocks a\n\
             denied exec target before the syscall runs, `ask` parks an unmatched one for a decision.\n\
@@ -405,6 +406,54 @@ const PAGES: &[Page] = &[
             the parked execs across the live sessions; `allow <id>` lets one run, `deny <id>` refuses\n\
             it (EPERM, never running). A parked exec not decided within the ask timeout is auto-denied\n\
             (fail-closed), so a process tree never hangs on a stalled decision.",
+    },
+    Page {
+        path: &["proc", "allow"],
+        synopsis: "sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "persist an allow rule to a config file's [proc] list",
+        options: &[
+            (
+                "<rule>",
+                "an exec-target glob (`*`/`?`). Without a `/` it matches the basename (`curl` blocks any `curl` on PATH); with a `/` it matches the full exec path (`/usr/bin/*`, `/nix/store/*/bin/git`)",
+            ),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
+            (
+                "-a, --app <name>",
+                "write the rule under that app's `[app.<name>.proc]`",
+            ),
+        ],
+        details:
+            "Adds a rule to the `[proc]` allow list. An `allow` rule only takes effect under\n\
+            `mode = \"ask\"` (it exempts a target from parking); under `enforce` everything not denied\n\
+            already runs, so an allow there is inert and is refused. Set `mode = \"ask\"` first (or use\n\
+            `deny`). Writing the project config re-trusts it (it must be absent or already trusted\n\
+            first); the global config and app profiles are trusted by location. `deny` always wins\n\
+            over `allow`.",
+    },
+    Page {
+        path: &["proc", "deny"],
+        synopsis: "sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "persist a deny rule to a config file's [proc] list",
+        options: &[
+            (
+                "<rule>",
+                "an exec-target glob (`*`/`?`). Without a `/` it matches the basename (`curl` blocks any `curl` on PATH); with a `/` it matches the full exec path (`/usr/bin/*`, `/nix/store/*/bin/git`)",
+            ),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
+            (
+                "-a, --app <name>",
+                "write the rule under that app's `[app.<name>.proc]`",
+            ),
+        ],
+        details:
+            "Adds a rule to the `[proc]` deny list — the target is blocked before its `execve` runs\n\
+            (EPERM, the syscall never runs), and `deny` always wins over `allow`. On a fresh project\n\
+            with no `[proc]` yet, `deny` bootstraps `mode = \"enforce\"` (a denylist), so it takes\n\
+            effect at once; an existing `off`/`observe` mode is refused (a rule would be inert). Writing\n\
+            the project config re-trusts it (it must be absent or already trusted first); the global\n\
+            config and app profiles are trusted by location.",
     },
     Page {
         path: &["fs"],

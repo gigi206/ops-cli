@@ -5,6 +5,8 @@ sbx proc ls      [<id>] [--json]
 sbx proc live    [<id>] [-i|--interval <secs>] [--json]
 sbx proc logs    [<id>] [-f|--follow] [--json]
 sbx proc pending [allow|deny <id>]
+sbx proc allow   <rule> [-l|-g] [-a <app>]
+sbx proc deny    <rule> [-l|-g] [-a <app>]
 ```
 
 Observe — and, under [`[proc]`](../configuration/proc.md) enforcement, **block** — what a running
@@ -14,6 +16,8 @@ watches it redraw in real time — both always available, reading `/proc` with n
 cooperation from the cage, launching nothing. `sbx proc logs` is the **exec-event feed**: the
 processes the agent spawns, in order, each with its enforcement verdict when the session is
 enforcing. `sbx proc pending` lists — and decides — the `execve`s an `ask`-mode session has parked.
+`sbx proc allow`/`deny` persist an exec rule to a config file's [`[proc]`](../configuration/proc.md)
+list — the sibling of [`sbx net allow`/`deny`](net.md).
 
 See also: [`sbx fs`](fs.md) (the file-write sibling) · [`sbx net`](net.md) · [`sbx session`](session.md).
 
@@ -153,6 +157,40 @@ A parked `execve` that is not decided within the ask timeout is auto-denied (fai
 process tree never hangs indefinitely on a stalled decision. Because a coding agent spawns
 constantly, `ask` is meant to run against a populated `allow` list — see
 [`[proc]`](../configuration/proc.md).
+
+## `allow` / `deny`
+
+```
+sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx proc deny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+```
+
+Persist an exec rule to a config file's [`[proc]`](../configuration/proc.md) `allow`/`deny` list —
+the sibling of [`sbx net allow`/`deny`](net.md). The `<rule>` is an exec-target glob (`*`/`?`):
+without a `/` it matches the **basename** (`curl` blocks any `curl` on `PATH`), with a `/` it matches
+the **full exec path** (`/usr/bin/*`, `/nix/store/*/bin/git`). `deny` always wins over `allow`.
+
+| Operand / option | Meaning |
+|---|---|
+| `<rule>` | an exec-target glob (basename, or a full path when it contains `/`) |
+| `-l`, `--local` | write the project `.sbx.toml` (the default) |
+| `-g`, `--global` | write the global `sbx.toml` |
+| `-a`, `--app <name>` | write the rule under that app's `[app.<name>.proc]` |
+
+The posture guard matches `[proc]`'s denylist-by-default. On a fresh project a `deny` **bootstraps**
+`mode = "enforce"` (a denylist) so it takes effect at once; an `allow` requires `mode = "ask"` — under
+`enforce` everything not denied already runs, so an allow there is inert and is refused. A rule added
+to an `off`/`observe` mode is likewise refused (it would do nothing).
+
+```sh
+sbx proc deny curl                 # fresh project → sets [proc] mode="enforce", deny=["curl"]
+sbx proc deny ssh -a claude-code   # under that app's [app.claude-code.proc]
+sbx proc allow git                 # only valid once mode = "ask"
+```
+
+Writing the project `.sbx.toml` **re-trusts** it (it must be absent or already trusted first), so the
+rule takes effect on the next launch; the global config and app profiles are trusted by location.
+Removing a rule is done by editing the config ([`sbx config edit`](config.md)).
 
 Honest limit: exec-blocking is a **guardrail, not a containment boundary** — it catches every
 `execve`, but an agent can still do harmful work *in-process* (in its own interpreter) without

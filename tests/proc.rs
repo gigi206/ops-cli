@@ -542,3 +542,76 @@ fn app_run_observe_streams_exec_events() {
         "an app run without --observe must emit no feed"
     );
 }
+
+/// Run `sbx <args>` for a `[proc]` config-write test: cwd = `proj`, with an isolated trust store,
+/// global config, and data dir, so `sbx proc allow|deny` writes and re-trusts against redirected
+/// dirs (never the developer's real home). Read-only and host-side: no launch, no nix.
+fn sbx_config_write(
+    args: &[&str],
+    proj: &Path,
+    state: &Path,
+    config: &Path,
+    data: &Path,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(args)
+        .current_dir(proj)
+        .env("XDG_STATE_HOME", state)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("spawn sbx")
+}
+
+#[test]
+fn proc_deny_bootstraps_enforce_writes_the_config_and_retrusts() {
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let out = sbx_config_write(
+        &["proc", "deny", "curl"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("enforce"), "stdout: {stdout}");
+    assert!(stdout.contains("re-trusted"), "must re-trust: {stdout}");
+    let body = std::fs::read_to_string(proj.path().join(".sbx.toml")).unwrap();
+    assert!(body.contains("mode = \"enforce\""), "{body}");
+    assert!(body.contains("deny = [\"curl\"]"), "{body}");
+    // A second deny appends against the now-trusted config (the trust pre-check must pass).
+    let again = sbx_config_write(
+        &["proc", "deny", "ssh"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    assert_eq!(again.status.code(), Some(0), "second deny should append");
+    let body = std::fs::read_to_string(proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        body.contains("\"curl\"") && body.contains("\"ssh\""),
+        "{body}"
+    );
+}
+
+#[test]
+fn proc_allow_with_no_posture_is_refused_and_writes_nothing() {
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let out = sbx_config_write(
+        &["proc", "allow", "git"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("ask"), "should point at mode=ask: {err}");
+    assert!(
+        !proj.path().join(".sbx.toml").exists(),
+        "a refused allow must write no config"
+    );
+}
