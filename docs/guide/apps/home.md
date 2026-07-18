@@ -57,6 +57,18 @@ rebuild). The credentials/login/identity you chose `"global"` *for* persist corr
 only tool self-equip is the caveat. The mitigation is `home_scope = "project"` (mise
 data and store both per-project, aligned).
 
+### A caveat for `flake:` packages in global-scope apps
+
+The same misalignment hits an in-cage-built package. A `flake:` package (and an inline
+`[flakes.<name>]`) builds in the cage, and its output lands in the **launching project's**
+per-project store — only a symlink to it is kept in the home. So a `"global"`-scope app
+launched from a **new** project finds that warm symlink pointing at a store path absent
+from the new project's `/nix`, and **rebuilds** on first launch there (minutes; a hard
+failure if offline). This is unlike a `nix:` package, which builds into the **shared**
+store and is re-seeded into each project offline — so a `nix:` tool never rebuilds in a
+fresh project. The mitigation is again `home_scope = "project"`: the home and the
+per-project store are then aligned, so a flake built in a project stays reachable there.
+
 ## Inspecting a running app
 
 ```sh
