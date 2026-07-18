@@ -4994,10 +4994,8 @@ fn build_app_show(
                             }
                             None => PackageInstalled::NotInstalled,
                         }
-                    } else if matches!(
-                        pkg.backend,
-                        Backend::Flake(_) | Backend::FlakeInline { .. }
-                    ) {
+                    } else if matches!(pkg.backend, Backend::Flake(_) | Backend::FlakeInline { .. })
+                    {
                         // A `flake:` build — and an inline `[flakes.<name>]` — lands in the cage home
                         // (like mise): a warm out-link there whose target store path is in the
                         // per-project store. A floating flake has no lock at all, so that out-link,

@@ -76,6 +76,11 @@ struct Prepared {
     /// host-side `[env]` driver.
     engine_ref: String,
     userland: Userland,
+    /// Suppress the per-launch "equipping … via mise use -g" informational line. Set on the batch
+    /// `sbx upgrade` path, where it repeats for every app and buries the one thing that matters —
+    /// which app actually rolled; left `false` for an ordinary launch, where it tells the user what
+    /// is being equipped.
+    quiet_equip: bool,
 }
 
 /// `sbx run [--] [<cmd>]`: run a command inside the project sandbox, or — with no command — open
@@ -773,6 +778,16 @@ impl GroupHome {
             GroupHome::GlobalApp(name) | GroupHome::ProjectApp(name) => format!("app: {name}"),
         }
     }
+
+    /// The bare display name for the report column and the recap list — the app name, or `project`
+    /// for the baseline. Unlike [`GroupHome::label`] it carries no `app:` prefix, so a run of them
+    /// aligns cleanly.
+    fn name(&self) -> String {
+        match self {
+            GroupHome::ProjectDefault => "project".to_string(),
+            GroupHome::GlobalApp(name) | GroupHome::ProjectApp(name) => name.clone(),
+        }
+    }
 }
 
 /// One in-cage `mise:` roll: the home that equips these tokens, the merged config to launch it
@@ -868,7 +883,7 @@ pub(crate) fn upgrade_mise_packages(
     cfg: &crate::config::Resolved,
     pal: &crate::style::Palette,
 ) -> bool {
-    let (h, n, warn, dim, r, ok_c) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset, pal.ok);
+    let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
     println!("{h}sbx upgrade — mise packages{r}");
     let groups = mise_package_groups(cfg);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
@@ -896,17 +911,41 @@ pub(crate) fn upgrade_mise_packages(
         }
     };
 
+    // In this batch context the per-app "equipping … via mise use -g" line `build` prints repeats
+    // for every app and buries the roll result — silence it (the report names each app anyway).
+    prep.quiet_equip = true;
+
+    // Every group name is known up front, so the result lines are dot-leader aligned to one column
+    // even though each prints live (as its cage finishes) to keep progress visible over a long
+    // multi-app roll. A closing recap then names exactly which apps advanced.
+    let width = groups
+        .iter()
+        .map(|g| g.home.name().chars().count())
+        .max()
+        .unwrap_or(0);
+
     let mut ok = true;
+    let mut rolled: Vec<String> = Vec::new();
+    let (mut up_to_date, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+
     for group in groups {
         let MiseGroup { home, cfg, tokens } = group;
-        let label = home.label();
+        let name = home.name();
         // `network = "none"` cannot fetch — the launch skips the equip there — so skip the roll
         // too (the tool stays at its persisted version). Not a failure: it is the declared posture.
         if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
-            println!("  [{n}{label}{r}] network = \"none\" — cannot fetch, {dim}skipped.{r}");
+            println!(
+                "{}",
+                roll_line(
+                    &name,
+                    width,
+                    &format!("{dim}network \"none\" — skipped{r}"),
+                    pal
+                )
+            );
+            skipped += 1;
             continue;
         }
-        println!("  [{n}{label}{r}] mise upgrade {n}{}{r}", tokens.join(", "));
 
         // Launch a cage in this group's home with its merged config so `build` sees the right
         // network/packages/home. The baseline warnings were already surfaced by `upgrade_cmd`,
@@ -927,6 +966,11 @@ pub(crate) fn upgrade_mise_packages(
         let (spec, guard) = match build(&prep, runtime, cmd) {
             Ok(v) => v,
             Err(_) => {
+                println!(
+                    "{}",
+                    roll_line(&name, width, &format!("{warn}failed to launch{r}"), pal)
+                );
+                failed += 1;
                 ok = false;
                 continue;
             }
@@ -934,29 +978,83 @@ pub(crate) fn upgrade_mise_packages(
         // Fork-and-wait (never exec-replace) so the next group can run; the guard, if any, is
         // held across the wait so the proxy/forwarder serves the fetch, then dropped as the group
         // ends (unlinks the sockets and CA). The cage's output is captured (not streamed): on a
-        // clean roll only mise's own version-transition summary is shown; the install/progress
-        // noise is surfaced only when the roll fails, so its cause is visible.
+        // clean roll only mise's own version-transition summary is surfaced; the install/progress
+        // noise is shown only when the roll fails, so its cause is visible.
         let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
         drop(guard);
         if code == 0 {
-            let transitions = mise_transitions(&out);
-            if !transitions.is_empty() {
-                for t in transitions {
-                    println!("    {ok_c}{t}{r}");
+            match mise_transitions(&out).as_slice() {
+                [] if mise_up_to_date(&out) => {
+                    println!(
+                        "{}",
+                        roll_line(&name, width, &format!("{dim}up to date{r}"), pal)
+                    );
+                    up_to_date += 1;
                 }
-            } else if mise_up_to_date(&out) {
-                println!("    {dim}already up to date.{r}");
-            } else {
-                println!("    {ok_c}upgraded.{r}");
+                [] => {
+                    println!(
+                        "{}",
+                        roll_line(&name, width, &format!("{ok_c}upgraded{r}"), pal)
+                    );
+                    rolled.push(name);
+                }
+                [only] => {
+                    // The token is redundant with the name column, so show just the version delta.
+                    let delta = only.split_once(' ').map_or(*only, |(_, v)| v);
+                    println!(
+                        "{}",
+                        roll_line(&name, width, &format!("{ok_c}{delta}{r}"), pal)
+                    );
+                    rolled.push(name);
+                }
+                many => {
+                    // A group that rolled several tokens: a count on the aligned line, then each
+                    // full `<token> <old> → <new>` transition indented below it.
+                    println!(
+                        "{}",
+                        roll_line(
+                            &name,
+                            width,
+                            &format!("{ok_c}{} tools rolled{r}", many.len()),
+                            pal
+                        )
+                    );
+                    for t in many {
+                        println!("       {ok_c}{t}{r}");
+                    }
+                    rolled.push(name);
+                }
             }
         } else {
-            crate::diag::warn(&format!("`{label}`: mise upgrade exited {code}"));
+            println!(
+                "{}",
+                roll_line(
+                    &name,
+                    width,
+                    &format!("{warn}mise upgrade exited {code}{r}"),
+                    pal
+                )
+            );
+            crate::diag::warn(&format!("`{}`: mise upgrade exited {code}", home.label()));
             for line in out.lines() {
-                eprintln!("    {line}");
+                eprintln!("       {line}");
             }
+            failed += 1;
             ok = false;
         }
     }
+
+    // Close with the one line that answers "which apps changed?": the rolled apps by name, plus a
+    // tally of the rest — coloured by outcome (a failure paints it a warning, a clean no-op dims).
+    let recap = mise_roll_recap(&rolled, up_to_date, skipped, failed);
+    let hue = if failed > 0 {
+        warn
+    } else if rolled.is_empty() {
+        dim
+    } else {
+        ok_c
+    };
+    println!("  {hue}{recap}{r}");
     ok
 }
 
@@ -2793,6 +2891,7 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
         nixpkgs,
         engine_ref,
         userland,
+        quiet_equip: false,
     })
 }
 
@@ -3045,19 +3144,25 @@ fn build(
     // the declared ref into a name-keyed out-link, the v1 behaviour kept for a project that never
     // ran `sbx upgrade flake`.
     let flake_lock = read_flake_lock(prep, &flake_pkgs);
-    // Each triple carries the build ref, the out-link, and the package name — the name keys the
+    // Each quad carries the build ref, the build *target* out-link, the *good* out-link, and the
+    // package name. The target is where the build lands (rev-keyed when pinned, so a roll rebuilds);
+    // the good out-link (name-only) is the stable path PATH resolves through — the wrap promotes it
+    // to each successful build and, when a build *fails*, leaves it at the last good build, so a
+    // broken pin runs the previous version rather than breaking the app. The name keys the
     // host-resolvable gc root the build registers, so a roll re-points one root and a host-side
     // `sbx gc` keeps the current build while collecting the rolled-away one.
-    let mut flake_pairs: Vec<(String, PathBuf, String)> = Vec::with_capacity(flake_pkgs.len());
+    let mut flake_pairs: Vec<(String, PathBuf, PathBuf, String)> =
+        Vec::with_capacity(flake_pkgs.len());
     for (name, reference) in &flake_pkgs {
         // A pinned package builds its locked (immutable) ref; an unpinned one the declared ref.
         let build_ref = match flake_lock.get(reference) {
             Some(pin) => pin.locked_ref.clone(),
             None => reference.clone(),
         };
-        let out_link = flake_out_link_for(name, reference, &flake_lock);
-        bin_paths.push(out_link.join("bin"));
-        flake_pairs.push((build_ref, out_link, name.clone()));
+        let target = flake_out_link_for(name, reference, &flake_lock);
+        let good = binds::flake_out_link(name);
+        bin_paths.push(good.join("bin"));
+        flake_pairs.push((build_ref, target, good, name.clone()));
     }
 
     // Inline `[flakes.<name>]` flakes: stage each `flake.nix` to a content-keyed directory on disk,
@@ -3080,14 +3185,17 @@ fn build(
         };
         let incage = binds::flake_inline_incage(&name);
         let build_ref = format!("path:{}#{attr}", incage.display());
-        let out_link = binds::flake_out_link_hash(&name, &hash);
+        // The content-hash-keyed target rebuilds when the inline flake is edited; the name-only good
+        // out-link is the stable PATH entry the wrap keeps at the last good build on a failure.
+        let target = binds::flake_out_link_hash(&name, &hash);
+        let good = binds::flake_out_link(&name);
         inline_flake_binds.push(binds::ExtraBind {
             src: dir,
             dest: incage,
             writable: false,
         });
-        bin_paths.push(out_link.join("bin"));
-        flake_pairs.push((build_ref, out_link, name));
+        bin_paths.push(good.join("bin"));
+        flake_pairs.push((build_ref, target, good, name));
     }
 
     // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
@@ -3364,11 +3472,13 @@ fn build(
             ));
         } else {
             if !auto_equip.is_empty() {
-                eprintln!(
-                    "sbx: equipping non-nix tools in-cage via mise: {} (each backend's host must \
-                     be in [network].allow under an allowlist)",
-                    auto_equip.join(", ")
-                );
+                if !prep.quiet_equip {
+                    eprintln!(
+                        "sbx: equipping non-nix tools in-cage via mise: {} (each backend's host \
+                         must be in [network].allow under an allowlist)",
+                        auto_equip.join(", ")
+                    );
+                }
                 cmd = wrap_mise_equip(
                     &prep.userland.mise_bin,
                     &prep.userland.shell_bin,
@@ -3388,10 +3498,12 @@ fn build(
                 ));
             }
             if !global_mise.is_empty() {
-                eprintln!(
-                    "sbx: equipping app packages in-cage via mise use -g: {}",
-                    global_mise.join(", ")
-                );
+                if !prep.quiet_equip {
+                    eprintln!(
+                        "sbx: equipping app packages in-cage via mise use -g: {}",
+                        global_mise.join(", ")
+                    );
+                }
                 cmd = wrap_mise_equip(
                     &prep.userland.mise_bin,
                     &prep.userland.shell_bin,
@@ -4106,20 +4218,41 @@ fn wrap_flake_equip(
     nix: &Path,
     bash: &Path,
     flake_dir: &Path,
-    triples: &[(String, PathBuf, String)],
+    quads: &[(String, PathBuf, PathBuf, String)],
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
-    let n = triples.len();
+    let n = quads.len();
+    // Per package (`$1` ref, `$2` build target, `$3` good out-link, `$4` key): build the target if
+    // it is neither warm nor already known-failed (a `<target>.failed` marker, so a broken pin is
+    // retried once per revision, not on every launch, and a new pin — a new rev-keyed target — is
+    // attempted afresh). On success the good out-link (what PATH resolves through) is promoted to the
+    // fresh build and any marker cleared; on failure it is left at the last good build so the app
+    // still runs, with a loud notice. Only the target/good pair is marked (never a floating package,
+    // whose target *is* its good — it has no revision to clear the marker, so it retries as before).
+    // The hard-fail (exit 1) is reserved for the case where no prior good build exists at all.
     let script = format!(
         "mkdir -p '{dir}'\n\
          n={n}\n\
          while [ \"$n\" -gt 0 ]; do\n\
-         out=\"$2\"\n\
-         [ -e \"$out/bin\" ] || '{nix}' build \"$1\" --no-write-lock-file --out-link \"$out\" 1>&2\n\
-         sp=$(readlink -f \"$out\" 2>/dev/null)\n\
+         ref=\"$1\"; target=\"$2\"; good=\"$3\"; key=\"$4\"\n\
+         if [ ! -e \"$target/bin\" ] && [ ! -e \"$target.failed\" ]; then\n\
+         '{nix}' build \"$ref\" --no-write-lock-file --out-link \"$target\" 1>&2\n\
+         [ -e \"$target/bin\" ] || [ \"$target\" = \"$good\" ] || touch \"$target.failed\"\n\
+         fi\n\
+         if [ -e \"$target/bin\" ]; then\n\
+         rm -f \"$target.failed\"\n\
+         sp=$(readlink -f \"$target\")\n\
+         [ \"$target\" != \"$good\" ] && ln -sfn \"$sp\" \"$good\"\n\
+         elif [ -e \"$good/bin\" ]; then\n\
+         sp=$(readlink -f \"$good\")\n\
+         echo \"sbx: flake '$key': build failed — falling back to the last good build; a new revision (or, for an inline flake, an edit) triggers a fresh build\" 1>&2\n\
+         else\n\
+         echo \"sbx: flake '$key': the build failed and there is no prior build to fall back to\" 1>&2\n\
+         exit 1\n\
+         fi\n\
          [ -n \"$sp\" ] && mkdir -p /nix/var/nix/gcroots \
-         && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$3\"\n\
-         shift 3\n\
+         && ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\"\n\
+         shift 4\n\
          n=$((n - 1))\n\
          done\n\
          exec \"$@\"",
@@ -4130,12 +4263,13 @@ fn wrap_flake_equip(
         bash.as_os_str().to_os_string(),
         OsString::from("-c"),
         OsString::from(script),
-        // `$0` — a label; the triples are `$1..$3n`, the command is what remains after the shifts.
+        // `$0` — a label; the quads are `$1..$4n`, the command is what remains after the shifts.
         OsString::from("sbx-flake-equip"),
     ];
-    for (reference, out_link, key) in triples {
+    for (reference, target, good, key) in quads {
         out.push(OsString::from(reference));
-        out.push(out_link.as_os_str().to_os_string());
+        out.push(target.as_os_str().to_os_string());
+        out.push(good.as_os_str().to_os_string());
         out.push(OsString::from(key));
     }
     out.extend(cmd);
@@ -4238,6 +4372,56 @@ fn mise_transitions(captured: &str) -> Vec<&str> {
 /// roll finds every tool already current. Pure — unit-tested against real mise output.
 fn mise_up_to_date(captured: &str) -> bool {
     captured.contains("up to date")
+}
+
+/// One dot-leader-aligned result line for the `mise:` roll report: the group `name`, a run of dots
+/// filling toward `width`, then the caller's already-styled `status`. Pure formatting — the dots
+/// carry `width - name` + a 3-dot minimum so even the widest name keeps a small gap.
+fn roll_line(name: &str, width: usize, status: &str, pal: &crate::style::Palette) -> String {
+    let dots = ".".repeat(width.saturating_sub(name.chars().count()) + 3);
+    format!(
+        "  {}{name}{} {}{dots}{} {status}",
+        pal.name, pal.reset, pal.dim, pal.reset
+    )
+}
+
+/// The one line that closes the `mise:` roll report and answers "which apps changed?": the rolled
+/// groups by name, then a parenthesised tally of the rest. Plain text (the caller colours it by
+/// outcome); pure, so it is unit-tested. With nothing rolled and nothing wrong it collapses to a
+/// single reassuring line rather than "0 apps rolled".
+fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed: usize) -> String {
+    let mut tail = Vec::new();
+    if up_to_date > 0 {
+        tail.push(format!("{up_to_date} up to date"));
+    }
+    if skipped > 0 {
+        tail.push(format!("{skipped} skipped"));
+    }
+    if failed > 0 {
+        tail.push(format!("{failed} failed"));
+    }
+    let tally = if tail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", tail.join(", "))
+    };
+
+    if rolled.is_empty() {
+        if !tail.is_empty() && skipped == 0 && failed == 0 {
+            format!("all {up_to_date} up to date.")
+        } else if tail.is_empty() {
+            "nothing to roll.".to_string()
+        } else {
+            format!("nothing rolled{tally}.")
+        }
+    } else {
+        let noun = if rolled.len() == 1 { "app" } else { "apps" };
+        format!(
+            "{} {noun} rolled: {}{tally}.",
+            rolled.len(),
+            rolled.join(", ")
+        )
+    }
 }
 
 /// The bwrap argv with the mandatory seccomp filters prepended. Returns the
@@ -4887,6 +5071,30 @@ Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 
     }
 
     #[test]
+    fn mise_roll_recap_names_the_apps_that_rolled_and_tallies_the_rest() {
+        // The headline case: two apps advanced out of many — the recap names them and tallies the
+        // untouched majority, so "which apps are concerned?" reads at a glance.
+        assert_eq!(
+            mise_roll_recap(&["cline".into(), "openfox".into()], 15, 0, 0),
+            "2 apps rolled: cline, openfox (15 up to date)."
+        );
+        // Nothing advanced, everything current — collapse to one reassuring line, not "0 rolled".
+        assert_eq!(mise_roll_recap(&[], 17, 0, 0), "all 17 up to date.");
+        // Singular noun, and a mixed tally (skips + failures) still surfaces.
+        assert_eq!(
+            mise_roll_recap(&["cline".into()], 0, 1, 2),
+            "1 app rolled: cline (1 skipped, 2 failed)."
+        );
+        // Nothing rolled but not a clean no-op — say what got in the way.
+        assert_eq!(
+            mise_roll_recap(&[], 10, 2, 1),
+            "nothing rolled (10 up to date, 2 skipped, 1 failed)."
+        );
+        // Degenerate empty run (no groups reached the loop).
+        assert_eq!(mise_roll_recap(&[], 0, 0, 0), "nothing to roll.");
+    }
+
+    #[test]
     fn session_runtime_maps_each_launch_runtime_to_its_owned_form() {
         // The owned record runtime `sbx session attach` reads back must mirror the launch-side runtime, so
         // an app session is reproduced in the app's home rather than the project's default.
@@ -5474,68 +5682,200 @@ Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 
     }
 
     #[test]
-    fn wrap_flake_equip_passes_refs_and_command_positionally_and_short_circuits() {
-        // Each (ref, out-link, key) rides `"$@"`, so a value from an untrusted-but-trusted-app
-        // config can never inject shell: only the absolute nix path, the out-link parent, and
-        // the integer triple count reach the script string. The short-circuit, the per-triple
-        // `nix build`, and the host-resolvable gc root (keyed by package name, the `$3`
-        // positional, never interpolated) are all present.
+    fn wrap_flake_equip_passes_quads_and_command_positionally() {
+        // Each (ref, target, good, key) rides `"$@"`, so a value from an untrusted-but-trusted-app
+        // config can never inject shell: only the absolute nix path, the out-link parent, and the
+        // integer quad count reach the script string. The per-quad build, the good-out-link
+        // promotion, the fallback branch, the `<target>.failed` marker, and the host-resolvable gc
+        // root (keyed by package name, the `$key` positional, never interpolated) are all present.
         let nix = PathBuf::from("/nix/store/nix/bin/nix");
         let bash = PathBuf::from("/nix/store/bash/bin/bash");
         let dir = PathBuf::from("/home/sandbox/.local/state/sbx/flake");
-        let triples = vec![
+        let quads = vec![
             (
                 "github:example/flake-tool#tui".to_string(),
+                PathBuf::from("/home/sandbox/.local/state/sbx/flake/flake-tool-rev"),
                 PathBuf::from("/home/sandbox/.local/state/sbx/flake/flake-tool"),
                 "flake-tool".to_string(),
             ),
             // a hostile ref must stay a single positional arg, never reach the script
             (
                 "github:evil/x#bin; rm -rf /".to_string(),
+                PathBuf::from("/home/sandbox/.local/state/sbx/flake/evil-rev"),
                 PathBuf::from("/home/sandbox/.local/state/sbx/flake/evil"),
                 "evil".to_string(),
             ),
         ];
         let cmd = vec![OsString::from("flake-tool"), OsString::from("-z")];
 
-        let argv = wrap_flake_equip(&nix, &bash, &dir, &triples, cmd);
+        let argv = wrap_flake_equip(&nix, &bash, &dir, &quads, cmd);
 
         assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
         assert_eq!(argv[1], OsString::from("-c"));
         let script = argv[2].to_string_lossy();
-        // nix by absolute path; the triple count drives the loop, not the refs; the out-link
-        // presence short-circuits the build; the command is exec'd after the triples are shifted.
+        // nix by absolute path; the quad count drives the loop, not the refs; the command is exec'd
+        // after the quads are shifted.
         assert!(script.contains("n=2"));
         assert!(script.contains(
-            "[ -e \"$out/bin\" ] || '/nix/store/nix/bin/nix' build \"$1\" \
-             --no-write-lock-file --out-link \"$out\""
+            "'/nix/store/nix/bin/nix' build \"$ref\" --no-write-lock-file --out-link \"$target\""
         ));
         assert!(script.contains("mkdir -p '/home/sandbox/.local/state/sbx/flake'"));
-        // the gc root is keyed by the `$3` positional (the package name), targeting the build's
-        // store path resolved by `readlink -f` — host-resolvable, overwritten each launch
-        assert!(script.contains("ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$3\""));
-        assert!(script.contains("shift 3"));
+        // the fallback machinery: the per-revision failed-marker, the promotion of the good
+        // out-link on success, and the loud notice when a pinned build fails.
+        assert!(script.contains("touch \"$target.failed\""));
+        assert!(script.contains("ln -sfn \"$sp\" \"$good\""));
+        assert!(script.contains("falling back to the last good build"));
+        assert!(script.contains("there is no prior build to fall back to"));
+        // the gc root is keyed by the `$key` positional (the package name), targeting the used
+        // build's store path resolved by `readlink -f` — host-resolvable, overwritten each launch
+        assert!(script.contains("ln -sfn \"$sp\" \"/nix/var/nix/gcroots/sbx-flake-$key\""));
+        assert!(script.contains("shift 4"));
         assert!(script.trim_end().ends_with("exec \"$@\""));
         assert!(
             !script.contains("rm -rf"),
             "a hostile ref must never be interpolated into the script: {script}"
         );
-        // label, then interleaved (ref, out-link, key) triples, then the command — all positional
+        // label, then interleaved (ref, target, good, key) quads, then the command — all positional
         assert_eq!(argv[3], OsString::from("sbx-flake-equip"));
         assert_eq!(argv[4], OsString::from("github:example/flake-tool#tui"));
         assert_eq!(
             argv[5],
+            OsString::from("/home/sandbox/.local/state/sbx/flake/flake-tool-rev")
+        );
+        assert_eq!(
+            argv[6],
             OsString::from("/home/sandbox/.local/state/sbx/flake/flake-tool")
         );
-        assert_eq!(argv[6], OsString::from("flake-tool"));
-        assert_eq!(argv[7], OsString::from("github:evil/x#bin; rm -rf /"));
+        assert_eq!(argv[7], OsString::from("flake-tool"));
+        assert_eq!(argv[8], OsString::from("github:evil/x#bin; rm -rf /"));
         assert_eq!(
-            argv[8],
+            argv[9],
+            OsString::from("/home/sandbox/.local/state/sbx/flake/evil-rev")
+        );
+        assert_eq!(
+            argv[10],
             OsString::from("/home/sandbox/.local/state/sbx/flake/evil")
         );
-        assert_eq!(argv[9], OsString::from("evil"));
-        assert_eq!(argv[10], OsString::from("flake-tool"));
-        assert_eq!(argv[11], OsString::from("-z"));
+        assert_eq!(argv[11], OsString::from("evil"));
+        assert_eq!(argv[12], OsString::from("flake-tool"));
+        assert_eq!(argv[13], OsString::from("-z"));
+    }
+
+    /// Write `body` to `path` as an executable file (a stub used to drive the flake-equip script).
+    #[cfg(test)]
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn wrap_flake_equip_falls_back_to_the_last_good_build_when_a_pinned_build_fails() {
+        // The headline of the fallback feature, run for real: when the pinned (rev-keyed) build
+        // fails, the launch must run the last good build instead of breaking — and must not
+        // re-attempt the doomed build on the next launch (the `<target>.failed` marker).
+        let tmp = crate::testutil::TmpDir::new();
+        let flake = tmp.path().join("flake");
+        std::fs::create_dir_all(&flake).unwrap();
+
+        // A `nix` that always fails the build, recording each call so we can prove the marker
+        // stops the second attempt.
+        let calls = tmp.path().join("nixcalls");
+        let fake_nix = tmp.path().join("nix");
+        write_exec(
+            &fake_nix,
+            &format!("#!/bin/sh\necho call >> '{}'\nexit 1\n", calls.display()),
+        );
+
+        // A pre-existing good build (the previous version) the fallback resolves to.
+        let good_store = tmp.path().join("goodstore");
+        std::fs::create_dir_all(good_store.join("bin")).unwrap();
+        let good = flake.join("tool");
+        std::os::unix::fs::symlink(&good_store, &good).unwrap();
+        let target = flake.join("tool-deadbeef"); // rev-keyed, does not exist
+
+        let quads = vec![(
+            "github:o/tool#default".to_string(),
+            target.clone(),
+            good.clone(),
+            "tool".to_string(),
+        )];
+        // The command the wrap execs once equip is done — reaching it proves we did NOT exit 1.
+        let cmd = vec![OsString::from("echo"), OsString::from("FELL-BACK")];
+        let argv = wrap_flake_equip(&fake_nix, &PathBuf::from("bash"), &flake, &quads, cmd);
+
+        let run = || {
+            std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("run the flake-equip script")
+        };
+
+        // First launch: build fails → fall back to the good build, exec the command, mark the failure.
+        let out1 = run();
+        assert!(out1.status.success(), "must fall back, not exit 1");
+        assert!(
+            String::from_utf8_lossy(&out1.stdout).contains("FELL-BACK"),
+            "the command must run off the good build after a failed pinned build"
+        );
+        assert!(
+            String::from_utf8_lossy(&out1.stderr).contains("falling back to the last good build"),
+            "the fallback must be announced loudly on stderr"
+        );
+        assert!(
+            flake.join("tool-deadbeef.failed").exists(),
+            "a failed pinned build must be marked so it is not re-attempted every launch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().lines().count(),
+            1,
+            "the failing build is attempted exactly once"
+        );
+
+        // Second launch: the marker short-circuits the doomed rebuild — still falls back, no new call.
+        let out2 = run();
+        assert!(out2.status.success());
+        assert!(String::from_utf8_lossy(&out2.stdout).contains("FELL-BACK"));
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().lines().count(),
+            1,
+            "the marker must stop a second attempt at the same failing revision"
+        );
+    }
+
+    #[test]
+    fn wrap_flake_equip_hard_fails_when_a_build_fails_and_no_good_build_exists() {
+        // With no prior good build to fall back to, a failed build is a hard error (exit 1) — the
+        // app cannot run, and that must surface, not be masked.
+        let tmp = crate::testutil::TmpDir::new();
+        let flake = tmp.path().join("flake");
+        std::fs::create_dir_all(&flake).unwrap();
+        let fake_nix = tmp.path().join("nix");
+        write_exec(&fake_nix, "#!/bin/sh\nexit 1\n");
+
+        let good = flake.join("tool"); // does NOT exist
+        let target = flake.join("tool-deadbeef");
+        let quads = vec![(
+            "github:o/tool#default".to_string(),
+            target,
+            good,
+            "tool".to_string(),
+        )];
+        let cmd = vec![OsString::from("echo"), OsString::from("SHOULD-NOT-RUN")];
+        let argv = wrap_flake_equip(&fake_nix, &PathBuf::from("bash"), &flake, &quads, cmd);
+
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .expect("run the flake-equip script");
+        assert!(!out.status.success(), "no good build → must hard-fail");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("SHOULD-NOT-RUN"),
+            "the command must not run when there is nothing to fall back to"
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no prior build to fall back to"));
     }
 
     #[test]

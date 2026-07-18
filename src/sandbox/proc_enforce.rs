@@ -583,7 +583,9 @@ fn recv_loop(
         }
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
         // SAFETY: req is a live, correctly-sized seccomp_notif for the RECV ioctl to fill.
-        let rc = unsafe { libc::ioctl(notif_fd, notif_recv_code(), &mut req) };
+        // `ioctl`'s request argument is `c_ulong` on glibc but `c_int` on musl, so cast the
+        // 32-bit request code to whichever the target libc expects (the shipping binary is musl).
+        let rc = unsafe { libc::ioctl(notif_fd, notif_recv_code() as libc::Ioctl, &mut req) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -650,7 +652,13 @@ fn handle_notif(
 /// Whether a seccomp notification id is still valid (the target has not been reaped).
 fn notif_id_valid(notif_fd: libc::c_int, id: u64) -> bool {
     // SAFETY: passes the address of a local u64 to the ID_VALID ioctl, which only reads it.
-    unsafe { libc::ioctl(notif_fd, notif_id_valid_code(), &id as *const u64) == 0 }
+    unsafe {
+        libc::ioctl(
+            notif_fd,
+            notif_id_valid_code() as libc::Ioctl,
+            &id as *const u64,
+        ) == 0
+    }
 }
 
 /// Answer a notification with `CONTINUE` (let the real syscall run).
@@ -675,7 +683,7 @@ pub(crate) fn send_resp(notif_fd: libc::c_int, resp: &libc::seccomp_notif_resp) 
     unsafe {
         libc::ioctl(
             notif_fd,
-            notif_send_code(),
+            notif_send_code() as libc::Ioctl,
             resp as *const libc::seccomp_notif_resp,
         );
     }
@@ -966,7 +974,7 @@ mod tests {
         for _ in 0..2 {
             assert!(poll_readable(notif, 3000), "no notification arrived");
             let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::ioctl(notif, notif_recv_code(), &mut req) };
+            let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
             if rc < 0 {
                 break;
             }
@@ -1069,7 +1077,7 @@ mod tests {
         let pending = Arc::new(PendingExec::new());
         if poll_readable(notif, 3000) {
             let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::ioctl(notif, notif_recv_code(), &mut req) };
+            let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
             if rc >= 0 {
                 handle_notif(notif, &req, &policy, &overlay, &ring, &pending);
             }

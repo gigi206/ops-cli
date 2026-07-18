@@ -3974,15 +3974,20 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
         "the locked flake ref must build in-cage through the allowlist and run: {log}"
     );
 
-    // Teeth: the launch built the rev-keyed out-link (the locked branch), not the floating one.
+    // Teeth: the launch built the rev-keyed out-link (the locked branch), not a floating build of
+    // the branch tip. The name-only `hello` out-link now exists too — but as the "good" pointer PATH
+    // resolves through, promoted to the very build the pin selected (so a later broken pin can fall
+    // back to it), so it points at the rev-keyed build's store path rather than an independent
+    // floating one.
     let links = project_flake_out_links(data.path());
     assert!(
         links.iter().any(|n| n == &format!("hello-{rev}")),
         "the launch must build the rev-keyed out-link `hello-{rev}` (links: {links:?})"
     );
-    assert!(
-        !links.iter().any(|n| n == "hello"),
-        "the floating out-link must not be built when the package is pinned (links: {links:?})"
+    assert_eq!(
+        project_flake_link_target(data.path(), "hello"),
+        project_flake_link_target(data.path(), &format!("hello-{rev}")),
+        "the good out-link must be promoted to the pinned build, not an independent floating one"
     );
 }
 
