@@ -560,6 +560,7 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
         Some("live") => proc_live(&args[1..]),
         Some("logs") | Some("log") => proc_logs(&args[1..]),
         Some("pending") => proc_pending(&args[1..]),
+        Some("rules") => proc_rules(&args[1..]),
         Some("allow") => proc_add_rule(config::manage::ProcList::Allow, &args[1..]),
         Some("deny") => proc_add_rule(config::manage::ProcList::Deny, &args[1..]),
         None => {
@@ -584,7 +585,17 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         config::manage::ProcList::Allow => "allow",
         config::manage::ProcList::Deny => "deny",
     };
-    let parsed = match split_scope(args) {
+    // `--session` (load the rule into the live overlay of the running session(s)) and its `--all` scope
+    // widener are extracted before `split_scope`, which rejects any flag it does not know; the
+    // config-scope flags (`--local`/`--global`/`-c`) and `-a` ride it.
+    let session = args.iter().any(|a| a.to_str() == Some("--session"));
+    let all = args.iter().any(|a| a.to_str() == Some("--all"));
+    let rest: Vec<OsString> = args
+        .iter()
+        .filter(|a| !matches!(a.to_str(), Some("--session") | Some("--all")))
+        .cloned()
+        .collect();
+    let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("sbx: {e}");
@@ -619,6 +630,29 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
+
+    if session {
+        // `--session` writes no config file, so the file-scope flags do not apply — point at the
+        // session-scope flags rather than silently ignore a `--global` the user expected to matter.
+        if parsed.scope_explicit {
+            eprintln!(
+                "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
+                 apply — use -a <app> or --all to scope the session(s)"
+            );
+            return ExitCode::from(2);
+        }
+        return proc_inject_session(list, &rule, all, parsed.app.as_deref(), &cwd);
+    }
+
+    // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
+    if all {
+        eprintln!(
+            "sbx: --all only applies with --session (it widens a live rule to every session); a config \
+             write targets one file — drop --all"
+        );
+        return ExitCode::from(2);
+    }
+
     match persist_proc_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
         Ok(message) => {
             println!("{message}");
@@ -629,6 +663,185 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
             ExitCode::from(code)
         }
     }
+}
+
+/// `sbx proc allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
+/// the running enforcing session(s) instead of a config file — the proactive sibling of
+/// `sbx proc pending`, and the proc analogue of `sbx net allow|deny --session`. The supervisor folds
+/// the overlay into every decision (deny wins over any allow), so a `--session deny` cuts a target
+/// immediately and a `--session allow` un-parks one under `ask`. It writes no config (no re-trust) and
+/// dies with the session. Scopes to the current project by default; `-a <app>` / `--all` widen it.
+fn proc_inject_session(
+    list: config::manage::ProcList,
+    rule: &str,
+    all: bool,
+    app: Option<&str>,
+    cwd: &Path,
+) -> ExitCode {
+    let verdict = match list {
+        config::manage::ProcList::Allow => proc_policy::Verdict::Allow,
+        config::manage::ProcList::Deny => proc_policy::Verdict::Deny,
+    };
+    let verb = match list {
+        config::manage::ProcList::Allow => "allow",
+        config::manage::ProcList::Deny => "deny",
+    };
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sbx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Two composing pid filters: the project (unless `--all` widens machine-wide) and the app (`-a`).
+    let project_pids = if all {
+        None
+    } else {
+        let canonical = match sandbox::project_identity(cwd) {
+            Ok((_, c)) => c,
+            Err(e) => {
+                eprintln!("sbx: cannot resolve the current project directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        Some(session_pids_for_project(&data_dir, &canonical))
+    };
+    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
+
+    let mut loaded: Vec<u32> = Vec::new();
+    let mut inert: Vec<u32> = Vec::new();
+    for s in session::Registry::at(&data_dir).list().unwrap_or_default() {
+        let pid = s.pid;
+        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        let socket = sandbox::proc_control::proc_control_socket(&data_dir, pid);
+        match sandbox::proc_control::inject_proc_rule(&socket, verdict, rule) {
+            Ok(sandbox::proc_control::InjectOutcome::Loaded) => loaded.push(pid),
+            Ok(sandbox::proc_control::InjectOutcome::Inert) => inert.push(pid),
+            // Refused (an older server) or a dead/non-enforcing socket — skip it.
+            Ok(sandbox::proc_control::InjectOutcome::Refused) | Err(_) => {}
+        }
+    }
+
+    if !loaded.is_empty() {
+        println!(
+            "loaded {verb} rule `{rule}` into {} live session(s): {}",
+            loaded.len(),
+            loaded
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !inert.is_empty() {
+        diag::warn(&format!(
+            "an `allow` is inert in {} non-`ask` session(s) ({}) — under `enforce` everything not \
+             denied already runs; use `deny`, or run those sessions in `ask` mode",
+            inert.len(),
+            inert
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if loaded.is_empty() && inert.is_empty() {
+        eprintln!(
+            "sbx: no enforcing session in scope to load the rule into — launch one with `[proc] mode \
+             = \"enforce\"`/`\"ask\"`, or write it to config (drop --session)"
+        );
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `sbx proc rules [-a <app>] [--all]`: list the live `--session` rule overlay of the running
+/// enforcing session(s). Config-file rules are shown by `sbx config show`; this lists only the
+/// session-scoped rules loaded with `sbx proc allow|deny --session`, which nothing else surfaces.
+fn proc_rules(args: &[OsString]) -> ExitCode {
+    let all = args.iter().any(|a| a.to_str() == Some("--all"));
+    let rest: Vec<OsString> = args
+        .iter()
+        .filter(|a| a.to_str() != Some("--all"))
+        .cloned()
+        .collect();
+    let parsed = match split_scope(&rest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sbx: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !parsed.positionals.is_empty() {
+        eprintln!(
+            "sbx: proc rules: unexpected argument `{}`",
+            parsed.positionals[0]
+        );
+        return ExitCode::from(2);
+    }
+    if parsed.scope_explicit {
+        eprintln!(
+            "sbx: proc rules lists live session rules, not a config file — use -a <app>/--all to \
+             scope, and `sbx config show` for the config policy"
+        );
+        return ExitCode::from(2);
+    }
+    let data_dir = match egress_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sbx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_pids = if all {
+        None
+    } else {
+        sandbox::project_identity(&cwd)
+            .ok()
+            .map(|(_, c)| session_pids_for_project(&data_dir, &c))
+    };
+    let app_pids = parsed
+        .app
+        .as_deref()
+        .map(|n| session_pids_for_app(&data_dir, n));
+
+    let mut rows: Vec<(u32, &'static str, String)> = Vec::new();
+    for s in session::Registry::at(&data_dir).list().unwrap_or_default() {
+        let pid = s.pid;
+        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+            continue;
+        }
+        let socket = sandbox::proc_control::proc_control_socket(&data_dir, pid);
+        if let Ok(overlay) = sandbox::proc_control::read_overlay_rules(&socket) {
+            for r in overlay {
+                rows.push((pid, r.verdict, r.rule));
+            }
+        }
+    }
+    if rows.is_empty() {
+        println!("no live session rules");
+        return ExitCode::SUCCESS;
+    }
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    println!("{}live session rules{}", pal.head, pal.reset);
+    for (pid, verdict, rule) in rows {
+        let hue = if verdict == "deny" { pal.err } else { pal.ok };
+        println!(
+            "  {dim}{pid}{r}  {hue}{verdict}{r}  {rule}",
+            dim = pal.dim,
+            r = pal.reset,
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// `sbx proc pending [allow|deny <id>]`: list the `execve`s an `ask`-mode session has parked awaiting a

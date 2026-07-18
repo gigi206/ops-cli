@@ -181,11 +181,26 @@ impl ProcPolicy {
     /// under `ask`; under a non-enforcing mode it is [`Allow`](Verdict::Allow) (decide is never called
     /// there, but the fallback is the safe, non-blocking one).
     pub(crate) fn decide(&self, exec_path: &str) -> Verdict {
+        self.decide_with(exec_path, &[], &[])
+    }
+
+    /// Decide one exec target, folding in a live `--session` overlay's extra allow/deny rules on top
+    /// of this config policy. **Deny wins across both sets**: an overlay `deny` cuts a config-allowed
+    /// target, and a config `deny` cannot be overridden by an overlay `allow`. Otherwise an `allow`
+    /// from either set matches; an unmatched target then follows the mode default (`Ask` under `ask`,
+    /// else `Allow`). [`decide`](Self::decide) is this with an empty overlay.
+    pub(crate) fn decide_with(
+        &self,
+        exec_path: &str,
+        overlay_allow: &[ProcRule],
+        overlay_deny: &[ProcRule],
+    ) -> Verdict {
         let basename = basename(exec_path);
-        if self.deny.iter().any(|r| r.matches(exec_path, basename)) {
+        let any = |rules: &[ProcRule]| rules.iter().any(|r| r.matches(exec_path, basename));
+        if any(&self.deny) || any(overlay_deny) {
             return Verdict::Deny;
         }
-        if self.allow.iter().any(|r| r.matches(exec_path, basename)) {
+        if any(&self.allow) || any(overlay_allow) {
             return Verdict::Allow;
         }
         match self.mode {
@@ -334,5 +349,31 @@ mod tests {
             assert_eq!(ProcMode::parse(m.as_str()), Some(m));
         }
         assert_eq!(ProcMode::parse("bogus"), None);
+    }
+
+    #[test]
+    fn decide_with_folds_the_overlay_and_deny_wins() {
+        let base = policy(ProcMode::Enforce, &["git"], &["curl"]);
+        let one = |r: &str| vec![ProcRule::new(r)];
+
+        // An overlay deny cuts a target the base would allow (unmatched → allow under enforce)…
+        assert_eq!(
+            base.decide_with("/bin/wget", &[], &one("wget")),
+            Verdict::Deny
+        );
+        // …while with no overlay that same target runs (denylist default-allow).
+        assert_eq!(base.decide("/bin/wget"), Verdict::Allow);
+        // Deny wins across BOTH sets: a base deny is not overridden by an overlay allow.
+        assert_eq!(
+            base.decide_with("/bin/curl", &one("curl"), &[]),
+            Verdict::Deny
+        );
+        // Under ask, an overlay allow un-parks an otherwise-unmatched target.
+        let ask = policy(ProcMode::Ask, &[], &[]);
+        assert_eq!(ask.decide("/bin/node"), Verdict::Ask);
+        assert_eq!(
+            ask.decide_with("/bin/node", &one("node"), &[]),
+            Verdict::Allow
+        );
     }
 }

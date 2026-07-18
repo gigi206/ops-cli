@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::proc_enforce::ProcOverlay;
+use crate::proc_policy::{self, ProcMode, Verdict};
+
 /// The default number of recent exec events a session retains for the live feed.
 pub(crate) const EXEC_RING_CAP: usize = 1000;
 
@@ -169,13 +172,16 @@ pub(crate) fn serve_enforced(
     listener: UnixListener,
     ring: Arc<ExecRing>,
     pending: Arc<super::proc_enforce::PendingExec>,
+    overlay: Arc<ProcOverlay>,
+    mode: ProcMode,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         let ring = ring.clone();
         let pending = pending.clone();
+        let overlay = overlay.clone();
         std::thread::spawn(move || {
-            let _ = handle_enforced(stream, &ring, &pending);
+            let _ = handle_enforced(stream, &ring, &pending, &overlay, mode);
         });
     }
     Ok(())
@@ -200,13 +206,15 @@ fn handle_enforced(
     stream: UnixStream,
     ring: &ExecRing,
     pending: &super::proc_enforce::PendingExec,
+    overlay: &ProcOverlay,
+    mode: ProcMode,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(LINE_MAX));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response = dispatch_enforced(line.trim(), ring, pending);
+    let response = dispatch_enforced(line.trim(), ring, pending, overlay, mode);
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
@@ -219,7 +227,39 @@ fn dispatch_enforced(
     cmd: &str,
     ring: &ExecRing,
     pending: &super::proc_enforce::PendingExec,
+    overlay: &ProcOverlay,
+    mode: ProcMode,
 ) -> String {
+    // `REMEMBER ALLOW|DENY <rule>` loads a live `--session` rule into the overlay; the rule is taken
+    // verbatim (not whitespace-split) so a glob with a space survives. `RULES` lists the overlay.
+    if let Some(body) = cmd.strip_prefix("REMEMBER ") {
+        let (verdict, rule) = if let Some(r) = body.strip_prefix("ALLOW ") {
+            (Verdict::Allow, r.trim())
+        } else if let Some(r) = body.strip_prefix("DENY ") {
+            (Verdict::Deny, r.trim())
+        } else {
+            return "err bad-request\n".to_string();
+        };
+        if proc_policy::validate_rule(rule).is_err() {
+            return "err bad-request\n".to_string();
+        }
+        // An `allow` only takes effect under `ask` (under `enforce` everything not denied already
+        // runs), so loading one into an enforce session would be inert — refuse it, consistent with
+        // the config-write guard, rather than store a rule that does nothing.
+        if verdict == Verdict::Allow && mode != ProcMode::Ask {
+            return "err inert\n".to_string();
+        }
+        overlay.remember(verdict, rule);
+        return "ok\n".to_string();
+    }
+    if cmd == "RULES" {
+        let mut out = String::new();
+        for (kind, rule) in overlay.snapshot() {
+            out.push_str(&format!("rule {kind} {rule}\n"));
+        }
+        out.push_str("ok\n");
+        return out;
+    }
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("LOG") => dispatch(cmd, ring),
@@ -399,6 +439,73 @@ pub(crate) fn answer_all_pending(socket: &Path, allow: bool) -> io::Result<Vec<S
         .collect())
 }
 
+/// The outcome of loading a `--session` rule into a running session's overlay.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InjectOutcome {
+    /// The rule was loaded into the session's live overlay.
+    Loaded,
+    /// The rule was refused as inert — an `allow` into a session not in `ask` mode (under `enforce`
+    /// everything not denied already runs, so the allow would do nothing).
+    Inert,
+    /// The server refused the rule (a malformed rule, or a server without this verb).
+    Refused,
+}
+
+/// Load a live `--session` rule into one session's overlay (`REMEMBER ALLOW|DENY <rule>`). A session
+/// whose socket is absent (not enforcing, or a dead/stale launch) fails the connect, which the caller
+/// distinguishes from a refusal.
+pub(crate) fn inject_proc_rule(
+    socket: &Path,
+    verdict: Verdict,
+    rule: &str,
+) -> io::Result<InjectOutcome> {
+    let verb = if verdict == Verdict::Deny {
+        "DENY"
+    } else {
+        "ALLOW"
+    };
+    let reply = query(socket, &format!("REMEMBER {verb} {rule}"))?;
+    let first = reply.lines().next().unwrap_or("");
+    Ok(if first == "ok" {
+        InjectOutcome::Loaded
+    } else if first == "err inert" {
+        InjectOutcome::Inert
+    } else {
+        InjectOutcome::Refused
+    })
+}
+
+/// One live `--session` overlay rule, as `sbx proc rules` lists it.
+pub(crate) struct OverlayRule {
+    /// The verdict list the rule is on (`"allow"` / `"deny"`).
+    pub(crate) verdict: &'static str,
+    pub(crate) rule: String,
+}
+
+/// List a session's live `--session` overlay rules (`RULES`). An absent socket (not enforcing / dead)
+/// fails the connect, distinguished from an empty overlay.
+pub(crate) fn read_overlay_rules(socket: &Path) -> io::Result<Vec<OverlayRule>> {
+    let reply = query(socket, "RULES")?;
+    let mut out = Vec::new();
+    for line in reply.lines() {
+        if line == "ok" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("rule allow ") {
+            out.push(OverlayRule {
+                verdict: "allow",
+                rule: rest.to_string(),
+            });
+        } else if let Some(rest) = line.strip_prefix("rule deny ") {
+            out.push(OverlayRule {
+                verdict: "deny",
+                rule: rest.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Send one command line to a session's control socket and return the full reply text.
 fn query(socket: &Path, cmd: &str) -> io::Result<String> {
     let stream = UnixStream::connect(socket)?;
@@ -558,5 +665,83 @@ mod tests {
 
         let tail = read_exec_log(&socket, Some(1)).unwrap();
         assert_eq!(tail.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn dispatch_enforced_remember_loads_the_overlay_and_rules_lists_it() {
+        let ring = ExecRing::new(4);
+        let pending = crate::sandbox::proc_enforce::PendingExec::new();
+        let overlay = ProcOverlay::new();
+        let policy = proc_policy::ProcPolicy::new(ProcMode::Ask, &[], &[]);
+
+        // REMEMBER DENY loads the deny list; the folded decision then denies the target.
+        assert_eq!(
+            dispatch_enforced(
+                "REMEMBER DENY curl",
+                &ring,
+                &pending,
+                &overlay,
+                ProcMode::Ask
+            ),
+            "ok\n"
+        );
+        assert_eq!(overlay.decide(&policy, "/bin/curl"), Verdict::Deny);
+
+        // REMEMBER ALLOW under ask un-parks a target that would otherwise park.
+        assert_eq!(
+            dispatch_enforced(
+                "REMEMBER ALLOW git",
+                &ring,
+                &pending,
+                &overlay,
+                ProcMode::Ask
+            ),
+            "ok\n"
+        );
+        assert_eq!(overlay.decide(&policy, "/usr/bin/git"), Verdict::Allow);
+
+        // RULES lists what was loaded, then `ok`.
+        let listing = dispatch_enforced("RULES", &ring, &pending, &overlay, ProcMode::Ask);
+        assert!(listing.contains("rule allow git"), "{listing}");
+        assert!(listing.contains("rule deny curl"), "{listing}");
+        assert!(listing.trim_end().ends_with("ok"));
+    }
+
+    #[test]
+    fn dispatch_enforced_refuses_an_inert_allow_and_a_malformed_remember() {
+        let ring = ExecRing::new(4);
+        let pending = crate::sandbox::proc_enforce::PendingExec::new();
+        let overlay = ProcOverlay::new();
+
+        // An allow into an enforce session is inert → refused, nothing loaded.
+        assert_eq!(
+            dispatch_enforced(
+                "REMEMBER ALLOW git",
+                &ring,
+                &pending,
+                &overlay,
+                ProcMode::Enforce
+            ),
+            "err inert\n"
+        );
+        assert!(overlay.snapshot().is_empty());
+
+        // A malformed REMEMBER (no verdict word) is a bad request.
+        assert_eq!(
+            dispatch_enforced("REMEMBER curl", &ring, &pending, &overlay, ProcMode::Ask),
+            "err bad-request\n"
+        );
+
+        // A deny is always live under enforce.
+        assert_eq!(
+            dispatch_enforced(
+                "REMEMBER DENY curl",
+                &ring,
+                &pending,
+                &overlay,
+                ProcMode::Enforce
+            ),
+            "ok\n"
+        );
     }
 }

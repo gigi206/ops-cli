@@ -615,3 +615,128 @@ fn proc_allow_with_no_posture_is_refused_and_writes_nothing() {
         "a refused allow must write no config"
     );
 }
+
+#[test]
+fn proc_deny_session_with_a_config_scope_flag_is_refused() {
+    // `--session` writes no file, so a file-scope flag does not apply — refuse rather than silently
+    // ignore it (mirrors `sbx net`). No launch needed.
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let out = sbx_config_write(
+        &["proc", "deny", "curl", "--session", "--local"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(
+        err.contains("--session"),
+        "should explain the flag clash: {err}"
+    );
+}
+
+#[test]
+fn proc_deny_session_with_no_live_session_is_reported() {
+    // With no enforcing session in scope, a `--session` load has nothing to reach — exit 1 with a
+    // pointer to launching one or writing config. Deterministic (empty data dir → empty registry).
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let out = sbx_config_write(
+        &["proc", "deny", "curl", "--session"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(
+        err.contains("no enforcing session in scope"),
+        "should report no session: {err}"
+    );
+}
+
+#[test]
+fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
+    // The `--session` headline: a rule injected through the real binary reaches a *running* enforcing
+    // cage's live overlay. A trusted `[proc] mode = "enforce"` detached cage stays alive; injecting a
+    // `--session deny` must load into that one session. The decide-reflects-the-overlay property is
+    // unit-tested; this proves the CLI → session enumeration → proc control socket → overlay chain
+    // end to end. Skipped, not failed, where the host cannot sandbox.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[proc]\nmode = \"enforce\"\n",
+    )
+    .unwrap();
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping proc --session e2e: host cannot sandbox");
+        return;
+    }
+    let trusted = sbx_isolated()
+        .args(["trust"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .output()
+        .expect("sbx trust");
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // A long-running detached enforce cage: it registers a session and binds its proc control socket.
+    let launched = sbx_isolated()
+        .args(["run", "--detach", "--", "sleep", "30"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("detached run");
+    assert!(
+        launched.status.success(),
+        "detach failed: {}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+
+    // Inject a `--session deny`; poll briefly for the session to be reachable (the socket binds before
+    // the detach returns, but allow for scheduling slack).
+    let mut loaded = false;
+    let mut last = String::new();
+    for _ in 0..10 {
+        let injected = sbx_isolated()
+            .args(["proc", "deny", "curl", "--session"])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", data.path())
+            .output()
+            .expect("inject");
+        last = format!(
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&injected.stdout),
+            String::from_utf8_lossy(&injected.stderr)
+        );
+        if injected.status.success()
+            && String::from_utf8_lossy(&injected.stdout).contains("loaded deny rule `curl` into 1")
+        {
+            loaded = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // Best-effort teardown before asserting, so a failure does not leave the cage running.
+    let _ = sbx_isolated()
+        .args(["session", "stop", "--all"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .output();
+
+    assert!(
+        loaded,
+        "the --session deny did not load into the live cage: {last}"
+    );
+}

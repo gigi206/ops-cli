@@ -5,8 +5,9 @@ sbx proc ls      [<id>] [--json]
 sbx proc live    [<id>] [-i|--interval <secs>] [--json]
 sbx proc logs    [<id>] [-f|--follow] [--json]
 sbx proc pending [allow|deny <id>]
-sbx proc allow   <rule> [-l|-g] [-a <app>]
-sbx proc deny    <rule> [-l|-g] [-a <app>]
+sbx proc allow   <rule> [-l|-g] [-a <app>] [--session [--all]]
+sbx proc deny    <rule> [-l|-g] [-a <app>] [--session [--all]]
+sbx proc rules   [-a <app>] [--all]
 ```
 
 Observe — and, under [`[proc]`](../configuration/proc.md) enforcement, **block** — what a running
@@ -161,8 +162,8 @@ constantly, `ask` is meant to run against a populated `allow` list — see
 ## `allow` / `deny`
 
 ```
-sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>]
-sbx proc deny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
+sbx proc deny  <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
 ```
 
 Persist an exec rule to a config file's [`[proc]`](../configuration/proc.md) `allow`/`deny` list —
@@ -175,7 +176,9 @@ the **full exec path** (`/usr/bin/*`, `/nix/store/*/bin/git`). `deny` always win
 | `<rule>` | an exec-target glob (basename, or a full path when it contains `/`) |
 | `-l`, `--local` | write the project `.sbx.toml` (the default) |
 | `-g`, `--global` | write the global `sbx.toml` |
-| `-a`, `--app <name>` | write the rule under that app's `[app.<name>.proc]` |
+| `-a`, `--app <name>` | write the rule under that app's `[app.<name>.proc]`; with `--session`, scope the live load to that app |
+| `--session` | load the rule into the running session(s) live, writing no config (see below) |
+| `--all` | with `--session`, widen the live load to every reachable session (all projects) |
 
 The posture guard matches `[proc]`'s denylist-by-default. On a fresh project a `deny` **bootstraps**
 `mode = "enforce"` (a denylist) so it takes effect at once; an `allow` requires `mode = "ask"` — under
@@ -191,6 +194,41 @@ sbx proc allow git                 # only valid once mode = "ask"
 Writing the project `.sbx.toml` **re-trusts** it (it must be absent or already trusted first), so the
 rule takes effect on the next launch; the global config and app profiles are trusted by location.
 Removing a rule is done by editing the config ([`sbx config edit`](config.md)).
+
+### `--session` — load a rule into a running session
+
+`--session` loads the rule into the **live overlay** of the running enforcing session(s) instead of a
+config file — the proactive sibling of [`pending`](#pending), and the analogue of
+[`sbx net allow`/`deny --session`](net.md). The supervisor folds the overlay into every decision
+(deny wins over any allow), so it takes effect **immediately** and dies with the session:
+
+```sh
+sbx proc deny curl --session         # cut `curl` in this project's live enforcing session(s) now
+sbx proc allow git --session -a claude-code   # un-park `git` in that app's ask session(s)
+```
+
+It writes **no config** (so, unlike a config write, it never re-trusts the project) and scopes to the
+current project by default; `-a <app>` / `--all` widen it, and the config-scope flags (`-l`/`-g`) do
+not apply. A `--session allow` only loads into an `ask` session (it is inert under `enforce`, and is
+reported as such). It governs **future** execs — it does not un-park (`allow`) or retroactively
+refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pending).
+
+## `rules`
+
+```
+sbx proc rules [-a|--app <name>] [--all]
+```
+
+List the live `--session` rule overlay of the running enforcing session(s) — the rules loaded with
+`sbx proc allow`/`deny --session`, which nothing else surfaces (the config-file `[proc]` rules are
+shown by [`sbx config show`](config.md)). Scopes to the current project by default; `-a <app>`/`--all`
+widen it.
+
+```sh
+sbx proc rules
+# live session rules
+#   479989  deny  curl
+```
 
 Honest limit: exec-blocking is a **guardrail, not a containment boundary** — it catches every
 `execve`, but an agent can still do harmful work *in-process* (in its own interpreter) without

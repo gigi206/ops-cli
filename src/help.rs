@@ -301,7 +301,8 @@ const PAGES: &[Page] = &[
             launch). `sbx proc logs` is the exec-event feed: the processes the agent has spawned, in\n\
             order, each with its enforcement verdict when the session is enforcing. `sbx proc pending`\n\
             lists — and decides — the execs an `ask`-mode session has parked. `sbx proc allow`/`deny`\n\
-            persist an exec rule to a config file's `[proc]` list (the sibling of `sbx net allow`/`deny`).\n\
+            persist an exec rule to a config file's `[proc]` list — or, with `--session`, load it into a\n\
+            running session live; `sbx proc rules` lists those live rules (the sibling of `sbx net`).\n\
             \n\
             Enforcement is configured by `[proc]` (a trusted-only security field): `enforce` blocks a\n\
             denied exec target before the syscall runs, `ask` parks an unmatched one for a decision.\n\
@@ -409,8 +410,9 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "allow"],
-        synopsis: "sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
-        summary: "persist an allow rule to a config file's [proc] list",
+        synopsis:
+            "sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        summary: "persist an allow rule to a config file's [proc] list (or load it live with --session)",
         options: &[
             (
                 "<rule>",
@@ -420,7 +422,15 @@ const PAGES: &[Page] = &[
             ("-g, --global", "write the global sbx.toml"),
             (
                 "-a, --app <name>",
-                "write the rule under that app's `[app.<name>.proc]`",
+                "write the rule under that app's `[app.<name>.proc]`; with `--session`, scope the live load to that app's session(s)",
+            ),
+            (
+                "--session",
+                "load the rule into the live overlay of the running enforcing session(s) instead of a config file (writes nothing, no re-trust); it takes effect immediately and dies with the session. An `allow` only loads into an `ask` session (inert under `enforce`). Scopes to the current project by default",
+            ),
+            (
+                "--all",
+                "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
             ),
         ],
         details:
@@ -429,12 +439,19 @@ const PAGES: &[Page] = &[
             already runs, so an allow there is inert and is refused. Set `mode = \"ask\"` first (or use\n\
             `deny`). Writing the project config re-trusts it (it must be absent or already trusted\n\
             first); the global config and app profiles are trusted by location. `deny` always wins\n\
-            over `allow`.",
+            over `allow`.\n\
+            \n\
+            `--session` instead loads the rule into the **live overlay** of the running enforcing\n\
+            session(s), which the supervisor folds into every decision — so a `--session allow`\n\
+            un-parks a target on an `ask` session immediately. It writes no file (no re-trust) and dies\n\
+            with the session; the config-scope flags do not apply. It does not un-park an `execve`\n\
+            already waiting (decide that with `sbx proc pending`); it governs future execs.",
     },
     Page {
         path: &["proc", "deny"],
-        synopsis: "sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
-        summary: "persist a deny rule to a config file's [proc] list",
+        synopsis:
+            "sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        summary: "persist a deny rule to a config file's [proc] list (or load it live with --session)",
         options: &[
             (
                 "<rule>",
@@ -444,7 +461,15 @@ const PAGES: &[Page] = &[
             ("-g, --global", "write the global sbx.toml"),
             (
                 "-a, --app <name>",
-                "write the rule under that app's `[app.<name>.proc]`",
+                "write the rule under that app's `[app.<name>.proc]`; with `--session`, scope the live load to that app's session(s)",
+            ),
+            (
+                "--session",
+                "load the rule into the live overlay of the running enforcing session(s) instead of a config file (writes nothing, no re-trust); it takes effect immediately and dies with the session. Scopes to the current project by default",
+            ),
+            (
+                "--all",
+                "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
             ),
         ],
         details:
@@ -453,7 +478,33 @@ const PAGES: &[Page] = &[
             with no `[proc]` yet, `deny` bootstraps `mode = \"enforce\"` (a denylist), so it takes\n\
             effect at once; an existing `off`/`observe` mode is refused (a rule would be inert). Writing\n\
             the project config re-trusts it (it must be absent or already trusted first); the global\n\
-            config and app profiles are trusted by location.",
+            config and app profiles are trusted by location.\n\
+            \n\
+            `--session` instead loads the rule into the **live overlay** of the running enforcing\n\
+            session(s) — so a `--session deny` cuts a target immediately (deny wins over any allow). It\n\
+            writes no file (no re-trust) and dies with the session; the config-scope flags do not\n\
+            apply. It does not retroactively deny an `execve` already parked (decide that with\n\
+            `sbx proc pending`); it governs future execs.",
+    },
+    Page {
+        path: &["proc", "rules"],
+        synopsis: "sbx proc rules [-a|--app <name>] [--all]",
+        summary: "list the live --session rule overlay of the running enforcing session(s)",
+        options: &[
+            (
+                "-a, --app <name>",
+                "list only the session(s) of that app",
+            ),
+            (
+                "--all",
+                "list every reachable session (all projects), not just the current one",
+            ),
+        ],
+        details:
+            "Lists the exec rules loaded live with `sbx proc allow`/`deny --session` across the running\n\
+            enforcing session(s). These are session-scoped and never written to config, so nothing else\n\
+            surfaces them — the config-file `[proc]` rules are shown by `sbx config show`. Scopes to the\n\
+            current project by default; `-a <app>`/`--all` widen it.",
     },
     Page {
         path: &["fs"],

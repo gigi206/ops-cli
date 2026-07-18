@@ -71,13 +71,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::binds::ExtraBind;
 use super::proc_control::ExecRing;
-use crate::proc_policy::{ProcPolicy, Verdict};
+use crate::proc_policy::{ProcMode, ProcPolicy, ProcRule, Verdict};
 
 /// The most `ask`-parked `execve`s a session holds at once. Beyond this, a further undecided `execve`
 /// is denied outright (fail-closed) rather than growing the registry without bound — mirroring the
@@ -328,6 +328,69 @@ fn exec_payload(payload: &[OsString]) -> ExitCode {
     })
 }
 
+// ── the live `--session` rule overlay ────────────────────────────────────────────────────────────
+
+/// Extra allow/deny rules loaded into a **running** enforcing session by `sbx proc allow|deny
+/// --session`, folded onto the resolved config policy at every decision (deny wins across both). It
+/// is shared (`Arc`) between the supervisor's decide path and the control server that writes it,
+/// starts empty, is never persisted, and dies with the session — the proc analogue of the egress
+/// `ManualRules` overlay.
+pub(crate) struct ProcOverlay {
+    inner: RwLock<OverlayInner>,
+}
+
+#[derive(Default)]
+struct OverlayInner {
+    allow: Vec<ProcRule>,
+    deny: Vec<ProcRule>,
+}
+
+impl ProcOverlay {
+    pub(crate) fn new() -> ProcOverlay {
+        ProcOverlay {
+            inner: RwLock::new(OverlayInner::default()),
+        }
+    }
+
+    /// Add a rule to the overlay (a `Deny` verdict to the deny list, else the allow list), deduped on
+    /// the exact raw string. Returns whether it was newly added.
+    pub(crate) fn remember(&self, verdict: Verdict, rule: &str) -> bool {
+        let mut g = self.inner.write().expect("overlay lock");
+        let list = if verdict == Verdict::Deny {
+            &mut g.deny
+        } else {
+            &mut g.allow
+        };
+        if list.iter().any(|r| r.as_str() == rule) {
+            return false;
+        }
+        list.push(ProcRule::new(rule));
+        true
+    }
+
+    /// Decide an exec target with the current overlay folded onto `base` (a short read-lock held for
+    /// the decision). Fast-pathed when the overlay is empty — the common case — to `base.decide`,
+    /// mirroring the egress proxy's borrow-when-empty effective policy.
+    pub(crate) fn decide(&self, base: &ProcPolicy, exec_path: &str) -> Verdict {
+        let g = self.inner.read().expect("overlay lock");
+        if g.allow.is_empty() && g.deny.is_empty() {
+            base.decide(exec_path)
+        } else {
+            base.decide_with(exec_path, &g.allow, &g.deny)
+        }
+    }
+
+    /// Snapshot the overlay as `(verdict-label, raw rule)` pairs (allow first, then deny), for
+    /// `sbx proc rules`.
+    pub(crate) fn snapshot(&self) -> Vec<(&'static str, String)> {
+        let g = self.inner.read().expect("overlay lock");
+        let mut out = Vec::with_capacity(g.allow.len() + g.deny.len());
+        out.extend(g.allow.iter().map(|r| ("allow", r.as_str().to_string())));
+        out.extend(g.deny.iter().map(|r| ("deny", r.as_str().to_string())));
+        out
+    }
+}
+
 // ── the host supervisor ───────────────────────────────────────────────────────────────────────────
 
 /// The cage binds a launch injects for exec enforcement: the shim binary (read-only) and the
@@ -383,18 +446,24 @@ pub(crate) fn start(
 
     let ring = Arc::new(ExecRing::new(super::proc_control::EXEC_RING_CAP));
     let pending = Arc::new(PendingExec::new());
+    // The live `--session` rule overlay, shared between the control server (which writes it) and the
+    // supervisor (which folds it into every decision). The mode is captured here (Copy) because the
+    // policy itself moves into the supervisor thread below.
+    let overlay = Arc::new(ProcOverlay::new());
+    let mode = policy.mode;
 
-    // The proc control socket: `sbx proc logs` reads the ring, and (under ask) `sbx proc allow`/`deny`
-    // answer a parked `execve`. Best-effort — a failure here still leaves enforcement running, only the
-    // out-of-band viewer/decider is unavailable.
+    // The proc control socket: `sbx proc logs` reads the ring, `sbx proc allow`/`deny` (under ask)
+    // answer a parked `execve` or (with `--session`) load a live rule into the overlay. Best-effort — a
+    // failure here still leaves enforcement running, only the out-of-band viewer/decider is unavailable.
     let control_socket = super::proc_control::proc_control_socket(data_dir, std::process::id());
     let _ = std::fs::remove_file(&control_socket);
     let control_socket = match UnixListener::bind(&control_socket) {
         Ok(l) => {
             let ring = ring.clone();
             let pending = pending.clone();
+            let overlay = overlay.clone();
             std::thread::spawn(move || {
-                let _ = super::proc_control::serve_enforced(l, ring, pending);
+                let _ = super::proc_control::serve_enforced(l, ring, pending, overlay, mode);
             });
             Some(control_socket)
         }
@@ -416,7 +485,7 @@ pub(crate) fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let handle = std::thread::spawn(move || {
-        supervise(listener, &flag, &policy, &ring, &pending);
+        supervise(listener, &flag, &policy, &overlay, &ring, &pending);
     });
 
     let binds = vec![
@@ -462,6 +531,7 @@ fn supervise(
     listener: UnixListener,
     stop: &AtomicBool,
     policy: &ProcPolicy,
+    overlay: &ProcOverlay,
     ring: &ExecRing,
     pending: &PendingExec,
 ) {
@@ -470,7 +540,7 @@ fn supervise(
         None => return, // stopped before the shim connected, or the handoff failed
     };
     drop(listener); // one handoff only; the agent cannot connect a second fd
-    recv_loop(notif_fd, stop, policy, ring, pending);
+    recv_loop(notif_fd, stop, policy, overlay, ring, pending);
     // SAFETY: notif_fd is our owned descriptor from recv_fd; closed exactly once here.
     unsafe { libc::close(notif_fd) };
 }
@@ -500,6 +570,7 @@ fn recv_loop(
     notif_fd: libc::c_int,
     stop: &AtomicBool,
     policy: &ProcPolicy,
+    overlay: &ProcOverlay,
     ring: &ExecRing,
     pending: &PendingExec,
 ) {
@@ -520,7 +591,7 @@ fn recv_loop(
             }
             return; // ENOENT / hang-up: the cage's filter is gone
         }
-        handle_notif(notif_fd, &req, policy, ring, pending);
+        handle_notif(notif_fd, &req, policy, overlay, ring, pending);
     }
 }
 
@@ -531,6 +602,7 @@ fn handle_notif(
     notif_fd: libc::c_int,
     req: &libc::seccomp_notif,
     policy: &ProcPolicy,
+    overlay: &ProcOverlay,
     ring: &ExecRing,
     pending: &PendingExec,
 ) {
@@ -544,11 +616,13 @@ fn handle_notif(
         // Could not read the path: fall back to the mode's unmatched default (allow under a denylist,
         // park under ask) rather than guessing a name match.
         match policy.mode {
-            crate::proc_policy::ProcMode::Ask => Verdict::Ask,
+            ProcMode::Ask => Verdict::Ask,
             _ => Verdict::Allow,
         }
     } else {
-        policy.decide(&path)
+        // Decide against the config policy folded with the live `--session` overlay (deny wins across
+        // both). The overlay read-lock is held only for this decision.
+        overlay.decide(policy, &path)
     };
     let shown = if path.is_empty() {
         "<unreadable>"
@@ -886,6 +960,7 @@ mod tests {
 
         // Deny /bin/true, allow everything else (denylist default-allow).
         let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
+        let overlay = ProcOverlay::new();
         let ring = Arc::new(ExecRing::new(16));
         let pending = Arc::new(PendingExec::new());
         for _ in 0..2 {
@@ -895,7 +970,7 @@ mod tests {
             if rc < 0 {
                 break;
             }
-            handle_notif(notif, &req, &policy, &ring, &pending);
+            handle_notif(notif, &req, &policy, &overlay, &ring, &pending);
         }
 
         // Read the child's two report bytes.
@@ -933,6 +1008,94 @@ mod tests {
                 .any(|e| e.command.contains("/bin/echo") && e.verdict == "allow"),
             "ring must show the allowed exec: {:?}",
             snap.events
+        );
+    }
+
+    /// A live `--session` overlay deny reaches the real syscall handler: the same host-side fork
+    /// harness, but the config policy denies **nothing** and the deny for `/bin/true` lives only in the
+    /// [`ProcOverlay`]. The child's `execve("/bin/true")` must still return `EPERM`, sourced from the
+    /// overlay — the deterministic proof of the link the cage `--session` e2e (skipped where the host
+    /// cannot sandbox) would otherwise be the only cover for.
+    #[test]
+    fn a_session_overlay_deny_returns_eperm_at_the_syscall() {
+        use std::os::unix::io::FromRawFd;
+
+        let mut sv = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        let mut pv = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(pv.as_mut_ptr()) }, 0);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // ── child (async-signal-safe only) ──
+            unsafe {
+                libc::close(sv[0]);
+                libc::close(pv[0]);
+                let notif = match install_notif_filter() {
+                    Ok(fd) => fd,
+                    Err(_) => libc::_exit(90),
+                };
+                let sock = UnixStream::from_raw_fd(sv[1]);
+                if send_fd(&sock, notif).is_err() {
+                    libc::_exit(91);
+                }
+                libc::close(notif);
+                let targv = [c"/bin/true".as_ptr(), std::ptr::null()];
+                libc::execv(c"/bin/true".as_ptr(), targv.as_ptr());
+                let err = *libc::__errno_location();
+                let byte = [if err == libc::EPERM { b'D' } else { b'X' }];
+                libc::write(pv[1], byte.as_ptr() as *const libc::c_void, 1);
+                libc::_exit(0);
+            }
+        }
+
+        // ── parent (the supervisor) ──
+        unsafe {
+            libc::close(sv[1]);
+            libc::close(pv[1]);
+        }
+        let sock = unsafe { UnixStream::from_raw_fd(sv[0]) };
+        let notif = recv_fd(&sock).expect("parent: recv notif fd");
+
+        // The config denies nothing; the deny lives only in the live `--session` overlay.
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+        let overlay = ProcOverlay::new();
+        assert!(overlay.remember(Verdict::Deny, "/bin/true"));
+        let ring = Arc::new(ExecRing::new(16));
+        let pending = Arc::new(PendingExec::new());
+        if poll_readable(notif, 3000) {
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::ioctl(notif, notif_recv_code(), &mut req) };
+            if rc >= 0 {
+                handle_notif(notif, &req, &policy, &overlay, &ring, &pending);
+            }
+        }
+
+        let mut buf = [0u8; 4];
+        let n = unsafe { libc::read(pv[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        unsafe {
+            libc::close(pv[0]);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(notif);
+        }
+        drop(sock);
+        let report = &buf[..n.max(0) as usize];
+        assert_eq!(
+            report.first().copied(),
+            Some(b'D'),
+            "an overlay-sourced deny must return EPERM at the syscall; got {report:?}"
+        );
+        assert!(
+            ring.snapshot(None)
+                .events
+                .iter()
+                .any(|e| e.command.contains("/bin/true") && e.verdict == "deny"),
+            "the ring must show the overlay-denied exec"
         );
     }
 }
