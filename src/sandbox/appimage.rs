@@ -230,7 +230,9 @@ pub(crate) fn resolve_source(
             url
         }
     };
-    let hash = prebuilt::prefetch_hash(nix, layout, &url)?;
+    // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
+    // into the error; a first launch streams the download progress live.
+    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
     Ok((url, hash))
 }
 

@@ -134,19 +134,45 @@ pub(crate) fn prefetch_name(url: &str) -> String {
 /// adds the file to sbx's store. An explicit `--name` is passed so a URL whose last segment
 /// percent-decodes to an illegal store name (e.g. an encoded space) still resolves — see
 /// [`prefetch_name`]. Pure fetch — no code runs.
-pub(crate) fn prefetch_hash(nix: &Path, layout: &Layout, url: &str) -> io::Result<String> {
+///
+/// `quiet` governs nix's own download output. A first launch (`quiet = false`) downloads the
+/// asset — often a large `.deb` — so nix's progress is streamed live (`stderr` inherited) as
+/// feedback. An `sbx upgrade` re-resolve (`quiet = true`) instead **captures** stderr and folds
+/// the real failure cause into the returned error, so the summary reads `re-resolve failed —
+/// <cause>` in place, rather than nix's multi-line retry warnings spilling out of order above the
+/// section header.
+pub(crate) fn prefetch_hash(
+    nix: &Path,
+    layout: &Layout,
+    url: &str,
+    quiet: bool,
+) -> io::Result<String> {
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .args(["store", "prefetch-file", "--json"])
         .args(["--name", &prefetch_name(url)])
         .arg(url)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if quiet {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     let out = cmd.spawn()?.wait_with_output()?;
     if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nix store prefetch-file {url} failed"
-        )));
+        // On the quiet path (an `sbx upgrade` re-resolve) stderr was captured and the summary
+        // already frames the line with `re-resolve failed — `, so the returned error is the folded
+        // cause alone. On the live path stderr has streamed to the terminal, so the bare step name
+        // is the right context for the launch failure that bubbles up.
+        if quiet {
+            let cause = fold_prefetch_cause(&String::from_utf8_lossy(&out.stderr));
+            return Err(io::Error::other(if cause.is_empty() {
+                "nix store prefetch-file failed".to_string()
+            } else {
+                cause
+            }));
+        }
+        return Err(io::Error::other("nix store prefetch-file failed"));
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| io::Error::other(format!("prefetch-file returned invalid JSON: {e}")))?;
@@ -160,6 +186,22 @@ pub(crate) fn prefetch_hash(nix: &Path, layout: &Layout, url: &str) -> io::Resul
         )));
     }
     Ok(hash.to_string())
+}
+
+/// Reduce nix's captured prefetch stderr to a single actionable cause for the summary line. nix
+/// emits one `error:` line at the end of a failed download (after any retry `warning:` lines), so
+/// the last `error:` line — with its prefix stripped — is the real reason (`unable to download
+/// '…': Could not resolve host: github.com`). Falls back to the whole trimmed stderr when there is
+/// no `error:` line, and to the empty string when there is nothing at all. Pure, so it is unit-tested
+/// against real nix output without invoking nix.
+fn fold_prefetch_cause(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .find_map(|l| l.strip_prefix("error:").map(|r| r.trim().to_string()))
+        .unwrap_or_else(|| stderr.trim().to_string())
 }
 
 /// The architecture name tokens for `system`: `(accepted, rejected)`. A release asset whose lowercased
@@ -222,6 +264,32 @@ mod tests {
         );
         // A degenerate URL with no last segment falls back to a fixed safe name.
         assert_eq!(prefetch_name("https://example.com/"), "source");
+    }
+
+    #[test]
+    fn fold_prefetch_cause_keeps_the_final_error_line_over_the_retry_warnings() {
+        // The shape nix emits for a failed download: several retry `warning:` lines, then one
+        // `error:` line carrying the real cause. Only the last is folded into the summary.
+        let stderr = "\
+warning: unable to download 'https://example.com/app.deb': Could not resolve hostname (6) Could not resolve host: example.com; retrying in 349 ms (attempt 1/5)
+warning: unable to download 'https://example.com/app.deb': Could not resolve hostname (6) Could not resolve host: example.com; retrying in 561 ms (attempt 2/5)
+error: unable to download 'https://example.com/app.deb': Could not resolve hostname (6) Could not resolve host: example.com
+";
+        assert_eq!(
+            fold_prefetch_cause(stderr),
+            "unable to download 'https://example.com/app.deb': Could not resolve hostname (6) Could not resolve host: example.com"
+        );
+    }
+
+    #[test]
+    fn fold_prefetch_cause_falls_back_when_there_is_no_error_line() {
+        // No `error:` line: keep the whole trimmed stderr rather than dropping the cause.
+        assert_eq!(
+            fold_prefetch_cause("  something went wrong  "),
+            "something went wrong"
+        );
+        // Nothing captured at all → empty, so the caller omits the `: <cause>` suffix.
+        assert_eq!(fold_prefetch_cause("   \n  \n"), "");
     }
 
     #[test]

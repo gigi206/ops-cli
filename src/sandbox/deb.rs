@@ -231,7 +231,9 @@ pub(crate) fn resolve_source(
         }
         DebSource::Apt { packages_url } => resolve_apt_deb_url(nix, layout, &packages_url, fresh)?,
     };
-    let hash = prebuilt::prefetch_hash(nix, layout, &url)?;
+    // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
+    // into the error; a first launch streams the download progress live.
+    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
     Ok((url, hash))
 }
 

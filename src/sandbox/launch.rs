@@ -868,7 +868,7 @@ pub(crate) fn upgrade_mise_packages(
     cfg: &crate::config::Resolved,
     pal: &crate::style::Palette,
 ) -> bool {
-    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let (h, n, warn, dim, r, ok_c) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset, pal.ok);
     println!("{h}sbx upgrade — mise packages{r}");
     let groups = mise_package_groups(cfg);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
@@ -933,11 +933,27 @@ pub(crate) fn upgrade_mise_packages(
         };
         // Fork-and-wait (never exec-replace) so the next group can run; the guard, if any, is
         // held across the wait so the proxy/forwarder serves the fetch, then dropped as the group
-        // ends (unlinks the sockets and CA).
-        let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
+        // ends (unlinks the sockets and CA). The cage's output is captured (not streamed): on a
+        // clean roll only mise's own version-transition summary is shown; the install/progress
+        // noise is surfaced only when the roll fails, so its cause is visible.
+        let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
         drop(guard);
-        if code != 0 {
+        if code == 0 {
+            let transitions = mise_transitions(&out);
+            if !transitions.is_empty() {
+                for t in transitions {
+                    println!("    {ok_c}{t}{r}");
+                }
+            } else if mise_up_to_date(&out) {
+                println!("    {dim}already up to date.{r}");
+            } else {
+                println!("    {ok_c}upgraded.{r}");
+            }
+        } else {
             crate::diag::warn(&format!("`{label}`: mise upgrade exited {code}"));
+            for line in out.lines() {
+                eprintln!("    {line}");
+            }
             ok = false;
         }
     }
@@ -4183,6 +4199,47 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
     }
 }
 
+/// Fork-and-wait like [`run_status`], but **capture** the cage's stdout and stderr instead of
+/// inheriting the terminal, returning `(exit code, combined output)`. Reserved for `sbx upgrade`,
+/// where a clean per-app summary is shown on success and the captured output is surfaced only on
+/// failure — never on the interactive/detached launch paths, which need live inherited stdio. The
+/// two streams are concatenated (stdout then stderr) because mise splits its output across both: a
+/// roll's `X → Y` summary goes to stdout, its `up to date` line to stderr.
+fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> (i32, String) {
+    let (argv, _seccomp) = match seccomp_argv(spec) {
+        Ok(v) => v,
+        Err(e) => return (1, format!("failed to prepare the seccomp filter: {e}")),
+    };
+    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, &spec.cage_slug);
+    match Command::new(prog).args(args).output() {
+        Ok(out) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            (status_code(out.status), combined)
+        }
+        Err(e) => (1, format!("failed to launch the sandbox: {e}")),
+    }
+}
+
+/// The version-transition lines mise prints for a successful roll — `<token> <from> → <to>`, one per
+/// upgraded tool — extracted from captured (non-TTY) output. The ` → ` (U+2192, space-padded) marker
+/// is unique to these lines; mise's install/download progress and the `mise use -g` equip preamble
+/// carry no arrow. Empty when nothing rolled (see [`mise_up_to_date`]). Pure — unit-tested against
+/// real mise output.
+fn mise_transitions(captured: &str) -> Vec<&str> {
+    captured
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains(" → "))
+        .collect()
+}
+
+/// Whether mise reported nothing to do. mise prints `All tools are up to date` (to stderr) when a
+/// roll finds every tool already current. Pure — unit-tested against real mise output.
+fn mise_up_to_date(captured: &str) -> bool {
+    captured.contains("up to date")
+}
+
 /// The bwrap argv with the mandatory seccomp filters prepended. Returns the
 /// backing memfds the caller must keep alive until bwrap has read them — they are
 /// not close-on-exec, and dropping a `File` early would close the descriptor
@@ -4787,6 +4844,46 @@ mod tests {
             err.to_string().contains("blocker"),
             "the failure names the unestablishable path: {err}"
         );
+    }
+
+    #[test]
+    fn mise_transitions_extracts_the_version_rolls_from_captured_output() {
+        // The exact shape a captured (non-TTY) `mise upgrade` produces: the `X → Y` summary goes to
+        // stdout under an "Upgraded N tool:" header, the install/uninstall progress to stderr — this
+        // fixture concatenates both, as `run_captured` does. Only the transition line is surfaced.
+        let captured = "\
+\nUpgraded 1 tool:\n  shfmt 3.7.0 → 3.13.1\n\
+mise shfmt@3.13.1    [1/2] install\n\
+mise shfmt@3.13.1  ✓ installed\n\
+mise uninstall shfmt@3.7.0 ✓ done\n";
+        assert_eq!(mise_transitions(captured), vec!["shfmt 3.7.0 → 3.13.1"]);
+
+        // A group that rolls several tokens surfaces one transition line each; the full-token form
+        // (as an `aqua:`/`pipx:` roll prints) is kept verbatim.
+        let multi = "\
+Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 2.20.0 → 2.21.0\n";
+        assert_eq!(
+            mise_transitions(multi),
+            vec![
+                "aqua:openai/codex 0.144.4 → 0.144.5",
+                "pipx:mistral-vibe 2.20.0 → 2.21.0"
+            ]
+        );
+
+        // No roll (the progress/equip preamble carries no ` → `) → nothing surfaced, so the caller
+        // falls through to the up-to-date / generic branch.
+        let none =
+            "mise ~/.config/mise/config.toml tools: npm:cline@3.0.40\nadded 3 packages in 617ms\n";
+        assert!(mise_transitions(none).is_empty());
+    }
+
+    #[test]
+    fn mise_up_to_date_detects_the_no_op_roll() {
+        // mise prints this to stderr when a roll finds every tool already current (the goose case).
+        assert!(mise_up_to_date("mise All tools are up to date\n"));
+        assert!(!mise_up_to_date(
+            "Upgraded 1 tool:\n  shfmt 3.7.0 → 3.13.1\n"
+        ));
     }
 
     #[test]

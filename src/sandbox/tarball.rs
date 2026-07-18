@@ -168,10 +168,12 @@ pub(crate) fn resolve_source(
     nix: &Path,
     layout: &Layout,
     locator: &str,
-    _fresh: bool,
+    fresh: bool,
 ) -> io::Result<(String, String)> {
     let url = locator.to_string();
-    let hash = prebuilt::prefetch_hash(nix, layout, &url)?;
+    // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
+    // into the error; a first launch streams the download progress live.
+    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
     Ok((url, hash))
 }
 
