@@ -834,8 +834,9 @@ pub(crate) fn tree_size(path: &Path) -> u64 {
 
 /// Prune — or, in a dry run, list — the stale gc roots of the **shared** store, returning the root
 /// directories dropped. The shared store keeps one closure per channel revision and per project, so
-/// it is rooted under `<data>/gcroots/`: `base/<rev>/` and `gui/<rev>/` (both keyed by the base
-/// channel revision), `mise/<rev>/` (the engine revision), and `projects/<id>/` (a project's
+/// it is rooted under `<data>/gcroots/`: `base/<rev>/`, `gui/<rev>/`, `gpu/<rev>/`, and
+/// `audio/<rev>/` (all four keyed by the base channel revision — a hole's userspace is provisioned
+/// against the same channel as the base), `mise/<rev>/` (the engine revision), and `projects/<id>/` (a project's
 /// declared `[packages]` and `nix:` tools). A rev directory not in its live set, and a project
 /// directory whose runtime tree under `projects_dir` is gone, are stale: dropping the root lets the
 /// following `nix-store --gc` collect the closure it held. Destructive only when `prune`. The live
@@ -849,9 +850,13 @@ pub(crate) fn prune_shared_gcroots(
     prune: bool,
 ) -> Vec<PathBuf> {
     let mut removed = Vec::new();
-    // base and the GUI font set are both keyed by the base channel revision.
-    prune_rev_dirs(&gcroots_dir.join("base"), live_base, prune, &mut removed);
-    prune_rev_dirs(&gcroots_dir.join("gui"), live_base, prune, &mut removed);
+    // base and the gui/gpu/audio hole userspaces are all keyed by the base channel revision: a
+    // hole's closure (fonts, mesa, the audio libraries) is built against the same channel as the
+    // base, so a base revision leaving the live set strands every hole built for it too. The family
+    // list is the one `project_keep_roots` uses, so the two cannot drift.
+    for family in ["base", "gui", "gpu", "audio"] {
+        prune_rev_dirs(&gcroots_dir.join(family), live_base, prune, &mut removed);
+    }
     prune_rev_dirs(&gcroots_dir.join("mise"), live_mise, prune, &mut removed);
 
     // Per-project roots: stale once the project's runtime tree is gone (the dead-tree reaper removes
@@ -1355,11 +1360,13 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
             std::os::unix::fs::symlink("/nix/store/x", dir.join("root")).unwrap();
         };
-        // base + gui are both keyed by the base channel rev: "live" current, "stale" rolled away
-        mk(&gcroots.join("base/live"));
-        mk(&gcroots.join("base/stale"));
-        mk(&gcroots.join("gui/live"));
-        mk(&gcroots.join("gui/stale"));
+        // base + the gui/gpu/audio hole userspaces are all keyed by the base channel rev: "live"
+        // current, "stale" rolled away. gpu/audio must be pruned exactly like base/gui — a rolled
+        // channel strands the mesa/libpulse closures built for the old revision.
+        for family in ["base", "gui", "gpu", "audio"] {
+            mk(&gcroots.join(family).join("live"));
+            mk(&gcroots.join(family).join("stale"));
+        }
         // mise keyed by the engine rev
         mk(&gcroots.join("mise/eng"));
         mk(&gcroots.join("mise/oldeng"));
@@ -1371,10 +1378,10 @@ mod tests {
         let live_base = BTreeSet::from(["live".to_string()]);
         let live_mise = BTreeSet::from(["eng".to_string()]);
 
-        // a dry run lists the stale set (base/stale, gui/stale, mise/oldeng, projects/p2) and
+        // a dry run lists the stale set (base/gui/gpu/audio stale, mise/oldeng, projects/p2) and
         // removes nothing
         let listed = prune_shared_gcroots(&gcroots, &projects, &live_base, &live_mise, false);
-        assert_eq!(listed.len(), 4, "stale set: {listed:?}");
+        assert_eq!(listed.len(), 6, "stale set: {listed:?}");
         assert!(
             gcroots.join("base/stale").is_dir(),
             "a dry run removed a root"
@@ -1382,9 +1389,14 @@ mod tests {
 
         // a prune removes exactly those, keeping every live revision and the live project
         let removed = prune_shared_gcroots(&gcroots, &projects, &live_base, &live_mise, true);
-        assert_eq!(removed.len(), 4);
-        assert!(!gcroots.join("base/stale").exists() && gcroots.join("base/live").is_dir());
-        assert!(!gcroots.join("gui/stale").exists() && gcroots.join("gui/live").is_dir());
+        assert_eq!(removed.len(), 6);
+        for family in ["base", "gui", "gpu", "audio"] {
+            assert!(
+                !gcroots.join(family).join("stale").exists()
+                    && gcroots.join(family).join("live").is_dir(),
+                "{family}: stale rev must be dropped and live kept"
+            );
+        }
         assert!(!gcroots.join("mise/oldeng").exists() && gcroots.join("mise/eng").is_dir());
         assert!(!gcroots.join("projects/p2").exists() && gcroots.join("projects/p1").is_dir());
     }
