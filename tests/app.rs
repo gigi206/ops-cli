@@ -279,6 +279,48 @@ fn show_detects_a_flake_built_into_the_home_even_when_floating() {
 }
 
 #[test]
+fn show_detects_an_inline_flake_built_into_the_home() {
+    let fx = Fixture::new();
+    // An inline `[flakes.<name>]` flake builds in-cage into a home out-link exactly like a `flake:`
+    // package (keyed `<name>-<hash>`), so its realized signal is that warm out-link — not the vague
+    // "per-project" the catch-all would otherwise report.
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\n[flakes.agent]\nattr = \"default\"\nflake = \"{ outputs = { self }: {}; }\"\n",
+    );
+    // The launch names an inline flake's out-link `<name>-<hash>`; `flake_built` matches it by the
+    // declared name's prefix, so a hash-suffixed link stands in for a real build.
+    fx.build_flake(
+        "demo-app",
+        "agent-0f1e2d3c",
+        "abcd1234abcd1234abcd1234abcd1234abcd1234-agent-2.0",
+    );
+
+    let out = fx.sbx(&["app", "show", "demo-app"]);
+    assert!(out.status.success(), "sbx app show failed: {}", text(&out));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("built agent-2.0"),
+        "an inline flake's warm out-link should read `built <pname-version>`, not per-project:\n{s}"
+    );
+
+    let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let flake = v["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["backend"] == "flake")
+        .expect("the inline flake package");
+    // `installed`, not `per-project` — the decisive check that FlakeInline is read via its out-link.
+    assert_eq!(flake["installed"]["state"], "installed");
+    assert!(flake["installed"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("agent-2.0"));
+}
+
+#[test]
 fn show_lists_installed_tools_no_declaration_accounts_for() {
     let fx = Fixture::new();
     fx.write_profile("demo-app", &demo_profile());

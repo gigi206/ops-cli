@@ -4355,10 +4355,15 @@ fn build_app_show(
                             }
                             None => PackageInstalled::NotInstalled,
                         }
-                    } else if matches!(pkg.backend, Backend::Flake(_)) {
-                        // A `flake:` build lands in the cage home (like mise), not the per-project
-                        // store — and a *floating* flake has no lock at all, so its realized signal
-                        // is the warm out-link in the app's home(s), not a lock scan.
+                    } else if matches!(
+                        pkg.backend,
+                        Backend::Flake(_) | Backend::FlakeInline { .. }
+                    ) {
+                        // A `flake:` build — and an inline `[flakes.<name>]` — lands in the cage home
+                        // (like mise): a warm out-link there whose target store path is in the
+                        // per-project store. A floating flake has no lock at all, so that out-link,
+                        // not a lock scan, is its realized signal (an inline flake keys it
+                        // `<name>-<hash>`, matched by the same name).
                         match homes
                             .iter()
                             .find_map(|h| sandbox::inspect::flake_built(&h.dir, &pkg.name))
@@ -4390,8 +4395,8 @@ fn build_app_show(
                             },
                         }
                     } else {
-                        // An inline flake (and any other per-project build not yet lock-scanned) lands
-                        // in the per-project store; `sbx projects show` details it per tree.
+                        // A backend with no specific realized-signal reader falls back here; its build
+                        // is in the per-project store, which `sbx projects show` details per tree.
                         PackageInstalled::PerProject
                     };
                     PackageShow {
