@@ -1287,9 +1287,12 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
     // reachable — `network = "none"`, empty netns) the notifications name must have an OWNER (the
     // relay; without it the name is unowned, as the in-cage portal serves only the portal), and
     // `GetServerInformation` on it must return the HOST daemon's info (a forward can only succeed if
-    // the relay bridged the private bus to the host). A short retry absorbs the startup race (the
-    // relay attaches within milliseconds of the in-cage dbus-daemon creating the socket). `gdbus`
-    // comes from the project's own `nix:glib.bin`. Skips (never fails) when the host cannot sandbox,
+    // the relay bridged the private bus to the host). A retry absorbs the startup race — the relay
+    // attaches within milliseconds when the host is idle, but the window is generous (~20s) so a
+    // host-side relay that is merely slow to be scheduled under heavy parallel load is not mistaken
+    // for one that never attached. `gdbus` comes from the project's own `nix:glib.bin`. It exits the
+    // loop the instant the name has an owner, so a healthy run is unaffected. Skips (never fails) when
+    // the host cannot sandbox,
     // has no compositor, no session bus, or the cache is unreachable.
     let project = TmpDir::new("relay-proj");
     let data = TmpDir::new("relay-data");
@@ -1337,7 +1340,7 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
 
     // Retry GetNameOwner until the relay has claimed the name (the startup race), then read the
     // forwarded server information. `--session` is the private bus (the portal env points it there).
-    let script = "for _ in $(seq 1 60); do \
+    let script = "for _ in $(seq 1 200); do \
            owner=$(gdbus call --session --dest org.freedesktop.DBus \
              --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.GetNameOwner \
              org.freedesktop.Notifications 2>&1); \
@@ -3594,9 +3597,23 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
         out.status.success(),
         "sbx upgrade mise must roll the baseline `mise:` package in-cage: {log}"
     );
+    let report = String::from_utf8_lossy(&out.stdout);
+    // The clean report names the baseline group in its own aligned status line (the `project`
+    // column), without leaking mise's raw install/progress chatter — that is captured and surfaced
+    // only on failure.
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("mise upgrade aqua:BurntSushi/ripgrep"),
-        "the report must name the project's mise: package group: {log}"
+        report.contains("project"),
+        "the report must name the baseline (project) mise: package group: {log}"
+    );
+    assert!(
+        !report.contains("mise ~/.config/mise"),
+        "mise's raw per-tool output must not leak into the clean roll report: {log}"
+    );
+    // The batch upgrade path silences the per-app "equipping … via mise use -g" line, which
+    // otherwise repeats for every group and buries the result.
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("equipping app packages"),
+        "sbx upgrade must not print the per-app equipping line: {log}"
     );
 
     // Teeth: the upgrade cage equipped ripgrep into the project's own home (the `rg` shim mise
