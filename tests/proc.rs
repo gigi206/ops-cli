@@ -425,6 +425,81 @@ fn run_observe_streams_exec_events() {
 }
 
 #[test]
+fn enforce_blocks_a_denied_binary_in_a_real_cage() {
+    // The headline of the enforcement increment: `[proc] mode = "enforce"` blocks a denied exec
+    // target *before the syscall runs*, in a real cage, via the seccomp user-notification shim +
+    // supervisor. A trusted project denies `id`; the allowed `echo` runs, but `id` is refused with
+    // EPERM and never produces its output. `[proc]` is security-gated, so the project must be trusted
+    // (an untrusted config drops it — proven separately). Skipped, not failed, where the host cannot
+    // sandbox; once it can, a denied `id` that still runs is a real enforcement failure.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
+    )
+    .unwrap();
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping proc enforce e2e: host cannot sandbox");
+        return;
+    }
+
+    // Trust the project so the security-gated `[proc]` applies; isolate the trust state alongside the
+    // data dir so the run below reads the same marker.
+    let trusted = sbx_isolated()
+        .args(["trust"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .output()
+        .expect("sbx trust");
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Allowed: `echo` is not denied, so it runs and prints.
+    let allowed = sbx_isolated()
+        .args(["run", "--", "echo", "ENFORCE-OK"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run echo");
+    assert!(
+        String::from_utf8_lossy(&allowed.stdout).contains("ENFORCE-OK"),
+        "an allowed command must run under enforce; stderr:\n{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    // Denied: `id` traps to the supervisor, is refused with EPERM (the syscall never runs), so the
+    // command fails and its real output (`uid=…`) never appears.
+    let denied = sbx_isolated()
+        .args(["run", "--", "id"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run id");
+    let out = String::from_utf8_lossy(&denied.stdout);
+    let err = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        !denied.status.success(),
+        "the denied `id` must fail (blocked): stdout={out:?} stderr={err:?}"
+    );
+    assert!(
+        !out.contains("uid="),
+        "the denied `id` must never run — its output leaked: {out:?}"
+    );
+    assert!(
+        err.contains("Operation not permitted") || err.contains("cannot execute id"),
+        "the block should surface a reason: {err:?}"
+    );
+}
+
+#[test]
 fn app_run_observe_streams_exec_events() {
     // The feed reaches the primary target — agents launched via `sbx app run`. `--observe` threads
     // through the app path the same way, forcing supervision and streaming `[sbx:exec]`. Teeth: the

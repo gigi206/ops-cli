@@ -1,19 +1,21 @@
 # `sbx proc`
 
 ```
-sbx proc ls   [<id>] [--json]
-sbx proc live [<id>] [-i|--interval <secs>] [--json]
-sbx proc logs [<id>] [-f|--follow] [--json]
+sbx proc ls      [<id>] [--json]
+sbx proc live    [<id>] [-i|--interval <secs>] [--json]
+sbx proc logs    [<id>] [-f|--follow] [--json]
+sbx proc pending [allow|deny <id>]
 ```
 
-Observe what a running sandbox is doing **inside its cage** — the observability sibling of
-[`sbx net`](net.md). `sbx proc ls` snapshots a session's **process tree** (the programs the
-agent has spawned) and `sbx proc live` watches it redraw in real time — both always available,
-reading `/proc` with no privilege and no cooperation from the cage, launching nothing.
-`sbx proc logs` is the **exec-event feed**: the processes the agent spawns, in order, for a
-session started with observation on ([`sbx run --observe`](run.md#observing-a-run-observe)).
+Observe — and, under [`[proc]`](../configuration/proc.md) enforcement, **block** — what a running
+sandbox is doing **inside its cage**, the process/exec sibling of [`sbx net`](net.md). `sbx proc ls`
+snapshots a session's **process tree** (the programs the agent has spawned) and `sbx proc live`
+watches it redraw in real time — both always available, reading `/proc` with no privilege and no
+cooperation from the cage, launching nothing. `sbx proc logs` is the **exec-event feed**: the
+processes the agent spawns, in order, each with its enforcement verdict when the session is
+enforcing. `sbx proc pending` lists — and decides — the `execve`s an `ask`-mode session has parked.
 
-See also: [`sbx net`](net.md) · [`sbx session`](session.md).
+See also: [`sbx fs`](fs.md) (the file-write sibling) · [`sbx net`](net.md) · [`sbx session`](session.md).
 
 ## `ls`
 
@@ -111,6 +113,48 @@ feed. The events are held in the supervisor's memory for the session's lifetime,
 per-session control socket that is never exposed inside the cage; nothing is written to disk or
 kept after the session exits.
 
-Honest limit: the feed is populated by a short-interval `/proc` poll, so a process that starts and
-exits within one tick can be missed. Precise per-spawn capture — and the ability to **block** a
-spawn — is a later increment (seccomp user-notification); this is the cheap, unprivileged first cut.
+Under a non-enforcing `--observe` run the feed is populated by a short-interval `/proc` poll, so a
+process that starts and exits within one tick can be missed — and each line's verdict reads
+`observe` (it records what ran, not a decision). Under [`[proc] mode = enforce`/`ask`](../configuration/proc.md)
+the feed comes from the seccomp user-notification supervisor instead: **every** `execve` is captured
+exactly, and each carries its real verdict — `allow`, `deny`, or `ask`.
+
+```
+#   14:02:11  deny     12346  /nix/store/…/bin/curl
+#   14:02:13  allow    12400  /nix/store/…/bin/rg
+```
+
+## `pending`
+
+```
+sbx proc pending [allow|deny <id>]
+```
+
+Under [`[proc] mode = "ask"`](../configuration/proc.md), an `execve` that matches neither the
+`allow` nor the `deny` list is **parked** — the process is blocked in the syscall — awaiting your
+decision. `sbx proc pending` lists every parked `execve` across the live sessions; `sbx proc pending
+allow <id>` lets it run (the syscall continues), `deny <id>` refuses it (the syscall returns
+`EPERM`, never running).
+
+| Operand | Meaning |
+|---|---|
+| *(none)* | list every parked `execve` — `<session-pid>.<notif-id>`, the cage pid, how long parked, and the exec path |
+| `allow <id>` / `deny <id>` | decide one parked `execve` by its `<session-pid>.<notif-id>` id |
+| `allow <pid>.*` / `deny <pid>.*` | decide **every** parked `execve` in session `<pid>` at once |
+
+```sh
+sbx proc pending
+# parked exec — awaiting a decision
+#   12345.4211  pid 12400 · 3s  /nix/store/…/bin/ssh
+sbx proc pending deny 12345.4211      # refuse it (EPERM)
+```
+
+A parked `execve` that is not decided within the ask timeout is auto-denied (fail-closed), so a
+process tree never hangs indefinitely on a stalled decision. Because a coding agent spawns
+constantly, `ask` is meant to run against a populated `allow` list — see
+[`[proc]`](../configuration/proc.md).
+
+Honest limit: exec-blocking is a **guardrail, not a containment boundary** — it catches every
+`execve`, but an agent can still do harmful work *in-process* (in its own interpreter) without
+spawning. It adds visibility and a veto, on top of the cage's real boundaries (confinement by
+absence, the read-only store, the network allowlist).

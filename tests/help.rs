@@ -18,8 +18,8 @@ fn sbx(args: &[&str]) -> Output {
 
 /// Every top-level command `main` dispatches.
 const TOP_LEVEL: &[&str] = &[
-    "doctor", "run", "mise", "app", "search", "test", "net", "proc", "plugins", "session", "trust",
-    "untrust", "config", "upgrade", "gc", "projects",
+    "doctor", "run", "mise", "app", "search", "test", "net", "proc", "fs", "plugins", "session",
+    "trust", "untrust", "config", "upgrade", "gc", "projects",
 ];
 
 /// Every command path the dispatchers accept (top-level commands and their subcommands). Keep
@@ -68,6 +68,9 @@ const PATHS: &[&[&str]] = &[
     &["proc", "ls"],
     &["proc", "live"],
     &["proc", "logs"],
+    &["proc", "pending"],
+    &["fs"],
+    &["fs", "logs"],
     &["plugins", "list"],
     &["plugins", "info"],
     &["plugins", "install"],

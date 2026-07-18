@@ -102,13 +102,43 @@ pub(crate) fn is_sri(s: &str) -> bool {
     })
 }
 
+/// A nix store-path name derived from a URL's last path segment, sanitized to the store's legal
+/// name set (`[A-Za-z0-9+._?=-]`, every other byte → `-`). `nix store prefetch-file` otherwise
+/// derives the store name from the URL and **percent-decodes** it — so a vendor filename carrying an
+/// encoded space (`My%20App.tar.gz` → `My App.tar.gz`) yields an illegal store name (a space) and the
+/// prefetch fails. The name is cosmetic (only labels the fetched store
+/// entry; the returned hash is content-addressed and the generated derivation re-fetches by hash), so
+/// a lossy sanitization is safe; an empty segment falls back to `source`.
+pub(crate) fn prefetch_name(url: &str) -> String {
+    let base = url.rsplit('/').next().unwrap_or("").trim();
+    let name: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '_' | '?' | '=' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = name.trim_matches('-');
+    if trimmed.is_empty() {
+        "source".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Resolve a concrete `https://` URL to its SRI content hash via `nix store prefetch-file`, which
 /// follows redirects (so a `…/releases/latest/download/…` URL resolves to the current asset) and
-/// adds the file to sbx's store. Pure fetch — no code runs.
+/// adds the file to sbx's store. An explicit `--name` is passed so a URL whose last segment
+/// percent-decodes to an illegal store name (e.g. an encoded space) still resolves — see
+/// [`prefetch_name`]. Pure fetch — no code runs.
 pub(crate) fn prefetch_hash(nix: &Path, layout: &Layout, url: &str) -> io::Result<String> {
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .args(["store", "prefetch-file", "--json"])
+        .args(["--name", &prefetch_name(url)])
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -169,6 +199,29 @@ mod tests {
         assert!(!is_sri("jBGtMS5l"));
         assert!(!is_sri("sha256-"));
         assert!(!is_sri("md5-abc"));
+    }
+
+    #[test]
+    fn prefetch_name_sanitizes_an_illegal_store_name_and_keeps_clean_ones() {
+        // A percent-encoded space (as a vendor filename like `My%20App.tar.gz` carries) would
+        // percent-decode to a space — an illegal store name — so `%` is sanitized to `-`, keeping the
+        // prefetch working.
+        assert_eq!(
+            prefetch_name("https://example.com/x/My%20App.tar.gz"),
+            "My-20App.tar.gz"
+        );
+        // A clean `.deb`/`.AppImage` name is unchanged, so the shared prefetch keeps deb/appimage
+        // behavior byte-identical.
+        assert_eq!(
+            prefetch_name("https://example.com/pool/demo-app_1.2_amd64.deb"),
+            "demo-app_1.2_amd64.deb"
+        );
+        assert_eq!(
+            prefetch_name("https://example.com/Demo-App-1.0-x86_64.AppImage"),
+            "Demo-App-1.0-x86_64.AppImage"
+        );
+        // A degenerate URL with no last segment falls back to a fixed safe name.
+        assert_eq!(prefetch_name("https://example.com/"), "source");
     }
 
     #[test]

@@ -292,14 +292,18 @@ const PAGES: &[Page] = &[
     Page {
         path: &["proc"],
         synopsis: "sbx proc <subcommand> [args...]",
-        summary: "observe what a running sandbox is doing inside its cage",
+        summary: "observe — and, under [proc] enforcement, block — what a sandbox execs",
         options: &[],
         details:
-            "The in-cage observability surface, sibling of `sbx net`. `sbx proc ls` snapshots a\n\
+            "The in-cage process/exec surface, sibling of `sbx net`. `sbx proc ls` snapshots a\n\
             session's process tree and `sbx proc live` watches it redrawn — both read-only, host-side,\n\
             and always available (they read `/proc` with no privilege, no cage cooperation, no\n\
             launch). `sbx proc logs` is the exec-event feed: the processes the agent has spawned, in\n\
-            order — available for a session launched with observation on (`sbx run --observe`).\n\
+            order, each with its enforcement verdict when the session is enforcing. `sbx proc pending`\n\
+            lists — and decides — the execs an `ask`-mode session has parked.\n\
+            \n\
+            Enforcement is configured by `[proc]` (a trusted-only security field): `enforce` blocks a\n\
+            denied exec target before the syscall runs, `ask` parks an unmatched one for a decision.\n\
             \n\
             Run one of the subcommands below.",
     },
@@ -373,8 +377,82 @@ const PAGES: &[Page] = &[
             watch a detached (`--detach`) one, which has no terminal for the inline feed. With no id\n\
             the sole live session is used; otherwise name one by its PID.\n\
             \n\
-            Honest limit: the feed is populated by a short-interval `/proc` poll, so a process shorter\n\
-            than one tick can be missed. Precise per-spawn capture (and blocking) is a later increment.",
+            Each line carries a verdict: `observe` for a non-enforcing `--observe` run (a `/proc`\n\
+            poll, so a process shorter than one tick can be missed), or the real `allow`/`deny`/`ask`\n\
+            under `[proc] mode = enforce`/`ask` (the seccomp supervisor captures every exec exactly).",
+    },
+    Page {
+        path: &["proc", "pending"],
+        synopsis: "sbx proc pending [allow|deny <id>]",
+        summary: "list and decide the execs an ask-mode session has parked",
+        options: &[
+            (
+                "(none)",
+                "list every parked exec — `<session-pid>.<notif-id>`, cage pid, wait time, and path",
+            ),
+            (
+                "allow <id> | deny <id>",
+                "decide one parked exec by its `<session-pid>.<notif-id>` id",
+            ),
+            (
+                "allow <pid>.* | deny <pid>.*",
+                "decide every parked exec in session `<pid>` at once",
+            ),
+        ],
+        details:
+            "Under `[proc] mode = \"ask\"`, an exec matching neither the `allow` nor `deny` list is\n\
+            parked — the process blocks in the syscall — awaiting a decision. `sbx proc pending` lists\n\
+            the parked execs across the live sessions; `allow <id>` lets one run, `deny <id>` refuses\n\
+            it (EPERM, never running). A parked exec not decided within the ask timeout is auto-denied\n\
+            (fail-closed), so a process tree never hangs on a stalled decision.",
+    },
+    Page {
+        path: &["fs"],
+        synopsis: "sbx fs <subcommand> [args...]",
+        summary: "observe the files a running sandbox writes in its project",
+        options: &[],
+        details:
+            "The filesystem lens of a running session, sibling of `sbx proc` (processes) and `sbx net`\n\
+            (egress). `sbx fs logs` is the file-write feed: the files the agent creates, writes,\n\
+            deletes, or moves in its project tree, observed host-side with inotify — available for a\n\
+            session launched with observation on (`sbx run --observe`).\n\
+            \n\
+            Run one of the subcommands below.",
+    },
+    Page {
+        path: &["fs", "logs"],
+        synopsis: "sbx fs logs [<id>] [-f|--follow] [--json]",
+        summary: "the file-write feed of an observed session",
+        options: &[
+            (
+                "<id>",
+                "the PID `sbx session ls` shows; omit it when only one session is live",
+            ),
+            (
+                "-f, --follow",
+                "stream new events until the session ends (Ctrl+C to stop)",
+            ),
+            (
+                "--json",
+                "emit one object per event (NDJSON), for a pipe",
+            ),
+        ],
+        details:
+            "The file-write feed — the files an agent creates, writes (`write` is a completed\n\
+            write-and-close), deletes (`remove`), or moves (`rename`) in its project tree, in order,\n\
+            with the time each change was seen. Observed host-side with inotify (no privilege, no cage\n\
+            cooperation), so the session must have been launched with observation on: `sbx run\n\
+            --observe` (or `sbx app run <name> --observe`, the same flag that feeds `sbx proc logs`). A\n\
+            session without it is reported as unobserved, not empty.\n\
+            \n\
+            It is the way to watch an observed session from another terminal — and the only way to\n\
+            watch a detached (`--detach`) one. With no id the sole live session is used; otherwise name\n\
+            one by its PID.\n\
+            \n\
+            Scope: only the project tree is watched. The per-project nix store and the app home are\n\
+            excluded as provisioning/state noise, build/VCS/vendor trees (`.git`, `node_modules`,\n\
+            `target`, `.venv`) are filtered out, and the cage's `/tmp` is a private tmpfs invisible to\n\
+            the host. Precise per-syscall capture (and blocking) is a later increment.",
     },
     Page {
         path: &["plugins"],
@@ -683,7 +761,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage]",
+        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             ("all", "roll every managed channel (the default)"),
@@ -698,6 +776,7 @@ const PAGES: &[Page] = &[
             ("flake", "the project's and apps' flake: packages"),
             ("deb", "the project's and apps' deb: packages"),
             ("appimage", "the project's and apps' appimage: packages"),
+            ("tarball", "the project's and apps' tarball: packages"),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
             versions advance only here, never on an sbx binary update.",

@@ -47,6 +47,11 @@ pub(crate) struct ExecEvent {
     /// renders it as a local `hh:mm:ss` time.
     pub(crate) at_epoch_ms: u128,
     pub(crate) pid: u32,
+    /// The enforcement verdict, when the event came from the seccomp user-notification supervisor:
+    /// `allow` / `deny` / `ask`. The cheap `/proc` poll observer (a non-enforcing `observe` run) sets
+    /// `observe` — it records what ran, not a decision. A short, fixed token, so it is safe before the
+    /// verbatim `command` on the wire.
+    pub(crate) verdict: String,
     pub(crate) command: String,
 }
 
@@ -86,10 +91,17 @@ impl ExecRing {
         }
     }
 
-    /// Append one observed exec, assigning the next sequence number and evicting the oldest if the
-    /// ring is full. `command` must already be sanitised of control characters and length-capped by
-    /// the caller. Returns the assigned sequence number.
+    /// Append one observed exec (the non-enforcing `/proc` poll path — verdict `observe`), assigning the
+    /// next sequence number and evicting the oldest if the ring is full. `command` must already be
+    /// sanitised of control characters and length-capped by the caller. Returns the assigned sequence.
     pub(crate) fn push(&self, pid: u32, command: &str) -> u64 {
+        self.push_verdict(pid, command, "observe")
+    }
+
+    /// Append one enforced exec (the seccomp user-notification path), tagged with its `verdict`
+    /// (`allow` / `deny` / `ask`). `command` — here the exec target path — must already be sanitised of
+    /// control characters and length-capped by the caller. Returns the assigned sequence.
+    pub(crate) fn push_verdict(&self, pid: u32, command: &str, verdict: &str) -> u64 {
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -101,6 +113,7 @@ impl ExecRing {
             seq,
             at_epoch_ms,
             pid,
+            verdict: verdict.to_string(),
             command: command.to_string(),
         });
         while g.events.len() > self.cap {
@@ -149,6 +162,25 @@ pub(crate) fn serve(listener: UnixListener, ring: Arc<ExecRing>) -> io::Result<(
     Ok(())
 }
 
+/// Serve the control socket for an **enforcing** session (`[proc] mode = enforce|ask`): like
+/// [`serve`], but the dispatch also answers the `ask` decision verbs (`LIST` the parked `execve`s,
+/// `ALLOW`/`DENY <id>` or `*` to decide them) against the shared [`PendingExec`].
+pub(crate) fn serve_enforced(
+    listener: UnixListener,
+    ring: Arc<ExecRing>,
+    pending: Arc<super::proc_enforce::PendingExec>,
+) -> io::Result<()> {
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let ring = ring.clone();
+        let pending = pending.clone();
+        std::thread::spawn(move || {
+            let _ = handle_enforced(stream, &ring, &pending);
+        });
+    }
+    Ok(())
+}
+
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
 /// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
 /// timeout are belt-and-braces against a stuck or malformed caller.
@@ -161,6 +193,73 @@ fn handle(stream: UnixStream, ring: &ExecRing) -> io::Result<()> {
     let response = dispatch(line.trim(), ring);
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
+}
+
+/// Handle one control connection for an enforcing session, dispatching the ask verbs too.
+fn handle_enforced(
+    stream: UnixStream,
+    ring: &ExecRing,
+    pending: &super::proc_enforce::PendingExec,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new((&stream).take(LINE_MAX));
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let response = dispatch_enforced(line.trim(), ring, pending);
+    (&stream).write_all(response.as_bytes())?;
+    (&stream).flush()
+}
+
+/// Dispatch an enforcing-session command: the observe `LOG` plus the ask decision verbs. `LIST`
+/// returns the parked `execve`s (`pending id=… pid=… waiting=… path=…`, `path` last/verbatim);
+/// `ALLOW <id>`/`DENY <id>` decides one by its notification id (`ok path=…` / `err not-found`);
+/// `ALLOW *`/`DENY *` decides them all (`answered path=…`* then `ok`).
+fn dispatch_enforced(
+    cmd: &str,
+    ring: &ExecRing,
+    pending: &super::proc_enforce::PendingExec,
+) -> String {
+    let mut parts = cmd.split_whitespace();
+    match parts.next() {
+        Some("LOG") => dispatch(cmd, ring),
+        Some("LIST") => {
+            let mut out = String::new();
+            for (id, pid, path, waited) in pending.list() {
+                out.push_str(&format!(
+                    "pending id={} pid={} waiting={} path={}\n",
+                    id,
+                    pid,
+                    waited.as_secs(),
+                    path
+                ));
+            }
+            out.push_str("ok\n");
+            out
+        }
+        Some(verb @ ("ALLOW" | "DENY")) => {
+            let allow = verb == "ALLOW";
+            match parts.next() {
+                Some("*") => {
+                    let mut out = String::new();
+                    for (_, _, path) in pending.answer_all(allow) {
+                        out.push_str(&format!("answered path={path}\n"));
+                    }
+                    out.push_str("ok\n");
+                    out
+                }
+                Some(tok) => match tok.parse::<u64>() {
+                    Ok(id) => match pending.answer(id, allow) {
+                        Some((_, path)) => format!("ok path={path}\n"),
+                        None => "err not-found\n".to_string(),
+                    },
+                    Err(_) => "err bad-request\n".to_string(),
+                },
+                None => "err bad-request\n".to_string(),
+            }
+        }
+        _ => "err bad-request\n".to_string(),
+    }
 }
 
 /// Map a control command to its response. `LOG` returns the retained events (a `dropped=` line when a
@@ -198,8 +297,8 @@ fn dispatch(cmd: &str, ring: &ExecRing) -> String {
 /// control characters from the command, so it cannot inject a second line.
 fn format_event_line(ev: &ExecEvent) -> String {
     format!(
-        "event seq={} at={} pid={} cmd={}\n",
-        ev.seq, ev.at_epoch_ms, ev.pid, ev.command
+        "event seq={} at={} pid={} verdict={} cmd={}\n",
+        ev.seq, ev.at_epoch_ms, ev.pid, ev.verdict, ev.command
     )
 }
 
@@ -252,6 +351,88 @@ pub(crate) fn read_exec_log(socket: &Path, after: Option<u64>) -> io::Result<Exe
     })
 }
 
+/// One parked `execve` awaiting an `ask` decision, as `sbx proc pending` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParkedView {
+    /// The kernel notification id — the token `sbx proc allow`/`deny` decides by.
+    pub(crate) id: u64,
+    pub(crate) pid: u32,
+    pub(crate) waiting_secs: u64,
+    pub(crate) path: String,
+}
+
+/// List the `execve`s currently parked for a decision on one session's control socket (`LIST`).
+pub(crate) fn read_pending(socket: &Path) -> io::Result<Vec<ParkedView>> {
+    let reply = query(socket, "LIST")?;
+    let mut out = Vec::new();
+    for line in reply.lines() {
+        if line == "ok" {
+            break;
+        }
+        if let Some(p) = parse_pending_line(line) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Decide one parked `execve` by its notification id (`ALLOW <id>` / `DENY <id>`). Returns the exec
+/// path that was decided, or `None` if the id was unknown (already answered / timed out).
+pub(crate) fn answer_pending(socket: &Path, id: u64, allow: bool) -> io::Result<Option<String>> {
+    let verb = if allow { "ALLOW" } else { "DENY" };
+    let reply = query(socket, &format!("{verb} {id}"))?;
+    let line = reply.lines().next().unwrap_or("");
+    if let Some(path) = line.strip_prefix("ok path=") {
+        Ok(Some(path.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Decide every parked `execve` on a session at once (`ALLOW *` / `DENY *`). Returns each decided path.
+pub(crate) fn answer_all_pending(socket: &Path, allow: bool) -> io::Result<Vec<String>> {
+    let verb = if allow { "ALLOW" } else { "DENY" };
+    let reply = query(socket, &format!("{verb} *"))?;
+    Ok(reply
+        .lines()
+        .filter_map(|l| l.strip_prefix("answered path=").map(str::to_string))
+        .collect())
+}
+
+/// Send one command line to a session's control socket and return the full reply text.
+fn query(socket: &Path, cmd: &str) -> io::Result<String> {
+    let stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    (&stream).write_all(format!("{cmd}\n").as_bytes())?;
+    (&stream).flush()?;
+    let mut reply = String::new();
+    BufReader::new(&stream).read_to_string(&mut reply)?;
+    Ok(reply)
+}
+
+/// Parse one `pending id=… pid=… waiting=… path=…` line, `path` verbatim last.
+fn parse_pending_line(line: &str) -> Option<ParkedView> {
+    let rest = line.strip_prefix("pending ")?;
+    let (head, path) = rest.split_once("path=")?;
+    let (mut id, mut pid, mut waiting) = (None, None, None);
+    for token in head.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "id" => id = value.parse().ok(),
+            "pid" => pid = value.parse().ok(),
+            "waiting" => waiting = value.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(ParkedView {
+        id: id?,
+        pid: pid?,
+        waiting_secs: waiting?,
+        path: path.to_string(),
+    })
+}
+
 /// Parse one `event seq=… at=… pid=… cmd=…` line back into an event, or `None` if malformed. Every
 /// field but `cmd` is a simple `key=value` token; `cmd` is the verbatim remainder after the first
 /// `cmd=` (it carries spaces, and the fixed numeric fields precede it, so the first `cmd=` is always
@@ -262,13 +443,14 @@ fn parse_event_line(line: &str) -> Option<ExecEvent> {
         Some((h, c)) => (h, c.to_string()),
         None => return None,
     };
-    let (mut seq, mut at, mut pid) = (None, None, None);
+    let (mut seq, mut at, mut pid, mut verdict) = (None, None, None, String::new());
     for token in head.split_whitespace() {
         let (key, value) = token.split_once('=')?;
         match key {
             "seq" => seq = value.parse().ok(),
             "at" => at = value.parse().ok(),
             "pid" => pid = value.parse().ok(),
+            "verdict" => verdict = value.to_string(),
             _ => {}
         }
     }
@@ -276,6 +458,7 @@ fn parse_event_line(line: &str) -> Option<ExecEvent> {
         seq: seq?,
         at_epoch_ms: at?,
         pid: pid?,
+        verdict,
         command,
     })
 }
@@ -339,6 +522,7 @@ mod tests {
             seq: 7,
             at_epoch_ms: 1_700_000_000_123,
             pid: 4242,
+            verdict: "deny".to_string(),
             command: "sh -c FOO=bar cmd=baz --flag=v".to_string(),
         };
         let line = format_event_line(&ev);

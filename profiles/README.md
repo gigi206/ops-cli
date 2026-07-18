@@ -38,6 +38,8 @@ with `sbx app export <name>`.
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
 | `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | **`network = "shared"`** (host-local LLM, see note ‡) |
+| `goose`           | `mise:aqua:block/goose` (Rust release binary, no runtime deps) | provider-dependent (BYOK: OpenRouter / Anthropic / OpenAI — examples in profile) |
+| `goose-desktop`   | `deb:` prebuilt `.deb` (Electron GUI, `gui`/`gpu`/`dbus`) — the same agent with a desktop UI | provider-dependent (GUI login or BYOK — examples in profile) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
@@ -199,6 +201,8 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
+| `goose`       | `mise:aqua:block/goose`                | Block's GitHub release binary (Rust, self-contained, GitHub artifact attestations verified via Sigstore) |
+| `goose-desktop` | `deb:…/releases/download/v1.43.0/goose_1.43.0_amd64.deb` | Block's prebuilt `.deb` (Electron + embedded Rust CLI), autoPatchelf'd host-side — hand-pinned (versioned filename, no `latest` alias) |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
 (mise's `aqua`/`github`/registry backends pull the real release binary, its `pipx` backend a

@@ -1,0 +1,101 @@
+# Goose — Block's open-source extensible AI agent (the CLI), sandboxed by sbx.
+#
+#   sbx app import profiles/goose.toml
+#   sbx app run goose
+#
+# Goose is a general-purpose, multi-provider AI agent written in Rust. It ships as a
+# self-contained release binary (no node, no runtime deps) distributed on GitHub releases;
+# sbx equips it fresh from upstream via mise's `aqua` backend, which selects the right asset
+# through the aqua registry (the plain gnu tarball, not the vulkan variant) and verifies
+# GitHub artifact attestations. The binary lands in the app's persistent isolated home — no
+# host mutation, no nixpkgs lag. It is equipped at the latest upstream version on the first
+# launch in a project, then pinned to that version; advance it with `sbx upgrade mise`.
+#
+# Goose is MULTI-PROVIDER BYOK (Anthropic, OpenAI, OpenRouter, Google, Ollama, …). This profile
+# ships with NO baked-in provider or credential — authenticate however you prefer: pick a
+# provider in Goose interactively (`goose configure`, persisted in the app's isolated home),
+# OR uncomment one of the provider examples below (env var + [secret] block + allowlist host).
+# The real key is read on the HOST and injected by the egress proxy on the wire — never in the
+# cage. The examples show the three common header-injectable providers:
+#   - OpenRouter : openrouter.ai , OPENROUTER_API_KEY , header "Authorization" type "bearer"
+#   - Anthropic  : api.anthropic.com , ANTHROPIC_API_KEY , header "x-api-key"   type "raw"
+#   - OpenAI     : api.openai.com , OPENAI_API_KEY , header "Authorization" type "bearer"
+cmd = "goose"
+
+# Your host Goose config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `goose` read and write these host files (config, credentials). Uncomment to share
+# your host Goose setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/goose", mode = "rw" },
+#]
+
+[packages]
+# Goose itself via mise's aqua backend (release binary). The aqua registry selects the asset
+# (the plain gnu tarball, not the vulkan variant) and verifies GitHub artifact attestations.
+# The first-launch download (github.com, api.github.com, release-assets.githubusercontent.com)
+# rides sbx's built-in nix-cache allow-set — the one host that does NOT is the sigstore TUF
+# repo mise contacts to verify the attestation, listed explicitly in [network] below.
+goose = "mise:aqua:block/goose"
+
+[network]
+mode = "deny"
+allow = [
+    # Install: Goose's GitHub release carries artifact attestations, which mise verifies via
+    # Sigstore (the CNCF signing/transparency infrastructure). The TUF root repository
+    # (tuf-repo-cdn.sigstore.dev) is fetched at install time to validate the attestation; it is
+    # NOT in sbx's built-in nix-cache allow-set, so it needs an explicit entry. The wildcard
+    # covers the apex + every sigstore subdomain (rekor/fulcio are read-only verification
+    # endpoints); sigstore.dev hosts only the Sigstore project, nothing else. The binary
+    # download itself (github.com + release-assets.githubusercontent.com) rides the built-in
+    # github allow-set. Verification is install-time only — a warm/offline relaunch reuses the
+    # installed binary and never touches sigstore.
+    "{*} https://*.sigstore.dev",
+    # Runtime provider host — uncomment the ONE matching your chosen provider (see the
+    # [env]/[secret] examples below): OpenRouter, Anthropic, or OpenAI. An app is read-by-default
+    # ({GET,HEAD}); the completions endpoint is a POST, so each is opened to all verbs with `{*}`.
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+]
+
+[env]
+# Provider-neutral: disable the parts that have no business in a cage, regardless of provider.
+# No system keyring exists in the hermetic cage; tell Goose to read the key from the env (or its
+# config file) instead.
+GOOSE_DISABLE_KEYRING = "1"
+# Cut Goose's non-essential traffic at the source (telemetry, update checks) so the tool never
+# generates it — complementing the [network] deny-by-construction backstop.
+GOOSE_TELEMETRY_OFF = "1"
+
+# --- Provider example (commented) — uncomment ONE block to inject a key host-side. ---
+# OpenRouter (one key, hundreds of models, OpenAI-compatible bearer auth):
+#GOOSE_PROVIDER = "openrouter"
+#GOOSE_MODEL = "anthropic/claude-sonnet-4.5"   # OpenRouter addresses models as <vendor>/<model>
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+# Anthropic direct:
+#GOOSE_PROVIDER = "anthropic"
+#GOOSE_MODEL = "claude-sonnet-4-5-20250514"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+# OpenAI direct:
+#GOOSE_PROVIDER = "openai"
+#GOOSE_MODEL = "gpt-4o"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+# --- [secret] example (commented) — uncomment the ONE matching your provider above. The real
+# key is read on the HOST (as $<PROVIDER>_API_KEY, or point `from` at a resolver, e.g.
+# sops://secrets.yaml#openrouter) and substituted on the wire by the egress proxy; the in-cage
+# value stays the placeholder. Goose sends the key in the provider's standard header, which the
+# proxy strip-and-replaces. ---
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

@@ -46,6 +46,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`audio`](configuration/audio.md) — microphone and playback via PulseAudio.
 - [`dbus`](configuration/dbus.md) — a private in-cage desktop portal (file chooser + theme + notifications).
 - [`network`](configuration/network.md) — the egress posture (links to [Networking](networking/README.md)).
+- [`[proc]`](configuration/proc.md) — observe or block what the agent execs (trusted-only).
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).
 - [`[app.<name>]`](configuration/apps.md) — named launch profiles (links to [Apps](apps/README.md)).
 - [`[net.groups]`](configuration/net-groups.md) — reusable egress groups.
@@ -65,6 +66,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`test`](cli/test.md) | check whether an access would be allowed |
 | [`net`](cli/net.md) | inspect and manage the egress policy |
 | [`proc`](cli/proc.md) | observe a running sandbox's process tree |
+| [`fs`](cli/fs.md) | observe the files a running sandbox writes |
 | [`plugins`](cli/plugins.md) | manage resolver plugins and plugin stores |
 | [`session`](cli/session.md) | list, attach to, and stop the live sessions |
 | [`trust` / `untrust`](cli/trust.md) | vouch for a project config |

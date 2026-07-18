@@ -1,7 +1,7 @@
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|flake|deb]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -14,6 +14,8 @@ advance **only here**, never on an `sbx` binary update.
 | `mise` | the mise engine, the project's `nix:` tools, and `mise:` packages |
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
+| `appimage` | the project's and apps' `appimage:` packages |
+| `tarball` | the project's and apps' `tarball:` packages |
 
 See also: [Upgrading toolchains](../housekeeping/upgrade.md) · [Provisioning](../concepts/provisioning.md) · [`nixpkgs`](../configuration/nixpkgs.md) · [`packages`](../configuration/packages.md).
 

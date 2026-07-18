@@ -188,6 +188,16 @@ pub(crate) enum Backend {
     /// the version still rolls forward on `sbx upgrade`. The stored string is the raw locator (the URL
     /// or `github:<owner>/<repo>`); [`super::sandbox::appimage`] dispatches on its shape.
     AppImage(String),
+    /// `tarball:<url>` — a prebuilt application `.tar.gz`/`.tgz` at an `https://` URL, provisioned
+    /// **host-side** into sbx's store exactly like `deb:`/`appimage:` (seeded, offline-reusable): sbx
+    /// resolves the URL to a content hash, then builds a generated derivation that `tar -xz`-extracts
+    /// it and `autoPatchelfHook`s it against the same curated Electron/Chromium library set.
+    /// Extraction runs no build script (`dontBuild`) and happens at BUILD time (a plain `tar`, no
+    /// runtime namespace op — the FUSE/namespace path is blocked in-cage), so evaluating it host-side
+    /// is safe. Meant for a GUI/desktop app distributed only as a plain tarball. One form: a direct
+    /// `https://…/….tar.gz` URL — the stored string is the raw locator;
+    /// [`super::sandbox::tarball`] resolves and builds it.
+    Tarball(String),
 }
 
 impl Backend {
@@ -201,6 +211,7 @@ impl Backend {
             Backend::Flake(reference) => reference,
             Backend::Deb(url) => url,
             Backend::AppImage(url) => url,
+            Backend::Tarball(url) => url,
             // The output attribute — a short locator for display; the bulky flake source is not
             // itself a one-line locator (rendered as `flake (inline) #<attr>` by the config view).
             Backend::FlakeInline { attr, .. } => attr,
@@ -215,6 +226,7 @@ impl Backend {
             Backend::Flake(_) => "flake",
             Backend::Deb(_) => "deb",
             Backend::AppImage(_) => "appimage",
+            Backend::Tarball(_) => "tarball",
             Backend::FlakeInline { .. } => "flake",
         }
     }
@@ -546,6 +558,12 @@ pub(crate) struct Resolved {
     /// `[app.<name>.network]` table is ignored (warned), and `sbx config show --app` does not surface
     /// the inherited value — the app inherits this baseline.
     pub(crate) egress_stats: bool,
+    /// The resolved process/exec posture: the default (`off`) unless the global config or a trusted
+    /// project set a mode. An untrusted project's choice is dropped with a warning — it may not forge
+    /// or loosen the enforcement of its own agent.
+    pub(crate) proc: crate::proc_policy::ProcPolicy,
+    /// Which layer supplied the winning `proc` posture (`Default` when neither config set it).
+    pub(crate) proc_origin: Provenance,
     /// The resolved GUI posture: the default (`None`) unless the global config or a trusted
     /// project asked for `"wayland"`. An untrusted project's choice is dropped with a warning
     /// — it may not open a display.
@@ -663,6 +681,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own network posture, set only when a trusted source declared one. `Some`
     /// overrides the baseline; `None` leaves the baseline posture in place.
     pub(crate) network: Option<NetworkPolicy>,
+    /// The app's own process/exec posture, set only when a trusted source declared one. `Some`
+    /// overrides the baseline; `None` leaves the baseline posture in place.
+    pub(crate) proc: Option<crate::proc_policy::ProcPolicy>,
     /// The app's own GUI posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place.
     pub(crate) gui: Option<GuiPolicy>,
@@ -710,6 +731,7 @@ pub(crate) struct ResolvedApp {
     /// no baseline to inherit. The launcher ignores all of these (a display affordance).
     pub(crate) cmd_origin: Provenance,
     pub(crate) network_origin: Provenance,
+    pub(crate) proc_origin: Provenance,
     pub(crate) gui_origin: Provenance,
     pub(crate) gpu_origin: Provenance,
     pub(crate) audio_origin: Provenance,
@@ -766,6 +788,11 @@ impl Resolved {
         // launches reach `merge_app`; `sbx run` (Mode A) never do, so they stay all-verbs.
         if let NetworkPolicy::Allowlist(policy) = &mut self.network {
             policy.apply_default_methods(&app.default_methods);
+        }
+        // The app's exec posture replaces the baseline's when it declared one (its own trusted
+        // policy for its own agent); otherwise the baseline's stands.
+        if let Some(proc) = app.proc {
+            self.proc = proc;
         }
         if let Some(gui) = app.gui {
             self.gui = gui;
@@ -884,6 +911,7 @@ impl Resolved {
             forward,
             seccomp,
             devices,
+            proc: _,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time. An override's inline
             // `[flakes]` is dropped (fail-closed): a one-shot `--config` blob is no place for a
@@ -1262,6 +1290,23 @@ fn resolve(
     };
     // The GUI posture is trusted by location at the global layer; an invalid or unset value
     // falls back to the default (no display).
+    // The process/exec posture is trusted by location at the global layer. `parent` is the built-in
+    // default (off) — the global layer has no lower config to inherit a table's omitted mode from.
+    let mut proc_origin = Provenance::Default;
+    let mut proc = match global.proc.and_then(|v| {
+        validate_proc(
+            &mut warnings,
+            GLOBAL_CONFIG,
+            v,
+            &crate::proc_policy::ProcPolicy::off(),
+        )
+    }) {
+        Some(policy) => {
+            proc_origin = Provenance::Global;
+            policy
+        }
+        None => crate::proc_policy::ProcPolicy::off(),
+    };
     let mut gui_origin = Provenance::Default;
     let mut gui = match global
         .gui
@@ -1435,6 +1480,23 @@ fn resolve(
             } else {
                 warnings.push(format!(
                     "{PROJECT_CONFIG}: ignoring `network` policy ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `proc` is a security field — a trusted project may set its agent's exec posture; an
+        // untrusted or changed one may not forge or loosen the enforcement of its own agent.
+        if let Some(value) = proj.proc {
+            if trusted {
+                // A project `[proc]` table without a `mode` inherits it from the resolved global
+                // posture (`proc` as it stands after the global layer).
+                if let Some(policy) = validate_proc(&mut warnings, PROJECT_CONFIG, value, &proc) {
+                    proc = policy;
+                    proc_origin = Provenance::Project;
+                }
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `proc` policy ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -1615,6 +1677,7 @@ fn resolve(
         &project_secret_defaults,
         &net_groups,
         &network,
+        &proc,
         plugins,
     );
 
@@ -1631,6 +1694,8 @@ fn resolve(
         network,
         network_origin,
         egress_stats,
+        proc,
+        proc_origin,
         gui,
         gui_origin,
         gpu,
@@ -2048,6 +2113,7 @@ fn resolve_apps(
     project_secret_defaults: &SecretDefaults,
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
+    baseline_proc: &crate::proc_policy::ProcPolicy,
     plugins: &PluginRegistry,
 ) -> BTreeMap<String, ResolvedApp> {
     let (mut project_apps, project_state) = match project_apps {
@@ -2078,6 +2144,7 @@ fn resolve_apps(
             project_secret_defaults,
             net_groups,
             baseline_network,
+            baseline_proc,
             plugins,
         );
         out.insert(name, resolved);
@@ -2116,6 +2183,7 @@ fn resolve_app(
     project_secret_defaults: &SecretDefaults,
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
+    baseline_proc: &crate::proc_policy::ProcPolicy,
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
@@ -2126,6 +2194,7 @@ fn resolve_app(
     let mut network: Option<NetworkPolicy> = None;
     // Every Mode-B app reads by default ({GET,HEAD}); a trusted layer's `default_methods` overrides it.
     let mut default_methods = builtin_app_default_methods();
+    let mut proc: Option<crate::proc_policy::ProcPolicy> = None;
     let mut gui: Option<GuiPolicy> = None;
     let mut gpu: Option<bool> = None;
     let mut audio: Option<bool> = None;
@@ -2159,6 +2228,7 @@ fn resolve_app(
     // stays `None` for the built-in default.
     let mut cmd_origin = Provenance::Default;
     let mut network_origin = Provenance::Default;
+    let mut proc_origin = Provenance::Default;
     let mut gui_origin = Provenance::Default;
     let mut gpu_origin = Provenance::Default;
     let mut audio_origin = Provenance::Default;
@@ -2199,6 +2269,14 @@ fn resolve_app(
                 if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
                     default_methods = m;
                 }
+            }
+        }
+        if let Some(field) = app.proc {
+            // A table without a mode inherits from the app's own proc so far, else the baseline.
+            let parent = proc.as_ref().unwrap_or(baseline_proc);
+            if let Some(policy) = validate_proc(&mut warnings, &source, field, parent) {
+                proc = Some(policy);
+                proc_origin = Provenance::Global;
             }
         }
         if let Some(value) = app.gui {
@@ -2307,6 +2385,23 @@ fn resolve_app(
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `network` policy ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `proc` mirrors `network`: an untrusted project may not set an exec posture, on its own app
+        // or by overriding a trusted one (the flagship property — an agent runs *on* untrusted code
+        // without that code being able to forge or loosen the enforcement of its own agent).
+        if let Some(field) = app.proc {
+            if trusted {
+                let parent = proc.as_ref().unwrap_or(baseline_proc);
+                if let Some(policy) = validate_proc(&mut warnings, &source, field, parent) {
+                    proc = Some(policy);
+                    proc_origin = Provenance::Project;
+                }
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `proc` policy ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -2496,6 +2591,7 @@ fn resolve_app(
         binds,
         packages,
         network,
+        proc,
         gui,
         gpu,
         audio,
@@ -2508,6 +2604,7 @@ fn resolve_app(
         default_methods,
         cmd_origin,
         network_origin,
+        proc_origin,
         gui_origin,
         gpu_origin,
         audio_origin,
@@ -2887,11 +2984,19 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             ));
         }
         Ok(Backend::AppImage(rest.to_string()))
+    } else if let Some(rest) = value.strip_prefix("tarball:") {
+        if !is_valid_tarball_url(rest) {
+            return Err(format!(
+                "invalid tarball reference `{rest}` — use an `https://` URL ending in `.tar.gz` \
+                 or `.tgz`"
+            ));
+        }
+        Ok(Backend::Tarball(rest.to_string()))
     } else {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
-             `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>`, or `appimage:<url>` / \
-             `appimage:github:<owner>/<repo>`"
+             `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>`, `appimage:<url>` / \
+             `appimage:github:<owner>/<repo>`, or `tarball:<url>`"
         ))
     }
 }
@@ -2922,6 +3027,24 @@ pub(crate) fn is_valid_appimage_url(url: &str) -> bool {
     url.strip_prefix("https://").is_some_and(|rest| {
         !rest.is_empty()
             && url.to_ascii_lowercase().ends_with(".appimage")
+            && url.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
+            })
+    })
+}
+
+/// A `tarball:` URL: an `https://` URL to a prebuilt application `.tar.gz`/`.tgz`. The sibling of
+/// [`is_valid_deb_url`] — required to be HTTPS (the fetch is unauthenticated beyond TLS and the
+/// bundle is executed after autoPatchelf, so a plaintext source is refused) and to end in `.tar.gz`
+/// or `.tgz` (case-insensitively; a mistyped value is caught, not silently built). The character set
+/// is the same injection-free URL set (including `%`, so a percent-encoded space like a vendor's
+/// `My%20App.tar.gz` is accepted), so the value carries no shell/nix metacharacter — it is
+/// interpolated into a generated nix expression and a `nix store prefetch-file` argument.
+pub(crate) fn is_valid_tarball_url(url: &str) -> bool {
+    url.strip_prefix("https://").is_some_and(|rest| {
+        let lower = url.to_ascii_lowercase();
+        !rest.is_empty()
+            && (lower.ends_with(".tar.gz") || lower.ends_with(".tgz"))
             && url.chars().all(|c| {
                 c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
             })
@@ -3041,6 +3164,40 @@ fn validate_gui(
             None
         }
     }
+}
+
+/// Validate a `proc` field — either a bare mode string or a `[proc]` table — mapping it to a
+/// [`ProcPolicy`] and warning on an unknown mode. A typo must never silently leave enforcement in the
+/// wrong posture; returning `None` keeps the prior (default or parent) policy rather than guessing.
+/// `parent` is the policy of the layer immediately below: a `[proc]` table that omits `mode` inherits
+/// its mode from `parent` while keeping its own `allow`/`deny` rules.
+fn validate_proc(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    field: crate::config::schema::ProcField,
+    parent: &crate::proc_policy::ProcPolicy,
+) -> Option<crate::proc_policy::ProcPolicy> {
+    use crate::config::schema::ProcField;
+    use crate::proc_policy::{ProcMode, ProcPolicy};
+    let (mode_str, allow, deny) = match field {
+        ProcField::Mode(m) => (Some(m), Vec::new(), Vec::new()),
+        ProcField::Table(t) => (t.mode, t.allow, t.deny),
+    };
+    let mode = match mode_str {
+        Some(m) => match ProcMode::parse(&m) {
+            Some(pm) => pm,
+            None => {
+                warnings.push(format!(
+                    "{source_label}: ignoring unknown proc mode `{m}` \
+                     (expected \"off\", \"observe\", \"enforce\", or \"ask\")"
+                ));
+                return None;
+            }
+        },
+        // A table with no mode inherits the parent layer's mode, keeping this table's own rules.
+        None => parent.mode,
+    };
+    Some(ProcPolicy::new(mode, &allow, &deny))
 }
 
 /// Validate a `network` field — either a posture string or a `[network]` table — mapping it to a
@@ -4858,6 +5015,7 @@ mod tests {
             limits: None,
             seccomp: None,
             devices: None,
+            proc: None,
             net: Default::default(),
         }
     }
@@ -5361,6 +5519,7 @@ mod tests {
             limits: None,
             seccomp: None,
             devices: None,
+            proc: None,
             home_scope: None,
         }
     }
@@ -6390,6 +6549,69 @@ mod tests {
     }
 
     #[test]
+    fn proc_is_trusted_gated_and_the_app_overlay_replaces_the_baseline() {
+        use crate::config::schema::{ProcField, ProcTable};
+        use crate::proc_policy::ProcMode;
+        let proc = |mode: &str, deny: &[&str]| {
+            Some(ProcField::Table(ProcTable {
+                mode: Some(mode.into()),
+                allow: Vec::new(),
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+            }))
+        };
+
+        // Global is trusted by location — its `[proc]` applies in full.
+        let r = resolve_no_plugins(
+            RawConfig {
+                proc: proc("enforce", &["curl"]),
+                ..RawConfig::default()
+            },
+            None,
+        );
+        assert_eq!(r.proc.mode, ProcMode::Enforce);
+        assert_eq!(r.proc.deny.len(), 1);
+        assert_eq!(r.proc_origin, Provenance::Global);
+
+        // An UNTRUSTED project's `[proc]` is dropped with a warning — the baseline stays off.
+        let untrusted = RawConfig {
+            proc: proc("enforce", &["id"]),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((untrusted, TrustState::Untrusted)),
+        );
+        assert_eq!(
+            r.proc.mode,
+            ProcMode::Off,
+            "an untrusted project may not enforce its own agent"
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("ignoring `proc`")));
+
+        // A TRUSTED project's `[proc]` applies.
+        let trusted = RawConfig {
+            proc: proc("ask", &["ssh"]),
+            ..RawConfig::default()
+        };
+        let r = resolve_no_plugins(RawConfig::default(), Some((trusted, TrustState::Trusted)));
+        assert_eq!(r.proc.mode, ProcMode::Ask);
+        assert_eq!(r.proc_origin, Provenance::Project);
+
+        // A globally-declared app's own `[proc]` is trusted by location and resolves to `Some`.
+        let app = RawApp {
+            proc: proc("enforce", &["curl"]),
+            ..raw_app(&["true"], &[], &[], &[], None)
+        };
+        let r = resolve_no_plugins(raw_with_app("probe", app), None);
+        let resolved_app = &r.apps["probe"];
+        assert_eq!(
+            resolved_app.proc.as_ref().map(|p| p.mode),
+            Some(ProcMode::Enforce),
+            "a global app's own proc applies (trusted by location)"
+        );
+    }
+
+    #[test]
     fn global_limits_are_honored_by_location() {
         // The global config is trusted by location, so its whole `[limits]` table applies.
         let global = raw_limits(Some("70%"), Some("16G"), Some("8192"));
@@ -6822,6 +7044,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: vec![PathBuf::from("/dev/kvm")],
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6889,6 +7113,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6932,6 +7158,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -6971,6 +7199,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -7104,6 +7334,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -7155,6 +7387,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         };
@@ -8307,6 +8541,33 @@ mod tests {
         assert!(!is_valid_appimage_url("http://e/x.AppImage")); // not https
         assert!(!is_valid_appimage_url("https://e/x.deb")); // wrong extension
         assert!(!is_valid_appimage_url("https://e/a b.AppImage")); // whitespace
+    }
+
+    #[test]
+    fn tarball_backend_parses_and_validates() {
+        // a direct `.tar.gz`/`.tgz` https URL routes to Backend::Tarball; the percent-encoded space
+        // a vendor filename can carry (`My%20App.tar.gz`) is accepted.
+        assert_eq!(
+            parse_backend("tarball:https://example.com/x/1.0/linux-x64/My%20App.tar.gz"),
+            Ok(Backend::Tarball(
+                "https://example.com/x/1.0/linux-x64/My%20App.tar.gz".into()
+            ))
+        );
+        assert!(matches!(
+            parse_backend("tarball:https://e/app.tgz"),
+            Ok(Backend::Tarball(_))
+        ));
+        // the validator directly.
+        assert!(is_valid_tarball_url("https://e/app.tar.gz"));
+        assert!(is_valid_tarball_url("https://e/APP.TGZ")); // extension is case-insensitive
+        assert!(is_valid_tarball_url("https://e/My%20App.tar.gz")); // %-encoded space
+        assert!(!is_valid_tarball_url("http://e/app.tar.gz")); // not https
+        assert!(!is_valid_tarball_url("https://e/app.deb")); // wrong extension
+        assert!(!is_valid_tarball_url("https://e/app.tar")); // not gz-compressed
+        assert!(!is_valid_tarball_url("https://e/a b.tar.gz")); // raw whitespace
+                                                                // a mistyped/unsupported form is refused up front (the manifest form is a later increment).
+        assert!(parse_backend("tarball:https://e/app.zip").is_err());
+        assert!(parse_backend("tarball:not-a-url").is_err());
     }
 
     #[test]

@@ -18,6 +18,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/projects/<id>/flake-packages.lock` — pinned `flake:` packages.
 - `<data>/projects/<id>/deb-packages.lock` — pinned `deb:` packages (URL → content hash).
 - `<data>/projects/<id>/appimage-packages.lock` — pinned `appimage:` packages (URL → content hash).
+- `<data>/projects/<id>/tarball-packages.lock` — pinned `tarball:` packages (URL → content hash).
 
 A launch reads these locks; it does not re-resolve. So updating the `sbx` binary leaves
 your versions exactly where they were. `sbx upgrade` is the one place that rewrites a
@@ -26,7 +27,7 @@ lock.
 ## The upgrade targets
 
 ```sh
-sbx upgrade [all|nix|mise|flake|deb|appimage]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball]
 ```
 
 | Target | Rolls forward |
@@ -36,6 +37,7 @@ sbx upgrade [all|nix|mise|flake|deb|appimage]
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
 | `appimage` | the project's and apps' `appimage:` packages |
+| `tarball` | the project's and apps' `tarball:` packages |
 | `all` | all of the above (the default) |
 
 The three are **decoupled**: `sbx upgrade nix` leaves `mise-engine.lock` untouched, and
@@ -69,6 +71,9 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
 - **`appimage:`** — the `deb:` twin for a prebuilt `.AppImage`: re-resolves each declared URL
   (or a `github:` locator's latest release asset) to its current content hash and rewrites
   `appimage-packages.lock`; a changed hash rebuilds host-side at the next launch.
+- **`tarball:`** — the `deb:` twin for a prebuilt `.tar.gz`: re-resolves each declared URL to its
+  current content hash and rewrites `tarball-packages.lock`; a changed hash rebuilds host-side at
+  the next launch. A version-stamped vendor URL is effectively frozen (its path names the version).
 
 ## The fresh-release hold (`mise:` packages)
 

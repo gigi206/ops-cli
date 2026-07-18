@@ -28,6 +28,7 @@ nix.
 | `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `sbx upgrade flake` | after a warm build |
 | `deb:<url>` · `deb:github:…` · `deb:apt:…` | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` | yes (seeded, durable) |
 | `appimage:<url>` | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` | yes (seeded, durable) |
+| `tarball:<url>` | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` | yes (seeded, durable) |
 
 ### `nix:` — a nixpkgs attribute
 
@@ -166,11 +167,28 @@ linux `.AppImage` asset (so a version-embedding asset name still rolls forward).
 appimage` re-resolves it. Pairs with [`gui = "wayland"`](gui.md), [`gpu = true`](gpu.md), and
 [`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
 
+### `tarball:` — a prebuilt application tarball
+
+```toml
+[packages]
+demo-app = "tarball:https://host/path/App.tar.gz"
+```
+
+The sibling of `deb:`/`appimage:`, for a GUI/desktop app distributed **only as a plain `.tar.gz`**
+(no `.deb`, no `.AppImage`, no nixpkgs attribute, no official flake). sbx resolves the URL to a
+content hash (pinned in a per-project `tarball-packages.lock`) and
+builds a generated derivation that **`tar -xz`-extracts it at build time** and `autoPatchelfHook`s
+its Electron/Chromium binaries against the same curated library set — **host-side**, seeded and
+offline-reusable. One form today: a direct `https://` URL ending in `.tar.gz` or `.tgz`. A
+version-stamped vendor URL does not roll forward on its own (the version is in the path); `sbx
+upgrade tarball` re-resolves the declared URL. Pairs with [`gui = "wayland"`](gui.md),
+[`gpu = true`](gpu.md), and [`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
+
 ## Why the tool sources are trusted-only
 
 Loosening `packages` (or the inline `[flakes]`) to an untrusted project would let it override
 a trusted app's tool and run attacker code under that app's posture — the same class of hole as
-overriding a trusted app's command. So all five `[packages]` backends **and** inline `[flakes]`
+overriding a trusted app's command. So all six `[packages]` backends **and** inline `[flakes]`
 are gated. A trusted app's tool **survives an untrusted project's override attempt** (the flagship
 "agent on untrusted code" property). The open self-equip path stays [`sbx mise`](../cli/mise.md)
 and a project's [`[tools]`](tools.md).

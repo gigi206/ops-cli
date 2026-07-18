@@ -23,6 +23,8 @@ mod flake;
 mod flake_inline;
 mod fonts;
 mod forward;
+pub(crate) mod fs_control;
+mod fs_watch;
 mod gc;
 mod gpu;
 mod guidata;
@@ -39,6 +41,7 @@ mod packages;
 mod portal;
 mod prebuilt;
 pub(crate) mod proc_control;
+pub(crate) mod proc_enforce;
 mod projectstore;
 mod proxy;
 mod resolver;
@@ -46,6 +49,7 @@ mod search;
 pub(crate) mod seccomp;
 mod smoke;
 mod spec;
+mod tarball;
 mod theme_relay;
 
 pub(crate) use appimage::{
@@ -79,3 +83,7 @@ pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use proxy::{builtin_allow_rules, union_with_builtin};
 pub(crate) use search::run as search;
 pub(crate) use smoke::run as smoke;
+pub(crate) use tarball::{
+    pinned_hashes as tarball_pinned_hashes, upgrade as upgrade_tarball,
+    withheld as withheld_tarball_packages, TarballUpgrade,
+};

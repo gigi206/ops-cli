@@ -15,7 +15,7 @@ See also: [Quick start](../getting-started/quickstart.md) · [`sbx app`](app.md)
 | Option | Meaning |
 |---|---|
 | `--detach` | run in the background as a session [`sbx session`](session.md) can see |
-| `--observe` | stream a `[sbx:exec]` feed of the processes the command spawns (see [Observing a run](#observing-a-run-observe)) |
+| `--observe` | record what the command does — its processes ([`sbx proc logs`](proc.md#logs)) and file writes ([`sbx fs logs`](fs.md#logs)); see [Observing a run](#observing-a-run-observe) |
 | `--config <toml\|@file>` | one-shot config override (any field); repeatable, later wins |
 | `--env KEY=VALUE` | one-shot override of a single cage environment variable; repeatable |
 | `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow=h1,h2` \| `deny=h1,h2` |
@@ -61,21 +61,32 @@ With no command, `sbx run` opens the project shell:
 
 ### Observing a run (`--observe`)
 
-`--observe` records each process the command spawns inside the cage — so you see what the agent
-runs as it runs. It is read-only, host-side, and **unprivileged** (it polls `/proc`; no `CAP_BPF`,
-no root), and it forces the supervised launch path so a host-side observer can watch the cage for
-its lifetime. Every observed event goes into a per-session ring you can read with
-[`sbx proc logs`](proc.md#logs); on a **non-interactive foreground run** each event is *also*
-echoed inline to **stderr** as a `[sbx:exec]` line.
+`--observe` records what the command does inside the cage — so you see the agent work as it works.
+It is read-only, host-side, and **unprivileged** (no `CAP_BPF`, no root), and it forces the
+supervised launch path so a host-side observer can watch the cage for its lifetime. It stands up two
+lenses, each read from another terminal:
+
+- the **process feed** — every process the command spawns, via a `/proc` poll — read with
+  [`sbx proc logs`](proc.md#logs);
+- the **file-write feed** — every file it creates, writes, deletes, or moves in the project tree,
+  via inotify — read with [`sbx fs logs`](fs.md#logs).
+
+On a **non-interactive foreground run** the process events are *also* echoed inline to **stderr** as
+`[sbx:exec]` lines (the file feed is never inline — it is far too chatty for a run's output).
 
 - Scope: observation runs on any launch — a non-interactive run, an **interactive terminal**, or a
   **detached** (`--detach`) one. Only the inline stderr echo is limited to the non-interactive
   foreground run (an interactive `[sbx:exec]` stream would fight a TUI for the screen, and a
-  detached session has no terminal at all). In both those cases watch the session from another
-  terminal with [`sbx proc logs <id> -f`](proc.md#logs) — which, for a detached run, is the only
-  way to see what it spawns.
-- Honest limit: polling only catches a process that outlives a tick (~300 ms), so very
-  short-lived commands are missed. Precise per-spawn capture (and blocking) is a later increment.
+  detached session has no terminal at all). In every other case watch the session from another
+  terminal with [`sbx proc logs <id> -f`](proc.md#logs) / [`sbx fs logs <id> -f`](fs.md#logs) —
+  which, for a detached run, is the only way to see what it does.
+- Honest limit: the process feed polls, so a process shorter than a tick (~300 ms) is missed; the
+  file feed sees a completed write-and-close, and only in the project tree (not `/tmp`, the store,
+  or the home).
+- For **precise per-exec capture and blocking**, set [`[proc] mode = "enforce"`/`"ask"`](../configuration/proc.md)
+  (a trusted-only security field): the process feed then comes from a seccomp user-notification
+  supervisor that captures every exec exactly and can refuse a denied one before it runs. The
+  `--observe` poll above is the cheap, always-available first cut; `[proc]` is the enforcing one.
 
 ```sh
 sbx run --observe -- ./build.sh

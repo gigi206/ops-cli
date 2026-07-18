@@ -17,6 +17,12 @@ smoke — goes through the same three always-on layers:
 2. **seccomp** — a two-filter syscall denylist (Posture A).
 3. **cgroup v2** — resource limits to bound denial-of-service, best-effort.
 
+Plus one **opt-in, trusted-only** layer: **exec enforcement** via
+[`[proc] mode = "enforce"`/`"ask"`](../configuration/proc.md) — a seccomp
+user-notification gate that blocks a denied `execve` before it runs. It is a
+**guardrail** (it vetoes what an agent *spawns*, not what it does in-process),
+layered on top of the three always-on controls, not a replacement for them.
+
 ## 1. bubblewrap hardening
 
 The base cage is a non-setuid [bubblewrap](https://github.com/containers/bubblewrap)

@@ -160,6 +160,17 @@ pub(crate) fn run(
 /// this session from another terminal; only the inline echo is suppressed, and that decision is made
 /// per launch path where the observer is started (interactive/detached never echo inline). Shared by
 /// `run`/`app`.
+/// Which observation lenses a launch runs, from its resolved `[proc]` policy and the `--observe` flag.
+/// The poll exec lens runs when observation is asked for but enforcement is **not** in effect — an
+/// enforcing launch (`enforce`/`ask`) uses the seccomp user-notification supervisor as its exec source
+/// instead, and that supervisor already owns the proc control socket, so the poll observer must not
+/// also bind it. The inotify fs lens follows the `--observe` flag. Returns `(exec_poll, fs)`.
+fn observation_flags(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> (bool, bool) {
+    let exec_poll = !proc.enforcing()
+        && (observe || matches!(proc.mode, crate::proc_policy::ProcMode::Observe));
+    (exec_poll, observe)
+}
+
 fn warn_observe_interactive(observe: bool, interactive: bool) {
     if observe && interactive {
         crate::diag::warn(
@@ -260,8 +271,16 @@ fn launch_foreground(
         // is true here: this is the non-tty foreground path, the one place the `[sbx:exec]` feed
         // streams to stderr (as well as into the ring `sbx proc logs` reads).
         maybe_guard => {
-            let observer =
-                observe.then(|| super::observe_feed::ProcObs::start(prep.layout.data_dir(), true));
+            let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
+            let observer = (exec_poll || fs).then(|| {
+                super::observe_feed::Observation::start(
+                    prep.layout.data_dir(),
+                    &spec.workdir,
+                    exec_poll,
+                    fs,
+                    true,
+                )
+            });
             let code = run_supervised(&prep.bwrap, &spec, &prep.cfg.limits);
             drop(observer);
             drop(maybe_guard);
@@ -390,8 +409,16 @@ fn detached_child(
     // like a guard, the observer needs a live parent, so it forces the supervised path below even
     // with no guard (a would-be exec-replace becomes fork+wait). `inline` is false: nothing streams
     // to the redirected stderr (the session log).
-    let observer =
-        observe.then(|| super::observe_feed::ProcObs::start(prep.layout.data_dir(), false));
+    let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
+    let observer = (exec_poll || fs).then(|| {
+        super::observe_feed::Observation::start(
+            prep.layout.data_dir(),
+            &spec.workdir,
+            exec_poll,
+            fs,
+            false,
+        )
+    });
 
     match guard {
         None if !observe => {
@@ -1300,6 +1327,9 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 Backend::AppImage(_) => {
                     gcroot_set.contains(format!("appimage-{}", pkg.name).as_str())
                 }
+                Backend::Tarball(_) => {
+                    gcroot_set.contains(format!("tarball-{}", pkg.name).as_str())
+                }
                 // A `flake:` build lands in the project home (like mise), not the store — and a
                 // floating flake has no lock — so the warm out-link is its realized signal.
                 Backend::Flake(_) => {
@@ -2045,6 +2075,23 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         }
     }
 
+    for (name, url) in super::packages::tarball_packages(&prep.cfg.packages) {
+        match super::tarball::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &url,
+        ) {
+            Ok((_, root)) => packages.roots.push(root),
+            Err(e) => {
+                eprintln!("sbx gc: cannot provision tarball package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
         crate::diag::warn(warning);
@@ -2149,8 +2196,16 @@ fn launch_pty_supervised(
     // With observation on, populate the exec ring + control socket so `sbx proc logs`/`sbx proc live`
     // can watch this interactive session from another terminal; held for the whole pty session and
     // torn down on exit. Never inline — this terminal belongs to the agent's TUI.
-    let _observer =
-        observe.then(|| super::observe_feed::ProcObs::start(prep.layout.data_dir(), false));
+    let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
+    let _observer = (exec_poll || fs).then(|| {
+        super::observe_feed::Observation::start(
+            prep.layout.data_dir(),
+            &spec.workdir,
+            exec_poll,
+            fs,
+            false,
+        )
+    });
 
     // The registered pid is this supervisor's own (`Session::current` records `std::process::id()`),
     // which is exactly what `sbx session ls` shows and `sbx session stop` accepts, so the hint names the real id.
@@ -2800,6 +2855,11 @@ pub(crate) struct LaunchGuard {
     /// rather than leaked by an exec — its presence forces the supervised path; dropping it removes
     /// the directory (socket and generated config).
     pub(crate) portal: Option<super::portal::HostDir>,
+    /// The exec-enforcement supervisor (`[proc] mode = enforce|ask`), when one is running. Its
+    /// receive loop is a host thread deciding every notified `execve`, so it must outlive the cage;
+    /// its presence forces the supervised path (a live parent). Dropping it stops the supervisor and
+    /// unlinks the handoff socket.
+    pub(crate) proc_enforce: Option<super::proc_enforce::ProcEnforce>,
 }
 
 impl LaunchGuard {
@@ -2835,6 +2895,9 @@ impl Drop for LaunchGuard {
         }
         if let Some(portal) = self.portal.take() {
             drop(portal);
+        }
+        if let Some(proc_enforce) = self.proc_enforce.take() {
+            drop(proc_enforce);
         }
     }
 }
@@ -2924,6 +2987,31 @@ fn build(
             }
             Err(e) => {
                 eprintln!("sbx: cannot provision appimage package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // `tarball:` packages are provisioned host-side too (the exact `deb:`/`appimage:` shape — a plain
+    // `.tar.gz` is extracted at build time, never self-mounted at runtime): resolve the URL to a hash
+    // (pinned in the per-project lock), build the generated extract+autoPatchelf derivation into sbx's
+    // store, prepend its bin to PATH, and seed its closure. A declared package is a requirement — a
+    // provisioning failure aborts the launch.
+    for (name, url) in super::packages::tarball_packages(&prep.cfg.packages) {
+        match super::tarball::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &url,
+        ) {
+            Ok((bin, root)) => {
+                bin_paths.push(bin);
+                packages.roots.push(root);
+            }
+            Err(e) => {
+                eprintln!("sbx: cannot provision tarball package `{name}` ({url}): {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3215,6 +3303,31 @@ fn build(
     // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
     // up before either install — and both are skipped under `network = "none"`.
     let mut cmd = cmd;
+
+    // Exec enforcement (`[proc] mode = enforce|ask`): stand up the seccomp user-notification
+    // supervisor and wrap the command with the in-cage shim, **innermost** — so only the agent
+    // command and its children are filtered, not the provisioning/egress plumbing wrapped around it
+    // below. Its guard forces the supervised path (a live parent for the supervisor thread).
+    // Fail-closed: if the supervisor cannot be stood up, the launch is refused rather than running the
+    // command unenforced.
+    let mut proc_enforce_guard = None;
+    let mut proc_binds: Vec<binds::ExtraBind> = Vec::new();
+    if prep.cfg.proc.enforcing() {
+        let sbx_exe = std::env::current_exe().map_err(|e| {
+            eprintln!("sbx: cannot locate the sbx binary for exec enforcement: {e}");
+            ExitCode::FAILURE
+        })?;
+        let (guard, wiring) =
+            super::proc_enforce::start(prep.layout.data_dir(), &sbx_exe, prep.cfg.proc.clone())
+                .map_err(|e| {
+                    eprintln!("sbx: cannot start exec enforcement: {e}");
+                    ExitCode::FAILURE
+                })?;
+        cmd = super::proc_enforce::wrap_command(cmd);
+        proc_binds = wiring.binds;
+        proc_enforce_guard = Some(guard);
+    }
+
     let mut autoequip_env: Vec<(String, String)> = Vec::new();
     let global_mise = super::packages::mise_packages(&prep.cfg.packages);
     let auto_equip = auto_equip_tokens(&prep.cfg);
@@ -3588,6 +3701,7 @@ fn build(
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(inline_flake_binds);
+    extra_binds.extend(proc_binds);
 
     // Pin sbx's own control plane in place whenever a read-write bind contains it: each root's host
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
@@ -3671,13 +3785,18 @@ fn build(
         eprintln!("sbx: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
-    let guard = if egress_guard.is_some() || forward_guard.is_some() || portal_host.is_some() {
+    let guard = if egress_guard.is_some()
+        || forward_guard.is_some()
+        || portal_host.is_some()
+        || proc_enforce_guard.is_some()
+    {
         Some(LaunchGuard {
             egress: egress_guard,
             forward: forward_guard,
             notify: notify_relay,
             theme: theme_relay,
             portal: portal_host,
+            proc_enforce: proc_enforce_guard,
         })
     } else {
         None
@@ -4836,6 +4955,8 @@ mod tests {
             egress_stats: true,
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gpu: false,
             audio: false,
             dbus: false,
@@ -4909,6 +5030,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         }

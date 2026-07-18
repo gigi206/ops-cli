@@ -131,7 +131,8 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
             | Backend::Flake(_)
             | Backend::FlakeInline { .. }
             | Backend::Deb(_)
-            | Backend::AppImage(_) => None,
+            | Backend::AppImage(_)
+            | Backend::Tarball(_) => None,
         })
         .collect()
 }
@@ -152,7 +153,8 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Mise(_)
             | Backend::FlakeInline { .. }
             | Backend::Deb(_)
-            | Backend::AppImage(_) => None,
+            | Backend::AppImage(_)
+            | Backend::Tarball(_) => None,
         })
         .collect()
 }
@@ -171,6 +173,28 @@ pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Mise(_)
             | Backend::Flake(_)
             | Backend::FlakeInline { .. }
+            | Backend::AppImage(_)
+            | Backend::Tarball(_) => None,
+        })
+        .collect()
+}
+
+/// The `(name, url)` of the *admitted* `tarball:` packages — the ones the launcher provisions
+/// host-side (resolve the URL to a hash, then build a generated `tar -xz`-extract+autoPatchelf
+/// derivation). Trusted-only, exactly like the other backends: an untrusted project's `tarball:`
+/// package is dropped here. The name keys the per-package gcroot; the url is the `.tar.gz` source
+/// sbx resolves and fetches.
+pub(crate) fn tarball_packages(packages: &[Package]) -> Vec<(String, String)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::Tarball(url) => Some((p.name.clone(), url.clone())),
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::Flake(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_)
             | Backend::AppImage(_) => None,
         })
         .collect()
@@ -191,7 +215,8 @@ pub(crate) fn appimage_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Mise(_)
             | Backend::Flake(_)
             | Backend::FlakeInline { .. }
-            | Backend::Deb(_) => None,
+            | Backend::Deb(_)
+            | Backend::Tarball(_) => None,
         })
         .collect()
 }
@@ -214,7 +239,8 @@ pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String
             | Backend::Mise(_)
             | Backend::Flake(_)
             | Backend::Deb(_)
-            | Backend::AppImage(_) => None,
+            | Backend::AppImage(_)
+            | Backend::Tarball(_) => None,
         })
         .collect()
 }
@@ -243,6 +269,14 @@ mod tests {
         Package {
             name: name.to_string(),
             backend: Backend::Flake(reference.to_string()),
+            state,
+        }
+    }
+
+    fn tarball_package(name: &str, url: &str, state: TrustState) -> Package {
+        Package {
+            name: name.to_string(),
+            backend: Backend::Tarball(url.to_string()),
             state,
         }
     }
@@ -345,6 +379,20 @@ mod tests {
             mise_packages(&pkgs_with_flake),
             vec!["aqua:example/demo-tool".to_string()],
             "a flake package is not a mise token"
+        );
+    }
+
+    #[test]
+    fn tarball_packages_returns_only_trusted_urls_by_name() {
+        let pkgs = [
+            tarball_package("app", "https://e/app.tar.gz", TrustState::Trusted),
+            package("node", "nodejs_20", TrustState::Trusted), // a nix package is not a tarball
+            tarball_package("evil", "https://e/evil.tar.gz", TrustState::Untrusted), // dropped
+        ];
+        assert_eq!(
+            tarball_packages(&pkgs),
+            vec![("app".to_string(), "https://e/app.tar.gz".to_string())],
+            "only the trusted tarball url, keyed by name; nix and untrusted are excluded"
         );
     }
 

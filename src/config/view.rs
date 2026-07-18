@@ -51,6 +51,10 @@ pub(crate) struct ConfigView {
     /// Whether the egress proxy records `sbx net stats` (on by default; off via `[network] stats =
     /// false`). Only meaningful under a filtering posture (the proxy runs only then).
     pub(crate) egress_stats: bool,
+    /// The resolved process/exec posture.
+    pub(crate) proc: ProcView,
+    /// Which layer supplied the proc posture (`Default` when neither config set it).
+    pub(crate) proc_origin: ProvenanceView,
     /// The resolved GUI posture.
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
@@ -385,6 +389,24 @@ pub(crate) enum GuiView {
     Wayland,
 }
 
+/// The resolved process/exec posture, for `sbx config show`.
+#[derive(Serialize, Default)]
+pub(crate) struct ProcView {
+    /// `off` / `observe` / `enforce` / `ask`.
+    pub(crate) mode: String,
+    pub(crate) allow: Vec<String>,
+    pub(crate) deny: Vec<String>,
+}
+
+/// Project a resolved [`crate::proc_policy::ProcPolicy`] into its view.
+pub(crate) fn proc_view(p: &crate::proc_policy::ProcPolicy) -> ProcView {
+    ProcView {
+        mode: p.mode.as_str().to_string(),
+        allow: p.allow.iter().map(|r| r.as_str().to_string()).collect(),
+        deny: p.deny.iter().map(|r| r.as_str().to_string()).collect(),
+    }
+}
+
 /// The cage's effective cgroup resource limits: the throttle threshold, the hard memory ceiling,
 /// and the task cap, each its config override when set or sbx's built-in default otherwise.
 #[derive(Serialize, Default)]
@@ -543,6 +565,9 @@ pub(crate) struct AppDetailView {
     /// The effective network posture (the app's own, else the baseline's).
     pub(crate) network: NetworkView,
     pub(crate) network_origin: ProvenanceView,
+    /// The effective process/exec posture (the app's own, else the baseline's).
+    pub(crate) proc: ProcView,
+    pub(crate) proc_origin: ProvenanceView,
     /// The effective GUI posture (the app's own, else the baseline's).
     pub(crate) gui: GuiView,
     pub(crate) gui_origin: ProvenanceView,
@@ -661,6 +686,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     let mut flake_pins = sandbox::flake_pinned_revs(cwd);
     flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
     flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
+    flake_pins.extend(sandbox::tarball_pinned_hashes(cwd));
 
     let packages = resolved
         .packages
@@ -725,6 +751,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         network,
         network_origin: resolved.network_origin.into(),
         egress_stats: resolved.egress_stats,
+        proc: proc_view(&resolved.proc),
+        proc_origin: resolved.proc_origin.into(),
         gui,
         gui_origin: resolved.gui_origin.into(),
         gpu: resolved.gpu,
@@ -762,6 +790,7 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
         Backend::FlakeInline { .. } => "in-cage via nix build (inline flake)",
         Backend::Deb(_) => "host-side from prebuilt .deb, durable",
         Backend::AppImage(_) => "host-side from prebuilt AppImage, durable",
+        Backend::Tarball(_) => "host-side from prebuilt tarball, durable",
     };
     let trusted = p.state == TrustState::Trusted;
     PackageView {
@@ -782,9 +811,11 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
 /// lock).
 fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) -> Option<String> {
     match backend {
-        // Flake refs and deb/appimage URLs are all looked up by locator in the merged pin map.
+        // Flake refs and deb/appimage/tarball URLs are all looked up by locator in the merged pin map.
         Backend::Flake(reference) => flake_pins.get(reference).cloned(),
-        Backend::Deb(url) | Backend::AppImage(url) => flake_pins.get(url).cloned(),
+        Backend::Deb(url) | Backend::AppImage(url) | Backend::Tarball(url) => {
+            flake_pins.get(url).cloned()
+        }
         // An inline flake floats — no persisted lock, so nothing to show.
         Backend::Nix(_) | Backend::Mise(_) | Backend::FlakeInline { .. } => None,
     }
@@ -1052,6 +1083,7 @@ pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> 
     let mut flake_pins = sandbox::flake_pinned_revs(cwd);
     flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
     flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
+    flake_pins.extend(sandbox::tarball_pinned_hashes(cwd));
     Some(app_detail_view(cwd, name, app, &resolved, &flake_pins))
 }
 
@@ -1080,6 +1112,9 @@ fn app_detail_view(
     }
     let network = network_view(&eff_network);
     let network_origin = origin_or_inherited(app.network.is_some(), app.network_origin);
+    let eff_proc = app.proc.clone().unwrap_or_else(|| baseline.proc.clone());
+    let proc = proc_view(&eff_proc);
+    let proc_origin = origin_or_inherited(app.proc.is_some(), app.proc_origin);
     let eff_gui = app.gui.unwrap_or(baseline.gui);
     let gui = match eff_gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
@@ -1180,6 +1215,8 @@ fn app_detail_view(
             .map_or(ProvenanceView::Default, Into::into),
         network,
         network_origin,
+        proc,
+        proc_origin,
         gui,
         gui_origin,
         gpu: eff_gpu,
@@ -1418,6 +1455,8 @@ mod tests {
             },
             network_origin: ProvenanceView::Project,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
             gpu: true,
@@ -1620,6 +1659,8 @@ mod tests {
             packages: vec![flake],
             network: None,
             gui: None,
+            proc: None,
+            proc_origin: Default::default(),
             gpu: None,
             audio: None,
             dbus: None,
@@ -1706,6 +1747,8 @@ mod tests {
             dbus_origin: Provenance::Default,
             forward: vec![9090],
             forward_origin: Provenance::Global,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             limits: sandbox::cgroup::Limits {
                 memory_high: Some("50%".into()),
                 memory_max: None,
@@ -1751,6 +1794,8 @@ mod tests {
             // The app adds its own port; the baseline's 9090 must survive the union.
             forward: vec![1455],
             secrets: vec![],
+            proc: None,
+            proc_origin: Default::default(),
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Provenance::Global,
             network_origin: Provenance::Global,

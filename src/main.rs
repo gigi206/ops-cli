@@ -16,6 +16,7 @@ mod pathfind;
 mod paths;
 mod plugin_store;
 mod plugins;
+mod proc_policy;
 mod sandbox;
 mod session;
 mod store;
@@ -59,6 +60,10 @@ fn main() -> ExitCode {
     }
 
     match name {
+        // Internal: the in-cage exec-enforcement shim. Runs inside the cage (sbx is bound read-only
+        // there), installs the seccomp user-notification filter, hands the listener fd to the host
+        // supervisor, and execs the real command. Never invoked by a user directly.
+        "__proc-shim" => sandbox::proc_enforce::run_shim(&rest),
         "doctor" => doctor(),
         "session" | "sessions" => session_cmd(rest),
         "trust" => trust_cmd(rest),
@@ -122,6 +127,7 @@ fn main() -> ExitCode {
         "test" => test_cmd(rest),
         "net" => net_cmd(rest),
         "proc" => proc_cmd(rest),
+        "fs" => fs_cmd(rest),
         "plugins" => plugins_cmd(rest),
         other => {
             eprintln!("sbx: unknown command '{other}'");
@@ -553,6 +559,7 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
         Some("ls") | Some("list") => proc_ls(&args[1..]),
         Some("live") => proc_live(&args[1..]),
         Some("logs") | Some("log") => proc_logs(&args[1..]),
+        Some("pending") => proc_pending(&args[1..]),
         None => {
             eprint!("{}", help::page_usage(&["proc"]).unwrap_or_default());
             ExitCode::from(2)
@@ -565,19 +572,139 @@ fn proc_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// Resolve the session a `proc` subcommand acts on: an explicit PID (a 0-or-1 match among the live
-/// set), or the sole live session when no id is given. On ambiguity or absence it prints guidance
-/// and returns the exit code the caller should propagate.
-fn resolve_proc_target<'a>(
+/// `sbx proc pending [allow|deny <id>]`: list the `execve`s an `ask`-mode session has parked awaiting a
+/// decision, or decide one by its id. An id is `<session-pid>.<notif-id>` (as the listing shows), or
+/// `<session-pid>.*` to decide every parked `execve` in that session at once.
+fn proc_pending(args: &[OsString]) -> ExitCode {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("allow") => proc_pending_answer(&args[1..], true),
+        Some("deny") => proc_pending_answer(&args[1..], false),
+        _ => proc_pending_list(args),
+    }
+}
+
+/// List every parked `execve` across the live observed sessions.
+fn proc_pending_list(args: &[OsString]) -> ExitCode {
+    if let Some(a) = args
+        .iter()
+        .find(|a| a.to_str().is_none_or(|s| s.starts_with('-')))
+    {
+        eprintln!("sbx: proc pending: unexpected argument {a:?}");
+        return ExitCode::from(2);
+    }
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sbx: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut any = false;
+    for s in &sessions {
+        let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), s.pid);
+        let parked = sandbox::proc_control::read_pending(&socket).unwrap_or_default();
+        for p in parked {
+            if !any {
+                println!("{h}parked exec — awaiting a decision{r}");
+                any = true;
+            }
+            println!(
+                "  {}.{}  {dim}pid {} · {}s{r}  {}",
+                s.pid, p.id, p.pid, p.waiting_secs, p.path
+            );
+        }
+    }
+    if !any {
+        println!("{dim}no exec is parked awaiting a decision.{r}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Decide one (or, with `*`, all) parked `execve` by id `<session-pid>.<notif-id>`.
+fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
+    let Some(id) = args.first().and_then(|a| a.to_str()) else {
+        eprintln!("sbx: proc pending {}: an id is required (`<session-pid>.<notif-id>`, or `<session-pid>.*`)", if allow { "allow" } else { "deny" });
+        return ExitCode::from(2);
+    };
+    let Some((pid_s, notif_s)) = id.split_once('.') else {
+        eprintln!(
+            "sbx: proc pending: id must be `<session-pid>.<notif-id>` (from `sbx proc pending`)"
+        );
+        return ExitCode::from(2);
+    };
+    let Ok(pid) = pid_s.parse::<u32>() else {
+        eprintln!("sbx: proc pending: `{pid_s}` is not a session pid");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), pid);
+    let verb = if allow { "allowed" } else { "denied" };
+    if notif_s == "*" {
+        match sandbox::proc_control::answer_all_pending(&socket, allow) {
+            Ok(paths) if !paths.is_empty() => {
+                for p in paths {
+                    println!("{verb} {p}");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(_) => {
+                eprintln!("sbx: proc pending: nothing parked in session {pid}");
+                ExitCode::from(2)
+            }
+            Err(_) => {
+                eprintln!("sbx: proc pending: session {pid} is not enforcing (no control socket)");
+                ExitCode::from(2)
+            }
+        }
+    } else {
+        let Ok(notif_id) = notif_s.parse::<u64>() else {
+            eprintln!("sbx: proc pending: `{notif_s}` is not a notification id");
+            return ExitCode::from(2);
+        };
+        match sandbox::proc_control::answer_pending(&socket, notif_id, allow) {
+            Ok(Some(path)) => {
+                println!("{verb} {path}");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                eprintln!(
+                    "sbx: proc pending: no parked exec `{id}` (already decided or timed out)"
+                );
+                ExitCode::from(2)
+            }
+            Err(_) => {
+                eprintln!("sbx: proc pending: session {pid} is not enforcing (no control socket)");
+                ExitCode::from(2)
+            }
+        }
+    }
+}
+
+/// Resolve the session a `proc`/`fs` subcommand acts on: an explicit PID (a 0-or-1 match among the
+/// live set), or the sole live session when no id is given. On ambiguity or absence it prints guidance
+/// (tagged with `verb`) and returns the exit code the caller should propagate.
+fn resolve_session_target<'a>(
     sessions: &'a [session::Session],
     id: Option<&str>,
+    verb: &str,
 ) -> Result<&'a session::Session, ExitCode> {
     match id {
         Some(id) => sessions
             .iter()
             .find(|s| s.pid.to_string() == id)
             .ok_or_else(|| {
-                eprintln!("sbx: proc: no live session '{id}' — run `sbx session ls` to list them.");
+                eprintln!(
+                    "sbx: {verb}: no live session '{id}' — run `sbx session ls` to list them."
+                );
                 ExitCode::from(2)
             }),
         None => match sessions {
@@ -588,7 +715,7 @@ fn resolve_proc_target<'a>(
             }
             many => {
                 eprintln!(
-                    "sbx: proc: {} live sessions — name one by its PID:",
+                    "sbx: {verb}: {} live sessions — name one by its PID:",
                     many.len()
                 );
                 for s in many {
@@ -640,7 +767,7 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
         }
     };
 
-    let target = match resolve_proc_target(&sessions, id) {
+    let target = match resolve_session_target(&sessions, id, "proc") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -758,7 +885,7 @@ fn proc_live(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let target = match resolve_proc_target(&sessions, parsed.id.as_deref()) {
+    let target = match resolve_session_target(&sessions, parsed.id.as_deref(), "proc") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -857,7 +984,7 @@ fn proc_logs(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let target = match resolve_proc_target(&sessions, id) {
+    let target = match resolve_session_target(&sessions, id, "proc") {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -968,13 +1095,209 @@ fn write_exec_event(
             "seq": e.seq,
             "at_epoch_ms": e.at_epoch_ms as u64,
             "pid": e.pid,
+            "verdict": e.verdict,
             "command": e.command,
         });
         writeln!(out, "{obj}")
     } else {
         let (dim, r) = (pal.dim, pal.reset);
         let time = format_log_time(e.at_epoch_ms);
-        writeln!(out, "  {dim}{time}{r}  {}  {}", e.pid, e.command)
+        // Colour the enforcement verdict: allow=ok, deny=err, ask=warn; the poll `observe` tag is dim
+        // (it records what ran, not a decision). A short, fixed-width column so the paths align.
+        let hue = match e.verdict.as_str() {
+            "allow" => pal.ok,
+            "deny" => pal.err,
+            "ask" => pal.warn,
+            _ => pal.dim,
+        };
+        writeln!(
+            out,
+            "  {dim}{time}{r}  {hue}{:<7}{r} {}  {}",
+            e.verdict, e.pid, e.command
+        )
+    }
+}
+
+/// `sbx fs <subcommand>`: observe the files a running session writes in its project tree. Currently
+/// one subcommand, `logs`; `log` is accepted as an alias.
+fn fs_cmd(args: Vec<OsString>) -> ExitCode {
+    if let Some(code) = help::maybe_help("fs", &args) {
+        return code;
+    }
+    match args.first().and_then(|a| a.to_str()) {
+        Some("logs") | Some("log") => fs_logs(&args[1..]),
+        None => {
+            eprint!("{}", help::page_usage(&["fs"]).unwrap_or_default());
+            ExitCode::from(2)
+        }
+        Some(other) => {
+            eprintln!("sbx: fs: unknown subcommand `{other}`");
+            eprintln!("       run `sbx help fs` for usage.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `sbx fs logs [<id>] [-f|--follow] [--json]`: read the file-write feed of a running session — the
+/// files the agent creates, writes, deletes, or moves in its project tree, observed host-side with
+/// inotify (no privilege, no cage cooperation). `<id>` is the PID `sbx session ls` shows; with no id
+/// the sole live session is used. Only a session launched with `--observe` has a feed; a session
+/// without one is reported as unobserved (distinct from an empty feed). `--follow` streams new events
+/// until the session ends; `--json` emits one NDJSON object per event.
+fn fs_logs(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    let mut follow = false;
+    let mut id: Option<&str> = None;
+    for a in args {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some("-f") | Some("--follow") => follow = true,
+            Some(s) if !s.starts_with('-') => {
+                if id.is_some() {
+                    eprintln!("sbx: fs logs: at most one session id");
+                    return ExitCode::from(2);
+                }
+                id = Some(s);
+            }
+            other => {
+                eprintln!(
+                    "sbx: fs logs: unexpected argument {:?}",
+                    other.unwrap_or_default()
+                );
+                eprint!("{}", help::page_usage(&["fs", "logs"]).unwrap_or_default());
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(layout) = store::Layout::from_env() else {
+        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        return ExitCode::FAILURE;
+    };
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sbx: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let target = match resolve_session_target(&sessions, id, "fs") {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let socket = sandbox::fs_control::fs_control_socket(layout.data_dir(), target.pid);
+
+    // The first read is a tail of the whole retained window. A connect failure means this session was
+    // not launched with observation on — there is no ring to read, distinct from an empty one.
+    let first = match sandbox::fs_control::read_fs_log(&socket, None) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!(
+                "sbx: fs logs: session {} is not being observed — relaunch it with `--observe` to \
+                 record the files it writes.",
+                target.pid
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    use std::io::Write as _;
+
+    // Write the header and the tail batch through a locked, error-checked stdout: a closed downstream
+    // pipe (`… | head`) ends the view cleanly (exit 0) rather than panicking on the broken pipe (Rust
+    // ignores SIGPIPE, so a bare `println!` would panic on EPIPE) — the pattern `sbx proc logs` uses.
+    {
+        let mut out = std::io::stdout().lock();
+        let wrote = (|| -> std::io::Result<()> {
+            if !json {
+                let (h, r) = (pal.head, pal.reset);
+                writeln!(
+                    out,
+                    "{h}file-write feed — session {} [{}] {}{r}",
+                    target.pid,
+                    target.label(),
+                    target.project.display()
+                )?;
+            }
+            for e in &first.events {
+                write_fs_event(&mut out, target.pid, e, json, &pal)?;
+            }
+            out.flush()
+        })();
+        if wrote.is_err() {
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    if !follow {
+        return ExitCode::SUCCESS;
+    }
+
+    // Follow: poll past the cursor until the session ends. The observer unlinks its socket on drop, so
+    // a connect failure after the first successful read is the clean end-of-session signal (a local UDS
+    // connect does not fail transiently); Ctrl+C stops it, and a closed downstream pipe ends it too.
+    let mut cursor = first.head;
+    loop {
+        std::thread::sleep(Duration::from_millis(400));
+        let snap = match sandbox::fs_control::read_fs_log(&socket, Some(cursor)) {
+            Ok(s) => s,
+            Err(_) => {
+                if !json {
+                    let mut out = std::io::stdout().lock();
+                    let (dim, r) = (pal.dim, pal.reset);
+                    let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
+                }
+                return ExitCode::SUCCESS;
+            }
+        };
+        let mut out = std::io::stdout().lock();
+        let wrote = (|| -> std::io::Result<()> {
+            if snap.dropped > 0 && !json {
+                let (dim, r) = (pal.dim, pal.reset);
+                writeln!(
+                    out,
+                    "  {dim}({} earlier event(s) evicted from the ring before this poll){r}",
+                    snap.dropped
+                )?;
+            }
+            for e in &snap.events {
+                write_fs_event(&mut out, target.pid, e, json, &pal)?;
+            }
+            out.flush()
+        })();
+        drop(out);
+        if wrote.is_err() {
+            // A closed downstream pipe (`… | head`) ends the follow cleanly.
+            return ExitCode::SUCCESS;
+        }
+        cursor = snap.head;
+    }
+}
+
+/// Write one filesystem event to `out`: a human line (`hh:mm:ss  kind    path`) or a JSON object (one
+/// per line, so a `--follow` stream is valid NDJSON). Returns the write result so the caller ends
+/// cleanly on a closed downstream pipe rather than panicking. Shared by the tail and follow reads.
+fn write_fs_event(
+    out: &mut impl std::io::Write,
+    session_pid: u32,
+    e: &sandbox::fs_control::FsEvent,
+    json: bool,
+    pal: &style::Palette,
+) -> std::io::Result<()> {
+    if json {
+        let obj = serde_json::json!({
+            "session_pid": session_pid,
+            "seq": e.seq,
+            "at_epoch_ms": e.at_epoch_ms as u64,
+            "kind": e.kind.token(),
+            "path": e.path,
+        });
+        writeln!(out, "{obj}")
+    } else {
+        let (dim, r) = (pal.dim, pal.reset);
+        let time = format_log_time(e.at_epoch_ms);
+        writeln!(out, "  {dim}{time}{r}  {:<6}  {}", e.kind.token(), e.path)
     }
 }
 
@@ -1778,6 +2101,28 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
     }
 
+    // The process/exec posture — shown only when the lens is on, so an unenforced config stays
+    // uncluttered. `--details` lists the allow/deny exec-target rules.
+    if view.proc.mode != "off" {
+        let p = &view.proc;
+        let _ = writeln!(
+            o,
+            "  {h}proc:{r} {} {dim}({} allow, {} deny){r}{}",
+            p.mode,
+            p.allow.len(),
+            p.deny.len(),
+            provenance_tag(view.proc_origin, pal)
+        );
+        if details {
+            for rule in &p.allow {
+                let _ = writeln!(o, "      {dim}allow{r} {rule}");
+            }
+            for rule in &p.deny {
+                let _ = writeln!(o, "      {dim}deny{r}  {rule}");
+            }
+        }
+    }
+
     // The GUI posture — shown only when opened (`wayland`), so a non-GUI config stays uncluttered.
     if matches!(view.gui, GuiView::Wayland) {
         let _ = writeln!(
@@ -2271,6 +2616,16 @@ fn render_app_detail(
             }
         }
     }
+
+    // The effective process/exec posture — shown even when `off`, so the inherited story is visible.
+    let proc_tag = app_provenance_tag(view.proc_origin, pal);
+    let _ = writeln!(
+        o,
+        "  {h}proc:{r}    {} {dim}({} allow, {} deny){r}{proc_tag}",
+        view.proc.mode,
+        view.proc.allow.len(),
+        view.proc.deny.len()
+    );
 
     // The effective GUI posture — shown even when `none`, so the inherited story is visible.
     let gui_tag = app_provenance_tag(view.gui_origin, pal);
@@ -9218,10 +9573,10 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     let what = match args.first() {
         None => "all",
         Some(arg) => match arg.to_str() {
-            Some(w @ ("all" | "nix" | "mise" | "flake" | "deb" | "appimage")) => w,
+            Some(w @ ("all" | "nix" | "mise" | "flake" | "deb" | "appimage" | "tarball")) => w,
             _ => {
                 eprintln!(
-                    "sbx: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage)",
+                    "sbx: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage, tarball)",
                     arg.to_string_lossy()
                 );
                 return ExitCode::from(2);
@@ -9296,6 +9651,11 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // The project's and apps' `appimage:` `[packages]` re-resolve their `.AppImage` URL to a new
         // content hash and the per-project appimage lock is rewritten — the exact `deb:` shape.
         ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, &pal);
+    }
+    if matches!(what, "tarball" | "all") {
+        // The project's and apps' `tarball:` `[packages]` re-resolve their `.tar.gz` URL to a new
+        // content hash and the per-project tarball lock is rewritten — the exact `deb:` shape.
+        ok &= upgrade_tarball_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
     // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
     // project's store is already holding superseded builds — cheap, filesystem-only, and silent
@@ -9883,6 +10243,85 @@ fn appimage_upgrade_summary(
             }
             Failed { url, error } => {
                 format!("  {n}appimage:{url}{r}: {err}re-resolve failed{r} — {error}")
+            }
+        });
+    }
+    if withheld > 0 {
+        lines.push(withheld_note());
+    }
+    lines
+}
+
+fn upgrade_tarball_packages(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+    pal: &style::Palette,
+) -> bool {
+    let outcomes = match sandbox::upgrade_tarball(nix, layout, cwd, cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("sbx: cannot roll the tarball packages: {e}");
+            return false;
+        }
+    };
+    for line in tarball_upgrade_summary(&outcomes, sandbox::withheld_tarball_packages(cfg), pal) {
+        println!("{line}");
+    }
+    !outcomes
+        .iter()
+        .any(|o| matches!(o, sandbox::TarballUpgrade::Failed { .. }))
+}
+
+/// The human-readable summary of a tarball roll — the `deb:`/`appimage:` twin (one line per declared
+/// URL: newly pinned, rolled, unchanged, or failed; plus the entries pruned and a withheld note).
+/// Pure, so every outcome is unit-tested without invoking nix.
+fn tarball_upgrade_summary(
+    outcomes: &[sandbox::TarballUpgrade],
+    withheld: usize,
+    pal: &style::Palette,
+) -> Vec<String> {
+    use sandbox::TarballUpgrade::*;
+    let (h, n, ok, warn, err, dim, r) = (
+        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
+    );
+    let mut lines = vec![format!("{h}sbx upgrade — tarball packages{r}")];
+    let withheld_note = || {
+        format!(
+            "  {warn}{withheld} tarball: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+        )
+    };
+    if outcomes.is_empty() {
+        lines.push(if withheld > 0 {
+            withheld_note()
+        } else {
+            format!("  {dim}no tarball: packages to roll.{r}")
+        });
+        return lines;
+    }
+    for outcome in outcomes {
+        lines.push(match outcome {
+            Unchanged { url, hash } => format!(
+                "  {n}tarball:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
+                short_hash(hash)
+            ),
+            Rolled { url, from, to } => format!(
+                "  {n}tarball:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
+                short_hash(from),
+                short_hash(to)
+            ),
+            Pinned { url, hash } => format!(
+                "  {n}tarball:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
+                short_hash(hash)
+            ),
+            Pruned { url } => {
+                format!(
+                    "  {n}tarball:{url}{r}: {dim}removed from the lock (no longer declared).{r}"
+                )
+            }
+            Failed { url, error } => {
+                format!("  {n}tarball:{url}{r}: {err}re-resolve failed{r} — {error}")
             }
         });
     }
@@ -11838,6 +12277,8 @@ mod tests {
             egress_stats: true,
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gpu: false,
             audio: false,
             dbus: false,
@@ -12192,6 +12633,55 @@ mod tests {
     }
 
     #[test]
+    fn tarball_upgrade_summary_distinguishes_the_outcomes() {
+        use sandbox::TarballUpgrade::*;
+
+        // an empty roll (no tarball: packages) says so plainly; an untrusted one names the withheld
+        let empty = tarball_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.contains("no tarball: packages"));
+        let withheld = tarball_upgrade_summary(&[], 1, &style::Palette::plain()).join("\n");
+        assert!(withheld.contains("1 tarball: package(s) withheld (untrusted)"));
+        assert!(!withheld.contains("no tarball: packages"));
+
+        let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
+        let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
+        let text = tarball_upgrade_summary(
+            &[
+                Unchanged {
+                    url: "https://e/a.tar.gz".into(),
+                    hash: h_a.into(),
+                },
+                Rolled {
+                    url: "https://e/b.tar.gz".into(),
+                    from: h_a.into(),
+                    to: h_b.into(),
+                },
+                Pinned {
+                    url: "https://e/c.tar.gz".into(),
+                    hash: h_b.into(),
+                },
+                Pruned {
+                    url: "https://e/old.tar.gz".into(),
+                },
+                Failed {
+                    url: "https://e/d.tar.gz".into(),
+                    error: "prefetch unreachable".into(),
+                },
+            ],
+            0,
+            &style::Palette::plain(),
+        )
+        .join("\n");
+        assert!(text.contains("tarball:https://e/a.tar.gz: jBGtMS5l — unchanged"));
+        assert!(text.contains("tarball:https://e/b.tar.gz: jBGtMS5l → XH0ykkcZ — rolled forward"));
+        assert!(text.contains("tarball:https://e/c.tar.gz: XH0ykkcZ — newly pinned"));
+        assert!(text.contains("tarball:https://e/old.tar.gz: removed from the lock"));
+        assert!(
+            text.contains("tarball:https://e/d.tar.gz: re-resolve failed — prefetch unreachable")
+        );
+    }
+
+    #[test]
     fn transactional_confirmations_are_plain_text_when_uncolored() {
         // The OFF path the integration capture and the existing substring assertions rely on:
         // empty spans, byte-identical plain text. Each line of the original wording is preserved.
@@ -12392,6 +12882,8 @@ mod tests {
             },
             network_origin: ProvenanceView::Project,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
@@ -12581,6 +13073,8 @@ mod tests {
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,
+            proc: ProcView::default(),
+            proc_origin: ProvenanceView::Inherited,
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
             gpu: false,
@@ -12854,6 +13348,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
@@ -12947,6 +13443,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
@@ -13074,6 +13572,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
@@ -13142,6 +13642,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
@@ -13246,6 +13748,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
@@ -13350,6 +13854,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,

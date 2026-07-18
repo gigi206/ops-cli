@@ -799,6 +799,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
             home_scope_origin: None,
             warnings: vec![],
         }
@@ -822,6 +824,8 @@ mod tests {
             egress_stats: true,
             gui: crate::config::GuiPolicy::default(),
             gui_origin: Default::default(),
+            proc: Default::default(),
+            proc_origin: Default::default(),
             gpu: false,
             audio: false,
             dbus: false,

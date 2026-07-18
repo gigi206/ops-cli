@@ -57,6 +57,14 @@ pub(crate) struct RawConfig {
     /// trusted project, ignored from an untrusted one, since narrowing or widening the network is a
     /// confidentiality choice an untrusted project may not make.
     pub(crate) network: Option<NetworkField>,
+    /// The process/exec observation-and-enforcement posture. Either a bare mode string — `"off"`
+    /// (the default), `"observe"` (capture spawns via a `/proc` poll, no blocking), `"enforce"`
+    /// (block `deny` exec targets before the syscall runs, allow everything else — a denylist), or
+    /// `"ask"` (block `deny`, allow `allow`, park an unmatched target for a live `sbx proc allow`/
+    /// `deny`) — or a table adding the `allow`/`deny` exec-target lists. A security field: honored
+    /// from the global config or a trusted project, ignored from an untrusted one — an untrusted
+    /// project may neither forge nor loosen the enforcement of its own agent.
+    pub(crate) proc: Option<ProcField>,
     /// The sandbox's GUI posture: `"none"` (the default — no display access) or `"wayland"`
     /// (bind the host's Wayland compositor socket read-only so a graphical app can map a
     /// window). A security field — honored from the global config or a trusted project,
@@ -292,6 +300,8 @@ pub(crate) struct RawApp {
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
+    /// The app's process/exec posture, overriding the baseline's when set. A security field.
+    pub(crate) proc: Option<ProcField>,
     /// The app's GUI posture, overriding the baseline's when set. A security field, like the
     /// baseline `gui`. An unset `Option` is omitted by TOML on export, so an app with no GUI
     /// need carries no `gui` line.
@@ -575,6 +585,36 @@ pub(crate) struct NetworkTable {
     /// (Mode A) stays all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_methods: Option<Vec<String>>,
+}
+
+/// The two shapes the `proc` field accepts: a bare mode string, or a table for the exec-target
+/// lists. An untagged enum so both TOML forms parse — `proc = "observe"` and
+/// `[proc] mode = "enforce"` with `allow`/`deny` — keeping the simple case a one-liner. The string
+/// case must come first for serde untagged to prefer it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum ProcField {
+    /// `proc = "off"` | `"observe"` | `"enforce"` | `"ask"`.
+    Mode(String),
+    /// `[proc] mode = "<mode>"` with optional `allow`/`deny` exec-target lists.
+    Table(ProcTable),
+}
+
+/// The table form of the `proc` field: a mode plus the exec-target lists. Under `enforce` a `deny`
+/// target is blocked and everything else runs (a denylist); under `ask` a `deny` target is blocked,
+/// an `allow` target runs, and an unmatched target parks. `deny` always wins. Each entry is a
+/// shell-style glob matching the exec path (a rule with `/`) or its basename (a rule without) —
+/// `curl`, `ssh`, `/usr/bin/*`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ProcTable {
+    /// The exec mode. Absent means "inherit the mode from the parent config layer" while keeping this
+    /// table's own `allow`/`deny` rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
+    #[serde(default)]
+    pub(crate) allow: Vec<String>,
+    #[serde(default)]
+    pub(crate) deny: Vec<String>,
 }
 
 /// Parse config bytes as TOML. The error is a human-readable string: the loader

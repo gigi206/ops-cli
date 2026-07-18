@@ -1,22 +1,25 @@
-//! In-supervisor exec-activity observer — the host-side half of process observation.
+//! In-supervisor observation — the host-side half of process and filesystem observation.
 //!
 //! When observation is on, the launch is forced onto a supervised path (a parent that outlives the
-//! cage), and this module runs a background thread there. It polls the cage's process set from `/proc`
-//! on a short interval, diffs successive snapshots, and for each newly-seen process pushes an event
-//! into the exec ring — read out-of-band by `sbx proc logs` over a per-session control socket — and,
+//! cage), and observation runs from there. The **exec lens** (this module's [`ExecObserver`]) polls the
+//! cage's process set from `/proc` on a short interval, diffs successive snapshots, and for each
+//! newly-seen process pushes an event into the exec ring — read out-of-band by `sbx proc logs` — and,
 //! on the foreground non-tty path, also echoes a `[sbx:exec] <cmd>` line to stderr inline with the run.
+//! The **filesystem lens** ([`super::fs_watch`]) watches the project tree with inotify and pushes each
+//! write into the fs ring, read by `sbx fs logs`.
 //!
-//! It roots on the supervisor's own pid (`std::process::id()`): the cage's processes are its
+//! The exec lens roots on the supervisor's own pid (`std::process::id()`): the cage's processes are its
 //! descendants in host pid-space (the same vantage point [`crate::observe`] and `sbx proc ls` use),
 //! so a `/proc` walk from that root sees the whole tree. No privilege, no cage cooperation.
 //!
-//! [`ProcObs`] assembles the three pieces — the ring, its control socket + serve thread, and the poll
-//! observer — and unlinks the socket on drop; it is the process/exec analogue of the egress guard, and
-//! the same substrate the later seccomp user-notification enforcement will reuse.
+//! [`Observation`] assembles both lenses — each with its own ring, control socket + serve thread, and
+//! observer — and unlinks the sockets on drop; it is the observe analogue of the egress guard, and the
+//! same substrate the later seccomp user-notification enforcement will reuse. The two lenses degrade
+//! **independently**: a failure to stand one up warns and leaves the other running.
 //!
-//! Honest limit: polling only sees a process that outlives a tick, so very short-lived commands are
-//! missed. Precise, per-`execve` capture (and the blocking that rides on it) is the seccomp
-//! user-notification path, a later increment; this feed is the cheap, unprivileged first cut.
+//! Honest limit: the exec poll only sees a process that outlives a tick, so very short-lived commands
+//! are missed. Precise, per-`execve` capture (and the blocking that rides on it) is the seccomp
+//! user-notification path, a later increment; these feeds are the cheap, unprivileged first cut.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::net::UnixListener;
@@ -26,6 +29,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use super::fs_control::{self, fs_control_dir, fs_control_socket, FsRing, FS_RING_CAP};
+use super::fs_watch::FsWatcher;
 use super::proc_control::{self, proc_control_dir, proc_control_socket, ExecRing, EXEC_RING_CAP};
 use crate::observe::{self, ProcInfo};
 
@@ -81,8 +86,10 @@ fn command_of(info: &ProcInfo) -> String {
 }
 
 /// Replace ASCII/Unicode control characters with a space and cap the length (on a char boundary), so
-/// the value is safe on the line-based control wire and the stderr feed.
-fn sanitize(s: &str) -> String {
+/// the value is safe on the line-based control wire and the stderr feed. Shared by both observation
+/// lenses — a command (exec) and a path (filesystem) both need it, and a Linux filename may carry a
+/// newline exactly as a hostile argv can.
+pub(crate) fn sanitize(s: &str) -> String {
     const MAX: usize = 512;
     let cleaned: String = s
         .chars()
@@ -167,51 +174,105 @@ fn run_loop(
     }
 }
 
-/// An assembled process observer: the exec ring, its control socket + serve thread, and the poll
-/// observer, wired together and held for a supervised cage's lifetime. Enabled when observation is on
-/// (any launch path where a parent sbx survives the cage), it unlinks the socket on drop and stops the
-/// observer — the process/exec analogue of the egress guard.
-pub(crate) struct ProcObs {
-    /// Stops and joins the poll thread on drop; held (not read) for that effect.
-    _observer: ExecObserver,
-    /// The bound control socket to unlink on drop, or `None` when it could not be bound (degraded to
-    /// the inline feed only).
-    socket: Option<PathBuf>,
+/// An assembled observation session: both lenses (exec and filesystem), each with its ring, control
+/// socket + serve thread, and observer, wired together and held for a supervised cage's lifetime.
+/// Enabled when observation is on (any launch path where a parent sbx survives the cage), it unlinks
+/// the sockets on drop and stops the observers — the observe analogue of the egress guard.
+pub(crate) struct Observation {
+    /// Stops and joins the exec poll thread on drop, or `None` when the exec lens is off — either it
+    /// was not requested, or the launch is *enforcing* (`[proc] mode = enforce|ask`), in which case the
+    /// seccomp user-notification supervisor is the exec source and owns the proc control socket, so the
+    /// poll observer must not also bind it. Held (not read) for the drop effect.
+    _observer: Option<ExecObserver>,
+    /// The bound exec control socket to unlink on drop, or `None` when it could not be bound (degraded
+    /// to the inline feed only).
+    exec_socket: Option<PathBuf>,
+    /// Stops and joins the inotify thread on drop, or `None` when the filesystem lens could not start
+    /// (degraded to the exec lens only); held (not read) for the drop effect.
+    _fs_watcher: Option<FsWatcher>,
+    /// The bound filesystem control socket to unlink on drop, or `None` when the lens is off / it could
+    /// not be bound.
+    fs_socket: Option<PathBuf>,
 }
 
-impl ProcObs {
-    /// Enable observation for the current supervisor: create the exec ring, bind the per-session
-    /// control socket under `<data>/proc/`, serve it, and start the poll observer rooted on this
-    /// process's own pid. `inline` echoes each event to stderr (the foreground non-tty feed); the
-    /// out-of-band ring + socket are populated regardless, so `sbx proc logs` can watch any observed
-    /// session — including a detached one, which has no terminal for an inline feed at all.
+impl Observation {
+    /// Enable observation for the current supervisor: stand up the exec lens (an exec ring served on a
+    /// `<data>/proc/` socket, plus a `/proc` poll rooted on this process's own pid) and the filesystem
+    /// lens (an fs ring served on a `<data>/fs/` socket, plus an inotify watch of `project`). `inline`
+    /// echoes each *exec* event to stderr (the foreground non-tty feed); the out-of-band rings + sockets
+    /// are populated regardless, so `sbx proc logs`/`sbx fs logs` can watch any observed session —
+    /// including a detached one, which has no terminal for an inline feed at all. The filesystem feed is
+    /// never inline (it is far too chatty for a run's stderr).
     ///
-    /// Best-effort: observation is not a security boundary here (that is the later seccomp
-    /// user-notification path), so a failure to bind the socket warns and degrades to the inline feed
-    /// only — the launch never fails for it.
-    pub(crate) fn start(data_dir: &Path, inline: bool) -> Self {
+    /// Best-effort and lens-independent: observation is not a security boundary here (that is the later
+    /// seccomp user-notification path), so a failure to stand up one lens warns and leaves the other
+    /// running — the launch never fails for it.
+    pub(crate) fn start(
+        data_dir: &Path,
+        project: &Path,
+        exec_poll: bool,
+        fs: bool,
+        inline: bool,
+    ) -> Self {
         let pid = std::process::id();
-        let ring = Arc::new(ExecRing::new(EXEC_RING_CAP));
-        let socket = bind_control(data_dir, pid, &ring);
-        let observer = ExecObserver::start(pid, OBSERVE_POLL_INTERVAL, ring, inline);
-        ProcObs {
+
+        // Exec lens (the cheap `/proc` poll). Skipped when the launch is enforcing — the seccomp
+        // user-notification supervisor is the exec source then, and owns the proc control socket.
+        let (observer, exec_socket) = if exec_poll {
+            let exec_ring = Arc::new(ExecRing::new(EXEC_RING_CAP));
+            let exec_socket = bind_control(data_dir, pid, &exec_ring);
+            let observer = ExecObserver::start(pid, OBSERVE_POLL_INTERVAL, exec_ring, inline);
+            (Some(observer), exec_socket)
+        } else {
+            (None, None)
+        };
+
+        // Filesystem lens (independent: a failure here leaves exec observation running).
+        let (fs_watcher, fs_socket) = if fs {
+            start_fs(data_dir, pid, project)
+        } else {
+            (None, None)
+        };
+
+        Observation {
             _observer: observer,
-            socket,
+            exec_socket,
+            _fs_watcher: fs_watcher,
+            fs_socket,
         }
     }
 }
 
-impl Drop for ProcObs {
+impl Drop for Observation {
     fn drop(&mut self) {
-        // Unlink the socket so `sbx proc logs` sees the session end. The `_observer` field's own Drop
-        // stops and joins the poll thread after this. The serve thread is left blocked on `accept`
-        // and is reaped when the supervisor exits — the egress control thread has the same lifetime.
-        // A `SIGKILL` skips this drop, so the pre-bind stale-socket removal in `bind_control` is what
-        // rescues an orphaned socket at the next launch that reuses the pid.
-        if let Some(socket) = &self.socket {
+        // Unlink both sockets so `sbx proc logs`/`sbx fs logs` see the session end. The `_observer` and
+        // `_fs_watcher` fields' own Drops stop and join their threads. Each serve thread is left blocked
+        // on `accept` and is reaped when the supervisor exits — the egress control thread has the same
+        // lifetime. A `SIGKILL` skips this drop, so the pre-bind stale-socket removal in `bind_control`/
+        // `bind_fs_control` is what rescues an orphaned socket at the next launch that reuses the pid.
+        for socket in [&self.exec_socket, &self.fs_socket].into_iter().flatten() {
             let _ = std::fs::remove_file(socket);
         }
     }
+}
+
+/// Stand up the filesystem lens (best-effort, independent of the exec lens): create the fs ring, watch
+/// the project tree with inotify, and bind + serve the fs control socket. A failure to create the
+/// inotify instance warns and yields `None` (the exec lens is untouched); a watcher that starts but
+/// whose socket cannot be bound is still held (harmless) so its own Drop tears it down cleanly.
+fn start_fs(data_dir: &Path, pid: u32, project: &Path) -> (Option<FsWatcher>, Option<PathBuf>) {
+    let ring = Arc::new(FsRing::new(FS_RING_CAP));
+    let watcher = match FsWatcher::start(project, ring.clone()) {
+        Ok(w) => w,
+        Err(e) => {
+            crate::diag::warn(&format!(
+                "could not start filesystem observation ({e}) — `sbx fs logs` will not see this session"
+            ));
+            return (None, None);
+        }
+    };
+    let socket = bind_fs_control(data_dir, pid, &ring);
+    (Some(watcher), socket)
 }
 
 /// Bind the per-session control socket and serve the ring on it. Returns the socket path when bound
@@ -248,6 +309,44 @@ fn bind_control(data_dir: &Path, pid: u32, ring: &Arc<ExecRing>) -> Option<PathB
     let serve_ring = ring.clone();
     std::thread::spawn(move || {
         let _ = proc_control::serve(listener, serve_ring);
+    });
+    Some(socket)
+}
+
+/// Bind the per-session filesystem control socket and serve the fs ring on it. The filesystem sibling
+/// of [`bind_control`]: the `<data>/fs/` dir is created owner-only, a stale socket left by a crashed
+/// predecessor that reused the pid is cleared first, then the listener is bound and served on a
+/// detached thread. Returns the socket path when bound (so the guard can unlink it), or `None`
+/// (warned) when it could not be.
+fn bind_fs_control(data_dir: &Path, pid: u32, ring: &Arc<FsRing>) -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = fs_control_dir(data_dir);
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+    {
+        crate::diag::warn(&format!(
+            "could not create the filesystem-observation directory ({e}) — `sbx fs logs` will not \
+             see this session"
+        ));
+        return None;
+    }
+    let socket = fs_control_socket(data_dir, pid);
+    let _ = std::fs::remove_file(&socket);
+    let listener = match UnixListener::bind(&socket) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::diag::warn(&format!(
+                "could not bind the filesystem-observation socket ({e}) — `sbx fs logs` will not see \
+                 this session"
+            ));
+            return None;
+        }
+    };
+    let serve_ring = ring.clone();
+    std::thread::spawn(move || {
+        let _ = fs_control::serve(listener, serve_ring);
     });
     Some(socket)
 }
