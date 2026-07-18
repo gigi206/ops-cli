@@ -20,6 +20,11 @@ enforcing. `sbx proc pending` lists — and decides — the `execve`s an `ask`-m
 `sbx proc allow`/`deny` persist an exec rule to a config file's [`[proc]`](../configuration/proc.md)
 list — the sibling of [`sbx net allow`/`deny`](net.md).
 
+To set the posture for a **single launch** without editing a config, use the one-shot
+[`--proc <mode>` / `SBX_PROC`](../configuration/overrides.md) override — e.g. `sbx run --proc off`
+disables a trusted project's enforcement for one run, and a `--config` blob's `[proc]` table carries
+one-shot allow/deny lists.
+
 See also: [`sbx fs`](fs.md) (the file-write sibling) · [`sbx net`](net.md) · [`sbx session`](session.md).
 
 ## `ls`

@@ -38,6 +38,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 | `--env KEY=VALUE` | `SBX_ENV_<KEY>` | one cage environment variable |
 | `--net <posture>` | `SBX_NET` | the network posture (below) |
 | `--gui <none\|wayland>` | `SBX_GUI` | the display posture |
+| `--proc <off\|observe\|enforce\|ask>` | `SBX_PROC` | the [process/exec](proc.md) posture (a bare mode) |
 | `--nixpkgs <ref>` | `SBX_NIXPKGS` | the nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | `SBX_BIND` | a host bind (read-only by default); repeatable |
 | `--forward <port[,port…]>` | `SBX_FORWARD` | host loopback TCP port(s) into the cage; repeatable |
@@ -71,6 +72,24 @@ containment was the filter, widening the **in-cage kernel attack surface** — s
 warned and skipped (less relaxation/no device — fail-closed), never fatal. Granting a device
 node exposes it; it does not confer a Linux capability, so a device that needs one (a VPN
 tun) is not made *usable* this way.
+
+#### `--proc` — the exec posture for one launch
+
+`--proc` sets only the [exec](proc.md) **mode** (`off`/`observe`/`enforce`/`ask`), the bare-string
+form of the `proc` field. Because an override is trusted by invocation, it may raise, lower, or
+**disable** enforcement for one run regardless of the config or app layers — so `--proc off`
+turns off a trusted project's `enforce` for a single launch (top authority, the same as
+`--gpu=false`), and `--proc enforce` stands enforcement up where a project set none. A mistyped
+mode is a **hard error** (like `--gui`/`--net`): keeping the baseline could leave *less*
+enforcement than you asked for, a fail-open a security posture must not have.
+
+The one-shot **allow/deny lists** are not on this flag — set them in a `--config` blob's `[proc]`
+table (`sbx run --config '[proc]\nmode="enforce"\ndeny=["curl"]' -- …`), or add them live to a
+running session with [`sbx proc allow`/`deny --session`](proc.md). A bare `--proc <mode>` **replaces
+the whole policy** (mode *and* any lists), so put the mode and its lists **together in one `--config`
+blob** — do **not** split them across `--proc enforce` + `--config '[proc] deny=[…]'`, as the typed
+`--proc` beats the blob wholesale and would silently discard the deny list (leaving you with
+enforce-*nothing*, a fail-open).
 
 #### The `--net` posture
 

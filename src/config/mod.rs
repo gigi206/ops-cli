@@ -911,7 +911,7 @@ impl Resolved {
             forward,
             seccomp,
             devices,
-            proc: _,
+            proc,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time. An override's inline
             // `[flakes]` is dropped (fail-closed): a one-shot `--config` blob is no place for a
@@ -927,14 +927,22 @@ impl Resolved {
         // a *fatal* one is promoted into the returned error (printed before aborting) rather than
         // lost with the dropped config; on success they merge into `self.warnings`.
         let mut notes = Vec::new();
-        let (scalars, fatal) =
-            build_override_scalars(&self.network, network, gui, limits, &mut notes);
+        let (scalars, fatal) = build_override_scalars(
+            &self.network,
+            &self.proc,
+            network,
+            gui,
+            proc,
+            limits,
+            &mut notes,
+        );
         if !fatal.is_empty() {
             return Err(override_fatal_error(fatal, notes));
         }
         let OverrideScalars {
             network: new_network,
             gui: new_gui,
+            proc: new_proc,
             limits: new_limits,
         } = scalars;
 
@@ -999,6 +1007,14 @@ impl Resolved {
         if let Some(policy) = new_gui {
             self.gui = policy;
             self.gui_origin = Provenance::Override;
+        }
+        // `proc` — the exec posture, validated above (a bad mode is fatal, like `gui`/`network`). The
+        // override is the final word, so it may raise, lower, or disable enforcement for this launch
+        // regardless of the config/app layers — an invoker disabling a trusted app's `enforce` for one
+        // run is by design (top authority, the same as `--gpu=false`).
+        if let Some(policy) = new_proc {
+            self.proc = policy;
+            self.proc_origin = Provenance::Override;
         }
         // `gpu` — a bool, so no value can be invalid (unlike `gui`/`network`); apply directly. The
         // override is trusted by invocation and the final word, so it may open or close GPU for this
@@ -1094,8 +1110,10 @@ impl Resolved {
         let mut notes = Vec::new();
         let (_, fatal) = build_override_scalars(
             &self.network,
+            &self.proc,
             ov.raw.network.clone(),
             ov.raw.gui.clone(),
+            ov.raw.proc.clone(),
             ov.raw.limits.clone(),
             &mut notes,
         );
@@ -1116,6 +1134,8 @@ struct OverrideScalars {
     /// The resolved network policy plus the egress-stats toggle the `[network]` table carried.
     network: Option<(NetworkPolicy, Option<bool>)>,
     gui: Option<GuiPolicy>,
+    /// The resolved process/exec posture (`Some` only when the override set `proc` and it validated).
+    proc: Option<crate::proc_policy::ProcPolicy>,
     limits: Option<crate::sandbox::cgroup::Limits>,
 }
 
@@ -1123,10 +1143,13 @@ struct OverrideScalars {
 /// (the mode-inheritance parent). Returns the built policies and the list of *fatal* field names —
 /// a set-but-invalid one, which has no safe fallback for an override. Non-fatal validator notes are
 /// pushed to `notes`. Consuming (the fields move into the validators), so a borrowing caller clones.
+#[allow(clippy::too_many_arguments)]
 fn build_override_scalars(
     baseline: &NetworkPolicy,
+    baseline_proc: &crate::proc_policy::ProcPolicy,
     network: Option<NetworkField>,
     gui: Option<String>,
+    proc: Option<schema::ProcField>,
     limits: Option<schema::RawLimits>,
     notes: &mut Vec<String>,
 ) -> (OverrideScalars, Vec<String>) {
@@ -1148,6 +1171,15 @@ fn build_override_scalars(
         match validate_gui(notes, OVERRIDE_SOURCE, value) {
             Some(policy) => scalars.gui = Some(policy),
             None => fatal.push("gui".to_string()),
+        }
+    }
+    // `proc` — a mode-less `[proc]` table inherits `baseline_proc`'s mode (so a `--config` blob's
+    // `[proc]\ndeny=[…]` keeps the effective mode); an *unknown* mode is fatal, exactly like `gui` —
+    // keeping the baseline could leave *less* enforcement than the user's mistyped intent, a fail-open.
+    if let Some(field) = proc {
+        match validate_proc(notes, OVERRIDE_SOURCE, field, baseline_proc) {
+            Some(policy) => scalars.proc = Some(policy),
+            None => fatal.push("proc".to_string()),
         }
     }
     if let Some(raw_limits) = limits {
@@ -9241,6 +9273,99 @@ mod tests {
             .unwrap();
         assert!(resolved.dbus);
         assert_eq!(resolved.dbus_origin, Provenance::Override);
+    }
+
+    #[test]
+    fn an_override_proc_posture_applies_and_beats_the_baseline_both_directions() {
+        use crate::proc_policy::ProcMode;
+        use schema::ProcField;
+
+        // Raise: a baseline with no proc (`off`) is lifted to `enforce` by the override — the final
+        // word — and the origin stamps `Override`.
+        let mut raised = resolve_no_plugins(RawConfig::default(), None);
+        assert_eq!(raised.proc.mode, ProcMode::Off);
+        raised = with_override(
+            raised,
+            RawConfig {
+                proc: Some(ProcField::Mode("enforce".into())),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(raised.proc.mode, ProcMode::Enforce);
+        assert_eq!(raised.proc_origin, Provenance::Override);
+
+        // Lower/disable: a globally-declared `enforce` baseline can be turned *off* for one launch by
+        // the override (top authority by invocation — the parity with `--gpu=false`).
+        let global = RawConfig {
+            proc: Some(ProcField::Mode("enforce".into())),
+            ..RawConfig::default()
+        };
+        let mut disabled = resolve_no_plugins(global, None);
+        assert_eq!(disabled.proc.mode, ProcMode::Enforce);
+        disabled = with_override(
+            disabled,
+            RawConfig {
+                proc: Some(ProcField::Mode("off".into())),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(disabled.proc.mode, ProcMode::Off);
+        assert_eq!(disabled.proc_origin, Provenance::Override);
+    }
+
+    #[test]
+    fn a_mode_less_override_proc_table_inherits_the_baseline_mode() {
+        use crate::proc_policy::ProcMode;
+        use schema::{ProcField, ProcTable};
+
+        // A `--config` blob's `[proc]\ndeny=[…]` with no `mode` keeps the baseline's effective mode
+        // (here a global `enforce`) while adding its deny rule — the parent-mode inheritance, so the
+        // override does not silently reset the posture to `off`.
+        let global = RawConfig {
+            proc: Some(ProcField::Mode("enforce".into())),
+            ..RawConfig::default()
+        };
+        let resolved = with_override(
+            resolve_no_plugins(global, None),
+            RawConfig {
+                proc: Some(ProcField::Table(ProcTable {
+                    mode: None,
+                    allow: vec![],
+                    deny: vec!["curl".into()],
+                })),
+                ..RawConfig::default()
+            },
+        );
+        assert_eq!(resolved.proc.mode, ProcMode::Enforce);
+        assert_eq!(resolved.proc.deny.len(), 1);
+        assert_eq!(resolved.proc_origin, Provenance::Override);
+    }
+
+    #[test]
+    fn a_set_but_invalid_override_proc_mode_is_a_hard_error_and_mutates_nothing() {
+        use crate::proc_policy::ProcMode;
+        use schema::ProcField;
+
+        // A mistyped proc mode has no safe fallback: keeping the baseline (here `enforce`) would run a
+        // *different* posture than the user's explicit intent, so it is fatal — never a silent revert.
+        let global = RawConfig {
+            proc: Some(ProcField::Mode("enforce".into())),
+            ..RawConfig::default()
+        };
+        let mut resolved = resolve_no_plugins(global, None);
+        let errs = resolved
+            .apply_override(Override::for_test(RawConfig {
+                proc: Some(ProcField::Mode("enfroce".into())),
+                ..RawConfig::default()
+            }))
+            .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("proc")),
+            "the error should name the offending field: {errs:?}"
+        );
+        // and nothing was applied — the baseline posture stands.
+        assert_eq!(resolved.proc.mode, ProcMode::Enforce);
+        assert_eq!(resolved.proc_origin, Provenance::Global);
     }
 
     #[test]

@@ -500,6 +500,123 @@ fn enforce_blocks_a_denied_binary_in_a_real_cage() {
 }
 
 #[test]
+fn an_override_config_proc_enforces_without_trusting_the_project() {
+    // The un-ignoring of an override's `[proc]`: a one-shot `--config` blob is trusted *by
+    // invocation*, so its `[proc] mode = "enforce"` blocks a denied exec in a real cage **without any
+    // `sbx trust`** — the invoker outranks the config layer. Teeth: the control run (no override) runs
+    // `id` (it prints `uid=…`), so the block appears *only* because the override reached the cage.
+    // Skipped, not failed, where the host cannot sandbox.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping override-proc enforce e2e: host cannot sandbox");
+        return;
+    }
+
+    // Control: no override, no project `[proc]` → `id` runs and prints its uid.
+    let control = sbx_isolated()
+        .args(["run", "--", "id"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run id");
+    assert!(
+        String::from_utf8_lossy(&control.stdout).contains("uid="),
+        "the control `id` must run (no enforcement); stderr:\n{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // Override: a `--config` blob enforces a deny of `id`, with the project untrusted (never
+    // `sbx trust`ed) — trusted by invocation. `id` traps to the supervisor and is refused with EPERM.
+    let denied = sbx_isolated()
+        .args([
+            "run",
+            "--config",
+            "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
+            "--",
+            "id",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run id under override");
+    let out = String::from_utf8_lossy(&denied.stdout);
+    let err = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        !denied.status.success() && !out.contains("uid="),
+        "the override must block `id` without trust: stdout={out:?} stderr={err:?}"
+    );
+    assert!(
+        err.contains("Operation not permitted") || err.contains("cannot execute id"),
+        "the block should surface a reason: {err:?}"
+    );
+}
+
+#[test]
+fn a_typed_proc_off_override_disables_a_trusted_projects_enforcement() {
+    // The typed `--proc` flag, threaded end-to-end with real teeth in the *disable* direction: an
+    // invoker may turn off a trusted project's `enforce` for one launch (top authority by invocation,
+    // the parity with `--gpu=false`). A trusted project denies `id`; the baseline run blocks it, but
+    // `--proc off` lets it run — proving the typed flag reached the cage. Skipped, not failed, where
+    // the host cannot sandbox.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
+    )
+    .unwrap();
+    if !host_can_sandbox(project.path(), data.path()) {
+        eprintln!("skipping typed-proc-off e2e: host cannot sandbox");
+        return;
+    }
+    let trusted = sbx_isolated()
+        .args(["trust"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .output()
+        .expect("sbx trust");
+    assert!(
+        trusted.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Baseline: the trusted `enforce` blocks `id`.
+    let blocked = sbx_isolated()
+        .args(["run", "--", "id"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run id");
+    assert!(
+        !blocked.status.success() && !String::from_utf8_lossy(&blocked.stdout).contains("uid="),
+        "the trusted enforce must block `id`; stderr:\n{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+
+    // `--proc off` disables enforcement for this one launch → `id` runs and prints its uid.
+    let re_enabled = sbx_isolated()
+        .args(["run", "--proc", "off", "--", "id"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", data.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run id under --proc off");
+    assert!(
+        String::from_utf8_lossy(&re_enabled.stdout).contains("uid="),
+        "`--proc off` must disable the trusted enforcement so `id` runs; stderr:\n{}",
+        String::from_utf8_lossy(&re_enabled.stderr)
+    );
+}
+
+#[test]
 fn app_run_observe_streams_exec_events() {
     // The feed reaches the primary target — agents launched via `sbx app run`. `--observe` threads
     // through the app path the same way, forcing supervision and streaming `[sbx:exec]`. Teeth: the

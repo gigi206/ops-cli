@@ -286,6 +286,41 @@ fn config_show_reflects_an_ambient_seccomp_and_device_override() {
 }
 
 #[test]
+fn config_show_reflects_an_ambient_proc_override() {
+    // `--proc`/`SBX_PROC` is a security posture; its ambient form must reach `sbx config show` (via
+    // the same `collect` a launch uses) and be tagged `(override)` — so a stale `SBX_PROC` cannot
+    // silently change a launch's enforcement without the view admitting it. No project config → the
+    // baseline is `off`, and the baseline view shows the proc line only when it is not `off`, so the
+    // line appears solely because of the override.
+    let fx = Fixture::new();
+    let out = fx
+        .sbx(&["config", "show"])
+        .env("SBX_PROC", "enforce")
+        .output()
+        .expect("spawn sbx");
+    assert!(out.status.success(), "config show should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("proc:") && stdout.contains("enforce") && stdout.contains("(override)"),
+        "config show must reflect and tag the ambient proc override:\n{stdout}"
+    );
+
+    // A set-but-invalid ambient proc mode is fatal (no safe fallback for a security posture) and
+    // surfaced; the baseline `off` stands, so the view neither lies nor hides the mistake.
+    let bad = fx
+        .sbx(&["config", "show"])
+        .env("SBX_PROC", "enfroce")
+        .output()
+        .expect("spawn sbx");
+    let text =
+        String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        text.contains("refusing to launch") || text.contains("invalid value"),
+        "a set-but-invalid ambient proc mode must be surfaced:\n{text}"
+    );
+}
+
+#[test]
 fn config_show_rejects_an_unknown_argument() {
     let fx = Fixture::new();
     let out = fx.run(&["config", "show", "--bogus"]);

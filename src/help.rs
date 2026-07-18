@@ -81,6 +81,10 @@ const PAGES: &[Page] = &[
                 "one-shot network posture: none | shared | ask | allow=h1,h2 | deny=h1,h2",
             ),
             ("--gui <none|wayland>", "one-shot display posture"),
+            (
+                "--proc <off|observe|enforce|ask>",
+                "one-shot process/exec posture (a bare mode; --config sets the allow/deny lists)",
+            ),
             ("--nixpkgs <ref>", "one-shot nixpkgs channel or revision"),
             (
                 "--bind <path[:ro|:rw]>",
@@ -134,18 +138,22 @@ const PAGES: &[Page] = &[
             One-shot overrides let you change any configuration field for a single launch without\n\
             editing a file. The whole-schema `--config` takes inline TOML (or `@<file>`) shaped\n\
             exactly like an `sbx.toml`, so it can set any field; the typed flags\n\
-            `--env`/`--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/`--seccomp`/\n\
-            `--device`/`--gpu`/`--audio`/`--dbus` are ergonomic shorthands for one field each. The\n\
+            `--env`/`--net`/`--gui`/`--proc`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/\n\
+            `--seccomp`/`--device`/`--gpu`/`--audio`/`--dbus` are ergonomic shorthands for one field\n\
+            each. The\n\
             booleans `--gpu`/`--audio`/`--dbus` are optional-value (bare means `true`, or\n\
             `=true`/`=false`); the rest take a\n\
-            value. Every flag has an environment\n\
-            equivalent — `SBX_CONFIG`, `SBX_ENV_<KEY>`, `SBX_NET`, `SBX_GUI`, `SBX_NIXPKGS`, `SBX_BIND`,\n\
+            value. `--proc` sets only the exec *mode* — the one-shot allow/deny lists live in a\n\
+            `--config` blob's `[proc]` table (or `sbx proc allow/deny --session` after launch). Every\n\
+            flag has an environment\n\
+            equivalent — `SBX_CONFIG`, `SBX_ENV_<KEY>`, `SBX_NET`, `SBX_GUI`, `SBX_PROC`, `SBX_NIXPKGS`,\n\
+            `SBX_BIND`,\n\
             `SBX_FORWARD`, `SBX_LIMIT_<key>`, `SBX_PACKAGE_<name>`, `SBX_SECCOMP`, `SBX_DEVICE`,\n\
             `SBX_GPU`, `SBX_AUDIO`, `SBX_DBUS`.\n\
             Precedence, lowest to highest:\n\
             `SBX_CONFIG < SBX_* typed < --config < --* typed` — the command line always beats the\n\
             environment, and a typed flag beats the blob. Scalars\n\
-            (`net`/`gui`/`nixpkgs`/`gpu`/`audio`/`dbus`)\n\
+            (`net`/`gui`/`proc`/`nixpkgs`/`gpu`/`audio`/`dbus`)\n\
             replace;\n\
             collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`) union. An override\n\
             is the final word: it beats a trusted project config and an app's own posture — including\n\
@@ -216,8 +224,8 @@ const PAGES: &[Page] = &[
                  repeatable (see `sbx help run`)",
             ),
             (
-                "--env / --net / --gui / --nixpkgs / --bind / --forward / --limit / --package / \
-                 --seccomp / --device / --gpu / --audio / --dbus",
+                "--env / --net / --gui / --proc / --nixpkgs / --bind / --forward / --limit / \
+                 --package / --seccomp / --device / --gpu / --audio / --dbus",
                 "typed one-shot overrides for a single field each, beating the app's posture; \
                  see `sbx help run`",
             ),
