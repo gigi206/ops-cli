@@ -4459,9 +4459,20 @@ fn app_list() -> ExitCode {
     let mut names: BTreeSet<&str> = profiles.iter().map(String::as_str).collect();
     names.extend(homes.keys().copied());
 
+    // The disk footprint mirrors `sbx projects`: the count of apps and the total across every
+    // installed home (a profile with no home contributes nothing).
+    let total_bytes: u64 = installed.iter().map(|a| a.total_bytes()).sum();
+    let disk = sandbox::human_bytes(total_bytes);
     match &profiles_dir {
-        Some(dir) => println!("{h}apps{r} {dim}(profiles in {}){r}:", dir.display()),
-        None => println!("{h}apps{r}:"),
+        Some(dir) => println!(
+            "{h}apps{r} {dim}({} app(s), {disk} on disk; profiles in {}){r}:",
+            names.len(),
+            dir.display()
+        ),
+        None => println!(
+            "{h}apps{r} {dim}({} app(s), {disk} on disk){r}:",
+            names.len()
+        ),
     }
 
     // `NAME` and `PROFILE` are the padded columns; `HOME` is last, so it needs no trailing width.
