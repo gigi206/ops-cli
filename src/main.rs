@@ -4378,8 +4378,20 @@ fn build_app_show(
                             },
                             None => PackageInstalled::NotInstalled,
                         }
+                    } else if matches!(pkg.backend, Backend::Nix(_)) {
+                        // A `nix:` package builds host-side into the shared store and is seeded into
+                        // each project's per-project store, gcrooted per tree — so its realized signal
+                        // is which trees built it, mirroring the deb:/appimage: per-tree report above.
+                        let trees = sandbox::inspect::nix_built_trees(data_dir, &pkg.name);
+                        match trees.len() {
+                            0 => PackageInstalled::NotInstalled,
+                            n => PackageInstalled::Installed {
+                                detail: format!("built in {}", plural_trees(n)),
+                            },
+                        }
                     } else {
-                        // nix: and inline-flake build into the per-project store.
+                        // An inline flake (and any other per-project build not yet lock-scanned) lands
+                        // in the per-project store; `sbx projects show` details it per tree.
                         PackageInstalled::PerProject
                     };
                     PackageShow {

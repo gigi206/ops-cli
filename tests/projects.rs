@@ -96,13 +96,14 @@ impl Fixture {
         std::fs::write(dir.join(name), b"x").unwrap();
     }
 
-    /// Fabricate a warm flake out-link in a tree's own home — `<tree>/home/.local/state/ops/flake/
-    /// <name>` — the realized signal for a `flake:` package (which builds into the home, not the store).
+    /// Fabricate a warm flake out-link in a tree's own home — `<tree>/home/.local/state/sbx/flake/
+    /// <name>` — the realized signal for a `flake:` package (the out-link symlink the launch leaves in
+    /// the home; the path mirrors the launch's write path `binds::FLAKE_ROOTS_REL`).
     fn build_flake(&self, tree_id: &str, name: &str, store_leaf: &str) {
         let dir = self
             .projects_dir()
             .join(tree_id)
-            .join("home/.local/state/ops/flake");
+            .join("home/.local/state/sbx/flake");
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(format!("/nix/store/{store_leaf}"), dir.join(name)).unwrap();
     }

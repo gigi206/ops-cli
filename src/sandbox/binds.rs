@@ -630,7 +630,7 @@ const MISE_SHIMS_REL: &str = ".local/share/mise/shims";
 /// relative to the sandbox `$HOME`. Each package gets `<this>/<name>`, a symlink into
 /// `/nix` (the per-project store); its `<name>/bin` joins PATH. Under the persistent home,
 /// so the out-link survives across launches (the warm-launch short-circuit reuses it).
-const FLAKE_ROOTS_REL: &str = ".local/state/sbx/flake";
+pub(crate) const FLAKE_ROOTS_REL: &str = ".local/state/sbx/flake";
 
 /// The directory holding every `flake:` package's out-link inside the cage (the parent the
 /// build wrapper creates before `nix build`). A fixed, sbx-owned path under the home.

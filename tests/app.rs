@@ -1,8 +1,8 @@
 //! Integration tests for `sbx app show`: the built binary reports one app's realized-on-disk detail
 //! — its profile source, home size, and each declared package annotated with whether it is actually
 //! installed (a `mise:` tool from the app home, a `deb:` build from a project tree's pins, a `nix:`
-//! package built per-project). Read-only: no sandbox, no nix, no network, so a lightweight fixture of
-//! fabricated files is enough.
+//! package from the project trees that gcrooted it). Read-only: no sandbox, no nix, no network, so a
+//! lightweight fixture of fabricated files is enough.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -111,16 +111,30 @@ impl Fixture {
         std::fs::write(dir.join("deb-packages.lock"), format!("{url}\t{hash}\n")).unwrap();
     }
 
-    /// Fabricate a warm flake out-link in a global app home — `home/.local/state/ops/flake/<name>`
-    /// pointing at a store path — the realized signal for a `flake:` package (which builds into the
-    /// home, not the per-project store).
+    /// Fabricate a warm flake out-link in a global app home — `home/.local/state/sbx/flake/<name>`
+    /// pointing at a store path — the realized signal for a `flake:` package (the out-link symlink the
+    /// launch leaves in the home; its target store path lives in the per-project store). The path
+    /// mirrors the launch's write path (`binds::FLAKE_ROOTS_REL`).
     fn build_flake(&self, app: &str, name: &str, store_leaf: &str) {
         let dir = self
             .data_home
             .path()
-            .join(format!("sbx/apps/{app}/home/.local/state/ops/flake"));
+            .join(format!("sbx/apps/{app}/home/.local/state/sbx/flake"));
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(format!("/nix/store/{store_leaf}"), dir.join(name)).unwrap();
+    }
+
+    /// Fabricate a `nix:` package gcroot in a project tree — `gcroots/projects/<tree_id>/<name>`, the
+    /// per-tree realized signal for a host-provisioned `nix:` package. The gcroot is keyed on the
+    /// package's **declared name** (the `[packages]` key), not its nixpkgs attribute.
+    fn build_nix(&self, tree_id: &str, name: &str) {
+        let dir = self
+            .data_home
+            .path()
+            .join("sbx/gcroots/projects")
+            .join(tree_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), "").unwrap();
     }
 }
 
@@ -149,6 +163,8 @@ fn show_reports_declared_vs_installed_across_backends() {
     // mise:aqua:demo/tool munges to aqua-demo-tool on disk.
     fx.install_mise_tool("demo-app", "aqua-demo-tool", "1.2.3");
     fx.pin_deb("aaaaaaaaaaaaaaaa", DEB_URL, "sha256-DEADBEEFcafef00d");
+    // The `nix:hello` package is keyed on its declared name `core`; gcroot it in the one tree.
+    fx.build_nix("aaaaaaaaaaaaaaaa", "core");
 
     let out = fx.sbx(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
@@ -166,10 +182,11 @@ fn show_reports_declared_vs_installed_across_backends() {
         s.contains("pinned in 1 tree (DEADBEEF)"),
         "deb pin status missing:\n{s}"
     );
-    // The nix package is reported as built per-project.
+    // The nix package reports the concrete tree it is built in — the per-tree realized signal, not a
+    // vague "per-project" deferral.
     assert!(
-        s.contains("nix:hello") && s.contains("built per-project"),
-        "nix per-project status missing:\n{s}"
+        s.contains("nix:hello") && s.contains("built in 1 tree"),
+        "nix per-tree status missing:\n{s}"
     );
     // The size breakdown is present.
     assert!(
@@ -184,6 +201,7 @@ fn show_json_carries_each_packages_installed_state() {
     fx.write_profile("demo-app", &demo_profile());
     fx.install_mise_tool("demo-app", "aqua-demo-tool", "1.2.3");
     fx.pin_deb("bbbbbbbbbbbbbbbb", DEB_URL, "sha256-00112233abcdef");
+    fx.build_nix("bbbbbbbbbbbbbbbb", "core");
 
     let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
     assert!(
@@ -206,7 +224,11 @@ fn show_json_carries_each_packages_installed_state() {
         .unwrap()
         .contains("1.2.3"));
     assert_eq!(by_backend("deb")["installed"]["state"], "installed");
-    assert_eq!(by_backend("nix")["installed"]["state"], "per_project");
+    assert_eq!(by_backend("nix")["installed"]["state"], "installed");
+    assert!(by_backend("nix")["installed"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("built in 1 tree"));
     // The one installed tool is declared, so nothing is orphaned.
     assert!(
         v["orphans"].as_array().expect("orphans array").is_empty(),
@@ -307,7 +329,16 @@ fn show_marks_a_declared_but_unbuilt_package_not_installed() {
         s.contains("mise:aqua:demo/tool") && s.contains("not installed"),
         "an unbuilt mise tool should read `not installed`:\n{s}"
     );
-    // With no home yet, the disk line says so rather than showing a size.
+    // A `nix:` package no tree has gcrooted reads `not installed` too — not a false "built
+    // per-project" for a build that never happened.
+    let nix_line = s
+        .lines()
+        .find(|l| l.contains("nix:hello"))
+        .unwrap_or_else(|| panic!("no nix:hello line:\n{s}"));
+    assert!(
+        nix_line.contains("not installed"),
+        "an unbuilt nix package should read `not installed`, got: {nix_line}"
+    );
     assert!(
         s.contains("not launched yet"),
         "an app with no home should report it:\n{s}"

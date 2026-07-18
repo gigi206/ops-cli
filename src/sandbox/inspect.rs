@@ -228,16 +228,33 @@ pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<&'st
     }
 }
 
+/// The out-link directory a home built before the `ops`→`sbx` rename still carries. A launch now
+/// writes the out-link to [`binds::FLAKE_ROOTS_REL`] (`.local/state/sbx/flake`), but a home last built
+/// under the old name keeps it here until its next relaunch rebuilds into the current dir — so the
+/// read side checks both, current first, to report such a home accurately through the transition.
+const FLAKE_ROOTS_REL_LEGACY: &str = ".local/state/ops/flake";
+
 /// Whether a `flake:` package named `name` (its free label) has a warm build out-link in `home` —
-/// `<home>/.local/state/ops/flake/<name>` (a floating build) or `<name>-<rev>` (a pinned one). A
-/// `flake:` build lives in the cage **home**, not the per-project store, so this — not a lock scan —
-/// is its realized signal (a *floating* flake has an out-link but no lock entry at all, which a lock
-/// scan would miss). Returns the out-link target's store-path label (e.g. `hermes-agent-0.18.2`, the
+/// `<home>/<FLAKE_ROOTS_REL>/<name>` (a floating build) or `<name>-<rev>` (a pinned one), where the
+/// out-link's target store path lives in the per-project store the launch bound at `/nix`. The
+/// out-link *symlink* is the realized signal a launch leaves in the home (a *floating* flake has an
+/// out-link but no lock entry at all, which a lock scan would miss). The current relative path is
+/// [`binds::FLAKE_ROOTS_REL`] — the same constant the launch writes to, so the read side cannot drift
+/// from the write side — with the pre-rename [`FLAKE_ROOTS_REL_LEGACY`] as a fallback for a home built
+/// before the rename. Returns the out-link target's store-path label (e.g. `hermes-agent-0.18.2`, the
 /// basename minus the store hash) for display, or `None` when no out-link exists. Read-only.
 pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
-    let dir = home.join(".local/state/ops/flake");
+    [super::binds::FLAKE_ROOTS_REL, FLAKE_ROOTS_REL_LEGACY]
+        .into_iter()
+        .find_map(|rel| flake_built_in(&home.join(rel), name))
+}
+
+/// The realized label of a `flake:` package's out-link within one out-link directory `dir`, or `None`
+/// when `dir` has no matching out-link. Factored out so [`flake_built`] can try the current and legacy
+/// directories in turn.
+fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
     let prefix = format!("{name}-");
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let fname = entry.file_name().to_string_lossy().into_owned();
         if fname != name && !fname.starts_with(&prefix) {
             continue;
@@ -271,6 +288,33 @@ pub(crate) fn gcroot_names(data_dir: &Path, tree_id: &str) -> Vec<String> {
     };
     names.sort();
     names
+}
+
+/// Which project trees have realized the `nix:` package named `name` — its per-tree "installed"
+/// signal, the analogue of [`prebuilt_pin_trees`] for the prebuilt backends. A `nix:` package builds
+/// host-side into the shared store and is seeded into each project's own store, gcrooted per tree at
+/// `<data>/gcroots/projects/<id>/<name>` (the launch keys the gcroot on the package's declared name).
+/// Scans every tree for that gcroot and returns the matching tree ids, sorted. Read-only; an absent
+/// gcroots dir is simply no trees.
+pub(crate) fn nix_built_trees(data_dir: &Path, name: &str) -> Vec<String> {
+    let Ok(trees) = std::fs::read_dir(data_dir.join("gcroots").join("projects")) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = trees
+        .flatten()
+        .filter_map(|t| {
+            if !t.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                return None;
+            }
+            let id = t.file_name().to_string_lossy().into_owned();
+            gcroot_names(data_dir, &id)
+                .iter()
+                .any(|n| n == name)
+                .then_some(id)
+        })
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// The `nix:` mise tools a project tree has resolved — `<tree_dir>/tools.lock`, mapping each
@@ -470,7 +514,10 @@ mod tests {
     #[test]
     fn flake_built_finds_a_warm_out_link_floating_or_pinned() {
         let home = std::env::temp_dir().join(format!("sbx-inspect-flk-{}", std::process::id()));
-        let flake = home.join(".local/state/ops/flake");
+        // The read path is the same constant the launch writes to — pinning it here means a rename of
+        // the out-link directory cannot silently make `flake_built` miss a warm build (the `ops`→`sbx`
+        // drift this constant closed).
+        let flake = home.join(crate::sandbox::binds::FLAKE_ROOTS_REL);
         std::fs::create_dir_all(&flake).unwrap();
         // A floating out-link keyed by name, pointing at a store path.
         std::os::unix::fs::symlink(
@@ -492,6 +539,54 @@ mod tests {
         .unwrap();
         assert!(flake_built(&home, "other").is_some());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn flake_built_falls_back_to_the_pre_rename_out_link_dir() {
+        let home =
+            std::env::temp_dir().join(format!("sbx-inspect-flk-legacy-{}", std::process::id()));
+        // A home built before the ops→sbx rename carries the out-link only at the legacy path; it must
+        // still be reported so the fix does not regress an existing home to `not installed`.
+        let legacy = home.join(FLAKE_ROOTS_REL_LEGACY);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::os::unix::fs::symlink(
+            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-hermes-desktop-0.17.0",
+            legacy.join("hermes-desktop"),
+        )
+        .unwrap();
+        assert_eq!(
+            flake_built(&home, "hermes-desktop"),
+            Some("hermes-desktop-0.17.0".to_string()),
+            "a pre-rename home's out-link must still be found via the legacy fallback"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn nix_built_trees_finds_the_package_gcroot_across_trees() {
+        let data = std::env::temp_dir().join(format!("sbx-inspect-nbt-{}", std::process::id()));
+        // Two trees gcrooted `chromium`; a third gcrooted only something else.
+        for id in ["t1", "t3"] {
+            let g = data.join("gcroots/projects").join(id);
+            std::fs::create_dir_all(&g).unwrap();
+            std::fs::write(g.join("chromium"), "").unwrap();
+            // A derivation-source sibling must not count as a build (gcroot_names filters `.expr`).
+            std::fs::write(g.join("chromium.expr"), "").unwrap();
+        }
+        let t2 = data.join("gcroots/projects/t2");
+        std::fs::create_dir_all(&t2).unwrap();
+        std::fs::write(t2.join("jq"), "").unwrap();
+
+        assert_eq!(
+            nix_built_trees(&data, "chromium"),
+            vec!["t1".to_string(), "t3".to_string()],
+            "the trees that gcrooted the package, sorted"
+        );
+        assert_eq!(nix_built_trees(&data, "jq"), vec!["t2".to_string()]);
+        // A package no tree built, and an absent gcroots dir, are both empty.
+        assert!(nix_built_trees(&data, "ripgrep").is_empty());
+        assert!(nix_built_trees(&data.join("nope"), "chromium").is_empty());
+        std::fs::remove_dir_all(&data).ok();
     }
 
     #[test]
