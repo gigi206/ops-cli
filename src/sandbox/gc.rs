@@ -72,6 +72,72 @@ pub(crate) fn prune_flake_roots(
     stale
 }
 
+/// Remove — or, in a dry run, list — the **data-dir** `<data>/gcroots/projects/<id>/<name>`
+/// out-links of host-provisioned packages that are no longer declared. `packages::provision` (and
+/// the `deb:`/`appimage:`/`tarball:` build paths) write one out-link per declared package there —
+/// bare `<name>` for `nix:`, `deb-`/`appimage-`/`tarball-<name>` for a prebuilt — and never remove
+/// one for a package the config drops, so a *removed* package leaks: [`project_keep_roots`] then
+/// still reads its (possibly dangling) out-link into the keep-set, and [`prune_superseded_roots`]
+/// keeps the per-project store copy it holds forever. This is the analogue of [`prune_flake_roots`]
+/// for that directory. `current` is the gcroot names of every currently-declared such package across
+/// the project's runtimes (see [`super::packages::project_gcroot_names`]); an out-link matching none
+/// is stale, and dropping it lets the same gc pass reclaim its per-project copy.
+///
+/// **Multi-output.** `nix build --out-link <name>` links *every* output of a derivation, so one
+/// `nix:` package roots `<name>` **and** siblings like `<name>-man`/`<name>-dev`. A sibling shares
+/// the `<name>-` prefix, so it is kept whenever its base package is declared — otherwise a live
+/// package's man/dev output would be deleted on every gc. A pruned prebuilt root's sibling `.expr`
+/// stamp (a plain file [`super::store::provision_expr`] writes beside it) is removed with it; the
+/// stamp of a *kept* root is a non-symlink and is never touched. Destructive only when `prune`.
+pub(crate) fn prune_project_package_roots(
+    data_gcroots: &Path,
+    id: &str,
+    current: &BTreeSet<String>,
+    prune: bool,
+) -> Vec<PathBuf> {
+    let dir = data_gcroots.join("projects").join(id);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        // Only the out-link symlinks are package roots; the `.expr` stamp beside a prebuilt root is a
+        // plain file, handled with its root below and otherwise left to a kept root.
+        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // Keep the out-link of a currently-declared package, and any multi-output sibling `<name>-…`.
+        if current.iter().any(|n| {
+            name == n
+                || name
+                    .strip_prefix(n.as_str())
+                    .is_some_and(|r| r.starts_with('-'))
+        }) {
+            continue;
+        }
+        let path = entry.path();
+        if prune {
+            if std::fs::remove_file(&path).is_ok() {
+                // Drop the sibling `.expr` stamp of a pruned prebuilt root so a re-add rebuilds clean
+                // rather than short-circuiting on a stamp whose out-link is gone. A `nix:` root has no
+                // such stamp, so this is a harmless no-op there.
+                let mut stamp = path.clone().into_os_string();
+                stamp.push(".expr");
+                let _ = std::fs::remove_file(PathBuf::from(stamp));
+                removed.push(path);
+            }
+        } else {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 /// The store-path basenames every *current* out-link of a project still points at — the keep-set a
 /// per-project store gc reconciles its accumulated seed roots against. `data_gcroots` is
 /// `<data>/gcroots`; the six root families that can seed a per-project store are all covered so the
@@ -927,6 +993,55 @@ mod tests {
         assert!(gcroots.join("sbx-flake-hello").symlink_metadata().is_ok());
         assert!(gcroots.join("abcd-coreutils").symlink_metadata().is_ok());
         assert!(gcroots.join("auto").is_dir());
+    }
+
+    #[test]
+    fn prune_project_package_roots_keeps_declared_and_multi_output_siblings() {
+        let data = TmpDir::new();
+        let gcroots = data.path().join("gcroots");
+        let id = "proj1";
+        let proj = gcroots.join("projects").join(id);
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // A bare-`nix:` root and its multi-output sibling (`nix build --out-link gzip` links `gzip`
+        // AND `gzip-man`); a declared prebuilt root with its `.expr` stamp; and a removed prebuilt
+        // root, also with a stamp. Plus a stray non-symlink that must never be touched.
+        let link = |name: &str| {
+            std::os::unix::fs::symlink(format!("/nix/store/h-{name}"), proj.join(name)).unwrap();
+        };
+        for name in ["gzip", "gzip-man", "deb-cursor", "tarball-gone"] {
+            link(name);
+        }
+        std::fs::write(proj.join("deb-cursor.expr"), b"stampA").unwrap();
+        std::fs::write(proj.join("tarball-gone.expr"), b"stampB").unwrap();
+        std::fs::write(proj.join("README"), b"note").unwrap();
+
+        // gzip (and its -man sibling) and deb-cursor stay declared; tarball-gone is removed.
+        let current = BTreeSet::from(["gzip".to_string(), "deb-cursor".to_string()]);
+
+        // A dry run lists exactly the removed root, removing nothing (not even its stamp).
+        let listed = prune_project_package_roots(&gcroots, id, &current, false);
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].ends_with("tarball-gone"));
+        assert!(proj.join("tarball-gone").symlink_metadata().is_ok());
+        assert!(proj.join("tarball-gone.expr").exists());
+
+        // A prune drops only the removed root, and its `.expr` stamp with it.
+        let removed = prune_project_package_roots(&gcroots, id, &current, true);
+        assert_eq!(removed.len(), 1);
+        assert!(proj.join("tarball-gone").symlink_metadata().is_err());
+        assert!(!proj.join("tarball-gone.expr").exists());
+
+        // The declared roots, the multi-output sibling, the kept root's stamp, and the stray plain
+        // file all survive.
+        assert!(proj.join("gzip").symlink_metadata().is_ok());
+        assert!(proj.join("gzip-man").symlink_metadata().is_ok());
+        assert!(proj.join("deb-cursor").symlink_metadata().is_ok());
+        assert!(proj.join("deb-cursor.expr").exists());
+        assert!(proj.join("README").exists());
+
+        // An absent project directory is a clean no-op, never an error.
+        assert!(prune_project_package_roots(&gcroots, "nope", &current, true).is_empty());
     }
 
     #[test]

@@ -29,6 +29,12 @@ sbx gc --prune            # reclaim this project's store
 - The per-project sweep reclaims a project's own store residue, including the **stale
   rev-keyed `flake:` out-links** an [`sbx upgrade flake`](upgrade.md) leaves behind
   (each roll `A → B` leaves the old `<name>-A` out-link and its closure).
+- It also reclaims the build of a **removed package** — delete a `nix:`/`deb:`/`appimage:`/
+  `tarball:` entry from a project's (or an app's) `[packages]` and the sweep drops its
+  data-directory out-link and reclaims its per-project store copy (a full closure on a
+  filesystem without reflink support), which was otherwise held until the whole project tree was
+  removed. (A `flake:` removal is covered by the bullet above; a `mise:` tool lives in the app
+  home, reclaimed by [`sbx app prune`](../cli/app.md).)
 - It also reclaims **superseded builds** the store accumulated. `sbx` roots every version it
   provisions into a project's store, and a newer build's root never displaces the older one —
   so old base-channel revisions, rebuilt tools, and rolled-forward GUI app builds (multiple

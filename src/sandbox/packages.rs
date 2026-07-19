@@ -165,6 +165,39 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The data-dir gcroot names of every **declared** host-provisioned `[packages]` backend — the
+/// backends that write a `<data>/gcroots/projects/<id>/<name>` out-link: `nix:` (bare `<name>`) and
+/// the prebuilt trio `deb:`/`appimage:`/`tarball:` (each direct **and** `:resolve` form, keyed
+/// `deb-`/`appimage-`/`tarball-<name>`). `mise:` (equipped in-cage) and `flake:` (rooted inside the
+/// project store as `sbx-flake-<name>`) write nothing here and are excluded. This is the keep-set
+/// `sbx gc` reconciles those out-links against so a *removed* package's leaked out-link — and, with
+/// it, its per-project store copy — is reclaimed.
+///
+/// Deliberately **declared-not-trusted**, unlike the trusted-only provisioning filters
+/// ([`deb_packages`] and friends): a package the user still declares but whose project trust has
+/// lapsed (an edit turns the config Changed) must **not** have its build reclaimed — for a heavy
+/// prebuilt (a multi-hundred-MB desktop app) that would force a full re-download on the next trusted
+/// launch. Only a package no longer declared at all is a removal, and a removal is absent from this
+/// set whatever its trust was. Keep the `deb-{name}`/`appimage-{name}`/`tarball-{name}` prefixes in
+/// step with the write sites (deb.rs/appimage.rs/tarball.rs) and the bare-`<name>` nix site
+/// ([`provision`]).
+pub(crate) fn project_gcroot_names(packages: &[Package]) -> Vec<String> {
+    packages
+        .iter()
+        .filter_map(|p| match &p.backend {
+            Backend::Nix(_) => Some(p.name.clone()),
+            Backend::Deb(_) | Backend::DebResolve { .. } => Some(format!("deb-{}", p.name)),
+            Backend::AppImage(_) | Backend::AppImageResolve { .. } => {
+                Some(format!("appimage-{}", p.name))
+            }
+            Backend::Tarball(_) | Backend::TarballResolve { .. } => {
+                Some(format!("tarball-{}", p.name))
+            }
+            Backend::Mise(_) | Backend::Flake(_) | Backend::FlakeInline { .. } => None,
+        })
+        .collect()
+}
+
 /// The `(name, url)` of the *admitted* `deb:` packages — the ones the launcher provisions
 /// host-side (resolve the URL to a hash, then build a generated unpack+autoPatchelf derivation).
 /// Trusted-only, exactly like the other backends: an untrusted project's `deb:` package is dropped
