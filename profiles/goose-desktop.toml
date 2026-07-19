@@ -88,9 +88,11 @@ dbus = true
 [packages]
 # Goose's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron + embedded Rust CLI,
 # no source build). Trusted-only [packages]; this profile is trusted by location once imported.
-# Hand-pinned to v1.43.0 (versioned filename — see VERSIONS above). On arm64 point this at the
-# aarch64 build when upstream ships one.
-goose-desktop = "deb:https://github.com/aaif-goose/goose/releases/download/v1.43.0/goose_1.43.0_amd64.deb"
+# The `github:` form tracks the repo's latest release and picks the native-arch `.deb`, so
+# `sbx upgrade deb` rolls it forward (no hand-pinned version). The repo ships both a plain
+# `…_amd64.deb` and a `…_amd64-vulkan.deb` GPU variant; the plain build is selected (arch token
+# terminal). On arm64 the same form selects the aarch64 build when upstream ships one.
+goose-desktop = "deb:github:aaif-goose/goose"
 
 [network]
 mode = "deny"

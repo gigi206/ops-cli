@@ -209,17 +209,11 @@ printf 'https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/%s-%
 # claude-desktop's Google Sign-In set. See the header's LIVE-GATE note — refine from `sbx net logs`.
 [network]
 mode = "deny"
-# The agent's model backend speaks gRPC over HTTP/2. The default MITM terminates TLS as HTTP/1.1,
-# which an h2-only client cannot use — so without this the Agent panel shows "No internet" (it works
-# under `--net shared`, where there is no MITM). `http2` makes the proxy do a proper per-host h2 MITM
-# for these backends, keeping full L7 inspection. Trusted-only field (this profile is trusted by
-# location). VERIFIED: without it an `--http2-prior-knowledge` request gets "unexpected data while we
-# expected SETTINGS frame"; with it, HTTP/2 negotiates cleanly. `daily-` is the staging channel the
-# agent uses in practice (observed as the busiest host, 104 requests).
-http2 = [
-    "cloudcode-pa.googleapis.com",
-    "daily-cloudcode-pa.googleapis.com",
-]
+# NOTE on HTTP/2: `cloudcode-pa` serves BOTH HTTP/1.1 (the REST account-setup + agent calls) and
+# HTTP/2 (gRPC). A `[network] http2 = [...]` entry makes the MITM *h2-only* for that host (fail-closed,
+# no h1 fallback), which BREAKS the h1 account-setup call (`blocked (http2-required)`), so it is NOT
+# used here — the backend works over h1, exactly as it did before (observed: 104 h1 requests to
+# `daily-cloudcode-pa`). Only add an `http2` entry if a host is proven h2-*only*.
 allow = [
     # Model / agent traffic — Google's Cloud Code (Gemini Code Assist) backend, the host the caged
     # agent + the native language_server POST completions to (observed on the `agy` CLI + the IDE spike).
@@ -260,6 +254,12 @@ allow = [
     # (the gallery protocol OPTIONS-preflights + POSTs an `extensionquery`). Remove if you do not want
     # the extension marketplace reachable.
     "{*} https://open-vsx.org",
+    # The Open VSX CONTENT CDN — the gallery (`open-vsx.org`) serves the query/metadata, but the
+    # extension packages themselves (`.vsix` + `package.json`) are downloaded from this Eclipse
+    # Foundation CDN (observed: `OPTIONS/GET …/golang/Go/…/package.json` when installing an
+    # extension). Read-only download + its CORS preflight, so GET/HEAD/OPTIONS. Both hosts are needed
+    # to install an extension; remove if you do not want the marketplace reachable.
+    "{GET,HEAD,OPTIONS} https://openvsx.eclipsecontent.org",
 ]
 # Silence deliberately-DENIED noise so `sbx net logs` reads clean (a `mute` never changes the verdict —
 # the host stays denied and still counts in `sbx net stats`; see them with `--all`). These are

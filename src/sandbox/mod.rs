@@ -34,6 +34,7 @@ mod mise;
 mod miseplugin;
 mod naming;
 pub(crate) mod netlearn;
+mod netns;
 mod nixhub;
 mod notify_relay;
 mod observe_feed;
@@ -77,6 +78,7 @@ pub(crate) use launch::{
 };
 pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
+pub(crate) use netns::run_holder;
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;

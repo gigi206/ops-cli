@@ -64,6 +64,11 @@ fn main() -> ExitCode {
         // there), installs the seccomp user-notification filter, hands the listener fd to the host
         // supervisor, and execs the real command. Never invoked by a user directly.
         "__proc-shim" => sandbox::proc_enforce::run_shim(&rest),
+        // Internal: the network-namespace holder. Runs host-side (never in the cage), pre-creates
+        // the cage's network namespace with a black-hole `dummy0` interface so an in-cage browser
+        // reports itself online, then execs the real `bwrap …` command. Never invoked by a user
+        // directly. `rest` is `[bwrap, bwrap-args…]`; it never returns.
+        "__netns-holder" => sandbox::run_holder(&rest),
         "doctor" => doctor(),
         "session" | "sessions" => session_cmd(rest),
         "trust" => trust_cmd(rest),

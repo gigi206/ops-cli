@@ -371,7 +371,18 @@ fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
     native.sort();
     native
         .iter()
-        .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
+        // Prefer an asset whose architecture token is *terminal* — `…_amd64.deb`, not
+        // `…_amd64-vulkan.deb` / `…_amd64-cuda.deb` — so a repo shipping GPU/feature variants of the
+        // same architecture resolves to the plain build (the sensible default). `sort()` above makes
+        // the choice deterministic when several plain builds somehow tie.
+        .find(|(name, _)| accept.iter().any(|t| name.ends_with(&format!("{t}.deb"))))
+        // Otherwise any asset positively naming this architecture (the arch token appears mid-name).
+        .or_else(|| {
+            native
+                .iter()
+                .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
+        })
+        // Finally, a single unambiguous `.deb` with no arch token, for a single-arch repo.
         .or_else(|| native.first().filter(|_| native.len() == 1))
         .map(|(_, url)| url.clone())
 }
@@ -760,6 +771,25 @@ mod tests {
             ]
         });
         assert_eq!(select_deb_asset(&foreign, "x86_64-linux"), None);
+    }
+
+    #[test]
+    fn select_deb_asset_prefers_the_plain_arch_build_over_a_same_arch_gpu_variant() {
+        // A repo that ships a GPU variant of the same architecture beside the plain build. The arch
+        // token sorts `amd64-vulkan.deb` before `amd64.deb` (`-` < `.`), so a naive first-contains
+        // match would take the variant; the terminal-arch preference selects the plain build.
+        let json = serde_json::json!({
+            "assets": [
+                { "name": "demo-app_1.43.0_amd64-vulkan.deb",
+                  "browser_download_url": "https://e/demo-app_1.43.0_amd64-vulkan.deb" },
+                { "name": "demo-app_1.43.0_amd64.deb",
+                  "browser_download_url": "https://e/demo-app_1.43.0_amd64.deb" }
+            ]
+        });
+        assert_eq!(
+            select_deb_asset(&json, "x86_64-linux").as_deref(),
+            Some("https://e/demo-app_1.43.0_amd64.deb")
+        );
     }
 
     fn deb_pkg(name: &str, url: &str, trusted: bool) -> crate::config::Package {

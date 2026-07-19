@@ -1117,6 +1117,176 @@ fn a_gui_wayland_launch_connects_to_the_host_compositor() {
 }
 
 #[test]
+fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
+    // A graphical cage under an isolated network namespace (here `network = "none"`) reads as
+    // *offline* to an in-cage browser — Chromium decides `navigator.onLine` from the presence of a
+    // non-loopback interface, and an empty namespace has only loopback. The launch is routed through
+    // the netns holder, which adds a black-hole `dummy0`, so the namespace carries `lo` + `dummy0`
+    // while its egress is unchanged (the dummy has no route). Gated to `gui = "wayland"`: a non-gui
+    // isolated cage keeps a loopback-only namespace. Skips (never fails) when the host cannot sandbox
+    // or the dummy mechanism is unavailable (e.g. the `dummy` kernel module cannot be created here).
+    let data = TmpDir::new("dummy-data");
+    let state = TmpDir::new("dummy-state");
+
+    // A GUI isolated cage: expect `lo` + `dummy0` in its network namespace.
+    let gui = TmpDir::new("dummy-gui");
+    std::fs::write(
+        gui.path().join(".sbx.toml"),
+        "gui = \"wayland\"\nnetwork = \"none\"\n",
+    )
+    .unwrap();
+    let probe = run_in(gui.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!("skipping netns-dummy e2e: host cannot sandbox");
+        return;
+    }
+    let t = sbx_in(
+        gui.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        t.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&t.stderr)
+    );
+    let out = sbx_in(
+        gui.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", "cat /proc/net/dev"],
+    );
+    let ifaces = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !ifaces.contains("dummy0") {
+        eprintln!("skipping netns-dummy e2e: dummy interface unavailable on this host:\n{ifaces}");
+        return;
+    }
+
+    // Teeth on the gating: a NON-gui isolated cage keeps a loopback-only namespace (no dummy).
+    let plain = TmpDir::new("dummy-plain");
+    std::fs::write(plain.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
+    let t2 = sbx_in(
+        plain.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        t2.status.success(),
+        "trust failed: {}",
+        String::from_utf8_lossy(&t2.stderr)
+    );
+    let out2 = sbx_in(
+        plain.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", "cat /proc/net/dev"],
+    );
+    let ifaces2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        !ifaces2.contains("dummy0"),
+        "a non-gui isolated cage must not get a dummy interface (gating): {ifaces2}"
+    );
+}
+
+#[test]
+fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
+    // The security invariant the dummy MUST preserve: it adds NO egress path. A `gui = "wayland"`
+    // cage under an allowlist gets `dummy0` (the holder path) AND still reaches only allowlisted
+    // hosts through the proxy — a non-allowlisted host is refused with a 403 while `dummy0` is
+    // present. Guards against a future "give dummy0 a default route to be safe" change silently
+    // opening egress (the `network = "none"` gating e2e cannot see that). Skips (never fails) when
+    // the host cannot sandbox, the dummy mechanism is unavailable, or the cache is unreachable.
+    let project = TmpDir::new("dummy-egress-proj");
+    let data = TmpDir::new("dummy-egress-data");
+    let state = TmpDir::new("dummy-egress-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "gui = \"wayland\"\n[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!("skipping dummy-egress e2e: host cannot sandbox");
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping dummy-egress e2e: the binary cache is unreachable");
+        return;
+    }
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The holder path is active (dummy0 present); skip if the mechanism is unavailable here.
+    let ifaces = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "sh", "-c", "cat /proc/net/dev"],
+    );
+    if !String::from_utf8_lossy(&ifaces.stdout).contains("dummy0") {
+        eprintln!("skipping dummy-egress e2e: dummy interface unavailable on this host");
+        return;
+    }
+
+    // ALLOWED through the proxy — proves egress still flows (the dummy did not replace the forwarder
+    // path): the real nix-cache-info content hash comes back.
+    let allowed = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "nix-prefetch-url",
+            "--type",
+            "sha256",
+            "https://cache.nixos.org/nix-cache-info",
+        ],
+    );
+    assert!(
+        allowed.status.success()
+            && String::from_utf8_lossy(&allowed.stdout)
+                .contains("15sqg1j6gq6081nk0v5c6npadlswb9238l336wb2g9bmmrry779c"),
+        "allowed egress failed with dummy0 present: {}{}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    // DENIED (the no-egress teeth): a non-allowlisted host is still refused with a 403 at the proxy
+    // even though `dummy0` is up — the dummy is a black hole, not a route to the world.
+    let denied = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "nix-prefetch-url",
+            "--type",
+            "sha256",
+            "https://example.com/nix-cache-info",
+        ],
+    );
+    assert!(
+        !denied.status.success() && String::from_utf8_lossy(&denied.stderr).contains("403"),
+        "the dummy interface must not open egress — a non-allowlisted host must still get 403: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+}
+
+#[test]
 fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     // Under `gui = "wayland"` the hole provisions a base font set host-side, seeds it into the
     // project store, and generates a fontconfig configuration naming it (via `FONTCONFIG_FILE`),

@@ -35,8 +35,25 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     ] {
         a.push(lit(ns));
     }
-    if spec.net == NetPolicy::Isolated {
-        a.push(lit("--unshare-net"));
+    match &spec.netns_dummy {
+        // Ordinary path: bwrap creates the cage's network namespace itself. An isolated posture
+        // gets an empty namespace (loopback only); a shared one inherits the host's.
+        None => {
+            if spec.net == NetPolicy::Isolated {
+                a.push(lit("--unshare-net"));
+            }
+        }
+        // Holder path: the network namespace is pre-created by the netns holder (with a `dummy0`
+        // interface up) and inherited across the holder's exec, so bwrap must *not* unshare its
+        // own — that would replace the holder's namespace with an empty one and lose the dummy.
+        // The holder runs as root in its user namespace, so map the cage back to the host uid/gid
+        // to keep the same-uid model (bwrap's default would otherwise leave the cage as uid 0).
+        Some(nd) => {
+            a.push(lit("--uid"));
+            a.push(OsString::from(nd.uid.to_string()));
+            a.push(lit("--gid"));
+            a.push(OsString::from(nd.gid.to_string()));
+        }
     }
     // A fresh UTS namespace inherits the host's hostname at creation, so set the cage's own —
     // `sbx-<slug>`, naming the cage after its app/project. It still never reveals the *host's*
@@ -215,6 +232,29 @@ mod tests {
 
         let isolated = to_argv(&spec(vec![], vec![], NetPolicy::Isolated));
         assert!(index_of(&isolated, "--unshare-net").is_some());
+    }
+
+    #[test]
+    fn the_holder_netns_replaces_unshare_net_with_a_uid_gid_map() {
+        // With the netns holder providing the (dummy-carrying) namespace, bwrap must NOT unshare its
+        // own network namespace — that would discard the holder's namespace — and must map the cage
+        // back to the host credentials (the holder runs root-in-userns).
+        let s = spec(vec![], vec![], NetPolicy::Isolated).with_netns_dummy(
+            super::super::spec::NetnsDummy {
+                uid: 4242,
+                gid: 4343,
+                holder_exe: PathBuf::from("/opt/sbx"),
+            },
+        );
+        let argv = to_argv(&s);
+        assert!(
+            index_of(&argv, "--unshare-net").is_none(),
+            "holder mode must not unshare-net: {argv:?}"
+        );
+        let uid = index_of(&argv, "--uid").expect("--uid present");
+        assert_eq!(argv[uid + 1], OsString::from("4242"));
+        let gid = index_of(&argv, "--gid").expect("--gid present");
+        assert_eq!(argv[gid + 1], OsString::from("4343"));
     }
 
     #[test]

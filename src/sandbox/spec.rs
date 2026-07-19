@@ -136,6 +136,30 @@ pub(crate) struct SandboxSpec {
     /// [`SandboxSpec::with_seccomp`]. Consumed when the seccomp filters are compiled, not by
     /// [`super::argv::to_argv`] (the filters are prepended as `--add-seccomp-fd` descriptors).
     pub(super) seccomp: super::seccomp::SeccompPolicy,
+    /// When set, the cage's network namespace is provided by the netns holder (which pre-creates
+    /// it with a dummy interface up) instead of by bwrap's own `--unshare-net`. A graphical app
+    /// under an isolated netns (empty except loopback) sees itself as *offline* — Chromium's
+    /// connectivity detection reports "no network interface" for a loopback-only namespace — so a
+    /// black-hole `dummy0` is added purely to make it report online; egress stays forced through
+    /// the proxy on loopback (the dummy has no route). Some means the launch is holder-wrapped and
+    /// `to_argv` maps the cage back to these host credentials (the holder runs root-in-userns);
+    /// None is the ordinary path (bwrap emits `--unshare-net`). See [`NetnsDummy`].
+    pub(super) netns_dummy: Option<NetnsDummy>,
+}
+
+/// The netns-holder wiring for a cage that needs a `dummy0` interface (see
+/// [`SandboxSpec::netns_dummy`]). Carries the host credentials the cage is mapped back to and the
+/// path to sbx's own binary (the `__netns-holder` subcommand), resolved once at build time so the
+/// launch never falls back to a namespace without `--unshare-net` (which would share the host
+/// network — a fail-open the holder path must never reach).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetnsDummy {
+    /// The host uid the cage is mapped to (`--uid`), preserving the same-uid model.
+    pub(super) uid: u32,
+    /// The host gid the cage is mapped to (`--gid`).
+    pub(super) gid: u32,
+    /// Absolute path to sbx's own binary, invoked as `<exe> __netns-holder <bwrap> <args…>`.
+    pub(super) holder_exe: PathBuf,
 }
 
 impl SandboxSpec {
@@ -167,7 +191,18 @@ impl SandboxSpec {
             cmd,
             cage_slug: "cage".to_string(),
             seccomp: super::seccomp::SeccompPolicy::default(),
+            netns_dummy: None,
         })
+    }
+
+    /// Route this launch through the netns holder so the cage's network namespace carries a
+    /// black-hole `dummy0` interface (see [`SandboxSpec::netns_dummy`]). The launch path sets it
+    /// only for a graphical (`gui = "wayland"`) cage under an isolated netns, and only once sbx's
+    /// own binary path is known — so `to_argv` can safely drop `--unshare-net` in favour of the
+    /// holder-provided namespace without ever risking a namespace-less (host-network) fallback.
+    pub(crate) fn with_netns_dummy(mut self, holder: NetnsDummy) -> Self {
+        self.netns_dummy = Some(holder);
+        self
     }
 
     /// Set the cage's readable name slug (see [`SandboxSpec::cage_slug`]). The launch path

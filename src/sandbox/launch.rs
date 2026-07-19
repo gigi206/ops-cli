@@ -3971,6 +3971,34 @@ fn build(
         eprintln!("sbx: cannot prepare the sandbox: {e}");
         ExitCode::FAILURE
     })?;
+    // A graphical cage under an isolated network namespace (any filtering posture — the namespace
+    // is empty but for loopback) reads as *offline* to an in-cage browser: Chromium decides
+    // `navigator.onLine` from the presence of a non-loopback interface, not from real reachability,
+    // so a graphical agent panel freezes on "No internet" even though proxy egress works. Route the
+    // launch through the netns holder (see `super::netns`), which pre-creates the namespace with a
+    // black-hole `dummy0` interface so the browser reports online — no egress is opened (the dummy
+    // has no route; all traffic still goes through the proxy on loopback). Gated to Wayland cages,
+    // the only ones running a browser engine, and only when sbx's own path is resolvable, so the
+    // launch never falls back to a cage without `--unshare-net` (which would share the host network).
+    let spec = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+        && spec.net == NetPolicy::Isolated
+    {
+        match std::env::current_exe() {
+            Ok(exe) => spec.with_netns_dummy(super::spec::NetnsDummy {
+                uid: unsafe { libc::getuid() },
+                gid: unsafe { libc::getgid() },
+                holder_exe: exe,
+            }),
+            Err(e) => {
+                eprintln!(
+                    "sbx: netns holder unavailable ({e}); the cage runs without an online signal"
+                );
+                spec
+            }
+        }
+    } else {
+        spec
+    };
     let guard = if egress_guard.is_some()
         || forward_guard.is_some()
         || portal_host.is_some()
@@ -4381,7 +4409,11 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
             return 1;
         }
     };
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, &spec.cage_slug);
+    // For a graphical isolated cage, route the launch through the netns holder so the namespace
+    // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.
+    let (holder_prog, holder_argv) =
+        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
+    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     match Command::new(prog).args(args).status() {
         Ok(status) => status_code(status),
         Err(e) => {
@@ -4402,7 +4434,11 @@ fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits
         Ok(v) => v,
         Err(e) => return (1, format!("failed to prepare the seccomp filter: {e}")),
     };
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, &spec.cage_slug);
+    // For a graphical isolated cage, route the launch through the netns holder so the namespace
+    // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.
+    let (holder_prog, holder_argv) =
+        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
+    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     match Command::new(prog).args(args).output() {
         Ok(out) => {
             let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -4520,7 +4556,11 @@ fn exec(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io:
     };
     // `_seccomp` stays alive until the exec replaces this process (or, on failure,
     // until this returns), so bwrap can read the inherited filter descriptors.
-    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, &spec.cage_slug);
+    // For a graphical isolated cage, route the launch through the netns holder so the namespace
+    // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.
+    let (holder_prog, holder_argv) =
+        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
+    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     Command::new(prog).args(args).exec()
 }
 
@@ -4545,7 +4585,12 @@ fn supervise(
     // between fork and exec may allocate.
     let mut bwrap_argv = super::seccomp::argv_prefix(&seccomp);
     bwrap_argv.extend(super::argv::to_argv(spec));
-    let (program, full_argv) = super::cgroup::wrap(bwrap, bwrap_argv, limits, &spec.cage_slug);
+    // Route a graphical isolated cage through the netns holder (dummy interface; see `super::netns`);
+    // a no-op passthrough otherwise.
+    let (holder_prog, holder_argv) =
+        super::netns::holder_wrap(bwrap, bwrap_argv, spec.netns_dummy.as_ref());
+    let (program, full_argv) =
+        super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     let program_c = cstring(program.as_os_str().as_bytes())?;
     let mut argv_owned = vec![program_c.clone()];
     for arg in &full_argv {
