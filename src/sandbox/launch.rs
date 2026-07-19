@@ -1441,7 +1441,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 Backend::AppImage(_) => {
                     gcroot_set.contains(format!("appimage-{}", pkg.name).as_str())
                 }
-                Backend::Tarball(_) => {
+                Backend::Tarball(_) | Backend::TarballResolve { .. } => {
                     gcroot_set.contains(format!("tarball-{}", pkg.name).as_str())
                 }
                 // A `flake:` build lands in the project home (like mise), not the store — and a
@@ -2201,6 +2201,26 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
                 eprintln!("sbx gc: cannot provision tarball package `{name}` ({url}): {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // A `tarball:resolve` package: build from its EXISTING pin only — gc must never run the resolve
+    // command or touch the network. An unpinned package (never launched) has nothing built to keep,
+    // so it is skipped rather than resolved.
+    for (name, _command) in super::packages::tarball_resolve_packages(&prep.cfg.packages) {
+        match super::tarball::provision_resolve_pinned(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+        ) {
+            Ok(Some((_, root))) => packages.roots.push(root),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("sbx gc: cannot build the pinned tarball resolver package `{name}`: {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3132,6 +3152,43 @@ fn build(
         }
     }
 
+    // `tarball:resolve` packages are the auto-upgrade form: sbx runs the profile's resolve command in
+    // a hermetic sandbox to discover the newest download URL, then resolves+builds it exactly like the
+    // direct form (same per-project lock and gcroot). A warm launch reuses the pin offline and does NOT
+    // run the command. The command runs with sbx's base tools plus the app's own `nix:` bins on PATH
+    // (so a command that needs e.g. `jq` declares it), and sbx's own store + CA bundle bound.
+    let resolve_cage = {
+        let mut bins = prep.userland.bin_paths.clone();
+        bins.extend(bin_paths.iter().cloned());
+        super::tarball::ResolveCage {
+            bwrap: prep.bwrap.as_path(),
+            store_src: crate::store::physical_path(&prep.layout, std::path::Path::new("/nix")),
+            shell_bin: prep.userland.shell_bin.as_path(),
+            ca_bundle: prep.userland.ca_bundle_src.as_path(),
+            bins,
+        }
+    };
+    for (name, command) in super::packages::tarball_resolve_packages(&prep.cfg.packages) {
+        match super::tarball::provision_resolve(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &command,
+            &resolve_cage,
+        ) {
+            Ok((bin, root)) => {
+                bin_paths.push(bin);
+                packages.roots.push(root);
+            }
+            Err(e) => {
+                eprintln!("sbx: cannot provision tarball resolver package `{name}`: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
     // `flake:` packages are built in-cage at launch (below), not host-provisioned, but their
     // out-link `bin` directories join PATH now — ahead of the base, like every other declared
     // tool. The out-link need not exist yet: the in-cage `nix build` creates it before the
@@ -3817,6 +3874,7 @@ fn build(
             &p.dbus_daemon,
             &p.xdp_root,
             &p.gtk_root,
+            &p.update_desktop_db,
             portal_scheme.as_deref(),
             cmd,
         );
@@ -5045,25 +5103,25 @@ mise uninstall shfmt@3.7.0 ✓ done\n";
         // A group that rolls several tokens surfaces one transition line each; the full-token form
         // (as an `aqua:`/`pipx:` roll prints) is kept verbatim.
         let multi = "\
-Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 2.20.0 → 2.21.0\n";
+Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-agent 2.20.0 → 2.21.0\n";
         assert_eq!(
             mise_transitions(multi),
             vec![
-                "aqua:openai/codex 0.144.4 → 0.144.5",
-                "pipx:mistral-vibe 2.20.0 → 2.21.0"
+                "aqua:example/demo-tool 0.144.4 → 0.144.5",
+                "pipx:demo-agent 2.20.0 → 2.21.0"
             ]
         );
 
         // No roll (the progress/equip preamble carries no ` → `) → nothing surfaced, so the caller
         // falls through to the up-to-date / generic branch.
         let none =
-            "mise ~/.config/mise/config.toml tools: npm:cline@3.0.40\nadded 3 packages in 617ms\n";
+            "mise ~/.config/mise/config.toml tools: npm:demo-tool@3.0.40\nadded 3 packages in 617ms\n";
         assert!(mise_transitions(none).is_empty());
     }
 
     #[test]
     fn mise_up_to_date_detects_the_no_op_roll() {
-        // mise prints this to stderr when a roll finds every tool already current (the goose case).
+        // mise prints this to stderr when a roll finds every tool already current.
         assert!(mise_up_to_date("mise All tools are up to date\n"));
         assert!(!mise_up_to_date(
             "Upgraded 1 tool:\n  shfmt 3.7.0 → 3.13.1\n"
@@ -5075,15 +5133,15 @@ Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 
         // The headline case: two apps advanced out of many — the recap names them and tallies the
         // untouched majority, so "which apps are concerned?" reads at a glance.
         assert_eq!(
-            mise_roll_recap(&["cline".into(), "openfox".into()], 15, 0, 0),
-            "2 apps rolled: cline, openfox (15 up to date)."
+            mise_roll_recap(&["demo-app".into(), "other-app".into()], 15, 0, 0),
+            "2 apps rolled: demo-app, other-app (15 up to date)."
         );
         // Nothing advanced, everything current — collapse to one reassuring line, not "0 rolled".
         assert_eq!(mise_roll_recap(&[], 17, 0, 0), "all 17 up to date.");
         // Singular noun, and a mixed tally (skips + failures) still surfaces.
         assert_eq!(
-            mise_roll_recap(&["cline".into()], 0, 1, 2),
-            "1 app rolled: cline (1 skipped, 2 failed)."
+            mise_roll_recap(&["demo-app".into()], 0, 1, 2),
+            "1 app rolled: demo-app (1 skipped, 2 failed)."
         );
         // Nothing rolled but not a clean no-op — say what got in the way.
         assert_eq!(
@@ -5128,8 +5186,8 @@ Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 
             "sbx session stop: no active sessions to stop."
         );
         assert_eq!(
-            render_gui_stop_hint("opencode-desktop", 4242, &p),
-            "sbx: opencode-desktop is graphical — press Ctrl+C twice here to quit (closing its window may only \
+            render_gui_stop_hint("demo-app", 4242, &p),
+            "sbx: demo-app is graphical — press Ctrl+C twice here to quit (closing its window may only \
              hide it — a tray app keeps running); `sbx session stop 4242` also stops it."
         );
         assert_eq!(
@@ -5157,8 +5215,8 @@ Upgraded 2 tools:\n  aqua:openai/codex 0.144.4 → 0.144.5\n  pipx:mistral-vibe 
         // An `sbx app` launch names the app; a plain `sbx run` into a GUI project names the
         // program by its basename (never a store path); an empty command falls back cleanly.
         assert_eq!(
-            launch_display_name(&binds::Runtime::GlobalApp("opencode-desktop"), &[]),
-            "opencode-desktop"
+            launch_display_name(&binds::Runtime::GlobalApp("demo-app"), &[]),
+            "demo-app"
         );
         assert_eq!(
             launch_display_name(&binds::Runtime::ProjectApp("agent"), &[]),

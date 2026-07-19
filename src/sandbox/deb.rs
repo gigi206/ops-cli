@@ -1,7 +1,7 @@
 //! `deb:` packages — a prebuilt Debian package (`.deb`) provisioned host-side.
 //!
 //! For a GUI/desktop app distributed only as a `.deb` (no runnable release binary, no nixpkgs
-//! attribute, and — for opencode-desktop — an official flake whose from-source build is broken by a
+//! attribute, and — for one such app — an official flake whose from-source build is broken by a
 //! bun-version mismatch), sbx packages the prebuilt `.deb` directly: resolve the URL to a content
 //! hash, then build a generated derivation that `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the
 //! ELF binaries against a curated Electron/Chromium library set. **No build script runs**
@@ -606,15 +606,15 @@ mod tests {
         let expr = derivation_expr(
             "github:NixOS/nixpkgs/abc",
             "x86_64-linux",
-            "opencode-desktop",
-            "https://example.com/x/opencode-desktop-linux-amd64.deb",
+            "demo-app",
+            "https://example.com/x/demo-app-linux-amd64.deb",
             HASH,
         );
         // pinned source (url + resolved hash), against the pinned nixpkgs for this system
         assert!(expr.contains(
             "(builtins.getFlake \"github:NixOS/nixpkgs/abc\").legacyPackages.x86_64-linux"
         ));
-        assert!(expr.contains("url = \"https://example.com/x/opencode-desktop-linux-amd64.deb\";"));
+        assert!(expr.contains("url = \"https://example.com/x/demo-app-linux-amd64.deb\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
         // unpack-only, no build script (safe host-side); the Electron lib set is present. The
         // extraction pipes the data tarball through a non-root `tar` so a setuid file (Chromium's
@@ -625,8 +625,8 @@ mod tests {
         // generic Electron install: find the app by its app.asar, wrap the launcher as bin/<name>
         assert!(expr.contains("resources/"));
         assert!(expr.contains("app.asar"));
-        assert!(expr.contains("$out/bin/opencode-desktop"));
-        assert!(expr.contains("meta.mainProgram = \"opencode-desktop\";"));
+        assert!(expr.contains("$out/bin/demo-app"));
+        assert!(expr.contains("meta.mainProgram = \"demo-app\";"));
         // no leftover placeholder
         assert!(!expr.contains('@'), "unreplaced placeholder in:\n{expr}");
     }
@@ -646,10 +646,10 @@ mod tests {
             },
         );
         lock.insert(
-            "github:iOfficeAI/AionUi".to_string(),
+            "github:example/demo-app".to_string(),
             DebPin {
                 hash: HASH.to_string(),
-                url: "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb".to_string(),
+                url: "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb".to_string(),
             },
         );
         write_pins(&layout, id, &lock).expect("write the lock");
@@ -668,10 +668,10 @@ mod tests {
             "https://example.com/a.deb"
         );
         assert_eq!(
-            read["github:iOfficeAI/AionUi"].url,
-            "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb"
+            read["github:example/demo-app"].url,
+            "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb"
         );
-        assert_eq!(read["github:iOfficeAI/AionUi"].hash, HASH);
+        assert_eq!(read["github:example/demo-app"].hash, HASH);
 
         // a legacy two-column line reads with url == key; a corrupt (non-SRI) line self-heals (drop).
         std::fs::write(
@@ -689,10 +689,10 @@ mod tests {
 
     #[test]
     fn parse_source_dispatches_github_from_url() {
-        match parse_source("github:iOfficeAI/AionUi") {
+        match parse_source("github:example/demo-app") {
             DebSource::Github { owner, repo } => {
-                assert_eq!(owner, "iOfficeAI");
-                assert_eq!(repo, "AionUi");
+                assert_eq!(owner, "example");
+                assert_eq!(repo, "demo-app");
             }
             DebSource::Url(_) | DebSource::Apt { .. } => panic!("github locator misparsed"),
         }
@@ -702,34 +702,35 @@ mod tests {
         ));
     }
 
-    // A trimmed capture of iOfficeAI/AionUi's `releases/latest` asset set (real names + URLs), the
-    // shape [`select_deb_asset`] must pick from: two linux `.deb`s (amd64 + arm64) beside mac/win.
-    const AIONUI_ASSETS: &str = r#"{
+    // A trimmed capture of a desktop app's `releases/latest` asset set (the same names + URL shape a
+    // real release carries), the shape [`select_deb_asset`] must pick from: two linux `.deb`s (amd64
+    // + arm64) beside mac/win.
+    const RELEASE_ASSETS: &str = r#"{
       "tag_name": "v2.1.35",
       "assets": [
-        { "name": "AionUi-2.1.35-linux-amd64.deb",
-          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb" },
-        { "name": "AionUi-2.1.35-linux-arm64.deb",
-          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-arm64.deb" },
-        { "name": "AionUi-2.1.35-mac-x64.dmg",
-          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-mac-x64.dmg" },
-        { "name": "AionUi-2.1.35-win-x64.exe",
-          "browser_download_url": "https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-win-x64.exe" }
+        { "name": "demo-app-2.1.35-linux-amd64.deb",
+          "browser_download_url": "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb" },
+        { "name": "demo-app-2.1.35-linux-arm64.deb",
+          "browser_download_url": "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-arm64.deb" },
+        { "name": "demo-app-2.1.35-mac-x64.dmg",
+          "browser_download_url": "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-mac-x64.dmg" },
+        { "name": "demo-app-2.1.35-win-x64.exe",
+          "browser_download_url": "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-win-x64.exe" }
       ]
     }"#;
 
     #[test]
     fn select_deb_asset_picks_the_native_arch_and_rejects_the_foreign_one() {
-        let json: serde_json::Value = serde_json::from_str(AIONUI_ASSETS).unwrap();
+        let json: serde_json::Value = serde_json::from_str(RELEASE_ASSETS).unwrap();
         // x86_64 selects the amd64 deb, never the arm64 deb or the mac/win assets.
         assert_eq!(
             select_deb_asset(&json, "x86_64-linux").as_deref(),
-            Some("https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-amd64.deb")
+            Some("https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb")
         );
         // aarch64 selects the arm64 deb from the same release.
         assert_eq!(
             select_deb_asset(&json, "aarch64-linux").as_deref(),
-            Some("https://github.com/iOfficeAI/AionUi/releases/download/v2.1.35/AionUi-2.1.35-linux-arm64.deb")
+            Some("https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-arm64.deb")
         );
     }
 
@@ -917,17 +918,17 @@ mod tests {
     // A trimmed apt `Packages` index shaped like a vendor's single-application pool: several versions
     // of one package, newest NOT last, so the ordering (not the file order) is what's under test.
     const APT_INDEX: &str = "\
-Package: claude-desktop
+Package: demo-app
 Version: 1.18286.2
-Filename: pool/main/c/claude-desktop/claude-desktop_1.18286.2_amd64.deb
+Filename: pool/main/d/demo-app/demo-app_1.18286.2_amd64.deb
 
-Package: claude-desktop
+Package: demo-app
 Version: 1.21459.0
-Filename: pool/main/c/claude-desktop/claude-desktop_1.21459.0_amd64.deb
+Filename: pool/main/d/demo-app/demo-app_1.21459.0_amd64.deb
 
-Package: claude-desktop
+Package: demo-app
 Version: 1.17377.0
-Filename: pool/main/c/claude-desktop/claude-desktop_1.17377.0_amd64.deb
+Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
 ";
 
     #[test]
@@ -938,7 +939,7 @@ Filename: pool/main/c/claude-desktop/claude-desktop_1.17377.0_amd64.deb
         assert_eq!(version, "1.21459.0");
         assert_eq!(
             filename,
-            "pool/main/c/claude-desktop/claude-desktop_1.21459.0_amd64.deb"
+            "pool/main/d/demo-app/demo-app_1.21459.0_amd64.deb"
         );
     }
 
@@ -1025,8 +1026,8 @@ Filename: pool/main/c/claude-desktop/claude-desktop_1.17377.0_amd64.deb
         assert!(parse_numeric_version("").is_none());
         // repo root is the URL up to the `/dists/` segment; Filename resolves against it.
         assert_eq!(
-            apt_repo_root("https://d.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages"),
-            Some("https://d.claude.ai/claude-desktop/apt/stable")
+            apt_repo_root("https://apt.example.com/demo-app/apt/stable/dists/stable/main/binary-amd64/Packages"),
+            Some("https://apt.example.com/demo-app/apt/stable")
         );
         assert_eq!(apt_repo_root("https://h/no-dists/Packages"), None);
     }

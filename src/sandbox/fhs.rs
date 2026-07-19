@@ -183,7 +183,7 @@ pub(crate) fn resolve_userland(
     let glibc = realise("glibc.out", LOADER, "glibc")?;
     let stdcpp = realise("stdenv.cc.cc.lib", "lib/libstdc++.so.6", "stdcpp")?;
     // zlib supplies `libz.so.1`, a near-universal dependency a foreign dynamic binary
-    // dlopens (Node native addons, the Cursor CLI, many bundled tools) that is absent
+    // dlopens (Node native addons, some bundled CLIs, many bundled tools) that is absent
     // from glibc/stdcpp. It joins the nix-ld foreign library path so a binary the cage
     // loads through the shim resolves it without a per-profile override.
     let zlib = realise("zlib", "lib/libz.so.1", "zlib")?;
@@ -531,7 +531,7 @@ mod resolve_tests {
 
         // nix-ld exposes `libz.so.1` to foreign binaries: zlib's lib dir is on the
         // foreign library path and the library file is backed by sbx's store. A binary
-        // the cage loads through the shim (the Cursor CLI, Node native addons) dlopens it.
+        // the cage loads through the shim (some bundled CLIs, Node native addons) dlopens it.
         let zlib_lib = u
             .foreign_lib_paths
             .iter()

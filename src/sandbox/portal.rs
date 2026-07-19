@@ -51,9 +51,13 @@ use std::process::Command;
 /// The packages the in-cage portal needs, each `(nixpkgs attribute, the marker its output must
 /// carry, gcroot name)`. `dbus` supplies the session-bus daemon (and `dbus-send`, used host-side to
 /// read the theme); `xdg-desktop-portal` is the portal front-end; `xdg-desktop-portal-gtk` is the
-/// GTK backend that renders the file dialog. They share the revision-keyed `gui` gcroot directory
-/// with the fonts/certutil/GUI data (all GUI-hole provisions on the same channel), so `sbx gc`
-/// keeps or drops them together.
+/// GTK backend that renders the file dialog; `desktop-file-utils` supplies `update-desktop-database`,
+/// which builds the desktop-database index the portal's `OpenURI` needs to resolve a custom-scheme
+/// deep-link handler an app registers (a `.desktop` with a `MimeType=x-scheme-handler/<scheme>`) — the
+/// portal launches only an app in the *registered/recommended* list, which that index (not the bare
+/// `mimeapps.list` default) populates. They share the revision-keyed `gui` gcroot directory with the
+/// fonts/certutil/GUI data (all GUI-hole provisions on the same channel), so `sbx gc` keeps or drops
+/// them together.
 const PACKAGES: &[(&str, &str, &str)] = &[
     ("dbus", "bin/dbus-daemon", "dbus"),
     (
@@ -65,6 +69,11 @@ const PACKAGES: &[(&str, &str, &str)] = &[
         "xdg-desktop-portal-gtk",
         "libexec/xdg-desktop-portal-gtk",
         "xdg-desktop-portal-gtk",
+    ),
+    (
+        "desktop-file-utils",
+        "bin/update-desktop-database",
+        "desktop-file-utils",
     ),
 ];
 
@@ -139,6 +148,9 @@ pub(crate) struct Provision {
     pub(crate) xdp_root: PathBuf,
     /// Logical root of `xdg-desktop-portal-gtk` (its servicedir plus the `gtk.portal` descriptor).
     pub(crate) gtk_root: PathBuf,
+    /// Logical path of `update-desktop-database` (run in-cage from the wrap preamble to index any
+    /// deep-link handler an app registers, so the portal's `OpenURI` can resolve it).
+    pub(crate) update_desktop_db: PathBuf,
 }
 
 /// Provision the three portal packages into sbx's store against the pinned `nixpkgs`, sharing the
@@ -156,13 +168,15 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
         resolved.push(root.clone());
         roots.push(root);
     }
-    // `resolved` is in `PACKAGES` order: dbus, xdg-desktop-portal, xdg-desktop-portal-gtk.
+    // `resolved` is in `PACKAGES` order: dbus, xdg-desktop-portal, xdg-desktop-portal-gtk,
+    // desktop-file-utils.
     let dbus_root = &resolved[0];
     Ok(Provision {
         dbus_daemon: dbus_root.join("bin/dbus-daemon"),
         dbus_send: dbus_root.join("bin/dbus-send"),
         xdp_root: resolved[1].clone(),
         gtk_root: resolved[2].clone(),
+        update_desktop_db: resolved[3].join("bin/update-desktop-database"),
         roots,
     })
 }
@@ -267,6 +281,7 @@ pub(crate) fn wrap_command(
     dbus_daemon: &Path,
     xdp_root: &Path,
     gtk_root: &Path,
+    update_desktop_db: &Path,
     color_scheme: Option<&str>,
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
@@ -290,12 +305,25 @@ pub(crate) fn wrap_command(
     };
     // A quoted heredoc delimiter (`'SBXPORTALCF'`) disables every shell expansion, so the config —
     // already fully substituted host-side — is written verbatim.
+    // Index the app's desktop-database in the background so the portal's `OpenURI` can resolve a
+    // deep-link handler the app registers (a `.desktop` with `MimeType=x-scheme-handler/<scheme>`,
+    // e.g. an OAuth-callback scheme): the portal launches only an app in the *registered/recommended*
+    // list, which `update-desktop-database` builds — the bare `mimeapps.list` default is not enough.
+    // The app writes its `.desktop` in its OWN command preamble (which `exec "$@"` runs AFTER this),
+    // then opens the URL only much later (at login), so a short bounded retry catches the file whenever
+    // it lands. Best-effort, never blocks; the background job dies with the cage (its PID-1 reaper).
+    let index = format!(
+        "( for _ in 1 2 3; do \"{udd}\" \"$HOME/.local/share/applications\" >/dev/null 2>&1; \
+         sleep 1; done ) &\n",
+        udd = update_desktop_db.display(),
+    );
     let preamble = format!(
         "mkdir -p {dir}/xdg-desktop-portal 2>/dev/null\n\
          cat > {dir}/session.conf <<'SBXPORTALCF'\n{session}SBXPORTALCF\n\
          cat > {dir}/xdg-desktop-portal/portals.conf <<'SBXPORTALPF'\n{portals}SBXPORTALPF\n\
          {seed}\
-         {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n",
+         {daemon} --config-file={dir}/session.conf --fork </dev/null >/dev/null 2>&1 || true\n\
+         {index}",
         dir = CAGE_DIR,
         daemon = dbus_daemon.display(),
         portals = PORTALS_CONF,
@@ -401,12 +429,13 @@ mod tests {
 
     #[test]
     fn wrap_command_starts_the_daemon_positionally_and_seeds_the_theme() {
-        let cmd = vec![OsString::from("claude-desktop"), OsString::from("--flag")];
+        let cmd = vec![OsString::from("demo-app"), OsString::from("--flag")];
         let argv = wrap_command(
             Path::new("/bin/bash"),
             Path::new("/nix/store/ddd-dbus/bin/dbus-daemon"),
             Path::new("/nix/store/aaa-xdg-desktop-portal"),
             Path::new("/nix/store/bbb-xdg-desktop-portal-gtk"),
+            Path::new("/nix/store/eee-dfu/bin/update-desktop-database"),
             Some("prefer-dark"),
             cmd,
         );
@@ -429,10 +458,19 @@ mod tests {
         assert!(!script.contains("GTK_THEME"));
         // the daemon is started plainly (no env prefix), config from the cage
         assert!(script.contains("\n/nix/store/ddd-dbus/bin/dbus-daemon --config-file="));
+        // the desktop-database indexer is backgrounded (so it runs after the app registers its
+        // deep-link handler), by absolute store path, targeting the cage home's applications dir
+        assert!(script.contains(
+            "\"/nix/store/eee-dfu/bin/update-desktop-database\" \"$HOME/.local/share/applications\""
+        ));
+        assert!(
+            script.contains("done ) &"),
+            "the indexer must be backgrounded: {script}"
+        );
         // the command runs as "$@", never spliced into the script text
         assert!(script.trim_end().ends_with("exec \"$@\""));
         assert_eq!(argv[3], OsString::from("sbx-incage-portal"));
-        assert_eq!(argv[4], OsString::from("claude-desktop"));
+        assert_eq!(argv[4], OsString::from("demo-app"));
         assert_eq!(argv[5], OsString::from("--flag"));
     }
 
@@ -443,6 +481,7 @@ mod tests {
             Path::new("/nix/store/ddd-dbus/bin/dbus-daemon"),
             Path::new("/nix/store/aaa-xdg-desktop-portal"),
             Path::new("/nix/store/bbb-xdg-desktop-portal-gtk"),
+            Path::new("/nix/store/eee-dfu/bin/update-desktop-database"),
             None,
             vec![OsString::from("x")],
         );

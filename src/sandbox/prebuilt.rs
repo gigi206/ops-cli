@@ -64,7 +64,7 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 /// The generic Electron install phase (a shell snippet), embedded by each backend's generated
 /// derivation into its `installPhase` after the bundle has been copied into `$out`. It locates the
 /// app directory by its `resources/` signature — either a packed `resources/app.asar` file or, for an
-/// asar-less build (modern VS Code forks such as Cursor ship the app as a loose `resources/app/`
+/// asar-less build (some modern VS Code forks ship the app as a loose `resources/app/`
 /// directory), the `resources/app` directory itself; both resolve to the same bundle root — and wraps
 /// the launcher, the executable beside it that is not a `.so`, a Chromium helper, or the AppImage
 /// `AppRun` script. Excluding `AppRun` is load-bearing for an AppImage (its squashfs carries an
@@ -300,7 +300,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         // AppRun exclusion is what makes one snippet serve both backends.
         assert!(wrap.contains("! -name 'AppRun'"));
         // The app is located by a packed `resources/app.asar` OR, for an asar-less VS Code fork
-        // (Cursor ships `resources/app/` as a loose directory), the `resources/app` directory.
+        // (some ship `resources/app/` as a loose directory), the `resources/app` directory.
         assert!(wrap.contains("resources/app.asar"));
         assert!(wrap.contains("-type d -path '*/resources/app'"));
         assert!(!wrap.contains('@'), "unfilled placeholder in:\n{wrap}");

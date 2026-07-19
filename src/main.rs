@@ -4008,7 +4008,7 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
 
 /// Parse the launch form of `sbx app run`: split sbx's own arguments from the app command's trailing
 /// arguments at the first `--`, then read the app name and `--detach` from the head. Tokens after
-/// `--` are appended verbatim to the app's declared `cmd` (e.g. `sbx app run claude -- -c` passes
+/// `--` are appended verbatim to the app's declared `cmd` (e.g. `sbx app run demo-app -- -c` passes
 /// `-c` to the launched command, so an agent can resume a session or tweak a flag without editing the
 /// profile). An unknown flag or a second name in the head is a usage error, so a typo cannot
 /// silently launch a different posture (a mistyped `--detach` running attached, or extra tokens
@@ -4347,7 +4347,7 @@ fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<
 /// `sbx app export <name> [--out <file>]`: write a named app out as a portable profile — an
 /// imported profile verbatim, or an inline app serialized to a minimal top-level profile (as
 /// authored, security fields and all; import is the trust act, not export). Writes to stdout by
-/// default (composable and clobber-safe — `sbx app export claude > claude.toml`), or to `--out
+/// default (composable and clobber-safe — `sbx app export demo-app > demo-app.toml`), or to `--out
 /// <file>` directly. The exported file re-imports identically (the round-trip the feature sells).
 fn app_export(args: &[OsString]) -> ExitCode {
     let mut name: Option<&str> = None;
@@ -4908,7 +4908,7 @@ struct AppHomeShow {
 #[derive(serde::Serialize)]
 struct OrphanTool {
     /// The tool as a `[packages]` value would name it: the `mise:` backend prefix plus its real
-    /// token (`mise:pipx:hermes-agent`), or the munged directory name when mise recorded no token.
+    /// token (`mise:pipx:demo-agent`), or the munged directory name when mise recorded no token.
     name: String,
     versions: Vec<String>,
 }
@@ -5070,7 +5070,7 @@ fn build_app_show(
             continue;
         }
         // Prefix the mise backend so the name reads like the `packages:` section and is the exact
-        // `[packages]` value that would adopt it (`mise:pipx:hermes-agent`, not a bare `pipx:…`).
+        // `[packages]` value that would adopt it (`mise:pipx:demo-agent`, not a bare `pipx:…`).
         orphan_versions
             .entry(format!("mise:{}", tool.label()))
             .or_default()
@@ -5190,7 +5190,7 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
     }
     // Installed mise tools no declared package accounts for — a leftover profile or a mise-pulled
     // dependency. Each `name` already carries the `mise:` backend prefix (see `build_app_show`), so
-    // the provider reads like the `packages:` section above (`mise:pipx:hermes-agent`).
+    // the provider reads like the `packages:` section above (`mise:pipx:demo-agent`).
     if !v.orphans.is_empty() {
         let _ = writeln!(s, "  installed (undeclared):");
         for t in &v.orphans {
@@ -10878,47 +10878,47 @@ mod tests {
         let os = |s: &str| OsString::from(s);
         // name only
         assert!(matches!(
-            parse_app_rm(&[os("claude")]),
+            parse_app_rm(&[os("demo-app")]),
             AppRmArgs::Ok {
                 purge: false,
                 gc: false,
-                name: "claude"
+                name: "demo-app"
             }
         ));
         // --purge before the name
         assert!(matches!(
-            parse_app_rm(&[os("--purge"), os("claude")]),
+            parse_app_rm(&[os("--purge"), os("demo-app")]),
             AppRmArgs::Ok {
                 purge: true,
                 gc: false,
-                name: "claude"
+                name: "demo-app"
             }
         ));
         // --purge after the name (either order)
         assert!(matches!(
-            parse_app_rm(&[os("claude"), os("--purge")]),
+            parse_app_rm(&[os("demo-app"), os("--purge")]),
             AppRmArgs::Ok {
                 purge: true,
                 gc: false,
-                name: "claude"
+                name: "demo-app"
             }
         ));
         // --purge and --gc together, name interleaved between the flags
         assert!(matches!(
-            parse_app_rm(&[os("--gc"), os("claude"), os("--purge")]),
+            parse_app_rm(&[os("--gc"), os("demo-app"), os("--purge")]),
             AppRmArgs::Ok {
                 purge: true,
                 gc: true,
-                name: "claude"
+                name: "demo-app"
             }
         ));
         // --gc alone parses; the --gc-requires---purge rule is the caller's, not the parser's
         assert!(matches!(
-            parse_app_rm(&[os("--gc"), os("claude")]),
+            parse_app_rm(&[os("--gc"), os("demo-app")]),
             AppRmArgs::Ok {
                 purge: false,
                 gc: true,
-                name: "claude"
+                name: "demo-app"
             }
         ));
         // no name — even with the flag, --purge alone must never mean "purge everything"
@@ -10929,12 +10929,12 @@ mod tests {
         ));
         // unknown option and a second positional are distinct errors
         assert!(matches!(
-            parse_app_rm(&[os("--nope"), os("claude")]),
+            parse_app_rm(&[os("--nope"), os("demo-app")]),
             AppRmArgs::UnknownOption("--nope")
         ));
         assert!(matches!(
-            parse_app_rm(&[os("claude"), os("codex")]),
-            AppRmArgs::Extra("codex")
+            parse_app_rm(&[os("demo-app"), os("demo-tool")]),
+            AppRmArgs::Extra("demo-tool")
         ));
     }
 
@@ -10980,14 +10980,14 @@ mod tests {
         // the free `env` table — baseline and per-app — is not gated
         assert!(!is_security_key("env.FOO"));
         assert!(!is_security_key("env"));
-        assert!(!is_security_key("app.claude.env.FOO"));
+        assert!(!is_security_key("app.demo-app.env.FOO"));
         // everything else is a security field, including an app's own security overlay
         assert!(is_security_key("binds"));
         assert!(is_security_key("network"));
-        assert!(is_security_key("app.claude.network"));
-        assert!(is_security_key("app.claude.cmd"));
+        assert!(is_security_key("app.demo-app.network"));
+        assert!(is_security_key("app.demo-app.cmd"));
         // a bare app table (no field) is gated too
-        assert!(is_security_key("app.claude"));
+        assert!(is_security_key("app.demo-app"));
     }
 
     #[test]
@@ -11256,9 +11256,9 @@ mod tests {
         // Empty → the "none" line with the how-it-arrives hint.
         assert!(render_pending(&[], &[], None, &p).contains("none"));
         // An empty listing under an `--app` filter names the app (not "nothing anywhere").
-        let scoped = render_pending(&[], &[], Some("claude-code"), &p);
+        let scoped = render_pending(&[], &[], Some("demo-app"), &p);
         assert!(
-            scoped.contains("none for app `claude-code`"),
+            scoped.contains("none for app `demo-app`"),
             "the empty filtered listing must name the app:\n{scoped}"
         );
 
@@ -11330,12 +11330,12 @@ mod tests {
         assert!(d.app.is_none());
 
         // `-i` / `--interval` set the refresh; `-a` / `--app` set the scope; both spellings work.
-        let a = parse_watch_args(&osv(&["-i", "5", "-a", "claude-code"])).unwrap();
+        let a = parse_watch_args(&osv(&["-i", "5", "-a", "demo-app"])).unwrap();
         assert_eq!(a.interval, Duration::from_secs(5));
-        assert_eq!(a.app.as_deref(), Some("claude-code"));
-        let b = parse_watch_args(&osv(&["--interval", "10", "--app", "codex"])).unwrap();
+        assert_eq!(a.app.as_deref(), Some("demo-app"));
+        let b = parse_watch_args(&osv(&["--interval", "10", "--app", "demo-tool"])).unwrap();
         assert_eq!(b.interval, Duration::from_secs(10));
-        assert_eq!(b.app.as_deref(), Some("codex"));
+        assert_eq!(b.app.as_deref(), Some("demo-tool"));
     }
 
     #[test]
@@ -11369,13 +11369,13 @@ mod tests {
         assert!(!d.json);
 
         // Every flag, both spellings.
-        let a = parse_live_args(&osv(&["-i", "3", "-a", "claude", "--json"])).unwrap();
+        let a = parse_live_args(&osv(&["-i", "3", "-a", "demo-app", "--json"])).unwrap();
         assert_eq!(a.interval, Duration::from_secs(3));
-        assert_eq!(a.app.as_deref(), Some("claude"));
+        assert_eq!(a.app.as_deref(), Some("demo-app"));
         assert!(a.json);
-        let b = parse_live_args(&osv(&["--interval", "5", "--app", "codex"])).unwrap();
+        let b = parse_live_args(&osv(&["--interval", "5", "--app", "demo-tool"])).unwrap();
         assert_eq!(b.interval, Duration::from_secs(5));
-        assert_eq!(b.app.as_deref(), Some("codex"));
+        assert_eq!(b.app.as_deref(), Some("demo-tool"));
         assert!(!b.json);
     }
 
@@ -11477,12 +11477,12 @@ mod tests {
         let ctx = vec![(
             4242u32,
             PathBuf::from("/home/u/proj"),
-            "app:claude".to_string(),
+            "app:demo-app".to_string(),
         )];
         let out = render_live(&sessions, &ctx, None, now_ms, &pal);
         assert!(out.contains("open egress flows:"), "header: {out}");
         assert!(
-            out.contains("session 4242 [app:claude] /home/u/proj"),
+            out.contains("session 4242 [app:demo-app] /home/u/proj"),
             "session header: {out}"
         );
         assert!(out.contains("api.test:443"), "flow host:port shown: {out}");
@@ -11499,9 +11499,9 @@ mod tests {
         // An empty listing names what populates it, and an app filter names the app.
         let empty = render_live(&[], &[], None, now_ms, &pal);
         assert!(empty.contains("no egress tunnel is open"), "empty: {empty}");
-        let empty_app = render_live(&[], &[], Some("claude"), now_ms, &pal);
+        let empty_app = render_live(&[], &[], Some("demo-app"), now_ms, &pal);
         assert!(
-            empty_app.contains("app `claude`"),
+            empty_app.contains("app `demo-app`"),
             "app-scoped empty: {empty_app}"
         );
     }
@@ -11541,7 +11541,7 @@ mod tests {
 
         let v = parse_log_args(&osv(&[
             "--app",
-            "claude-code",
+            "demo-app",
             "--host",
             "api.test",
             "--verdict",
@@ -11552,7 +11552,7 @@ mod tests {
             "--json",
         ]))
         .unwrap();
-        assert_eq!(v.app.as_deref(), Some("claude-code"));
+        assert_eq!(v.app.as_deref(), Some("demo-app"));
         assert_eq!(v.host.as_deref(), Some("api.test"));
         assert_eq!(v.verdict, Some(LogVerdict::Error));
         assert_eq!(v.limit, Some(5));
@@ -11706,7 +11706,7 @@ mod tests {
         // port alone would not tell them apart (a `tcp://` splice can ride 443).
         let mut https = log_event(
             1,
-            "claude.ai",
+            "example.com",
             Some("WS"),
             Some("/sub"),
             Deny,
@@ -11758,7 +11758,7 @@ mod tests {
         // TLS" signal is never lost to a bare `h2` — with a `grpc` tag; both surface in the JSON too.
         let mut h2 = log_event(
             1,
-            "repo42.cursor.sh",
+            "repo42.example.net",
             Some("POST"),
             Some("/pkg.Service/Method"),
             Allow,
@@ -11871,13 +11871,13 @@ mod tests {
             &[],
             &[],
             &LogView {
-                app: Some("claude-code".into()),
+                app: Some("demo-app".into()),
                 ..LogView::default()
             },
             &p,
             true,
         );
-        assert!(scoped.contains("for app `claude-code`"), "{scoped}");
+        assert!(scoped.contains("for app `demo-app`"), "{scoped}");
 
         let sessions = [SessionLog {
             pid: 4242,
@@ -11916,13 +11916,13 @@ mod tests {
         let context = vec![(
             4242u32,
             std::path::PathBuf::from("/home/u/proj"),
-            "app:claude-code".to_string(),
+            "app:demo-app".to_string(),
         )];
 
         let out = render_logs(&sessions, &context, &LogView::default(), &p, true);
         // The session header from the registry context.
         assert!(
-            out.contains("session 4242 [app:claude-code] /home/u/proj"),
+            out.contains("session 4242 [app:demo-app] /home/u/proj"),
             "{out}"
         );
         // Each event line leads with the session id (before the time) — proven by the id and the host
@@ -12031,9 +12031,9 @@ mod tests {
             render_drain("allowed", false, None, &[], &[], &[], &p).contains("no pending requests")
         );
         // An empty drain under an `--app` filter names the app (not "nothing anywhere").
-        let scoped = render_drain("allowed", false, Some("claude-code"), &[], &[], &[], &p);
+        let scoped = render_drain("allowed", false, Some("demo-app"), &[], &[], &[], &p);
         assert!(
-            scoped.contains("for app `claude-code`"),
+            scoped.contains("for app `demo-app`"),
             "the empty filtered drain must name the app:\n{scoped}"
         );
 
@@ -12087,7 +12087,7 @@ mod tests {
         // Duplication collapse (the regression): a session that retried one destination many times
         // must list that host ONCE with a ×count, not once per request.
         let mut hosts = vec!["ziglang.org".to_string(); 20];
-        hosts.push("downloads.claude.ai".to_string());
+        hosts.push("downloads.example.com".to_string());
         let bursty = vec![(285706u32, hosts)];
         let out = render_drain("allowed", false, None, &bursty, &[], &[], &p);
         // Teeth: on the un-folded code this count is 20, so the assert fails without the fix.
@@ -12103,7 +12103,7 @@ mod tests {
         // The header still counts every request (21), and the singleton host gets no ×1 noise.
         assert!(out.contains("allowed 21 parked request(s)"), "{out}");
         assert!(
-            out.contains("downloads.claude.ai") && !out.contains("×1"),
+            out.contains("downloads.example.com") && !out.contains("×1"),
             "a single-request host must not get a ×1 suffix:\n{out}"
         );
     }
@@ -12212,32 +12212,32 @@ mod tests {
         let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
 
         // A bare name: no detach, no passthrough, no override, no net-learn.
-        let a = parse_app_launch(&v(&["claude"])).unwrap();
-        assert_eq!((a.name.as_str(), a.detach), ("claude", false));
+        let a = parse_app_launch(&v(&["demo-app"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("demo-app", false));
         assert!(a.tail.is_empty() && a.cli.config.is_empty() && a.cli.env.is_empty());
         assert!(a.net_learn.is_none());
 
         // `--detach` before the (absent) `--` sets the flag.
-        let a = parse_app_launch(&v(&["claude", "--detach"])).unwrap();
-        assert_eq!((a.name.as_str(), a.detach), ("claude", true));
+        let a = parse_app_launch(&v(&["demo-app", "--detach"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("demo-app", true));
         assert!(a.tail.is_empty());
         assert!(!a.observe, "no --observe by default");
 
         // `--observe` sets the feed flag and leaves the name intact.
-        let a = parse_app_launch(&v(&["claude", "--observe"])).unwrap();
-        assert_eq!((a.name.as_str(), a.observe), ("claude", true));
+        let a = parse_app_launch(&v(&["demo-app", "--observe"])).unwrap();
+        assert_eq!((a.name.as_str(), a.observe), ("demo-app", true));
         assert!(!a.detach);
 
         // `--` separates sbx's args from the passthrough tail, appended verbatim.
-        let a = parse_app_launch(&v(&["claude", "--", "-c"])).unwrap();
-        assert_eq!((a.name.as_str(), a.detach), ("claude", false));
+        let a = parse_app_launch(&v(&["demo-app", "--", "-c"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("demo-app", false));
         assert_eq!(a.tail, v(&["-c"]));
 
         // A flag before `--` is sbx's; the same token after `--` is the program's (passthrough).
-        let a = parse_app_launch(&v(&["claude", "--detach", "--", "-c", "--foo"])).unwrap();
-        assert_eq!((a.name.as_str(), a.detach), ("claude", true));
+        let a = parse_app_launch(&v(&["demo-app", "--detach", "--", "-c", "--foo"])).unwrap();
+        assert_eq!((a.name.as_str(), a.detach), ("demo-app", true));
         assert_eq!(a.tail, v(&["-c", "--foo"]));
-        let a = parse_app_launch(&v(&["claude", "--", "--detach"])).unwrap();
+        let a = parse_app_launch(&v(&["demo-app", "--", "--detach"])).unwrap();
         assert!(
             !a.detach,
             "`--detach` after `--` is the program's, not sbx's"
@@ -12245,8 +12245,8 @@ mod tests {
         assert_eq!(a.tail, v(&["--detach"]));
 
         // A trailing `--` with nothing after it is an empty tail, not an error.
-        let a = parse_app_launch(&v(&["claude", "--"])).unwrap();
-        assert_eq!(a.name, "claude");
+        let a = parse_app_launch(&v(&["demo-app", "--"])).unwrap();
+        assert_eq!(a.name, "demo-app");
         assert!(a.tail.is_empty());
 
         // A one-shot override is collected from the head, in any order with the name/`--detach`, and
@@ -12254,7 +12254,7 @@ mod tests {
         let a = parse_app_launch(&v(&[
             "--env",
             "FOO=bar",
-            "claude",
+            "demo-app",
             "--config",
             "network=\"none\"",
             "--",
@@ -12262,37 +12262,38 @@ mod tests {
             "x",
         ]))
         .unwrap();
-        assert_eq!(a.name, "claude");
+        assert_eq!(a.name, "demo-app");
         assert_eq!(a.cli.config, vec!["network=\"none\"".to_string()]);
         assert_eq!(a.cli.env, vec!["FOO=bar".to_string()]);
         assert_eq!(a.tail, v(&["--config", "x"]));
         // The `--flag=value` inline form is accepted too.
-        let a = parse_app_launch(&v(&["claude", "--config=gui=\"wayland\"", "--env=A=1"])).unwrap();
+        let a =
+            parse_app_launch(&v(&["demo-app", "--config=gui=\"wayland\"", "--env=A=1"])).unwrap();
         assert_eq!(a.cli.config, vec!["gui=\"wayland\"".to_string()]);
         assert_eq!(a.cli.env, vec!["A=1".to_string()]);
 
         // `--net-learn`: bare is `domain` (the default), the local scope, no dry-run.
-        let a = parse_app_launch(&v(&["claude", "--net-learn"])).unwrap();
+        let a = parse_app_launch(&v(&["demo-app", "--net-learn"])).unwrap();
         let nl = a.net_learn.expect("net-learn set");
         assert_eq!(nl.gran, sandbox::Granularity::Domain);
         assert!(matches!(nl.scope, config::manage::Scope::Local) && !nl.dry_run);
         // `=level`, `--dry-run`, and `-g` compose, in any order with the name.
-        let a = parse_app_launch(&v(&["--net-learn=path", "claude", "--dry-run", "-g"])).unwrap();
+        let a = parse_app_launch(&v(&["--net-learn=path", "demo-app", "--dry-run", "-g"])).unwrap();
         let nl = a.net_learn.expect("net-learn set");
         assert_eq!(nl.gran, sandbox::Granularity::Path);
         assert!(matches!(nl.scope, config::manage::Scope::Global) && nl.dry_run);
         // A bad granularity, `--net-learn` with `--detach`, and a scope/`--dry-run` without
         // `--net-learn` are each usage errors (never a silently-ignored flag).
-        assert!(parse_app_launch(&v(&["claude", "--net-learn=subtree"])).is_err());
-        assert!(parse_app_launch(&v(&["claude", "--net-learn", "--detach"])).is_err());
-        assert!(parse_app_launch(&v(&["claude", "--dry-run"])).is_err());
-        assert!(parse_app_launch(&v(&["claude", "-g"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--net-learn=subtree"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--net-learn", "--detach"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--dry-run"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "-g"])).is_err());
 
         // The typed security flags are collected into their own fields, in any order with the name.
         let a = parse_app_launch(&v(&[
             "--net",
             "none",
-            "claude",
+            "demo-app",
             "--bind",
             "/data:rw",
             "--forward",
@@ -12307,7 +12308,7 @@ mod tests {
             "hello=nix:hello",
         ]))
         .unwrap();
-        assert_eq!(a.name, "claude");
+        assert_eq!(a.name, "demo-app");
         assert_eq!(a.cli.net, vec!["none".to_string()]);
         assert_eq!(a.cli.gui, vec!["wayland".to_string()]);
         assert_eq!(a.cli.nixpkgs, vec!["nixos-23.11".to_string()]);
@@ -12317,21 +12318,21 @@ mod tests {
         assert_eq!(a.cli.packages, vec!["hello=nix:hello".to_string()]);
 
         // The boolean flags are optional-value and must never consume the following token: a bare
-        // `--gpu` placed right before the name still leaves `claude` as the name (not swallowed as a
+        // `--gpu` placed right before the name still leaves `demo-app` as the name (not swallowed as a
         // value), normalizing to `"true"`; the inline `--dbus=false` form carries its value.
-        let a = parse_app_launch(&v(&["--gpu", "claude", "--dbus=false"])).unwrap();
-        assert_eq!(a.name, "claude");
+        let a = parse_app_launch(&v(&["--gpu", "demo-app", "--dbus=false"])).unwrap();
+        assert_eq!(a.name, "demo-app");
         assert_eq!(a.cli.gpu, vec!["true".to_string()]);
         assert_eq!(a.cli.dbus, vec!["false".to_string()]);
 
         // Errors: a second name, an unknown flag, no name at all, `--` with no name before it, and a
         // value-taking flag with no value.
-        assert!(parse_app_launch(&v(&["claude", "extra"])).is_err());
-        assert!(parse_app_launch(&v(&["claude", "--unknown"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "extra"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--unknown"])).is_err());
         assert!(parse_app_launch(&v(&[])).is_err());
         assert!(parse_app_launch(&v(&["--", "-c"])).is_err());
-        assert!(parse_app_launch(&v(&["claude", "--config"])).is_err());
-        assert!(parse_app_launch(&v(&["claude", "--net"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--config"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--net"])).is_err());
     }
 
     #[test]
@@ -12340,12 +12341,12 @@ mod tests {
         use session::{Kind, Registry, Session, SessionRuntime};
 
         // Register THIS process (alive, so it survives the registry's liveness pruning) as an
-        // `sbx app claude-code` session in a throwaway data dir.
+        // `sbx app demo-app` session in a throwaway data dir.
         let data = TmpDir::new();
         let me = Session::current(
             std::path::PathBuf::from("/home/u/proj"),
             Kind::Run,
-            SessionRuntime::GlobalApp("claude-code".to_string()),
+            SessionRuntime::GlobalApp("demo-app".to_string()),
         )
         .expect("read this process's session identity");
         Registry::at(data.path())
@@ -12353,7 +12354,7 @@ mod tests {
             .expect("register the session");
 
         // The filter returns this app's live pid...
-        let pids = session_pids_for_app(data.path(), "claude-code");
+        let pids = session_pids_for_app(data.path(), "demo-app");
         assert!(
             pids.contains(&std::process::id()),
             "the app's live session must be selected: {pids:?}"

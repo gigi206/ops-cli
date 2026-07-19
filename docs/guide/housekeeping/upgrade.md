@@ -18,7 +18,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/projects/<id>/flake-packages.lock` — pinned `flake:` packages.
 - `<data>/projects/<id>/deb-packages.lock` — pinned `deb:` packages (URL → content hash).
 - `<data>/projects/<id>/appimage-packages.lock` — pinned `appimage:` packages (URL → content hash).
-- `<data>/projects/<id>/tarball-packages.lock` — pinned `tarball:` packages (URL → content hash).
+- `<data>/projects/<id>/tarball-packages.lock` — pinned `tarball:` packages (declared source → content hash, plus the resolved download URL for a `tarball:resolve` package).
 
 A launch reads these locks; it does not re-resolve. So updating the `sbx` binary leaves
 your versions exactly where they were. `sbx upgrade` is the one place that rewrites a
@@ -71,9 +71,12 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
 - **`appimage:`** — the `deb:` twin for a prebuilt `.AppImage`: re-resolves each declared URL
   (or a `github:` locator's latest release asset) to its current content hash and rewrites
   `appimage-packages.lock`; a changed hash rebuilds host-side at the next launch.
-- **`tarball:`** — the `deb:` twin for a prebuilt `.tar.gz`: re-resolves each declared URL to its
-  current content hash and rewrites `tarball-packages.lock`; a changed hash rebuilds host-side at
-  the next launch. A version-stamped vendor URL is effectively frozen (its path names the version).
+- **`tarball:`** — the `deb:` twin for a prebuilt `.tar.gz`: re-resolves each declared source and
+  rewrites `tarball-packages.lock`; a changed hash rebuilds host-side at the next launch. A direct
+  `tarball:<url>` re-resolves the same URL, so a version-stamped one is effectively frozen (its path
+  names the version). A `tarball:resolve` package instead re-runs its `[tarball.<name>]` `resolve`
+  command (in a hermetic sandbox) to discover the newest download URL — so it **does** roll forward;
+  the heavy tarball is re-fetched only when that URL actually changed.
 
 ## The fresh-release hold (`mise:` packages)
 

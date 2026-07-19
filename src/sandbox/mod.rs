@@ -84,6 +84,6 @@ pub(crate) use proxy::{builtin_allow_rules, union_with_builtin};
 pub(crate) use search::run as search;
 pub(crate) use smoke::run as smoke;
 pub(crate) use tarball::{
-    pinned_hashes as tarball_pinned_hashes, upgrade as upgrade_tarball,
+    pinned_hashes as tarball_pinned_hashes, upgrade_project as upgrade_tarball,
     withheld as withheld_tarball_packages, TarballUpgrade,
 };

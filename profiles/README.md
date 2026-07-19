@@ -33,6 +33,7 @@ with `sbx app export <name>`.
 | `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
 | `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
 | `agy`             | `mise:aqua:google-antigravity/antigravity-cli`  | `accounts.google.com` (Google OAuth) |
+| `antigravity-ide` | `tarball:resolve` prebuilt `.tar.gz` (Electron GUI IDE / VS Code fork, `gui`/`gpu`/`dbus`, auto-upgraded) | `cloudcode-pa.googleapis.com` (Google OAuth, in-cage browser) |
 | `auggie`          | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | `*.api.augmentcode.com` (Augment account) |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
@@ -197,6 +198,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
+| `antigravity-ide` | `tarball:resolve` (+ `[tarball.antigravity-ide]`) | Google's official IDE `.tar.gz` from `edgedl.me.gvt1.com` (Electron / VS Code fork), autoPatchelf'd host-side — auto-upgraded via a sandboxed resolve command over Google's version API (`sbx upgrade tarball`) |
 | `auggie`      | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | Augment Code npm package (pure-node CLI, node at runtime) |
 | `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
@@ -329,10 +331,13 @@ do not guess the values, so each waits on a real fact or on a named feature:
   reaches the backend, and a transparent redirect is an sbx-sized feature (a Chromium-safe LD_PRELOAD
   connect-shim, or a cap-free loopback-DNS + SNI-relay interceptor), not a profile knob. So t3code keeps
   bwrap + seccomp + the isolated home + the minimal `/dev`, but reaches the host network unfiltered —
-  the honest posture for an Electron app whose backend is proxy-blind. Still waiting, each on a real
-  fact: the Antigravity *IDE*
-  (distinct from the `agy` CLI, profiled above) and hermes desktop — each needs a prebuilt package and
-  a groundable credential, or is better served by its headless sibling (the `hermes` CLI is profiled).
+  the honest posture for an Electron app whose backend is proxy-blind. The Antigravity *IDE* (distinct
+  from the `agy` CLI, profiled above) now **ships** as `antigravity-ide` — packaged from Google's
+  official `.tar.gz` via the `tarball:resolve` backend (auto-upgraded through a sandboxed resolve command),
+  with the `gui`/`gpu`/`dbus` holes and the Google Sign-In in-cage-browser flow; its real build + login
+  is the pending live-gate like every GUI profile. Still waiting on a real fact: hermes desktop — it
+  needs a prebuilt package and a groundable credential, or is better served by its headless sibling
+  (the `hermes` CLI is profiled).
 
 - **`aionui`** is the closest GUI candidate — it is an Electron app **but ships a genuine
   headless `--webui` HTTP-server mode** and is OpenRouter-keyable. It waits on two things:

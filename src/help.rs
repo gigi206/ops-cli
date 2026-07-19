@@ -237,12 +237,12 @@ const PAGES: &[Page] = &[
             home.\n\n\
             Arguments after a `--` are appended to the app's declared command, so you can pass a\n\
             flag to the launched program without editing the profile — e.g. `sbx app run\n\
-            claude-code -- -c` runs the profile's `claude` command with `-c` (resume the previous\n\
+            demo-app -- -c` runs the profile's `demo-app` command with `-c` (resume the previous\n\
             session). They are ordinary launch-time arguments; the app's posture (network, binds,\n\
             secrets, home) is fixed by the profile and unchanged.\n\n\
             A one-shot override (`--config` or a typed flag, and their `SBX_*` environment\n\
             equivalents) is applied *after* the app's overlay, so it is the final word — e.g.\n\
-            `sbx app run claude-code --net none` cuts the app's network for one run. Note that\n\
+            `sbx app run demo-app --net none` cuts the app's network for one run. Note that\n\
             overriding an app's network drops its read-by-default verb filter (an override posture is\n\
             all-verbs, like a Mode-A launch); scope it with `{GET,HEAD}` rules in a `--config`\n\
             `[network]` if you need to keep it. See `sbx help run` for the full precedence rules.\n\n\
@@ -2014,11 +2014,11 @@ mod tests {
 
         // A help flag *after* a `--` belongs to the launched command — `sbx app run <name> -- --help`
         // passes `--help` through, so sbx does not intercept it.
-        assert!(maybe_help("app", &v(&["run", "claude", "--", "--help"])).is_none());
-        assert!(maybe_help("app", &v(&["run", "claude", "--", "-h"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "demo-app", "--", "--help"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "demo-app", "--", "-h"])).is_none());
         // No help flag at all runs the command.
-        assert!(maybe_help("app", &v(&["run", "claude", "--", "-c"])).is_none());
-        assert!(maybe_help("app", &v(&["run", "claude"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "demo-app", "--", "-c"])).is_none());
+        assert!(maybe_help("app", &v(&["run", "demo-app"])).is_none());
     }
 
     #[test]

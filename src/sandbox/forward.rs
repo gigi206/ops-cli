@@ -105,7 +105,7 @@ pub(crate) struct Forward {
 /// (its backlog queues connections) from the moment the launch is up — never a first-request race
 /// (mirrors [`super::egress::start`]). The primary `127.0.0.1` bind fails the launch **closed** with
 /// a message naming the port when it is already in use: the OAuth redirect URL is fixed, so an
-/// ephemeral substitute would silently break the callback, and two `sbx app codex` logins colliding
+/// ephemeral substitute would silently break the callback, and two `sbx app <name>` logins colliding
 /// is a one-shot, not a recurring hazard. The `[::1]` bind is best-effort — it catches a `localhost`
 /// callback the browser sends over IPv6, but a host with IPv6 disabled simply keeps the v4 path.
 pub(crate) fn start(layout: &Layout, mut ports: Vec<u16>) -> io::Result<(Forwarder, Wiring)> {
@@ -388,7 +388,7 @@ mod tests {
             Path::new("/nix/store/x-socat/bin/socat"),
             Path::new("/nix/store/y-bash/bin/bash"),
             &forwards,
-            vec![OsString::from("codex"), OsString::from("login")],
+            vec![OsString::from("demo-app"), OsString::from("login")],
         );
         assert_eq!(out[0], OsString::from("/nix/store/y-bash/bin/bash"));
         assert_eq!(out[1], OsString::from("-c"));
@@ -400,7 +400,7 @@ mod tests {
         assert!(script.trim_end().ends_with("exec \"$@\""));
         // `$0` label, then the command positionally — nothing interpolated into the script.
         assert_eq!(out[3], OsString::from("sbx-forward"));
-        assert_eq!(out[4], OsString::from("codex"));
+        assert_eq!(out[4], OsString::from("demo-app"));
         assert_eq!(out[5], OsString::from("login"));
     }
 

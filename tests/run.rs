@@ -3159,6 +3159,80 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
 }
 
 #[test]
+fn a_tarball_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
+    // The `tarball:resolve` auto-upgrade form runs the profile's resolve command in a HERMETIC bwrap
+    // cage (sbx's own base tools, sbx's store + CA bundle, shared network), captures the URL it prints,
+    // and validates it before any fetch. This proves that mechanism end-to-end through the real `sbx
+    // run` WITHOUT the heavy Electron build: the command prints a deliberately INVALID URL, so the
+    // launch must fail with that exact token named — which can only happen if the cage ran the command
+    // in the real base userland (a `printf` builtin under `/bin/sh`) and captured+validated its stdout.
+    // Teeth: the printed token appears AND the validation rejection appears. Skips (never fails) when
+    // the host cannot sandbox or the cache is unreachable (the base userland is fetched on first launch).
+    let project = TmpDir::new("resolve-proj");
+    let data = TmpDir::new("resolve-data");
+    let state = TmpDir::new("resolve-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ndemo = \"tarball:resolve\"\n\n\
+         [tarball.demo]\nresolve = [\"sh\", \"-c\", \"printf RESOLVE-RAN-not-a-tarball\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping tarball-resolve e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping tarball-resolve e2e: the network is unreachable");
+        return;
+    }
+
+    // `[packages]` (and the resolve command) is trusted-only, so trust the project first.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The resolved "URL" is not a valid tarball, so the launch fails — and its error names the exact
+    // token the command printed, proving the hermetic cage ran the command and captured its stdout.
+    assert!(
+        !out.status.success(),
+        "an invalid resolved URL must fail the launch:\n{log}"
+    );
+    assert!(
+        log.contains("RESOLVE-RAN-not-a-tarball"),
+        "the resolved token must appear (the cage ran the command + captured its stdout):\n{log}"
+    );
+    assert!(
+        log.contains("not a valid `.tar.gz`"),
+        "the resolved URL must be rejected by validation before any fetch:\n{log}"
+    );
+}
+
+#[test]
 fn a_synthetic_xdg_open_surfaces_the_url_and_exits_zero() {
     // A tool that auto-opens a browser/file calls `xdg-open <arg>`; the hermetic cage has no
     // display, browser, or file manager, so without a stub the call fails with "xdg-open not

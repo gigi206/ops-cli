@@ -3483,15 +3483,15 @@ mod tests {
         // A `*.domain` wildcard matches the apex and any subdomain, spoof-safe (a leading `.` is
         // required), and still honours the optional port. This is the same suffix-safe rule the
         // `allow`/`deny` `*.domain` kind uses.
-        let wild = Http2Host::parse("*.cursor.sh").unwrap();
-        assert!(wild.matches("cursor.sh", 443)); // apex
-        assert!(wild.matches("api5.cursor.sh", 443)); // subdomain
-        assert!(wild.matches("agent.api5.cursor.sh", 443)); // nested subdomain
-        assert!(!wild.matches("cursor.sh.evil.com", 443)); // lookalike suffix → no match
-        assert!(!wild.matches("notcursor.sh", 443)); // must break on a dot, not a substring
-        let wild_pinned = Http2Host::parse("*.cursor.sh:443").unwrap();
-        assert!(wild_pinned.matches("api5.cursor.sh", 443));
-        assert!(!wild_pinned.matches("api5.cursor.sh", 8443)); // wrong port
+        let wild = Http2Host::parse("*.example.net").unwrap();
+        assert!(wild.matches("example.net", 443)); // apex
+        assert!(wild.matches("api5.example.net", 443)); // subdomain
+        assert!(wild.matches("agent.api5.example.net", 443)); // nested subdomain
+        assert!(!wild.matches("example.net.evil.com", 443)); // lookalike suffix → no match
+        assert!(!wild.matches("notexample.net", 443)); // must break on a dot, not a substring
+        let wild_pinned = Http2Host::parse("*.example.net:443").unwrap();
+        assert!(wild_pinned.matches("api5.example.net", 443));
+        assert!(!wild_pinned.matches("api5.example.net", 8443)); // wrong port
     }
 
     #[test]

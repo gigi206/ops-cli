@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn wrap_imports_the_ca_then_execs_the_command_positionally() {
-        let cmd: Vec<OsString> = ["opencode-desktop", "--no-sandbox"]
+        let cmd: Vec<OsString> = ["demo-app", "--no-sandbox"]
             .iter()
             .map(OsString::from)
             .collect();
@@ -147,9 +147,9 @@ mod tests {
         assert!(script.trim_end().ends_with("exec \"$@\""));
         // the label, then the command verbatim after it (positional, never in the script)
         assert_eq!(out[3], OsString::from("sbx-ca-trust"));
-        assert_eq!(out[4], OsString::from("opencode-desktop"));
+        assert_eq!(out[4], OsString::from("demo-app"));
         assert_eq!(out[5], OsString::from("--no-sandbox"));
         // the command tokens never leak into the script text
-        assert!(!script.contains("opencode-desktop"));
+        assert!(!script.contains("demo-app"));
     }
 }

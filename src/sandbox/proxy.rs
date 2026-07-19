@@ -4977,7 +4977,7 @@ mod tests {
     }
 
     /// A streamed response that idles longer than the per-read timeout must not be cut: the failure
-    /// that truncated streaming agents (codex/opencode) mid-completion with a rustls "peer closed
+    /// that truncated streaming agents mid-completion with a rustls "peer closed
     /// connection without sending TLS close_notify". The timeout is shrunk to 200 ms and the upstream
     /// pauses 500 ms mid-response; the whole body must still arrive. Teeth: without
     /// `begin_response_stream` lifting the upstream read timeout, the pause aborts the relay and the
@@ -5957,10 +5957,10 @@ mod tests {
         assert_eq!(bare.allow_suggestion("h.test"), "sbx net allow h.test");
         let app = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
             .unwrap()
-            .with_app(Some("claude-code".into()));
+            .with_app(Some("demo-app".into()));
         assert_eq!(
             app.allow_suggestion("h.test"),
-            "sbx net allow h.test --app claude-code"
+            "sbx net allow h.test --app demo-app"
         );
     }
 

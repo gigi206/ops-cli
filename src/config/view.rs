@@ -791,6 +791,7 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
         Backend::Deb(_) => "host-side from prebuilt .deb, durable",
         Backend::AppImage(_) => "host-side from prebuilt AppImage, durable",
         Backend::Tarball(_) => "host-side from prebuilt tarball, durable",
+        Backend::TarballResolve { .. } => "host-side from prebuilt tarball (auto-upgrade), durable",
     };
     let trusted = p.state == TrustState::Trusted;
     PackageView {
@@ -816,8 +817,13 @@ fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) ->
         Backend::Deb(url) | Backend::AppImage(url) | Backend::Tarball(url) => {
             flake_pins.get(url).cloned()
         }
-        // An inline flake floats — no persisted lock, so nothing to show.
-        Backend::Nix(_) | Backend::Mise(_) | Backend::FlakeInline { .. } => None,
+        // An inline flake floats — no persisted lock, so nothing to show. A `tarball:resolve`
+        // package's pin is keyed by `resolve:<name>` (not a locator in this map), so its rev is not
+        // surfaced here; it is reported by `sbx app show`/inspect from the per-project lock.
+        Backend::Nix(_)
+        | Backend::Mise(_)
+        | Backend::FlakeInline { .. }
+        | Backend::TarballResolve { .. } => None,
     }
 }
 

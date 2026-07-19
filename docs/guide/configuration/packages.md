@@ -28,7 +28,7 @@ nix.
 | `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `sbx upgrade flake` | after a warm build |
 | `deb:<url>` · `deb:github:…` · `deb:apt:…` | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` | yes (seeded, durable) |
 | `appimage:<url>` | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` | yes (seeded, durable) |
-| `tarball:<url>` | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` | yes (seeded, durable) |
+| `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 
 ### `nix:` — a nixpkgs attribute
 
@@ -179,10 +179,45 @@ The sibling of `deb:`/`appimage:`, for a GUI/desktop app distributed **only as a
 content hash (pinned in a per-project `tarball-packages.lock`) and
 builds a generated derivation that **`tar -xz`-extracts it at build time** and `autoPatchelfHook`s
 its Electron/Chromium binaries against the same curated library set — **host-side**, seeded and
-offline-reusable. One form today: a direct `https://` URL ending in `.tar.gz` or `.tgz`. A
-version-stamped vendor URL does not roll forward on its own (the version is in the path); `sbx
-upgrade tarball` re-resolves the declared URL. Pairs with [`gui = "wayland"`](gui.md),
-[`gpu = true`](gpu.md), and [`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
+offline-reusable. Pairs with [`gui = "wayland"`](gui.md), [`gpu = true`](gpu.md), and
+[`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
+
+Two forms:
+
+- **Direct** — `tarball:https://host/path/App.tar.gz`, a URL ending in `.tar.gz` or `.tgz`. A
+  version-stamped vendor URL does not roll forward on its own (the version is in the path); `sbx
+  upgrade tarball` only re-resolves the same URL.
+- **Auto-upgrade** — `tarball:resolve`, paired with a `[tarball.<name>]` table carrying a `resolve`
+  **command** that prints the newest release's download URL, so `sbx upgrade tarball` can roll the app
+  forward automatically (the direct form's version-stamped URL cannot). Use this when there is no
+  stable "latest" download alias:
+
+  ```toml
+  [packages]
+  demo-app = "tarball:resolve"
+
+  [tarball.demo-app]
+  # A command (argv) that prints the newest `.tar.gz` download URL to stdout, and nothing else.
+  resolve = ["sh", "-c", "curl -fsS https://updates.example.com/releases | grep -oE 'https://[^\"]+\\.tar\\.gz' | head -1"]
+  ```
+
+  The `[packages]` entry stays the canonical tool list (the `tarball:resolve` sentinel is the opt-in);
+  the `[tarball.<name>]` table — keyed by the same package name — carries the resolver command. On the
+  first launch (and on `sbx upgrade tarball`) sbx runs that command **in a hermetic sandbox**, captures
+  the URL it prints, validates it, and pins it + its content hash; a warm launch reuses the pin offline
+  and does **not** run the command. An upgrade re-runs the command and re-fetches the tarball only when
+  the URL actually changed — a no-op upgrade never re-downloads a large asset.
+
+  The command works with **any** vendor's version-discovery shape (JSON, XML, a text file, a redirect —
+  whatever your command can parse). It runs with sbx's own base tools on `PATH` (`curl`, `coreutils`,
+  `grep`, `sed`, `awk` — never the host's, so a command is portable by construction) plus the app's own
+  `nix:` `[packages]`, so if you need e.g. `jq`, declare `jq = "nix:jq"` and it is on the resolver's
+  `PATH`. Because the command is arbitrary code it is honored **only from a trusted source** and **never
+  runs for an untrusted layer**; it is sandboxed (no host filesystem, no secrets) and the URL it prints
+  is re-validated (`https://`, ending `.tar.gz`/`.tgz`, injection-free) before any fetch. Its network is
+  the **host network, not the app's `[network]` allowlist** — the same as the host-side tarball fetch
+  the resolved URL then feeds; the allowlist governs the app's *runtime* egress, not this provisioning
+  step.
 
 ## Why the tool sources are trusted-only
 

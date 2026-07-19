@@ -549,11 +549,11 @@ mod tests {
         let state = TmpDir::new();
         // A data root with a project and a global app home.
         std::fs::create_dir_all(data.path().join("projects").join("abc123")).unwrap();
-        std::fs::create_dir_all(data.path().join("apps").join("claude")).unwrap();
+        std::fs::create_dir_all(data.path().join("apps").join("demo-app")).unwrap();
         // A config root with `sbx.toml` and an imported profile.
         std::fs::write(cfg.path().join("sbx.toml"), "").unwrap();
         std::fs::create_dir_all(cfg.path().join("apps")).unwrap();
-        std::fs::write(cfg.path().join("apps").join("codex.toml"), "").unwrap();
+        std::fs::write(cfg.path().join("apps").join("demo-tool.toml"), "").unwrap();
         // A state root with a `trusted/` dir.
         std::fs::create_dir_all(state.path().join("trusted")).unwrap();
 
@@ -609,7 +609,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|c| c["name"] == "claude"),
+                .any(|c| c["name"] == "demo-app"),
             "enumerated global app home"
         );
 
@@ -632,7 +632,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|c| c["name"] == "codex"),
+                .any(|c| c["name"] == "demo-tool"),
             "enumerated profile (suffix stripped)"
         );
 
@@ -697,13 +697,13 @@ mod tests {
         let tmp = TmpDir::new();
         let apps = tmp.path().join("apps");
         std::fs::create_dir_all(&apps).unwrap();
-        std::fs::write(apps.join("claude.toml"), "").unwrap();
+        std::fs::write(apps.join("demo-app.toml"), "").unwrap();
         std::fs::write(apps.join("not-a-profile.txt"), "").unwrap();
         let live = BTreeSet::new();
         let kids = enumerate(&apps, Enumerate::Profiles, &live, None);
         assert_eq!(kids.len(), 1, "only .toml files kept");
-        assert_eq!(kids[0].name, "claude", "suffix stripped");
-        assert!(kids[0].path.ends_with("claude.toml"), "full path kept");
+        assert_eq!(kids[0].name, "demo-app", "suffix stripped");
+        assert!(kids[0].path.ends_with("demo-app.toml"), "full path kept");
         // Profiles carry no liveness state — the field is absent.
         assert!(kids[0].state.is_none() && kids[0].last_used.is_none());
     }

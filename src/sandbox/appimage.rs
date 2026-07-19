@@ -490,8 +490,8 @@ mod tests {
         let expr = derivation_expr(
             "github:NixOS/nixpkgs/abc",
             "x86_64-linux",
-            "t3code",
-            "https://example.com/x/T3-Code-0.0.28-x86_64.AppImage",
+            "demo-app",
+            "https://example.com/x/demo-app-0.0.28-x86_64.AppImage",
             HASH,
         );
         // pinned source (url + resolved hash) against the pinned nixpkgs, extracted (not run) via
@@ -500,7 +500,7 @@ mod tests {
             "(builtins.getFlake \"github:NixOS/nixpkgs/abc\").legacyPackages.x86_64-linux"
         ));
         assert!(expr.contains("appimageTools.extractType2"));
-        assert!(expr.contains("url = \"https://example.com/x/T3-Code-0.0.28-x86_64.AppImage\";"));
+        assert!(expr.contains("url = \"https://example.com/x/demo-app-0.0.28-x86_64.AppImage\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
         assert!(expr.contains("cp -r ${extracted}/. \"$out\""));
         assert!(expr.contains("dontBuild = true;"));
@@ -510,19 +510,19 @@ mod tests {
         // shared launcher-locating install phase, wrapped as bin/<name>, prepending the bundle root.
         assert!(expr.contains("app.asar"));
         assert!(expr.contains("! -name 'AppRun'"));
-        assert!(expr.contains("$out/bin/t3code"));
+        assert!(expr.contains("$out/bin/demo-app"));
         assert!(expr.contains("LD_LIBRARY_PATH : \"$out:"));
-        assert!(expr.contains("meta.mainProgram = \"t3code\";"));
+        assert!(expr.contains("meta.mainProgram = \"demo-app\";"));
         // no leftover placeholder
         assert!(!expr.contains('@'), "unreplaced placeholder in:\n{expr}");
     }
 
     #[test]
     fn parse_source_dispatches_github_from_url() {
-        match parse_source("github:pingdotgg/t3code") {
+        match parse_source("github:example/demo-app") {
             AppImageSource::Github { owner, repo } => {
-                assert_eq!(owner, "pingdotgg");
-                assert_eq!(repo, "t3code");
+                assert_eq!(owner, "example");
+                assert_eq!(repo, "demo-app");
             }
             AppImageSource::Url(_) => panic!("github locator misparsed as a URL"),
         }
@@ -532,25 +532,26 @@ mod tests {
         ));
     }
 
-    // A trimmed capture of pingdotgg/t3code's `releases/latest` asset set (real names + URLs), the
-    // shape [`select_appimage_asset`] must pick from: one linux `.AppImage` beside its update yml.
-    const T3CODE_ASSETS: &str = r#"{
+    // A trimmed capture of a desktop app's `releases/latest` asset set (the same names + URL shape a
+    // real release carries), the shape [`select_appimage_asset`] must pick from: one linux
+    // `.AppImage` beside its update yml.
+    const RELEASE_ASSETS: &str = r#"{
       "tag_name": "v0.0.28",
       "assets": [
         { "name": "latest-linux.yml",
-          "browser_download_url": "https://github.com/pingdotgg/t3code/releases/download/v0.0.28/latest-linux.yml" },
-        { "name": "T3-Code-0.0.28-x86_64.AppImage",
-          "browser_download_url": "https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage" }
+          "browser_download_url": "https://github.com/example/demo-app/releases/download/v0.0.28/latest-linux.yml" },
+        { "name": "demo-app-0.0.28-x86_64.AppImage",
+          "browser_download_url": "https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage" }
       ]
     }"#;
 
     #[test]
     fn select_appimage_asset_picks_the_native_arch_appimage() {
-        let json: serde_json::Value = serde_json::from_str(T3CODE_ASSETS).unwrap();
+        let json: serde_json::Value = serde_json::from_str(RELEASE_ASSETS).unwrap();
         // x86_64 selects the x86_64 AppImage, never the update yml.
         assert_eq!(
             select_appimage_asset(&json, "x86_64-linux").as_deref(),
-            Some("https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage")
+            Some("https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage")
         );
         // aarch64 host: no arm64 AppImage in this release → None (fail-closed, no guess).
         assert_eq!(select_appimage_asset(&json, "aarch64-linux"), None);
@@ -601,10 +602,10 @@ mod tests {
             },
         );
         lock.insert(
-            "github:pingdotgg/t3code".to_string(),
+            "github:example/demo-app".to_string(),
             AppImagePin {
                 hash: HASH.to_string(),
-                url: "https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage".to_string(),
+                url: "https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage".to_string(),
             },
         );
         write_pins(&layout, id, &lock).expect("write the lock");
@@ -623,8 +624,8 @@ mod tests {
             "https://example.com/a.AppImage"
         );
         assert_eq!(
-            read["github:pingdotgg/t3code"].url,
-            "https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage"
+            read["github:example/demo-app"].url,
+            "https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage"
         );
 
         // a corrupt (non-SRI) line self-heals (drop).

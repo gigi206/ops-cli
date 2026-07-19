@@ -25,7 +25,7 @@ pub(crate) struct RawConfig {
     /// is a free label — the merge key across layers and the on-disk root name; the value
     /// carries a mandatory backend prefix (parsed downstream, not here): `nix:<attribute>`
     /// for a nixpkgs attribute provisioned host-side (e.g. `nix:nodejs_20`), `mise:<token>`
-    /// for a mise backend equipped in-cage (e.g. `mise:aqua:openai/codex`), or `flake:<ref>`
+    /// for a mise backend equipped in-cage (e.g. `mise:aqua:example/demo-tool`), or `flake:<ref>`
     /// for a flake output built in-cage (e.g. `flake:github:owner/repo#attr`).
     /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
@@ -40,6 +40,16 @@ pub(crate) struct RawConfig {
     /// forbids adding scalar keys to a table after one of its subtables is opened.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
+    /// Auto-upgrade resolvers for `tarball:resolve` packages, declared as `[tarball.<name>]`
+    /// tables. Each pairs with a `[packages]` entry `<name> = "tarball:resolve"` (the opt-in
+    /// sentinel) and carries a `resolve` command that prints the newest release's download URL, so
+    /// `sbx upgrade` can re-run it and roll the pin forward. A security field like `packages` — it
+    /// runs an arbitrary (sandboxed) command host-side, so it is honored only from a trusted source.
+    /// Declared as its own table (not folded into `[packages]`) so the command reads clearly and
+    /// never trips the TOML rule that forbids adding scalar keys to a table after one of its
+    /// subtables is opened.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tarball: BTreeMap<String, RawTarball>,
     /// Override the nixpkgs reference the tools resolve against: a branch/channel
     /// (`nixos-23.11`) or a 40-hex revision under `NixOS/nixpkgs`. A security field
     /// — honored from the global config or a trusted project, ignored from an
@@ -298,6 +308,13 @@ pub(crate) struct RawApp {
     /// when empty on serialize, so an app with no inline flake carries no `[flakes]` table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
+    /// Auto-upgrade resolvers for this app's `tarball:resolve` packages, declared as
+    /// `[app.<name>.tarball.<tool>]` (or a top-level `[tarball.<tool>]` in an imported profile).
+    /// Same shape and gating as the baseline `tarball` (see [`RawConfig::tarball`]); each pairs with
+    /// a `<tool> = "tarball:resolve"` entry in the app's `packages`. Skipped when empty on serialize,
+    /// so an app with no such package carries no `[tarball]` table.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tarball: BTreeMap<String, RawTarball>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
     /// The app's process/exec posture, overriding the baseline's when set. A security field.
@@ -350,8 +367,8 @@ pub(crate) struct RawApp {
     pub(crate) home_scope: Option<String>,
 }
 
-/// The command form of an app's `cmd`: a full argv (`["claude", "--flag"]`) or a bare
-/// program name (`"claude"`, taken as a one-element argv). An untagged enum so both TOML
+/// The command form of an app's `cmd`: a full argv (`["demo-app", "--flag"]`) or a bare
+/// program name (`"demo-app"`, taken as a one-element argv). An untagged enum so both TOML
 /// shapes parse, matching the string-or-table forward-compatibility of `NetworkField`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -387,6 +404,23 @@ pub(crate) struct RawInlineFlake {
     /// default when unset) or a dotted path like `packages.x86_64-linux.hello`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attr: Option<String>,
+}
+
+/// An auto-upgrade resolver declared as a `[tarball.<name>]` table, paired with a `[packages]`
+/// entry `<name> = "tarball:resolve"`. It gives sbx a **command** that discovers the newest release's
+/// download URL of a prebuilt `.tar.gz` app whose URL is version-stamped (no stable `latest` alias):
+/// the command prints the concrete `.tar.gz` URL to stdout, and sbx runs it **sandboxed** (in a
+/// hermetic bubblewrap cage with sbx's base tools — `curl`/`coreutils`/`grep`/`sed`/`awk` — and the
+/// app's own `nix:` `[packages]` on `PATH`, so a command that needs e.g. `jq` just declares it), then
+/// validates the printed URL and pins it. `sbx upgrade tarball` re-runs the command and rolls the app
+/// forward. Because the command is arbitrary code, this is honored **only from a trusted source**;
+/// it never runs for an untrusted layer.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTarball {
+    /// The resolver command as an argv (`["sh", "-c", "curl -s <api> | …"]`) — never
+    /// whitespace-split, like `cmd`. It prints the newest release's `.tar.gz` download URL to stdout
+    /// (and nothing else); sbx validates that URL before fetching or building it.
+    pub(crate) resolve: Vec<String>,
 }
 
 /// The `[secret]` section: a reserved `defaults` table plus one entry per destination host.
@@ -867,6 +901,7 @@ mod tests {
             FOO = "bar"
             [packages]
             demo-tool = "mise:aqua:example/demo-tool"
+            demo-app = "tarball:manifest"
             [flakes.inline-tool]
             attr = "default"
             flake = '''
@@ -877,6 +912,8 @@ mod tests {
   };
 }
 '''
+            [tarball.demo-app]
+            resolve = ["sh", "-c", "curl -s https://api.example.com/releases | sed -n 1p"]
             [network]
             mode = "deny"
             allow = ["api.example.com", "*.nixos.org"]
@@ -922,6 +959,13 @@ mod tests {
             .expect("the [flakes] table parses");
         assert_eq!(flake.attr.as_deref(), Some("default"));
         assert!(flake.flake.contains("packages.x86_64-linux.default"));
+        // The `[tarball.<name>]` auto-upgrade table parses (its `resolve` command argv).
+        let tb = app
+            .tarball
+            .get("demo-app")
+            .expect("the [tarball] table parses");
+        assert_eq!(tb.resolve.first().map(String::as_str), Some("sh"));
+        assert!(tb.resolve.iter().any(|a| a.contains("curl")));
         let serialized = serialize_app(&app).unwrap();
         let reparsed = parse_app(serialized.as_bytes()).unwrap();
         // A multiline flake source may re-emit escaped through `toml::to_string`; the round-trip is

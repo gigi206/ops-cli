@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn cage_slug_prefers_the_app_then_the_project_basename() {
         let project = PathBuf::from("/home/gigi/Documents/ops-cli");
-        assert_eq!(cage_slug(Some("claude-code"), &project), "claude-code");
+        assert_eq!(cage_slug(Some("demo-app"), &project), "demo-app");
         assert_eq!(cage_slug(None, &project), "ops-cli");
         // A rootless / unnamed project path falls back rather than yielding an empty slug.
         assert_eq!(cage_slug(None, Path::new("/")), "cage");
@@ -187,14 +187,14 @@ mod tests {
     #[test]
     fn a_cage_hostname_carries_the_sbx_prefix() {
         assert_eq!(cage_hostname("ops-cli"), "sbx-ops-cli");
-        assert_eq!(cage_hostname("claude-code"), "sbx-claude-code");
+        assert_eq!(cage_hostname("demo-app"), "sbx-demo-app");
     }
 
     #[test]
     fn a_scope_unit_carries_the_sbx_prefix_and_pid() {
         assert_eq!(
-            scope_unit("claude-code", 4089496),
-            "sbx-claude-code-4089496.scope"
+            scope_unit("demo-app", 4089496),
+            "sbx-demo-app-4089496.scope"
         );
         assert_eq!(scope_unit("ops-cli", 62727), "sbx-ops-cli-62727.scope");
     }

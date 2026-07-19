@@ -354,7 +354,7 @@ fn assemble(
         },
         // Zone 1 — a synthetic `/etc/machine-id` (and its dbus alias), stable per app-home and
         // unique per home, never the host's. A hermetic cage carries neither file nor a MAC, so a
-        // desktop app that derives a device id from them (VS Code / Cursor run
+        // desktop app that derives a device id from them (some editors run
         // `cat /var/lib/dbus/machine-id /etc/machine-id || hostname`) otherwise hashes an empty
         // string — the same id in every cage, which the app's anti-abuse reads as one machine
         // running countless accounts. A distinct per-home id gives each app its own persistent
@@ -811,7 +811,7 @@ fn hosts_contents(hostname: &str) -> String {
 /// same app-home and unique per home** — never the host's real machine-id (which the hermetic cage
 /// does not carry, and which would leak a host identifier). A hermetic cage otherwise has no
 /// `/etc/machine-id`, `/var/lib/dbus/machine-id`, or MAC, so a desktop app that fingerprints the
-/// machine (VS Code / Cursor read `cat /var/lib/dbus/machine-id /etc/machine-id || hostname` to build
+/// machine (some editors read `cat /var/lib/dbus/machine-id /etc/machine-id || hostname` to build
 /// a device id) falls back to hashing an empty string — producing the *same* id in every such cage,
 /// which the app's server-side anti-abus then reads as one machine running countless accounts. A
 /// per-home synthetic id gives each app a distinct, persistent machine identity instead. The input is
@@ -1288,9 +1288,9 @@ mod tests {
 
     #[test]
     fn the_synthetic_machine_id_is_systemd_shaped_deterministic_and_per_home() {
-        let a1 = machine_id_contents(Path::new("/data/sbx/apps/cursor/home"));
-        let a2 = machine_id_contents(Path::new("/data/sbx/apps/cursor/home"));
-        let b = machine_id_contents(Path::new("/data/sbx/apps/codex/home"));
+        let a1 = machine_id_contents(Path::new("/data/sbx/apps/demo-app/home"));
+        let a2 = machine_id_contents(Path::new("/data/sbx/apps/demo-app/home"));
+        let b = machine_id_contents(Path::new("/data/sbx/apps/demo-tool/home"));
         // systemd format: exactly 32 lowercase hex digits + a trailing newline.
         let body = a1.strip_suffix('\n').expect("newline-terminated");
         assert_eq!(body.len(), 32, "32 hex digits: {a1:?}");

@@ -132,7 +132,8 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
             | Backend::FlakeInline { .. }
             | Backend::Deb(_)
             | Backend::AppImage(_)
-            | Backend::Tarball(_) => None,
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. } => None,
         })
         .collect()
 }
@@ -154,7 +155,8 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::FlakeInline { .. }
             | Backend::Deb(_)
             | Backend::AppImage(_)
-            | Backend::Tarball(_) => None,
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. } => None,
         })
         .collect()
 }
@@ -174,7 +176,8 @@ pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Flake(_)
             | Backend::FlakeInline { .. }
             | Backend::AppImage(_)
-            | Backend::Tarball(_) => None,
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. } => None,
         })
         .collect()
 }
@@ -190,12 +193,37 @@ pub(crate) fn tarball_packages(packages: &[Package]) -> Vec<(String, String)> {
         .filter(|p| p.state == TrustState::Trusted)
         .filter_map(|p| match &p.backend {
             Backend::Tarball(url) => Some((p.name.clone(), url.clone())),
+            // The auto-upgrade `tarball:resolve` form is provisioned separately (it carries a
+            // resolver command, not a direct URL) — see [`tarball_resolve_packages`].
             Backend::Nix(_)
             | Backend::Mise(_)
             | Backend::Flake(_)
             | Backend::FlakeInline { .. }
             | Backend::Deb(_)
-            | Backend::AppImage(_) => None,
+            | Backend::AppImage(_)
+            | Backend::TarballResolve { .. } => None,
+        })
+        .collect()
+}
+
+/// The `(name, resolver-command)` of the *admitted* `tarball:resolve` packages — the auto-upgrade
+/// form the launcher provisions host-side (run the command sandboxed to print the newest download
+/// URL, then resolve+build exactly like the direct `tarball:` form). Trusted-only, exactly like
+/// [`tarball_packages`]: an untrusted project's resolver package is dropped here, so **its command
+/// is never executed**. The name keys the same per-package gcroot as the direct form.
+pub(crate) fn tarball_resolve_packages(packages: &[Package]) -> Vec<(String, Vec<String>)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::TarballResolve { command } => Some((p.name.clone(), command.clone())),
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::Flake(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_)
+            | Backend::AppImage(_)
+            | Backend::Tarball(_) => None,
         })
         .collect()
 }
@@ -216,7 +244,8 @@ pub(crate) fn appimage_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Flake(_)
             | Backend::FlakeInline { .. }
             | Backend::Deb(_)
-            | Backend::Tarball(_) => None,
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. } => None,
         })
         .collect()
 }
@@ -240,7 +269,8 @@ pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String
             | Backend::Flake(_)
             | Backend::Deb(_)
             | Backend::AppImage(_)
-            | Backend::Tarball(_) => None,
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. } => None,
         })
         .collect()
 }
@@ -384,15 +414,47 @@ mod tests {
 
     #[test]
     fn tarball_packages_returns_only_trusted_urls_by_name() {
+        let resolver = |name: &str, state| Package {
+            name: name.to_string(),
+            backend: Backend::TarballResolve {
+                command: vec!["sh".into(), "-c".into(), "echo https://e/app.tar.gz".into()],
+            },
+            state,
+        };
         let pkgs = [
             tarball_package("app", "https://e/app.tar.gz", TrustState::Trusted),
             package("node", "nodejs_20", TrustState::Trusted), // a nix package is not a tarball
             tarball_package("evil", "https://e/evil.tar.gz", TrustState::Untrusted), // dropped
+            resolver("rz", TrustState::Trusted), // the resolve form is NOT a direct tarball url
         ];
         assert_eq!(
             tarball_packages(&pkgs),
             vec![("app".to_string(), "https://e/app.tar.gz".to_string())],
-            "only the trusted tarball url, keyed by name; nix and untrusted are excluded"
+            "only the trusted DIRECT tarball url, keyed by name; nix, resolve and untrusted excluded"
+        );
+    }
+
+    #[test]
+    fn tarball_resolve_packages_returns_only_trusted_commands_by_name() {
+        let resolver = |name: &str, state| Package {
+            name: name.to_string(),
+            backend: Backend::TarballResolve {
+                command: vec!["sh".into(), "-c".into(), "echo url".into()],
+            },
+            state,
+        };
+        let pkgs = [
+            resolver("keep", TrustState::Trusted),
+            tarball_package("direct", "https://e/app.tar.gz", TrustState::Trusted), // not a resolver
+            resolver("drop", TrustState::Untrusted),                                // dropped
+        ];
+        assert_eq!(
+            tarball_resolve_packages(&pkgs),
+            vec![(
+                "keep".to_string(),
+                vec!["sh".to_string(), "-c".to_string(), "echo url".to_string()]
+            )],
+            "only the trusted resolver (name, command); direct and untrusted excluded"
         );
     }
 

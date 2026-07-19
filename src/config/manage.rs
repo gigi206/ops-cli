@@ -1320,15 +1320,15 @@ mod tests {
     fn add_egress_rule_writes_the_apps_own_network_table_with_implicit_parents() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        add_egress_rule(&p, Some("claude"), EgressList::Allow, "api.anthropic.com").unwrap();
+        add_egress_rule(&p, Some("demo-app"), EgressList::Allow, "api.example.com").unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(
-            body.contains("[app.claude.network]") && body.contains("api.anthropic.com"),
+            body.contains("[app.demo-app.network]") && body.contains("api.example.com"),
             "{body}"
         );
-        // The structural parents are implicit, so no empty `[app]` / `[app.claude]` headers.
+        // The structural parents are implicit, so no empty `[app]` / `[app.demo-app]` headers.
         assert!(
-            !body.contains("[app]\n") && !body.contains("[app.claude]\n"),
+            !body.contains("[app]\n") && !body.contains("[app.demo-app]\n"),
             "parent tables must be implicit:\n{body}"
         );
     }
@@ -1341,7 +1341,7 @@ mod tests {
         // `net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields` instead.
         let cwd = std::path::Path::new("/some/cwd");
         assert_eq!(
-            scope_app_path(&Scope::Local, cwd, "claude").unwrap(),
+            scope_app_path(&Scope::Local, cwd, "demo-app").unwrap(),
             cwd.join(crate::config::PROJECT_CONFIG)
         );
         let explicit = std::path::PathBuf::from("/etc/sbx.toml");
@@ -1599,12 +1599,12 @@ mod tests {
     fn add_proc_rule_writes_an_apps_own_proc_table_with_implicit_parents() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "");
-        add_proc_rule(&p, Some("claude"), ProcList::Deny, "ssh").unwrap();
+        add_proc_rule(&p, Some("demo-app"), ProcList::Deny, "ssh").unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
-        assert!(body.contains("[app.claude.proc]"), "{body}");
+        assert!(body.contains("[app.demo-app.proc]"), "{body}");
         assert!(body.contains("mode = \"enforce\""), "{body}");
         assert!(body.contains("deny = [\"ssh\"]"), "{body}");
-        // The `[app]` / `[app.claude]` parents are implicit — no bare empty header.
+        // The `[app]` / `[app.demo-app]` parents are implicit — no bare empty header.
         assert!(!body.contains("[app]\n"), "no empty [app] header:\n{body}");
     }
 }

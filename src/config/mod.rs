@@ -27,7 +27,7 @@ use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
     NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
-    RawInlineFlake, RawSecretDefaults, SecretFrom,
+    RawInlineFlake, RawSecretDefaults, RawTarball, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -144,7 +144,7 @@ pub(crate) enum Backend {
     /// justified; realising it can run a build, so it is honored only from a trusted
     /// source.
     Nix(String),
-    /// `mise:<token>` — a mise backend token (e.g. `aqua:openai/codex`, `opencode`,
+    /// `mise:<token>` — a mise backend token (e.g. `aqua:example/demo-tool`, `bare-tool`,
     /// `npm:@scope/pkg`, or `nix:<pkg>` for nixhub), equipped in-cage globally via
     /// `mise use -g` (durable, on PATH, fetched at launch). The token after `mise:`
     /// is passed to mise verbatim — sbx adds no per-backend logic of its own.
@@ -198,6 +198,17 @@ pub(crate) enum Backend {
     /// `https://…/….tar.gz` URL — the stored string is the raw locator;
     /// [`super::sandbox::tarball`] resolves and builds it.
     Tarball(String),
+    /// `tarball:resolve` — the auto-upgrade form of [`Backend::Tarball`], for a prebuilt `.tar.gz`
+    /// app whose download URL is version-stamped (no stable `latest` alias). Declared as a
+    /// `[packages]` sentinel `<name> = "tarball:resolve"` paired with a `[tarball.<name>]` table
+    /// (see [`RawTarball`]) carrying a `resolve` **command** that prints the newest release's
+    /// download URL. sbx runs the command **sandboxed** (a hermetic bubblewrap cage with sbx's base
+    /// tools + the app's own `nix:` `[packages]` on `PATH`), validates the printed URL, prefetches
+    /// its hash, and pins it — so it seeds/pins/builds exactly like the direct form, but `sbx upgrade
+    /// tarball` can re-run the command and roll the pin forward. The command is arbitrary code, so it
+    /// comes only from a trusted layer and never runs for an untrusted one; its printed URL is
+    /// re-validated by `is_valid_tarball_url` before any fetch.
+    TarballResolve { command: Vec<String> },
 }
 
 impl Backend {
@@ -212,6 +223,10 @@ impl Backend {
             Backend::Deb(url) => url,
             Backend::AppImage(url) => url,
             Backend::Tarball(url) => url,
+            // A fixed short token (the sentinel form), so `sbx config` reads `tarball:resolve`; the
+            // actual command is not a one-line locator, and the per-project lock keys the pin by the
+            // package name, not this string.
+            Backend::TarballResolve { .. } => "resolve",
             // The output attribute — a short locator for display; the bulky flake source is not
             // itself a one-line locator (rendered as `flake (inline) #<attr>` by the config view).
             Backend::FlakeInline { attr, .. } => attr,
@@ -227,6 +242,7 @@ impl Backend {
             Backend::Deb(_) => "deb",
             Backend::AppImage(_) => "appimage",
             Backend::Tarball(_) => "tarball",
+            Backend::TarballResolve { .. } => "tarball",
             Backend::FlakeInline { .. } => "flake",
         }
     }
@@ -914,12 +930,14 @@ impl Resolved {
             proc,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time. An override's inline
-            // `[flakes]` is dropped (fail-closed): a one-shot `--config` blob is no place for a
-            // multiline `flake.nix`, so an inline flake is declared in a profile or project config.
+            // `[flakes]` and `[tarball]` tables are dropped (fail-closed): a one-shot `--config` blob
+            // is no place for a multiline `flake.nix` or an auto-upgrade manifest, so both are
+            // declared in a profile or project config.
             nixpkgs: _,
             net: _,
             app: _,
             flakes: _,
+            tarball: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -1284,6 +1302,7 @@ fn resolve(
         GLOBAL_CONFIG,
         global.packages,
         global.flakes,
+        global.tarball,
         TrustState::Trusted,
         false,
     );
@@ -1475,6 +1494,7 @@ fn resolve(
             PROJECT_CONFIG,
             proj.packages,
             proj.flakes,
+            proj.tarball,
             state,
             false,
         );
@@ -2245,7 +2265,7 @@ fn resolve_app(
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
-    // — else `sbx app claude` against an untrusted repo would silently run the repo's command
+    // — else `sbx app <name>` against an untrusted repo would silently run the repo's command
     // under the trusted app's posture (an integrity-of-intent hijack).
     let mut cmd_trusted = false;
     // The persistent-home keying, defaulting to one global home per app. Integrity-gated by
@@ -2284,6 +2304,7 @@ fn resolve_app(
             &source,
             app.packages,
             app.flakes,
+            app.tarball,
             TrustState::Trusted,
             false,
         );
@@ -2396,6 +2417,7 @@ fn resolve_app(
             &source,
             app.packages,
             app.flakes,
+            app.tarball,
             state,
             !trusted,
         );
@@ -2689,7 +2711,7 @@ fn apply_app_secret(
 }
 
 /// The warning source label for a field of `[app.<name>]` in a given config file — e.g.
-/// `".sbx.toml [app.claude]"` — so a dropped app field reads as clearly as a baseline one.
+/// `".sbx.toml [app.demo-app]"` — so a dropped app field reads as clearly as a baseline one.
 fn app_source(config: &str, name: &str) -> String {
     format!("{config} [app.{name}]")
 }
@@ -2870,7 +2892,7 @@ fn apply_packages(
         // When `protect_trusted` is set (an untrusted project layering over a trusted app),
         // a package a trusted layer already supplied may not be overridden — the integrity-of-
         // intent guard `cmd` has, applied to the tool: else an untrusted project could swap a
-        // trusted app's `claude-code` for its own attribute and either run attacker code (closed
+        // trusted app's `demo-tool` for its own attribute and either run attacker code (closed
         // separately by `[packages]` being trusted-only) or simply deny the app its tool. A new
         // name may still be added.
         if protect_trusted
@@ -2903,15 +2925,28 @@ fn apply_packages(
 /// a trusted app's tool. The collision check is per-layer, so a *legitimate* cross-layer override
 /// (a project flake replacing a global package of the same name) does not trip it — the two sit in
 /// different `apply_tools` calls.
+#[allow(clippy::too_many_arguments)]
 fn apply_tools(
     out: &mut Vec<Package>,
     warnings: &mut Vec<String>,
     source: &str,
-    packages: BTreeMap<String, String>,
+    mut packages: BTreeMap<String, String>,
     flakes: BTreeMap<String, RawInlineFlake>,
+    tarball: BTreeMap<String, RawTarball>,
     state: TrustState,
     protect_trusted: bool,
 ) {
+    // A `<name> = "tarball:resolve"` entry is a sentinel, not a real backend locator: pull it out
+    // of the ordinary packages before `apply_packages` (which would reject the bare `tarball:`
+    // prefix) and hand the names to `apply_tarball_resolvers`, which binds each to its
+    // `[tarball.<name>]` table.
+    let resolve_names: BTreeSet<String> = packages
+        .iter()
+        .filter(|(_, v)| v.as_str() == TARBALL_RESOLVE_SENTINEL)
+        .map(|(k, _)| k.clone())
+        .collect();
+    packages.retain(|_, v| v.as_str() != TARBALL_RESOLVE_SENTINEL);
+
     for name in packages.keys() {
         if flakes.contains_key(name) {
             warnings.push(format!(
@@ -2922,6 +2957,88 @@ fn apply_tools(
     }
     apply_packages(out, warnings, source, packages, state, protect_trusted);
     apply_flakes(out, warnings, source, flakes, state, protect_trusted);
+    apply_tarball_resolvers(
+        out,
+        warnings,
+        source,
+        tarball,
+        &resolve_names,
+        state,
+        protect_trusted,
+    );
+}
+
+/// Bind each `<name> = "tarball:resolve"` sentinel to its `[tarball.<name>]` table, folding it into
+/// `out` as a [`Backend::TarballResolve`] tool. Modelled on [`apply_flakes`]: a malformed name, an
+/// empty `resolve` command, or the `protect_trusted` override of a trusted app's tool is dropped with
+/// a warning (fail-closed). Both mismatch directions are warned loudly so a half-declared package
+/// never silently vanishes: a `[tarball.<name>]` table with no matching sentinel is ignored (the
+/// sentinel is the opt-in that keeps `[packages]` the canonical tool list), and a sentinel with no
+/// table cannot resolve. Trust is *recorded*, not enforced here — the launcher withholds an untrusted
+/// resolver package and **never runs its command**, exactly as it withholds the direct `tarball:` form.
+fn apply_tarball_resolvers(
+    out: &mut Vec<Package>,
+    warnings: &mut Vec<String>,
+    source: &str,
+    tarball: BTreeMap<String, RawTarball>,
+    resolve_names: &BTreeSet<String>,
+    state: TrustState,
+    protect_trusted: bool,
+) {
+    // Which sentinels actually have a `[tarball.<name>]` table (valid or not) — so the
+    // no-table warning below fires only for a truly-orphan sentinel, never a second time for one
+    // whose table was present but rejected above.
+    let table_names: BTreeSet<String> = tarball.keys().cloned().collect();
+    for (name, raw) in tarball {
+        if !resolve_names.contains(&name) {
+            warnings.push(format!(
+                "{source}: ignoring [tarball.{name}] — no matching `{name} = \
+                 \"{TARBALL_RESOLVE_SENTINEL}\"` in [packages]"
+            ));
+            continue;
+        }
+        if !is_valid_package_name(&name) {
+            warnings.push(format!(
+                "{source}: ignoring malformed tarball name `{name}`"
+            ));
+            continue;
+        }
+        if protect_trusted
+            && out
+                .iter()
+                .any(|p| p.name == name && p.state == TrustState::Trusted)
+        {
+            warnings.push(format!(
+                "{source}: ignoring tarball resolver `{name}` override of a trusted app ({})",
+                untrusted_reason(state)
+            ));
+            continue;
+        }
+        if raw.resolve.iter().all(|a| a.trim().is_empty()) {
+            warnings.push(format!(
+                "{source}: ignoring [tarball.{name}]: the `resolve` command is empty"
+            ));
+            continue;
+        }
+        upsert_package(
+            out,
+            name,
+            Backend::TarballResolve {
+                command: raw.resolve,
+            },
+            state,
+        );
+    }
+    // A sentinel with no `[tarball.<name>]` table at all can never resolve — warn rather than
+    // silently drop the package (a sentinel whose table was present but invalid was already warned).
+    for name in resolve_names {
+        if !table_names.contains(name) {
+            warnings.push(format!(
+                "{source}: ignoring package `{name}`: `{TARBALL_RESOLVE_SENTINEL}` needs a \
+                 `[tarball.{name}]` table declaring a `resolve` command"
+            ));
+        }
+    }
 }
 
 /// Fold a layer's inline flakes (`[flakes.<name>]`) into `out` as [`Backend::FlakeInline`] tools,
@@ -3016,11 +3133,19 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             ));
         }
         Ok(Backend::AppImage(rest.to_string()))
+    } else if value == TARBALL_RESOLVE_SENTINEL {
+        // The auto-upgrade sentinel is bound to its `[tarball.<name>]` table by `apply_tools`
+        // (which strips it before this point), so reaching here means the table is missing or the
+        // sentinel was used in a context without one (e.g. a one-shot `--config` blob) — fail closed.
+        Err(format!(
+            "`{TARBALL_RESOLVE_SENTINEL}` needs a matching `[tarball.<name>]` table declaring a \
+             `resolve` command"
+        ))
     } else if let Some(rest) = value.strip_prefix("tarball:") {
         if !is_valid_tarball_url(rest) {
             return Err(format!(
                 "invalid tarball reference `{rest}` — use an `https://` URL ending in `.tar.gz` \
-                 or `.tgz`"
+                 or `.tgz`, or `tarball:resolve` with a `[tarball.<name>]` table"
             ));
         }
         Ok(Backend::Tarball(rest.to_string()))
@@ -3028,10 +3153,16 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
              `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>`, `appimage:<url>` / \
-             `appimage:github:<owner>/<repo>`, or `tarball:<url>`"
+             `appimage:github:<owner>/<repo>`, `tarball:<url>`, or `tarball:resolve`"
         ))
     }
 }
+
+/// The `[packages]` value that opts a package into the auto-upgrade resolver form: it declares the
+/// package in `[packages]` (keeping that the canonical tool list) while its `resolve` command lives
+/// in a paired `[tarball.<name>]` table. Not a real backend locator — [`apply_tools`] strips it
+/// before [`apply_packages`] runs and binds it to the table by name.
+const TARBALL_RESOLVE_SENTINEL: &str = "tarball:resolve";
 
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
@@ -4088,12 +4219,12 @@ fn is_valid_attr(attr: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
 }
 
-/// A mise backend token (the part after `mise:`), e.g. `aqua:openai/codex`, `opencode`,
-/// `npm:@anthropic-ai/claude-code`, or `aqua:openai/codex@0.141.0`. It rides the equip
+/// A mise backend token (the part after `mise:`), e.g. `aqua:example/demo-tool`, `bare-tool`,
+/// `npm:@example/demo-tool`, or `aqua:example/demo-tool@0.141.0`. It rides the equip
 /// wrapper positionally, so it cannot inject shell whatever it contains; the charset is
 /// still restricted to what a real token uses (no whitespace or control characters) so a
 /// malformed value is refused rather than handed to mise. The `[`, `]`, and `,` are admitted
-/// for PEP 508 extras (`pipx:hermes-agent[web]`, `pipx:hermes-agent[web,messaging]`) — a
+/// for PEP 508 extras (`pipx:demo-agent[web]`, `pipx:demo-agent[web,messaging]`) — a
 /// Python install selects optional dependency groups that way. They are not shell or nix
 /// metacharacters in any backend (the token is positional argv to mise, and the equip never
 /// interpolates it into a nix expression or a shell string), so admitting them adds no
@@ -5035,6 +5166,7 @@ mod tests {
             binds: binds.iter().map(|s| RawBind::Path(s.to_string())).collect(),
             packages: BTreeMap::new(),
             flakes: BTreeMap::new(),
+            tarball: BTreeMap::new(),
             nixpkgs: None,
             network: None,
             gui: None,
@@ -5128,7 +5260,7 @@ mod tests {
             mode: Some("deny".into()),
             allow: vec![],
             deny: vec![],
-            mute: vec!["@telemetry".into(), "antigravity-unleash.goog".into()],
+            mute: vec!["@telemetry".into(), "telemetry.example.com".into()],
             http2: vec![],
             ask_timeout: None,
             ask_notice: None,
@@ -5541,6 +5673,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             flakes: BTreeMap::new(),
+            tarball: BTreeMap::new(),
             network,
             gui: None,
             gpu: None,
@@ -5675,76 +5808,73 @@ mod tests {
 
     #[test]
     fn an_untrusted_project_cannot_override_a_trusted_apps_command() {
-        // The integrity-of-intent guard: `sbx app claude` against an untrusted repo must run
+        // The integrity-of-intent guard: `sbx app demo-app` against an untrusted repo must run
         // the trusted app's command, never one the repo substituted.
-        let global = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
-        let project = raw_with_app("claude", raw_app(&["evil"], &[], &[], &[], None));
+        let global = raw_with_app("demo-app", raw_app(&["demo-app"], &[], &[], &[], None));
+        let project = raw_with_app("demo-app", raw_app(&["evil"], &[], &[], &[], None));
         let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
-        let app = &r.apps["claude"];
-        assert_eq!(app.cmd, vec!["claude".to_string()]);
+        let app = &r.apps["demo-app"];
+        assert_eq!(app.cmd, vec!["demo-app".to_string()]);
         assert!(app.warnings.iter().any(|w| w.contains("cmd")));
 
         // A trusted project, by contrast, may override the command.
-        let global = raw_with_app("claude", raw_app(&["claude"], &[], &[], &[], None));
+        let global = raw_with_app("demo-app", raw_app(&["demo-app"], &[], &[], &[], None));
         let project = raw_with_app(
-            "claude",
-            raw_app(&["claude", "--resume"], &[], &[], &[], None),
+            "demo-app",
+            raw_app(&["demo-app", "--resume"], &[], &[], &[], None),
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
         assert_eq!(
-            r.apps["claude"].cmd,
-            vec!["claude".to_string(), "--resume".to_string()]
+            r.apps["demo-app"].cmd,
+            vec!["demo-app".to_string(), "--resume".to_string()]
         );
     }
 
     #[test]
     fn an_untrusted_project_cannot_override_a_trusted_apps_package() {
-        // The package half of the integrity-of-intent guard (mirror of `cmd`): `sbx app claude`
+        // The package half of the integrity-of-intent guard (mirror of `cmd`): `sbx app demo-app`
         // against an untrusted repo must keep the trusted app's tool, never one the repo
         // substituted — else the repo could deny the app its tool, or aim it at an attacker's.
         let global = raw_with_app(
-            "claude",
+            "demo-app",
             raw_app(
-                &["claude"],
+                &["demo-app"],
                 &[],
                 &[],
-                &[("claude-code", "mise:aqua:anthropics/claude-code")],
+                &[("demo-tool", "mise:aqua:example/demo-tool")],
                 None,
             ),
         );
         let project = raw_with_app(
-            "claude",
+            "demo-app",
             raw_app(
-                &["claude"],
+                &["demo-app"],
                 &[],
                 &[],
-                &[("claude-code", "mise:aqua:attacker/x")],
+                &[("demo-tool", "mise:aqua:attacker/x")],
                 None,
             ),
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
-        let app = &r.apps["claude"];
+        let app = &r.apps["demo-app"];
         let p = app
             .packages
             .iter()
-            .find(|p| p.name == "claude-code")
+            .find(|p| p.name == "demo-tool")
             .expect("the app's package survives");
         // The trusted token survives, still trusted; the attacker's is refused with a warning.
-        assert_eq!(
-            p.backend,
-            Backend::Mise("aqua:anthropics/claude-code".into())
-        );
+        assert_eq!(p.backend, Backend::Mise("aqua:example/demo-tool".into()));
         assert_eq!(p.state, TrustState::Trusted);
         assert!(app
             .warnings
             .iter()
-            .any(|w| w.contains("claude-code") && w.contains("override")));
+            .any(|w| w.contains("demo-tool") && w.contains("override")));
         // Security teeth: the attacker's token is not merely lower-priority — it is absent, so it
-        // can never reach `mise use -g`. Exactly one `claude-code`, and it is the trusted one.
+        // can never reach `mise use -g`. Exactly one `demo-tool`, and it is the trusted one.
         assert_eq!(
             app.packages
                 .iter()
-                .filter(|p| p.name == "claude-code")
+                .filter(|p| p.name == "demo-tool")
                 .count(),
             1
         );
@@ -5757,32 +5887,32 @@ mod tests {
 
         // A trusted project, by contrast, may override the package by name.
         let global = raw_with_app(
-            "claude",
+            "demo-app",
             raw_app(
-                &["claude"],
+                &["demo-app"],
                 &[],
                 &[],
-                &[("claude-code", "mise:aqua:anthropics/claude-code")],
+                &[("demo-tool", "mise:aqua:example/demo-tool")],
                 None,
             ),
         );
         let project = raw_with_app(
-            "claude",
+            "demo-app",
             raw_app(
-                &["claude"],
+                &["demo-app"],
                 &[],
                 &[],
-                &[("claude-code", "nix:claude-code")],
+                &[("demo-tool", "nix:demo-tool")],
                 None,
             ),
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
-        let p = r.apps["claude"]
+        let p = r.apps["demo-app"]
             .packages
             .iter()
-            .find(|p| p.name == "claude-code")
+            .find(|p| p.name == "demo-tool")
             .unwrap();
-        assert_eq!(p.backend, Backend::Nix("claude-code".into()));
+        assert_eq!(p.backend, Backend::Nix("demo-tool".into()));
     }
 
     #[test]
@@ -6228,22 +6358,22 @@ mod tests {
         // The flagship property for the inbound hole: a globally-declared app keeps its forward
         // ports even under an untrusted project, which may neither remove them nor open its own.
         let global = raw_with_app(
-            "codex",
+            "demo-app",
             RawApp {
                 forward: Some(vec![1455]),
-                ..raw_app(&["codex"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         // An untrusted project tries to add a port to the trusted app — dropped.
         let project = raw_with_app(
-            "codex",
+            "demo-app",
             RawApp {
                 forward: Some(vec![31337]),
                 ..raw_app(&[], &[], &[], &[], None)
             },
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
-        let app = &r.apps["codex"];
+        let app = &r.apps["demo-app"];
         assert_eq!(
             app.forward,
             vec![1455],
@@ -6272,15 +6402,15 @@ mod tests {
     fn a_trusted_app_forward_is_honored() {
         // A trusted (global-declared) app's forward ports are honored and carried on the overlay.
         let global = raw_with_app(
-            "codex",
+            "demo-app",
             RawApp {
                 forward: Some(vec![1455]),
-                ..raw_app(&["codex"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         let r = resolve_no_plugins(global, None);
-        assert_eq!(r.apps["codex"].forward, vec![1455]);
-        assert_eq!(r.apps["codex"].forward_origin, Provenance::Global);
+        assert_eq!(r.apps["demo-app"].forward, vec![1455]);
+        assert_eq!(r.apps["demo-app"].forward_origin, Provenance::Global);
     }
 
     #[test]
@@ -6288,17 +6418,17 @@ mod tests {
         // The flagship property for devices: a globally-declared app keeps its device grant even
         // under an untrusted project, which may neither widen it nor grant its own.
         let global = raw_with_app(
-            "codex",
+            "demo-app",
             RawApp {
                 devices: Some(schema::RawDevices {
                     allow: vec!["/dev/kvm".into()],
                 }),
-                ..raw_app(&["codex"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         // An untrusted project tries to add a device to the trusted app — dropped.
         let project = raw_with_app(
-            "codex",
+            "demo-app",
             RawApp {
                 devices: Some(schema::RawDevices {
                     allow: vec!["/dev/dri".into()],
@@ -6307,7 +6437,7 @@ mod tests {
             },
         );
         let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
-        let app = &r.apps["codex"];
+        let app = &r.apps["demo-app"];
         assert_eq!(
             app.devices,
             vec![PathBuf::from("/dev/kvm")],
@@ -6338,17 +6468,17 @@ mod tests {
     fn a_trusted_app_devices_grant_is_honored() {
         // A trusted (global-declared) app's device grant is honored and carried on the overlay.
         let global = raw_with_app(
-            "codex",
+            "demo-app",
             RawApp {
                 devices: Some(schema::RawDevices {
                     allow: vec!["/dev/kvm".into()],
                 }),
-                ..raw_app(&["codex"], &[], &[], &[], None)
+                ..raw_app(&["demo-app"], &[], &[], &[], None)
             },
         );
         let r = resolve_no_plugins(global, None);
-        assert_eq!(r.apps["codex"].devices, vec![PathBuf::from("/dev/kvm")]);
-        assert_eq!(r.apps["codex"].devices_origin, Provenance::Global);
+        assert_eq!(r.apps["demo-app"].devices, vec![PathBuf::from("/dev/kvm")]);
+        assert_eq!(r.apps["demo-app"].devices_origin, Provenance::Global);
     }
 
     /// Build a `RawLimits` from optional tokens, for the per-app overlay tests.
@@ -8454,17 +8584,17 @@ mod tests {
         // forward. The locator is stored verbatim in `Backend::Deb`.
         let r = resolve_no_plugins(
             raw_packages(&[
-                ("aionui", "deb:github:iOfficeAI/AionUi"),
-                ("norepo", "deb:github:iOfficeAI"), // one segment: refused
-                ("extra", "deb:github:a/b/c"),      // three segments: refused
-                ("dots", "deb:github:../evil"),     // traversal segment: refused
-                ("meta", "deb:github:o/r$x"),       // metacharacter: refused
+                ("demo-app", "deb:github:example/demo-app"),
+                ("norepo", "deb:github:example"), // one segment: refused
+                ("extra", "deb:github:a/b/c"),    // three segments: refused
+                ("dots", "deb:github:../evil"),   // traversal segment: refused
+                ("meta", "deb:github:o/r$x"),     // metacharacter: refused
             ]),
             None,
         );
         assert_eq!(
-            pkg(&r.packages, "aionui").unwrap().backend,
-            Backend::Deb("github:iOfficeAI/AionUi".into())
+            pkg(&r.packages, "demo-app").unwrap().backend,
+            Backend::Deb("github:example/demo-app".into())
         );
         for refused in ["norepo", "extra", "dots", "meta"] {
             assert!(
@@ -8498,10 +8628,10 @@ mod tests {
         // apt repo's highest-version `.deb` (for a vendor pool with no `latest` alias). The locator is
         // stored verbatim in `Backend::Deb`; the index URL points at the Packages index, not a `.deb`,
         // so the `.deb` suffix is not required.
-        let idx = "apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages";
+        let idx = "apt:https://apt.example.com/demo-app/apt/stable/dists/stable/main/binary-amd64/Packages";
         let r = resolve_no_plugins(
             raw_packages(&[
-                ("claude-desktop", &format!("deb:{idx}")),
+                ("demo-app", &format!("deb:{idx}")),
                 ("plain", "deb:http://h/x/Packages"), // not https: refused
                 ("meta", "deb:apt:https://h/x$y/Packages"), // metacharacter: refused
                 ("bare", "deb:apt:"),                 // empty url: refused
@@ -8509,7 +8639,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            pkg(&r.packages, "claude-desktop").unwrap().backend,
+            pkg(&r.packages, "demo-app").unwrap().backend,
             Backend::Deb(idx.into())
         );
         for refused in ["plain", "meta", "bare"] {
@@ -8540,10 +8670,10 @@ mod tests {
         let r = resolve_no_plugins(
             raw_packages(&[
                 (
-                    "t3code",
-                    "appimage:https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage",
+                    "demo-app",
+                    "appimage:https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage",
                 ),
-                ("t3repo", "appimage:github:pingdotgg/t3code"),
+                ("demo-repo", "appimage:github:example/demo-app"),
                 ("plain", "appimage:http://example.com/x.AppImage"), // not https: refused
                 ("notimg", "appimage:https://example.com/x.deb"),    // wrong extension: refused
                 ("spacey", "appimage:https://example.com/a b.AppImage"), // whitespace: refused
@@ -8552,14 +8682,14 @@ mod tests {
             None,
         );
         assert_eq!(
-            pkg(&r.packages, "t3code").unwrap().backend,
+            pkg(&r.packages, "demo-app").unwrap().backend,
             Backend::AppImage(
-                "https://github.com/pingdotgg/t3code/releases/download/v0.0.28/T3-Code-0.0.28-x86_64.AppImage".into()
+                "https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage".into()
             )
         );
         assert_eq!(
-            pkg(&r.packages, "t3repo").unwrap().backend,
-            Backend::AppImage("github:pingdotgg/t3code".into())
+            pkg(&r.packages, "demo-repo").unwrap().backend,
+            Backend::AppImage("github:example/demo-app".into())
         );
         for refused in ["plain", "notimg", "spacey", "badrepo"] {
             assert!(
@@ -8597,9 +8727,140 @@ mod tests {
         assert!(!is_valid_tarball_url("https://e/app.deb")); // wrong extension
         assert!(!is_valid_tarball_url("https://e/app.tar")); // not gz-compressed
         assert!(!is_valid_tarball_url("https://e/a b.tar.gz")); // raw whitespace
-                                                                // a mistyped/unsupported form is refused up front (the manifest form is a later increment).
+                                                                // a mistyped form is refused up front; the bare `tarball:resolve` sentinel is refused here
+                                                                // too (it is bound to its table by `apply_tools`, not parsed as a locator).
         assert!(parse_backend("tarball:https://e/app.zip").is_err());
         assert!(parse_backend("tarball:not-a-url").is_err());
+        assert!(parse_backend("tarball:resolve").is_err());
+    }
+
+    /// A `RawConfig` declaring one `tarball:resolve` package: the `[packages]` sentinel plus its
+    /// paired `[tarball.<name>]` table carrying the resolver command argv.
+    fn raw_tarball_resolve(name: &str, command: &[&str]) -> RawConfig {
+        let mut raw = raw_packages(&[(name, TARBALL_RESOLVE_SENTINEL)]);
+        raw.tarball.insert(
+            name.to_string(),
+            RawTarball {
+                resolve: command.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        raw
+    }
+
+    const CMD: &[&str] = &[
+        "sh",
+        "-c",
+        "curl -s https://api.example.com/releases | sed -n 1p",
+    ];
+
+    #[test]
+    fn a_tarball_resolve_sentinel_binds_to_its_table() {
+        // `[packages] app = "tarball:resolve"` + `[tarball.app]` folds into one TarballResolve
+        // tool carrying the resolver command; the global layer is trusted by location.
+        let r = resolve_no_plugins(raw_tarball_resolve("app", CMD), None);
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().backend,
+            Backend::TarballResolve {
+                command: CMD.iter().map(|s| s.to_string()).collect(),
+            }
+        );
+        assert_eq!(pkg(&r.packages, "app").unwrap().state, TrustState::Trusted);
+    }
+
+    #[test]
+    fn an_orphan_tarball_table_is_ignored_with_a_warning() {
+        // A `[tarball.<name>]` table with no matching `<name> = "tarball:resolve"` sentinel is not a
+        // tool — the sentinel is the opt-in that keeps `[packages]` the canonical list.
+        let mut raw = RawConfig::default();
+        raw.tarball.insert(
+            "orphan".to_string(),
+            RawTarball {
+                resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        let r = resolve_no_plugins(raw, None);
+        assert!(pkg(&r.packages, "orphan").is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("[packages]")));
+    }
+
+    #[test]
+    fn an_orphan_tarball_sentinel_is_ignored_with_a_warning() {
+        // A `<name> = "tarball:resolve"` with no `[tarball.<name>]` table can never resolve.
+        let r = resolve_no_plugins(raw_packages(&[("lonely", TARBALL_RESOLVE_SENTINEL)]), None);
+        assert!(pkg(&r.packages, "lonely").is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("lonely") && w.contains("[tarball.lonely]")));
+    }
+
+    #[test]
+    fn an_empty_tarball_resolve_command_is_dropped_with_a_warning() {
+        // A `resolve` command that is empty (or only blanks) could never run — fail-closed.
+        let r = resolve_no_plugins(raw_tarball_resolve("a", &["", "  "]), None);
+        assert!(pkg(&r.packages, "a").is_none());
+        assert!(r.warnings.iter().any(|w| w.contains("resolve")));
+    }
+
+    #[test]
+    fn an_untrusted_projects_tarball_resolve_is_stamped_untrusted() {
+        // Trust is recorded, not enforced, at resolve: the launcher (`tarball_resolve_packages`,
+        // trusted-only) withholds it and NEVER runs its command, like the direct `tarball:` form.
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((raw_tarball_resolve("app", CMD), TrustState::Untrusted)),
+        );
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().state,
+            TrustState::Untrusted
+        );
+    }
+
+    #[test]
+    fn apply_tarball_resolvers_refuses_an_untrusted_override_of_a_trusted_tool() {
+        // The flagship integrity guard at tool granularity: with `protect_trusted`, an untrusted
+        // layer's tarball resolver may not replace a tool a trusted layer already supplied, but may
+        // add a new one — so an untrusted project cannot swap a trusted app's tool for its own command.
+        let mut out = vec![Package {
+            name: "guarded".into(),
+            backend: Backend::Nix("jq".into()),
+            state: TrustState::Trusted,
+        }];
+        let mut warnings = Vec::new();
+        let tarball: BTreeMap<String, RawTarball> = ["guarded", "fresh"]
+            .into_iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    RawTarball {
+                        resolve: CMD.iter().map(|s| s.to_string()).collect(),
+                    },
+                )
+            })
+            .collect();
+        let names: BTreeSet<String> = ["guarded".to_string(), "fresh".to_string()].into();
+        apply_tarball_resolvers(
+            &mut out,
+            &mut warnings,
+            "project",
+            tarball,
+            &names,
+            TrustState::Untrusted,
+            true,
+        );
+        // The trusted tool is untouched; the new one is added (untrusted, withheld at launch).
+        assert_eq!(
+            pkg(&out, "guarded").unwrap().backend,
+            Backend::Nix("jq".into())
+        );
+        assert!(matches!(
+            pkg(&out, "fresh").unwrap().backend,
+            Backend::TarballResolve { .. }
+        ));
+        assert!(warnings.iter().any(|w| w.contains("guarded")));
     }
 
     #[test]
@@ -8626,13 +8887,13 @@ mod tests {
         // admitted so a Python install can select optional dependency groups, and the
         // whitespace/control characters that a real token never carries still refused.
         for t in [
-            "aqua:openai/codex",
-            "opencode",
-            "npm:@anthropic-ai/claude-code",
-            "aqua:openai/codex@0.141.0",
-            "pipx:hermes-agent",
-            "pipx:hermes-agent[web]",
-            "pipx:hermes-agent[web,messaging]",
+            "aqua:example/demo-tool",
+            "bare-tool",
+            "npm:@example/demo-tool",
+            "aqua:example/demo-tool@0.141.0",
+            "pipx:demo-agent",
+            "pipx:demo-agent[web]",
+            "pipx:demo-agent[web,messaging]",
         ] {
             assert!(is_valid_mise_token(t), "{t} should be a valid mise token");
         }

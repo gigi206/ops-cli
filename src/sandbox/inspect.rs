@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 /// the version directories realized for it.
 pub(crate) struct InstalledTool {
     /// The directory name mise gives the tool under `installs/` — the *munged* form of its declared
-    /// token (see [`mise_munge`]), e.g. `aqua-anthropics-claude-code`.
+    /// token (see [`mise_munge`]), e.g. `aqua-example-demo-tool`.
     pub(crate) name: String,
-    /// The real backend token mise recorded for this tool (`pipx:hermes-agent`, `aqua:openai/codex`,
+    /// The real backend token mise recorded for this tool (`pipx:demo-agent`, `aqua:example/demo-tool`,
     /// …), read from its `.mise.backend.toml`. `None` when that metadata is absent. Preferred over
     /// the munged directory name for display *and* for an exact match against a declared token.
     pub(crate) token: Option<String>,
@@ -36,8 +36,8 @@ impl InstalledTool {
 }
 
 /// Map a declared mise locator to the directory name mise gives it under `installs/`: `:` and `/`
-/// become `-` and `@` is dropped, so `aqua:anthropics/claude-code` → `aqua-anthropics-claude-code`,
-/// `npm:@augmentcode/auggie` → `npm-augmentcode-auggie`, and a bare registry token like `opencode`
+/// become `-` and `@` is dropped, so `aqua:example/demo-tool` → `aqua-example-demo-tool`,
+/// `npm:@example/other-tool` → `npm-example-other-tool`, and a bare registry token like `bare-tool`
 /// is unchanged. Best-effort — it mirrors mise's observed naming so a declared package can be paired
 /// with its realized install; a miss only drops the pairing, never asserts a wrong state, because
 /// the installed list is read straight from disk regardless of this mapping.
@@ -101,7 +101,7 @@ pub(crate) fn mise_installed(home: &Path) -> Vec<InstalledTool> {
 }
 
 /// The real backend token mise recorded for the tool installed at `tool_dir` — the `short` (or
-/// `full`) key of its `.mise.backend.toml` (`short = "pipx:hermes-agent"`). This recovers the
+/// `full`) key of its `.mise.backend.toml` (`short = "pipx:demo-agent"`). This recovers the
 /// provider the munged directory name hides. Parsed line-wise (the file is a tiny flat table), so no
 /// TOML dependency. `None` when the metadata is absent or unparsable.
 fn backend_token(tool_dir: &Path) -> Option<String> {
@@ -224,6 +224,7 @@ pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<&'st
     match backend {
         Backend::Deb(_) => Some("deb-packages.lock"),
         Backend::AppImage(_) => Some("appimage-packages.lock"),
+        Backend::Tarball(_) | Backend::TarballResolve { .. } => Some("tarball-packages.lock"),
         _ => None,
     }
 }
@@ -241,7 +242,7 @@ const FLAKE_ROOTS_REL_LEGACY: &str = ".local/state/ops/flake";
 /// out-link but no lock entry at all, which a lock scan would miss). The current relative path is
 /// [`binds::FLAKE_ROOTS_REL`] — the same constant the launch writes to, so the read side cannot drift
 /// from the write side — with the pre-rename [`FLAKE_ROOTS_REL_LEGACY`] as a fallback for a home built
-/// before the rename. Returns the out-link target's store-path label (e.g. `hermes-agent-0.18.2`, the
+/// before the rename. Returns the out-link target's store-path label (e.g. `demo-agent-0.18.2`, the
 /// basename minus the store hash) for display, or `None` when no out-link exists. Read-only.
 pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
     [super::binds::FLAKE_ROOTS_REL, FLAKE_ROOTS_REL_LEGACY]
@@ -363,16 +364,19 @@ mod tests {
     #[test]
     fn munge_mirrors_mises_backend_naming() {
         assert_eq!(
-            mise_munge("aqua:anthropics/claude-code"),
-            "aqua-anthropics-claude-code"
+            mise_munge("aqua:example/demo-tool"),
+            "aqua-example-demo-tool"
         );
         assert_eq!(
-            mise_munge("npm:@augmentcode/auggie"),
-            "npm-augmentcode-auggie"
+            mise_munge("npm:@example/other-tool"),
+            "npm-example-other-tool"
         );
-        assert_eq!(mise_munge("aqua:openai/codex"), "aqua-openai-codex");
+        assert_eq!(
+            mise_munge("aqua:example/pinned-tool"),
+            "aqua-example-pinned-tool"
+        );
         // A bare registry token is unchanged.
-        assert_eq!(mise_munge("opencode"), "opencode");
+        assert_eq!(mise_munge("bare-tool"), "bare-tool");
     }
 
     #[test]
@@ -395,37 +399,31 @@ mod tests {
     fn mise_installed_reads_tools_and_versions_skipping_metadata() {
         let tmp = std::env::temp_dir().join(format!("sbx-inspect-{}", std::process::id()));
         let installs = tmp.join(".local/share/mise/installs");
-        std::fs::create_dir_all(installs.join("aqua-anthropics-claude-code/2.1.209")).unwrap();
-        std::fs::create_dir_all(installs.join("aqua-anthropics-claude-code/latest")).unwrap();
-        std::fs::create_dir_all(installs.join("opencode/1.17.9")).unwrap();
+        std::fs::create_dir_all(installs.join("aqua-example-demo-tool/2.1.209")).unwrap();
+        std::fs::create_dir_all(installs.join("aqua-example-demo-tool/latest")).unwrap();
+        std::fs::create_dir_all(installs.join("bare-tool/1.17.9")).unwrap();
         // mise's own metadata file must be ignored (it is a file, not a tool dir).
         std::fs::write(installs.join(".mise-installs.toml"), b"x").unwrap();
         // The backend metadata recovers the real token behind the munged directory name.
         std::fs::write(
-            installs.join("aqua-anthropics-claude-code/.mise.backend.toml"),
-            "short = \"aqua:anthropics/claude-code\"\nfull = \"aqua:anthropics/claude-code\"\n",
+            installs.join("aqua-example-demo-tool/.mise.backend.toml"),
+            "short = \"aqua:example/demo-tool\"\nfull = \"aqua:example/demo-tool\"\n",
         )
         .unwrap();
 
         let tools = mise_installed(&tmp);
         assert_eq!(tools.len(), 2, "two tools, metadata skipped");
-        assert_eq!(tools[0].name, "aqua-anthropics-claude-code");
-        assert_eq!(
-            tools[0].token.as_deref(),
-            Some("aqua:anthropics/claude-code")
-        );
-        assert_eq!(tools[0].label(), "aqua:anthropics/claude-code");
-        assert!(
-            tools[0].is("aqua:anthropics/claude-code"),
-            "exact token match"
-        );
+        assert_eq!(tools[0].name, "aqua-example-demo-tool");
+        assert_eq!(tools[0].token.as_deref(), Some("aqua:example/demo-tool"));
+        assert_eq!(tools[0].label(), "aqua:example/demo-tool");
+        assert!(tools[0].is("aqua:example/demo-tool"), "exact token match");
         assert_eq!(tools[0].versions, vec!["2.1.209", "latest"]);
         assert_eq!(concrete_versions(&tools[0]), vec!["2.1.209"]);
         // No metadata → token None, label falls back to the munged dir, match via munge still works.
-        assert_eq!(tools[1].name, "opencode");
+        assert_eq!(tools[1].name, "bare-tool");
         assert_eq!(tools[1].token, None);
-        assert_eq!(tools[1].label(), "opencode");
-        assert!(tools[1].is("opencode"));
+        assert_eq!(tools[1].label(), "bare-tool");
+        assert!(tools[1].is("bare-tool"));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -483,13 +481,13 @@ mod tests {
         let data = std::env::temp_dir().join(format!("sbx-inspect-gc-{}", std::process::id()));
         let dir = data.join("gcroots/projects/abc123");
         std::fs::create_dir_all(&dir).unwrap();
-        for f in ["chromium", "deb-cursor", "deb-cursor.expr", "node"] {
+        for f in ["chromium", "deb-demo-app", "deb-demo-app.expr", "node"] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
         let names = gcroot_names(&data, "abc123");
         assert_eq!(
             names,
-            vec!["chromium", "deb-cursor", "node"],
+            vec!["chromium", "deb-demo-app", "node"],
             "expr skipped"
         );
         assert!(gcroot_names(&data, "absent").is_empty());
@@ -521,13 +519,13 @@ mod tests {
         std::fs::create_dir_all(&flake).unwrap();
         // A floating out-link keyed by name, pointing at a store path.
         std::os::unix::fs::symlink(
-            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-hermes-agent-0.18.2",
-            flake.join("hermes"),
+            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-demo-agent-0.18.2",
+            flake.join("demo-app"),
         )
         .unwrap();
         assert_eq!(
-            flake_built(&home, "hermes"),
-            Some("hermes-agent-0.18.2".to_string()),
+            flake_built(&home, "demo-app"),
+            Some("demo-agent-0.18.2".to_string()),
             "the store-path label, hash stripped"
         );
         // A pinned out-link is keyed `<name>-<rev>`; still matched by the name.
@@ -550,13 +548,13 @@ mod tests {
         let legacy = home.join(FLAKE_ROOTS_REL_LEGACY);
         std::fs::create_dir_all(&legacy).unwrap();
         std::os::unix::fs::symlink(
-            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-hermes-desktop-0.17.0",
-            legacy.join("hermes-desktop"),
+            "/nix/store/9d2v9068xl6f926gl4hbkyfixh8ar0yw-demo-desktop-0.17.0",
+            legacy.join("demo-desktop"),
         )
         .unwrap();
         assert_eq!(
-            flake_built(&home, "hermes-desktop"),
-            Some("hermes-desktop-0.17.0".to_string()),
+            flake_built(&home, "demo-desktop"),
+            Some("demo-desktop-0.17.0".to_string()),
             "a pre-rename home's out-link must still be found via the legacy fallback"
         );
         std::fs::remove_dir_all(&home).ok();

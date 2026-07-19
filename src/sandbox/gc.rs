@@ -631,7 +631,7 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
 /// One mise tool `sbx app prune` would remove (or removed) from an app home — a tool the app's
 /// config does not declare (a leftover from a former profile, or one pulled in by hand).
 pub(crate) struct PrunedTool {
-    /// The tool's real backend token (`pipx:hermes-agent`), for the report.
+    /// The tool's real backend token (`pipx:demo-agent`), for the report.
     pub(crate) token: String,
     /// On-disk size of the install that was (or would be) freed.
     pub(crate) bytes: u64,
@@ -1412,17 +1412,17 @@ mod tests {
         let data = TmpDir::new();
         let d = data.path();
         // the target app: a global home and a per-project home
-        mk_home(&d.join("apps/claude/home"));
-        mk_home(&d.join("apps/claude/etc"));
-        mk_home(&d.join("projects/p1/apps/claude/home"));
+        mk_home(&d.join("apps/demo-app/home"));
+        mk_home(&d.join("apps/demo-app/etc"));
+        mk_home(&d.join("projects/p1/apps/demo-app/home"));
         // a different app, and unrelated project state, must all survive
-        mk_home(&d.join("apps/codex/home"));
+        mk_home(&d.join("apps/demo-tool/home"));
         mk_home(&d.join("projects/p1/apps/other/home"));
         mk_home(&d.join("projects/p1/store/nix"));
 
-        let report = purge_app_homes(d, "claude");
+        let report = purge_app_homes(d, "demo-app");
 
-        // both of claude's homes removed, nothing failed
+        // both of demo-app's homes removed, nothing failed
         assert_eq!(
             report.removed.len(),
             2,
@@ -1431,10 +1431,10 @@ mod tests {
         );
         assert!(report.failed.is_empty());
         assert!(report.freed() > 0);
-        assert!(!d.join("apps/claude").exists());
-        assert!(!d.join("projects/p1/apps/claude").exists());
+        assert!(!d.join("apps/demo-app").exists());
+        assert!(!d.join("projects/p1/apps/demo-app").exists());
         // everything else is untouched
-        assert!(d.join("apps/codex/home").is_dir());
+        assert!(d.join("apps/demo-tool/home").is_dir());
         assert!(d.join("projects/p1/apps/other/home").is_dir());
         assert!(d.join("projects/p1/store/nix").is_dir());
     }
@@ -1442,10 +1442,10 @@ mod tests {
     #[test]
     fn purge_app_homes_reports_nothing_for_an_unknown_app() {
         let data = TmpDir::new();
-        mk_home(&data.path().join("apps/claude/home"));
+        mk_home(&data.path().join("apps/demo-app/home"));
         let report = purge_app_homes(data.path(), "ghost");
         assert!(report.found_nothing());
-        assert!(data.path().join("apps/claude").is_dir()); // the real app is untouched
+        assert!(data.path().join("apps/demo-app").is_dir()); // the real app is untouched
     }
 
     #[test]
@@ -1465,27 +1465,27 @@ mod tests {
     fn installed_app_homes_groups_global_and_per_project() {
         let data = TmpDir::new();
         let d = data.path();
-        // claude: a global home + two per-project homes
-        mk_home(&d.join("apps/claude/home"));
-        mk_home(&d.join("projects/p1/apps/claude/home"));
-        mk_home(&d.join("projects/p2/apps/claude/home"));
-        // codex: a global home only
-        mk_home(&d.join("apps/codex/home"));
+        // demo-app: a global home + two per-project homes
+        mk_home(&d.join("apps/demo-app/home"));
+        mk_home(&d.join("projects/p1/apps/demo-app/home"));
+        mk_home(&d.join("projects/p2/apps/demo-app/home"));
+        // demo-tool: a global home only
+        mk_home(&d.join("apps/demo-tool/home"));
         // scratch: a single per-project home, no global one
         mk_home(&d.join("projects/p1/apps/scratch/home"));
 
         let apps = installed_app_homes(d);
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["claude", "codex", "scratch"]); // sorted
+        assert_eq!(names, ["demo-app", "demo-tool", "scratch"]); // sorted
 
-        let claude = &apps[0];
-        assert!(claude.global_bytes.is_some());
-        assert_eq!(claude.project_homes, 2);
-        assert!(claude.total_bytes() > 0);
+        let demo_app = &apps[0];
+        assert!(demo_app.global_bytes.is_some());
+        assert_eq!(demo_app.project_homes, 2);
+        assert!(demo_app.total_bytes() > 0);
 
-        let codex = &apps[1];
-        assert!(codex.global_bytes.is_some());
-        assert_eq!(codex.project_homes, 0);
+        let demo_tool = &apps[1];
+        assert!(demo_tool.global_bytes.is_some());
+        assert_eq!(demo_tool.project_homes, 0);
 
         let scratch = &apps[2];
         assert!(scratch.global_bytes.is_none());
