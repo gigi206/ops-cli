@@ -3403,6 +3403,156 @@ fn a_tarball_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated
 }
 
 #[test]
+fn a_deb_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
+    // The `deb:resolve` auto-upgrade form is the `deb:` twin of `tarball:resolve`: it runs the
+    // profile's resolve command in the SAME hermetic bwrap cage, captures the URL it prints, and
+    // validates it as a `.deb` before any fetch. Proven end-to-end through the real `sbx run` WITHOUT
+    // the heavy Electron build: the command prints a deliberately INVALID URL, so the launch must fail
+    // naming that exact token — which can only happen if the cage ran the command in the real base
+    // userland (`printf` under `/bin/sh`) and captured+validated its stdout. Teeth: the printed token
+    // appears AND the `.deb` validation rejection appears. Skips (never fails) when the host cannot
+    // sandbox or the cache is unreachable (the base userland is fetched on first launch).
+    let project = TmpDir::new("deb-resolve-proj");
+    let data = TmpDir::new("deb-resolve-data");
+    let state = TmpDir::new("deb-resolve-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ndemo = \"deb:resolve\"\n\n\
+         [deb.demo]\nresolve = [\"sh\", \"-c\", \"printf RESOLVE-RAN-not-a-deb\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping deb-resolve e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping deb-resolve e2e: the network is unreachable");
+        return;
+    }
+
+    // `[packages]` (and the resolve command) is trusted-only, so trust the project first.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The resolved "URL" is not a valid `.deb`, so the launch fails — and its error names the exact
+    // token the command printed, proving the hermetic cage ran the command and captured its stdout.
+    assert!(
+        !out.status.success(),
+        "an invalid resolved URL must fail the launch:\n{log}"
+    );
+    assert!(
+        log.contains("RESOLVE-RAN-not-a-deb"),
+        "the resolved token must appear (the cage ran the command + captured its stdout):\n{log}"
+    );
+    assert!(
+        log.contains("not a valid `.deb`"),
+        "the resolved URL must be rejected by validation before any fetch:\n{log}"
+    );
+}
+
+#[test]
+fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
+    // `sbx upgrade deb` is the whole point of `deb:resolve` (the `apps-must-be-upgradable` rule): it
+    // must build its OWN resolver cage (`build_resolve_cage_parts` + `has_resolve_ref`, a code path
+    // DISTINCT from the launch-time provisioning above) and re-run the command. The provisioning e2e
+    // does not exercise that path, so this one drives `sbx upgrade deb` directly. A `deb:resolve` that
+    // `printf`s an INVALID URL makes the upgrade FAIL, naming the token in the roll summary's
+    // `re-resolve failed` line — which can only happen if the upgrade cage ran the command and
+    // validated its stdout. Network-light: validation rejects before any `.deb` prefetch; only the
+    // base userland seed (already paid by the probe) costs. Skips when the host cannot sandbox or the
+    // cache is unreachable.
+    let project = TmpDir::new("deb-up-proj");
+    let data = TmpDir::new("deb-up-data");
+    let state = TmpDir::new("deb-up-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ndemo = \"deb:resolve\"\n\n\
+         [deb.demo]\nresolve = [\"sh\", \"-c\", \"printf RESOLVE-RAN-not-a-deb\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store the upgrade cage needs); skip if unsandboxable.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping deb-upgrade-resolve e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping deb-upgrade-resolve e2e: the network is unreachable");
+        return;
+    }
+
+    // `deb:resolve` is trusted-only, so trust the project before the upgrade will run its command.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "deb"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The invalid resolved URL makes the roll fail (a Failed outcome → non-zero exit), and the summary
+    // names the exact token the command printed — proving the UPGRADE cage ran the command (not the
+    // launch path, whose failure reads `cannot provision …`, not `re-resolve failed`).
+    assert!(
+        !out.status.success(),
+        "an invalid resolved URL must fail the roll:\n{log}"
+    );
+    assert!(
+        log.contains("re-resolve failed"),
+        "the failure must come from the upgrade roll summary, not the launch path:\n{log}"
+    );
+    assert!(
+        log.contains("RESOLVE-RAN-not-a-deb") && log.contains("not a valid `.deb`"),
+        "the roll must name the token the command printed and reject it as a non-`.deb` URL:\n{log}"
+    );
+}
+
+#[test]
 fn a_synthetic_xdg_open_surfaces_the_url_and_exits_zero() {
     // A tool that auto-opens a browser/file calls `xdg-open <arg>`; the hermetic cage has no
     // display, browser, or file manager, so without a stub the call fails with "xdg-open not

@@ -792,6 +792,7 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
         Backend::AppImage(_) => "host-side from prebuilt AppImage, durable",
         Backend::Tarball(_) => "host-side from prebuilt tarball, durable",
         Backend::TarballResolve { .. } => "host-side from prebuilt tarball (auto-upgrade), durable",
+        Backend::DebResolve { .. } => "host-side from prebuilt .deb (auto-upgrade), durable",
     };
     let trusted = p.state == TrustState::Trusted;
     PackageView {
@@ -823,7 +824,8 @@ fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) ->
         Backend::Nix(_)
         | Backend::Mise(_)
         | Backend::FlakeInline { .. }
-        | Backend::TarballResolve { .. } => None,
+        | Backend::TarballResolve { .. }
+        | Backend::DebResolve { .. } => None,
     }
 }
 

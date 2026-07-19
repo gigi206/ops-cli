@@ -49,7 +49,14 @@ pub(crate) struct RawConfig {
     /// never trips the TOML rule that forbids adding scalar keys to a table after one of its
     /// subtables is opened.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) tarball: BTreeMap<String, RawTarball>,
+    pub(crate) tarball: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers for `deb:resolve` packages, declared as `[deb.<name>]` tables — the
+    /// exact `deb:` analogue of [`tarball`](Self::tarball). Each pairs with a `[packages]` entry
+    /// `<name> = "deb:resolve"` and carries a `resolve` command that prints the newest release's
+    /// `.deb` download URL, so `sbx upgrade` can re-run it and roll the pin forward. A security field
+    /// (it runs an arbitrary sandboxed command host-side), honored only from a trusted source.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) deb: BTreeMap<String, RawResolve>,
     /// Override the nixpkgs reference the tools resolve against: a branch/channel
     /// (`nixos-23.11`) or a 40-hex revision under `NixOS/nixpkgs`. A security field
     /// — honored from the global config or a trusted project, ignored from an
@@ -314,7 +321,13 @@ pub(crate) struct RawApp {
     /// a `<tool> = "tarball:resolve"` entry in the app's `packages`. Skipped when empty on serialize,
     /// so an app with no such package carries no `[tarball]` table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) tarball: BTreeMap<String, RawTarball>,
+    pub(crate) tarball: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers for this app's `deb:resolve` packages, declared as
+    /// `[app.<name>.deb.<tool>]` (or a top-level `[deb.<tool>]` in an imported profile). Same shape
+    /// and gating as the baseline `deb` (see [`RawConfig::deb`]); each pairs with a
+    /// `<tool> = "deb:resolve"` entry in the app's `packages`. Skipped when empty on serialize.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) deb: BTreeMap<String, RawResolve>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
     /// The app's process/exec posture, overriding the baseline's when set. A security field.
@@ -406,20 +419,21 @@ pub(crate) struct RawInlineFlake {
     pub(crate) attr: Option<String>,
 }
 
-/// An auto-upgrade resolver declared as a `[tarball.<name>]` table, paired with a `[packages]`
-/// entry `<name> = "tarball:resolve"`. It gives sbx a **command** that discovers the newest release's
-/// download URL of a prebuilt `.tar.gz` app whose URL is version-stamped (no stable `latest` alias):
-/// the command prints the concrete `.tar.gz` URL to stdout, and sbx runs it **sandboxed** (in a
-/// hermetic bubblewrap cage with sbx's base tools — `curl`/`coreutils`/`grep`/`sed`/`awk` — and the
-/// app's own `nix:` `[packages]` on `PATH`, so a command that needs e.g. `jq` just declares it), then
-/// validates the printed URL and pins it. `sbx upgrade tarball` re-runs the command and rolls the app
-/// forward. Because the command is arbitrary code, this is honored **only from a trusted source**;
-/// it never runs for an untrusted layer.
+/// An auto-upgrade resolver declared as a `[tarball.<name>]` or `[deb.<name>]` table, paired with a
+/// `[packages]` entry `<name> = "tarball:resolve"` / `"deb:resolve"`. It gives sbx a **command** that
+/// discovers the newest release's download URL of a prebuilt app whose URL is version-stamped (no
+/// stable `latest` alias): the command prints the concrete URL to stdout, and sbx runs it
+/// **sandboxed** (in a hermetic bubblewrap cage with sbx's base tools — `curl`/`coreutils`/`grep`/
+/// `sed`/`awk` — and the app's own `nix:` `[packages]` on `PATH`, so a command that needs e.g. `jq`
+/// just declares it), then validates the printed URL (against the backend's shape — `.tar.gz` or
+/// `.deb`) and pins it. `sbx upgrade` re-runs the command and rolls the app forward. Because the
+/// command is arbitrary code, this is honored **only from a trusted source**; it never runs for an
+/// untrusted layer.
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct RawTarball {
+pub(crate) struct RawResolve {
     /// The resolver command as an argv (`["sh", "-c", "curl -s <api> | …"]`) — never
-    /// whitespace-split, like `cmd`. It prints the newest release's `.tar.gz` download URL to stdout
-    /// (and nothing else); sbx validates that URL before fetching or building it.
+    /// whitespace-split, like `cmd`. It prints the newest release's download URL to stdout (and
+    /// nothing else); sbx validates that URL before fetching or building it.
     pub(crate) resolve: Vec<String>,
 }
 

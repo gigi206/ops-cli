@@ -45,6 +45,7 @@ pub(crate) mod proc_control;
 pub(crate) mod proc_enforce;
 mod projectstore;
 mod proxy;
+mod resolve;
 mod resolver;
 mod search;
 pub(crate) mod seccomp;
@@ -60,8 +61,8 @@ pub(crate) use appimage::{
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{probe as resource_limits, LimitReport};
 pub(crate) use deb::{
-    pinned_hashes as deb_pinned_hashes, upgrade as upgrade_deb, withheld as withheld_deb_packages,
-    DebUpgrade,
+    pinned_hashes as deb_pinned_hashes, upgrade_project as upgrade_deb,
+    withheld as withheld_deb_packages, DebUpgrade,
 };
 pub(crate) use flake::{
     pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,

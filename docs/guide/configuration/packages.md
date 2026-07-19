@@ -26,7 +26,7 @@ nix.
 | `nix:<attribute>` | host-side, into the shared store | tracks the nixpkgs channel | yes (seeded, durable) |
 | `mise:<token>` | in-cage, via `mise use -g` | upstream-direct, fetched at launch | first launch needs network |
 | `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `sbx upgrade flake` | after a warm build |
-| `deb:<url>` · `deb:github:…` · `deb:apt:…` | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` | yes (seeded, durable) |
+| `deb:<url>` · `deb:github:…` · `deb:apt:…` · `deb:resolve` (+ `[deb.<name>]`) | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 | `appimage:<url>` | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` | yes (seeded, durable) |
 | `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 
@@ -137,6 +137,7 @@ Three source forms:
 | `deb:<https url ending in .deb>` | a fixed `.deb`. A `…/releases/latest/download/…` URL rolls forward via its redirect; a version-stamped URL does not. |
 | `deb:github:<owner>/<repo>` | the repo's newest GitHub release — sbx selects its linux `.deb` asset (so a version-embedding asset name still rolls). |
 | `deb:apt:<https Packages-index url>` | an apt repository's newest `.deb` — sbx reads the uncompressed `Packages` index, picks the highest version, and derives its `.deb` URL. For a vendor pool with **no `latest` alias** (e.g. `claude-desktop`). |
+| `deb:resolve` (+ `[deb.<name>]`) | a `resolve` **command** you supply that prints the newest `.deb` URL — for a vendor with a download **API** but no `latest`/apt form (e.g. `cursor`). See below. |
 
 For `deb:github:` and `deb:apt:` the URL sbx derives from the remote index/release is
 **re-validated** by the same `https://`-and-`.deb` charset check a hand-written `deb:` URL passes,
@@ -147,6 +148,32 @@ is plain dotted-decimal (a non-numeric version is refused rather than mis-ordere
 
 Pairs with [`gui = "wayland"`](gui.md) for the display; sbx seeds its MITM CA into the cage's NSS
 store so the Chromium app trusts a filtering posture's proxy.
+
+**Auto-upgrade — `deb:resolve`.** When a vendor ships a version-stamped `.deb` URL with no
+`…/latest/…` alias and no apt index (so `deb:<url>` would freeze and neither `deb:github:` nor
+`deb:apt:` applies), pair a `deb:resolve` sentinel with a `[deb.<name>]` table carrying a `resolve`
+**command** that prints the current `.deb` URL — sbx runs it on the first launch and on `sbx upgrade
+deb` to roll forward. This is the exact `deb:` twin of [`tarball:resolve`](#tarball--a-prebuilt-application-tarball):
+
+```toml
+[packages]
+cursor = "deb:resolve"
+
+[deb.cursor]
+# A command (argv) that prints the current `.deb` URL to stdout, and nothing else. Here: query the
+# vendor download API and extract its `debUrl` field.
+resolve = ["sh", "-c", "curl -fsSL 'https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable' | sed -n 's/.*\"debUrl\":\"\\([^\"]*\\)\".*/\\1/p'"]
+```
+
+The `[packages]` entry stays the canonical tool list (the `deb:resolve` sentinel is the opt-in); the
+`[deb.<name>]` table — keyed by the same package name — carries the command. sbx runs it **in a
+hermetic sandbox** (its own base tools — `curl`/`coreutils`/`grep`/`sed`/`awk` — plus the app's own
+`nix:` `[packages]`; the host network for the API, sbx's own CA bundle for TLS), captures the URL it
+prints, **re-validates** it (`https://`, ending `.deb`, injection-free) before any fetch, and pins it
++ its content hash in `deb-packages.lock`. A warm launch reuses the pin offline and does **not** run
+the command; `sbx upgrade deb` re-runs it and re-fetches the `.deb` only when the URL actually
+changed. Because the command is arbitrary code it is honored **only from a trusted source** and
+**never runs for an untrusted layer**.
 
 ### `appimage:` — a prebuilt AppImage
 

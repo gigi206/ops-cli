@@ -1437,7 +1437,9 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
             let realized = match &pkg.backend {
                 Backend::Mise(token) => home_tools.iter().any(|t| t.is(token)),
                 Backend::Nix(_) => gcroot_set.contains(pkg.name.as_str()),
-                Backend::Deb(_) => gcroot_set.contains(format!("deb-{}", pkg.name).as_str()),
+                Backend::Deb(_) | Backend::DebResolve { .. } => {
+                    gcroot_set.contains(format!("deb-{}", pkg.name).as_str())
+                }
                 Backend::AppImage(_) => {
                     gcroot_set.contains(format!("appimage-{}", pkg.name).as_str())
                 }
@@ -2221,6 +2223,25 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok(None) => {}
             Err(e) => {
                 eprintln!("sbx gc: cannot build the pinned tarball resolver package `{name}`: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // A `deb:resolve` package: build from its EXISTING pin only, exactly like `tarball:resolve` above
+    // (never run the command or touch the network; an unpinned package is skipped).
+    for (name, _command) in super::packages::deb_resolve_packages(&prep.cfg.packages) {
+        match super::deb::provision_resolve_pinned(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+        ) {
+            Ok(Some((_, root))) => packages.roots.push(root),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("sbx gc: cannot build the pinned deb resolver package `{name}`: {e}");
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3160,7 +3181,7 @@ fn build(
     let resolve_cage = {
         let mut bins = prep.userland.bin_paths.clone();
         bins.extend(bin_paths.iter().cloned());
-        super::tarball::ResolveCage {
+        super::resolve::ResolveCage {
             bwrap: prep.bwrap.as_path(),
             store_src: crate::store::physical_path(&prep.layout, std::path::Path::new("/nix")),
             shell_bin: prep.userland.shell_bin.as_path(),
@@ -3184,6 +3205,30 @@ fn build(
             }
             Err(e) => {
                 eprintln!("sbx: cannot provision tarball resolver package `{name}`: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // `deb:resolve` packages — the `deb:` auto-upgrade twin of `tarball:resolve`, provisioned through
+    // the same hermetic resolve cage (its command prints the newest `.deb` URL, then sbx builds it
+    // exactly like a direct `deb:`). A warm launch reuses the pin and does NOT run the command.
+    for (name, command) in super::packages::deb_resolve_packages(&prep.cfg.packages) {
+        match super::deb::provision_resolve(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &command,
+            &resolve_cage,
+        ) {
+            Ok((bin, root)) => {
+                bin_paths.push(bin);
+                packages.roots.push(root);
+            }
+            Err(e) => {
+                eprintln!("sbx: cannot provision deb resolver package `{name}`: {e}");
                 return Err(ExitCode::FAILURE);
             }
         }

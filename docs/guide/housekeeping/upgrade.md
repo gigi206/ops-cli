@@ -16,7 +16,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/projects/<id>/nixpkgs.lock` — a project's own channel pin.
 - `<data>/projects/<id>/tools.lock` — resolved `nix:` mise tools.
 - `<data>/projects/<id>/flake-packages.lock` — pinned `flake:` packages.
-- `<data>/projects/<id>/deb-packages.lock` — pinned `deb:` packages (URL → content hash).
+- `<data>/projects/<id>/deb-packages.lock` — pinned `deb:` packages (declared source → content hash, plus the resolved download URL for a `deb:resolve` package).
 - `<data>/projects/<id>/appimage-packages.lock` — pinned `appimage:` packages (URL → content hash).
 - `<data>/projects/<id>/tarball-packages.lock` — pinned `tarball:` packages (declared source → content hash, plus the resolved download URL for a `tarball:resolve` package).
 
@@ -65,9 +65,13 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
   [egress allowlist](../networking/modes.md); `network = "none"` skips a home.
 - **`flake:`** — re-pins each declared flake ref (`nix flake metadata`) and rewrites
   `flake-packages.lock`; a re-pin builds the newly-locked ref at the next launch.
-- **`deb:`** — re-resolves each declared `.deb` URL to its current content hash
-  (`nix store prefetch-file`, following a `…/releases/latest/…` redirect) and rewrites
-  `deb-packages.lock`; a changed hash rebuilds host-side at the next launch.
+- **`deb:`** — re-resolves each declared source to its current `.deb` URL and content hash
+  (`nix store prefetch-file`, following a `…/releases/latest/…` redirect; re-querying a `github:`
+  release or an `apt:` index for the `github:`/`apt:` forms) and rewrites `deb-packages.lock`; a
+  changed hash rebuilds host-side at the next launch. A `deb:resolve` package instead re-runs its
+  `[deb.<name>]` `resolve` command (in a hermetic sandbox) to discover the current `.deb` URL — so a
+  vendor with a download API but no `latest`/apt form still rolls forward; the heavy `.deb` is
+  re-fetched only when that URL actually changed.
 - **`appimage:`** — the `deb:` twin for a prebuilt `.AppImage`: re-resolves each declared URL
   (or a `github:` locator's latest release asset) to its current content hash and rewrites
   `appimage-packages.lock`; a changed hash rebuilds host-side at the next launch.

@@ -27,7 +27,7 @@ use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
     NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
-    RawInlineFlake, RawSecretDefaults, RawTarball, SecretFrom,
+    RawInlineFlake, RawResolve, RawSecretDefaults, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -201,7 +201,7 @@ pub(crate) enum Backend {
     /// `tarball:resolve` — the auto-upgrade form of [`Backend::Tarball`], for a prebuilt `.tar.gz`
     /// app whose download URL is version-stamped (no stable `latest` alias). Declared as a
     /// `[packages]` sentinel `<name> = "tarball:resolve"` paired with a `[tarball.<name>]` table
-    /// (see [`RawTarball`]) carrying a `resolve` **command** that prints the newest release's
+    /// (see [`RawResolve`]) carrying a `resolve` **command** that prints the newest release's
     /// download URL. sbx runs the command **sandboxed** (a hermetic bubblewrap cage with sbx's base
     /// tools + the app's own `nix:` `[packages]` on `PATH`), validates the printed URL, prefetches
     /// its hash, and pins it — so it seeds/pins/builds exactly like the direct form, but `sbx upgrade
@@ -209,6 +209,14 @@ pub(crate) enum Backend {
     /// comes only from a trusted layer and never runs for an untrusted one; its printed URL is
     /// re-validated by `is_valid_tarball_url` before any fetch.
     TarballResolve { command: Vec<String> },
+    /// `deb:resolve` — the auto-upgrade form of [`Backend::Deb`], the exact `deb:` analogue of
+    /// [`Backend::TarballResolve`]. Declared as a `[packages]` sentinel `<name> = "deb:resolve"`
+    /// paired with a `[deb.<name>]` table (see [`RawResolve`]) carrying a `resolve` **command** that
+    /// prints the newest release's `.deb` download URL. sbx runs the command sandboxed, validates the
+    /// printed URL (`is_valid_deb_url`), prefetches its hash, and pins it — so it builds exactly like
+    /// the direct `deb:` form, but `sbx upgrade deb` can re-run the command and roll the pin forward.
+    /// Arbitrary code, so it comes only from a trusted layer and never runs for an untrusted one.
+    DebResolve { command: Vec<String> },
 }
 
 impl Backend {
@@ -227,6 +235,8 @@ impl Backend {
             // actual command is not a one-line locator, and the per-project lock keys the pin by the
             // package name, not this string.
             Backend::TarballResolve { .. } => "resolve",
+            // Same fixed short token as `TarballResolve`; the pin is keyed by the package name.
+            Backend::DebResolve { .. } => "resolve",
             // The output attribute — a short locator for display; the bulky flake source is not
             // itself a one-line locator (rendered as `flake (inline) #<attr>` by the config view).
             Backend::FlakeInline { attr, .. } => attr,
@@ -243,6 +253,7 @@ impl Backend {
             Backend::AppImage(_) => "appimage",
             Backend::Tarball(_) => "tarball",
             Backend::TarballResolve { .. } => "tarball",
+            Backend::DebResolve { .. } => "deb",
             Backend::FlakeInline { .. } => "flake",
         }
     }
@@ -930,14 +941,15 @@ impl Resolved {
             proc,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time. An override's inline
-            // `[flakes]` and `[tarball]` tables are dropped (fail-closed): a one-shot `--config` blob
-            // is no place for a multiline `flake.nix` or an auto-upgrade manifest, so both are
-            // declared in a profile or project config.
+            // `[flakes]`, `[tarball]`, and `[deb]` tables are dropped (fail-closed): a one-shot
+            // `--config` blob is no place for a multiline `flake.nix` or an auto-upgrade resolver
+            // command, so all are declared in a profile or project config.
             nixpkgs: _,
             net: _,
             app: _,
             flakes: _,
             tarball: _,
+            deb: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -1303,6 +1315,7 @@ fn resolve(
         global.packages,
         global.flakes,
         global.tarball,
+        global.deb,
         TrustState::Trusted,
         false,
     );
@@ -1495,6 +1508,7 @@ fn resolve(
             proj.packages,
             proj.flakes,
             proj.tarball,
+            proj.deb,
             state,
             false,
         );
@@ -2305,6 +2319,7 @@ fn resolve_app(
             app.packages,
             app.flakes,
             app.tarball,
+            app.deb,
             TrustState::Trusted,
             false,
         );
@@ -2418,6 +2433,7 @@ fn resolve_app(
             app.packages,
             app.flakes,
             app.tarball,
+            app.deb,
             state,
             !trusted,
         );
@@ -2932,20 +2948,28 @@ fn apply_tools(
     source: &str,
     mut packages: BTreeMap<String, String>,
     flakes: BTreeMap<String, RawInlineFlake>,
-    tarball: BTreeMap<String, RawTarball>,
+    tarball: BTreeMap<String, RawResolve>,
+    deb: BTreeMap<String, RawResolve>,
     state: TrustState,
     protect_trusted: bool,
 ) {
-    // A `<name> = "tarball:resolve"` entry is a sentinel, not a real backend locator: pull it out
-    // of the ordinary packages before `apply_packages` (which would reject the bare `tarball:`
-    // prefix) and hand the names to `apply_tarball_resolvers`, which binds each to its
-    // `[tarball.<name>]` table.
-    let resolve_names: BTreeSet<String> = packages
-        .iter()
-        .filter(|(_, v)| v.as_str() == TARBALL_RESOLVE_SENTINEL)
-        .map(|(k, _)| k.clone())
-        .collect();
-    packages.retain(|_, v| v.as_str() != TARBALL_RESOLVE_SENTINEL);
+    // A `<name> = "tarball:resolve"` / `"deb:resolve"` entry is a sentinel, not a real backend
+    // locator: pull each out of the ordinary packages before `apply_packages` (which would reject the
+    // bare prefix) and hand the names to `apply_resolvers`, which binds each to its `[tarball.<name>]`
+    // / `[deb.<name>]` table.
+    let collect_sentinel =
+        |packages: &BTreeMap<String, String>, sentinel: &str| -> BTreeSet<String> {
+            packages
+                .iter()
+                .filter(|(_, v)| v.as_str() == sentinel)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+    let tarball_names = collect_sentinel(&packages, TARBALL_RESOLVE_SENTINEL);
+    let deb_names = collect_sentinel(&packages, DEB_RESOLVE_SENTINEL);
+    packages.retain(|_, v| {
+        v.as_str() != TARBALL_RESOLVE_SENTINEL && v.as_str() != DEB_RESOLVE_SENTINEL
+    });
 
     for name in packages.keys() {
         if flakes.contains_key(name) {
@@ -2957,49 +2981,69 @@ fn apply_tools(
     }
     apply_packages(out, warnings, source, packages, state, protect_trusted);
     apply_flakes(out, warnings, source, flakes, state, protect_trusted);
-    apply_tarball_resolvers(
+    apply_resolvers(
         out,
         warnings,
         source,
         tarball,
-        &resolve_names,
+        &tarball_names,
         state,
         protect_trusted,
+        TARBALL_RESOLVE_SENTINEL,
+        "tarball",
+        |command| Backend::TarballResolve { command },
+    );
+    apply_resolvers(
+        out,
+        warnings,
+        source,
+        deb,
+        &deb_names,
+        state,
+        protect_trusted,
+        DEB_RESOLVE_SENTINEL,
+        "deb",
+        |command| Backend::DebResolve { command },
     );
 }
 
-/// Bind each `<name> = "tarball:resolve"` sentinel to its `[tarball.<name>]` table, folding it into
-/// `out` as a [`Backend::TarballResolve`] tool. Modelled on [`apply_flakes`]: a malformed name, an
-/// empty `resolve` command, or the `protect_trusted` override of a trusted app's tool is dropped with
-/// a warning (fail-closed). Both mismatch directions are warned loudly so a half-declared package
-/// never silently vanishes: a `[tarball.<name>]` table with no matching sentinel is ignored (the
-/// sentinel is the opt-in that keeps `[packages]` the canonical tool list), and a sentinel with no
-/// table cannot resolve. Trust is *recorded*, not enforced here — the launcher withholds an untrusted
-/// resolver package and **never runs its command**, exactly as it withholds the direct `tarball:` form.
-fn apply_tarball_resolvers(
+/// Bind each `<name> = "<label>:resolve"` sentinel to its `[<label>.<name>]` table, folding it into
+/// `out` as the backend `make_backend` builds from the command. Shared by the `tarball:resolve` and
+/// `deb:resolve` forms (the two differ only in the sentinel, the table label, and the backend built).
+/// Modelled on [`apply_flakes`]: a malformed name, an empty `resolve` command, or the `protect_trusted`
+/// override of a trusted app's tool is dropped with a warning (fail-closed). Both mismatch directions
+/// are warned loudly so a half-declared package never silently vanishes: a `[<label>.<name>]` table
+/// with no matching sentinel is ignored (the sentinel is the opt-in that keeps `[packages]` the
+/// canonical tool list), and a sentinel with no table cannot resolve. Trust is *recorded*, not enforced
+/// here — the launcher withholds an untrusted resolver package and **never runs its command**.
+#[allow(clippy::too_many_arguments)]
+fn apply_resolvers(
     out: &mut Vec<Package>,
     warnings: &mut Vec<String>,
     source: &str,
-    tarball: BTreeMap<String, RawTarball>,
+    tables: BTreeMap<String, RawResolve>,
     resolve_names: &BTreeSet<String>,
     state: TrustState,
     protect_trusted: bool,
+    sentinel: &str,
+    label: &str,
+    make_backend: fn(Vec<String>) -> Backend,
 ) {
-    // Which sentinels actually have a `[tarball.<name>]` table (valid or not) — so the
-    // no-table warning below fires only for a truly-orphan sentinel, never a second time for one
-    // whose table was present but rejected above.
-    let table_names: BTreeSet<String> = tarball.keys().cloned().collect();
-    for (name, raw) in tarball {
+    // Which sentinels actually have a `[<label>.<name>]` table (valid or not) — so the no-table
+    // warning below fires only for a truly-orphan sentinel, never a second time for one whose table
+    // was present but rejected above.
+    let table_names: BTreeSet<String> = tables.keys().cloned().collect();
+    for (name, raw) in tables {
         if !resolve_names.contains(&name) {
             warnings.push(format!(
-                "{source}: ignoring [tarball.{name}] — no matching `{name} = \
-                 \"{TARBALL_RESOLVE_SENTINEL}\"` in [packages]"
+                "{source}: ignoring [{label}.{name}] — no matching `{name} = \
+                 \"{sentinel}\"` in [packages]"
             ));
             continue;
         }
         if !is_valid_package_name(&name) {
             warnings.push(format!(
-                "{source}: ignoring malformed tarball name `{name}`"
+                "{source}: ignoring malformed {label} name `{name}`"
             ));
             continue;
         }
@@ -3009,33 +3053,26 @@ fn apply_tarball_resolvers(
                 .any(|p| p.name == name && p.state == TrustState::Trusted)
         {
             warnings.push(format!(
-                "{source}: ignoring tarball resolver `{name}` override of a trusted app ({})",
+                "{source}: ignoring {label} resolver `{name}` override of a trusted app ({})",
                 untrusted_reason(state)
             ));
             continue;
         }
         if raw.resolve.iter().all(|a| a.trim().is_empty()) {
             warnings.push(format!(
-                "{source}: ignoring [tarball.{name}]: the `resolve` command is empty"
+                "{source}: ignoring [{label}.{name}]: the `resolve` command is empty"
             ));
             continue;
         }
-        upsert_package(
-            out,
-            name,
-            Backend::TarballResolve {
-                command: raw.resolve,
-            },
-            state,
-        );
+        upsert_package(out, name, make_backend(raw.resolve), state);
     }
-    // A sentinel with no `[tarball.<name>]` table at all can never resolve — warn rather than
+    // A sentinel with no `[<label>.<name>]` table at all can never resolve — warn rather than
     // silently drop the package (a sentinel whose table was present but invalid was already warned).
     for name in resolve_names {
         if !table_names.contains(name) {
             warnings.push(format!(
-                "{source}: ignoring package `{name}`: `{TARBALL_RESOLVE_SENTINEL}` needs a \
-                 `[tarball.{name}]` table declaring a `resolve` command"
+                "{source}: ignoring package `{name}`: `{sentinel}` needs a `[{label}.{name}]` \
+                 table declaring a `resolve` command"
             ));
         }
     }
@@ -3113,6 +3150,14 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             return Err(format!("invalid flake reference `{reference}`"));
         }
         Ok(Backend::Flake(reference.to_string()))
+    } else if value == DEB_RESOLVE_SENTINEL {
+        // Checked before the `deb:` strip below, or `deb:resolve` would parse as a `deb:` URL and be
+        // rejected as invalid. Bound to its `[deb.<name>]` table by `apply_tools`; reaching here means
+        // the table is missing or a context without one (e.g. a one-shot `--config` blob).
+        Err(format!(
+            "`{DEB_RESOLVE_SENTINEL}` needs a matching `[deb.<name>]` table declaring a \
+             `resolve` command"
+        ))
     } else if let Some(rest) = value.strip_prefix("deb:") {
         if !is_valid_deb_url(rest)
             && !is_valid_deb_github_locator(rest)
@@ -3152,8 +3197,8 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
     } else {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
-             `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>`, `appimage:<url>` / \
-             `appimage:github:<owner>/<repo>`, `tarball:<url>`, or `tarball:resolve`"
+             `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>` / `deb:resolve`, \
+             `appimage:<url>` / `appimage:github:<owner>/<repo>`, `tarball:<url>`, or `tarball:resolve`"
         ))
     }
 }
@@ -3163,6 +3208,11 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
 /// in a paired `[tarball.<name>]` table. Not a real backend locator — [`apply_tools`] strips it
 /// before [`apply_packages`] runs and binds it to the table by name.
 const TARBALL_RESOLVE_SENTINEL: &str = "tarball:resolve";
+
+/// The `[packages]` value that opts a package into the `deb:` auto-upgrade resolver form — the exact
+/// `deb:` analogue of [`TARBALL_RESOLVE_SENTINEL`]. Its `resolve` command lives in a paired
+/// `[deb.<name>]` table; [`apply_tools`] strips it before [`apply_packages`] and binds it by name.
+const DEB_RESOLVE_SENTINEL: &str = "deb:resolve";
 
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
@@ -5167,6 +5217,7 @@ mod tests {
             packages: BTreeMap::new(),
             flakes: BTreeMap::new(),
             tarball: BTreeMap::new(),
+            deb: BTreeMap::new(),
             nixpkgs: None,
             network: None,
             gui: None,
@@ -5674,6 +5725,7 @@ mod tests {
                 .collect(),
             flakes: BTreeMap::new(),
             tarball: BTreeMap::new(),
+            deb: BTreeMap::new(),
             network,
             gui: None,
             gpu: None,
@@ -8575,6 +8627,10 @@ mod tests {
         assert!(!is_valid_deb_url("http://example.com/x.deb"));
         assert!(!is_valid_deb_url("https://example.com/x.tar.gz"));
         assert!(!is_valid_deb_url("https://example.com/a b.deb"));
+        // the bare `deb:resolve` sentinel is not a locator: it is bound to its `[deb.<name>]` table
+        // by `apply_tools`, so parsing it as a backend locator is refused (checked before the `deb:`
+        // strip, or it would parse as a `deb:` URL `resolve` and be rejected for the wrong reason).
+        assert!(parse_backend("deb:resolve").is_err());
     }
 
     #[test]
@@ -8740,7 +8796,7 @@ mod tests {
         let mut raw = raw_packages(&[(name, TARBALL_RESOLVE_SENTINEL)]);
         raw.tarball.insert(
             name.to_string(),
-            RawTarball {
+            RawResolve {
                 resolve: command.iter().map(|s| s.to_string()).collect(),
             },
         );
@@ -8774,7 +8830,7 @@ mod tests {
         let mut raw = RawConfig::default();
         raw.tarball.insert(
             "orphan".to_string(),
-            RawTarball {
+            RawResolve {
                 resolve: CMD.iter().map(|s| s.to_string()).collect(),
             },
         );
@@ -8830,19 +8886,19 @@ mod tests {
             state: TrustState::Trusted,
         }];
         let mut warnings = Vec::new();
-        let tarball: BTreeMap<String, RawTarball> = ["guarded", "fresh"]
+        let tarball: BTreeMap<String, RawResolve> = ["guarded", "fresh"]
             .into_iter()
             .map(|n| {
                 (
                     n.to_string(),
-                    RawTarball {
+                    RawResolve {
                         resolve: CMD.iter().map(|s| s.to_string()).collect(),
                     },
                 )
             })
             .collect();
         let names: BTreeSet<String> = ["guarded".to_string(), "fresh".to_string()].into();
-        apply_tarball_resolvers(
+        apply_resolvers(
             &mut out,
             &mut warnings,
             "project",
@@ -8850,6 +8906,9 @@ mod tests {
             &names,
             TrustState::Untrusted,
             true,
+            TARBALL_RESOLVE_SENTINEL,
+            "tarball",
+            |command| Backend::TarballResolve { command },
         );
         // The trusted tool is untouched; the new one is added (untrusted, withheld at launch).
         assert_eq!(
@@ -8861,6 +8920,119 @@ mod tests {
             Backend::TarballResolve { .. }
         ));
         assert!(warnings.iter().any(|w| w.contains("guarded")));
+    }
+
+    /// A `RawConfig` declaring one `deb:resolve` package: the `[packages]` sentinel plus its paired
+    /// `[deb.<name>]` table carrying the resolver command argv — the `deb:` twin of
+    /// [`raw_tarball_resolve`].
+    fn raw_deb_resolve(name: &str, command: &[&str]) -> RawConfig {
+        let mut raw = raw_packages(&[(name, DEB_RESOLVE_SENTINEL)]);
+        raw.deb.insert(
+            name.to_string(),
+            RawResolve {
+                resolve: command.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        raw
+    }
+
+    #[test]
+    fn a_deb_resolve_sentinel_binds_to_its_table() {
+        // `[packages] app = "deb:resolve"` + `[deb.app]` folds into one DebResolve tool carrying the
+        // resolver command; the global layer is trusted by location. The `deb:` analogue of
+        // `a_tarball_resolve_sentinel_binds_to_its_table`.
+        let r = resolve_no_plugins(raw_deb_resolve("app", CMD), None);
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().backend,
+            Backend::DebResolve {
+                command: CMD.iter().map(|s| s.to_string()).collect(),
+            }
+        );
+        assert_eq!(pkg(&r.packages, "app").unwrap().state, TrustState::Trusted);
+    }
+
+    #[test]
+    fn an_orphan_deb_table_is_ignored_with_a_warning() {
+        // A `[deb.<name>]` table with no matching `<name> = "deb:resolve"` sentinel is not a tool —
+        // the sentinel is the opt-in that keeps `[packages]` the canonical list.
+        let mut raw = RawConfig::default();
+        raw.deb.insert(
+            "orphan".to_string(),
+            RawResolve {
+                resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        let r = resolve_no_plugins(raw, None);
+        assert!(pkg(&r.packages, "orphan").is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("[packages]")));
+    }
+
+    #[test]
+    fn an_orphan_deb_sentinel_is_ignored_with_a_warning() {
+        // A `<name> = "deb:resolve"` with no `[deb.<name>]` table can never resolve.
+        let r = resolve_no_plugins(raw_packages(&[("lonely", DEB_RESOLVE_SENTINEL)]), None);
+        assert!(pkg(&r.packages, "lonely").is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("lonely") && w.contains("[deb.lonely]")));
+    }
+
+    #[test]
+    fn an_empty_deb_resolve_command_is_dropped_with_a_warning() {
+        // A `resolve` command that is empty (or only blanks) could never run — fail-closed.
+        let r = resolve_no_plugins(raw_deb_resolve("a", &["", "  "]), None);
+        assert!(pkg(&r.packages, "a").is_none());
+        assert!(r.warnings.iter().any(|w| w.contains("resolve")));
+    }
+
+    #[test]
+    fn an_untrusted_projects_deb_resolve_is_stamped_untrusted() {
+        // Trust is recorded, not enforced, at resolve: the launcher (`deb_resolve_packages`,
+        // trusted-only) withholds it and NEVER runs its command, like the direct `deb:` form.
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((raw_deb_resolve("app", CMD), TrustState::Untrusted)),
+        );
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().state,
+            TrustState::Untrusted
+        );
+    }
+
+    #[test]
+    fn a_deb_resolve_and_a_tarball_resolve_coexist_as_distinct_backends() {
+        // The two sentinels bind to distinct tables (`[deb.<name>]` vs `[tarball.<name>]`) and build
+        // distinct backends, so two resolver packages (one of each form) coexist — each is bound by
+        // its own sentinel, not confused for the other's.
+        let mut raw = raw_packages(&[
+            ("web", TARBALL_RESOLVE_SENTINEL),
+            ("app", DEB_RESOLVE_SENTINEL),
+        ]);
+        raw.tarball.insert(
+            "web".to_string(),
+            RawResolve {
+                resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        raw.deb.insert(
+            "app".to_string(),
+            RawResolve {
+                resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        let r = resolve_no_plugins(raw, None);
+        assert!(matches!(
+            pkg(&r.packages, "web").unwrap().backend,
+            Backend::TarballResolve { .. }
+        ));
+        assert!(matches!(
+            pkg(&r.packages, "app").unwrap().backend,
+            Backend::DebResolve { .. }
+        ));
     }
 
     #[test]

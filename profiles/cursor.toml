@@ -17,12 +17,13 @@
 # set. The build is HOST-SIDE (a `.deb` runs no build script, so evaluating it host-side is safe),
 # seeded into the store, offline-reusable after the first launch.
 #
-# VERSION PIN — MANUAL bump (no `…/latest/…` URL). Cursor's `.deb` URL embeds a version + build
-# hash, so it pins the version below (3.11.25 at authoring time). Cursor has no `…/releases/latest/…`
-# URL and no apt index to track, so `sbx upgrade deb` re-resolves the SAME pinned URL (it does not
-# roll forward). To update, get the current URL from Cursor's download API and replace the `deb:`
-# line:  curl -sL 'https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable'
-# (returns {"downloadUrl":…, "debUrl":…, "version":…}) — use its `debUrl`.
+# VERSION — AUTO-UPGRADE via `deb:resolve`. Cursor's `.deb` URL embeds a version + build hash and has
+# no `…/latest/…` alias, so a fixed `deb:<url>` would freeze at one version. Instead this profile uses
+# `deb:resolve` paired with the `[deb.cursor]` table below: sbx runs its `resolve` command in a
+# hermetic sandbox to query Cursor's download API for the CURRENT `.deb` URL, pins it per project on
+# first launch, and `sbx upgrade deb` re-runs it to roll forward — no manual URL bump. The API
+# (`https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable`) returns
+# {"downloadUrl":…, "debUrl":…, "version":…}; the command extracts its `debUrl`.
 #
 # FIRST LAUNCH resolves + builds the `.deb` host-side, pulling the Electron closure (hundreds of
 # MiB — a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse
@@ -195,14 +196,29 @@ dbus = true
 #]
 
 [packages]
-# Cursor's prebuilt `.deb`, version-pinned (see the VERSION PIN note in the header — bump via the
-# download API). Trusted-only, like every backend; this profile is trusted by location once imported.
-cursor = "deb:https://downloads.cursor.com/production/fc2563ec93d793fc275eef734405a4fdf8b47b26/linux/x64/deb/amd64/deb/cursor_3.11.25_amd64.deb"
+# Cursor's prebuilt `.deb`, AUTO-UPGRADED via `deb:resolve` (see the VERSION note in the header): the
+# `[deb.cursor]` table below re-derives the current `.deb` URL from Cursor's download API, so
+# `sbx upgrade deb` rolls forward with no manual URL bump. Trusted-only, like every backend; this
+# profile is trusted by location once imported.
+cursor = "deb:resolve"
 # In-cage Chromium for the account sign-in flow (the `cmd` wrapper opens http(s) auth URLs in it and
 # routes the `cursor://` callback back to the editor). A large closure (a couple hundred MB the first
 # launch, seeded + offline-reusable after). Drop this and the `cmd` wrapper if you only ever sign in
 # with EMAIL (that stays in the app webview and needs no external browser).
 chromium = "nix:chromium"
+
+# The `deb:resolve` command for `cursor` above. sbx runs it in a hermetic sandbox (base tools only —
+# `curl`/`sed`; SHARED network to reach the vendor API, sbx's own CA bundle for TLS) and pins the
+# `.deb` URL it prints. Cursor's `.deb` URL embeds a version + build hash and has no `…/latest/…`
+# alias, so a direct `deb:<url>` would freeze; this queries Cursor's download API for the CURRENT
+# `debUrl` instead. `curl -fsSL` follows the API's redirect and fails closed on an HTTP error; `sed`
+# extracts the `debUrl` JSON field. `sbx upgrade deb` re-runs this and rolls forward; a warm launch
+# reuses the pin WITHOUT re-running it (offline). The printed URL is re-validated as a `.deb` URL
+# before it is fetched, so an unexpected API response cannot point sbx at a non-`.deb` source.
+[deb.cursor]
+resolve = ["sh", "-c", '''
+curl -fsSL "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable" | sed -n 's/.*"debUrl":"\([^"]*\)".*/\1/p'
+''']
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
 # opened to all verbs with `{*}`. See the EGRESS note in the header for the HTTP/2 caveat.
