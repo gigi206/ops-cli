@@ -222,10 +222,25 @@ pub(crate) fn prebuilt_pin_in(tree_dir: &Path, lockfile: &str, locator: &str) ->
 pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<&'static str> {
     use crate::config::Backend;
     match backend {
-        Backend::Deb(_) => Some("deb-packages.lock"),
-        Backend::AppImage(_) => Some("appimage-packages.lock"),
+        Backend::Deb(_) | Backend::DebResolve { .. } => Some("deb-packages.lock"),
+        Backend::AppImage(_) | Backend::AppImageResolve { .. } => Some("appimage-packages.lock"),
         Backend::Tarball(_) | Backend::TarballResolve { .. } => Some("tarball-packages.lock"),
         _ => None,
+    }
+}
+
+/// The key a prebuilt package's pin is stored under in its per-tree lock: the declared locator for a
+/// direct form (its URL / `github:` / `apt:` locator), or `resolve:<name>` for a `*:resolve` package
+/// — whose pin is keyed by name, not by the one-line `resolve` sentinel [`Backend::locator`] returns.
+/// So a built `deb:resolve` / `appimage:resolve` / `tarball:resolve` package is found in its lock,
+/// not reported as un-built.
+pub(crate) fn prebuilt_pin_key(backend: &crate::config::Backend, name: &str) -> String {
+    use crate::config::Backend;
+    match backend {
+        Backend::TarballResolve { .. }
+        | Backend::DebResolve { .. }
+        | Backend::AppImageResolve { .. } => format!("resolve:{name}"),
+        other => other.locator().to_string(),
     }
 }
 
@@ -474,6 +489,29 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn prebuilt_pin_key_is_the_locator_for_a_direct_form_and_resolve_name_for_a_resolver() {
+        use crate::config::Backend;
+        // A direct prebuilt looks its pin up by its declared locator (URL / github: / apt:).
+        assert_eq!(
+            prebuilt_pin_key(&Backend::Deb("https://e/a.deb".into()), "app"),
+            "https://e/a.deb"
+        );
+        assert_eq!(
+            prebuilt_pin_key(&Backend::AppImage("github:o/r".into()), "app"),
+            "github:o/r"
+        );
+        // A `*:resolve` package's pin is keyed `resolve:<name>` (not the `resolve` sentinel locator),
+        // so a built one is found in its lock instead of reported as un-built.
+        for backend in [
+            Backend::DebResolve { command: vec![] },
+            Backend::AppImageResolve { command: vec![] },
+            Backend::TarballResolve { command: vec![] },
+        ] {
+            assert_eq!(prebuilt_pin_key(&backend, "cursor"), "resolve:cursor");
+        }
     }
 
     #[test]

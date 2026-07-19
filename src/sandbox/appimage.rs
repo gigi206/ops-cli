@@ -346,26 +346,146 @@ pub(crate) fn provision(
             (u, h)
         }
     };
-    let expr = derivation_expr(nixpkgs, &system, name, &url, &hash);
+    build_pinned(nix, layout, project_id.as_str(), nixpkgs, name, &url, &hash)
+}
+
+/// The lock key for an `appimage:resolve` package — `resolve:<name>`, keyed by the package name
+/// (unique per resolved config) rather than a URL, so a warm launch and `sbx gc`/`sbx upgrade` find
+/// the pin without re-running the resolver command.
+fn resolve_key(name: &str) -> String {
+    format!("resolve:{name}")
+}
+
+/// Build one already-resolved `appimage:` package (direct or resolver form) into sbx's store and
+/// return `(bin dir, store root)`. Shared by [`provision`], [`provision_resolve`], and the gc keep
+/// path, so the derivation + per-package gcroot (`appimage-<name>`) are identical across forms.
+fn build_pinned(
+    nix: &Path,
+    layout: &Layout,
+    project_id: &str,
+    nixpkgs: &str,
+    name: &str,
+    url: &str,
+    hash: &str,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let system = super::current_system();
+    let expr = derivation_expr(nixpkgs, &system, name, url, hash);
     let gcroot = layout
         .data_dir()
         .join("gcroots")
         .join("projects")
-        .join(project_id.as_str())
+        .join(project_id)
         .join(format!("appimage-{name}"));
     let logical = store::provision_expr(nix, layout, &gcroot, &expr, name, "bin")?;
     Ok((logical.join("bin"), logical))
 }
 
+/// Provision one `appimage:resolve` package host-side — the auto-upgrade twin of [`provision`]. The
+/// per-project lock is keyed by `resolve:<name>`; on a **warm** launch the pinned `(url, hash)` is
+/// reused offline and the resolve command is **not run** (the offline invariant), and only a first
+/// launch or `sbx upgrade` runs it. Builds the same derivation and per-package gcroot as the direct
+/// form, so the two forms provision identically once resolved.
+pub(crate) fn provision_resolve(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    nixpkgs: &str,
+    name: &str,
+    command: &[String],
+    cage: &super::resolve::ResolveCage,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let project_id = super::binds::project_runtime_id(project)?;
+    let key = resolve_key(name);
+    let mut lock = pins(layout, project_id.as_str());
+    let (url, hash) = match lock.get(&key) {
+        Some(pin) => (pin.url.clone(), pin.hash.clone()),
+        None => {
+            let u = super::resolve::resolve_url(
+                cage,
+                name,
+                command,
+                crate::config::is_valid_appimage_url,
+                "`.AppImage`",
+            )?;
+            let h = prebuilt::prefetch_hash(nix, layout, &u, false)?;
+            lock.insert(
+                key,
+                AppImagePin {
+                    hash: h.clone(),
+                    url: u.clone(),
+                },
+            );
+            write_pins(layout, project_id.as_str(), &lock)?;
+            (u, h)
+        }
+    };
+    build_pinned(nix, layout, project_id.as_str(), nixpkgs, name, &url, &hash)
+}
+
+/// Build an `appimage:resolve` package from its EXISTING pin only — for the gc keep path, which must
+/// never run the resolve command or touch the network. Returns `None` when the package is not yet
+/// pinned (nothing has been built to keep), so gc skips it rather than resolving.
+pub(crate) fn provision_resolve_pinned(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    nixpkgs: &str,
+    name: &str,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let project_id = super::binds::project_runtime_id(project)?;
+    let Some(pin) = pins(layout, project_id.as_str()).remove(&resolve_key(name)) else {
+        return Ok(None);
+    };
+    build_pinned(
+        nix,
+        layout,
+        project_id.as_str(),
+        nixpkgs,
+        name,
+        &pin.url,
+        &pin.hash,
+    )
+    .map(Some)
+}
+
+/// A declared `appimage:` reference to roll forward, in either form. The lock is keyed by
+/// [`Self::key`] — the declared locator (a direct `.AppImage` URL or `github:…`), or `resolve:<name>`
+/// for a resolver package.
+enum AppImageRef {
+    /// A locator resolved via [`resolve_source`] — a direct URL or `github:<owner>/<repo>`. Its
+    /// concrete `.AppImage` URL and content hash are always re-derived on upgrade.
+    Locator(String),
+    /// An `appimage:resolve` — its concrete download URL is re-derived by re-running the resolve
+    /// command, and the heavy `.AppImage` prefetch runs only when that URL differs from the stored
+    /// pin.
+    Resolve { name: String, command: Vec<String> },
+}
+
+impl AppImageRef {
+    /// The per-project lock key: the declared locator, or `resolve:<name>`.
+    fn key(&self) -> String {
+        match self {
+            AppImageRef::Locator(locator) => locator.clone(),
+            AppImageRef::Resolve { name, .. } => resolve_key(name),
+        }
+    }
+}
+
 /// Re-resolve a project's declared `appimage:` references and rewrite the per-project lock — pinning
-/// new ones, rolling changed ones forward, and pruning entries whose URL is no longer declared.
-/// Mirrors [`super::deb::upgrade`]: references collected generically across the baseline and each
-/// app, resolution best-effort per reference, lock rewritten once at the end.
+/// new ones, rolling changed ones forward, and pruning entries no longer declared. Mirrors
+/// [`super::deb::upgrade`]: references collected generically across the baseline and each app,
+/// resolution best-effort per reference, lock rewritten once at the end. A locator form always
+/// re-resolves (a `latest`/`github:` source can move); an `appimage:resolve` first re-runs its
+/// command to re-derive the download URL and **skips the heavy `.AppImage` prefetch when that URL is
+/// unchanged**, so a no-op `sbx upgrade` does not re-download a large versioned asset. `cage` is the
+/// sandbox resolve commands run in; when it is `None` (the host cannot sandbox), a resolver reference
+/// cannot be rolled and is reported as failed rather than silently frozen.
 pub(crate) fn upgrade(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
+    cage: Option<&super::resolve::ResolveCage>,
 ) -> io::Result<Vec<AppImageUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     let Declared {
@@ -388,30 +508,56 @@ pub(crate) fn upgrade(
         outcomes.push(AppImageUpgrade::Pruned { url });
     }
 
-    for locator in &declared {
-        let previous = lock.get(locator).map(|p| p.hash.clone());
-        match resolve_source(nix, layout, locator, &system, true) {
+    for reference in &declared {
+        let key = reference.key();
+        let previous = lock.get(&key).cloned();
+        let resolved = match reference {
+            // A locator: always re-resolve (a `latest`/`github:` source can move). `fresh` re-queries
+            // GitHub past the fetch cache; the lock records the resolved asset URL, not the locator.
+            AppImageRef::Locator(locator) => resolve_source(nix, layout, locator, &system, true),
+            // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
+            // reuse the pinned hash without prefetching the (large) `.AppImage` again.
+            AppImageRef::Resolve { name, command } => match cage {
+                None => Err(io::Error::other(
+                    "cannot run the resolve command (no usable sandbox on this host)",
+                )),
+                Some(cage) => match super::resolve::resolve_url(
+                    cage,
+                    name,
+                    command,
+                    crate::config::is_valid_appimage_url,
+                    "`.AppImage`",
+                ) {
+                    Ok(url) => match &previous {
+                        Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
+                        _ => prebuilt::prefetch_hash(nix, layout, &url, true).map(|h| (url, h)),
+                    },
+                    Err(e) => Err(e),
+                },
+            },
+        };
+        match resolved {
             Ok((url, hash)) => {
                 let outcome = match &previous {
-                    Some(old) if old == &hash => AppImageUpgrade::Unchanged {
-                        url: locator.clone(),
+                    Some(pin) if pin.hash == hash => AppImageUpgrade::Unchanged {
+                        url: key.clone(),
                         hash: hash.clone(),
                     },
-                    Some(old) => AppImageUpgrade::Rolled {
-                        url: locator.clone(),
-                        from: old.clone(),
+                    Some(pin) => AppImageUpgrade::Rolled {
+                        url: key.clone(),
+                        from: pin.hash.clone(),
                         to: hash.clone(),
                     },
                     None => AppImageUpgrade::Pinned {
-                        url: locator.clone(),
+                        url: key.clone(),
                         hash: hash.clone(),
                     },
                 };
-                lock.insert(locator.clone(), AppImagePin { hash, url });
+                lock.insert(key, AppImagePin { hash, url });
                 outcomes.push(outcome);
             }
             Err(e) => outcomes.push(AppImageUpgrade::Failed {
-                url: locator.clone(),
+                url: key,
                 error: e.to_string(),
             }),
         }
@@ -421,31 +567,125 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// The two views `sbx upgrade appimage` needs of a project's declared `appimage:` URLs, collected in
-/// one pass over the baseline and each app overlay (see [`declared`]).
+/// The owned pieces an `appimage:resolve` upgrade cage borrows from — held across the [`upgrade`]
+/// call so the [`super::resolve::ResolveCage`]'s references stay valid.
+struct ResolveCageParts {
+    bwrap: PathBuf,
+    store_src: PathBuf,
+    shell_bin: PathBuf,
+    ca_bundle: PathBuf,
+    bins: Vec<PathBuf>,
+}
+
+/// Whether the project (baseline or any app) declares a trusted `appimage:resolve` package — so the
+/// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
+fn has_resolve_ref(cfg: &crate::config::Resolved) -> bool {
+    let any = |pkgs: &[crate::config::Package]| {
+        !super::packages::appimage_resolve_packages(pkgs).is_empty()
+    };
+    any(&cfg.packages)
+        || cfg.apps.values().any(|app| {
+            let mut merged = cfg.clone();
+            merged.merge_app(app.clone());
+            any(&merged.packages)
+        })
+}
+
+/// Assemble the resolver sandbox for `sbx upgrade` — the same hermetic base userland + the project's
+/// `nix:` package bins a launch gives a resolve command, so a command runs identically at first launch
+/// and at upgrade. Best-effort: if the host cannot resolve an engine or sandbox, this returns `None`
+/// and [`upgrade_project`] reports each resolver reference as un-rollable rather than silently frozen.
+fn build_resolve_cage_parts(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    cfg: &crate::config::Resolved,
+) -> Option<ResolveCageParts> {
+    let bwrap = crate::store::resolve_bwrap(Some(layout))?.path;
+    let nixpkgs = super::launch::effective_lock_target(project, layout, cfg)
+        .ok()?
+        .resolve(nix, layout)
+        .ok()?;
+    let engine_ref =
+        crate::store::resolve_engine_ref(nix, layout, cfg.nixpkgs_global.as_deref()).ok()?;
+    let userland = super::fhs::resolve_userland(nix, layout, &nixpkgs, &engine_ref).ok()?;
+    let mut bins = userland.bin_paths.clone();
+    // The app's `nix:` bins, so a resolve command using e.g. `jq` resolves at upgrade time exactly as
+    // it does at launch. Best-effort — the base tools are always present regardless.
+    if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) {
+        bins.extend(p.bins);
+    }
+    Some(ResolveCageParts {
+        bwrap,
+        store_src: crate::store::physical_path(layout, Path::new("/nix")),
+        shell_bin: userland.shell_bin.clone(),
+        ca_bundle: userland.ca_bundle_src.clone(),
+        bins,
+    })
+}
+
+/// `sbx upgrade appimage`: roll a project's declared `appimage:` packages forward. Builds the resolver
+/// sandbox (only when an `appimage:resolve` package is declared) and delegates to [`upgrade`]. A
+/// locator-only project keeps the cheap path (no base-userland build).
+pub(crate) fn upgrade_project(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    cfg: &crate::config::Resolved,
+) -> io::Result<Vec<AppImageUpgrade>> {
+    let parts = if has_resolve_ref(cfg) {
+        build_resolve_cage_parts(nix, layout, project, cfg)
+    } else {
+        None
+    };
+    let cage = parts.as_ref().map(|p| super::resolve::ResolveCage {
+        bwrap: p.bwrap.as_path(),
+        store_src: p.store_src.clone(),
+        shell_bin: p.shell_bin.as_path(),
+        ca_bundle: p.ca_bundle.as_path(),
+        bins: p.bins.clone(),
+    });
+    upgrade(nix, layout, project, cfg, cage.as_ref())
+}
+
+/// The two views `sbx upgrade appimage` needs of a project's declared `appimage:` references,
+/// collected in one pass over the baseline and each app overlay (see [`declared`]).
 struct Declared {
-    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward.
-    trusted: Vec<String>,
-    /// Every declared URL **regardless of trust** — the universe the lock is pruned against, so an
-    /// untrusted/Changed project's still-declared package keeps its pin instead of being unpinned.
+    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward, each in its declared
+    /// form.
+    trusted: Vec<AppImageRef>,
+    /// Every declared lock key **regardless of trust** — the universe the lock is pruned against, so
+    /// an untrusted/Changed project's still-declared package keeps its pin instead of being unpinned.
     all: std::collections::BTreeSet<String>,
 }
 
 /// Collect both views in a single walk of the layers, each app overlay materialized once (a
-/// `merge_app` clone) — so `sbx upgrade` walks the apps once, not twice.
+/// `merge_app` clone) — so `sbx upgrade` walks the apps once, not twice. Both `appimage:` forms are
+/// collected: a locator keyed by its locator string, a resolver package keyed by `resolve:<name>`.
 fn declared(cfg: &crate::config::Resolved) -> Declared {
     let mut seen = std::collections::BTreeSet::new();
     let mut trusted = Vec::new();
     let mut all = std::collections::BTreeSet::new();
     let mut absorb = |pkgs: &[crate::config::Package]| {
-        for (_, url) in super::packages::appimage_packages(pkgs) {
-            if seen.insert(url.clone()) {
-                trusted.push(url);
+        for (_, locator) in super::packages::appimage_packages(pkgs) {
+            if seen.insert(locator.clone()) {
+                trusted.push(AppImageRef::Locator(locator));
+            }
+        }
+        for (name, command) in super::packages::appimage_resolve_packages(pkgs) {
+            if seen.insert(resolve_key(&name)) {
+                trusted.push(AppImageRef::Resolve { name, command });
             }
         }
         for p in pkgs {
-            if let crate::config::Backend::AppImage(url) = &p.backend {
-                all.insert(url.clone());
+            match &p.backend {
+                crate::config::Backend::AppImage(url) => {
+                    all.insert(url.clone());
+                }
+                crate::config::Backend::AppImageResolve { .. } => {
+                    all.insert(resolve_key(&p.name));
+                }
+                _ => {}
             }
         }
     };
@@ -465,8 +705,11 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
     let untrusted = |pkgs: &[crate::config::Package]| {
         pkgs.iter()
             .filter(|p| {
-                matches!(p.backend, crate::config::Backend::AppImage(_))
-                    && p.state != crate::trust::TrustState::Trusted
+                matches!(
+                    p.backend,
+                    crate::config::Backend::AppImage(_)
+                        | crate::config::Backend::AppImageResolve { .. }
+                ) && p.state != crate::trust::TrustState::Trusted
             })
             .count()
     };
@@ -742,10 +985,12 @@ mod tests {
             )],
         );
         // baseline first, then the app's new url; the duplicate and the untrusted one are gone.
-        assert_eq!(
-            declared(&cfg).trusted,
-            vec!["https://e/a.AppImage", "https://e/b.AppImage"]
-        );
+        let keys: Vec<String> = declared(&cfg)
+            .trusted
+            .iter()
+            .map(AppImageRef::key)
+            .collect();
+        assert_eq!(keys, vec!["https://e/a.AppImage", "https://e/b.AppImage"]);
         // the prune universe keeps the untrusted url (so `sbx upgrade` never unpins a withheld pin).
         let universe = declared(&cfg).all;
         assert!(universe.contains("https://e/evil.AppImage"));

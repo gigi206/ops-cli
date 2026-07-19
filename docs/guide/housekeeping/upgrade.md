@@ -17,7 +17,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/projects/<id>/tools.lock` — resolved `nix:` mise tools.
 - `<data>/projects/<id>/flake-packages.lock` — pinned `flake:` packages.
 - `<data>/projects/<id>/deb-packages.lock` — pinned `deb:` packages (declared source → content hash, plus the resolved download URL for a `deb:resolve` package).
-- `<data>/projects/<id>/appimage-packages.lock` — pinned `appimage:` packages (URL → content hash).
+- `<data>/projects/<id>/appimage-packages.lock` — pinned `appimage:` packages (declared source → content hash, plus the resolved download URL for an `appimage:resolve` package).
 - `<data>/projects/<id>/tarball-packages.lock` — pinned `tarball:` packages (declared source → content hash, plus the resolved download URL for a `tarball:resolve` package).
 
 A launch reads these locks; it does not re-resolve. So updating the `sbx` binary leaves
@@ -74,7 +74,10 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
   re-fetched only when that URL actually changed.
 - **`appimage:`** — the `deb:` twin for a prebuilt `.AppImage`: re-resolves each declared URL
   (or a `github:` locator's latest release asset) to its current content hash and rewrites
-  `appimage-packages.lock`; a changed hash rebuilds host-side at the next launch.
+  `appimage-packages.lock`; a changed hash rebuilds host-side at the next launch. An `appimage:resolve`
+  package instead re-runs its `[appimage.<name>]` `resolve` command (in a hermetic sandbox) to discover
+  the current `.AppImage` URL — so a vendor with a download API but no `latest`/`github:` form still
+  rolls forward; the heavy `.AppImage` is re-fetched only when that URL actually changed.
 - **`tarball:`** — the `deb:` twin for a prebuilt `.tar.gz`: re-resolves each declared source and
   rewrites `tarball-packages.lock`; a changed hash rebuilds host-side at the next launch. A direct
   `tarball:<url>` re-resolves the same URL, so a version-stamped one is effectively frozen (its path

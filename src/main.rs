@@ -5017,8 +5017,10 @@ fn build_app_show(
                         }
                     } else if let Some(lockfile) = sandbox::inspect::prebuilt_lockfile(&pkg.backend)
                     {
-                        let hits =
-                            sandbox::inspect::prebuilt_pin_trees(data_dir, lockfile, &locator);
+                        // A `*:resolve` package's pin is keyed `resolve:<name>`, not by the `resolve`
+                        // sentinel `locator` carries — look it up by that key so a built one is found.
+                        let key = sandbox::inspect::prebuilt_pin_key(&pkg.backend, &pkg.name);
+                        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, lockfile, &key);
                         match hits.first() {
                             Some((_, short)) => PackageInstalled::Installed {
                                 detail: format!("pinned in {} ({short})", plural_trees(hits.len())),

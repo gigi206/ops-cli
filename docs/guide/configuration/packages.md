@@ -27,7 +27,7 @@ nix.
 | `mise:<token>` | in-cage, via `mise use -g` | upstream-direct, fetched at launch | first launch needs network |
 | `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `sbx upgrade flake` | after a warm build |
 | `deb:<url>` · `deb:github:…` · `deb:apt:…` · `deb:resolve` (+ `[deb.<name>]`) | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
-| `appimage:<url>` | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` | yes (seeded, durable) |
+| `appimage:<url>` · `appimage:github:…` · `appimage:resolve` (+ `[appimage.<name>]`) | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 | `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 
 ### `nix:` — a nixpkgs attribute
@@ -193,6 +193,27 @@ ending in `.AppImage`, or `appimage:github:<owner>/<repo>` — which tracks the 
 linux `.AppImage` asset (so a version-embedding asset name still rolls forward). `sbx upgrade
 appimage` re-resolves it. Pairs with [`gui = "wayland"`](gui.md), [`gpu = true`](gpu.md), and
 [`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
+
+**Auto-upgrade — `appimage:resolve`.** For a vendor whose `.AppImage` URL is version-stamped with no
+`…/latest/…` alias and no `github:` release to track, pair an `appimage:resolve` sentinel with an
+`[appimage.<name>]` table carrying a `resolve` **command** that prints the current `.AppImage` URL —
+the exact `appimage:` twin of [`deb:resolve`](#deb--a-prebuilt-debian-package) /
+[`tarball:resolve`](#tarball--a-prebuilt-application-tarball):
+
+```toml
+[packages]
+demo-app = "appimage:resolve"
+
+[appimage.demo-app]
+# A command (argv) that prints the current `.AppImage` URL to stdout, and nothing else.
+resolve = ["sh", "-c", "curl -fsSL https://updates.example.com/api | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p'"]
+```
+
+sbx runs it in the same hermetic sandbox as the other `*:resolve` forms (base tools + the app's own
+`nix:` `[packages]`, host network, sbx's own CA bundle), re-validates the printed URL (`https://`,
+ending `.AppImage`, injection-free) before any fetch, and pins it in `appimage-packages.lock`. A warm
+launch reuses the pin offline; `sbx upgrade appimage` re-runs it and rolls forward. Honored **only
+from a trusted source** and **never run for an untrusted layer**.
 
 ### `tarball:` — a prebuilt application tarball
 

@@ -1440,7 +1440,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 Backend::Deb(_) | Backend::DebResolve { .. } => {
                     gcroot_set.contains(format!("deb-{}", pkg.name).as_str())
                 }
-                Backend::AppImage(_) => {
+                Backend::AppImage(_) | Backend::AppImageResolve { .. } => {
                     gcroot_set.contains(format!("appimage-{}", pkg.name).as_str())
                 }
                 Backend::Tarball(_) | Backend::TarballResolve { .. } => {
@@ -2242,6 +2242,24 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok(None) => {}
             Err(e) => {
                 eprintln!("sbx gc: cannot build the pinned deb resolver package `{name}`: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+    for (name, _command) in super::packages::appimage_resolve_packages(&prep.cfg.packages) {
+        match super::appimage::provision_resolve_pinned(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+        ) {
+            Ok(Some((_, root))) => packages.roots.push(root),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "sbx gc: cannot build the pinned appimage resolver package `{name}`: {e}"
+                );
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3229,6 +3247,30 @@ fn build(
             }
             Err(e) => {
                 eprintln!("sbx: cannot provision deb resolver package `{name}`: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // `appimage:resolve` packages — the `appimage:` auto-upgrade twin, provisioned through the same
+    // hermetic resolve cage (its command prints the newest `.AppImage` URL, then sbx builds it exactly
+    // like a direct `appimage:`). A warm launch reuses the pin and does NOT run the command.
+    for (name, command) in super::packages::appimage_resolve_packages(&prep.cfg.packages) {
+        match super::appimage::provision_resolve(
+            &prep.nix,
+            &prep.layout,
+            &prep.cwd,
+            &prep.nixpkgs,
+            &name,
+            &command,
+            &resolve_cage,
+        ) {
+            Ok((bin, root)) => {
+                bin_paths.push(bin);
+                packages.roots.push(root);
+            }
+            Err(e) => {
+                eprintln!("sbx: cannot provision appimage resolver package `{name}`: {e}");
                 return Err(ExitCode::FAILURE);
             }
         }

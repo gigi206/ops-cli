@@ -55,7 +55,7 @@ mod tarball;
 mod theme_relay;
 
 pub(crate) use appimage::{
-    pinned_hashes as appimage_pinned_hashes, upgrade as upgrade_appimage,
+    pinned_hashes as appimage_pinned_hashes, upgrade_project as upgrade_appimage,
     withheld as withheld_appimage_packages, AppImageUpgrade,
 };
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};

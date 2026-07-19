@@ -3553,6 +3553,146 @@ fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
 }
 
 #[test]
+fn an_appimage_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
+    // The `appimage:resolve` auto-upgrade form is the `appimage:` twin of `tarball:resolve`/
+    // `deb:resolve`: it runs the profile's resolve command in the SAME hermetic bwrap cage, captures
+    // the URL it prints, and validates it as an `.AppImage` before any fetch. Proven end-to-end
+    // through the real `sbx run` WITHOUT the heavy Electron build: the command prints a deliberately
+    // INVALID URL, so the launch must fail naming that exact token — which can only happen if the cage
+    // ran the command in the real base userland (`printf` under `/bin/sh`) and captured+validated its
+    // stdout. Teeth: the printed token appears AND the `.AppImage` validation rejection appears. Skips
+    // (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("ai-resolve-proj");
+    let data = TmpDir::new("ai-resolve-data");
+    let state = TmpDir::new("ai-resolve-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ndemo = \"appimage:resolve\"\n\n\
+         [appimage.demo]\nresolve = [\"sh\", \"-c\", \"printf RESOLVE-RAN-not-an-appimage\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store); skip if the host cannot sandbox.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping appimage-resolve e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping appimage-resolve e2e: the network is unreachable");
+        return;
+    }
+
+    // `[packages]` (and the resolve command) is trusted-only, so trust the project first.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.status.success(),
+        "an invalid resolved URL must fail the launch:\n{log}"
+    );
+    assert!(
+        log.contains("RESOLVE-RAN-not-an-appimage"),
+        "the resolved token must appear (the cage ran the command + captured its stdout):\n{log}"
+    );
+    assert!(
+        log.contains("not a valid `.AppImage`"),
+        "the resolved URL must be rejected by validation before any fetch:\n{log}"
+    );
+}
+
+#[test]
+fn sbx_upgrade_appimage_runs_an_appimage_resolve_command_through_the_upgrade_cage() {
+    // The `appimage:` twin of `sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage`:
+    // `sbx upgrade appimage` must build its OWN resolver cage (appimage's `build_resolve_cage_parts` +
+    // `has_resolve_ref`, distinct code from the launch-time provisioning) and re-run the command. An
+    // `appimage:resolve` that `printf`s an INVALID URL makes the upgrade FAIL, naming the token in the
+    // roll summary's `re-resolve failed` line. Network-light: validation rejects before any prefetch.
+    let project = TmpDir::new("ai-up-proj");
+    let data = TmpDir::new("ai-up-data");
+    let state = TmpDir::new("ai-up-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ndemo = \"appimage:resolve\"\n\n\
+         [appimage.demo]\nresolve = [\"sh\", \"-c\", \"printf RESOLVE-RAN-not-an-appimage\"]\n",
+    )
+    .unwrap();
+
+    // capability probe (also seeds the base store the upgrade cage needs); skip if unsandboxable.
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping appimage-upgrade-resolve e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping appimage-upgrade-resolve e2e: the network is unreachable");
+        return;
+    }
+
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "appimage"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.status.success(),
+        "an invalid resolved URL must fail the roll:\n{log}"
+    );
+    assert!(
+        log.contains("re-resolve failed"),
+        "the failure must come from the upgrade roll summary, not the launch path:\n{log}"
+    );
+    assert!(
+        log.contains("RESOLVE-RAN-not-an-appimage") && log.contains("not a valid `.AppImage`"),
+        "the roll must name the token and reject it as a non-`.AppImage` URL:\n{log}"
+    );
+}
+
+#[test]
 fn a_synthetic_xdg_open_surfaces_the_url_and_exits_zero() {
     // A tool that auto-opens a browser/file calls `xdg-open <arg>`; the hermetic cage has no
     // display, browser, or file manager, so without a stub the call fails with "xdg-open not

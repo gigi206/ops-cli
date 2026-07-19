@@ -134,7 +134,8 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
             | Backend::AppImage(_)
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }
@@ -158,7 +159,8 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::AppImage(_)
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }
@@ -180,7 +182,8 @@ pub(crate) fn deb_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::AppImage(_)
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }
@@ -205,7 +208,8 @@ pub(crate) fn tarball_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Deb(_)
             | Backend::AppImage(_)
             | Backend::TarballResolve { .. }
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }
@@ -228,7 +232,8 @@ pub(crate) fn tarball_resolve_packages(packages: &[Package]) -> Vec<(String, Vec
             | Backend::Deb(_)
             | Backend::AppImage(_)
             | Backend::Tarball(_)
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }
@@ -251,7 +256,32 @@ pub(crate) fn deb_resolve_packages(packages: &[Package]) -> Vec<(String, Vec<Str
             | Backend::Deb(_)
             | Backend::AppImage(_)
             | Backend::Tarball(_)
-            | Backend::TarballResolve { .. } => None,
+            | Backend::TarballResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
+        })
+        .collect()
+}
+
+/// The `(name, resolver-command)` of the *admitted* `appimage:resolve` packages — the `appimage:`
+/// auto-upgrade twin of [`tarball_resolve_packages`]/[`deb_resolve_packages`]: the launcher runs the
+/// command sandboxed to print the newest `.AppImage` URL, then resolves+builds exactly like the direct
+/// `appimage:` form. Trusted-only: an untrusted project's resolver package is dropped here, so **its
+/// command is never executed**. The name keys the same per-package gcroot as the direct form.
+pub(crate) fn appimage_resolve_packages(packages: &[Package]) -> Vec<(String, Vec<String>)> {
+    packages
+        .iter()
+        .filter(|p| p.state == TrustState::Trusted)
+        .filter_map(|p| match &p.backend {
+            Backend::AppImageResolve { command } => Some((p.name.clone(), command.clone())),
+            Backend::Nix(_)
+            | Backend::Mise(_)
+            | Backend::Flake(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_)
+            | Backend::AppImage(_)
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. }
+            | Backend::DebResolve { .. } => None,
         })
         .collect()
 }
@@ -274,7 +304,8 @@ pub(crate) fn appimage_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Deb(_)
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }
@@ -300,7 +331,8 @@ pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String
             | Backend::AppImage(_)
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
-            | Backend::DebResolve { .. } => None,
+            | Backend::DebResolve { .. }
+            | Backend::AppImageResolve { .. } => None,
         })
         .collect()
 }

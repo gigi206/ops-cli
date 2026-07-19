@@ -217,6 +217,16 @@ pub(crate) enum Backend {
     /// the direct `deb:` form, but `sbx upgrade deb` can re-run the command and roll the pin forward.
     /// Arbitrary code, so it comes only from a trusted layer and never runs for an untrusted one.
     DebResolve { command: Vec<String> },
+    /// `appimage:resolve` — the auto-upgrade form of [`Backend::AppImage`], the exact `appimage:`
+    /// analogue of [`Backend::TarballResolve`]/[`Backend::DebResolve`]. Declared as a `[packages]`
+    /// sentinel `<name> = "appimage:resolve"` paired with an `[appimage.<name>]` table (see
+    /// [`RawResolve`]) carrying a `resolve` **command** that prints the newest release's `.AppImage`
+    /// download URL. sbx runs the command sandboxed, validates the printed URL
+    /// (`is_valid_appimage_url`), prefetches its hash, and pins it — so it builds exactly like the
+    /// direct `appimage:` form, but `sbx upgrade appimage` can re-run the command and roll the pin
+    /// forward. Arbitrary code, so it comes only from a trusted layer and never runs for an untrusted
+    /// one.
+    AppImageResolve { command: Vec<String> },
 }
 
 impl Backend {
@@ -237,6 +247,8 @@ impl Backend {
             Backend::TarballResolve { .. } => "resolve",
             // Same fixed short token as `TarballResolve`; the pin is keyed by the package name.
             Backend::DebResolve { .. } => "resolve",
+            // Same fixed short token as the other resolvers; the pin is keyed by the package name.
+            Backend::AppImageResolve { .. } => "resolve",
             // The output attribute — a short locator for display; the bulky flake source is not
             // itself a one-line locator (rendered as `flake (inline) #<attr>` by the config view).
             Backend::FlakeInline { attr, .. } => attr,
@@ -254,6 +266,7 @@ impl Backend {
             Backend::Tarball(_) => "tarball",
             Backend::TarballResolve { .. } => "tarball",
             Backend::DebResolve { .. } => "deb",
+            Backend::AppImageResolve { .. } => "appimage",
             Backend::FlakeInline { .. } => "flake",
         }
     }
@@ -941,15 +954,16 @@ impl Resolved {
             proc,
             // The channel is applied earlier (before the lock is chosen); groups/apps are not
             // launch-shaping and were noticed and dropped at collection time. An override's inline
-            // `[flakes]`, `[tarball]`, and `[deb]` tables are dropped (fail-closed): a one-shot
-            // `--config` blob is no place for a multiline `flake.nix` or an auto-upgrade resolver
-            // command, so all are declared in a profile or project config.
+            // `[flakes]`, `[tarball]`, `[deb]`, and `[appimage]` tables are dropped (fail-closed): a
+            // one-shot `--config` blob is no place for a multiline `flake.nix` or an auto-upgrade
+            // resolver command, so all are declared in a profile or project config.
             nixpkgs: _,
             net: _,
             app: _,
             flakes: _,
             tarball: _,
             deb: _,
+            appimage: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -1316,6 +1330,7 @@ fn resolve(
         global.flakes,
         global.tarball,
         global.deb,
+        global.appimage,
         TrustState::Trusted,
         false,
     );
@@ -1509,6 +1524,7 @@ fn resolve(
             proj.flakes,
             proj.tarball,
             proj.deb,
+            proj.appimage,
             state,
             false,
         );
@@ -2320,6 +2336,7 @@ fn resolve_app(
             app.flakes,
             app.tarball,
             app.deb,
+            app.appimage,
             TrustState::Trusted,
             false,
         );
@@ -2434,6 +2451,7 @@ fn resolve_app(
             app.flakes,
             app.tarball,
             app.deb,
+            app.appimage,
             state,
             !trusted,
         );
@@ -2950,13 +2968,14 @@ fn apply_tools(
     flakes: BTreeMap<String, RawInlineFlake>,
     tarball: BTreeMap<String, RawResolve>,
     deb: BTreeMap<String, RawResolve>,
+    appimage: BTreeMap<String, RawResolve>,
     state: TrustState,
     protect_trusted: bool,
 ) {
-    // A `<name> = "tarball:resolve"` / `"deb:resolve"` entry is a sentinel, not a real backend
-    // locator: pull each out of the ordinary packages before `apply_packages` (which would reject the
-    // bare prefix) and hand the names to `apply_resolvers`, which binds each to its `[tarball.<name>]`
-    // / `[deb.<name>]` table.
+    // A `<name> = "tarball:resolve"` / `"deb:resolve"` / `"appimage:resolve"` entry is a sentinel, not
+    // a real backend locator: pull each out of the ordinary packages before `apply_packages` (which
+    // would reject the bare prefix) and hand the names to `apply_resolvers`, which binds each to its
+    // `[tarball.<name>]` / `[deb.<name>]` / `[appimage.<name>]` table.
     let collect_sentinel =
         |packages: &BTreeMap<String, String>, sentinel: &str| -> BTreeSet<String> {
             packages
@@ -2967,8 +2986,11 @@ fn apply_tools(
         };
     let tarball_names = collect_sentinel(&packages, TARBALL_RESOLVE_SENTINEL);
     let deb_names = collect_sentinel(&packages, DEB_RESOLVE_SENTINEL);
+    let appimage_names = collect_sentinel(&packages, APPIMAGE_RESOLVE_SENTINEL);
     packages.retain(|_, v| {
-        v.as_str() != TARBALL_RESOLVE_SENTINEL && v.as_str() != DEB_RESOLVE_SENTINEL
+        v.as_str() != TARBALL_RESOLVE_SENTINEL
+            && v.as_str() != DEB_RESOLVE_SENTINEL
+            && v.as_str() != APPIMAGE_RESOLVE_SENTINEL
     });
 
     for name in packages.keys() {
@@ -3004,6 +3026,18 @@ fn apply_tools(
         DEB_RESOLVE_SENTINEL,
         "deb",
         |command| Backend::DebResolve { command },
+    );
+    apply_resolvers(
+        out,
+        warnings,
+        source,
+        appimage,
+        &appimage_names,
+        state,
+        protect_trusted,
+        APPIMAGE_RESOLVE_SENTINEL,
+        "appimage",
+        |command| Backend::AppImageResolve { command },
     );
 }
 
@@ -3170,6 +3204,15 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             ));
         }
         Ok(Backend::Deb(rest.to_string()))
+    } else if value == APPIMAGE_RESOLVE_SENTINEL {
+        // Checked before the `appimage:` strip below, or `appimage:resolve` would parse as an
+        // `appimage:` URL and be rejected as invalid. Bound to its `[appimage.<name>]` table by
+        // `apply_tools`; reaching here means the table is missing or a context without one (e.g. a
+        // one-shot `--config` blob).
+        Err(format!(
+            "`{APPIMAGE_RESOLVE_SENTINEL}` needs a matching `[appimage.<name>]` table declaring a \
+             `resolve` command"
+        ))
     } else if let Some(rest) = value.strip_prefix("appimage:") {
         if !is_valid_appimage_url(rest) && !is_valid_deb_github_locator(rest) {
             return Err(format!(
@@ -3198,7 +3241,8 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
              `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>` / `deb:resolve`, \
-             `appimage:<url>` / `appimage:github:<owner>/<repo>`, `tarball:<url>`, or `tarball:resolve`"
+             `appimage:<url>` / `appimage:github:<owner>/<repo>` / `appimage:resolve`, \
+             `tarball:<url>`, or `tarball:resolve`"
         ))
     }
 }
@@ -3213,6 +3257,12 @@ const TARBALL_RESOLVE_SENTINEL: &str = "tarball:resolve";
 /// `deb:` analogue of [`TARBALL_RESOLVE_SENTINEL`]. Its `resolve` command lives in a paired
 /// `[deb.<name>]` table; [`apply_tools`] strips it before [`apply_packages`] and binds it by name.
 const DEB_RESOLVE_SENTINEL: &str = "deb:resolve";
+
+/// The `[packages]` value that opts a package into the `appimage:` auto-upgrade resolver form — the
+/// exact `appimage:` analogue of [`TARBALL_RESOLVE_SENTINEL`]. Its `resolve` command lives in a
+/// paired `[appimage.<name>]` table; [`apply_tools`] strips it before [`apply_packages`] and binds it
+/// by name.
+const APPIMAGE_RESOLVE_SENTINEL: &str = "appimage:resolve";
 
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
@@ -5218,6 +5268,7 @@ mod tests {
             flakes: BTreeMap::new(),
             tarball: BTreeMap::new(),
             deb: BTreeMap::new(),
+            appimage: BTreeMap::new(),
             nixpkgs: None,
             network: None,
             gui: None,
@@ -5726,6 +5777,7 @@ mod tests {
             flakes: BTreeMap::new(),
             tarball: BTreeMap::new(),
             deb: BTreeMap::new(),
+            appimage: BTreeMap::new(),
             network,
             gui: None,
             gpu: None,
@@ -8759,6 +8811,10 @@ mod tests {
         assert!(!is_valid_appimage_url("http://e/x.AppImage")); // not https
         assert!(!is_valid_appimage_url("https://e/x.deb")); // wrong extension
         assert!(!is_valid_appimage_url("https://e/a b.AppImage")); // whitespace
+                                                                   // the bare `appimage:resolve` sentinel is not a locator: it is bound to its
+                                                                   // `[appimage.<name>]` table by `apply_tools`, so parsing it as a backend locator is refused
+                                                                   // (checked before the `appimage:` strip, or it would parse as an `appimage:` URL `resolve`).
+        assert!(parse_backend("appimage:resolve").is_err());
     }
 
     #[test]
@@ -9003,27 +9059,93 @@ mod tests {
         );
     }
 
+    /// A `RawConfig` declaring one `appimage:resolve` package: the `[packages]` sentinel plus its
+    /// paired `[appimage.<name>]` table — the `appimage:` twin of [`raw_deb_resolve`].
+    fn raw_appimage_resolve(name: &str, command: &[&str]) -> RawConfig {
+        let mut raw = raw_packages(&[(name, APPIMAGE_RESOLVE_SENTINEL)]);
+        raw.appimage.insert(
+            name.to_string(),
+            RawResolve {
+                resolve: command.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        raw
+    }
+
     #[test]
-    fn a_deb_resolve_and_a_tarball_resolve_coexist_as_distinct_backends() {
-        // The two sentinels bind to distinct tables (`[deb.<name>]` vs `[tarball.<name>]`) and build
-        // distinct backends, so two resolver packages (one of each form) coexist — each is bound by
-        // its own sentinel, not confused for the other's.
+    fn an_appimage_resolve_sentinel_binds_to_its_table() {
+        // `[packages] app = "appimage:resolve"` + `[appimage.app]` folds into one AppImageResolve tool
+        // carrying the resolver command; the global layer is trusted by location.
+        let r = resolve_no_plugins(raw_appimage_resolve("app", CMD), None);
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().backend,
+            Backend::AppImageResolve {
+                command: CMD.iter().map(|s| s.to_string()).collect(),
+            }
+        );
+        assert_eq!(pkg(&r.packages, "app").unwrap().state, TrustState::Trusted);
+    }
+
+    #[test]
+    fn an_orphan_appimage_table_is_ignored_with_a_warning() {
+        // An `[appimage.<name>]` table with no matching `<name> = "appimage:resolve"` sentinel is not
+        // a tool — the sentinel is the opt-in that keeps `[packages]` the canonical list.
+        let mut raw = RawConfig::default();
+        raw.appimage.insert(
+            "orphan".to_string(),
+            RawResolve {
+                resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        let r = resolve_no_plugins(raw, None);
+        assert!(pkg(&r.packages, "orphan").is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("[packages]")));
+    }
+
+    #[test]
+    fn an_orphan_appimage_sentinel_is_ignored_with_a_warning() {
+        // A `<name> = "appimage:resolve"` with no `[appimage.<name>]` table can never resolve.
+        let r = resolve_no_plugins(raw_packages(&[("lonely", APPIMAGE_RESOLVE_SENTINEL)]), None);
+        assert!(pkg(&r.packages, "lonely").is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("lonely") && w.contains("[appimage.lonely]")));
+    }
+
+    #[test]
+    fn an_untrusted_projects_appimage_resolve_is_stamped_untrusted() {
+        // Trust is recorded, not enforced, at resolve: the launcher (`appimage_resolve_packages`,
+        // trusted-only) withholds it and NEVER runs its command, like the direct `appimage:` form.
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((raw_appimage_resolve("app", CMD), TrustState::Untrusted)),
+        );
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().state,
+            TrustState::Untrusted
+        );
+    }
+
+    #[test]
+    fn the_three_resolve_forms_coexist_as_distinct_backends() {
+        // The three sentinels bind to distinct tables (`[tarball.<name>]` / `[deb.<name>]` /
+        // `[appimage.<name>]`) and build distinct backends, so three resolver packages (one of each
+        // form) coexist — each is bound by its own sentinel, not confused for another's.
         let mut raw = raw_packages(&[
             ("web", TARBALL_RESOLVE_SENTINEL),
             ("app", DEB_RESOLVE_SENTINEL),
+            ("img", APPIMAGE_RESOLVE_SENTINEL),
         ]);
-        raw.tarball.insert(
-            "web".to_string(),
-            RawResolve {
-                resolve: CMD.iter().map(|s| s.to_string()).collect(),
-            },
-        );
-        raw.deb.insert(
-            "app".to_string(),
-            RawResolve {
-                resolve: CMD.iter().map(|s| s.to_string()).collect(),
-            },
-        );
+        let cmd = || RawResolve {
+            resolve: CMD.iter().map(|s| s.to_string()).collect(),
+        };
+        raw.tarball.insert("web".to_string(), cmd());
+        raw.deb.insert("app".to_string(), cmd());
+        raw.appimage.insert("img".to_string(), cmd());
         let r = resolve_no_plugins(raw, None);
         assert!(matches!(
             pkg(&r.packages, "web").unwrap().backend,
@@ -9032,6 +9154,10 @@ mod tests {
         assert!(matches!(
             pkg(&r.packages, "app").unwrap().backend,
             Backend::DebResolve { .. }
+        ));
+        assert!(matches!(
+            pkg(&r.packages, "img").unwrap().backend,
+            Backend::AppImageResolve { .. }
         ));
     }
 

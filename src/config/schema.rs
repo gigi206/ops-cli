@@ -57,6 +57,14 @@ pub(crate) struct RawConfig {
     /// (it runs an arbitrary sandboxed command host-side), honored only from a trusted source.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) deb: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers for `appimage:resolve` packages, declared as `[appimage.<name>]` tables
+    /// — the exact `appimage:` analogue of [`tarball`](Self::tarball). Each pairs with a `[packages]`
+    /// entry `<name> = "appimage:resolve"` and carries a `resolve` command that prints the newest
+    /// release's `.AppImage` download URL, so `sbx upgrade` can re-run it and roll the pin forward. A
+    /// security field (it runs an arbitrary sandboxed command host-side), honored only from a trusted
+    /// source.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) appimage: BTreeMap<String, RawResolve>,
     /// Override the nixpkgs reference the tools resolve against: a branch/channel
     /// (`nixos-23.11`) or a 40-hex revision under `NixOS/nixpkgs`. A security field
     /// — honored from the global config or a trusted project, ignored from an
@@ -328,6 +336,12 @@ pub(crate) struct RawApp {
     /// `<tool> = "deb:resolve"` entry in the app's `packages`. Skipped when empty on serialize.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) deb: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers for this app's `appimage:resolve` packages, declared as
+    /// `[app.<name>.appimage.<tool>]` (or a top-level `[appimage.<tool>]` in an imported profile).
+    /// Same shape and gating as the baseline `appimage` (see [`RawConfig::appimage`]); each pairs with
+    /// an `<tool> = "appimage:resolve"` entry in the app's `packages`. Skipped when empty on serialize.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) appimage: BTreeMap<String, RawResolve>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
     /// The app's process/exec posture, overriding the baseline's when set. A security field.
