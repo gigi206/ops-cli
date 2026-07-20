@@ -713,9 +713,16 @@ fn proc_inject_session(
     };
     let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
 
+    let sessions = match session::Registry::at(&data_dir).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sbx: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut loaded: Vec<u32> = Vec::new();
     let mut inert: Vec<u32> = Vec::new();
-    for s in session::Registry::at(&data_dir).list().unwrap_or_default() {
+    for s in sessions {
         let pid = s.pid;
         if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
             continue;
@@ -816,8 +823,15 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         .as_deref()
         .map(|n| session_pids_for_app(&data_dir, n));
 
+    let sessions = match session::Registry::at(&data_dir).list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sbx: cannot read the session registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut rows: Vec<(u32, &'static str, String)> = Vec::new();
-    for s in session::Registry::at(&data_dir).list().unwrap_or_default() {
+    for s in sessions {
         let pid = s.pid;
         if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
             continue;
