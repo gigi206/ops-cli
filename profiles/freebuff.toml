@@ -1,7 +1,7 @@
 # Freebuff — CodebuffAI's free terminal coding agent, sandboxed by sbx.
 #
 #   sbx app import profiles/freebuff.toml
-#   sbx app freebuff
+#   sbx app run freebuff
 #
 # Freebuff is a Node CLI distributed on npm, so sbx equips it in-cage with a node
 # runtime (nix) plus mise's npm backend. The npm package is a thin launcher: on the
@@ -14,7 +14,7 @@
 # routes model traffic through Codebuff's backend server-side. So there is no API key
 # to inject and no [secret] block. Instead you log in ONCE inside the cage:
 #
-#   sbx app freebuff        # then, in the agent: `freebuff login`
+#   sbx app run freebuff        # then, in the agent: `freebuff login`
 #
 # The login token is written under the app's dedicated, persistent, isolated home
 # (`~/.config/manicode/`), so it survives later launches and never bleeds into the

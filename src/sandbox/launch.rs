@@ -32,7 +32,6 @@ use super::forward;
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use crate::session::{self, Kind, RecordGuard, Session};
 use crate::store::Layout;
-use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io;
@@ -864,6 +863,43 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
             .sum::<usize>()
 }
 
+/// The `mise upgrade <tokens>` command for one roll group. The rolled tokens are the group's
+/// `[packages] mise:` tools, which for a **global app** live in the app-global home pool (Lane-1
+/// `mise use -g` pins them there). The cage's ambient primary for a global app is the *per-project*
+/// pool, which does not hold them, so a plain `mise upgrade` there would find nothing and silently
+/// roll nothing — a regression of a shipped command. So for a global app the roll is pinned to the
+/// app-global pool via a bash `MISE_DATA_DIR=<app-global>` prefix; the tokens ride `"$@"`
+/// positionally (no shell injection — only the sbx-owned mise path and fixed cage data dir are
+/// interpolated), and `exec` keeps the roll the cage's main process. Other runtimes have a single
+/// pool (the home), already the ambient primary, so the plain command runs unwrapped.
+fn mise_upgrade_cmd(
+    runtime: binds::Runtime,
+    mise: &Path,
+    bash: &Path,
+    tokens: &[String],
+) -> Vec<OsString> {
+    if matches!(runtime, binds::Runtime::GlobalApp(_)) {
+        let data_dir = binds::mise_app_global_data_dir();
+        let script = format!(
+            "MISE_DATA_DIR='{data_dir}' exec {mise} upgrade \"$@\"",
+            mise = mise.to_string_lossy(),
+        );
+        let mut cmd = vec![
+            bash.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from(script),
+            // `$0` — a label; the tokens are `$1..$n`.
+            OsString::from("sbx-mise-upgrade"),
+        ];
+        cmd.extend(tokens.iter().map(OsString::from));
+        cmd
+    } else {
+        let mut cmd = vec![mise.as_os_str().to_os_string(), OsString::from("upgrade")];
+        cmd.extend(tokens.iter().map(OsString::from));
+        cmd
+    }
+}
+
 /// Roll the project's and its apps' `mise:` `[packages]` forward, in-cage. A `mise:` package is
 /// equipped by `mise use -g <token>` at launch and then frozen at the installed version (the
 /// floating `latest` request stays satisfied, so a later launch does not re-resolve), so
@@ -957,11 +993,12 @@ pub(crate) fn upgrade_mise_packages(
         cfg.warnings.clear();
         prep.cfg = cfg;
 
-        let mut cmd = vec![
-            prep.userland.mise_bin.clone().into_os_string(),
-            OsString::from("upgrade"),
-        ];
-        cmd.extend(tokens.iter().map(OsString::from));
+        let cmd = mise_upgrade_cmd(
+            runtime,
+            &prep.userland.mise_bin,
+            &prep.userland.shell_bin,
+            &tokens,
+        );
 
         let (spec, guard) = match build(&prep, runtime, cmd) {
             Ok(v) => v,
@@ -1446,12 +1483,13 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 Backend::Tarball(_) | Backend::TarballResolve { .. } => {
                     gcroot_set.contains(format!("tarball-{}", pkg.name).as_str())
                 }
-                // A `flake:` build lands in the project home (like mise), not the store — and a
-                // floating flake has no lock — so the warm out-link is its realized signal.
-                Backend::Flake(_) => {
+                // A remote `flake:` builds host-side under a bare-`<name>` data-dir gcroot, like
+                // `nix:`; an inline `[flakes.<name>]` builds in-cage and lands a warm out-link in the
+                // project home, so the home out-link is its realized signal.
+                Backend::Flake(_) => gcroot_set.contains(pkg.name.as_str()),
+                Backend::FlakeInline { .. } => {
                     super::inspect::flake_built(&dir.join("home"), &pkg.name).is_some()
                 }
-                Backend::FlakeInline { .. } => gcroot_set.contains(pkg.name.as_str()),
             };
             if !realized {
                 unbuilt.push(UnbuiltView {
@@ -1982,23 +2020,17 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
     let store = equip_for_gc(&prep)?;
     let store_dir = store.store_dir().to_path_buf();
 
-    // Drop the `sbx-flake-<name>` roots of removed packages. A roll self-cleans (its root is
-    // overwritten onto the new build), but a removal leaves the root pointing at an unwanted build;
-    // this prunes those so the sweep reclaims them. The current set spans every runtime — the
-    // baseline and each app's merged packages — so a flake package declared only in an app keeps
-    // its root.
-    // Inline `[flakes.<name>]` flakes register the same `sbx-flake-<name>` gcroot as a `flake:`
-    // package, so their names belong in the keep-set too, or the sweep would prune a live inline
-    // flake's root.
+    // Drop the in-cage `sbx-flake-<name>` roots of removed inline `[flakes.<name>]` flakes. Only an
+    // inline flake builds in-cage and registers this root (a remote `flake:` is provisioned host-side
+    // and carries a data-dir out-link, pruned by `prune_project_package_roots` below); the root is
+    // name-keyed and overwritten each launch, so an edit self-cleans, but a removal leaves it pointing
+    // at an unwanted build — this prunes those so the sweep reclaims them. The current set spans every
+    // runtime — the baseline and each app's merged packages — so an inline flake declared only in an
+    // app keeps its root.
     let flake_root_names = |pkgs: &[crate::config::Package]| {
-        super::packages::flake_packages(pkgs)
+        super::packages::flake_inline_packages(pkgs)
             .into_iter()
-            .map(|(name, _)| name)
-            .chain(
-                super::packages::flake_inline_packages(pkgs)
-                    .into_iter()
-                    .map(|(name, _, _)| name),
-            )
+            .map(|(name, _, _)| name)
     };
     let mut flake_names: std::collections::BTreeSet<String> =
         flake_root_names(&prep.cfg.packages).collect();
@@ -3296,33 +3328,16 @@ fn build(
     // tool. The out-link need not exist yet: the in-cage `nix build` creates it before the
     // command runs, exactly as the mise shims dir is on PATH before mise populates it. Each
     // out-link is keyed by the (validated) package name under the persistent home.
-    let flake_pkgs = super::packages::flake_packages(&prep.cfg.packages);
-    // Consult the per-project flake lock: a pinned package builds its locked (immutable) ref into
-    // an out-link keyed by that revision, so an `sbx upgrade flake` that moved the pin rebuilds at
-    // this launch (the rev-keyed path does not yet exist). An unpinned package floats — it builds
-    // the declared ref into a name-keyed out-link, the v1 behaviour kept for a project that never
-    // ran `sbx upgrade flake`.
-    let flake_lock = read_flake_lock(prep, &flake_pkgs);
-    // Each quad carries the build ref, the build *target* out-link, the *good* out-link, and the
-    // package name. The target is where the build lands (rev-keyed when pinned, so a roll rebuilds);
-    // the good out-link (name-only) is the stable path PATH resolves through — the wrap promotes it
-    // to each successful build and, when a build *fails*, leaves it at the last good build, so a
-    // broken pin runs the previous version rather than breaking the app. The name keys the
-    // host-resolvable gc root the build registers, so a roll re-points one root and a host-side
-    // `sbx gc` keeps the current build while collecting the rolled-away one.
-    let mut flake_pairs: Vec<(String, PathBuf, PathBuf, String)> =
-        Vec::with_capacity(flake_pkgs.len());
-    for (name, reference) in &flake_pkgs {
-        // A pinned package builds its locked (immutable) ref; an unpinned one the declared ref.
-        let build_ref = match flake_lock.get(reference) {
-            Some(pin) => pin.locked_ref.clone(),
-            None => reference.clone(),
-        };
-        let target = flake_out_link_for(name, reference, &flake_lock);
-        let good = binds::flake_out_link(name);
-        bin_paths.push(good.join("bin"));
-        flake_pairs.push((build_ref, target, good, name.clone()));
-    }
+    // A remote `flake:` package is built host-side into the shared store and seeded per project (see
+    // `packages::provision`), so it lands once and is reused everywhere like a `nix:` tool — its `bin/`
+    // is already on PATH via the provisioned package bins. Only inline `[flakes.<name>]` flakes still
+    // build in-cage here: an inline flake is local content the user staged, and building local content
+    // host-side is exactly what `is_valid_flake_ref` refuses for a remote ref, so the inline case stays
+    // contained in the cage. Each quad carries the build ref, the content-hash-keyed build *target*
+    // out-link, the stable *good* out-link PATH resolves through (kept at the last good build on a
+    // failure), and the flake name.
+    let mut flake_pairs: Vec<(String, PathBuf, PathBuf, String)> = Vec::new();
+    let mut inline_flake_names: Vec<String> = Vec::new();
 
     // Inline `[flakes.<name>]` flakes: stage each `flake.nix` to a content-keyed directory on disk,
     // bind it read-only into the cage at `/opt/sbx/flakes/<name>`, and build `path:<dir>#<attr>`
@@ -3354,6 +3369,7 @@ fn build(
             writable: false,
         });
         bin_paths.push(good.join("bin"));
+        inline_flake_names.push(name.clone());
         flake_pairs.push((build_ref, target, good, name));
     }
 
@@ -3614,6 +3630,12 @@ fn build(
     let mut autoequip_env: Vec<(String, String)> = Vec::new();
     let global_mise = super::packages::mise_packages(&prep.cfg.packages);
     let auto_equip = auto_equip_tokens(&prep.cfg);
+    // A global app's Lane-1 `mise use -g` must install an app `[packages] mise:` tool into the
+    // app-global home pool (installed once, shared across projects, and where `sbx app show`/`list`/
+    // `gc` read), not the ambient per-project primary. Pin the equip step there for a global app;
+    // for `sbx run`/a per-project app the ambient primary is already the app-global home, so no pin.
+    let app_global_mise_dir =
+        matches!(runtime, binds::Runtime::GlobalApp(_)).then(binds::mise_app_global_data_dir);
     if !global_mise.is_empty() || !auto_equip.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
             // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only
@@ -3643,6 +3665,9 @@ fn build(
                     &prep.userland.shell_bin,
                     "install",
                     &auto_equip,
+                    // Lane 2 (project `.mise.toml` tools) runs under the ambient primary — the
+                    // per-project pool for a global app, which is where these belong.
+                    None,
                     cmd,
                 );
                 // Tell the in-cage mise to trust the project config so the installed tools
@@ -3668,35 +3693,34 @@ fn build(
                     &prep.userland.shell_bin,
                     "use -g",
                     &global_mise,
+                    // Pin the install to the app-global home pool for a global app (see above);
+                    // None for other runtimes, where the ambient primary is already app-global.
+                    app_global_mise_dir.as_deref(),
                     cmd,
                 );
             }
         }
     }
 
-    // `flake:` packages are built in-cage with `nix build --out-link` — an uncurated
-    // third-party flake is contained by the cage, not built host-side like a curated `nix:`
-    // attribute. The build fetches, so (like the mise equip) it wraps the command *before* the
-    // egress wrap and is skipped under `network = "none"`. The wrap short-circuits when the
-    // out-link is already realised in the project's store, so a warm launch is a no-op and an
-    // already-built tool runs offline.
+    // Inline `[flakes.<name>]` flakes are built in-cage with `nix build --out-link` — the local
+    // content the user staged is contained by the cage, never built host-side (which
+    // `is_valid_flake_ref` refuses for a remote ref; a remote `flake:` package is built host-side by
+    // `packages::provision`). The build fetches its inputs, so (like the mise equip) it wraps the
+    // command *before* the egress wrap and is skipped under `network = "none"`. The wrap
+    // short-circuits when the out-link is already realised in the project's store, so a warm launch is
+    // a no-op and an already-built flake runs offline.
     if !flake_pairs.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
-            let names: Vec<&str> = flake_pkgs.iter().map(|(n, _)| n.as_str()).collect();
             crate::diag::warn(&format!(
-                "flake packages [{}] are declared but `network = \"none\"` — they \
+                "inline flakes [{}] are declared but `network = \"none\"` — they \
                  cannot be built and will be absent unless already present",
-                names.join(", ")
+                inline_flake_names.join(", ")
             ));
         } else {
             eprintln!(
-                "sbx: building flake packages in-cage via nix build: {} (each flake's fetch \
+                "sbx: building inline flakes in-cage via nix build: {} (each flake's fetch \
                  host must be in [network].allow under an allowlist)",
-                flake_pkgs
-                    .iter()
-                    .map(|(n, r)| format!("{n} ({r})"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                inline_flake_names.join(", ")
             );
             cmd = wrap_flake_equip(
                 &prep.userland.nix_bin,
@@ -4210,37 +4234,6 @@ fn collect_roots(
     roots
 }
 
-/// Read the project's flake lock, but only when a `flake:` package is declared — the common
-/// launch reads no lock and derives no project id. An unreadable id or absent lock yields an
-/// empty map (every package floats), the v1 behaviour.
-fn read_flake_lock(
-    prep: &Prepared,
-    flake_pkgs: &[(String, String)],
-) -> BTreeMap<String, super::flake::FlakePin> {
-    if flake_pkgs.is_empty() {
-        return BTreeMap::new();
-    }
-    match binds::project_runtime_id(&prep.cwd) {
-        Ok(id) => super::flake::pins(&prep.layout, &id),
-        Err(_) => BTreeMap::new(),
-    }
-}
-
-/// The out-link a `flake:` package builds into, given the project's flake lock: a pinned
-/// package's revision-keyed path, an unpinned one's name-keyed path. The single place that
-/// choice is made, so the launch (which builds the out-link) and `sbx gc` (which decides
-/// whether an out-link on disk is a current root or a rolled-away leftover) never diverge.
-fn flake_out_link_for(
-    name: &str,
-    reference: &str,
-    lock: &BTreeMap<String, super::flake::FlakePin>,
-) -> PathBuf {
-    match lock.get(reference) {
-        Some(pin) => binds::flake_out_link_rev(name, &pin.rev),
-        None => binds::flake_out_link(name),
-    }
-}
-
 /// Resolve a trusted project's mise `[env]` into environment entries. Empty when
 /// the project declares no mise file, or it is withheld — an untrusted or changed
 /// mise file only warns (its `[env]` is held back, like its security fields).
@@ -4354,16 +4347,27 @@ fn auto_equip_tokens(cfg: &crate::config::Resolved) -> Vec<String> {
 /// token from an untrusted config can never inject shell. Best-effort: a failed equip does not
 /// abort the command (the missing tool surfaces when it is used), matching the self-equip
 /// posture rather than the host `nix:` hard-fail guarantee.
+///
+/// `mise_data_dir`, when `Some`, pins **only the equip step's** `MISE_DATA_DIR` (the exec'd command
+/// keeps the cage's ambient value). This is how a global app's Lane-1 `mise use -g` installs an app
+/// package into the app-global home pool while the ambient primary is the per-project pool: the
+/// value is an sbx-owned fixed cage path ([`binds::mise_app_global_data_dir`]), so single-quoting it
+/// in the assignment is injection-safe.
 fn wrap_mise_equip(
     mise: &Path,
     bash: &Path,
     verb: &str,
     tokens: &[String],
+    mise_data_dir: Option<&str>,
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
     let n = tokens.len();
+    let data_dir_prefix = match mise_data_dir {
+        Some(dir) => format!("MISE_DATA_DIR='{dir}' "),
+        None => String::new(),
+    };
     let script = format!(
-        "{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {n}; exec \"$@\"",
+        "{data_dir_prefix}{mise} {verb} \"${{@:1:{n}}}\" 1>&2; shift {n}; exec \"$@\"",
         mise = mise.to_string_lossy(),
     );
     let mut out = vec![
@@ -5844,7 +5848,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         ];
         let cmd = vec![OsString::from("demo-app"), OsString::from("--print")];
 
-        let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, cmd);
+        let argv = wrap_mise_equip(&mise, &bash, "install", &tokens, None, cmd);
 
         assert_eq!(argv[0], OsString::from("/nix/store/bash/bin/bash"));
         assert_eq!(argv[1], OsString::from("-c"));
@@ -5876,14 +5880,80 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         let tokens = vec!["aqua:example/demo-tool".to_string()];
         let cmd = vec![OsString::from("demo-app")];
 
-        let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, cmd);
+        let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, None, cmd);
 
         let script = argv[2].to_string_lossy();
         assert!(script.contains("/nix/store/mise/bin/mise use -g \"${@:1:1}\""));
         assert!(script.contains("shift 1;"));
+        // no data-dir override: the equip runs under the ambient primary
+        assert!(!script.contains("MISE_DATA_DIR="));
         // the token is a positional arg, never in the script
         assert_eq!(argv[4], OsString::from("aqua:example/demo-tool"));
         assert_eq!(argv[5], OsString::from("demo-app"));
+    }
+
+    #[test]
+    fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
+        // For a global app, Lane-1 `mise use -g` is pinned to the app-global home pool so the app
+        // tool installs there (shared across projects, read by `sbx app show`/`gc`) while the
+        // ambient primary stays the per-project pool. The pin applies to the equip step only — the
+        // exec'd command keeps the ambient value — and the value is single-quoted (injection-safe,
+        // an sbx-owned fixed path).
+        let mise = PathBuf::from("/nix/store/mise/bin/mise");
+        let bash = PathBuf::from("/nix/store/bash/bin/bash");
+        let tokens = vec!["aqua:example/demo-tool".to_string()];
+        let cmd = vec![OsString::from("demo-app")];
+        let data_dir = crate::sandbox::binds::mise_app_global_data_dir();
+
+        let argv = wrap_mise_equip(&mise, &bash, "use -g", &tokens, Some(&data_dir), cmd);
+
+        let script = argv[2].to_string_lossy();
+        // the equip's MISE_DATA_DIR is pinned to the app-global home, single-quoted, before mise
+        assert!(
+            script.contains(&format!(
+                "MISE_DATA_DIR='{data_dir}' /nix/store/mise/bin/mise use -g"
+            )),
+            "the global lane must pin the app-global data dir: {script}"
+        );
+        // the pin is only on the equip command, not the exec'd command
+        assert!(script.trim_end().ends_with("exec \"$@\""));
+        // the token still rides positionally
+        assert_eq!(argv[4], OsString::from("aqua:example/demo-tool"));
+    }
+
+    #[test]
+    fn mise_upgrade_cmd_pins_the_app_global_pool_only_for_a_global_app() {
+        // `sbx upgrade mise` rolls `[packages] mise:` tools, which for a global app live in the
+        // app-global home pool. The cage's ambient primary for a global app is the per-project pool
+        // (the split), which does not hold them, so the roll must be pinned to the app-global pool —
+        // else `mise upgrade` finds nothing and silently rolls nothing (a shipped-command regression).
+        let mise = PathBuf::from("/nix/store/mise/bin/mise");
+        let bash = PathBuf::from("/nix/store/bash/bin/bash");
+        let tokens = vec!["aqua:example/demo-tool".to_string()];
+        let data_dir = crate::sandbox::binds::mise_app_global_data_dir();
+
+        // global app: pinned to the app-global pool via a bash MISE_DATA_DIR prefix
+        let g = mise_upgrade_cmd(binds::Runtime::GlobalApp("cc"), &mise, &bash, &tokens);
+        assert_eq!(g[0], OsString::from("/nix/store/bash/bin/bash"));
+        let script = g[2].to_string_lossy();
+        assert!(
+            script.contains(&format!(
+                "MISE_DATA_DIR='{data_dir}' exec /nix/store/mise/bin/mise upgrade"
+            )),
+            "the global-app roll must pin the app-global data dir: {script}"
+        );
+        assert_eq!(g[4], OsString::from("aqua:example/demo-tool")); // token positional
+
+        // sbx run / a per-project app: single pool (the ambient primary), plain unwrapped command
+        for rt in [
+            binds::Runtime::ProjectDefault,
+            binds::Runtime::ProjectApp("cc"),
+        ] {
+            let c = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
+            assert_eq!(c[0], OsString::from("/nix/store/mise/bin/mise"));
+            assert_eq!(c[1], OsString::from("upgrade"));
+            assert_eq!(c[2], OsString::from("aqua:example/demo-tool"));
+        }
     }
 
     #[test]

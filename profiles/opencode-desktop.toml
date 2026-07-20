@@ -1,7 +1,7 @@
 # opencode desktop — the Electron GUI of opencode, sandboxed by sbx (with a Wayland display).
 #
 #   sbx app import profiles/opencode-desktop.toml
-#   sbx app opencode-desktop
+#   sbx app run opencode-desktop
 #
 # This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
 # `opencode-web` (the same server in your browser). opencode ships a native desktop app built with

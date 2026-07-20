@@ -1,12 +1,14 @@
 //! Provisioning a project's declared tools.
 //!
 //! A project (or the global config) names tools as `name = "<backend>:<locator>"`. This
-//! module handles the **`nix:`** ones — realising each admitted nixpkgs attribute against
-//! the pinned nixpkgs into sbx's store and reporting the `bin` directories to prepend to
-//! the sandbox `PATH`. The **`mise:`** and **`flake:`** ones are not realised here: they
-//! are equipped in-cage at launch — [`mise_packages`] collects the mise tokens (`mise use
-//! -g`), [`flake_packages`] the `(name, ref)` of the flake packages (`nix build
-//! --out-link`).
+//! module realises the **host-side** backends into sbx's store and reports the `bin`
+//! directories to prepend to the sandbox `PATH`: **`nix:`** (a pinned nixpkgs attribute) and
+//! **`flake:`** (a remote flake ref). Both build once (content-addressed → a second project
+//! is a cache hit) and are seeded per project, so a `flake:` tool no longer rebuilds in each
+//! project. The **`mise:`** ones are not realised here — they are equipped in-cage at launch
+//! by `mise use -g` ([`mise_packages`] collects the tokens); an inline `[flakes.<name>]` is
+//! built in-cage too (local content). [`flake_packages`] still names the remote `(name, ref)`
+//! flake packages for `sbx upgrade flake`'s pin resolution.
 //!
 //! Admission is a security decision for every backend: provisioning a tool can fetch or
 //! build, so an untrusted project's packages are withheld until the project is trusted.
@@ -88,24 +90,47 @@ pub(crate) fn provision(
 
     let id = super::binds::project_runtime_id(project)?;
     let gcroots = layout.data_dir().join("gcroots").join("projects").join(&id);
+    // A `flake:` package builds host-side into the shared store like a `nix:` one (built once,
+    // content-addressed → a second project is a cache hit; seeded per project). The pin selects the
+    // immutable build target — the locked ref when `flake-packages.lock` pins it, else the declared
+    // ref (which floats, frozen warm until `sbx upgrade flake`, like a floating `mise:` tool).
+    let flake_pins = super::flake::pins(layout, &id);
 
     let mut bins = Vec::with_capacity(admitted.len());
     let mut roots = Vec::with_capacity(admitted.len());
     for p in admitted {
-        // A `mise:` package is equipped in-cage by `mise use -g` at launch, not host-side;
-        // only the `nix:` ones are realised here.
-        let Backend::Nix(attr) = &p.backend else {
-            continue;
+        // A declared tool is a requirement: surface a realisation failure naming the package,
+        // never drop it silently.
+        let logical = match &p.backend {
+            // A `nix:` package: a pinned nixpkgs attribute, built host-side into the shared store.
+            Backend::Nix(attr) => {
+                store::provision(nix, layout, &gcroots.join(&p.name), nixpkgs, attr, BIN).map_err(
+                    |e| {
+                        io::Error::other(format!(
+                            "cannot provision package `{}` ({attr}): {e}",
+                            p.name
+                        ))
+                    },
+                )?
+            }
+            // A `flake:` package: build its (possibly pinned) target host-side, same store/seed path.
+            Backend::Flake(reference) => {
+                let target = flake_pins
+                    .get(reference)
+                    .map(|pin| pin.locked_ref.clone())
+                    .unwrap_or_else(|| reference.clone());
+                store::provision_flake(nix, layout, &gcroots.join(&p.name), &target, &p.name, BIN)
+                    .map_err(|e| {
+                    io::Error::other(format!(
+                        "cannot provision flake package `{}` ({reference}): {e}",
+                        p.name
+                    ))
+                })?
+            }
+            // `mise:` is equipped in-cage by `mise use -g`; an inline `[flakes.<name>]` is built
+            // in-cage (local content); the prebuilt trio is provisioned by their own modules.
+            _ => continue,
         };
-        // A declared tool is a requirement: surface a realisation failure naming the
-        // package and attribute, never drop it silently.
-        let logical = store::provision(nix, layout, &gcroots.join(&p.name), nixpkgs, attr, BIN)
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "cannot provision package `{}` ({attr}): {e}",
-                    p.name
-                ))
-            })?;
         bins.push(logical.join(BIN));
         roots.push(logical);
     }
@@ -140,12 +165,12 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
         .collect()
 }
 
-/// The `(name, ref)` of the *admitted* `flake:` packages — the ones the launcher builds
-/// in-cage with `nix build --out-link`. Trusted-only, like the host-side `nix:` path and the
-/// global `mise:` one: an untrusted project's `flake:` package is dropped here (its
-/// withholding is warned once by [`provision`]'s admission, so this stays a quiet pure
-/// filter). The name keys the per-package out-link under the home; the ref is the flake
-/// reference passed to nix positionally.
+/// The `(name, ref)` of the *admitted* remote `flake:` packages — the trusted references
+/// `sbx upgrade flake` re-resolves and pins (see [`super::flake`]). Trusted-only, like the host-side
+/// `nix:` path and the global `mise:` one: an untrusted project's `flake:` package is dropped here
+/// (its withholding is warned once by [`provision`]'s admission, so this stays a quiet pure filter).
+/// The name is the package name; the ref is the flake reference. The build itself is host-side (see
+/// [`provision`]), keyed by name under `<data>/gcroots/projects/<id>/`.
 pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
     packages
         .iter()
@@ -166,12 +191,12 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
 }
 
 /// The data-dir gcroot names of every **declared** host-provisioned `[packages]` backend — the
-/// backends that write a `<data>/gcroots/projects/<id>/<name>` out-link: `nix:` (bare `<name>`) and
-/// the prebuilt trio `deb:`/`appimage:`/`tarball:` (each direct **and** `:resolve` form, keyed
-/// `deb-`/`appimage-`/`tarball-<name>`). `mise:` (equipped in-cage) and `flake:` (rooted inside the
-/// project store as `sbx-flake-<name>`) write nothing here and are excluded. This is the keep-set
-/// `sbx gc` reconciles those out-links against so a *removed* package's leaked out-link — and, with
-/// it, its per-project store copy — is reclaimed.
+/// backends that write a `<data>/gcroots/projects/<id>/<name>` out-link: `nix:` and a remote `flake:`
+/// (both bare `<name>`) and the prebuilt trio `deb:`/`appimage:`/`tarball:` (each direct **and**
+/// `:resolve` form, keyed `deb-`/`appimage-`/`tarball-<name>`). `mise:` (equipped in-cage) and an
+/// inline `[flakes.<name>]` (rooted inside the project store as `sbx-flake-<name>`) write nothing here
+/// and are excluded. This is the keep-set `sbx gc` reconciles those out-links against so a *removed*
+/// package's leaked out-link — and, with it, its per-project store copy — is reclaimed.
 ///
 /// Deliberately **declared-not-trusted**, unlike the trusted-only provisioning filters
 /// ([`deb_packages`] and friends): a package the user still declares but whose project trust has
@@ -185,7 +210,8 @@ pub(crate) fn project_gcroot_names(packages: &[Package]) -> Vec<String> {
     packages
         .iter()
         .filter_map(|p| match &p.backend {
-            Backend::Nix(_) => Some(p.name.clone()),
+            // `nix:` and a remote `flake:` are both built host-side under a bare `<name>` out-link.
+            Backend::Nix(_) | Backend::Flake(_) => Some(p.name.clone()),
             Backend::Deb(_) | Backend::DebResolve { .. } => Some(format!("deb-{}", p.name)),
             Backend::AppImage(_) | Backend::AppImageResolve { .. } => {
                 Some(format!("appimage-{}", p.name))
@@ -193,7 +219,9 @@ pub(crate) fn project_gcroot_names(packages: &[Package]) -> Vec<String> {
             Backend::Tarball(_) | Backend::TarballResolve { .. } => {
                 Some(format!("tarball-{}", p.name))
             }
-            Backend::Mise(_) | Backend::Flake(_) | Backend::FlakeInline { .. } => None,
+            // `mise:` is equipped in-cage; an inline `[flakes.<name>]` roots in the project store as
+            // `sbx-flake-<name>` — neither writes a data-dir out-link here.
+            Backend::Mise(_) | Backend::FlakeInline { .. } => None,
         })
         .collect()
 }

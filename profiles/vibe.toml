@@ -1,7 +1,7 @@
 # Mistral Vibe — Mistral's minimal open-source coding agent (CLI), sandboxed by sbx.
 #
 #   sbx app import profiles/vibe.toml
-#   sbx app vibe
+#   sbx app run vibe
 #
 # Vibe (github.com/mistralai/mistral-vibe) is a Python coding agent published to PyPI as the
 # `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). sbx equips it via

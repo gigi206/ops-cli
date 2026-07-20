@@ -64,7 +64,8 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
   app's home), fetching the latest upstream version. The fetch rides the app's
   [egress allowlist](../networking/modes.md); `network = "none"` skips a home.
 - **`flake:`** — re-pins each declared flake ref (`nix flake metadata`) and rewrites
-  `flake-packages.lock`; a re-pin builds the newly-locked ref at the next launch.
+  `flake-packages.lock`; a re-pin builds the newly-locked ref **host-side** at the next launch
+  (like `nix:`/`deb:`), re-pointing the package's name-keyed out-link at the new build.
 - **`deb:`** — re-resolves each declared source to its current `.deb` URL and content hash
   (`nix store prefetch-file`, following a `…/releases/latest/…` redirect; re-querying a `github:`
   release or an `apt:` index for the `github:`/`apt:` forms) and rewrites `deb-packages.lock`; a
@@ -148,8 +149,8 @@ sbx upgrade mise         # the mise engine + this project's mise-managed tools
 sbx upgrade flake        # re-pin flake: packages
 ```
 
-After a `flake:` upgrade, run [`sbx gc`](gc.md) to reclaim the superseded rev-keyed
-out-links.
+After a `flake:` upgrade, run [`sbx gc`](gc.md) to reclaim the build the roll superseded
+(the old build its name-keyed out-link no longer points at).
 
 ## Reclaiming superseded builds
 

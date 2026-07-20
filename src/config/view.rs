@@ -786,7 +786,7 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
     let realised = match p.backend {
         Backend::Nix(_) => "host-side, durable",
         Backend::Mise(_) => "in-cage via mise, fetched at launch",
-        Backend::Flake(_) => "in-cage via nix build, fetched at launch",
+        Backend::Flake(_) => "host-side via nix build, durable",
         Backend::FlakeInline { .. } => "in-cage via nix build (inline flake)",
         Backend::Deb(_) => "host-side from prebuilt .deb, durable",
         Backend::AppImage(_) => "host-side from prebuilt AppImage, durable",

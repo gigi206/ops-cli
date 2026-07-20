@@ -1,7 +1,7 @@
 # Antigravity CLI (agy) — Google's terminal coding agent, sandboxed by sbx.
 #
 #   sbx app import profiles/agy.toml
-#   sbx app agy
+#   sbx app run agy
 #
 # `agy` is a genuine terminal TUI (distinct from the Antigravity *IDE*, a GUI desktop
 # app), shipped as a self-contained native Linux binary — so it needs no display and
@@ -18,7 +18,7 @@
 # inside the cage; the CLI's SSH/headless mode prints an authorization URL to open in your
 # own browser, so no in-cage browser (and no Wayland display) is needed:
 #
-#   sbx app agy        # then complete the printed Google Sign-In URL in your browser
+#   sbx app run agy        # then complete the printed Google Sign-In URL in your browser
 #
 # There is no separate `login` subcommand — the OAuth flow triggers on first real use. The
 # credential then persists in the app's dedicated, persistent, isolated home, so it survives

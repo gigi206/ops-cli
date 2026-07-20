@@ -1,7 +1,7 @@
 # Claude Desktop — Anthropic's official desktop app (Chat + Cowork + Code), sandboxed by sbx.
 #
 #   sbx app import profiles/claude-desktop.toml
-#   sbx app claude-desktop
+#   sbx app run claude-desktop
 #
 # This is the GRAPHICAL app whose **Code** tab runs the same Claude Code engine as the
 # `claude-code` CLI profile (its terminal sibling), plus the Chat and Cowork tabs, parallel

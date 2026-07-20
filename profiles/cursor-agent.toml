@@ -1,8 +1,8 @@
 # Cursor CLI — Cursor's headless terminal coding agent (`cursor-agent`), sandboxed by sbx.
 #
 #   sbx app import profiles/cursor-agent.toml
-#   sbx app cursor-agent -- -p "your task here"        # headless: prompt in, result out
-#   sbx app cursor-agent                               # interactive TUI
+#   sbx app run cursor-agent -- -p "your task here"        # headless: prompt in, result out
+#   sbx app run cursor-agent                               # interactive TUI
 #
 # This is the Cursor **CLI** (`cursor-agent`, a.k.a. `agent`), NOT the Cursor desktop editor
 # (that Electron app is packaged from Cursor's `.deb` — see `profiles/cursor.toml`). The CLI runs the same
@@ -32,7 +32,7 @@
 #
 #   1. API KEY (recommended for the cage) — generate one at cursor.com/dashboard/api, then inject it
 #      for a single caged launch WITHOUT baking it into this file:
-#          sbx app cursor-agent --env CURSOR_API_KEY=… -- -p "your task"
+#          sbx app run cursor-agent --env CURSOR_API_KEY=… -- -p "your task"
 #      (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage
 #      env for that launch only, so the key never lands in the committed profile. `$SBX_ENV_CURSOR_API_KEY`
 #      works too. The CLI also accepts a `--api-key` flag.) Do NOT put `CURSOR_API_KEY` in `[env]`
@@ -87,7 +87,7 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 exec cursor-agent "$@"
 ''',
-    # `$0` placeholder: `sbx app cursor-agent -- <args>` appends <args> to this cmd array, so they
+    # `$0` placeholder: `sbx app run cursor-agent -- <args>` appends <args> to this cmd array, so they
     # arrive as `$1 $2 …` (this element fills `$0`) and reach the agent verbatim via `exec … "$@"`.
     "cursor-agent",
 ]

@@ -1,7 +1,7 @@
 # Auggie — Augment Code's terminal coding agent (augmentcode.com), sandboxed by sbx.
 #
 #   sbx app import profiles/auggie.toml
-#   sbx app auggie
+#   sbx app run auggie
 #
 # Auggie ships as an npm package (`@augmentcode/auggie`), a genuine terminal CLI that
 # runs anywhere Node.js runs — so sbx equips it in-cage with a node runtime (Node 20+
@@ -22,7 +22,7 @@
 #      On the HOST, once:  auggie login   (opens your browser, one-time)
 #                          auggie token print   → a session JSON {accessToken, tenantURL, scopes}
 #      Then inject it for a single caged launch WITHOUT baking it into this file:
-#          sbx app auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"
+#          sbx app run auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"
 #      (`--env` is an authoritative one-shot override read on the host; the value reaches the
 #      cage env for that launch only, so the secret never lands in the committed profile. You
 #      can also pass it as $SBX_ENV_AUGMENT_SESSION_AUTH.) Auggie also accepts the pair

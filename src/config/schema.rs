@@ -26,15 +26,17 @@ pub(crate) struct RawConfig {
     /// carries a mandatory backend prefix (parsed downstream, not here): `nix:<attribute>`
     /// for a nixpkgs attribute provisioned host-side (e.g. `nix:nodejs_20`), `mise:<token>`
     /// for a mise backend equipped in-cage (e.g. `mise:aqua:example/demo-tool`), or `flake:<ref>`
-    /// for a flake output built in-cage (e.g. `flake:github:owner/repo#attr`).
+    /// for a flake output built host-side into the shared store like `nix:` (e.g.
+    /// `flake:github:owner/repo#attr`).
     /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, String>,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
     /// written directly in the config (the `flake` field, a multiline string) plus an optional
     /// output `attr` (default `"default"`); sbx stages it, binds it read-only into the cage, and
-    /// builds `path:<dir>#<attr>` **in-cage** exactly like a `flake:` package, folding it into the
-    /// same tool set (the name is the merge key and the on-disk root name). A security field like
+    /// builds `path:<dir>#<attr>` **in-cage** — local content cannot be built host-side, unlike a
+    /// remote `flake:` ref — folding it into the same tool set (the name is the merge key and the
+    /// on-disk root name). A security field like
     /// `packages` — arbitrary nix build source, honored only from a trusted source. Distinct from
     /// `[packages]` so a bulky multiline flake reads clearly and never trips the TOML rule that
     /// forbids adding scalar keys to a table after one of its subtables is opened.
@@ -418,9 +420,10 @@ impl RawCmd {
 }
 
 /// An inline nix flake declared as a `[flakes.<name>]` table: the full `flake.nix` source plus
-/// an optional output attribute. Unlike a `flake:<ref>` package (a reference to an external
-/// flake), the flake source lives directly in the config — sbx stages it to a directory, binds it
-/// read-only into the cage, and builds `path:<dir>#<attr>` in-cage. The flake floats: it has no
+/// an optional output attribute. Unlike a `flake:<ref>` package (a reference to an external flake,
+/// built host-side), the flake source lives directly in the config — sbx stages it to a directory,
+/// binds it read-only into the cage, and builds `path:<dir>#<attr>` in-cage (local content cannot
+/// be built host-side). The flake floats: it has no
 /// persisted lock and no `sbx upgrade` path, so pin the inputs inside the `flake.nix` itself
 /// (e.g. `nixpkgs.url = "github:NixOS/nixpkgs/<rev>"`) for a reproducible build.
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 # Hermes — NousResearch's open-source agentic CLI (Hermes), sandboxed by sbx.
 #
 #   sbx app import profiles/hermes.toml
-#   sbx app hermes
+#   sbx app run hermes
 #
 # Hermes ships as a nix flake, and sbx equips it via the flake's `#default` output —
 # `flake:github:NousResearch/hermes-agent#default` in [packages] — so `sbx upgrade flake` rolls it

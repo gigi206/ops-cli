@@ -1,7 +1,7 @@
 # Kilo Code (kilo) — a terminal AI coding agent (an opencode fork), sandboxed by sbx.
 #
 #   sbx app import profiles/kilocode.toml
-#   sbx app kilocode
+#   sbx app run kilocode
 #
 # The tool is equipped fresh from upstream: mise's `github` backend pulls Kilo Code's
 # standalone release binary (`kilo-linux-x64.tar.gz`) — verified by GitHub artifact

@@ -66,13 +66,21 @@ pub(crate) fn concrete_versions(tool: &InstalledTool) -> Vec<String> {
     }
 }
 
-/// The mise tools realized under `home` — reads `<home>/.local/share/mise/installs/<tool>/<ver>/`,
-/// skipping mise's own `.mise-installs.toml` metadata file (filtered out by the directory check) and
-/// any non-directory entry. Sorted by name; empty when the home carries no mise data. Read-only.
+/// The mise tools realized under a home — reads `<home>/.local/share/mise/installs/<tool>/<ver>/`.
+/// A thin wrapper over [`mise_installed_in`] for the home layout (mise's data dir is `.local/share/mise`
+/// under the home); a global app's per-project pool reads its `installs/` directly instead.
 pub(crate) fn mise_installed(home: &Path) -> Vec<InstalledTool> {
-    let installs = home.join(".local/share/mise/installs");
+    mise_installed_in(&home.join(".local/share/mise/installs"))
+}
+
+/// The mise tools realized directly under a mise `installs/` dir — `<installs>/<tool>/<ver>/`,
+/// skipping mise's own `.mise-installs.toml` metadata file (filtered out by the directory check) and
+/// any non-directory entry. Sorted by name; empty when the dir carries no mise data. Read-only. Used
+/// for a home's mise dir (via [`mise_installed`]) and for a global app's per-project pool, whose
+/// `installs/` sits directly under the pool dir (the pool *is* mise's data dir).
+pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
     let mut tools = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&installs) else {
+    let Ok(entries) = std::fs::read_dir(installs) else {
         return tools;
     };
     for entry in entries.flatten() {
@@ -163,6 +171,43 @@ pub(crate) fn app_home_dirs(data_dir: &Path, name: &str) -> Vec<AppHome> {
         homes.extend(per_project);
     }
     homes
+}
+
+/// A global app's per-project mise pool on disk — `<data>/projects/<id>/apps/<name>/mise`, where a
+/// global app's `nix:`-via-mise self-equips and project `.mise.toml` tools install, kept aligned with
+/// each project's `/nix` store. The pool dir *is* mise's data dir, so its tools live directly under
+/// `<dir>/installs/` (unlike a home, whose mise data is under `.local/share/mise`). Only a
+/// `home_scope = "global"` app has these — a per-project app roots its mise data under its per-project
+/// home instead, and so has none.
+pub(crate) struct AppMisePool {
+    /// The project tree id the pool belongs to.
+    pub(crate) project_id: String,
+    /// The pool directory `<data>/projects/<id>/apps/<name>/mise` — mise's data dir, `installs/` under it.
+    pub(crate) dir: PathBuf,
+}
+
+/// The per-project mise pools app `name` has on disk — one per project tree carrying a
+/// `projects/<id>/apps/<name>/mise` dir (a global app that self-equipped in that project). Sorted by
+/// project id. Read-only; a project without the dir contributes nothing.
+pub(crate) fn app_per_project_mise_pools(data_dir: &Path, name: &str) -> Vec<AppMisePool> {
+    let mut pools = Vec::new();
+    let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) else {
+        return pools;
+    };
+    for p in projects.flatten() {
+        if !p.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let dir = p.path().join("apps").join(name).join("mise");
+        if dir.is_dir() {
+            pools.push(AppMisePool {
+                project_id: p.file_name().to_string_lossy().into_owned(),
+                dir,
+            });
+        }
+    }
+    pools.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+    pools
 }
 
 /// Which project trees pin `locator` in `lockfile` — the realized-where signal for a `deb:`,
@@ -449,6 +494,45 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         assert!(mise_installed(&tmp).is_empty());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn app_per_project_mise_pools_reads_a_global_apps_pools_directly() {
+        // A global app's per-project pool is `projects/<id>/apps/<name>/mise` — the pool dir *is*
+        // mise's data dir, so its tools live directly under `<pool>/installs/` (not `.local/share/mise`,
+        // the home layout `mise_installed` assumes). Pin that the enumeration finds only projects with a
+        // pool and that `mise_installed_in` reads the pool's `installs/` at the right depth.
+        let data = std::env::temp_dir().join(format!("sbx-inspect-pools-{}", std::process::id()));
+        std::fs::remove_dir_all(&data).ok();
+        // two projects each with a per-project pool holding one self-equipped tool
+        for id in ["p1", "p2"] {
+            let installs = data.join(format!("projects/{id}/apps/ag/mise/installs"));
+            std::fs::create_dir_all(installs.join("nix-jq/1.8.1")).unwrap();
+            std::fs::write(
+                installs.join("nix-jq/.mise.backend.toml"),
+                "short = \"nix:jq\"\n",
+            )
+            .unwrap();
+        }
+        // a project where this app has only a home (a per-project app, or no self-equip) — no pool
+        std::fs::create_dir_all(data.join("projects/p3/apps/ag/home")).unwrap();
+
+        let pools = app_per_project_mise_pools(&data, "ag");
+        assert_eq!(
+            pools
+                .iter()
+                .map(|p| p.project_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p1", "p2"],
+            "only projects with a mise pool, sorted by id (p3 has a home, no pool)"
+        );
+        // the pool's tools read directly from `<pool>/installs`, not `.local/share/mise`
+        let tools = mise_installed_in(&pools[0].dir.join("installs"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].label(), "nix:jq");
+        assert_eq!(concrete_versions(&tools[0]), vec!["1.8.1"]);
+
+        std::fs::remove_dir_all(&data).ok();
     }
 
     #[test]

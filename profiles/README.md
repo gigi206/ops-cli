@@ -5,7 +5,7 @@ profile here is a separate, portable artifact you import deliberately:
 
 ```sh
 sbx app import profiles/claude-code.toml   # a conscious trust act
-sbx app claude-code                        # launch it, sandboxed
+sbx app run claude-code                        # launch it, sandboxed
 ```
 
 A profile is a standalone TOML file shaped as a top-level app (`cmd` plus the
@@ -112,7 +112,7 @@ can only reach the provider you listed.
 > `cmd` runs Cursor's own `curl cursor.com/install | bash` **inside the cage** on first launch (the
 > installer needs `tar`+`gzip`, provisioned as `nix:` packages; the un-patchelf'd binary runs under
 > the cage's `nix-ld` shim). It is an **account** profile — a Cursor account API key (from
-> cursor.com/dashboard/api), injected per launch with `sbx app cursor-agent --env CURSOR_API_KEY=…`
+> cursor.com/dashboard/api), injected per launch with `sbx app run cursor-agent --env CURSOR_API_KEY=…`
 > (never baked in), or the interactive `cursor-agent login`. Egress is a least-privilege allowlist
 > on `*.cursor.sh` (Cursor's own recommended wildcard). **Its unverified set is unusually large** —
 > import + resolve are covered by the shipped-profiles test, but the packaging (bootstrap + nix-ld
@@ -145,7 +145,7 @@ can only reach the provider you listed.
 > — like every profile — the **live equip/run and auth** are still to be proven with a real account.
 > The recommended credential path is headless: on the host `auggie login` then `auggie token print`,
 > and inject the session JSON for one caged launch with
-> `sbx app auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"`. Auggie is a **pure-node** CLI
+> `sbx app run auggie --env AUGMENT_SESSION_AUTH="$(auggie token print)"`. Auggie is a **pure-node** CLI
 > (unlike the native-binary `cline`/`droid`), so it needs the `nix:nodejs` runtime at run time, not
 > only to install.
 >

@@ -1,7 +1,7 @@
 # Cline — the autonomous coding agent's standalone CLI, sandboxed by sbx.
 #
 #   sbx app import profiles/cline.toml
-#   sbx app cline
+#   sbx app run cline
 #
 # Cline ships a genuine terminal CLI on npm (the `cline` package), distributed as a
 # self-contained native binary resolved through platform-specific optional dependencies

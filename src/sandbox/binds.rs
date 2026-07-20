@@ -182,6 +182,11 @@ pub(crate) struct ProjectRuntime {
     pub(crate) home_src: PathBuf,
     /// Directory holding the synthetic `passwd`/`group`, bound read-only.
     pub(crate) etc_dir: PathBuf,
+    /// For a **global app** only: the host path of the per-project mise data pool, bound writable
+    /// as mise's primary [`MISE_PROJECT_INCAGE`] so a `nix:` self-equip's install aligns with the
+    /// per-project `/nix` store. `None` for `sbx run` and a per-project app, whose home — and thus
+    /// mise's data dir — is already per-project, so they keep the single-pool wiring.
+    pub(crate) mise_project_src: Option<PathBuf>,
 }
 
 /// The synthetic sandbox identity. Same uid/gid as the host (the same-uid model),
@@ -200,6 +205,10 @@ struct SandboxPaths<'a> {
     project: &'a Path,
     /// Host sandbox home; bound read-write at [`SANDBOX_HOME`].
     home_src: &'a Path,
+    /// For a global app only: the host per-project mise data pool, bound writable at
+    /// [`MISE_PROJECT_INCAGE`] (mise's primary for the split). `None` keeps the single app-global
+    /// pool ([`mise_env`] then reads its whole install/shim set from the home).
+    mise_project_src: Option<&'a Path>,
     /// Synthetic identity files; bound read-only at `/etc/passwd`/`/etc/group`.
     passwd_src: &'a Path,
     group_src: &'a Path,
@@ -410,6 +419,21 @@ fn assemble(
         },
     ]);
 
+    // Zone 2 — a global app's per-project mise data pool, bound writable. A global app's home
+    // (and its default mise pool) is shared across projects, but mise's *primary* data dir must be
+    // per-project so a `nix:` self-equip's install record aligns with the per-project `/nix` store
+    // rather than trusting a stale app-global record that points at another project's store; the
+    // app-global pool's installs stay reachable as a read-only fallback (see [`mise_env`]). Only a
+    // global app supplies this (`sbx run` and a per-project app already root their home
+    // per-project). Its dest ([`MISE_PROJECT_INCAGE`]) is under `/opt/sbx`, disjoint from every
+    // structural mount and from the config binds/devices/launcher binds.
+    if let Some(src) = paths.mise_project_src {
+        mounts.push(Mount::Bind {
+            src: src.to_path_buf(),
+            dest: PathBuf::from(MISE_PROJECT_INCAGE),
+        });
+    }
+
     // Host device nodes from a trusted `[devices]` grant, bound at their own `/dev/*` paths with
     // device access. Emitted *after* the `Mount::Dev` above (part of the structural block), so each
     // real device layers over the minimal, hostless `/dev` rather than being shadowed by it. A `-try`
@@ -446,6 +470,14 @@ fn assemble(
     // the loader are wired by absolute path, not PATH, so prepending here never weakens
     // them.
     let mut path_dirs = overlay.bin_paths.to_vec();
+    // For a global app, the per-project primary's shims come first (project + `nix:` tools the agent
+    // self-equips), then the app-global pool's shims (the agent's own `mise:` tools reached through
+    // the shared-install fallback). A shim only re-resolves from the ambient `MISE_DATA_DIR` at exec,
+    // so both dirs must be on PATH for the shim *files* to exist; the pool a tool resolves from is
+    // still chosen by the ambient env, not by PATH order.
+    if paths.mise_project_src.is_some() {
+        path_dirs.push(PathBuf::from(format!("{MISE_PROJECT_INCAGE}/shims")));
+    }
     path_dirs.push(PathBuf::from(format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}")));
     path_dirs.extend(userland.bin_paths.iter().cloned());
     // The synthetic `/usr/bin` (only `env` and `xdg-open`, both sbx-owned — no host
@@ -500,7 +532,7 @@ fn assemble(
         ),
         ("LANG".to_string(), "C.UTF-8".to_string()),
     ];
-    env.extend(mise_env());
+    env.extend(mise_env(paths.mise_project_src.is_some()));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
     }
@@ -538,6 +570,7 @@ const STRUCTURAL_DESTS: &[&str] = &[
     CAGE_CA_BUNDLE,
     SHELL_RC_INCAGE,
     super::miseplugin::INCAGE_DIR,
+    MISE_PROJECT_INCAGE,
     super::contract::EGRESS_CONTRACT_INCAGE,
 ];
 
@@ -626,6 +659,30 @@ const MISE_DATA_REL: &str = ".local/share/mise";
 /// a missing PATH entry is simply ignored.
 const MISE_SHIMS_REL: &str = ".local/share/mise/shims";
 
+/// Where a global app's per-project mise data pool is bound writable inside the cage — mise's
+/// *primary* `MISE_DATA_DIR` for a global app. A global app's home (and thus its app-global mise
+/// pool: installs, shims, global config) is shared across every project, but mise's install pool
+/// must be per-project so a `nix:`-via-mise self-equip's install record aligns with the per-project
+/// `/nix` store rather than trusting a stale app-global record that points at another project's
+/// store. The app-global pool's installs stay reachable as a read-only shared fallback
+/// (`MISE_SHARED_INSTALL_DIRS`), preserving cross-project reuse of the agent's own tools. mise
+/// derives its config/state/cache dirs from `$HOME` (XDG), so those stay app-global untouched — only
+/// the data dir (installs, shims, plugins, downloads) moves. Under `/opt/sbx`, disjoint from every
+/// structural mount. Only a global app supplies it; `sbx run` and a per-project app already root
+/// their home — and therefore mise's data dir — per-project, so they keep the single-pool wiring.
+const MISE_PROJECT_INCAGE: &str = "/opt/sbx/mise-project";
+
+/// mise's app-global data dir inside the cage — the sandbox `$HOME`'s mise dir. For a global app,
+/// Lane-1 `mise use -g` of an app `[packages] mise:` tool must run pinned here (not the per-project
+/// primary [`MISE_PROJECT_INCAGE`]) so the tool is installed once and shared across every project,
+/// and so the housekeeping read-path (`sbx app show`/`list`/`gc`, which enumerate the home's mise
+/// installs) sees it. For `sbx run`/a per-project app this is already mise's ambient primary, so the
+/// pin is a no-op. A fixed cage path (no per-launch data), returned as an owned `String` for the
+/// launch's equip wrap.
+pub(crate) fn mise_app_global_data_dir() -> String {
+    format!("{SANDBOX_HOME}/{MISE_DATA_REL}")
+}
+
 /// Where a `flake:` package's `nix build --out-link` gcroot lives inside the cage,
 /// relative to the sandbox `$HOME`. Each package gets `<this>/<name>`, a symlink into
 /// `/nix` (the per-project store); its `<name>/bin` joins PATH. Under the persistent home,
@@ -645,18 +702,9 @@ pub(crate) fn flake_out_link(name: &str) -> PathBuf {
     flake_roots_dir().join(name)
 }
 
-/// The rev-keyed in-cage out-link for the `flake:` package `name` pinned to `rev` — distinct
-/// from the floating [`flake_out_link`], so re-pinning to a new revision builds a fresh path the
-/// warm short-circuit cannot mistake for the old one (a lock change rebuilds without any home
-/// being enumerated). `name` is a validated package name and `rev` is 40-hex, so neither escapes
-/// [`flake_roots_dir`].
-pub(crate) fn flake_out_link_rev(name: &str, rev: &str) -> PathBuf {
-    flake_roots_dir().join(format!("{name}-{rev}"))
-}
-
 /// The content-hash-keyed in-cage out-link for the inline flake `name` whose source hashes to
-/// `hash` — the analogue of [`flake_out_link_rev`] for an inline `[flakes.<name>]`, which has no
-/// revision to key by. Editing the flake changes the hash, so the out-link path is absent and the
+/// `hash` — an inline `[flakes.<name>]` has no revision to key by, so its source content hash
+/// distinguishes builds. Editing the flake changes the hash, so the out-link path is absent and the
 /// warm short-circuit rebuilds (the stale build is left unrooted, so `sbx gc` reclaims it). `name`
 /// is a validated package name and `hash` is hex, so neither escapes [`flake_roots_dir`].
 ///
@@ -703,8 +751,17 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 /// The structural environment that turns the cage's mise into a working
 /// self-equip front-end. Lowest precedence (a trusted config may still override
 /// it, which only harms that project's own in-cage builds):
-/// - `MISE_DATA_DIR` anchors mise under the writable home, where sbx has placed
-///   the `nix:` backend plugin registration;
+/// - `MISE_DATA_DIR` anchors mise's install/shim/plugin pool, where sbx has placed
+///   the `nix:` backend plugin registration. It is the app-global home's mise dir
+///   for `sbx run` and a per-project app (whose home is already per-project), but the
+///   dedicated per-project pool ([`MISE_PROJECT_INCAGE`]) for a **global app**, whose
+///   home — and therefore whose default mise dir — is shared across every project;
+/// - `MISE_SHARED_INSTALL_DIRS` (global app only) points mise at the app-global pool's
+///   installs as a **read-only fallback**, searched only when the per-project primary
+///   lacks a tool. This preserves cross-project reuse of the agent's own tools after the
+///   primary moves per-project. mise derives its config/state/cache dirs from `$HOME`
+///   (XDG), so a global app's activation records and caches stay app-global untouched —
+///   only the data dir moves;
 /// - `MISE_EXPERIMENTAL` enables mise's custom backends, the gate on `nix:`;
 /// - `MISE_YES` auto-confirms prompts so a non-interactive `mise install` never
 ///   blocks;
@@ -715,13 +772,24 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 ///   seccomp filter denies the mount/namespace syscalls nix's *inner* build
 ///   sandbox would use, so an in-cage build must run without it (the cage is the
 ///   boundary, not nix's inner sandbox); setting it here makes that deterministic
-///   rather than relying on nix's silent fallback. These keys are on the
-///   untrusted-only env denylist, so only sbx sets them.
-fn mise_env() -> Vec<(String, String)> {
-    vec![
+///   rather than relying on nix's silent fallback. The `NIX_CONFIG` key is on the
+///   untrusted-only env denylist. `MISE_DATA_DIR`/`MISE_SHARED_INSTALL_DIRS` are data
+///   paths (not code-load paths like `NIX_LD`), so — like `MISE_EXPERIMENTAL`/`MISE_YES`
+///   — they are not denylisted: an untrusted `[env]` override only mispoints the
+///   project's own cage's mise (self-sabotage), never a loader/`AT_SECURE` escape.
+///
+/// `per_project_primary` selects the split: `true` for a global app (primary moves
+/// per-project, app-global installs become the read-only fallback), `false` otherwise
+/// (single app-global-home pool, the historical wiring).
+fn mise_env(per_project_primary: bool) -> Vec<(String, String)> {
+    let mut env = vec![
         (
             "MISE_DATA_DIR".to_string(),
-            format!("{SANDBOX_HOME}/{MISE_DATA_REL}"),
+            if per_project_primary {
+                MISE_PROJECT_INCAGE.to_string()
+            } else {
+                format!("{SANDBOX_HOME}/{MISE_DATA_REL}")
+            },
         ),
         ("MISE_EXPERIMENTAL".to_string(), "1".to_string()),
         ("MISE_YES".to_string(), "1".to_string()),
@@ -732,7 +800,14 @@ fn mise_env() -> Vec<(String, String)> {
              filter-syscalls = false"
                 .to_string(),
         ),
-    ]
+    ];
+    if per_project_primary {
+        env.push((
+            "MISE_SHARED_INSTALL_DIRS".to_string(),
+            format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs"),
+        ));
+    }
+    env
 }
 
 /// Where sbx's CA bundle appears in the cage. The cacert tree is bound at `/etc/ssl`
@@ -852,17 +927,27 @@ pub(crate) enum Runtime<'a> {
 /// directory.
 fn project_runtime(data_dir: &Path, project: &Path, runtime: Runtime) -> ProjectRuntime {
     let project_base = || data_dir.join("projects").join(project_id(project));
-    let base = match runtime {
-        Runtime::ProjectDefault => project_base(),
+    let (base, mise_project_src) = match runtime {
+        Runtime::ProjectDefault => (project_base(), None),
         // A global app's home is project-independent — keyed only by the app name, so the same
-        // identity is reused in every project.
-        Runtime::GlobalApp(name) => data_dir.join("apps").join(name),
-        // A per-project app's home nests under the project, isolating its state per project.
-        Runtime::ProjectApp(name) => project_base().join("apps").join(name),
+        // identity is reused in every project. Its mise data pool, however, is keyed per (project,
+        // app) — `projects/<id>/apps/<name>/mise`, the same base a per-project app roots its home
+        // under, plus `/mise` — so a `nix:` self-equip's install record aligns with the per-project
+        // `/nix` store and never points at another project's store. App-keyed (not project-keyed),
+        // so a tool the agent self-equips in app A stays private to app A, preserving per-app
+        // isolation for mise install records exactly as before the split.
+        Runtime::GlobalApp(name) => (
+            data_dir.join("apps").join(name),
+            Some(project_base().join("apps").join(name).join("mise")),
+        ),
+        // A per-project app's home nests under the project, isolating its state per project — its
+        // mise data dir is therefore already per-project-aligned, so it keeps the single-pool wiring.
+        Runtime::ProjectApp(name) => (project_base().join("apps").join(name), None),
     };
     ProjectRuntime {
         home_src: base.join("home"),
         etc_dir: base.join("etc"),
+        mise_project_src,
     }
 }
 
@@ -1042,8 +1127,24 @@ pub(crate) fn build_spec(
     // shared across projects) and register it for this cage's mise: a symlink in the
     // writable mise data dir pointing at the read-only in-cage plugin. Both run on
     // every launch so an sbx upgrade (a changed embedded tree) re-stages and re-points.
+    //
+    // The registration goes under mise's *primary* data dir, which `MISE_PLUGINS_DIR`
+    // follows. The app-global home's mise dir is always a primary: it is the sole pool for
+    // `sbx run`/a per-project app, and for a global app it is where Lane-1 `mise use -g` of
+    // an app `[packages] mise:` tool runs (pinned there so the tool is shared across projects).
+    // A global app *additionally* has the per-project pool ([`MISE_PROJECT_INCAGE`]) as the
+    // ambient primary for a project `.mise.toml`/`nix:` self-equip, so the plugin is registered
+    // there too (and the pool created owner-only, so the writable bind has an existing source) —
+    // otherwise that mise would find no `nix:` backend and self-equip would break.
     let mise_plugin = super::miseplugin::stage(data_dir)?;
-    super::miseplugin::register(&rt.home_src.join(MISE_DATA_REL).join("plugins"))?;
+    let mut mise_plugin_dirs = vec![rt.home_src.join(MISE_DATA_REL).join("plugins")];
+    if let Some(pool) = &rt.mise_project_src {
+        DirBuilder::new().recursive(true).mode(0o700).create(pool)?;
+        mise_plugin_dirs.push(pool.join("plugins"));
+    }
+    for dir in &mise_plugin_dirs {
+        super::miseplugin::register(dir)?;
+    }
 
     // The cage's readable name: the app name for `sbx app <name>`, else the project's own
     // directory name. Carried on the spec so the scope, hostname, and session listing all
@@ -1076,6 +1177,7 @@ pub(crate) fn build_spec(
     let paths = SandboxPaths {
         project: &project,
         home_src: &rt.home_src,
+        mise_project_src: rt.mise_project_src.as_deref(),
         passwd_src: &passwd,
         group_src: &group,
         mise_plugin_src: &mise_plugin,
@@ -1109,25 +1211,6 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn a_flake_out_link_is_keyed_distinctly_per_revision() {
-        // The load-bearing property of pinning: a re-pin to a new revision must produce a
-        // different out-link path, so the `[ -e "$out/bin" ]` warm short-circuit (which checks
-        // that exact path) cannot mistake the new pin for an already-built old one and skip the
-        // rebuild. Each revision — and the floating (unpinned) form — is its own path.
-        let rev_a = "11707dc2f618dd54ca8739b309ec4fc024de578b";
-        let rev_b = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
-        let a = flake_out_link_rev("flake-tool", rev_a);
-        let b = flake_out_link_rev("flake-tool", rev_b);
-        let floating = flake_out_link("flake-tool");
-        assert_ne!(a, b, "a different revision is a different out-link");
-        assert_ne!(
-            a, floating,
-            "a pinned out-link differs from the floating one"
-        );
-        assert!(a.ends_with(format!("flake-tool-{rev_a}")));
-    }
 
     #[test]
     fn the_shell_rc_sets_a_cage_naming_prompt_before_sourcing_bashrc() {
@@ -1190,6 +1273,7 @@ mod tests {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
+            mise_project_src: None,
             passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
             group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -1436,6 +1520,7 @@ mod tests {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
+            mise_project_src: None,
             passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
             group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -1620,6 +1705,7 @@ mod tests {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
+            mise_project_src: None,
             passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
             group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -1694,6 +1780,7 @@ mod tests {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
+            mise_project_src: None,
             passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
             group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -1990,6 +2077,7 @@ mod tests {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
+            mise_project_src: None,
             passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
             group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
@@ -2140,6 +2228,269 @@ mod tests {
         let file = base.join("file");
         std::fs::write(&file, b"x").unwrap();
         assert!(canonicalize_project(&file).is_err());
+    }
+
+    #[test]
+    fn mise_env_moves_the_primary_and_adds_a_shared_fallback_for_a_global_app() {
+        // A global app splits mise storage: the primary data dir moves to the per-project pool
+        // (installs align with the per-project /nix store) while the app-global home's installs
+        // become a read-only fallback so the agent's own tools are not rebuilt per project. Every
+        // other runtime keeps the single app-global-home pool (the historical wiring).
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+        };
+
+        let single = mise_env(false);
+        assert_eq!(
+            get(&single, "MISE_DATA_DIR"),
+            Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}"))
+        );
+        assert!(
+            get(&single, "MISE_SHARED_INSTALL_DIRS").is_none(),
+            "a single-pool cage has no shared-install fallback"
+        );
+
+        let split = mise_env(true);
+        assert_eq!(
+            get(&split, "MISE_DATA_DIR"),
+            Some(MISE_PROJECT_INCAGE.to_string()),
+            "the split moves mise's primary to the per-project pool"
+        );
+        assert_eq!(
+            get(&split, "MISE_SHARED_INSTALL_DIRS"),
+            Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs")),
+            "the app-global installs are the read-only fallback (preserving agent-tool reuse)"
+        );
+        // The split never sets config/state/cache — mise derives those from $HOME (XDG), so a
+        // global app's activation records and caches stay app-global. sbx must leave them unset.
+        for k in ["MISE_CONFIG_DIR", "MISE_STATE_DIR", "MISE_CACHE_DIR"] {
+            assert!(
+                get(&split, k).is_none(),
+                "{k} must stay mise's $HOME-derived default"
+            );
+        }
+    }
+
+    #[test]
+    fn project_runtime_keys_the_per_project_mise_pool_per_project_and_app() {
+        // The per-project mise pool exists only for a global app (whose home is app-global and thus
+        // misaligned with the per-project /nix store); sbx run and a per-project app keep the single
+        // pool. When present it is app-keyed under the project — projects/<id>/apps/<name>/mise — so
+        // a tool the agent self-equips in app A stays private to app A.
+        let data = Path::new("/data/sbx");
+        let p1 = Path::new("/home/u/proj");
+        let p2 = Path::new("/home/u/other");
+
+        // sbx run and a per-project app: no split.
+        assert!(project_runtime(data, p1, Runtime::ProjectDefault)
+            .mise_project_src
+            .is_none());
+        assert!(project_runtime(data, p1, Runtime::ProjectApp("demo-app"))
+            .mise_project_src
+            .is_none());
+
+        // A global app: the pool sits under projects/<id>/apps/<name>/mise (app-keyed, per-project).
+        let pool = project_runtime(data, p1, Runtime::GlobalApp("demo-app"))
+            .mise_project_src
+            .expect("a global app has a per-project mise pool");
+        let expected = data
+            .join("projects")
+            .join(project_id(p1))
+            .join("apps")
+            .join("demo-app")
+            .join("mise");
+        assert_eq!(pool, expected);
+
+        // Per-project: the same global app in another project gets a distinct pool.
+        let pool_p2 = project_runtime(data, p2, Runtime::GlobalApp("demo-app"))
+            .mise_project_src
+            .unwrap();
+        assert_ne!(pool, pool_p2, "the pool is keyed per project");
+
+        // Per-app: a different global app in the same project gets a distinct pool.
+        let pool_other = project_runtime(data, p1, Runtime::GlobalApp("other-app"))
+            .mise_project_src
+            .unwrap();
+        assert_ne!(pool, pool_other, "the pool is keyed per app (isolated)");
+
+        // The pool nests under the project dir, so `sbx gc`/`projects rm` reclaim it with the tree.
+        assert!(pool.starts_with(data.join("projects").join(project_id(p1))));
+    }
+
+    #[test]
+    fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
+        // For a global app, assemble binds the per-project pool writable at MISE_PROJECT_INCAGE,
+        // sets mise's primary there with the app-global installs as the shared fallback, and puts
+        // BOTH shims dirs on PATH (the shim files must exist; the pool a tool resolves from is the
+        // ambient env's, not PATH order).
+        let pool = Path::new("/data/sbx/projects/abc/apps/demo-app/mise");
+        let paths = SandboxPaths {
+            project: Path::new("/home/u/proj"),
+            home_src: Path::new("/data/sbx/apps/demo-app/home"),
+            mise_project_src: Some(pool),
+            passwd_src: Path::new("/data/sbx/apps/demo-app/etc/passwd"),
+            group_src: Path::new("/data/sbx/apps/demo-app/etc/group"),
+            mise_plugin_src: Path::new("/store/mise-plugin"),
+            shell_rc_src: Path::new("/store/bashrc"),
+            contract_src: Path::new("/store/egress-contract.md"),
+            xdg_open_src: Path::new("/data/sbx/apps/demo-app/etc/xdg-open"),
+            hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),
+            machine_id_src: Path::new("/data/sbx/apps/demo-app/etc/machine-id"),
+        };
+        let env = [("TERM".to_string(), "xterm".to_string())];
+        let overlay = Overlay {
+            env: &env,
+            binds: &[],
+            bin_paths: &[],
+        };
+        let spec = assemble(
+            &paths,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            &[],
+            NetPolicy::Shared,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("valid spec");
+
+        // The pool is bound writable at the fixed cage path.
+        assert!(
+            spec.mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == pool && dest == Path::new(MISE_PROJECT_INCAGE)
+            )),
+            "the per-project mise pool is bound writable at {MISE_PROJECT_INCAGE}"
+        );
+
+        let get = |k: &str| {
+            spec.env
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("MISE_DATA_DIR"), Some(MISE_PROJECT_INCAGE.to_string()));
+        assert_eq!(
+            get("MISE_SHARED_INSTALL_DIRS"),
+            Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs"))
+        );
+
+        // Both shims dirs on PATH, per-project primary before the app-global fallback.
+        let path = get("PATH").expect("PATH set");
+        let per_project = format!("{MISE_PROJECT_INCAGE}/shims");
+        let app_global = format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}");
+        let pp_i = path.split(':').position(|p| p == per_project);
+        let ag_i = path.split(':').position(|p| p == app_global);
+        assert!(pp_i.is_some(), "per-project shims on PATH");
+        assert!(ag_i.is_some(), "app-global shims on PATH");
+        assert!(
+            pp_i < ag_i,
+            "the per-project primary's shims come before the app-global fallback's"
+        );
+    }
+
+    #[test]
+    fn a_single_pool_cage_neither_binds_a_per_project_mise_pool_nor_sets_a_shared_fallback() {
+        // The negative: with no split (sbx run / per-project app), assemble binds no per-project
+        // pool, sets no shared fallback, and leaves exactly the one app-global shims dir on PATH.
+        let spec = assembled(); // its SandboxPaths carries mise_project_src: None
+        assert!(
+            !spec
+                .mounts
+                .iter()
+                .any(|m| m.dest() == Path::new(MISE_PROJECT_INCAGE)),
+            "no per-project mise pool is bound for a single-pool cage"
+        );
+        assert!(
+            !spec
+                .env
+                .iter()
+                .any(|(k, _)| k == "MISE_SHARED_INSTALL_DIRS"),
+            "no shared-install fallback for a single-pool cage"
+        );
+        let path = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(
+            !path
+                .split(':')
+                .any(|p| p == format!("{MISE_PROJECT_INCAGE}/shims")),
+            "a single-pool cage has no per-project shims dir on PATH"
+        );
+    }
+
+    #[test]
+    fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
+        // MISE_PLUGINS_DIR follows the primary MISE_DATA_DIR. A global app has two primaries — the
+        // per-project pool (ambient, for a project `.mise.toml`/`nix:` self-equip) and the app-global
+        // home (Lane-1 `mise use -g`) — so the nix: backend plugin must be registered under BOTH, or
+        // whichever mise lacks it finds no nix: backend and self-equip breaks. On the critical path
+        // of the fix, so proven not assumed.
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        std::fs::write(project.path().join("README"), b"hi").unwrap();
+
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+        };
+        let spec = build_spec(
+            data.path(),
+            project.path(),
+            Runtime::GlobalApp("demo-app"),
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("build spec");
+
+        // The spec binds the pool, so the registration dir is reachable in-cage.
+        assert!(spec
+            .mounts
+            .iter()
+            .any(|m| m.dest() == Path::new(MISE_PROJECT_INCAGE)));
+
+        let id = project_id(&project.path().canonicalize().unwrap());
+        let per_project_link = data
+            .path()
+            .join("projects")
+            .join(&id)
+            .join("apps")
+            .join("demo-app")
+            .join("mise")
+            .join("plugins")
+            .join(crate::sandbox::miseplugin::PLUGIN_NAME);
+        assert_eq!(
+            std::fs::read_link(&per_project_link).unwrap(),
+            Path::new(crate::sandbox::miseplugin::INCAGE_DIR),
+            "the nix: plugin is registered under the per-project primary"
+        );
+        // and ALSO under the app-global home's mise plugins (Lane-1 `mise use -g` runs there).
+        let home_link = data
+            .path()
+            .join("apps")
+            .join("demo-app")
+            .join("home")
+            .join(MISE_DATA_REL)
+            .join("plugins")
+            .join(crate::sandbox::miseplugin::PLUGIN_NAME);
+        assert_eq!(
+            std::fs::read_link(&home_link).unwrap(),
+            Path::new(crate::sandbox::miseplugin::INCAGE_DIR),
+            "the nix: plugin is also registered under the app-global home for a global app"
+        );
     }
 }
 
@@ -3135,6 +3486,94 @@ mod smoke {
             before,
             fingerprint(&shared_paths),
             "the shared store changed under the activation launches"
+        );
+    }
+
+    #[test]
+    fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
+        // The real launch path (build_spec → to_argv → bwrap) must thread the global-app mise
+        // split all the way into the cage: mise's primary at the per-project pool, the app-global
+        // installs as the read-only fallback, and BOTH shims dirs on PATH. A unit test proves the
+        // spec; only a real launch proves the generated argv carries it.
+        let Some((bwrap, nix)) = prerequisites() else {
+            eprintln!("skipping mise-split smoke: need bwrap, userns, and nix");
+            return;
+        };
+        let data = TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let nixpkgs = crate::store::LockTarget::global(&layout, None)
+            .resolve(&nix, &layout)
+            .expect("resolve nixpkgs");
+        let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+        else {
+            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            return;
+        };
+
+        let project = TmpDir::new();
+        std::fs::write(project.path().join("README"), b"hi").unwrap();
+
+        let cmd = vec![
+            userland.shell_bin.clone().into_os_string(),
+            OsString::from("-c"),
+            OsString::from(
+                "printf 'PATH=%s\\nDATA=%s\\nSHARED=%s\\n' \
+                 \"$PATH\" \"$MISE_DATA_DIR\" \"$MISE_SHARED_INSTALL_DIRS\"",
+            ),
+        ];
+        let env = [("TERM".to_string(), "dumb".to_string())];
+        let overlay = Overlay {
+            env: &env,
+            binds: &[],
+            bin_paths: &[],
+        };
+        let nix_mount = NixMount {
+            src: crate::store::physical_path(&layout, Path::new("/nix")),
+            writable: false,
+        };
+        let spec = build_spec(
+            data.path(),
+            project.path(),
+            Runtime::GlobalApp("demo-app"),
+            &userland,
+            &nix_mount,
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            "",
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            cmd,
+        )
+        .expect("build spec");
+
+        let out = Command::new(&bwrap)
+            .args(super::super::argv::to_argv(&spec))
+            .output()
+            .expect("spawn bwrap");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "bwrap failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // both shims dirs are on PATH (the per-project primary's and the app-global fallback's)
+        assert!(
+            stdout.contains(&format!("{MISE_PROJECT_INCAGE}/shims")),
+            "per-project shims dir missing from PATH:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}")),
+            "app-global shims dir missing from PATH:\n{stdout}"
+        );
+        // mise's primary is the per-project pool, with the app-global installs as the fallback
+        assert!(
+            stdout.contains(&format!("DATA={MISE_PROJECT_INCAGE}")),
+            "MISE_DATA_DIR is not the per-project pool:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("SHARED={SANDBOX_HOME}/{MISE_DATA_REL}/installs")),
+            "MISE_SHARED_INSTALL_DIRS is not the app-global installs:\n{stdout}"
         );
     }
 }

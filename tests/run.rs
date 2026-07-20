@@ -4044,6 +4044,265 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
         "a fresh `mise:` package app must equip claude-code via `mise use -g` and run it under its \
          own allowlist (the aqua release fetch riding the built-in allow-set): {log}"
     );
+
+    // The mise-split fold has teeth here: Lane-1 `mise use -g` pins the app package's install to the
+    // app-global home pool — where `sbx app show`/`list`/`gc` read — not the ambient per-project
+    // pool. So claude-code's install must land under the app-global home (`<data>/sbx/apps/cc/home`,
+    // since sbx roots its data dir at `$XDG_DATA_HOME/sbx`). If Lane 1 wrote the per-project pool
+    // (the pre-fold behaviour) this dir would be empty/absent, and the housekeeping read-path would
+    // under-report the tool. Discriminating: this assertion fails if the app-global pin did not take.
+    let app_global_installs = data
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("cc")
+        .join("home")
+        .join(".local/share/mise/installs");
+    let has_install = std::fs::read_dir(&app_global_installs)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        has_install,
+        "Lane-1 `mise use -g` must install the app package into the app-global home pool ({}), \
+         where `sbx app show`/`gc` read it — found empty/absent: {log}",
+        app_global_installs.display()
+    );
+}
+
+/// The installed-tool directories under a mise `installs/` dir, sorted. mise lays out
+/// `installs/<munged-tool>/<version>` and keeps a top-level `.mise-installs.toml` bookkeeping file
+/// beside them, so only the *directories* are tools — the count the two-pool split is measured by,
+/// independent of the munged names. An absent dir yields an empty list (a pool that never installed).
+fn mise_installs_entries(installs: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(installs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Every per-project mise pool a global app has created under `data`, as `(installs_dir, entries)`
+/// pairs. A global app's per-project pool lives at `projects/<id>/apps/<app>/mise` (keyed per
+/// project *and* app), so one launch per project yields one pool; a plain `sbx run` (ProjectDefault)
+/// never creates one, so the set is exactly the app launches. Used to prove a `nix:` self-equip
+/// lands in the launching project's own pool (aligned with that project's `/nix`), not app-global.
+fn per_project_app_mise_installs(data: &Path, app: &str) -> Vec<(PathBuf, Vec<String>)> {
+    let projects = data.join("sbx").join("projects");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+        let installs = entry
+            .path()
+            .join("apps")
+            .join(app)
+            .join("mise")
+            .join("installs");
+        if installs.is_dir() {
+            let entries = mise_installs_entries(&installs);
+            out.push((installs, entries));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn a_global_app_splits_mise_pools_across_two_projects() {
+    // The headline two-project proof of the mise-pool split. A global app (`home_scope` defaults to
+    // global, so its `$HOME` — and mise config — is shared across every project, while its `/nix`
+    // store is per-project) carries two kinds of mise tool:
+    //   * an **agent tool** declared `[packages] mise:` (here `aqua:…/ripgrep`), equipped app-global
+    //     by Lane-1 `mise use -g` so it is installed once and reused everywhere; and
+    //   * a **`nix:` self-equip** the agent performs in-cage (`mise use -g nix:jq`), whose install is
+    //     a pointer into the per-project `/nix` store and so must land in a per-project pool.
+    // Launched in project A then project B (same app, same data dir → same app-global home), the
+    // split must route each to the right pool. The discrimination rests on install *location counts*
+    // (a refetch overwrites in place, so inter-launch equality proves nothing; and under shared net a
+    // missing store path is substitutable, so "jq runs in B" is only corroboration):
+    //   * app-global `installs/` holds exactly 1 tool (rg) — jq is ABSENT from the app-global pool,
+    //     which is the fix itself: were jq shared app-global, B would resolve it from there → A's
+    //     store path → absent in B's `/nix` → the "active but absent" failure this split removes.
+    //   * two per-project pools (one per project), each holding exactly 1 tool (jq) with rg ABSENT —
+    //     rg lives only in the shared app-global pool and is not duplicated into either per-project
+    //     pool, so the agent reuses the one app-global copy rather than re-installing rg per project.
+    // Old (single-pool) behaviour would show (app-global 2, per-project pools 0); the split shows
+    // (app-global 1, two pools of 1). Skips (never fails) without a sandbox or the network.
+    let project_a = TmpDir::new("m2a-proj");
+    let project_b = TmpDir::new("m2b-proj");
+    let data = TmpDir::new("m2-data");
+    let state = TmpDir::new("m2-state");
+    let toml = "[app.ag]\n\
+                cmd = [\"sh\", \"-c\", \"mise use -g nix:jq && jq --version && rg --version\"]\n\
+                [app.ag.packages]\n\
+                rg = \"mise:aqua:BurntSushi/ripgrep\"\n";
+    std::fs::write(project_a.path().join(".sbx.toml"), toml).unwrap();
+    std::fs::write(project_b.path().join(".sbx.toml"), toml).unwrap();
+
+    // capability probe per project (also seeds each project's base store once); skip if the host
+    // cannot sandbox or the network (tools are fetched fresh from upstream) is unreachable.
+    let probe_a = run_in(project_a.path(), data.path(), &["true"]);
+    let probe_b = run_in(project_b.path(), data.path(), &["true"]);
+    if !probe_a.status.success() || !probe_b.status.success() {
+        eprintln!(
+            "skipping mise-split two-project e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe_a.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping mise-split two-project e2e: the network is unreachable");
+        return;
+    }
+
+    // trust both projects so their `[packages]` (a trusted-only field) is honored — otherwise the
+    // app package is withheld and Lane 1 never runs.
+    for project in [project_a.path(), project_b.path()] {
+        let trusted = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
+        assert!(
+            trusted.status.success(),
+            "sbx trust failed: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+    }
+
+    // Launch in project A, then project B. Both must run jq (the `nix:` self-equip) and rg (the
+    // app-global agent tool) — corroboration that the tools resolve; the FS counts below carry the
+    // discrimination.
+    let launch = |project: &Path, label: &str| {
+        let out = sbx_in(project, data.path(), state.path(), &["app", "run", "ag"]);
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("jq-") && stdout.contains("ripgrep"),
+            "the global app must self-equip jq and reuse rg in project {label}: {log}"
+        );
+    };
+    launch(project_a.path(), "A");
+    launch(project_b.path(), "B");
+
+    // app-global pool: exactly the one agent tool (rg), pinned there by Lane-1 `mise use -g`. jq's
+    // absence here is the fix — the `nix:` self-equip did not pollute the shared app-global pool with
+    // a store pointer that only resolves in one project's `/nix`.
+    let app_global_installs = data
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("ag")
+        .join("home")
+        .join(".local/share/mise/installs");
+    let app_global = mise_installs_entries(&app_global_installs);
+    assert!(
+        app_global.len() == 1 && app_global[0].contains("ripgrep"),
+        "app-global pool must hold exactly the agent tool (rg), with the nix: self-equip (jq) \
+         ABSENT — found {app_global:?} at {}",
+        app_global_installs.display()
+    );
+
+    // per-project pools: one per project, each holding exactly the `nix:` self-equip (jq) and NOT rg.
+    // Two pools proves each project installed jq into its own store-aligned pool; each holding a
+    // single tool (not two) proves rg stayed in the shared app-global pool and was not copied
+    // per-project (the agent reuses the one app-global copy).
+    let per_project = per_project_app_mise_installs(data.path(), "ag");
+    assert_eq!(
+        per_project.len(),
+        2,
+        "each project must have its own per-project mise pool for the app (the nix: self-equip's \
+         store-aligned home) — found {per_project:?}"
+    );
+    for (installs, entries) in &per_project {
+        assert!(
+            entries.len() == 1 && entries[0].contains("jq"),
+            "a per-project pool must hold exactly the nix: self-equip (jq), with the app-global \
+             agent tool (rg) staying in the shared app-global pool and ABSENT here — found \
+             {entries:?} at {}",
+            installs.display()
+        );
+    }
+}
+
+#[test]
+fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
+    // Lane 2 of the mise split: a project's own `mise.toml` `[tools]` non-`nix:` tool auto-equips at
+    // launch under the ambient primary — which, for a global app, is the per-project pool (aligned
+    // with the project's `/nix` store), NOT the app-global home. Teeth: `rg`, declared only in the
+    // project's `mise.toml`, must install into `projects/<id>/apps/ag/mise/installs` and be ABSENT
+    // from the app-global home (which holds only the app's own `[packages]` — here none). This is the
+    // Lane-2 landing check §6 folds into Increment 3. Skips (never fails) without a sandbox or network.
+    let project = TmpDir::new("l2-proj");
+    let data = TmpDir::new("l2-data");
+    // a global app (home_scope defaults to global) whose cmd runs the project tool; the tool itself is
+    // declared in the project's mise.toml (Lane 2 — the open self-equip toolchain), not `[packages]`.
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[app.ag]\ncmd = [\"sh\", \"-c\", \"rg --version\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("mise.toml"),
+        "[tools]\n\"aqua:BurntSushi/ripgrep\" = \"latest\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping Lane-2 pool e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping Lane-2 pool e2e: the network is unreachable");
+        return;
+    }
+
+    // Lane-2 auto-equip is open (no trust needed); the inline app is the project's own.
+    let out = app_in(project.path(), data.path(), "ag");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ripgrep"),
+        "the global app must auto-equip the project's mise.toml tool and run it: {log}"
+    );
+
+    // Teeth: rg landed in the per-project pool, aligned with this project's /nix store.
+    let per_project = per_project_app_mise_installs(data.path(), "ag");
+    assert_eq!(
+        per_project.len(),
+        1,
+        "the project's Lane-2 tool must create exactly one per-project pool: {per_project:?}"
+    );
+    let (installs, entries) = &per_project[0];
+    assert!(
+        entries.iter().any(|e| e.contains("ripgrep")),
+        "the project mise.toml tool (rg) must install into the per-project pool — found {entries:?} \
+         at {}",
+        installs.display()
+    );
+
+    // ...and NOT into the app-global home (whose mise data holds only the app's own [packages] — none).
+    let app_global_installs = data
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("ag")
+        .join("home")
+        .join(".local/share/mise/installs");
+    let app_global = mise_installs_entries(&app_global_installs);
+    assert!(
+        !app_global.iter().any(|e| e.contains("ripgrep")),
+        "the project's Lane-2 tool must NOT land in the shared app-global pool — found {app_global:?}"
+    );
 }
 
 /// The path to a mise shim in the single project's default home under `data`, if present.
@@ -4159,114 +4418,186 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
 }
 
 #[test]
-fn a_flake_package_app_builds_in_cage_then_reruns_offline_from_the_warm_out_link() {
-    // The load-bearing proof of the `flake:` backend, in two phases.
-    //
-    // PHASE 1 (cold build under the allowlist): an app declaring its tool as a
-    // `[packages] flake:<ref>` builds the flake **in-cage** with `nix build --out-link` at the
-    // `sbx app` launch — an uncurated third-party flake contained by the cage, not built
-    // host-side like a `nix:` attribute — lands the result on PATH, and runs it under the app's
-    // *own* network allowlist. The ref is a real, pinned flake (`nixpkgs#hello`); `hello` prints
-    // "Hello, world!" through the empty-netns MITM, proving the parse → in-cage build →
-    // out-link-on-PATH → run chain. Honest limitation: this flake's inputs (the nixpkgs tarball
-    // from codeload, the `hello` closure from cache.nixos.org) ride the *built-in* built-in
-    // allow-set, so it does NOT exercise a fetch from a host *outside* that set — the uv2nix/PyPI
-    // friction a real profile like hermes hits is a heavier manual validation, not covered here.
-    //
-    // PHASE 2 (warm + offline reuse): the same project is re-launched with `network = "none"` (the
-    // network cut entirely). With no egress, the build *cannot* re-run — so `hello` printing again
-    // proves the warm/offline short-circuit: the out-link persisted in the app's home and its
-    // closure in the per-project store are reused, no re-fetch. This is the teeth for the property
-    // that justified building `nix build --out-link` (not `nix profile install`): a warm launch is
-    // a no-op that works offline.
-    //
-    // Short tags keep the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or
-    // network.
-    let project = TmpDir::new("flk-proj");
-    let data = TmpDir::new("flk-data");
-    let state = TmpDir::new("flk-state");
-    let flake = "flake:github:NixOS/nixpkgs/9ae611a455b90cf061d8f332b977e387bda8e1ca#hello";
-    let toml = |mode: &str, net: &str| {
-        format!(
-            "[app.fk]\n\
-             cmd = [\"hello\"]\n\
-             [app.fk.packages]\n\
-             hello = \"{flake}\"\n\
-             [app.fk.network]\n\
-             mode = \"{mode}\"\n{net}"
-        )
-    };
-    std::fs::write(
-        project.path().join(".sbx.toml"),
-        toml("deny", "allow = [\"cache.nixos.org\"]\n"),
-    )
-    .unwrap();
+fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
+    // The global-app counterpart of the baseline `mise:` roll: `sbx upgrade mise` must roll a global
+    // app's `[packages] mise:` tool in the APP-GLOBAL pool (where Lane-1 `mise use -g` installs it,
+    // shared across projects), not the ambient per-project primary — the `mise_upgrade_cmd` app-global
+    // pin. Teeth: with no `sbx app run` first, only the upgrade cage can equip rg, and it must appear
+    // in the app-global home, ABSENT from any per-project pool. Skips (never fails) without a sandbox
+    // or the network.
+    let project = TmpDir::new("ugm-proj");
+    let data = TmpDir::new("ugm-data");
+    let state = TmpDir::new("ugm-state");
 
-    // capability probe (untrusted → shared net); also seeds the project store once.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         eprintln!(
-            "skipping `flake:` package app e2e: host cannot sandbox ({})",
+            "skipping global-app mise upgrade e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping `flake:` package app e2e: the network is unreachable");
+        eprintln!("skipping global-app mise upgrade e2e: the network is unreachable");
         return;
     }
 
-    let trust = |project: &Path| {
-        // trust so the app's `[packages] flake:` and its network posture are honored (both
-        // security fields); editing the network mode re-arms the gate, hence trusting per phase.
+    // a global app with an app-global agent tool, declared only now; trusted so the `mise:` package
+    // (a trusted-only field) is admitted.
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[app.ag]\ncmd = [\"true\"]\n[app.ag.packages]\nrg = \"mise:aqua:BurntSushi/ripgrep\"\n",
+    )
+    .unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["upgrade", "mise"],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "sbx upgrade mise must roll the global app's `mise:` package in-cage: {log}"
+    );
+
+    // Teeth: the roll equipped rg into the APP-GLOBAL home (Lane-1 pin), not a per-project pool.
+    let app_global_installs = data
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("ag")
+        .join("home")
+        .join(".local/share/mise/installs");
+    let app_global = mise_installs_entries(&app_global_installs);
+    assert!(
+        app_global.iter().any(|e| e.contains("ripgrep")),
+        "sbx upgrade mise must equip+roll the global app's tool in the APP-GLOBAL pool — found \
+         {app_global:?} at {}: {log}",
+        app_global_installs.display()
+    );
+    // ...and NOT into a per-project pool (the pin keeps a global app's [packages] tool app-global).
+    let per_project = per_project_app_mise_installs(data.path(), "ag");
+    assert!(
+        per_project
+            .iter()
+            .all(|(_, entries)| !entries.iter().any(|e| e.contains("ripgrep"))),
+        "the global app's [packages] tool must stay app-global, not land in a per-project pool: \
+         {per_project:?}"
+    );
+}
+
+#[test]
+fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_reuses_it() {
+    // The load-bearing proof of the `flake:` backend's host-side build: a `flake:` package is now
+    // built HOST-SIDE into the shared store — like a `nix:` attribute, not in-cage into the
+    // per-project store — so it lands ONCE and is seeded into every project (no per-project rebuild).
+    // Two teeth:
+    //   * after a launch, the flake's output is in the SHARED store (`<data>/sbx/store/nix/store/
+    //     …hello…`), which the old in-cage build (into the per-project store only) never touched;
+    //   * a SECOND, fresh project declaring the same flake runs `hello` too, reusing the shared build
+    //     (a content-addressed cache hit — no rebuild).
+    // The ref is rev-pinned in its URL, so nix evaluates it purely (no github round-trip). The build
+    // fetches over the HOST network (host-side, like `nix:`/`deb:`), so it needs no cage allowlist —
+    // which also removes the "a flake whose build self-fetches is blocked under the allowlist" wall.
+    // Short tags keep the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or network.
+    let proj_a = TmpDir::new("flka-proj");
+    let proj_b = TmpDir::new("flkb-proj");
+    let data = TmpDir::new("flk-data");
+    let state = TmpDir::new("flk-state");
+    let flake = "flake:github:NixOS/nixpkgs/9ae611a455b90cf061d8f332b977e387bda8e1ca#hello";
+    let toml = format!("[app.fk]\ncmd = [\"hello\"]\n[app.fk.packages]\nhello = \"{flake}\"\n");
+    std::fs::write(proj_a.path().join(".sbx.toml"), &toml).unwrap();
+    std::fs::write(proj_b.path().join(".sbx.toml"), &toml).unwrap();
+
+    // capability probe (also seeds project A's base store once).
+    let probe = run_in(proj_a.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping host-side `flake:` e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping host-side `flake:` e2e: the network is unreachable");
+        return;
+    }
+
+    let launch = |project: &Path| {
+        // trust so the app's `[packages] flake:` (a trusted-only field) is admitted.
         let t = sbx_in(project, data.path(), state.path(), &["trust", ".sbx.toml"]);
         assert!(
             t.status.success(),
             "sbx trust failed: {}",
             String::from_utf8_lossy(&t.stderr)
         );
-    };
-    let launch = || {
-        sbx_in(
-            project.path(),
-            data.path(),
-            state.path(),
-            &["app", "run", "fk"],
-        )
+        sbx_in(project, data.path(), state.path(), &["app", "run", "fk"])
     };
 
-    // PHASE 1 — cold build under the allowlist.
-    trust(project.path());
-    let cold = launch();
-    let cold_log = format!(
+    // Project A: cold host-side build + run.
+    let a = launch(proj_a.path());
+    let a_log = format!(
         "{}{}",
-        String::from_utf8_lossy(&cold.stderr),
-        String::from_utf8_lossy(&cold.stdout)
+        String::from_utf8_lossy(&a.stderr),
+        String::from_utf8_lossy(&a.stdout)
     );
-    if !cold.status.success() && transient_fetch_failure(&cold_log) {
-        eprintln!("skipping `flake:` package app e2e: transient nix download fault: {cold_log}");
+    if !a.status.success() && transient_fetch_failure(&a_log) {
+        eprintln!("skipping host-side `flake:` e2e: transient nix download fault: {a_log}");
         return;
     }
     assert!(
-        cold.status.success() && String::from_utf8_lossy(&cold.stdout).contains("Hello, world!"),
-        "phase 1: a `flake:` package app must build the flake in-cage with `nix build --out-link` \
-         and run it under its own allowlist: {cold_log}"
+        a.status.success() && String::from_utf8_lossy(&a.stdout).contains("Hello, world!"),
+        "project A: a `flake:` package must build host-side and run `hello`: {a_log}"
     );
 
-    // PHASE 2 — cut the network entirely and re-launch: the warm out-link must run offline.
-    std::fs::write(project.path().join(".sbx.toml"), toml("none", "")).unwrap();
-    trust(project.path());
-    let warm = launch();
-    let warm_log = format!(
+    // Teeth 1: the flake output is in the SHARED store (host-side build), not only a per-project
+    // store — the old in-cage build never wrote the shared store, so its presence proves the swap.
+    let shared_store = data
+        .path()
+        .join("sbx")
+        .join("store")
+        .join("nix")
+        .join("store");
+    let in_shared = std::fs::read_dir(&shared_store)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains("hello"));
+    assert!(
+        in_shared,
+        "the flake output must be in the shared store (host-side build), not only the per-project \
+         store — none found under {}",
+        shared_store.display()
+    );
+
+    // Project B (fresh, different cwd, same data dir): reuses the shared build — `hello` runs there
+    // too, a content-addressed cache hit rather than a rebuild.
+    let b = launch(proj_b.path());
+    let b_log = format!(
         "{}{}",
-        String::from_utf8_lossy(&warm.stderr),
-        String::from_utf8_lossy(&warm.stdout)
+        String::from_utf8_lossy(&b.stderr),
+        String::from_utf8_lossy(&b.stdout)
     );
     assert!(
-        warm.status.success() && String::from_utf8_lossy(&warm.stdout).contains("Hello, world!"),
-        "phase 2: with `network = \"none\"` (no egress) the warm out-link must run `hello` offline \
-         — a re-fetch is impossible, so this proves the short-circuit reuses the prior build: \
-         {warm_log}"
+        b.status.success() && String::from_utf8_lossy(&b.stdout).contains("Hello, world!"),
+        "project B: a fresh project must reuse the shared host-side build and run `hello`: {b_log}"
     );
 }
 
@@ -4394,37 +4725,26 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     );
 }
 
-/// The names under the (single) project default home's flake out-link directory, in `data`.
-/// `sbx run` builds a `flake:` package's out-link here; the name reveals whether the launch chose
-/// the rev-keyed (locked) form or the floating one.
-fn project_flake_out_links(data: &Path) -> Vec<String> {
-    let projects = data.join("sbx").join("projects");
-    let Ok(entries) = std::fs::read_dir(&projects) else {
-        return vec![];
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path().join("home/.local/state/sbx/flake");
-        if let Ok(links) = std::fs::read_dir(&dir) {
-            return links
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-        }
-    }
-    vec![]
+/// The logical store path the host-side data-dir out-link `<data>/sbx/gcroots/projects/<id>/<name>`
+/// points at — the build a `nix:`/remote-`flake:` package was provisioned to (one project per data
+/// dir here). `None` when no such out-link exists.
+fn project_package_out_link_target(data: &Path, name: &str) -> Option<PathBuf> {
+    std::fs::read_dir(data.join("sbx/gcroots/projects"))
+        .ok()?
+        .flatten()
+        .find_map(|e| std::fs::read_link(e.path().join(name)).ok())
 }
 
 #[test]
-fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
-    // The load-bearing proof of the *locked* launch path — the entire launch-side deliverable of
-    // the flake roll-forward. After `sbx upgrade flake` pins a `flake:` package, a launch reads the
-    // per-project lock and builds the *locked* (narHash'd, immutable) reference — not the declared
-    // floating one — into an out-link keyed by the revision, in-cage through the allowlist. Teeth:
-    // (1) `hello` prints "Hello, world!", proving the locked narHash ref builds in-cage through the
-    // empty-netns MITM (the existing flake e2e builds a narHash-*free* ref, so this is the
-    // first proof the narHash form works on the wire); (2) the out-link is the rev-keyed
-    // `hello-<rev>`, not the floating `hello` — so `build()` took the `Some(pin)` branch and chose
-    // the locked ref. Reuses the revision the in-cage flake build e2e already warms. Skips (never
+fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
+    // The host-side locked-launch proof — the pin path, distinct from the floating one the
+    // `..._builds_host_side_into_the_shared_store...` e2e proves. After `sbx upgrade flake` pins a
+    // `flake:` package, a launch reads the per-project lock and builds the *locked* (narHash'd,
+    // immutable) reference host-side into the shared store, rooted like a `nix:` tool. Teeth:
+    // (1) `hello` prints "Hello, world!", proving the locked narHash ref (a different ref string than
+    // the narHash-*free* floating one) builds host-side and runs; (2) the launch wrote the data-dir
+    // out-link `<data>/sbx/gcroots/projects/<id>/hello` pointing at the build — the host-side rooting
+    // (like `nix:`), not the retired in-cage `home/.local/state/sbx/flake/` out-link. Skips (never
     // fails) without sandbox or network.
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     let project = TmpDir::new("lfk-proj");
@@ -4487,7 +4807,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
         "the flake package must pin: {pin_log}"
     );
 
-    // launch: build the *locked* ref into the rev-keyed out-link, in-cage through the allowlist.
+    // launch: build the *locked* (narHash'd) ref host-side, run it.
     let out = sbx_in(
         project.path(),
         data.path(),
@@ -4505,23 +4825,17 @@ fn a_locked_flake_package_builds_the_pinned_ref_into_a_rev_keyed_out_link() {
     }
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("Hello, world!"),
-        "the locked flake ref must build in-cage through the allowlist and run: {log}"
+        "the locked flake ref must build host-side and run: {log}"
     );
 
-    // Teeth: the launch built the rev-keyed out-link (the locked branch), not a floating build of
-    // the branch tip. The name-only `hello` out-link now exists too — but as the "good" pointer PATH
-    // resolves through, promoted to the very build the pin selected (so a later broken pin can fall
-    // back to it), so it points at the rev-keyed build's store path rather than an independent
-    // floating one.
-    let links = project_flake_out_links(data.path());
+    // Teeth: the pinned launch rooted the build in the host-side data-dir out-link (like a `nix:`
+    // tool), pointing at hello's store path — not the retired in-cage out-link.
+    let target = project_package_out_link_target(data.path(), "hello");
     assert!(
-        links.iter().any(|n| n == &format!("hello-{rev}")),
-        "the launch must build the rev-keyed out-link `hello-{rev}` (links: {links:?})"
-    );
-    assert_eq!(
-        project_flake_link_target(data.path(), "hello"),
-        project_flake_link_target(data.path(), &format!("hello-{rev}")),
-        "the good out-link must be promoted to the pinned build, not an independent floating one"
+        target
+            .as_deref()
+            .is_some_and(|p| p.to_string_lossy().contains("hello")),
+        "the pinned launch must root the host-side data-dir out-link for `hello` (got {target:?})"
     );
 }
 
@@ -4533,15 +4847,6 @@ fn project_store_dir(data: &Path) -> Option<PathBuf> {
         .map(|e| e.path().join("store"))
         .find(|p| p.exists())
 }
-/// The logical store path a flake out-link named `link` points at (its build output).
-fn project_flake_link_target(data: &Path, link: &str) -> Option<PathBuf> {
-    std::fs::read_dir(data.join("sbx").join("projects"))
-        .ok()?
-        .flatten()
-        .find_map(|e| {
-            std::fs::read_link(e.path().join("home/.local/state/sbx/flake").join(link)).ok()
-        })
-}
 /// Whether `path` (a logical `/nix/store/<hash>-name`) is physically present in `store_dir`.
 fn in_store(store_dir: &Path, path: &Path) -> bool {
     store_dir
@@ -4551,28 +4856,33 @@ fn in_store(store_dir: &Path, path: &Path) -> bool {
 }
 
 #[test]
-fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
-    // The load-bearing live proof of `sbx gc` (the M5 in-project store slice), in two phases that
-    // pin the one property that matters: a host-side `sbx gc --prune` must KEEP a current `flake:`
-    // build and reclaim one whose package is gone. The build registers a host-resolvable gc root
-    // (keyed by package name, target `/nix/store/<hash>`), the same way mise roots its installs —
-    // without it, the in-cage `--out-link` root targets `/home/sandbox/…`, which dangles host-side,
-    // so a host-side gc would delete the *current* build (the bug phase 1 exists to catch).
-    //   Phase 1: build `hello`, then `sbx gc --prune` with `hello` still declared — the build SURVIVES,
-    //            and a seeded base path survives too (checked before any relaunch).
-    //   Phase 2: remove the package, re-trust, `sbx gc --prune` — its lingering root is pruned and the
-    //            build COLLECTED (deterministic: `hello`'s output is unique to it). A roll reaches the
-    //            same end by overwriting the root, which the `wrap_flake_equip` unit test covers.
+fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
+    // The live proof of `sbx gc` for a host-side `flake:` package, in two phases pinning the one
+    // property that matters: `sbx gc --prune` must KEEP the current build and reclaim the one a roll
+    // superseded. A host-side flake is provisioned like a `nix:` tool — its build lands in the shared
+    // store, is seeded into the per-project store (with a seed root), and is rooted host-side by a
+    // data-dir out-link `<data>/sbx/gcroots/projects/<id>/hello` (not an in-cage `sbx-flake-hello`
+    // root — only an inline `[flakes]` writes one now).
+    //   Phase 1 (KEEP): build `hello`, `sbx gc --prune` with `hello` current — the build SURVIVES, and
+    //            a seeded base (glibc) path survives too.
+    //   Phase 2 (ROLL re-point): change the package's flake ref to a genuinely-distinct target under
+    //            the *same* package name (`#hello` → `#figlet`), relaunch (the `hello` out-link
+    //            re-points to the new build), `sbx gc --prune` — the OLD build is COLLECTED and the NEW
+    //            one KEPT, in one pass, through the same superseded-root reconciliation a `nix:`
+    //            rebuild uses. (A *removed* package's reclamation is covered at the unit level by
+    //            `prune_project_package_roots_keeps_declared_and_multi_output_siblings`.)
     // Skips (never fails) without sandbox or network.
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     let project = TmpDir::new("gc-proj");
     let data = TmpDir::new("gc-data");
     let state = TmpDir::new("gc-state");
-    let flake_cfg = format!(
-        "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#hello\"\n\
-         [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n"
-    );
-    std::fs::write(project.path().join(".sbx.toml"), &flake_cfg).unwrap();
+    let cfg = |attr: &str| {
+        format!(
+            "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#{attr}\"\n\
+             [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n"
+        )
+    };
+    std::fs::write(project.path().join(".sbx.toml"), cfg("hello")).unwrap();
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -4587,54 +4897,55 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
         return;
     }
 
-    let trusted = sbx_in(
-        project.path(),
-        data.path(),
-        state.path(),
-        &["trust", ".sbx.toml"],
-    );
-    assert!(trusted.status.success(), "sbx trust failed");
+    let trust = |proj: &Path| {
+        let t = sbx_in(proj, data.path(), state.path(), &["trust", ".sbx.toml"]);
+        assert!(
+            t.status.success(),
+            "sbx trust failed: {}",
+            String::from_utf8_lossy(&t.stderr)
+        );
+    };
+    trust(project.path());
 
-    // Build the flake package in-cage. Floating is enough — no pin needed.
+    // Build the flake package host-side. Floating is enough — no pin needed.
     let built = sbx_in(
         project.path(),
         data.path(),
         state.path(),
         &["run", "--", "hello"],
     );
+    let built_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stderr),
+        String::from_utf8_lossy(&built.stdout)
+    );
+    if !built.status.success() && transient_fetch_failure(&built_log) {
+        eprintln!("skipping sbx gc e2e: transient nix download fault: {built_log}");
+        return;
+    }
     if !built.status.success() || !String::from_utf8_lossy(&built.stdout).contains("Hello, world!")
     {
-        eprintln!(
-            "skipping sbx gc e2e: the flake build did not complete in-cage: {}{}",
-            String::from_utf8_lossy(&built.stderr),
-            String::from_utf8_lossy(&built.stdout)
-        );
+        eprintln!("skipping sbx gc e2e: the flake build did not complete host-side: {built_log}");
         return;
     }
 
     let store_dir = project_store_dir(data.path()).expect("project store");
-    let built_path =
-        project_flake_link_target(data.path(), "hello").expect("hello out-link target");
+    let hello_path =
+        project_package_out_link_target(data.path(), "hello").expect("hello out-link target");
     assert!(
-        in_store(&store_dir, &built_path),
-        "the flake build is not in the project store before gc: {built_path:?}"
+        in_store(&store_dir, &hello_path),
+        "the flake build is not in the project store before gc: {hello_path:?}"
     );
-    // The build registered a host-resolvable gc root keyed by package name (the fix): a symlink
-    // under the store's gcroots whose target is the build's `/nix/store/<hash>` path.
-    let flake_root = store_dir.join("nix/var/nix/gcroots/sbx-flake-hello");
-    assert_eq!(
-        std::fs::read_link(&flake_root).ok().as_deref(),
-        Some(built_path.as_path()),
-        "the build did not register a host-resolvable gc root at {flake_root:?}"
-    );
-    // A seeded base gc-root (any top-level root that is not auto/ nor the flake root) — both the
-    // phase-1 survival witness and, in phase 2, the path the roll re-points the flake root onto.
-    let base_path = std::fs::read_dir(store_dir.join("nix/var/nix/gcroots"))
+    // A seeded base (glibc) seed root — the survival witness across both phases. A seed root's file
+    // name is the store-path basename, so `-glibc-` locates it.
+    let gcroots = store_dir.join("nix/var/nix/gcroots");
+    let base_name = std::fs::read_dir(&gcroots)
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name() != "auto" && e.file_name() != "sbx-flake-hello")
-        .find_map(|e| std::fs::read_link(e.path()).ok())
-        .expect("a seeded base gc-root");
+        .map(|e| e.file_name())
+        .find(|n| n.to_string_lossy().contains("-glibc-"))
+        .expect("a seeded glibc root");
+    let base_path = std::fs::read_link(gcroots.join(&base_name)).unwrap();
 
     // ---- Phase 1: gc with `hello` still current — the build must SURVIVE. ----
     let gc1 = sbx_in(
@@ -4653,31 +4964,54 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
         "sbx gc --prune (phase 1) failed: {gc1_log}"
     );
     assert!(
-        in_store(&store_dir, &built_path),
+        in_store(&store_dir, &hello_path),
         "the CURRENT flake build was collected by gc — host-side rooting did not hold: \
-         {built_path:?}\n{gc1_log}"
+         {hello_path:?}\n{gc1_log}"
     );
     assert!(
         in_store(&store_dir, &base_path),
         "a seeded base path was collected by gc: {base_path:?}\n{gc1_log}"
     );
 
-    // ---- Phase 2: remove the package, re-trust, gc — its lingering name-keyed root is now stale,
-    // so `prune_flake_roots` drops it and the sweep reclaims the build. This exercises the
-    // removed-package path end-to-end (no manual gcroot mutation); a roll's self-clean is the same
-    // outcome reached by an overwrite, which the `wrap_flake_equip` unit test covers. ----
-    std::fs::write(
-        project.path().join(".sbx.toml"),
-        "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
-    )
-    .unwrap();
-    let retrust = sbx_in(
+    // ---- Phase 2: roll the package's flake ref to a genuinely-distinct target under the same name
+    // (`#hello` → `#figlet`), relaunch (the out-link re-points), then gc: the OLD build is collected
+    // and the NEW one kept, via the same superseded-root reconciliation a `nix:` rebuild uses. ----
+    std::fs::write(project.path().join(".sbx.toml"), cfg("figlet")).unwrap();
+    trust(project.path());
+    // Relaunch: re-provision host-side (target changed → the stamp misses → a rebuild), re-pointing
+    // the `hello` out-link at figlet's build. `true` is enough — provisioning is what re-points, and
+    // the rolled-to package provides `figlet`, not `hello`, so we do not run it by name.
+    let relaunch = sbx_in(
         project.path(),
         data.path(),
         state.path(),
-        &["trust", ".sbx.toml"],
+        &["run", "--", "true"],
     );
-    assert!(retrust.status.success(), "re-trust failed");
+    let relaunch_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&relaunch.stderr),
+        String::from_utf8_lossy(&relaunch.stdout)
+    );
+    if !relaunch.status.success() && transient_fetch_failure(&relaunch_log) {
+        eprintln!("skipping sbx gc e2e: transient nix download fault on the roll: {relaunch_log}");
+        return;
+    }
+    assert!(
+        relaunch.status.success(),
+        "the rolled flake ref must build host-side: {relaunch_log}"
+    );
+
+    let figlet_path =
+        project_package_out_link_target(data.path(), "hello").expect("re-pointed out-link target");
+    assert_ne!(
+        figlet_path, hello_path,
+        "the roll must re-point the `hello` out-link at a genuinely-distinct build (still \
+         {hello_path:?})"
+    );
+    assert!(
+        in_store(&store_dir, &figlet_path),
+        "the rolled-to build is not in the project store: {figlet_path:?}"
+    );
 
     let gc2 = sbx_in(
         project.path(),
@@ -4694,21 +5028,18 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_removed_one() {
         gc2.status.success(),
         "sbx gc --prune (phase 2) failed: {gc2_log}"
     );
-    // the lingering root was pruned, and its build collected by the sweep
+    // The OLD (rolled-away) build is collected; the NEW build and the base survive.
     assert!(
-        !flake_root.exists(),
-        "the removed package's gc root was not pruned: {flake_root:?}\n{gc2_log}"
+        !in_store(&store_dir, &hello_path),
+        "the rolled-away flake build was not collected: {hello_path:?}\n{gc2_log}"
     );
     assert!(
-        !in_store(&store_dir, &built_path),
-        "the removed package's flake build was not collected: {built_path:?}\n{gc2_log}"
+        in_store(&store_dir, &figlet_path),
+        "gc collected the CURRENT (rolled-to) flake build: {figlet_path:?}\n{gc2_log}"
     );
-    // The base still runs end-to-end (it re-seeds first, so this is a convenience check).
-    let base = run_in(project.path(), data.path(), &["sh", "-c", "echo BASE-OK"]);
     assert!(
-        base.status.success() && String::from_utf8_lossy(&base.stdout).contains("BASE-OK"),
-        "the cage no longer runs after gc: {}",
-        String::from_utf8_lossy(&base.stderr)
+        in_store(&store_dir, &base_path),
+        "gc dropped a current base path: {base_path:?}\n{gc2_log}"
     );
 }
 

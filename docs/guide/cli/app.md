@@ -78,8 +78,8 @@ broken out), and each declared package annotated with whether it is **actually i
 | Package | Installed reads |
 |---|---|
 | `mise:` | `installed <version>` (read from the app's home) or `not installed` |
-| `deb:` / `appimage:` / `flake:` | `pinned in N tree(s) (<hash>)` — the build lives in the [per-project store](../concepts/directory-layout.md); see [`sbx projects show`](projects.md) — or `not built` |
-| `nix:` | `built per-project` |
+| `deb:` / `appimage:` / `tarball:` | `pinned in N tree(s) (<hash>)` — the build lives in the [per-project store](../concepts/directory-layout.md); see [`sbx projects show`](projects.md) — or `not built` |
+| `nix:` / `flake:` | `built in N tree(s)` — built host-side into the shared store, seeded per project; or `not built` |
 
 A package a launch would not provision because an untrusted layer declared it reads
 `withheld` (distinct from `not installed`, so it is not mistaken for a failed provision).
@@ -89,6 +89,14 @@ removed profile, or a dependency a `mise:` backend pulled in — they are listed
 `installed (undeclared)`, named by their real backend token (its provider, e.g.
 `pipx:hermes-agent`, recovered from mise's metadata rather than the munged directory name), so
 the report shows everything that is actually installed, not only what the profile names.
+
+For a `"global"`-scope app, the report also surfaces its **per-project mise pools** — where
+the agent's `nix:`-via-mise self-equips and the project's own `mise.toml` tools install,
+aligned with each project's `/nix` store (see
+[Two mise pools](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned)). Each
+pool appears in the `disk` breakdown as `project <id> (mise pool)`, and its tools are listed
+per project under `per-project self-equips` — kept distinct from the app-global declared tools,
+since they are transient per-project state, re-resolved when a project's store lacks them.
 
 Read-only: no trust gate, no launch, no network. `--json` emits the same model for scripting.
 

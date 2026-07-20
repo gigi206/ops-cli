@@ -1,17 +1,20 @@
 //! In-project store garbage collection.
 //!
 //! A project's own writable store (`<data>/projects/<id>/store`) grows as the agent
-//! self-equips: every `flake:` build, every in-cage `mise`/`nix` install lands a closure
-//! there. Most of it stays referenced — the base userland and the project's declared tools
-//! are gc-rooted at seed time (see [`super::projectstore`]), mise installs root themselves,
-//! and each `flake:` build registers a host-resolvable root keyed by package name that a roll
-//! re-points — but a flake revision rolled forward, and a flake package removed outright, leave
-//! the previous build unreferenced. This reclaims those.
+//! self-equips: every host-provisioned `nix:`/`flake:` build seeded here, every in-cage
+//! `mise`/inline-flake install lands a closure there. Most of it stays referenced — the base
+//! userland and the project's declared tools are gc-rooted at seed time (see
+//! [`super::projectstore`]), mise installs root themselves — but a build superseded by a roll, and
+//! a package removed outright, leave the previous closure unreferenced. This reclaims those.
 //!
-//! Two steps. First [`prune_flake_roots`] drops the `sbx-flake-<name>` roots of removed packages
-//! (a roll's overwrite self-cleans, but a removal cannot reach itself). Then a plain `nix-store
-//! --gc` against the project store sweeps: every live build carries a root whose target is a
-//! `/nix/store/<hash>` path, which the relocated store resolves host-side, so the sweep keeps the
+//! The stale roots come in two shapes, pruned before the sweep. An inline `[flakes.<name>]` flake
+//! builds in-cage and registers a name-keyed `sbx-flake-<name>` root in the project store, which
+//! [`prune_flake_roots`] drops once its name leaves the config (an edit self-cleans; a removal
+//! cannot reach itself). A host-provisioned package (`nix:`, a remote `flake:`, the prebuilt trio)
+//! carries a data-dir out-link that [`prune_project_package_roots`] drops on removal, while
+//! [`prune_superseded_roots`] reconciles the per-project seed roots a roll supersedes. Then a plain
+//! `nix-store --gc` against the project store sweeps: every live build carries a root whose target is
+//! a `/nix/store/<hash>` path, which the relocated store resolves host-side, so the sweep keeps the
 //! live set and collects the rest — no per-home enumeration. The default is a dry run: it reports
 //! what would be freed with `--print-dead`, summed by `--query --size`, and only changes anything
 //! when the caller asks.
@@ -30,14 +33,16 @@ pub(crate) struct GcReport {
     pub(crate) bytes: u64,
 }
 
-/// Remove the host-resolvable `sbx-flake-<name>` gc roots whose package is no longer declared.
+/// Remove the in-cage `sbx-flake-<name>` gc roots whose inline flake is no longer declared.
 ///
-/// A `flake:` build registers a root keyed by package name, overwritten each launch — so a roll
-/// (same name, new build) self-cleans, but a *removed* package's root lingers, pointing at a build
-/// nothing wants. This drops those roots so the following sweep reclaims their builds. `current` is
-/// the set of currently-declared flake package names across the project's runtimes; any
-/// `sbx-flake-<name>` root whose `<name>` is not in it is stale. Read-only unless `prune` (a dry
-/// run lists what it would remove without touching anything). Returns the stale roots.
+/// Only an inline `[flakes.<name>]` flake builds in-cage and registers this name-keyed root,
+/// overwritten each launch — so an edit (same name, new build) self-cleans, but a *removed* inline
+/// flake's root lingers, pointing at a build nothing wants. This drops those roots so the following
+/// sweep reclaims their builds. A remote `flake:` package is provisioned host-side and never writes
+/// here — its data-dir out-link is pruned by [`prune_project_package_roots`] instead. `current` is
+/// the set of currently-declared inline-flake names across the project's runtimes; any
+/// `sbx-flake-<name>` root whose `<name>` is not in it is stale. Read-only unless `prune` (a dry run
+/// lists what it would remove without touching anything). Returns the stale roots.
 pub(crate) fn prune_flake_roots(
     store_dir: &Path,
     current: &BTreeSet<String>,
@@ -575,12 +580,17 @@ impl AppPurgeReport {
     }
 }
 
-/// Remove app `name`'s isolated home directories — the global home `<data>/apps/<name>/` (shared
-/// across projects) and each per-project home `<data>/projects/<id>/apps/<name>/`. These hold the
+/// Remove app `name`'s isolated runtime directories — the global home `<data>/apps/<name>/` (shared
+/// across projects) and each per-project directory `<data>/projects/<id>/apps/<name>/`. The whole
+/// `apps/<name>/` subtree is removed at each site, so it reclaims everything an app keeps there: a
+/// per-project (`home_scope = "project"`) app's home, and — for a **global** app — its per-project
+/// mise pool (`mise/`, the `nix:`-via-mise self-equips kept `/nix`-aligned per project beside the
+/// shared store), which sits under the same `apps/<name>/` dir and so goes with it. These hold the
 /// app's mise data (the tools its `mise:` backends installed), its config, and its login/session
 /// state — all app-exclusive, so removing them frees that state immediately. The shared per-project
 /// nix store, which backs *every* app in a project, is deliberately **not** touched here; `sbx gc`
-/// owns its reclamation (a purged app's `nix:`/`flake:` closures become collectable there).
+/// owns its reclamation (a purged app's `nix:`/`flake:` closures — the pool's included — become
+/// collectable once their in-pool out-links are removed with the pool).
 ///
 /// `name` reaches [`force_remove_dir_all`], so the same single-ordinary-component guard the reap
 /// sink applies ([`is_safe_tree_id`]) is re-applied here before any `join`: a separator, a `..`, or
@@ -1353,6 +1363,30 @@ mod tests {
         }
     }
 
+    /// The per-project mise pool a global app self-equips into lives at
+    /// `projects/<id>/apps/<name>/mise`, under the project tree `reap_one` (and so `sbx projects rm`)
+    /// removes wholesale. Pin that it is reclaimed with the tree — a future move of the pool out from
+    /// under `projects/<id>/` would leak it past a project removal, and fail here.
+    #[test]
+    fn reap_one_reclaims_a_projects_per_project_mise_pool() {
+        let base = TmpDir::new();
+        let projects = base.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        make_tree(&projects, "aaaaaaaaaaaaaaaa", None);
+        // a global app's per-project mise pool nested in the tree
+        let pool = projects.join("aaaaaaaaaaaaaaaa/apps/ag/mise/installs/nix-jq/1.0");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join("f"), b"x").unwrap();
+
+        let live = BTreeSet::new();
+        let out = reap_one(&projects, "aaaaaaaaaaaaaaaa", &live, true);
+        assert!(matches!(out, ReapOneOutcome::Tree { .. }));
+        assert!(!projects.join("aaaaaaaaaaaaaaaa").exists());
+        // teeth: the mise pool went with the tree
+        assert!(!projects.join("aaaaaaaaaaaaaaaa/apps/ag/mise").exists());
+    }
+
     /// `reap_one` refuses a traversal/absolute id at the sink — it never joins it onto `projects/`
     /// nor deletes anything, even with `prune`. Teeth: a real directory that a naive `join` of the
     /// id would have reached is left untouched.
@@ -1552,6 +1586,44 @@ mod tests {
         assert!(d.join("apps/demo-tool/home").is_dir());
         assert!(d.join("projects/p1/apps/other/home").is_dir());
         assert!(d.join("projects/p1/store/nix").is_dir());
+    }
+
+    /// A global app (`home_scope = "global"`) keeps one app-global home *and*, in each project it has
+    /// self-equipped in, a per-project mise pool at `projects/<id>/apps/<name>/mise` — a sibling of an
+    /// absent per-project home, holding the `nix:`-via-mise installs kept `/nix`-aligned. The pool
+    /// nests under the `apps/<name>/` dir a purge removes wholesale, so it must be reclaimed with the
+    /// home. This pins it: moving the pool out from under `apps/<name>/` would leak it past a purge and
+    /// fail here.
+    #[test]
+    fn purge_app_homes_reclaims_a_global_apps_per_project_mise_pool() {
+        let data = TmpDir::new();
+        let d = data.path();
+        // the app-global home (shared across projects)
+        mk_home(&d.join("apps/ag/home"));
+        // two per-project pools — mise data only, no per-project home (the global-app layout)
+        mk_home(&d.join("projects/p1/apps/ag/mise/installs/nix-jq/1.0"));
+        mk_home(&d.join("projects/p2/apps/ag/mise/installs/nix-jq/1.0"));
+        // unrelated state that must survive
+        mk_home(&d.join("projects/p1/store/nix"));
+        mk_home(&d.join("projects/p1/apps/other/home"));
+
+        let report = purge_app_homes(d, "ag");
+
+        // the app-global home plus both per-project pools were reclaimed
+        assert_eq!(
+            report.removed.len(),
+            3,
+            "removed: {:?}",
+            report.removed.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert!(report.failed.is_empty());
+        assert!(!d.join("apps/ag").exists());
+        // teeth: each per-project pool went with its `apps/<name>/` dir
+        assert!(!d.join("projects/p1/apps/ag/mise").exists());
+        assert!(!d.join("projects/p2/apps/ag/mise").exists());
+        // the shared store and a sibling app are untouched
+        assert!(d.join("projects/p1/store/nix").is_dir());
+        assert!(d.join("projects/p1/apps/other/home").is_dir());
     }
 
     #[test]

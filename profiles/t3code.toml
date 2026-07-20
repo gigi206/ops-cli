@@ -1,7 +1,7 @@
 # T3 Code — the open-source control plane for coding agents (pingdotgg/t3code), sandboxed by sbx.
 #
 #   sbx app import profiles/t3code.toml
-#   sbx app t3code
+#   sbx app run t3code
 #
 # T3 Code is a free, open-source Electron desktop app: ONE interface that drives OTHER coding agents
 # — Claude Code, Codex, OpenCode, Cursor — spawning each as a CLI subprocess, switching models
@@ -126,7 +126,7 @@ dbus = true
 # every clean way to route the backend hits a hard wall (proxychains breaks Chromium's renderer; Electron
 # strips NODE_OPTIONS so a preload can't reach the backend; a cap-free transparent interceptor is an
 # sbx-sized feature, not a profile knob — full reasoning in the commented "aspirational allowlist" below
-# and in `profiles/README.md`). So t3code ships `shared` so `sbx app t3code` just works. What you KEEP
+# and in `profiles/README.md`). So t3code ships `shared` so `sbx app run t3code` just works. What you KEEP
 # under shared: bubblewrap + seccomp + the isolated home + the minimal /dev — only egress FILTERING is
 # off (the app reaches any host, but still cannot see your real $HOME or other processes).
 network = "shared"

@@ -30,6 +30,7 @@ subtrees:
 | `engine/` | the bundled `nix` / `bwrap` engines a self-contained release materializes |
 | `gcroots/` | gcroots keeping provisioned closures alive (base, mise, gui, per-project) |
 | `projects/<id>/` | the **per-project** writable store and its locks |
+| `projects/<id>/apps/<name>/mise/` | a global app's **per-project mise pool** — its `nix:`-via-mise self-equips, kept `/nix`-aligned |
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
 | `sessions/` | the daemonless session registry ([`sbx session ls`](../housekeeping/sessions.md)) |
 | `egress/` | per-launch egress proxy sockets and CA material |
@@ -42,7 +43,9 @@ subtrees:
 The **per-project** directory `projects/<id>/` holds the project's own writable nix
 store (seeded from the shared store) plus its resolution locks —
 `nixpkgs.lock` (a project pin), `tools.lock` (resolved `nix:` mise tools), and
-`flake-packages.lock` (pinned `flake:` packages). See
+`flake-packages.lock` (pinned `flake:` packages) — and, under `apps/<name>/mise/`, a
+global app's [per-project mise pool](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned)
+(its `nix:`-via-mise self-equips, kept aligned with this project's store). See
 [Provisioning](provisioning.md) for how the per-project store works.
 
 ## State — the trust records

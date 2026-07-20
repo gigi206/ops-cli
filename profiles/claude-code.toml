@@ -1,7 +1,7 @@
 # Claude Code — Anthropic's agentic coding CLI, sandboxed by sbx.
 #
 #   sbx app import profiles/claude-code.toml
-#   sbx app claude-code
+#   sbx app run claude-code
 #
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls Anthropic's
 # standalone `claude` release binary) into the app's persistent home — no host

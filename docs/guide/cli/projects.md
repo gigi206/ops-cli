@@ -40,7 +40,8 @@ Each tree's **state**:
 - its **state** and **size**, broken down `store` / `home` / `other`;
 - the **nixpkgs** channel or per-project pin it resolves against;
 - the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`) —
-  the store is **shared** by the project and every app launched in it, so the roots include
+  a host-side `flake:` build is provisioned like a `nix:` one, so it appears under `nix`; the
+  store is **shared** by the project and every app launched in it, so the roots include
   app packages;
 - the **mise tools** in the project's own home;
 - when the project directory still exists, the project's declared packages/tools that are

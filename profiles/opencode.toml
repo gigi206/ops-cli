@@ -1,7 +1,7 @@
 # opencode — a terminal AI coding agent (multi-provider), sandboxed by sbx.
 #
 #   sbx app import profiles/opencode.toml
-#   sbx app opencode
+#   sbx app run opencode
 #
 # The tool is equipped fresh from upstream (mise's registry resolves `opencode` to
 # its standalone release binary) — no nixpkgs lag. It is equipped at the latest

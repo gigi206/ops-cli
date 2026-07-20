@@ -21,7 +21,7 @@ See also: [`sbx projects`](projects.md) · [Garbage collection](../housekeeping/
 ## Behavior
 
 - Without flags: a **dry run** listing what the current project's store would reclaim
-  (including stale rev-keyed `flake:` out-links left by an upgrade).
+  (including builds a `flake:`/`nix:` roll or a removed package superseded).
 - `--prune`: performs the reclamation.
 - `--all`: also collects the shared store — the closures no live project or locked
   channel revision still roots — under an exclusive lock.

@@ -1059,6 +1059,78 @@ pub(crate) fn provision(
     select_marked_output(layout, &stdout, attr, marker)
 }
 
+/// Provision a `flake:` package from a full flake build *target* into the user-owned store,
+/// gcrooted at `gcroot` — the same store setup, sandboxed build, and marked-output selection as
+/// [`provision`], only the target is passed verbatim rather than assembled from `<flake_ref>#<attr>`.
+/// The target is what a `flake:` package resolves to: a declared `github:owner/repo#attr`, a locked
+/// `github:owner/repo/<rev>#attr`, or a bare `github:owner/repo` (the flake's default package). So a
+/// `flake:` package builds host-side exactly like a `nix:` one — into the shared store, seeded per
+/// project — instead of in-cage per project. The build sandbox is on (safe in plain host context);
+/// build-time fetches use the host network, so a flake whose build self-fetches is unaffected by the
+/// cage's egress allowlist. `--no-write-lock-file` leaves the flake's own lock untouched (the source
+/// is a remote, read-only ref). `label` names the build in an error and drives the output selection.
+///
+/// Short-circuits on the target like [`provision_expr`], for a reason that does not apply to a `nix:`
+/// attribute: a `nix:` target names the *pinned* channel revision, so `nix build` is a fast eval-cache
+/// hit that never re-resolves; but a **floating** `flake:` target (no revision — e.g. `…#default`) would
+/// re-resolve the flake's latest revision after nix's `tarball-ttl` and silently roll the tool. Keying a
+/// `<gcroot>.expr` stamp on the *target string* and reusing the built output when the target is unchanged
+/// **freezes a floating flake at its first build** until `sbx upgrade flake` pins it (which changes the
+/// target to a locked ref → a rebuild), and makes a pinned flake a warm no-op until a roll changes its
+/// locked ref. The reuse also lets a warm launch — and a fresh project seeding the shared build — skip
+/// nix entirely, so it works offline.
+pub(crate) fn provision_flake(
+    nix: &Path,
+    layout: &Layout,
+    gcroot: &Path,
+    target: &str,
+    label: &str,
+    marker: &str,
+) -> io::Result<PathBuf> {
+    ensure(layout)?;
+    if let Some(parent) = gcroot.parent() {
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+
+    let stamp = expr_stamp_path(gcroot);
+    let digest = expr_digest(target);
+    if let Some(path) = reuse_built_expr(layout, gcroot, marker, &stamp, &digest) {
+        return Ok(path);
+    }
+
+    let mut cmd = nix_command(nix, layout);
+    cmd.args(["--extra-experimental-features", "nix-command flakes"])
+        // Nix's own progress (the first-run cache fetch / build) streams to the user, as in
+        // [`provision`]. This build runs only when the short-circuit above misses — a cold or
+        // retargeted (rolled/pinned) flake.
+        .arg("build")
+        .args(["--option", "sandbox", "true"])
+        .arg("--no-write-lock-file")
+        .arg("--out-link")
+        .arg(gcroot)
+        .arg("--print-out-paths")
+        .arg(target)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let out = cmd.spawn()?.wait_with_output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!("nix build {target} failed")));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let resolved = select_marked_output(layout, &stdout, label, marker)?;
+    // Stamp only after a successful, marked build, so a failed build never leaves a stamp that would
+    // short-circuit to a nonexistent output next launch.
+    write_expr_stamp(&stamp, &digest);
+    Ok(resolved)
+}
+
 /// Provision a package built from a Nix *expression* into the user-owned store, gcrooted at
 /// `gcroot`. The same store setup, gcroot, sandboxed build, and marked-output selection as
 /// [`provision`], only the build target differs: `--expr <expr>` instead of `<flake_ref>#<attr>`.

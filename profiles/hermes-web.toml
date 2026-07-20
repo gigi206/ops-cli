@@ -1,9 +1,9 @@
 # Hermes — NousResearch's open-source agent, served as a browser dashboard by sbx.
 #
 #   sbx app import profiles/hermes-web.toml
-#   sbx app hermes-web        # then open http://127.0.0.1:9119 in your host browser
+#   sbx app run hermes-web        # then open http://127.0.0.1:9119 in your host browser
 #
-# A second way to run Hermes alongside `sbx app hermes` (the terminal CLI). Hermes ships a
+# A second way to run Hermes alongside `sbx app run hermes` (the terminal CLI). Hermes ships a
 # browser dashboard — `hermes dashboard` serves a FastAPI/React SPA (the built `web_dist/`
 # bundle, packaged inside the wheel) on 127.0.0.1:9119. sbx serves it headless in the cage
 # (`--no-open`, no in-cage browser) and forwards the host's localhost:9119 into the cage, so

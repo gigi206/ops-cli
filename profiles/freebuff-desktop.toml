@@ -1,0 +1,73 @@
+# freebuff-desktop — freebuff desktop app (Electron) under sbx
+# Import:  sbx app import profiles/freebuff-desktop.toml
+# Launch:  sbx app run freebuff-desktop
+
+cmd = "freebuff"
+home_scope = "global"
+
+[packages]
+# Linux AppImage from the official download endpoint
+freebuff = "appimage:https://freebuff.com/api/desktop/download/linux"
+
+[network]
+mode = "deny"
+# The AppImage may need network for:
+# - GitHub OAuth login (accounts.google.com, github.com)
+# - Telemetry (posthog)
+# - Model providers (via Codebuff backend)
+allow = [
+  "{*} https://api.codebuff.com",
+  "{*} https://www.codebuff.com",
+  "{*} https://codebuff.com",
+  "{GET} https://registry.npmjs.org",
+  # GitHub OAuth
+  "{*} https://github.com",
+  "{*} https://api.github.com",
+  # Google OAuth
+  '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+  "{*} https://oauth2.googleapis.com",
+  "{GET} https://www.google.com",
+  "{GET} https://ssl.gstatic.com",
+  "{GET} https://www.gstatic.com",
+  "{GET} https://fonts.gstatic.com",
+  "{GET} https://fonts.googleapis.com",
+  "{GET} https://lh3.googleusercontent.com",
+]
+
+# Mute telemetry from default log
+mute = [
+  "*.i.posthog.com",
+]
+
+# GUI/GPU/DBus — trusted-only security fields.
+# freebuff-desktop is an Electron app, so it needs Wayland display.
+gui = "wayland"
+gpu = true
+dbus = true
+
+# CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key.
+# You log in ONCE inside the cage (GitHub or Google OAuth).
+# The token persists in the app's dedicated, persistent, isolated home.
+# There is no [secret] block because no HTTP header key is injected.
+
+# Optional: share your host Freebuff config with the cage instead of the app's
+# isolated home (the default). `binds` is a security field, honored only because
+# this profile lives in your trusted config dir. Uncomment to share host setup.
+#binds = [
+#    { path = "~/.config/manicode", mode = "rw" },
+#    { path = "~/.local/share/manicode", mode = "rw" },
+#]
+
+# OPTIONAL direct-OpenRouter BYOK (commented). By default freebuff authenticates to a
+# CODEBUFF account and routes ALL model traffic through Codebuff's backend — there is no
+# provider key to inject, so this block does nothing on its own and is NOT the shipped path.
+# It is here only for parity with the BYOK profiles: it takes effect solely if a freebuff
+# release lets you point it at OpenRouter directly (uncomment `openrouter.ai` in `allow` too).
+# The real key is then read on the HOST and injected by the egress proxy on the wire — never in the cage.
+#[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

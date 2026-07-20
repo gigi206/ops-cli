@@ -1,7 +1,7 @@
 # Garbage collection
 
 `sbx` provisions a per-project nix store and, over time, leaves reclaimable residue —
-superseded closures and stale rev-keyed `flake:` out-links. `sbx gc` reclaims the nix
+superseded closures and the builds of removed packages. `sbx gc` reclaims the nix
 store; whole per-project runtime **trees** (for projects that no longer exist) are removed
 by [`sbx projects rm`](../cli/projects.md).
 
@@ -26,20 +26,19 @@ sbx gc --prune            # reclaim this project's store
 | `sbx gc --all` | also the **shared** store's orphaned closures (dry run) |
 | `sbx gc --all --prune` | the above, collected under an exclusive lock |
 
-- The per-project sweep reclaims a project's own store residue, including the **stale
-  rev-keyed `flake:` out-links** an [`sbx upgrade flake`](upgrade.md) leaves behind
-  (each roll `A → B` leaves the old `<name>-A` out-link and its closure).
-- It also reclaims the build of a **removed package** — delete a `nix:`/`deb:`/`appimage:`/
-  `tarball:` entry from a project's (or an app's) `[packages]` and the sweep drops its
-  data-directory out-link and reclaims its per-project store copy (a full closure on a
-  filesystem without reflink support), which was otherwise held until the whole project tree was
-  removed. (A `flake:` removal is covered by the bullet above; a `mise:` tool lives in the app
-  home, reclaimed by [`sbx app prune`](../cli/app.md).)
+- The per-project sweep reclaims the build of a **removed package** — delete a
+  `nix:`/`flake:`/`deb:`/`appimage:`/`tarball:` entry from a project's (or an app's) `[packages]`
+  and the sweep drops its data-directory out-link and reclaims its per-project store copy (a full
+  closure on a filesystem without reflink support), which was otherwise held until the whole
+  project tree was removed. (A `mise:` tool instead lives in the app home, reclaimed by
+  [`sbx app prune`](../cli/app.md); an inline `[flakes]` build is reclaimed once its name leaves
+  the config.)
 - It also reclaims **superseded builds** the store accumulated. `sbx` roots every version it
   provisions into a project's store, and a newer build's root never displaces the older one —
-  so old base-channel revisions, rebuilt tools, and rolled-forward GUI app builds (multiple
-  `chromium`/`electron`/desktop versions) pile up and a plain sweep, seeing them all rooted,
-  frees nothing. The sweep now reconciles those seed roots against what the project's
+  so old base-channel revisions, rebuilt tools, rolled-forward `flake:` builds (each
+  [`sbx upgrade flake`](upgrade.md) re-points the name-keyed out-link, leaving the old build), and
+  rolled-forward GUI app builds (multiple `chromium`/`electron`/desktop versions) pile up and a
+  plain sweep, seeing them all rooted, frees nothing. The sweep now reconciles those seed roots against what the project's
   **current** out-links reference — keeping the current version of each and collecting the
   superseded ones. It is conservative: if the base or mise out-links for the current revision
   are missing it skips rather than risk dropping a live build, so an over-eager prune only ever

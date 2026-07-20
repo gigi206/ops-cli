@@ -1,7 +1,7 @@
 # Cursor — the Cursor AI code editor (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
 #   sbx app import profiles/cursor.toml
-#   sbx app cursor
+#   sbx app run cursor
 #
 # This is the Cursor **desktop editor** (the full GUI IDE). For the headless terminal agent, use
 # `profiles/cursor-agent.toml` instead (a CLI that fits Mode-B far more cleanly). Confined by sbx,
@@ -69,8 +69,8 @@
 # FIRST LOGIN — run it once under `--net shared` (host network, no allowlist whack-a-mole while you
 # discover which SSO hosts the flow touches), let the session persist in the isolated home, then run
 # filtered:
-#     sbx app cursor --net shared     # first run: complete the sign-in, watch `sbx net logs -a cursor`
-#     sbx app cursor                  # later runs: filtered by the allowlist below
+#     sbx app run cursor --net shared     # first run: complete the sign-in, watch `sbx net logs -a cursor`
+#     sbx app run cursor                  # later runs: filtered by the allowlist below
 # If you sign in with Google/GitHub SSO, add the provider's host chain to `allow` (for Google the
 # repo-standard bounded regex — see `profiles/claude-desktop.toml`; the `accounts.google.<ccTLD>/…/SetSID`
 # redirect is load-bearing). A plain EMAIL sign-in stays on Cursor's own domain and needs no SSO hosts.

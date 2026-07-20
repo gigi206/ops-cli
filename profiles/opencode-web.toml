@@ -1,7 +1,7 @@
 # opencode web — opencode's browser UI, served headless in the cage, opened in your HOST browser.
 #
 #   sbx app import profiles/opencode-web.toml
-#   sbx app opencode-web
+#   sbx app run opencode-web
 #   # then open http://127.0.0.1:4096 in your browser
 #
 # This is the third face of opencode (alongside the `opencode` CLI/TUI and the `opencode-desktop`

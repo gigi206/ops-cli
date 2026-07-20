@@ -1,7 +1,7 @@
 # OpenFox — a local-LLM web coding agent (github.com/co-l/openfox), sandboxed by sbx.
 #
 #   sbx app import profiles/openfox.toml
-#   sbx app openfox
+#   sbx app run openfox
 #   # then open http://127.0.0.1:10369 in your browser
 #
 # OpenFox is a Node.js/TypeScript coding agent with a "Plan → Builder" workflow, an integrated

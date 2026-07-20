@@ -1265,6 +1265,32 @@ fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
     errs
 }
 
+/// Warn about any `mise:nix:<pkg>` package. Routing `nix:` content through the mise backend pins the
+/// install record app-global (Lane-1 `mise use -g`, so a global app's declared `mise:` tool installs
+/// once and is shared) while the built store path is per-project — so the record and content misalign
+/// across projects, the same failure the per-project mise split fixes for `nix:`-via-mise self-equips.
+/// The fix is a plain `nix:<pkg>`, which is host-provisioned and seeded into each project's store,
+/// per-project-aligned by construction — so this warns rather than rerouting. Trusted-only: a withheld
+/// package never equips, so it stays silent. `source` prefixes the message (e.g. `` `app <name> ` ``).
+fn warn_mise_nix_packages(source: &str, packages: &[Package], warnings: &mut Vec<String>) {
+    for pkg in packages {
+        if pkg.state != TrustState::Trusted {
+            continue;
+        }
+        if let Backend::Mise(token) = &pkg.backend {
+            if let Some(attr) = token.strip_prefix("nix:") {
+                warnings.push(format!(
+                    "{source}package `{}` uses `mise:nix:{attr}`: for a global app its install record \
+                     is pinned app-global while its `/nix` store path is per-project, so it misaligns \
+                     across projects — declare it as `nix:{attr}` (host-provisioned, \
+                     per-project-aligned) instead",
+                    pkg.name
+                ));
+            }
+        }
+    }
+}
+
 /// Layer the global config (trusted by location) under the project config, gating
 /// the project's security-relevant fields by its trust verdict. Pure: the policy
 /// matrix is decided here from already-read inputs.
@@ -1762,6 +1788,15 @@ fn resolve(
         &proc,
         plugins,
     );
+
+    // An *app* `[packages] mise:nix:<pkg>` re-introduces the per-project misalignment the mise split
+    // otherwise fixes: a global app's Lane-1 pin lands the install record app-global while the `/nix`
+    // store path is per-project. Warn per app, pointing at the aligned `nix:<pkg>` form. A *baseline*
+    // `mise:nix:` (used by `sbx run`, whose home is already per-project) is aligned, so it is not
+    // flagged. Trusted-only.
+    for (app_name, app) in &apps {
+        warn_mise_nix_packages(&format!("app `{app_name}` "), &app.packages, &mut warnings);
+    }
 
     Resolved {
         env,
@@ -5237,6 +5272,53 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_mise_nix_package_warns_to_use_the_plain_nix_backend() {
+        // `mise:nix:<pkg>` routes `nix:` content through the mise backend, whose Lane-1 pin lands the
+        // install record app-global while the store path is per-project — the misalignment the split
+        // otherwise fixes. Warn, pointing at the aligned `nix:<pkg>` form; only for a *trusted* package
+        // (a withheld one never equips), and never for a real shared mise backend or a plain `nix:`.
+        let pkgs = vec![
+            Package {
+                name: "jq".into(),
+                backend: Backend::Mise("nix:jq".into()),
+                state: TrustState::Trusted,
+            },
+            Package {
+                name: "rg".into(),
+                backend: Backend::Mise("aqua:BurntSushi/ripgrep".into()),
+                state: TrustState::Trusted,
+            },
+            Package {
+                name: "hello".into(),
+                backend: Backend::Nix("hello".into()),
+                state: TrustState::Trusted,
+            },
+            Package {
+                name: "fd".into(),
+                backend: Backend::Mise("nix:fd".into()),
+                state: TrustState::Untrusted,
+            },
+        ];
+        let mut warnings = Vec::new();
+        warn_mise_nix_packages("app `demo` ", &pkgs, &mut warnings);
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the trusted mise:nix: package warns: {warnings:?}"
+        );
+        let w = &warnings[0];
+        assert!(w.contains("app `demo` package `jq`"), "{w}");
+        assert!(w.contains("mise:nix:jq"), "{w}");
+        assert!(w.contains("nix:jq"), "it points at the aligned form: {w}");
+        // a shared mise backend, a plain nix:, and a withheld mise:nix: are all silent
+        assert!(
+            !w.contains("ripgrep") && !w.contains("hello") && !w.contains("fd"),
+            "{w}"
+        );
+    }
 
     /// Test shim: [`super::validate_network`] with no egress groups and the built-in `Shared`
     /// default as the inheritance parent — the common case in these unit tests. It shadows the

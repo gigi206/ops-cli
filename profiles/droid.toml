@@ -1,7 +1,7 @@
 # Droid — Factory's terminal coding agent (factory.ai), sandboxed by sbx.
 #
 #   sbx app import profiles/droid.toml
-#   sbx app droid
+#   sbx app run droid
 #
 # Droid ships a genuine terminal CLI on npm (the `droid` package), distributed as a
 # self-contained native binary resolved through a platform-specific optional dependency
@@ -18,7 +18,7 @@
 # account credential persists in the app's dedicated, persistent, isolated home (`~/.factory/`),
 # never bleeding into the project shell or another app:
 #
-#   sbx app droid        # then log in interactively (the token persists in the isolated home)
+#   sbx app run droid        # then log in interactively (the token persists in the isolated home)
 #
 # Headless use (`droid exec`) reads `FACTORY_API_KEY` from the environment — but sbx has NO
 # host->cage env passthrough for a credential (its passthrough channel carries only TERM/LANG,

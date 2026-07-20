@@ -4907,6 +4907,21 @@ struct AppHomeShow {
     tools_bytes: u64,
 }
 
+/// A global app's per-project mise pool for `sbx app show`: which project, its size, and the tools
+/// self-equipped there. These are the `nix:`-via-mise self-equips (and project `.mise.toml` tools)
+/// kept aligned with each project's `/nix` store — distinct from the app-global home's declared
+/// tools, which is why they get their own section rather than folding into the home's package view.
+#[derive(serde::Serialize)]
+struct AppMisePoolShow {
+    /// The project tree id the pool belongs to.
+    project_id: String,
+    /// Total bytes of the pool dir.
+    bytes: u64,
+    /// The tools self-equipped into the pool, each named as a `[packages]` value would
+    /// (`mise:nix:jq`) with its versions — undeclared per-project state, listed for visibility.
+    tools: Vec<OrphanTool>,
+}
+
 /// A mise tool present in a home but not matched to any declared package — the literal
 /// "everything actually installed" that the declared-package list does not name (a leftover from a
 /// removed profile, or a tool a `mise:` backend pulled in as a dependency).
@@ -4929,6 +4944,9 @@ struct AppShow {
     /// The effective network posture label, when the app is declared.
     network: Option<&'static str>,
     homes: Vec<AppHomeShow>,
+    /// A global app's per-project mise pools — the `nix:`-via-mise self-equips aligned with each
+    /// project's `/nix` store. Empty for a per-project app (its mise data lives under its home).
+    pools: Vec<AppMisePoolShow>,
     total_bytes: u64,
     packages: Vec<PackageShow>,
     /// Installed mise tools that no declared package accounts for.
@@ -4974,7 +4992,31 @@ fn build_app_show(
             }
         })
         .collect();
-    let total_bytes = home_views.iter().map(|h| h.bytes).sum();
+    // A global app's per-project mise pools — its `nix:`-via-mise self-equips, which the split routes
+    // per project (aligned with each project's `/nix` store) rather than into the app-global home. A
+    // per-project app has none (its mise data lives under its per-project home). Kept distinct from the
+    // home's declared tools, and their bytes counted in the disk total.
+    let pools: Vec<AppMisePoolShow> = sandbox::inspect::app_per_project_mise_pools(data_dir, name)
+        .into_iter()
+        .map(|pool| {
+            let bytes = sandbox::tree_size(&pool.dir);
+            let tools = sandbox::inspect::mise_installed_in(&pool.dir.join("installs"))
+                .iter()
+                .map(|t| OrphanTool {
+                    name: format!("mise:{}", t.label()),
+                    versions: sandbox::inspect::concrete_versions(t),
+                })
+                .collect();
+            AppMisePoolShow {
+                project_id: pool.project_id,
+                bytes,
+                tools,
+            }
+        })
+        .collect();
+
+    let total_bytes = home_views.iter().map(|h| h.bytes).sum::<u64>()
+        + pools.iter().map(|p| p.bytes).sum::<u64>();
 
     let packages = app
         .map(|a| {
@@ -4999,13 +5041,11 @@ fn build_app_show(
                             }
                             None => PackageInstalled::NotInstalled,
                         }
-                    } else if matches!(pkg.backend, Backend::Flake(_) | Backend::FlakeInline { .. })
-                    {
-                        // A `flake:` build — and an inline `[flakes.<name>]` — lands in the cage home
-                        // (like mise): a warm out-link there whose target store path is in the
-                        // per-project store. A floating flake has no lock at all, so that out-link,
-                        // not a lock scan, is its realized signal (an inline flake keys it
-                        // `<name>-<hash>`, matched by the same name).
+                    } else if matches!(pkg.backend, Backend::FlakeInline { .. }) {
+                        // An inline `[flakes.<name>]` is built in-cage and lands a warm out-link in the
+                        // cage home (keyed `<name>-<hash>`, matched by the same name), whose target
+                        // store path is in the per-project store. A remote `flake:` is built host-side
+                        // instead — handled with `nix:` below.
                         match homes
                             .iter()
                             .find_map(|h| sandbox::inspect::flake_built(&h.dir, &pkg.name))
@@ -5027,10 +5067,11 @@ fn build_app_show(
                             },
                             None => PackageInstalled::NotInstalled,
                         }
-                    } else if matches!(pkg.backend, Backend::Nix(_)) {
-                        // A `nix:` package builds host-side into the shared store and is seeded into
-                        // each project's per-project store, gcrooted per tree — so its realized signal
-                        // is which trees built it, mirroring the deb:/appimage: per-tree report above.
+                    } else if matches!(pkg.backend, Backend::Nix(_) | Backend::Flake(_)) {
+                        // A `nix:` package — and now a remote `flake:` package — builds host-side into
+                        // the shared store and is seeded into each project's per-project store, gcrooted
+                        // per tree (bare `<name>`), so its realized signal is which trees built it,
+                        // mirroring the deb:/appimage: per-tree report above.
                         let trees = sandbox::inspect::nix_built_trees(data_dir, &pkg.name);
                         match trees.len() {
                             0 => PackageInstalled::NotInstalled,
@@ -5113,6 +5154,7 @@ fn build_app_show(
             config::NetworkPolicy::Allowlist(pol) => net_mode_word(pol.default_action().into()),
         }),
         homes: home_views,
+        pools,
         total_bytes,
         packages,
         orphans,
@@ -5159,8 +5201,9 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
     if let Some(net) = v.network {
         let _ = writeln!(s, "  network:  {net}");
     }
-    // On-disk usage: the total, then one breakdown line per home (its mise-tools share vs the rest).
-    if v.homes.is_empty() {
+    // On-disk usage: the total, then one breakdown line per home (its mise-tools share vs the rest),
+    // then one per per-project mise pool (all mise data — its self-equips aligned with the project store).
+    if v.homes.is_empty() && v.pools.is_empty() {
         let _ = writeln!(s, "  disk:     {dim}— (not launched yet){r}");
     } else {
         let _ = writeln!(s, "  disk:     {}", sandbox::human_bytes(v.total_bytes));
@@ -5173,6 +5216,14 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
                 sandbox::human_bytes(home.bytes),
                 sandbox::human_bytes(home.tools_bytes),
                 sandbox::human_bytes(state),
+            );
+        }
+        for pool in &v.pools {
+            let _ = writeln!(
+                s,
+                "    project {} {dim}(mise pool){r} · {}",
+                pool.project_id,
+                sandbox::human_bytes(pool.bytes),
             );
         }
     }
@@ -5208,6 +5259,29 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
                 format!("  {dim}{versions}{r}")
             };
             let _ = writeln!(s, "    {n}{}{r}{suffix}", t.name);
+        }
+    }
+    // A global app's per-project self-equips: the `nix:`-via-mise tools each project resolved into its
+    // own `/nix`-aligned pool, listed per project. Distinct from the app-global declared tools above —
+    // these are transient per-project state, re-resolved when the project's store lacks them.
+    let pools_with_tools: Vec<&AppMisePoolShow> =
+        v.pools.iter().filter(|p| !p.tools.is_empty()).collect();
+    if !pools_with_tools.is_empty() {
+        let _ = writeln!(s, "  per-project self-equips:");
+        for pool in pools_with_tools {
+            for t in &pool.tools {
+                let versions = t.versions.join(", ");
+                let suffix = if versions.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {dim}{versions}{r}")
+                };
+                let _ = writeln!(
+                    s,
+                    "    {dim}project {}{r}  {n}{}{r}{suffix}",
+                    pool.project_id, t.name
+                );
+            }
         }
     }
     s
@@ -12370,6 +12444,62 @@ mod tests {
         assert!(
             session_pids_for_app(data.path(), "other").is_empty(),
             "a different app must select no session"
+        );
+    }
+
+    #[test]
+    fn app_show_surfaces_a_global_apps_per_project_mise_pools() {
+        use crate::testutil::TmpDir;
+        // A global app self-equipped `nix:jq` into two projects' per-project pools. `app show` must
+        // surface both — the correctness the pool split otherwise loses, since the pools are
+        // `.../mise` (mise's own data dir), not `.../home`, so `app_home_dirs` alone misses them.
+        let data = TmpDir::new();
+        let d = data.path();
+        // the app-global home holds the declared agent tool (rg), which `app_home_dirs` does read
+        std::fs::create_dir_all(
+            d.join("apps/ag/home/.local/share/mise/installs/aqua-burnt-sushi-ripgrep/14.1.1"),
+        )
+        .unwrap();
+        // two per-project pools, each with the `nix:` self-equip (installs directly under the pool)
+        for id in ["p1", "p2"] {
+            let inst = d.join(format!("projects/{id}/apps/ag/mise/installs/nix-jq"));
+            std::fs::create_dir_all(inst.join("1.8.1")).unwrap();
+            std::fs::write(inst.join(".mise.backend.toml"), "short = \"nix:jq\"\n").unwrap();
+        }
+
+        let homes = sandbox::inspect::app_home_dirs(d, "ag");
+        let view = build_app_show("ag", None, &config::NetworkPolicy::Shared, &homes, d);
+
+        // both pools captured, each holding exactly the self-equip; the pool tools are kept separate
+        // from the app-global home's tools (the declared-package matching stays home-only).
+        assert_eq!(
+            view.pools
+                .iter()
+                .map(|p| p.project_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p1", "p2"]
+        );
+        assert!(
+            view.pools
+                .iter()
+                .all(|p| p.tools.len() == 1 && p.tools[0].name == "mise:nix:jq"),
+            "each pool lists exactly its nix: self-equip: {:?}",
+            view.pools
+                .iter()
+                .map(|p| p.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+
+        // the rendered output surfaces the pools: a disk line per pool + the self-equips section
+        let out = render_app_show(&view, &style::Palette::plain());
+        assert!(out.contains("(mise pool)"), "disk names the pools:\n{out}");
+        assert!(
+            out.contains("per-project self-equips"),
+            "the self-equips section is shown:\n{out}"
+        );
+        assert!(
+            out.contains("mise:nix:jq"),
+            "the self-equipped tool is named:\n{out}"
         );
     }
 

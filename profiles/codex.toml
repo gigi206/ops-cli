@@ -1,7 +1,7 @@
 # Codex — OpenAI's coding agent CLI, sandboxed by sbx.
 #
 #   sbx app import profiles/codex.toml
-#   sbx app codex
+#   sbx app run codex
 #
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls OpenAI's codex
 # release binary) — no nixpkgs lag. It is equipped at the latest upstream version on the
@@ -13,7 +13,7 @@
 #  - **API key** (header-injected): set `$OPENAI_API_KEY` on the host and uncomment the
 #    `[secret."api.openai.com"]` block below. The egress proxy injects the key on the wire
 #    to api.openai.com; the plaintext never enters the cage.
-#  - **ChatGPT login (OAuth)**: run `sbx app codex`, then `codex login` inside the cage.
+#  - **ChatGPT login (OAuth)**: run `sbx app run codex`, then `codex login` inside the cage.
 #    Codex opens the OAuth URL in your host browser; the provider redirects to
 #    http://localhost:1455/auth/callback, and `forward = [1455]` forwards that host
 #    loopback port into the cage so codex (listening on its own loopback) receives the

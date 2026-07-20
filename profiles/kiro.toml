@@ -1,0 +1,191 @@
+# Kiro CLI — AWS's agentic coding CLI (Amazon Q Developer / Kiro), sandboxed by sbx.
+#
+#   sbx app import profiles/kiro.toml
+#   sbx app run kiro
+#
+# Kiro CLI is distributed for Linux as:
+#   - AppImage (non-Electron structure: usr/bin/kiro-cli, not resources/app.asar)
+#   - ZIP (kirocli-x86_64-linux.zip) with binaries in kirocli/bin/
+#
+# The `appimage:` backend expects Electron apps (resources/app.asar) and fails on
+# Kiro's native structure. The `tarball:` backend only accepts .tar.gz/.tgz URLs.
+#
+# This profile uses `tarball:resolve` with a custom resolve command that:
+#   1. Downloads the ZIP from AWS S3
+#   2. Extracts the `kiro-cli` binary
+#   3. Creates a minimal .tar.gz with structure electron_wrap expects:
+#        kiro/
+#          resources/app/     # empty dir (electron_wrap looks for this)
+#          kiro-cli           # binary at top level (electron_wrap finds first executable)
+#   4. Writes tarball to project dir (.sbx-kiro/), outputs file:// URL
+#      (host nix build can read project dir via bind mount)
+#
+# `sbx upgrade appimage` re-fetches the "latest" ZIP and rolls the pin forward.
+#
+# Authentication (multiple providers, browser-based by default):
+#   - GitHub, Google, AWS Builder ID, AWS IAM Identity Center, External IdP
+#   Run `sbx app run kiro -- login` and follow the browser flow. The token
+#   persists in the app's isolated home (`~/.local/share/kiro-cli/`).
+#   For CI/headless: set $KIRO_API_KEY on the host and uncomment the
+#   [secret."runtime.*.kiro.dev"] block below (Pro/Pro+/Pro Max/Power only).
+#
+# Network: deny-by-default allowlist covering Kiro's service endpoints (new
+# kiro.dev endpoints + legacy q.amazonaws.com), auth/token exchange, telemetry,
+# and auto-update downloads. Browser-based sign-in opens app.kiro.dev on the
+# HOST (bypasses the cage) — the callback is local to the browser, so no
+# in-cage OAuth loopback or forward port is needed.
+cmd = [
+    "kiro-cli",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+[packages]
+# Kiro CLI from AWS S3 "latest" ZIP via tarball:resolve auto-upgrade.
+# The resolve command downloads the ZIP, builds a compatible .tar.gz, and serves
+# it via a file:// URL from the project directory.
+kiro = "tarball:resolve"
+
+[tarball.kiro]
+# Resolve command: runs in a hermetic cage with network access, base tools, and
+# the project's nix: bins on PATH. Prints a file:// URL to stdout pointing to a
+# .tar.gz in the project directory (visible to host nix build).
+# Steps:
+#   1. Download the ZIP from AWS S3
+#   2. Extract the `kiro-cli` binary
+#   3. Create a minimal .tar.gz with structure electron_wrap expects:
+#        kiro/
+#          resources/app/     # empty dir (electron_wrap looks for this)
+#          kiro-cli           # binary at top level (electron_wrap finds first executable)
+#   4. Write tarball to project dir, output file:// URL
+resolve = [
+    "bash",
+    "-euo",
+    "pipefail",
+    "-c",
+    """
+set -euo pipefail
+
+ZIP_URL='https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip'
+WORKDIR=$(mktemp -d)
+cd "$WORKDIR"
+
+echo 'Downloading Kiro CLI ZIP...' >&2
+curl -fsSL "$ZIP_URL" -o kirocli.zip
+
+echo 'Extracting...' >&2
+unzip -q kirocli.zip
+
+# The ZIP contains kirocli/bin/kiro-cli (main binary, ~119MB)
+# Create .tar.gz with structure that electron_wrap expects:
+#   kiro/
+#     resources/app/     # empty directory (electron_wrap looks for this)
+#     kiro-cli           # binary at top level (electron_wrap finds first executable here)
+echo 'Building compatible tarball...' >&2
+mkdir -p kiro/resources/app
+cp kirocli/bin/kiro-cli kiro/
+chmod +x kiro/kiro-cli
+
+tar -czf kiro.tar.gz kiro
+
+# Write tarball to project directory (bind-mounted from host, so host nix can read it)
+# Use a stable name based on content hash for idempotency
+HASH=$(sha256sum kiro.tar.gz | cut -d' ' -f1 | cut -c1-16)
+DEST_DIR="$PWD/.sbx-kiro"
+mkdir -p "$DEST_DIR"
+DEST="$DEST_DIR/kiro-$HASH.tar.gz"
+cp kiro.tar.gz "$DEST"
+
+# Output file:// URL with absolute path for host nix fetchurl
+ABS_DEST=$(realpath "$DEST")
+echo "file://$ABS_DEST"
+"""
+]
+
+# Egress allowlist — Kiro service endpoints (chat, completions, config, auth, telemetry, updates).
+# Regions: us-east-1 (primary), eu-central-1 (Europe). Wildcards cover subdomains.
+# Browser sign-in (app.kiro.dev) happens on the HOST, not in the cage.
+[network]
+mode = "deny"
+allow = [
+    # Kiro application / assets / sign-in portal (host browser)
+    "{GET} https://app.kiro.dev",
+    "{GET} https://assets.app.kiro.dev",
+    "{GET} https://cli.kiro.dev",
+
+    # Auth / token exchange / logout (CLI traffic)
+    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
+    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
+    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
+
+    # Kiro service endpoints (new kiro.dev) — inference, config, telemetry
+    "{*} https://runtime.us-east-1.kiro.dev",
+    "{*} https://runtime.eu-central-1.kiro.dev",
+    "{*} https://management.us-east-1.kiro.dev",
+    "{*} https://management.eu-central-1.kiro.dev",
+    "{*} https://telemetry.us-east-1.kiro.dev",
+    "{*} https://telemetry.eu-central-1.kiro.dev",
+
+    # Legacy q.amazonaws.com endpoints (still used for some operations)
+    "{*} https://q.us-east-1.amazonaws.com",
+    "{*} https://q.eu-central-1.amazonaws.com",
+
+    # Auto-updates / Powers registry / icons / CLI downloads
+    "{GET} https://prod.download.desktop.kiro.dev",
+    "{GET} https://prod.download.cli.kiro.dev",
+    "{GET} https://desktop-release.q.us-east-1.amazonaws.com",
+
+    # Telemetry (CloudWatch RUM, cookie consent, feedback)
+    "{GET} https://prod.us-east-1.telemetry.desktop.kiro.dev",
+    "{GET} https://prod.eu-central-1.telemetry.desktop.kiro.dev",
+    "{GET} https://prod.us-east-1.telemetry.kiro.aws.dev",
+    "{GET} https://dataplane.rum.us-east-1.amazonaws.com",
+    "{GET} https://dataplane.rum.eu-central-1.amazonaws.com",
+    "{GET} https://prod.assets.shortbread.aws.dev",
+    "{GET} https://prod.log.shortbread.aws.dev",
+    "{GET} https://prod.tools.shortbread.aws.dev",
+    "{GET} https://rendering.aperture-public-api.feedback.console.aws.dev",
+    "{GET} https://a0.awsstatic.com",
+    "{GET} https://kaa-assets.app.kiro.dev",
+    "{GET} https://kiro.dev",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`):
+# telemetry/metrics we deliberately leave DENIED. A `mute` never changes the
+# verdict (still refused) and never hides a count (`sbx net stats` tallies it);
+# it only keeps the line out of the default log. See with `sbx net log --all`,
+# edit from CLI with `sbx net mute|unmute <host> -a kiro`.
+mute = [
+    "telemetry.us-east-1.kiro.dev",
+    "telemetry.eu-central-1.kiro.dev",
+    "prod.us-east-1.telemetry.desktop.kiro.dev",
+    "prod.eu-central-1.telemetry.desktop.kiro.dev",
+    "prod.us-east-1.telemetry.kiro.aws.dev",
+    "dataplane.rum.us-east-1.amazonaws.com",
+    "dataplane.rum.eu-central-1.amazonaws.com",
+]
+
+# BYOK path (Kiro Pro/Pro+/Pro Max/Power only): the real key is read on the HOST
+# and injected by the egress proxy — never in the cage. Set $KIRO_API_KEY on the
+# host, uncomment the [secret] block. The runtime endpoint varies by region; the
+# key is injected on the wire to the active runtime.* host.
+[env]
+# KIRO_API_KEY = "ksk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."runtime.us-east-1.kiro.dev"]
+#from = "env://KIRO_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+
+# Optional: share your host Kiro config with the cage (read-write at real path).
+# binds is a security field, honored only because this profile lives in your
+# trusted config dir. Uncomment to use host config instead of the app's isolated home.
+#binds = [
+#    { path = "~/.local/share/kiro-cli", mode = "rw" },
+#    { path = "~/.config/kiro", mode = "rw" },
+#]

@@ -25,7 +25,7 @@ nix.
 |---|---|---|---|
 | `nix:<attribute>` | host-side, into the shared store | tracks the nixpkgs channel | yes (seeded, durable) |
 | `mise:<token>` | in-cage, via `mise use -g` | upstream-direct, fetched at launch | first launch needs network |
-| `flake:<ref>` | in-cage, via `nix build` | floats, or pinned by `sbx upgrade flake` | after a warm build |
+| `flake:<ref>` | host-side, via `nix build` | floats, or pinned by `sbx upgrade flake` | yes (seeded, durable) |
 | `deb:<url>` · `deb:github:…` · `deb:apt:…` · `deb:resolve` (+ `[deb.<name>]`) | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 | `appimage:<url>` · `appimage:github:…` · `appimage:resolve` (+ `[appimage.<name>]`) | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 | `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
@@ -44,7 +44,12 @@ per-project store). Use [`sbx search <query>`](../cli/search.md) to find attribu
 names. Advances with [`sbx upgrade nix`](../housekeeping/upgrade.md).
 
 `mise:nix:<pkg>` routes to mise's nixhub resolver — a way to get a nix package with
-mise's own version selection, not a third nix path.
+mise's own version selection, not a third nix path. **Prefer plain `nix:<pkg>` in an
+app's `[packages]`:** a global app's `mise:nix:` tool has its install record pinned in
+the app-global pool while its `/nix` store path is per-project, so it can misalign across
+projects (see [Two mise pools](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned)).
+A plain `nix:` package is host-provisioned and seeded into each project's store, aligned by
+construction — sbx warns when a global app declares `mise:nix:`.
 
 ### `mise:` — a mise backend
 
@@ -62,6 +67,18 @@ with [`sbx upgrade mise`](../housekeeping/upgrade.md).
 Note: an `npm:` tool needs `/usr/bin/env` (the cage provides a synthetic one) and, if
 it is pure JS, a node runtime — declare `nodejs = "nix:nodejs"` alongside it.
 
+**`mise:` is the one backend equipped inside the cage** — every other backend is
+provisioned host-side, before the cage, so only `mise:` is governed by the cage's
+[`network`](network.md) posture. In practice: under an allowlist the backend's
+distribution host must be in `[network].allow` (e.g. `registry.npmjs.org` for `npm:`,
+`github.com` for `aqua:`/`github:`); under `network = "none"` a declared `mise:` tool
+cannot be fetched and is absent (a warning, unless it was already equipped). This is
+**by design** — a `mise:` tool is fetched upstream-direct at launch, which is exactly
+what keeps it fresher than nixpkgs; the host-side backends trade that freshness for a
+durable, network-independent store path. If you want a tool that is present regardless
+of the cage's network — and it exists in nixpkgs — declare it as [`nix:`](#nix--a-nixpkgs-attribute)
+instead.
+
 ### `flake:` — a nix flake output
 
 ```toml
@@ -69,15 +86,15 @@ it is pure JS, a node runtime — declare `nodejs = "nix:nodejs"` alongside it.
 agent = "flake:github:owner/repo#default"
 ```
 
-Built **in-cage** with `nix build <ref>` into the project's own store, the out-link's
-`bin/` prepended to `PATH`. A warm/offline second launch short-circuits. The flake ref
-must carry an explicit scheme — **every local-source form is rejected**
-(`path:`/`git+file:`, a leading `/`·`.`·`~`, the bare indirect `nixpkgs`) so a config
-cannot aim the in-cage build at a host path. The first launch needs network **and**
-the build's own fetch hosts in the [egress allowlist](../networking/rules.md). A flake
-build step that fetches with its own HTTP client (e.g. `bun install`) rather than
-nix's fetcher is blocked under a filtering posture — prefer a release binary via
-`mise:github:` for such tools. Pins advance with
+Built **host-side** with `nix build <ref>` into `sbx`'s shared store — built once
+(content-addressed, so a second project is a cache hit) and seeded into each project's
+store, its `bin/` prepended to the cage `PATH`. Durable and offline-reusable, exactly
+like `nix:`. The flake ref must carry an explicit scheme — **every local-source form is
+rejected** (`path:`/`git+file:`, a leading `/`·`.`·`~`, the bare indirect `nixpkgs`) so a
+config cannot aim the build at a host path. The build fetches its inputs over the **host**
+network (not the cage allowlist), so a flake whose build self-fetches with its own HTTP
+client (e.g. `bun install`) builds fine — the cage allowlist governs only the app's
+**runtime** egress. Pins advance with
 [`sbx upgrade flake`](../housekeeping/upgrade.md).
 
 ## `[flakes]` — an inline nix flake
@@ -100,10 +117,12 @@ flake = '''
 ```
 
 sbx stages the source to a directory, binds it **read-only** into the cage, and builds
-`path:<dir>#<attr>` **in-cage** — exactly the same containment as a `flake:` package, applied to
-arbitrary inline build source. The out-link's `bin/` is prepended to `PATH`, and the out-link is
-keyed by the source's **content hash**, so **editing the flake in the config rebuilds** at the next
-launch while an unchanged flake reuses the warm build. It is folded into the same tool set as
+`path:<dir>#<attr>` **in-cage**. Unlike a remote `flake:` ref — which builds host-side — an inline
+flake is local content you authored, and building local content host-side is exactly what
+`flake:`'s scheme check refuses, so the inline case stays contained in the cage. The out-link's
+`bin/` is prepended to `PATH`, and the out-link is keyed by the source's **content hash**, so
+**editing the flake in the config rebuilds** at the next launch while an unchanged flake reuses the
+warm build. It is folded into the same tool set as
 `[packages]` (the name is the merge key), so a name declared in both `[packages]` and `[flakes]` is
 a mistake — sbx warns and the inline flake wins.
 
@@ -112,8 +131,10 @@ string, and TOML forbids adding scalar keys to `[packages]` once one of its subt
 
 An inline flake **floats**: it has no persisted lock and no `sbx upgrade` path, so **pin the inputs
 inside the `flake.nix`** (e.g. `nixpkgs.url = "github:NixOS/nixpkgs/<rev>"`) for a reproducible
-build. Like `flake:`, the first build needs network **and** the build's own fetch hosts in the
-[egress allowlist](../networking/rules.md). A security field, honored only from a trusted source.
+build. Because it builds **in-cage** (unlike a host-side `flake:` ref), the first build needs network
+**and** the build's own fetch hosts in the [egress allowlist](../networking/rules.md) — a flake whose
+build self-fetches with its own HTTP client is blocked under a filtering posture, so prefer a remote
+`flake:<ref>` (host-side build) for those. A security field, honored only from a trusted source.
 
 ### `deb:` — a prebuilt Debian package
 

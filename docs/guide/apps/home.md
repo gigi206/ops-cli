@@ -46,28 +46,56 @@ stay **project-scoped** (shared across an app and the project shell). So per-app
 isolation is not per-app *store* isolation — a consciously accepted, same-uid,
 self-harm-class residual.
 
-### A caveat for global-scope apps
+### Two mise pools keep a global app's self-equips aligned
 
-Because `MISE_DATA_DIR` lives under `$HOME`, a `"global"`-scope app's mise **activation
-state** is shared across projects, while the store backing `/nix` is per-project. So a
-global app that `mise use`s a `nix:` tool in project A persists the *activation*
-globally but builds the tool into project A's store only — in project B mise believes
-the tool active while B's store lacks it (offline: a hard failure; online: a silent
-rebuild). The credentials/login/identity you chose `"global"` *for* persist correctly;
-only tool self-equip is the caveat. The mitigation is `home_scope = "project"` (mise
-data and store both per-project, aligned).
+A `"global"`-scope app keeps **one** home — its identity, login, and mise **activation
+state** — shared across every project, while the store backing `/nix` is per-project. To
+keep a `nix:`-via-mise self-equip aligned with that per-project store, sbx splits a global
+app's mise install storage into two pools:
 
-### A caveat for `flake:` packages in global-scope apps
+| Pool | Location | Holds | Scope |
+|---|---|---|---|
+| **app-global** | `<data>/apps/<name>/home/.local/share/mise` | the app's own `[packages] mise:` tools | shared across projects |
+| **per-project** | `<data>/projects/<id>/apps/<name>/mise` | the agent's `nix:`-via-mise self-equips and the project's `mise.toml` tools | per-project, `/nix`-aligned |
 
-The same misalignment hits an in-cage-built package. A `flake:` package (and an inline
-`[flakes.<name>]`) builds in the cage, and its output lands in the **launching project's**
-per-project store — only a symlink to it is kept in the home. So a `"global"`-scope app
-launched from a **new** project finds that warm symlink pointing at a store path absent
-from the new project's `/nix`, and **rebuilds** on first launch there (minutes; a hard
-failure if offline). This is unlike a `nix:` package, which builds into the **shared**
-store and is re-seeded into each project offline — so a `nix:` tool never rebuilds in a
-fresh project. The mitigation is again `home_scope = "project"`: the home and the
-per-project store are then aligned, so a flake built in a project stays reachable there.
+So when a global app runs `mise use nix:<tool>` in project A, the install lands in A's
+per-project pool (aligned with A's `/nix`). In project B, mise correctly sees it as
+not-installed and rebuilds into B's store — a **clean per-project rebuild**, not a stale
+app-global record pointing at A's store (the "active but absent" failure this split
+removes). The app's own `[packages] mise:` tools stay in the shared app-global pool
+(installed once, reused everywhere). [`sbx app show <name>`](../cli/app.md#inspecting-an-app)
+surfaces both — the app-global tools under `disk`, the per-project self-equips under
+`per-project self-equips`.
+
+This is **automatic** — no config field, and it applies only to a `"global"`-scope app (a
+`"project"`-scope app already roots its mise data under its per-project home). One residual
+is inherent: the activation record stays app-global, so a `nix:` self-equip is re-evaluated
+per project and rebuilds on first launch there — cheap when the project's shared `/nix`
+already holds the built path (a store cache hit), a real rebuild only when it does not (and
+a hard failure offline on that first launch). The credentials/login/identity you chose
+`"global"` *for* persist correctly. `home_scope = "project"` avoids even the re-evaluation
+by aligning the home with the per-project store from the start.
+
+> **Avoid `mise:nix:<pkg>` in an app's `[packages]`.** Routing a `nix:` package through the
+> mise backend pins its install record in the app-global pool while its `/nix` store path is
+> per-project — the very misalignment above. Declare it as plain [`nix:<pkg>`](../configuration/packages.md)
+> instead: a `nix:` package is host-provisioned and seeded into each project's store, aligned
+> by construction. sbx warns when a global app declares `mise:nix:`.
+
+### A caveat for inline `[flakes]` in global-scope apps
+
+A remote `flake:` package **no longer** has this problem: it builds **host-side** into the
+shared store and is re-seeded into each project offline, exactly like a `nix:` tool — so a
+`"global"`-scope app's `flake:` package never rebuilds in a fresh project.
+
+An inline [`[flakes.<name>]`](../configuration/packages.md#flakes--an-inline-nix-flake) still
+builds **in the cage** (it is local content, which cannot be built host-side), and its output
+lands in the **launching project's** per-project store — only a symlink to it is kept in the
+home. So a `"global"`-scope app carrying an inline flake, launched from a **new** project, finds
+that warm symlink pointing at a store path absent from the new project's `/nix`, and **rebuilds**
+on first launch there (a hard failure if offline). The mitigation is again `home_scope =
+"project"`, which aligns the home with the per-project store; or, when the tool is available as
+a remote flake, prefer a `flake:<ref>` (host-side, seeded like `nix:`).
 
 ## Inspecting a running app
 
