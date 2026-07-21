@@ -172,7 +172,7 @@ pub(crate) fn dir_digest(root: &Path) -> Result<[u8; 32], String> {
         h.update([if *exec { b'1' } else { b'0' }]);
         h.update([0u8]);
         h.update(file_hash);
-        h.update([b'\n']);
+        h.update(*b"\n");
     }
     Ok(h.finalize().into())
 }

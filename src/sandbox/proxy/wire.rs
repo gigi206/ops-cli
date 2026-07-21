@@ -203,7 +203,7 @@ pub(super) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<V
         r.read_exact(&mut buf[start..])?;
         let mut crlf = [0u8; 2];
         r.read_exact(&mut crlf)?;
-        if crlf != [b'\r', b'\n'] {
+        if crlf != *b"\r\n" {
             return Err(invalid("chunk data not followed by CRLF"));
         }
     }
