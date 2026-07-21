@@ -12,11 +12,17 @@
 min_version = "2024.12.0"
 
 [tools]
+# The COMPLETE build toolchain, declared here so `mise install` gives every contributor
+# exactly what `mise run build`/`mise run ci` need — with no dependence on a personal
+# rustup install or a `~/.cargo/bin` on PATH. rust supplies cargo/rustc; without it, the
+# build task's `cargo` would have to come from each machine's own setup (which is how it
+# silently breaks). Pinned for reproducibility; bump deliberately.
+rust                            = "1.96.0"
 # The shipping binary is a static musl build; some dependencies carry C/asm, so
 # the musl target needs a musl-targeting C compiler. zig provides a self-contained
 # musl cross-cc and cargo-zigbuild wires it into cargo — no system musl-gcc package
 # required. Build with:
-#   mise exec -- cargo zigbuild --release --target x86_64-unknown-linux-musl
+#   mise run build   # == cargo zigbuild --release --target x86_64-unknown-linux-musl
 zig                             = "latest"
 "github:rust-cross/cargo-zigbuild" = "latest"
 
