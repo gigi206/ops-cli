@@ -4,6 +4,7 @@
 
 pub(crate) mod doctor;
 pub(crate) mod gc;
+pub(crate) mod projects;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod trust;
