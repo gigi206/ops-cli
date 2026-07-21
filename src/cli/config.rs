@@ -12,11 +12,11 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{config, diag, help, style, trust};
-use crate::{
-    config_cwd, net_mode_word, render_config_unchanged, render_config_write,
-    render_trusted_whole_file, short_rev, split_scope, ScopeArgs,
+use crate::cli::confirm::{
+    render_config_unchanged, render_config_write, render_trusted_whole_file,
 };
+use crate::{config, diag, help, style, trust};
+use crate::{config_cwd, net_mode_word, short_rev, split_scope, ScopeArgs};
 
 /// `sbx config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
 /// shows the resolved configuration for the current project — the layered global + project

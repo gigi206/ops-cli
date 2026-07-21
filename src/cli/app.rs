@@ -9,9 +9,10 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::cli::confirm::{render_app_exported, render_app_imported, render_removed};
 use crate::{
     build_override, config_cwd, egress_write_target, flag_name, net_mode_word, persist_egress_rule,
-    render_app_exported, render_app_imported, render_removed, take_override_flag,
+    take_override_flag,
 };
 use crate::{config, diag, help, sandbox, session, store, style, trust};
 

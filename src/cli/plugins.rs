@@ -9,11 +9,11 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{diag, help, plugin_store, plugins, store, stores, style};
-use crate::{
+use crate::cli::confirm::{
     render_plugin_installed, render_publish_key_warning, render_published, render_removed,
     render_store_configured, render_store_tofu, render_store_updated,
 };
+use crate::{diag, help, plugin_store, plugins, store, stores, style};
 
 /// `sbx plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
 /// — it reads `<data>/plugins`, not a project's `.sbx.toml`. A read-only diagnostic for now;
