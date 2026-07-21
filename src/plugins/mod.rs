@@ -19,6 +19,12 @@
 //! reserved or ill-formed scheme, or two plugins claiming one scheme drops the offending
 //! plugin(s) with a warning — never a failed launch, and never a silently-honored bad plugin.
 
+/// The remote signed-store subsystem lives alongside the registry: [`catalogue`] is the
+/// offline Ed25519 trust core, and [`stores`] is the impure git-driven fetch/verify/cache
+/// shell around it.
+pub(crate) mod catalogue;
+pub(crate) mod stores;
+
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -443,7 +449,7 @@ pub(crate) fn install(layout: &crate::store::Layout, source: &Path) -> Result<In
 /// scheme it advertised (`expected_scheme`) — or the install is refused fail-closed, so a catalogue
 /// that misrepresents what it pins can never install something other than what was listed. The
 /// content itself was already pinned to the catalogue by the caller's
-/// [`crate::plugin_store::verify_entry`]; this adds the identity half of that reconciliation. The
+/// [`crate::plugins::catalogue::verify_entry`]; this adds the identity half of that reconciliation. The
 /// store checkout's file modes (umask-dependent after a `git` fetch) are canonicalized during the
 /// install, so the placed plugin's permissions are deterministic regardless of how it was fetched.
 pub(crate) fn install_from_store(

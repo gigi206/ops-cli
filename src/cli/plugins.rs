@@ -13,7 +13,8 @@ use crate::cli::confirm::{
     render_plugin_installed, render_publish_key_warning, render_published, render_removed,
     render_store_configured, render_store_tofu, render_store_updated,
 };
-use crate::{diag, help, plugin_store, plugins, store, stores, style};
+use crate::plugins::{catalogue, stores};
+use crate::{diag, help, plugins, store, style};
 
 /// `sbx plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
 /// — it reads `<data>/plugins`, not a project's `.sbx.toml`. A read-only diagnostic for now;
@@ -264,7 +265,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                 let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
                 eprintln!(
                     "{}",
-                    render_store_tofu(&plugin_store::to_hex(&added.pubkey), &added.name, &epal)
+                    render_store_tofu(&catalogue::to_hex(&added.pubkey), &added.name, &epal)
                 );
             }
             let cat = &added.catalogue;
@@ -347,7 +348,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             // line's palette is decided from the stream it actually goes to.
             let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
             eprintln!("{}", render_publish_key_warning(Path::new(key), &epal));
-            let pubkey = plugin_store::to_hex(&published.pubkey);
+            let pubkey = catalogue::to_hex(&published.pubkey);
             let plugins: Vec<(&str, &str)> = published
                 .plugins
                 .iter()
@@ -497,7 +498,7 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     println!("{h}store{r} {n}'{}'{r}", cfg.name);
     println!("  url:      {}", cfg.url);
-    println!("  key:      {}", plugin_store::to_hex(&cfg.pubkey));
+    println!("  key:      {}", catalogue::to_hex(&cfg.pubkey));
     println!(
         "  trust:    {}",
         if cfg.tofu {

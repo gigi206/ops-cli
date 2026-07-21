@@ -15,13 +15,11 @@ mod help;
 mod observe;
 mod pathfind;
 mod paths;
-mod plugin_store;
 mod plugins;
 mod proc_policy;
 mod sandbox;
 mod session;
 mod store;
-mod stores;
 mod style;
 #[cfg(test)]
 mod testutil;

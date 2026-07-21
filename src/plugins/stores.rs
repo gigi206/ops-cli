@@ -2,7 +2,7 @@
 //!
 //! A remote plugin store is a git repository whose root carries a signed `catalogue.toml`
 //! (and a detached `catalogue.toml.sig`) plus the plugin directories the catalogue pins.
-//! This module is the impure shell around [`crate::plugin_store`]'s pure trust core: it
+//! This module is the impure shell around [`crate::plugins::catalogue`]'s pure trust core: it
 //! drives `git` to fetch a store, verifies the catalogue's Ed25519 signature against the
 //! store's configured public key, and — only on success — caches the result under
 //! `<data>/stores/<name>/`, where it is trusted by location (owner-only, a project cannot
@@ -46,7 +46,7 @@ const GITATTRIBUTES: &str = ".gitattributes";
 #[derive(Debug)]
 pub(crate) struct Added {
     pub(crate) name: String,
-    pub(crate) catalogue: crate::plugin_store::Catalogue,
+    pub(crate) catalogue: crate::plugins::catalogue::Catalogue,
     pub(crate) pubkey: [u8; 32],
     pub(crate) tofu: bool,
 }
@@ -141,7 +141,8 @@ fn add_inner(
     // cached, so a later read of the cache can trust it by location.
     let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
     let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
-    let catalogue = crate::plugin_store::verified_catalogue(&catalogue_bytes, &signature, &pubkey)?;
+    let catalogue =
+        crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &pubkey)?;
 
     // The cached tree is a plain content tree, not a working git repository — drop the
     // `.git` directory so no git metadata (or hooks) sits in the trusted data dir; the next
@@ -278,11 +279,12 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             .to_str()
             .ok_or_else(|| format!("plugin `{}` has a non-UTF-8 path", p.name))?
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let sha256 = crate::plugin_store::to_hex(&crate::plugin_store::dir_digest(&p.dir)?);
+        let sha256 =
+            crate::plugins::catalogue::to_hex(&crate::plugins::catalogue::dir_digest(&p.dir)?);
         listing.push((p.name.clone(), p.scheme.clone()));
         entries.insert(
             p.name.clone(),
-            crate::plugin_store::CatalogueEntry {
+            crate::plugins::catalogue::CatalogueEntry {
                 scheme: p.scheme.clone(),
                 version: p.version.clone().unwrap_or_default(),
                 description: p.description.clone().unwrap_or_default(),
@@ -296,15 +298,15 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
         Some(r) => r,
         None => next_rev(&dir)?,
     };
-    let catalogue = crate::plugin_store::Catalogue {
+    let catalogue = crate::plugins::catalogue::Catalogue {
         rev,
         plugins: entries,
     };
-    let bytes = crate::plugin_store::serialize_catalogue(&catalogue)?;
+    let bytes = crate::plugins::catalogue::serialize_catalogue(&catalogue)?;
 
     // The bytes we are about to sign must parse back to the very catalogue we built, so a publish
     // never emits a listing our own verifier would reject.
-    let reparsed = crate::plugin_store::Catalogue::parse(bytes.as_bytes())
+    let reparsed = crate::plugins::catalogue::Catalogue::parse(bytes.as_bytes())
         .map_err(|e| format!("internal error: produced an unparseable catalogue: {e}"))?;
     if reparsed != catalogue {
         return Err(
@@ -328,11 +330,15 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
     overwrite(&dir.join(CATALOGUE), bytes.as_bytes())?;
     overwrite(
         &dir.join(CATALOGUE_SIG),
-        format!("{}\n", crate::plugin_store::to_hex(signature.as_ref())).as_bytes(),
+        format!(
+            "{}\n",
+            crate::plugins::catalogue::to_hex(signature.as_ref())
+        )
+        .as_bytes(),
     )?;
     overwrite(
         &dir.join(REPO_PUBKEY),
-        crate::plugin_store::to_hex(&pubkey).as_bytes(),
+        crate::plugins::catalogue::to_hex(&pubkey).as_bytes(),
     )?;
     // git must deliver the signed bytes verbatim: `* -text` disables end-of-line conversion so the
     // catalogue a consumer clones is byte-identical to the one signed here. (sbx's own fetch also
@@ -374,7 +380,7 @@ fn subdirs_without_manifest(plugins_dir: &Path) -> Result<Vec<String>, String> {
 fn next_rev(dir: &Path) -> Result<u64, String> {
     match std::fs::read(dir.join(CATALOGUE)) {
         Ok(bytes) => {
-            let existing = crate::plugin_store::Catalogue::parse(&bytes).map_err(|e| {
+            let existing = crate::plugins::catalogue::Catalogue::parse(&bytes).map_err(|e| {
                 format!(
                     "cannot determine the next revision: the existing `{CATALOGUE}` does not parse \
                      ({e}) — pass an explicit `--rev`"
@@ -534,12 +540,12 @@ pub(crate) fn list(layout: &crate::store::Layout) -> Vec<String> {
 pub(crate) fn cached_catalogue(
     layout: &crate::store::Layout,
     name: &str,
-) -> Result<crate::plugin_store::Catalogue, String> {
+) -> Result<crate::plugins::catalogue::Catalogue, String> {
     crate::plugins::validate_install_name(name)?;
     let path = layout.store_path(name).join(CHECKOUT).join(CATALOGUE);
     let bytes = std::fs::read(&path)
         .map_err(|e| format!("cannot read the cached catalogue of store `{name}`: {e}"))?;
-    crate::plugin_store::Catalogue::parse(&bytes)
+    crate::plugins::catalogue::Catalogue::parse(&bytes)
 }
 
 /// Install a resolver plugin from a configured store by name, gated by the catalogue's per-plugin
@@ -597,7 +603,7 @@ pub(crate) fn install_plugin(
 
     // The content gate: the directory must reproduce the digest the signed catalogue pinned, so the
     // bytes about to be installed are exactly what was listed and signed.
-    crate::plugin_store::verify_entry(entry, &plugin_dir)?;
+    crate::plugins::catalogue::verify_entry(entry, &plugin_dir)?;
 
     crate::plugins::install_from_store(layout, &plugin_dir, plugin_name, &entry.scheme)
 }
@@ -609,7 +615,7 @@ pub(crate) struct Updated {
     pub(crate) name: String,
     pub(crate) old_rev: u64,
     pub(crate) new_rev: u64,
-    pub(crate) catalogue: crate::plugin_store::Catalogue,
+    pub(crate) catalogue: crate::plugins::catalogue::Catalogue,
 }
 
 /// Re-fetch a configured store and atomically replace its cache, enforcing two invariants the
@@ -643,7 +649,7 @@ pub(crate) fn update(
     let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
     let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
     let catalogue =
-        crate::plugin_store::verified_catalogue(&catalogue_bytes, &signature, &cfg.pubkey)?;
+        crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &cfg.pubkey)?;
 
     if catalogue.rev < cfg.locked_rev {
         return Err(format!(
@@ -795,7 +801,7 @@ pub(crate) fn parse_pubkey_arg(arg: &str) -> Result<[u8; 32], String> {
 /// Decode a hex string into a 32-byte Ed25519 public key, fail-closed on bad hex or the wrong
 /// length. Shared by the `--key` argument and the pinned key read back from a store's cache.
 fn decode_key(hex: &str) -> Result<[u8; 32], String> {
-    let bytes = crate::plugin_store::decode_hex(hex)
+    let bytes = crate::plugins::catalogue::decode_hex(hex)
         .map_err(|e| format!("the public key is not valid hex: {e}"))?;
     bytes.try_into().map_err(|b: Vec<u8>| {
         format!(
@@ -856,7 +862,7 @@ fn read_signature(path: &Path) -> Result<Vec<u8>, String> {
     )?;
     let text =
         String::from_utf8(bytes).map_err(|_| format!("the `{CATALOGUE_SIG}` is not valid text"))?;
-    crate::plugin_store::decode_hex(&text)
+    crate::plugins::catalogue::decode_hex(&text)
         .map_err(|e| format!("the catalogue signature is not valid hex: {e}"))
 }
 
@@ -892,7 +898,7 @@ fn store_toml(url: &str, pubkey: &[u8; 32], tofu: bool) -> String {
     let url = url.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
         "url = \"{url}\"\npubkey = \"{}\"\ntrust = \"{}\"\n",
-        crate::plugin_store::to_hex(pubkey),
+        crate::plugins::catalogue::to_hex(pubkey),
         if tofu { "tofu" } else { "pinned" }
     )
 }
@@ -947,7 +953,7 @@ impl Drop for Stage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin_store::{dir_digest, to_hex};
+    use crate::plugins::catalogue::{dir_digest, to_hex};
     use std::os::unix::fs::PermissionsExt;
 
     fn keypair() -> Ed25519KeyPair {
@@ -1799,11 +1805,11 @@ mod tests {
 
         // Read the artifacts back from disk — exactly what a consumer fetches.
         let cat_bytes = std::fs::read(repo.path().join(CATALOGUE)).unwrap();
-        let sig = crate::plugin_store::decode_hex(
+        let sig = crate::plugins::catalogue::decode_hex(
             &std::fs::read_to_string(repo.path().join(CATALOGUE_SIG)).unwrap(),
         )
         .unwrap();
-        let pubkey: [u8; 32] = crate::plugin_store::decode_hex(
+        let pubkey: [u8; 32] = crate::plugins::catalogue::decode_hex(
             &std::fs::read_to_string(repo.path().join(REPO_PUBKEY)).unwrap(),
         )
         .unwrap()
@@ -1816,11 +1822,11 @@ mod tests {
         // Verify with the pubkey *from disk*, then check each plugin's pin against its subdirectory:
         // the full consumer chain, which only passes if signer and verifier share one digest and
         // one serialization (the anti-drift guarantee).
-        let cat = crate::plugin_store::verified_catalogue(&cat_bytes, &sig, &pubkey).unwrap();
+        let cat = crate::plugins::catalogue::verified_catalogue(&cat_bytes, &sig, &pubkey).unwrap();
         assert_eq!(cat.rev, 3);
         assert_eq!(cat.plugins.len(), 2);
         for entry in cat.plugins.values() {
-            crate::plugin_store::verify_entry(entry, &repo.path().join(&entry.path)).unwrap();
+            crate::plugins::catalogue::verify_entry(entry, &repo.path().join(&entry.path)).unwrap();
         }
 
         // The end-of-line guard that keeps the signed bytes byte-exact across a clone is shipped.
