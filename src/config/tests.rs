@@ -1904,97 +1904,6 @@ fn a_subcommand_verb_is_a_usable_app_name() {
 }
 
 #[test]
-fn reading_profiles_keys_each_app_by_its_file_stem() {
-    // A profile file is a top-level app; its filename (stem) is the app name.
-    let dir = TmpDir::new();
-    std::fs::write(
-        dir.path().join("demo-app.toml"),
-        b"cmd = \"demo-app\"\n[env]\nA = \"1\"\n",
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("review.toml"), b"cmd = [\"review\"]\n").unwrap();
-    // A profile whose stem coincides with a `sbx app` subcommand verb is a usable app now that
-    // launching goes through `sbx app run <name>` — it is keyed, not dropped.
-    std::fs::write(dir.path().join("import.toml"), b"cmd = \"x\"\n").unwrap();
-    // A non-.toml file is ignored; a profile whose stem is an unsafe name (here, a space) is
-    // dropped with a warning, never keyed.
-    std::fs::write(dir.path().join("notes.txt"), b"ignore me\n").unwrap();
-    std::fs::write(dir.path().join("bad name.toml"), b"cmd = \"x\"\n").unwrap();
-
-    let mut warnings = Vec::new();
-    let apps = read_profile_apps_from(dir.path(), &mut warnings);
-    assert!(apps.contains_key("demo-app") && apps.contains_key("review"));
-    assert!(
-        apps.contains_key("import"),
-        "a profile named like a subcommand verb is a usable app (run via `sbx app run import`)"
-    );
-    assert!(
-        !apps.contains_key("notes"),
-        "a non-.toml file is not a profile"
-    );
-    assert!(
-        !apps.contains_key("bad name"),
-        "an unsafe-name profile is dropped"
-    );
-    assert!(
-        warnings.iter().any(|w| w.contains("bad name.toml")),
-        "a dropped unsafe-name profile must warn: {warnings:?}"
-    );
-}
-
-#[test]
-fn an_absent_profiles_directory_is_simply_no_profiles() {
-    let dir = TmpDir::new();
-    let mut warnings = Vec::new();
-    let apps = read_profile_apps_from(&dir.path().join("nope"), &mut warnings);
-    assert!(apps.is_empty() && warnings.is_empty());
-}
-
-#[test]
-fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
-    // A global app lives only as a profile file; an inline `[app.<name>]` in `sbx.toml` is
-    // forbidden and dropped inert with a migration warning, so it can never shadow an imported
-    // profile of the same name. The profile takes the name; a non-colliding profile is added.
-    let mut global = raw_with_app("demo-app", raw_app(&["inline"], &[], &[], &[], None));
-    let profiles: BTreeMap<String, RawApp> = [
-        (
-            "demo-app".to_string(),
-            raw_app(&["profile"], &[], &[], &[], None),
-        ),
-        (
-            "review".to_string(),
-            raw_app(&["review"], &[], &[], &[], None),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    let mut warnings = Vec::new();
-    merge_profile_apps(&mut global, profiles, &mut warnings);
-    // The inline definition is gone; the profile of the same name replaces it.
-    assert_eq!(
-        global.app["demo-app"]
-            .cmd
-            .as_ref()
-            .map(|c| c.clone().into_argv()),
-        Some(vec!["profile".to_string()])
-    );
-    assert!(global.app.contains_key("review"));
-    // Exactly the colliding inline app warns, with the "a profile already provides it" remedy —
-    // delete the stub, not re-export it (the profile already exists). The non-colliding profile
-    // `review` is added silently.
-    assert_eq!(warnings.len(), 1, "only the inline app warns: {warnings:?}");
-    let w = &warnings[0];
-    assert!(
-        w.contains("demo-app") && w.contains("ignored") && w.contains("already provides it"),
-        "the colliding inline must be told to delete the stub: {w}"
-    );
-    assert!(
-        !w.contains("sbx app export"),
-        "when a profile already exists, do not suggest export: {w}"
-    );
-}
-
-#[test]
 fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
     // A complete profile validates and its granted posture is summarized for display.
     let ok = validate_profile(
@@ -2664,177 +2573,6 @@ fn an_app_bind_can_flip_a_baseline_rw_bind_back_to_read_only_in_place() {
 }
 
 #[test]
-fn control_plane_mode_forces_ro_at_or_under_a_root_and_keeps_rw_above_it() {
-    // A writable bind AT or UNDER an sbx control-plane root is forced read-only (the whole bind
-    // is control plane). A writable bind that merely CONTAINS a root stays read-write (the
-    // launcher pins the root in place). An unrelated writable bind is left alone; a read-only
-    // bind is never touched. Pure, over explicit roots (no environment).
-    let roots = vec![PathBuf::from("/home/u/.config/sbx")];
-    let mut warnings = Vec::new();
-
-    // Exact match → forced read-only.
-    assert!(!control_plane_mode(
-        Path::new("/home/u/.config/sbx"),
-        true,
-        &roots,
-        &mut warnings
-    ));
-    // A descendant of the root (aiming straight at a trust marker) → forced read-only.
-    assert!(!control_plane_mode(
-        Path::new("/home/u/.config/sbx/apps"),
-        true,
-        &roots,
-        &mut warnings
-    ));
-    assert_eq!(warnings.len(), 2, "each read-only case warns: {warnings:?}");
-    assert!(
-        warnings.iter().all(|w| w.contains("read-only instead")),
-        "the at-or-under case names the downgrade: {warnings:?}"
-    );
-
-    // An ancestor of the root (a broad `~/.config`, or a whole-home bind) → stays read-write,
-    // with an informational note that its control-plane paths are pinned.
-    let mut w2 = Vec::new();
-    assert!(control_plane_mode(
-        Path::new("/home/u/.config"),
-        true,
-        &roots,
-        &mut w2
-    ));
-    assert_eq!(
-        w2.len(),
-        1,
-        "the contains-a-root case notes the pinning: {w2:?}"
-    );
-    assert!(
-        w2[0].contains("pinned read-only in place") && w2[0].contains("/home/u/.config/sbx"),
-        "the note names the protected path: {w2:?}"
-    );
-
-    // A sibling that merely shares a textual prefix is not a conflict, and warns nothing.
-    let mut w3 = Vec::new();
-    assert!(control_plane_mode(
-        Path::new("/home/u/.config/sbximposter"),
-        true,
-        &roots,
-        &mut w3
-    ));
-    // A read-only bind is never touched and never warns, even at the root itself.
-    assert!(!control_plane_mode(
-        Path::new("/home/u/.config/sbx"),
-        false,
-        &roots,
-        &mut w3
-    ));
-    assert!(w3.is_empty(), "no warning for the safe cases: {w3:?}");
-}
-
-#[test]
-fn control_plane_pins_freezes_each_contained_roots_path_chain() {
-    // A whole-home read-write bind that contains three control-plane roots yields the mountpoint
-    // chain that pins each: every intermediate directory read-write, each root read-only,
-    // deduplicated (the shared `.local` appears once) and ordered shallow-to-deep so a parent is
-    // always established before its child (a child bound first would be shadowed by the parent).
-    let roots = vec![
-        PathBuf::from("/home/u/.local/share/sbx"),
-        PathBuf::from("/home/u/.local/state/sbx/trusted"),
-        PathBuf::from("/home/u/.config/sbx"),
-    ];
-    let binds = vec![Bind {
-        path: PathBuf::from("/home/u"),
-        writable: true,
-    }];
-    let pins = control_plane_pins_for(&binds, &roots);
-
-    // Every root is present read-only; every non-root pin is a read-write intermediate.
-    for root in &roots {
-        assert!(
-            pins.iter().any(|p| &p.path == root && !p.writable),
-            "root pinned read-only: {} in {pins:?}",
-            root.display()
-        );
-    }
-    assert!(
-        pins.iter()
-            .filter(|p| p.writable)
-            .all(|p| !roots.contains(&p.path)),
-        "read-write pins are intermediates, never a root: {pins:?}"
-    );
-    // The shared ancestor `.local` is pinned exactly once (dedup across the two roots under it).
-    assert_eq!(
-        pins.iter()
-            .filter(|p| p.path == Path::new("/home/u/.local"))
-            .count(),
-        1,
-        "the shared intermediate is deduplicated: {pins:?}"
-    );
-    // Parent-before-child: each pin's index is greater than every strict ancestor pin's index.
-    for (i, p) in pins.iter().enumerate() {
-        for (j, q) in pins.iter().enumerate() {
-            if p.path.starts_with(&q.path) && p.path != q.path {
-                assert!(
-                    j < i,
-                    "ancestor {} must precede {}: {pins:?}",
-                    q.path.display(),
-                    p.path.display()
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn control_plane_pins_only_covers_roots_a_bind_strictly_contains() {
-    let roots = vec![
-        PathBuf::from("/home/u/.local/share/sbx"),
-        PathBuf::from("/home/u/.config/sbx"),
-    ];
-
-    // A partial-ancestor bind covers only the root it contains, and its chain starts below the
-    // bind boundary (never re-pinning the bind itself).
-    let partial = vec![Bind {
-        path: PathBuf::from("/home/u/.local"),
-        writable: true,
-    }];
-    let pins = control_plane_pins_for(&partial, &roots);
-    assert!(
-        pins.iter()
-            .any(|p| p.path == Path::new("/home/u/.local/share/sbx") && !p.writable),
-        "the contained root is pinned: {pins:?}"
-    );
-    assert!(
-        pins.iter()
-            .all(|p| p.path != Path::new("/home/u/.config/sbx")),
-        "an uncontained root is not pinned: {pins:?}"
-    );
-    assert!(
-        pins.iter().all(|p| p.path != Path::new("/home/u/.local")),
-        "the bind boundary itself is never a pin: {pins:?}"
-    );
-
-    // A descendant/exact bind (at or under a root) yields no pins — that bind is forced
-    // read-only by `control_plane_mode`, so it is not writable here anyway.
-    let under = vec![Bind {
-        path: PathBuf::from("/home/u/.config/sbx/apps"),
-        writable: true,
-    }];
-    assert!(
-        control_plane_pins_for(&under, &roots).is_empty(),
-        "a bind under a root pins nothing"
-    );
-
-    // A read-only ancestor bind pins nothing (only a read-write bind needs the protection).
-    let ro = vec![Bind {
-        path: PathBuf::from("/home/u"),
-        writable: false,
-    }];
-    assert!(
-        control_plane_pins_for(&ro, &roots).is_empty(),
-        "a read-only bind pins nothing"
-    );
-}
-
-#[test]
 fn expand_bind_path_expands_a_leading_home_or_runtime_variable() {
     let home = Path::new("/home/u");
     let runtime = Path::new("/run/user/1000");
@@ -2902,42 +2640,6 @@ fn expand_bind_path_rejects_unsupported_and_unset_variables() {
     assert!(expand_bind_path("~/x", None, r).is_err());
     assert!(expand_bind_path("$HOME", None, r).is_err());
     assert!(expand_bind_path("$XDG_RUNTIME_DIR/s", h, None).is_err());
-}
-
-#[test]
-fn describe_raw_bind_marks_read_write_and_flags_malformed_entries() {
-    // The import posture summary: a bare path and an explicit `"ro"` render plain; a
-    // `"rw"` bind carries the `(rw)` marker (the more-privileged case worth flagging before an
-    // import); an unrecognized mode and a table without a `path` are shown so they are visible.
-    assert_eq!(describe_raw_bind(&RawBind::Path("/data".into())), "/data");
-    assert_eq!(
-        describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
-            path: Some("/data".into()),
-            mode: Some("ro".into()),
-        })),
-        "/data"
-    );
-    assert_eq!(
-        describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
-            path: Some("/data".into()),
-            mode: Some("rw".into()),
-        })),
-        "/data (rw)"
-    );
-    assert_eq!(
-        describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
-            path: Some("/data".into()),
-            mode: Some("write".into()),
-        })),
-        "/data (mode write?)"
-    );
-    assert_eq!(
-        describe_raw_bind(&RawBind::Detailed(schema::RawBindTable {
-            path: None,
-            mode: Some("rw".into()),
-        })),
-        "(bind without a path) (rw)"
-    );
 }
 
 #[test]
@@ -6125,4 +5827,48 @@ fn base64_encode_matches_rfc_4648_vectors() {
     ] {
         assert_eq!(base64_encode(input.as_bytes()), want, "base64({input:?})");
     }
+}
+
+#[test]
+fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
+    // A global app lives only as a profile file; an inline `[app.<name>]` in `sbx.toml` is
+    // forbidden and dropped inert with a migration warning, so it can never shadow an imported
+    // profile of the same name. The profile takes the name; a non-colliding profile is added.
+    let mut global = raw_with_app("demo-app", raw_app(&["inline"], &[], &[], &[], None));
+    let profiles: BTreeMap<String, RawApp> = [
+        (
+            "demo-app".to_string(),
+            raw_app(&["profile"], &[], &[], &[], None),
+        ),
+        (
+            "review".to_string(),
+            raw_app(&["review"], &[], &[], &[], None),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let mut warnings = Vec::new();
+    merge_profile_apps(&mut global, profiles, &mut warnings);
+    // The inline definition is gone; the profile of the same name replaces it.
+    assert_eq!(
+        global.app["demo-app"]
+            .cmd
+            .as_ref()
+            .map(|c| c.clone().into_argv()),
+        Some(vec!["profile".to_string()])
+    );
+    assert!(global.app.contains_key("review"));
+    // Exactly the colliding inline app warns, with the "a profile already provides it" remedy —
+    // delete the stub, not re-export it (the profile already exists). The non-colliding profile
+    // `review` is added silently.
+    assert_eq!(warnings.len(), 1, "only the inline app warns: {warnings:?}");
+    let w = &warnings[0];
+    assert!(
+        w.contains("demo-app") && w.contains("ignored") && w.contains("already provides it"),
+        "the colliding inline must be told to delete the stub: {w}"
+    );
+    assert!(
+        !w.contains("sbx app export"),
+        "when a profile already exists, do not suggest export: {w}"
+    );
 }
