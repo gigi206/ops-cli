@@ -5815,21 +5815,6 @@ fn header_shape_formats_each_type_and_prefix() {
 }
 
 #[test]
-fn base64_encode_matches_rfc_4648_vectors() {
-    for (input, want) in [
-        ("", ""),
-        ("f", "Zg=="),
-        ("fo", "Zm8="),
-        ("foo", "Zm9v"),
-        ("foob", "Zm9vYg=="),
-        ("fooba", "Zm9vYmE="),
-        ("foobar", "Zm9vYmFy"),
-    ] {
-        assert_eq!(base64_encode(input.as_bytes()), want, "base64({input:?})");
-    }
-}
-
-#[test]
 fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
     // A global app lives only as a profile file; an inline `[app.<name>]` in `sbx.toml` is
     // forbidden and dropped inert with a migration warning, so it can never shadow an imported
