@@ -3,6 +3,7 @@
 //! parsing, orchestration, and output rendering.
 
 pub(crate) mod doctor;
+pub(crate) mod fs;
 pub(crate) mod gc;
 pub(crate) mod proc;
 pub(crate) mod projects;
