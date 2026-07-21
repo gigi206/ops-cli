@@ -8,6 +8,7 @@
 //! a weaker engine, because that would mean no security boundary at all.
 
 mod allowlist;
+mod cli;
 mod config;
 mod diag;
 mod help;
@@ -128,7 +129,7 @@ fn main() -> ExitCode {
             sandbox::run_mise(rest)
         }
         "app" => app_cmd(rest),
-        "search" => search_cmd(rest),
+        "search" => cli::search::run(rest),
         "test" => test_cmd(rest),
         "net" => net_cmd(rest),
         "proc" => proc_cmd(rest),
@@ -5429,39 +5430,6 @@ fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
 /// project can declare, by querying nixhub. Host-side and read-only — it resolves
 /// nothing into the sandbox and needs no trust gate (a discovery front-end, like a plain
 /// `nix search`). It needs nix only to ride its fetcher for the one network step.
-fn search_cmd(args: Vec<OsString>) -> ExitCode {
-    // The query is the first non-flag argument; any further words are ignored (nixhub
-    // matches a single token, so a multi-word search is pointless — quote a phrase to
-    // pass it as one argument if ever needed).
-    let query = args
-        .iter()
-        .filter_map(|a| a.to_str())
-        .find(|a| !a.starts_with('-'));
-    let Some(query) = query else {
-        eprintln!("sbx: usage: {}", help::synopsis("search"));
-        return ExitCode::from(2);
-    };
-    let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
-        return ExitCode::FAILURE;
-    };
-    let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        eprintln!("sbx: nix not found — `sbx search` needs it to query nixhub. See `sbx doctor`.");
-        return ExitCode::FAILURE;
-    };
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    match sandbox::search(&nix, &layout, query, &sandbox::current_system(), &pal) {
-        Ok(report) => {
-            print!("{report}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("sbx search: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 /// `sbx test <kind> <target>`: probe whether an access would be allowed and explain why —
 /// a diagnostic surface meant to grow with sbx's access controls (the network egress
 /// allowlist now; filesystem/Landlock access later). No launch, no nix, no network.
