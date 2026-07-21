@@ -1026,15 +1026,13 @@ pub(crate) fn provision(
 
 /// Like [`provision`], but permits an **unfree**-licensed attribute (a proprietary vendor
 /// binary packaged in nixpkgs — e.g. an agent CLI whose upstream ships closed-source
-/// releases). nixpkgs refuses to evaluate such a package unless allowed, so this passes
-/// `--impure` (nixpkgs reads the allow flag via `builtins.getEnv`, empty in pure mode) with
-/// `NIXPKGS_ALLOW_UNFREE=1`. `--impure` is a *global* evaluation switch, not a scoped one: it
-/// disables pure evaluation, so `builtins.getEnv` can read every inherited variable (not just
-/// this one) and eval may touch impure paths — nixpkgs simply happens to consult only
-/// `NIXPKGS_ALLOW_UNFREE`. The derivation stays pinned by `flake_ref#attr`, so the build
-/// *output* is as reproducible as the free path. The residual exposure: the shared
-/// `nix_command` environment is not cleared, so it is visible to `getEnv` during eval — latent,
-/// since this path is trusted-only (below) and runs against pinned nixpkgs.
+/// releases). nixpkgs refuses to evaluate such a package unless allowed, so this builds it
+/// through a **pure** expression that re-imports the pinned nixpkgs with a scoped
+/// `config.allowUnfree = true` (see [`provision_command`]) — *not* `--impure`. Evaluation
+/// therefore stays pure (`builtins.getEnv` reads nothing, no impure paths are touched) and the
+/// unfree allowance is confined to this one import rather than being a global switch. The
+/// resulting derivation is byte-identical to the `flake_ref#attr` build (same `.drv`), so the
+/// output is as reproducible as the free path — only the licence gate changes.
 ///
 /// Reachable **only** from the trusted-only `[packages]` `nix:` provisioning path (an
 /// untrusted project's `[packages]` are dropped before provisioning), never from the
@@ -1053,10 +1051,11 @@ pub(crate) fn provision_unfree(
     provision_licensed(nix, layout, gcroot, flake_ref, attr, marker, true)
 }
 
-/// Assemble (without spawning) the `nix build <flake_ref>#<attr>` invocation
-/// [`provision_licensed`] runs, so its argv/env — in particular the unfree `--impure` +
-/// `NIXPKGS_ALLOW_UNFREE` pair — is unit-testable without a real nix. Only stdout/stderr wiring
-/// is left to the caller.
+/// Assemble (without spawning) the `nix build` invocation [`provision_licensed`] runs, so its
+/// argv is unit-testable without a real nix. A free build selects `<flake_ref>#<attr>`
+/// positionally; an unfree build instead evaluates a **pure** `--expr` that re-imports the pinned
+/// nixpkgs with a scoped `config.allowUnfree = true` — no `--impure`. Only stdout/stderr wiring is
+/// left to the caller.
 fn provision_command(
     nix: &Path,
     layout: &Layout,
@@ -1066,23 +1065,30 @@ fn provision_command(
     allow_unfree: bool,
 ) -> Command {
     let mut cmd = nix_command(nix, layout);
-    if allow_unfree {
-        cmd.env("NIXPKGS_ALLOW_UNFREE", "1");
-    }
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
-        .arg("build");
-    if allow_unfree {
-        // `--impure` must follow the `build` subcommand (it is an evaluation flag). It disables
-        // pure evaluation globally — so `builtins.getEnv` can read the whole inherited
-        // environment, not only the `NIXPKGS_ALLOW_UNFREE` nixpkgs consults — but unpins nothing:
-        // the derivation is still fixed by `flake_ref#attr`.
-        cmd.arg("--impure");
-    }
-    cmd.args(["--option", "sandbox", "true"])
+        .arg("build")
+        .args(["--option", "sandbox", "true"])
         .arg("--out-link")
         .arg(gcroot)
-        .arg("--print-out-paths")
-        .arg(format!("{flake_ref}#{attr}"));
+        .arg("--print-out-paths");
+    if allow_unfree {
+        // Permit an unfree attribute by re-importing the PINNED nixpkgs with a scoped
+        // `config.allowUnfree = true`, evaluated purely — never `--impure`. `builtins.getFlake` on
+        // a locked ref (a rev) is pure; the system is passed explicitly, so no impure
+        // `builtins.currentSystem` is consulted; and the allowance is confined to this one import,
+        // not a global eval switch. The derivation is byte-identical to the `flake_ref#attr` build
+        // (same `.drv`), so nothing is unpinned — only the licence gate opens. `attr` is a dotted
+        // attr-path (`python3Packages.foo` → nested access, matching the flakeref `#attr` form); a
+        // segment containing `+` (which `is_valid_attr` admits) would parse here as the addition
+        // operator and fail the build — vanishingly rare for an unfree package, and fail-closed.
+        let system = format!("{}-linux", std::env::consts::ARCH);
+        cmd.arg("--expr").arg(format!(
+            "(import (builtins.getFlake \"{flake_ref}\").outPath \
+             {{ config.allowUnfree = true; system = \"{system}\"; }}).{attr}"
+        ));
+    } else {
+        cmd.arg(format!("{flake_ref}#{attr}"));
+    }
     cmd
 }
 
@@ -1450,16 +1456,23 @@ mod tests {
     }
 
     #[test]
-    fn provision_command_permits_unfree_only_when_asked() {
+    fn provision_command_permits_unfree_via_a_pure_expr_only_when_asked() {
         let layout = Layout::under(Path::new("/data/sbx"));
-        let unfree_env = |cmd: &Command| {
+        let has_env = |cmd: &Command| {
             cmd.get_envs()
-                .any(|(k, v)| k == OsStr::new("NIXPKGS_ALLOW_UNFREE") && v == Some(OsStr::new("1")))
+                .any(|(k, _)| k == OsStr::new("NIXPKGS_ALLOW_UNFREE"))
         };
         let has_impure = |cmd: &Command| cmd.get_args().any(|a| a == OsStr::new("--impure"));
+        // The single argument following `--expr`, if any.
+        let expr_arg = |cmd: &Command| -> Option<String> {
+            let args: Vec<_> = cmd.get_args().collect();
+            let i = args.iter().position(|a| *a == OsStr::new("--expr"))?;
+            args.get(i + 1).map(|a| a.to_string_lossy().into_owned())
+        };
 
-        // The unfree path carries both the `--impure` flag (after `build`) and the allow-env, so a
-        // proprietary nixpkgs attribute evaluates instead of being refused.
+        // The unfree path evaluates a PURE `--expr` that re-imports the pinned nixpkgs with a scoped
+        // `config.allowUnfree = true` — so a proprietary attribute evaluates instead of being
+        // refused — while carrying NEITHER `--impure` NOR the allow-env, so evaluation stays pure.
         let unfree = provision_command(
             Path::new("/nix"),
             &layout,
@@ -1469,20 +1482,31 @@ mod tests {
             true,
         );
         assert!(
-            unfree_env(&unfree),
-            "unfree build must set NIXPKGS_ALLOW_UNFREE"
+            !has_env(&unfree),
+            "unfree build must not set NIXPKGS_ALLOW_UNFREE"
         );
-        assert!(has_impure(&unfree), "unfree build must pass --impure");
-        let args: Vec<_> = unfree.get_args().collect();
-        let build = args.iter().position(|a| *a == OsStr::new("build")).unwrap();
-        let impure = args
-            .iter()
-            .position(|a| *a == OsStr::new("--impure"))
-            .unwrap();
-        assert!(impure > build, "--impure must follow the build subcommand");
+        assert!(
+            !has_impure(&unfree),
+            "unfree build must stay pure (no --impure)"
+        );
+        let expr = expr_arg(&unfree).expect("unfree build must select via --expr");
+        assert!(
+            expr.contains("config.allowUnfree = true")
+                && expr.contains("builtins.getFlake")
+                && expr.contains(").kiro-cli"),
+            "the expr must scope allowUnfree over the pinned flake's attr:\n{expr}"
+        );
+        // The positional `flake_ref#attr` installable must be absent — the expr is the installable.
+        assert!(
+            !unfree
+                .get_args()
+                .any(|a| a == OsStr::new("nixpkgs#kiro-cli")),
+            "unfree build must not also pass the positional installable"
+        );
 
-        // The free path (every base-userland / fonts / gpu provision) carries NEITHER, so nothing
-        // silently loosens the licence gate for sbx's own components.
+        // The free path (every base-userland / fonts / gpu provision) selects the positional
+        // `flake_ref#attr` with no `--expr`, no `--impure`, and no allow-env — nothing silently
+        // loosens the licence gate for sbx's own components.
         let free = provision_command(
             Path::new("/nix"),
             &layout,
@@ -1492,12 +1516,17 @@ mod tests {
             false,
         );
         assert!(
-            !unfree_env(&free),
+            !has_env(&free),
             "free build must not set NIXPKGS_ALLOW_UNFREE"
         );
         assert!(
             !has_impure(&free),
             "free build must stay pure (no --impure)"
+        );
+        assert!(expr_arg(&free).is_none(), "free build must not use --expr");
+        assert!(
+            free.get_args().any(|a| a == OsStr::new("nixpkgs#hello")),
+            "free build must select the positional installable"
         );
     }
 
