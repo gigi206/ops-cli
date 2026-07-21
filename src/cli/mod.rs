@@ -5,6 +5,7 @@
 pub(crate) mod doctor;
 pub(crate) mod fs;
 pub(crate) mod gc;
+pub(crate) mod plugins;
 pub(crate) mod proc;
 pub(crate) mod projects;
 pub(crate) mod search;
