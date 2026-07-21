@@ -6,54 +6,67 @@
 //! function of the Spec. So whatever reaches bubblewrap was declared in one
 //! place — a security review has a single surface to audit.
 
-mod appimage;
+// Launch core: the SandboxSpec -> bwrap-argv -> cage pipeline, plus the terminal.
 mod argv;
-mod attach;
-mod audio;
 mod binds;
-mod catrust;
-pub(crate) mod cgroup;
-mod contract;
-pub(crate) mod control;
-mod deb;
-pub(crate) mod egress;
-pub(crate) mod egress_stats;
 mod fhs;
+mod launch;
+mod naming;
+mod pty;
+mod smoke;
+mod spec;
+
+// Provisioning & packaging: the nix/mise engines, the package backends, the store.
+mod appimage;
+mod deb;
 mod flake;
 mod flake_inline;
-mod fonts;
-mod forward;
-pub(crate) mod fs_control;
-mod fs_watch;
-mod gc;
-mod gpu;
-mod guidata;
-pub(crate) mod inspect;
-mod launch;
 mod mise;
 mod miseplugin;
-mod naming;
-pub(crate) mod netlearn;
-mod netns;
 mod nixhub;
-mod notify_relay;
-mod observe_feed;
 mod packages;
-mod portal;
 mod prebuilt;
-pub(crate) mod proc_control;
-pub(crate) mod proc_enforce;
 mod projectstore;
-mod proxy;
-mod pty;
 mod resolve;
 mod resolver;
 mod search;
-pub(crate) mod seccomp;
-mod smoke;
-mod spec;
 mod tarball;
+
+// Network egress (Model B): empty netns -> in-cage forwarder -> host MITM proxy.
+mod contract;
+pub(crate) mod control;
+pub(crate) mod egress;
+pub(crate) mod egress_stats;
+mod forward;
+pub(crate) mod netlearn;
+mod netns;
+mod proxy;
+
+// In-cage enforcement: seccomp denylist, cgroup limits, exec policy.
+pub(crate) mod cgroup;
+pub(crate) mod proc_control;
+pub(crate) mod proc_enforce;
+pub(crate) mod seccomp;
+
+// Filesystem observability.
+pub(crate) mod fs_control;
+mod fs_watch;
+
+// Desktop / GUI holes: Wayland, GPU, audio, the D-Bus portal, theme/notifications.
+mod audio;
+mod catrust;
+mod fonts;
+mod gpu;
+mod guidata;
+mod notify_relay;
+mod portal;
 mod theme_relay;
+
+// Session lifecycle & introspection.
+mod attach;
+mod gc;
+pub(crate) mod inspect;
+mod observe_feed;
 
 pub(crate) use appimage::{
     pinned_hashes as appimage_pinned_hashes, upgrade_project as upgrade_appimage,
