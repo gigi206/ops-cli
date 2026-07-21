@@ -21,6 +21,7 @@ with `sbx app export <name>`.
 | ----------------- | ------------------------------------ | ----------------------- |
 | `claude-code`     | `mise:aqua:anthropics/claude-code`   | `api.anthropic.com`     |
 | `codex`           | `mise:aqua:openai/codex`             | `api.openai.com`        |
+| `kiro`            | `nix:kiro-cli` (nixpkgs native CLI — AWS's rebranded Amazon Q CLI; `unfree`) | `*.kiro.dev` services (browser login / BYOK) |
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
 | `opencode-web`    | `mise:opencode` (`opencode web` + `forward`) | provider-dependent |
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
@@ -186,6 +187,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | ------------- | -------------------------------------------- | ------------------------------ |
 | `claude-code` | `mise:aqua:anthropics/claude-code`           | Anthropic's standalone release |
 | `codex`       | `mise:aqua:openai/codex`                      | OpenAI's GitHub release        |
+| `kiro`        | `nix:kiro-cli`                               | nixpkgs' derivation of AWS's official Kiro CLI `.tar.gz` (native binary, `unfree`) |
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
 | `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
 | `opencode-desktop` | `deb:…/releases/latest/download/opencode-desktop-linux-amd64.deb` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side |

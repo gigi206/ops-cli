@@ -1,191 +1,238 @@
-# Kiro CLI — AWS's agentic coding CLI (Amazon Q Developer / Kiro), sandboxed by sbx.
+# Kiro CLI — AWS's agentic coding CLI (the rebranded Amazon Q Developer CLI), sandboxed by sbx.
 #
 #   sbx app import profiles/kiro.toml
-#   sbx app run kiro
+#   sbx app run kiro -- login --license free   # authenticate once (in-cage browser, see below)
+#   sbx app run kiro -- chat                    # agentic chat/coding mode (strict egress)
+#   sbx app run kiro                            # the CLI (kiro-cli)
 #
-# Kiro CLI is distributed for Linux as:
-#   - AppImage (non-Electron structure: usr/bin/kiro-cli, not resources/app.asar)
-#   - ZIP (kirocli-x86_64-linux.zip) with binaries in kirocli/bin/
+# Kiro CLI is a **native glibc terminal program** (a Rust TUI: kiro-cli + kiro-cli-chat +
+# kiro-cli-term) — NOT an Electron/Chromium app. It runs like any other CLI in the cage; the
+# in-cage Chromium below is used ONLY to complete the OAuth sign-in, never for daily runs.
 #
-# The `appimage:` backend expects Electron apps (resources/app.asar) and fails on
-# Kiro's native structure. The `tarball:` backend only accepts .tar.gz/.tgz URLs.
+# It is packaged from nixpkgs' own `kiro-cli` derivation (`nix:kiro-cli`): built host-side
+# into sbx's shared store (once, then seeded per project — no per-project rebuild of the
+# ~530 MB artifact), from the official vendor `.tar.gz` that nixpkgs pins and autoPatchelfs.
+# `kiro-cli` is proprietary (an `unfree` nixpkgs package); a `[packages]` declaration is
+# trusted-only, so sbx builds it. Its version tracks sbx's pinned nixpkgs channel and rolls
+# forward with `sbx upgrade nix`.
 #
-# This profile uses `tarball:resolve` with a custom resolve command that:
-#   1. Downloads the ZIP from AWS S3
-#   2. Extracts the `kiro-cli` binary
-#   3. Creates a minimal .tar.gz with structure electron_wrap expects:
-#        kiro/
-#          resources/app/     # empty dir (electron_wrap looks for this)
-#          kiro-cli           # binary at top level (electron_wrap finds first executable)
-#   4. Writes tarball to project dir (.sbx-kiro/), outputs file:// URL
-#      (host nix build can read project dir via bind mount)
+# ── LOGIN: the in-cage browser (default flow) ─────────────────────────────────────────────
+# `kiro-cli login` (without `--use-device-flow`) opens its sign-in page in a browser and then
+# waits on a `http://localhost:3128` OAuth callback. In a hermetic cage the host browser cannot
+# reach the CAGE's loopback, so the login happens IN the cage: kiro-cli opens the page by calling
+# `xdg-open <url>`, and the `cmd` preamble below wires an `xdg-open` that routes it to an **in-cage
+# Chromium**. You complete Google / GitHub / Builder ID sign-in in that Chromium; the redirect to
+# `http://localhost:3128` is a normal http URL Chromium follows back to kiro-cli's own in-cage
+# listener, so the whole flow closes inside the cage. The token persists in the app's isolated
+# `$HOME` — login is a one-time step.
 #
-# `sbx upgrade appimage` re-fetches the "latest" ZIP and rolls the pin forward.
+#     sbx app run kiro -- login --license free    # Builder ID / Google / GitHub
+#     sbx app run kiro -- login --license pro     # enterprise Identity Center
 #
-# Authentication (multiple providers, browser-based by default):
-#   - GitHub, Google, AWS Builder ID, AWS IAM Identity Center, External IdP
-#   Run `sbx app run kiro -- login` and follow the browser flow. The token
-#   persists in the app's isolated home (`~/.local/share/kiro-cli/`).
-#   For CI/headless: set $KIRO_API_KEY on the host and uncomment the
-#   [secret."runtime.*.kiro.dev"] block below (Pro/Pro+/Pro Max/Power only).
+# This works under the STRICT `deny` allowlist below — the `[network]` block already permits the
+# Kiro sign-in hosts AND the Google Sign-In chain (including the `accounts.google.<ccTLD>/SetSID`
+# cross-domain cookie step, the classic blank-SetSID-page blocker). GitHub / Builder ID sign-in
+# stay on their own domains and need even less. Once the token is persisted, daily use needs no
+# browser (`sbx app run kiro -- chat`; the token refresh hits the already-allowed `oidc.*`).
 #
-# Network: deny-by-default allowlist covering Kiro's service endpoints (new
-# kiro.dev endpoints + legacy q.amazonaws.com), auth/token exchange, telemetry,
-# and auto-update downloads. Browser-based sign-in opens app.kiro.dev on the
-# HOST (bypasses the cage) — the callback is local to the browser, so no
-# in-cage OAuth loopback or forward port is needed.
+# TWO ESCAPES if a login still stalls on a blank/partial page:
+#   * A refused host. Watch `sbx net log -a kiro --all` for a `denied-*` line and add it:
+#     `sbx net allow <host> -a kiro`. Chromium's own stderr is captured in `chromium-login.log`
+#     in the app home (path via `sbx app show kiro`) — read it to see what the page is waiting on.
+#   * `sbx app run kiro --net shared -- login …` — the host network, no allowlist at all, for the
+#     login only (you keep bubblewrap + seccomp + the isolated home + the minimal /dev). The token
+#     then persists, and daily use returns to the strict default.
+#
+# HONEST GATE (cannot be pre-verified): the in-cage Chromium is a fresh, cookie-less profile, and
+# some IdPs — Google in particular — may wall "unusual/insecure browser" or a 2FA step in exactly
+# this setup. The transport is proven; whether the IdP lets you finish is your account's call. If
+# Google balks, use GitHub or Builder ID, or the device flow (next section).
+#
+# ── LOGIN fallback: the device flow (no browser) ──────────────────────────────────────────
+# `--use-device-flow` polls instead of opening a browser — useful if the in-cage Chromium login
+# is blocked. kiro-cli prints ONLY a one-time CODE (`Confirm the following code in the browser`);
+# in the sandbox it does NOT print the verification URL and does NOT open a browser. Open the URL
+# yourself on the HOST and enter the code:
+#
+#     sbx app run kiro -- login --license free --use-device-flow
+#     Builder ID / Google / GitHub (`--license free`):  https://view.awsapps.com/start/#/device
+#     Identity Center (`--license pro`):                 your org's SSO start URL, #/device
+#
+# The device code expires in ~10 MINUTES. Open the URL and enter the code promptly. If the CLI
+# stays on `Logging in...` forever, the code was never confirmed in a browser (or has since
+# expired) — Ctrl-C and re-run login to get a fresh code, then open the URL right away.
+#
+# NOTE on port 3128: the OAuth callback binds `localhost:3128`. Under `--net shared` this is the
+# HOST loopback (3128 is squid's default port) — fine unless something already listens there;
+# under the strict default the cage has its own empty-netns loopback, so there is never a clash.
 cmd = [
+    "bash",
+    "-c",
+    '''
+set -e
+# kiro-cli's browser login opens its sign-in page via `xdg-open <url>`. The hermetic cage has no
+# xdg-open, so wire one that routes http(s) to an in-cage Chromium. `--no-sandbox`: sbx's build
+# strips the setuid bit off chrome-sandbox, so Chromium's own SUID sandbox would abort FATAL — the
+# cage (bubblewrap + seccomp + empty/host netns) IS the boundary. `--password-store=basic` avoids a
+# system-keyring dependency the hermetic cage does not provide.
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
+#!/bin/sh
+# Chromium stderr -> a log in the isolated home, so a stuck OAuth page (e.g. a blank Google
+# SetSID) can be diagnosed after the fact. Read it host-side: the app home is shown by
+# `sbx app show kiro` (…/apps/kiro/home/chromium-login.log).
+#   --use-system-ca: under the strict allowlist sbx runs a TLS-terminating MITM proxy and seeds
+#     its per-session CA into the cage's NSS store — Chromium must be told to consult it, else it
+#     rejects every HTTPS cert and the sign-in page never loads (a blank/spinning page).
+#   --disable-dev-shm-usage: route Chromium's shared memory to /tmp — the standard cage flag every
+#     working GUI profile carries.
+exec chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+  --use-system-ca --password-store=basic \
+  --no-first-run --no-default-browser-check "$@" 2>>"$HOME/chromium-login.log"
+WRAP
+chmod +x "$HOME/.local/bin/xdg-open"
+export PATH="$HOME/.local/bin:$PATH"
+exec kiro-cli "$@"
+''',
+    # `$0` placeholder: `sbx app run kiro -- <args>` appends <args> to this cmd array, so they
+    # arrive as `$1 $2 …` (this element fills `$0`) and reach kiro-cli verbatim via `exec … "$@"`.
     "kiro-cli",
-    "--no-sandbox",
-    "--ozone-platform=wayland",
-    "--disable-dev-shm-usage",
 ]
 
+# DISPLAY + GPU for the in-cage login browser. `gui = "wayland"` binds the host Wayland socket
+# (read-only) so the in-cage Chromium can map a window; `gpu = true` opens hardware-accelerated
+# rendering (mesa into sbx's store + the `/dev/dri` render node), without which a Wayland Chromium
+# never maps its window. No `dbus`: kiro-cli is a native CLI that calls `xdg-open` directly (not the
+# desktop portal `OpenURI`), so the private-portal hole is not needed here. Both are trusted-only
+# security fields, honored from this profile because it is trusted by location once imported.
 gui = "wayland"
 gpu = true
-dbus = true
+
+# Optional: share your host Kiro CLI state with the cage (read-write at its real path), instead
+# of the app's isolated home. `binds` is a security field, honored only from this trusted
+# profile. Uncomment to reuse a login you already did on the host. Must stay a top-level key
+# (before the first `[table]` header): written after a `[table]`, TOML would fold it into that
+# table (e.g. `network.binds`) and it would be silently ignored.
+#binds = [
+#    { path = "~/.local/share/kiro-cli", mode = "rw" },
+#    { path = "~/.aws", mode = "rw" },
+#]
 
 [packages]
-# Kiro CLI from AWS S3 "latest" ZIP via tarball:resolve auto-upgrade.
-# The resolve command downloads the ZIP, builds a compatible .tar.gz, and serves
-# it via a file:// URL from the project directory.
-kiro = "tarball:resolve"
+# Kiro CLI from nixpkgs (host-side, durable, offline-reusable after the first build). The
+# derivation fetches the official AWS `.tar.gz`, patchelfs the native binaries, and puts
+# kiro-cli / kiro-cli-chat / kiro-cli-term on PATH.
+kiro = "nix:kiro-cli"
 
-[tarball.kiro]
-# Resolve command: runs in a hermetic cage with network access, base tools, and
-# the project's nix: bins on PATH. Prints a file:// URL to stdout pointing to a
-# .tar.gz in the project directory (visible to host nix build).
-# Steps:
-#   1. Download the ZIP from AWS S3
-#   2. Extract the `kiro-cli` binary
-#   3. Create a minimal .tar.gz with structure electron_wrap expects:
-#        kiro/
-#          resources/app/     # empty dir (electron_wrap looks for this)
-#          kiro-cli           # binary at top level (electron_wrap finds first executable)
-#   4. Write tarball to project dir, output file:// URL
-resolve = [
-    "bash",
-    "-euo",
-    "pipefail",
-    "-c",
-    """
-set -euo pipefail
+# Chromium for the in-cage OAuth sign-in only (see the LOGIN note above). This closure is seeded
+# per project even though daily TUI runs never launch it — the cost of a single profile whose
+# login self-contains inside the cage. It is shared across every `gui`/Chromium profile, so it is
+# built at most once for your whole store.
+chromium = "nix:chromium"
 
-ZIP_URL='https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip'
-WORKDIR=$(mktemp -d)
-cd "$WORKDIR"
-
-echo 'Downloading Kiro CLI ZIP...' >&2
-curl -fsSL "$ZIP_URL" -o kirocli.zip
-
-echo 'Extracting...' >&2
-unzip -q kirocli.zip
-
-# The ZIP contains kirocli/bin/kiro-cli (main binary, ~119MB)
-# Create .tar.gz with structure that electron_wrap expects:
-#   kiro/
-#     resources/app/     # empty directory (electron_wrap looks for this)
-#     kiro-cli           # binary at top level (electron_wrap finds first executable here)
-echo 'Building compatible tarball...' >&2
-mkdir -p kiro/resources/app
-cp kirocli/bin/kiro-cli kiro/
-chmod +x kiro/kiro-cli
-
-tar -czf kiro.tar.gz kiro
-
-# Write tarball to project directory (bind-mounted from host, so host nix can read it)
-# Use a stable name based on content hash for idempotency
-HASH=$(sha256sum kiro.tar.gz | cut -d' ' -f1 | cut -c1-16)
-DEST_DIR="$PWD/.sbx-kiro"
-mkdir -p "$DEST_DIR"
-DEST="$DEST_DIR/kiro-$HASH.tar.gz"
-cp kiro.tar.gz "$DEST"
-
-# Output file:// URL with absolute path for host nix fetchurl
-ABS_DEST=$(realpath "$DEST")
-echo "file://$ABS_DEST"
-"""
-]
-
-# Egress allowlist — Kiro service endpoints (chat, completions, config, auth, telemetry, updates).
-# Regions: us-east-1 (primary), eu-central-1 (Europe). Wildcards cover subdomains.
-# Browser sign-in (app.kiro.dev) happens on the HOST, not in the cage.
-[network]
-mode = "deny"
-allow = [
-    # Kiro application / assets / sign-in portal (host browser)
-    "{GET} https://app.kiro.dev",
-    "{GET} https://assets.app.kiro.dev",
-    "{GET} https://cli.kiro.dev",
-
-    # Auth / token exchange / logout (CLI traffic)
-    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
-    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
-    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
-
-    # Kiro service endpoints (new kiro.dev) — inference, config, telemetry
-    "{*} https://runtime.us-east-1.kiro.dev",
-    "{*} https://runtime.eu-central-1.kiro.dev",
-    "{*} https://management.us-east-1.kiro.dev",
-    "{*} https://management.eu-central-1.kiro.dev",
-    "{*} https://telemetry.us-east-1.kiro.dev",
-    "{*} https://telemetry.eu-central-1.kiro.dev",
-
-    # Legacy q.amazonaws.com endpoints (still used for some operations)
-    "{*} https://q.us-east-1.amazonaws.com",
-    "{*} https://q.eu-central-1.amazonaws.com",
-
-    # Auto-updates / Powers registry / icons / CLI downloads
-    "{GET} https://prod.download.desktop.kiro.dev",
-    "{GET} https://prod.download.cli.kiro.dev",
-    "{GET} https://desktop-release.q.us-east-1.amazonaws.com",
-
-    # Telemetry (CloudWatch RUM, cookie consent, feedback)
-    "{GET} https://prod.us-east-1.telemetry.desktop.kiro.dev",
-    "{GET} https://prod.eu-central-1.telemetry.desktop.kiro.dev",
-    "{GET} https://prod.us-east-1.telemetry.kiro.aws.dev",
-    "{GET} https://dataplane.rum.us-east-1.amazonaws.com",
-    "{GET} https://dataplane.rum.eu-central-1.amazonaws.com",
-    "{GET} https://prod.assets.shortbread.aws.dev",
-    "{GET} https://prod.log.shortbread.aws.dev",
-    "{GET} https://prod.tools.shortbread.aws.dev",
-    "{GET} https://rendering.aperture-public-api.feedback.console.aws.dev",
-    "{GET} https://a0.awsstatic.com",
-    "{GET} https://kaa-assets.app.kiro.dev",
-    "{GET} https://kiro.dev",
-]
-
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`):
-# telemetry/metrics we deliberately leave DENIED. A `mute` never changes the
-# verdict (still refused) and never hides a count (`sbx net stats` tallies it);
-# it only keeps the line out of the default log. See with `sbx net log --all`,
-# edit from CLI with `sbx net mute|unmute <host> -a kiro`.
-mute = [
-    "telemetry.us-east-1.kiro.dev",
-    "telemetry.eu-central-1.kiro.dev",
-    "prod.us-east-1.telemetry.desktop.kiro.dev",
-    "prod.eu-central-1.telemetry.desktop.kiro.dev",
-    "prod.us-east-1.telemetry.kiro.aws.dev",
-    "dataplane.rum.us-east-1.amazonaws.com",
-    "dataplane.rum.eu-central-1.amazonaws.com",
-]
-
-# BYOK path (Kiro Pro/Pro+/Pro Max/Power only): the real key is read on the HOST
-# and injected by the egress proxy — never in the cage. Set $KIRO_API_KEY on the
-# host, uncomment the [secret] block. The runtime endpoint varies by region; the
-# key is injected on the wire to the active runtime.* host.
-[env]
-# KIRO_API_KEY = "ksk-sbx-placeholder-replaced-by-the-egress-proxy"
-
+# BYOK (Pro / Pro+ / Pro Max / Power tiers): the CLI reads a `KIRO_API_KEY` env var (key
+# generated at app.kiro.dev). The exact wire header the CLI sends this key in is NOT
+# publicly documented, so sbx does not header-inject it (a guessed injection could silently
+# fail or leak). If you have a key, either use interactive login above, or — accepting that
+# the value then lives inside the cage — set it explicitly with a one-shot override:
+#     KIRO_API_KEY=… sbx app run kiro          (via OPS_ENV_KIRO_API_KEY, or `--env`)
+# Only if you have verified the CLI sends it as `Authorization: Bearer` to the runtime host
+# is the never-in-cage `[secret]` broker below usable — verify before uncommenting.
 #[secret."runtime.us-east-1.kiro.dev"]
 #from = "env://KIRO_API_KEY"
 #header = "Authorization"
 #type = "bearer"
 
-# Optional: share your host Kiro config with the cage (read-write at real path).
-# binds is a security field, honored only because this profile lives in your
-# trusted config dir. Uncomment to use host config instead of the app's isolated home.
-#binds = [
-#    { path = "~/.local/share/kiro-cli", mode = "rw" },
-#    { path = "~/.config/kiro", mode = "rw" },
-#]
+# Egress — deny by construction except Kiro's own service hosts. Two regions are listed
+# (us-east-1 primary, eu-central-1 Europe); the CLI talks to whichever your account uses.
+# A host the CLI reaches that is not listed returns a 403 whose body names the exact rule to
+# add — `sbx net allow <host> -a kiro` — so extend this as your first login/run surfaces one.
+# NOTE: this allowlist governs DAILY runs (`chat`/`kiro-cli`), which need no browser. The
+# in-cage browser LOGIN is done under `--net shared` (see the LOGIN note), so it bypasses this
+# list — do not try to enumerate the IdP's host sprawl here.
+[network]
+mode = "deny"
+allow = [
+    # Inference / chat (POST completions).
+    "{*} https://runtime.us-east-1.kiro.dev",
+    "{*} https://runtime.eu-central-1.kiro.dev",
+    "{*} https://q.us-east-1.amazonaws.com",
+    "{*} https://q.eu-central-1.amazonaws.com",
+
+    # Auth / token exchange / refresh / logout + the sign-in page (rendered in the in-cage browser).
+    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
+    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
+    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
+    # The Kiro sign-in page AND its OAuth continuation (it POSTs back after the IdP), so all verbs.
+    "{*} https://app.kiro.dev",
+    "{GET} https://assets.app.kiro.dev",
+    # AWS "shortbread" cookie-consent banner assets rendered on the sign-in page.
+    "{GET} https://prod.assets.shortbread.aws.dev",
+    # AWS SSO OIDC device-flow endpoint — `login --use-device-flow` polls it for the token.
+    # Required for Builder ID / Google / GitHub (`--license free`) AND Identity Center
+    # (`--license pro`), because in the cage a browser redirect cannot be handled.
+    "{*} https://oidc.us-east-1.amazonaws.com",
+    "{*} https://oidc.eu-central-1.amazonaws.com",
+
+    # ── Google Sign-In ("Continue with Google") — the consent AND the cross-domain cookie step
+    # render in the in-cage Chromium. Google serves the consent and the `/accounts/SetSID`
+    # session-cookie step from your COUNTRY domain (accounts.google.com, .fr, .de, .co.uk, …), then
+    # bounces back to app.kiro.dev → localhost. DENY SetSID and the OAuth chain never completes —
+    # the browser hangs on a BLANK SetSID page (the exact symptom this set fixes). The bounded regex
+    # covers any ccTLD and is anchored so a look-alike (accounts.google.com.evil.com) is REFUSED.
+    # Not needed for GitHub / Builder ID sign-in (those stay on their own domains — a simpler login).
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{*} https://oauth2.googleapis.com",
+    "{*} https://apis.google.com",
+    "{GET} https://www.google.com",
+    "{GET} https://ssl.gstatic.com",
+    "{GET} https://www.gstatic.com",
+    "{GET} https://fonts.gstatic.com",
+    "{GET} https://fonts.googleapis.com",
+    "{GET} https://lh3.googleusercontent.com",
+
+    # Config / management.
+    "{*} https://management.us-east-1.kiro.dev",
+    "{*} https://management.eu-central-1.kiro.dev",
+
+    # Update check / downloads (the CLI's own self-update probe).
+    "{GET} https://prod.download.cli.kiro.dev",
+    "{GET} https://prod.download.desktop.kiro.dev",
+    "{GET} https://desktop-release.q.us-east-1.amazonaws.com",
+    "{GET} https://cli.kiro.dev",
+
+    # Enterprise AWS IAM Identity Center (`--license pro`) also needs your org's portal +
+    # directory hosts — uncomment and replace <region>/<directory> with yours (the OIDC host
+    # above is already allowed). See kiro.dev/docs/cli/authentication.
+    #"{*} https://portal.sso.us-east-1.amazonaws.com",
+    #"{*} https://<directory>.awsapps.com",
+    #"{GET} https://signin.aws",
+]
+
+# Telemetry / metrics we deliberately leave DENIED. `mute` never changes the verdict (still
+# refused, still counted by `sbx net stats`); it only keeps the refusal out of the default
+# `sbx net log` so the actionable denials stay readable. See them with `sbx net log --all`,
+# and edit from the CLI with `sbx net mute|unmute <host> -a kiro`.
+mute = [
+    "telemetry.us-east-1.kiro.dev",
+    "telemetry.eu-central-1.kiro.dev",
+    # v2 metrics endpoint the current CLI (2.13.0) reports to — observed denied during login.
+    "prod.us-east-1.telemetry-v2.kiro.dev",
+    "prod.eu-central-1.telemetry-v2.kiro.dev",
+    "prod.us-east-1.telemetry.desktop.kiro.dev",
+    "prod.eu-central-1.telemetry.desktop.kiro.dev",
+    "prod.us-east-1.telemetry.kiro.aws.dev",
+    "dataplane.rum.us-east-1.amazonaws.com",
+    "dataplane.rum.eu-central-1.amazonaws.com",
+    # Legacy Amazon Q metrics endpoint the CLI still probes (denied — no functional impact).
+    "client-telemetry.us-east-1.amazonaws.com",
+    # Chromium's own probes + Google noise during the in-cage sign-in (denied, non-essential —
+    # component/DRM updates, connectivity checks, translate, YouTube cookie sync).
+    "redirector.gvt1.com",
+    "clients2.google.com",
+    "android.clients.google.com",
+    "play.google.com",
+    "optimizationguide-pa.googleapis.com",
+    "translate.googleapis.com",
+    "accounts.youtube.com",
+]

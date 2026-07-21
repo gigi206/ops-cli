@@ -43,6 +43,14 @@ Provisioned **host-side** from the pinned nixpkgs channel into `sbx`'s store, it
 per-project store). Use [`sbx search <query>`](../cli/search.md) to find attribute
 names. Advances with [`sbx upgrade nix`](../housekeeping/upgrade.md).
 
+**Unfree packages are allowed here.** Some tools ship a proprietary (`unfree`) nixpkgs
+derivation — e.g. a vendor agent CLI whose upstream is closed-source. Because a
+`[packages]` declaration is trusted-only (an untrusted project's `[packages]` are
+dropped before anything is built), `sbx` builds such an attribute rather than refusing
+it. This is a *licensing* allowance, not a security relaxation — `unfree` is orthogonal
+to `sbx`'s code-trust boundary, and it never reaches the in-cage `sbx mise install nix:`
+self-equip path.
+
 `mise:nix:<pkg>` routes to mise's nixhub resolver — a way to get a nix package with
 mise's own version selection, not a third nix path. **Prefer plain `nix:<pkg>` in an
 app's `[packages]`:** a global app's `mise:nix:` tool has its install record pinned in

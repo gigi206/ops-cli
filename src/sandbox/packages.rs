@@ -103,15 +103,17 @@ pub(crate) fn provision(
         // never drop it silently.
         let logical = match &p.backend {
             // A `nix:` package: a pinned nixpkgs attribute, built host-side into the shared store.
+            // Unfree is permitted here — a `[packages]` declaration is trusted-only, and some agent
+            // CLIs ship proprietary (unfree) nixpkgs derivations; see [`store::provision_unfree`] for
+            // why this is licensing, not a security relaxation.
             Backend::Nix(attr) => {
-                store::provision(nix, layout, &gcroots.join(&p.name), nixpkgs, attr, BIN).map_err(
-                    |e| {
+                store::provision_unfree(nix, layout, &gcroots.join(&p.name), nixpkgs, attr, BIN)
+                    .map_err(|e| {
                         io::Error::other(format!(
                             "cannot provision package `{}` ({attr}): {e}",
                             p.name
                         ))
-                    },
-                )?
+                    })?
             }
             // A `flake:` package: build its (possibly pinned) target host-side, same store/seed path.
             Backend::Flake(reference) => {
