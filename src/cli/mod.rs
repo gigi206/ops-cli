@@ -11,5 +11,6 @@ pub(crate) mod proc;
 pub(crate) mod projects;
 pub(crate) mod search;
 pub(crate) mod session;
+pub(crate) mod test;
 pub(crate) mod trust;
 pub(crate) mod upgrade;
