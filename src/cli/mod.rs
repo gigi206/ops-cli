@@ -3,3 +3,4 @@
 //! parsing, orchestration, and output rendering.
 
 pub(crate) mod search;
+pub(crate) mod trust;
