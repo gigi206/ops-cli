@@ -2,6 +2,7 @@
 //! per command family. `main` parses argv and routes here; each family owns its argument
 //! parsing, orchestration, and output rendering.
 
+pub(crate) mod app;
 pub(crate) mod doctor;
 pub(crate) mod fs;
 pub(crate) mod gc;
