@@ -76,7 +76,7 @@ fn main() -> ExitCode {
         "untrust" => cli::trust::untrust_cmd(rest.into_iter().next()),
         "config" => config_cmd(rest),
         "upgrade" => upgrade_cmd(rest),
-        "gc" => gc_cmd(rest),
+        "gc" => cli::gc::run(rest),
         "projects" | "project" => projects_cmd(rest),
         "path" => path_cmd(&rest),
         "run" => {
@@ -9953,31 +9953,6 @@ fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
-}
-
-/// `sbx gc [--all] [--prune]`: reclaim sbx's per-project store space. By default it sweeps the
-/// current project's store; `--all` also reaps whole runtime trees whose project directory is
-/// gone. A dry run by default (it reports what would be freed and touches nothing); `--prune`
-/// actually reclaims. Reclamation is irreversible, so the destructive form is opt-in.
-fn gc_cmd(args: Vec<OsString>) -> ExitCode {
-    let mut prune = false;
-    let mut all = false;
-    for a in &args {
-        match a.to_str() {
-            Some("--prune") => prune = true,
-            Some("--all") => all = true,
-            Some(_) => {
-                eprintln!("sbx: usage: {}", help::synopsis("gc"));
-                return ExitCode::from(2);
-            }
-            None => {
-                eprintln!("sbx: gc: argument is not valid UTF-8");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    sandbox::gc(prune, all, &pal)
 }
 
 /// `sbx projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
