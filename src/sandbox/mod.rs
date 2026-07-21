@@ -45,6 +45,7 @@ pub(crate) mod proc_control;
 pub(crate) mod proc_enforce;
 mod projectstore;
 mod proxy;
+mod pty;
 mod resolve;
 mod resolver;
 mod search;
