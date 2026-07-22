@@ -257,3 +257,159 @@ pub(super) fn strip_eol(line: &[u8]) -> &[u8] {
     }
     &line[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_head_rejects_a_non_utf8_or_empty_head() {
+        assert!(
+            parse_head(&[0xff, 0xfe]).is_err(),
+            "a non-UTF-8 head is refused"
+        );
+        assert!(parse_head(b"").is_err());
+        assert!(
+            parse_head(b"\r\n").is_err(),
+            "an empty request line is refused"
+        );
+    }
+
+    #[test]
+    fn parse_head_reads_the_request_line_and_headers_over_crlf_or_lf() {
+        let head = parse_head(b"GET / HTTP/1.1\r\nHost: h\r\nX: y\r\n\r\n").unwrap();
+        assert_eq!(head.request_line, "GET / HTTP/1.1");
+        assert!(head.headers.iter().any(|(k, v)| k == "Host" && v == "h"));
+        // a header line without a colon is skipped (not fatal), and LF-only endings parse too.
+        let head = parse_head(b"POST /x HTTP/1.1\nHost: h\nnonsense\n\n").unwrap();
+        assert_eq!(head.request_line, "POST /x HTTP/1.1");
+        assert!(head.headers.iter().any(|(k, _)| k == "Host"));
+        assert!(!head.headers.iter().any(|(k, _)| k == "nonsense"));
+    }
+
+    #[test]
+    fn request_line_parts_requires_all_three_tokens() {
+        assert_eq!(
+            request_line_parts("GET / HTTP/1.1"),
+            Some(("GET".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            request_line_parts("GET /"),
+            None,
+            "a missing HTTP-version token is refused"
+        );
+        assert_eq!(request_line_parts(""), None);
+    }
+
+    #[test]
+    fn split_authority_handles_ports_and_a_bracketed_ipv6_literal() {
+        assert_eq!(split_authority("h:443"), Some(("h".to_string(), 443)));
+        assert_eq!(
+            split_authority("[::1]:8080"),
+            Some(("::1".to_string(), 8080))
+        );
+        assert_eq!(
+            split_authority("hostonly"),
+            None,
+            "a missing port is refused (CONNECT requires one)"
+        );
+        assert_eq!(split_authority("h:notaport"), None);
+    }
+
+    #[test]
+    fn strip_port_removes_a_numeric_port_but_keeps_a_non_numeric_suffix() {
+        assert_eq!(strip_port("h:443"), "h");
+        assert_eq!(strip_port("[::1]:8080"), "::1");
+        assert_eq!(strip_port("[::1]"), "::1");
+        assert_eq!(strip_port("h"), "h");
+        // a colon suffix that is not all-digits is not a port, so the value is kept verbatim.
+        assert_eq!(strip_port("h:notaport"), "h:notaport");
+    }
+
+    #[test]
+    fn header_name_eq_is_case_and_underscore_insensitive() {
+        // so a client cannot dodge the strip-and-replace with an alternate spelling of a header sbx
+        // injects (`X_API_KEY` folded onto `X-Api-Key`).
+        assert!(header_name_eq("X_API_KEY", "x-api-key"));
+        assert!(header_name_eq("Authorization", "authorization"));
+        assert!(!header_name_eq("x-api-key", "x-api-token"));
+    }
+
+    #[test]
+    fn head_expects_continue_detects_the_case_insensitive_expectation() {
+        let with = parse_head(b"POST / HTTP/1.1\r\nExpect: 100-Continue\r\n\r\n").unwrap();
+        assert!(head_expects_continue(&with));
+        let without = parse_head(b"POST / HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert!(!head_expects_continue(&without));
+    }
+
+    #[test]
+    fn strip_eol_drops_a_crlf_a_lone_lf_or_nothing() {
+        assert_eq!(strip_eol(b"line\r\n"), b"line");
+        assert_eq!(strip_eol(b"line\n"), b"line");
+        assert_eq!(strip_eol(b"line"), b"line");
+    }
+
+    #[test]
+    fn read_chunk_size_line_parses_hex_and_extensions_but_fails_closed_on_junk() {
+        let mut r: &[u8] = b"1a\r\n";
+        assert_eq!(read_chunk_size_line(&mut r).unwrap(), 0x1a);
+        // a `;extension` after the size is ignored (only the hex count is read).
+        let mut r: &[u8] = b"5;ext=1\r\n";
+        assert_eq!(read_chunk_size_line(&mut r).unwrap(), 5);
+        // a non-hex size is refused rather than mis-parsed.
+        let mut r: &[u8] = b"zz\r\n";
+        assert!(read_chunk_size_line(&mut r).is_err());
+        // an EOF mid-line (no terminator) is a malformed-body error, not a silent short read.
+        let mut r: &[u8] = b"5";
+        assert!(read_chunk_size_line(&mut r).is_err());
+    }
+
+    #[test]
+    fn read_line_bounded_refuses_a_no_newline_flood_over_the_bound() {
+        let flood = vec![b'a'; 16]; // no newline, longer than the tiny bound below
+        let mut r: &[u8] = &flood;
+        assert!(
+            read_line_bounded(&mut r, 8).is_err(),
+            "a no-newline flood over the bound is a hard error, not unbounded buffering"
+        );
+        let mut empty: &[u8] = b"";
+        assert!(
+            read_line_bounded(&mut empty, 8).unwrap().is_empty(),
+            "EOF before any byte returns an empty line"
+        );
+    }
+
+    #[test]
+    fn read_chunked_body_reassembles_and_fails_closed_on_bad_framing() {
+        // two chunks then the zero terminator (with a trailer) reassemble to the payload.
+        let mut r: &[u8] = b"3\r\nabc\r\n2\r\nde\r\n0\r\nTrailer: x\r\n\r\n";
+        assert_eq!(
+            read_chunked_body(&mut r, CHUNKED_REQUEST_CAP).unwrap(),
+            b"abcde"
+        );
+        // chunk data not followed by CRLF is a malformed body.
+        let mut r: &[u8] = b"3\r\nabcXX";
+        assert!(read_chunked_body(&mut r, CHUNKED_REQUEST_CAP).is_err());
+        // a body over the cap fails closed rather than buffering unboundedly.
+        let mut r: &[u8] = b"4\r\ndata\r\n0\r\n\r\n";
+        assert!(
+            read_chunked_body(&mut r, 2).is_err(),
+            "a chunk past the cap is refused"
+        );
+    }
+
+    #[test]
+    fn copy_exact_errors_on_a_read_shorter_than_the_content_length() {
+        let mut src: &[u8] = b"abc";
+        let mut dst = Vec::new();
+        copy_exact(&mut src, &mut dst, 3).unwrap();
+        assert_eq!(dst, b"abc");
+        let mut src: &[u8] = b"ab";
+        let mut dst = Vec::new();
+        assert!(
+            copy_exact(&mut src, &mut dst, 5).is_err(),
+            "fewer bytes than the declared length is a truncated-body error"
+        );
+    }
+}
