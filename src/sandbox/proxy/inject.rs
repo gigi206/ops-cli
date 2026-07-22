@@ -55,3 +55,51 @@ impl fmt::Debug for SecretNeedle {
         write!(f, "SecretNeedle(<redacted {} bytes>)", self.0.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The formed header value carries the plaintext secret, so its `Debug` must never leak it — the
+    // redacted `Debug` is the guard that keeps a secret out of a log line or a panic message.
+    #[test]
+    fn header_injection_debug_redacts_the_value() {
+        let injection = HeaderInjection {
+            rule: crate::allowlist::classify("api.example.com").unwrap(),
+            header: "x-api-key".to_string(),
+            value: "SECRET-TOKEN-abc123".to_string(),
+        };
+        let shown = format!("{injection:?}");
+        assert!(
+            !shown.contains("SECRET-TOKEN-abc123"),
+            "the secret value must never appear in Debug output: {shown}"
+        );
+        assert!(
+            shown.contains("<redacted>"),
+            "the value must render as <redacted>: {shown}"
+        );
+        // the non-secret fields stay visible, so the Debug is still useful for diagnosis.
+        assert!(
+            shown.contains("x-api-key"),
+            "the header name is kept: {shown}"
+        );
+    }
+
+    // The needle holds a secret to scan the wire for; its `Debug` reports only the byte length, never
+    // the value, and `as_bytes` returns the raw bytes the outbound scan matches against.
+    #[test]
+    fn secret_needle_debug_redacts_the_value_but_reports_its_length() {
+        let secret = b"SECRET-TOKEN-abc123";
+        let needle = SecretNeedle::new(secret.to_vec());
+        assert_eq!(needle.as_bytes(), secret);
+        let shown = format!("{needle:?}");
+        assert!(
+            !shown.contains("SECRET-TOKEN"),
+            "the secret must never appear in Debug output: {shown}"
+        );
+        assert!(
+            shown.contains(&format!("{} bytes", secret.len())),
+            "the redacted Debug reports the byte length: {shown}"
+        );
+    }
+}

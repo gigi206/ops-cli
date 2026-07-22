@@ -748,4 +748,187 @@ mod tests {
         assert_eq!(read[&key].url, concrete);
         assert_eq!(read[&key].hash, HASH);
     }
+
+    fn tarball_pkg(name: &str, url: &str, trusted: bool) -> crate::config::Package {
+        crate::config::Package {
+            name: name.into(),
+            backend: crate::config::Backend::Tarball(url.into()),
+            state: if trusted {
+                crate::trust::TrustState::Trusted
+            } else {
+                crate::trust::TrustState::Untrusted
+            },
+        }
+    }
+
+    fn tarball_resolve_pkg(name: &str, command: &[&str], trusted: bool) -> crate::config::Package {
+        crate::config::Package {
+            name: name.into(),
+            backend: crate::config::Backend::TarballResolve {
+                command: command.iter().map(|s| s.to_string()).collect(),
+            },
+            state: if trusted {
+                crate::trust::TrustState::Trusted
+            } else {
+                crate::trust::TrustState::Untrusted
+            },
+        }
+    }
+
+    fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
+        crate::config::ResolvedApp {
+            cmd: vec!["x".into()],
+            home_scope: crate::config::AppHomeScope::Global,
+            env: vec![],
+            binds: vec![],
+            packages,
+            network: None,
+            gui: None,
+            gpu: None,
+            audio: None,
+            dbus: None,
+            limits: Default::default(),
+            forward: vec![],
+            secrets: vec![],
+            default_methods: crate::allowlist::Methods::Unspecified,
+            cmd_origin: Default::default(),
+            network_origin: Default::default(),
+            gui_origin: Default::default(),
+            gpu_origin: Default::default(),
+            audio_origin: Default::default(),
+            dbus_origin: Default::default(),
+            forward_origin: Default::default(),
+            limits_origin: Default::default(),
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
+            proc: None,
+            proc_origin: Default::default(),
+            home_scope_origin: None,
+            warnings: vec![],
+        }
+    }
+
+    fn resolved(
+        packages: Vec<crate::config::Package>,
+        apps: Vec<(&str, crate::config::ResolvedApp)>,
+    ) -> crate::config::Resolved {
+        crate::config::Resolved {
+            env: vec![],
+            env_layer: Default::default(),
+            binds: vec![],
+            bind_layer: Default::default(),
+            packages,
+            nixpkgs_global: None,
+            nixpkgs_project: None,
+            mise: None,
+            network: crate::config::NetworkPolicy::default(),
+            network_origin: Default::default(),
+            egress_stats: true,
+            gui: crate::config::GuiPolicy::default(),
+            gui_origin: Default::default(),
+            proc: Default::default(),
+            proc_origin: Default::default(),
+            gpu: false,
+            audio: false,
+            dbus: false,
+            gpu_origin: Default::default(),
+            audio_origin: Default::default(),
+            dbus_origin: Default::default(),
+            forward: vec![],
+            forward_origin: Default::default(),
+            limits: Default::default(),
+            limits_origin: Default::default(),
+            secrets: vec![],
+            seccomp: Default::default(),
+            seccomp_origin: Default::default(),
+            devices: Vec::new(),
+            devices_origin: Default::default(),
+            declared_secrets: vec![],
+            apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn tarball_declared_trusted_covers_both_forms_dedups_and_drops_untrusted() {
+        let cfg = resolved(
+            vec![
+                tarball_pkg("a", "https://e/a.tar.gz", true),
+                tarball_pkg("evil", "https://e/evil.tar.gz", false), // untrusted: dropped
+                tarball_resolve_pkg("res", &["print-url"], true), // resolver form, key `resolve:res`
+            ],
+            vec![
+                (
+                    "alpha",
+                    app_with(vec![
+                        tarball_pkg("b", "https://e/b.tar.gz", true),
+                        tarball_pkg("a2", "https://e/a.tar.gz", true), // duplicate url: deduped
+                    ]),
+                ),
+                ("beta", app_with(vec![])), // no tarball package: contributes nothing
+            ],
+        );
+        // Both `tarball:` forms are collected, baseline first (direct, then resolver), then the app's
+        // new url; the duplicate and the untrusted one are gone.
+        let keys: Vec<String> = declared(&cfg).trusted.iter().map(TarballRef::key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "https://e/a.tar.gz".to_string(),
+                resolve_key("res"),
+                "https://e/b.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tarball_prune_universe_keeps_untrusted_and_withheld_counts_both_forms() {
+        let cfg = resolved(
+            vec![
+                tarball_pkg("a", "https://e/a.tar.gz", true),
+                tarball_pkg("evil", "https://e/evil.tar.gz", false),
+                tarball_resolve_pkg("badres", &["x"], false), // untrusted resolver
+            ],
+            vec![(
+                "app",
+                app_with(vec![tarball_pkg("c", "https://e/c.tar.gz", false)]),
+            )],
+        );
+        // The prune universe keeps every declared key regardless of trust, so `sbx upgrade` on a
+        // Changed project never unpins a still-declared package.
+        let universe = declared(&cfg).all;
+        assert!(universe.contains("https://e/a.tar.gz"));
+        assert!(
+            universe.contains("https://e/evil.tar.gz"),
+            "a withheld-but-declared url must survive pruning"
+        );
+        assert!(universe.contains(&resolve_key("badres")));
+        assert!(universe.contains("https://e/c.tar.gz"));
+        // `withheld` counts every untrusted tarball package (both forms), across baseline and apps.
+        assert_eq!(
+            withheld(&cfg),
+            3,
+            "two untrusted baseline packages + one untrusted app package"
+        );
+    }
+
+    #[test]
+    fn has_resolve_ref_detects_a_declared_resolver_in_the_baseline_or_an_app() {
+        let baseline = resolved(vec![tarball_resolve_pkg("r", &["print"], true)], vec![]);
+        assert!(has_resolve_ref(&baseline));
+
+        let direct_only = resolved(vec![tarball_pkg("d", "https://e/d.tar.gz", true)], vec![]);
+        assert!(!has_resolve_ref(&direct_only));
+
+        let in_app = resolved(
+            vec![],
+            vec![("a", app_with(vec![tarball_resolve_pkg("ar", &["p"], true)]))],
+        );
+        assert!(
+            has_resolve_ref(&in_app),
+            "a resolver declared only inside an app overlay is still detected"
+        );
+    }
 }
