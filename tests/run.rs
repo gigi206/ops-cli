@@ -2596,7 +2596,7 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
             "-c",
             "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
              nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
-             sleep 60",
+             sleep 300",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -2614,11 +2614,23 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
         rows.iter()
             .any(|r| r["host"] == host && r["verdict"] == verdict)
     };
-    // Generous: a fresh test store provisions the whole base cold, including the one-time
-    // locale-archive build, before the session makes its egress requests; the deadline covers
-    // that cold start plus the fetches (production reuses the cached base, so this is a
-    // fresh-store test cost, not a launch cost).
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // The budget starts at spawn, so it must cover everything the background session does before
+    // its first event exists: provisioning a fresh test store (the whole base cold, including the
+    // one-time locale-archive build) and then two real fetches through the MITM. Measured warm,
+    // that already approaches a minute — so a one-minute budget carried no slack, and a cold shared
+    // store or a machine running several such sessions at once exhausted it before any event was
+    // pushed. Four minutes widens that near-zero margin about fourfold at no cost on the happy path:
+    // the loop breaks as soon as it sees what it is waiting for, so a passing run is unchanged and
+    // only a genuinely broken one pays the wait. The session's own `sleep` must outlive this budget,
+    // or the log — which is live-only — would be gone before the deadline expires.
+    //
+    // A wider budget is not a cure, only more headroom: cold provisioning under heavy parallelism
+    // could still exceed it. The structural fix is to stop timing the provisioning at all — the
+    // warm-up probe above runs *before* the project is trusted, so it warms the `shared` path while
+    // the background session takes the allowlist one, leaving that path's first-launch cost inside
+    // this window. Warming the post-trust path before the clock starts would make the budget
+    // generous rather than merely larger.
+    let deadline = Instant::now() + Duration::from_secs(240);
     // Deferred init: the loop assigns `last` on its first iteration, before either break — so it is
     // always set by the post-loop read, with no dead initial store.
     let mut last;
@@ -2738,7 +2750,7 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
             "-c",
             "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
              nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
-             sleep 60",
+             sleep 300",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -2788,11 +2800,23 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     };
     // Poll the accumulating stream until both decisions appear, or a generous deadline — stopping as
     // soon as they do keeps the test fast without a fragile fixed sleep.
-    // Generous: a fresh test store provisions the whole base cold, including the one-time
-    // locale-archive build, before the session makes its egress requests; the deadline covers
-    // that cold start plus the fetches (production reuses the cached base, so this is a
-    // fresh-store test cost, not a launch cost).
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // The budget starts at spawn, so it must cover everything the background session does before
+    // its first event exists: provisioning a fresh test store (the whole base cold, including the
+    // one-time locale-archive build) and then two real fetches through the MITM. Measured warm,
+    // that already approaches a minute — so a one-minute budget carried no slack, and a cold shared
+    // store or a machine running several such sessions at once exhausted it before any event was
+    // pushed. Four minutes widens that near-zero margin about fourfold at no cost on the happy path:
+    // the loop breaks as soon as it sees what it is waiting for, so a passing run is unchanged and
+    // only a genuinely broken one pays the wait. The session's own `sleep` must outlive this budget,
+    // or the log — which is live-only — would be gone before the deadline expires.
+    //
+    // A wider budget is not a cure, only more headroom: cold provisioning under heavy parallelism
+    // could still exceed it. The structural fix is to stop timing the provisioning at all — the
+    // warm-up probe above runs *before* the project is trusted, so it warms the `shared` path while
+    // the background session takes the allowlist one, leaving that path's first-launch cost inside
+    // this window. Warming the post-trust path before the clock starts would make the budget
+    // generous rather than merely larger.
+    let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         {
             let buf = captured.lock().unwrap();
