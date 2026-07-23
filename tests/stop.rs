@@ -24,6 +24,27 @@ fn sbx() -> Command {
     cmd
 }
 
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
+///
+/// Deliberately **not** `std::env::temp_dir()`, which resolves to `/tmp` when `TMPDIR` is unset. A
+/// fixture here holds a provisioned nix store, which is inode-heavy. `/tmp` is usually a tmpfs
+/// whose inode count is capped machine-wide at about a million, so these fixtures exhaust it and
+/// *unrelated* work then fails with "no space left on device" while the disk is nearly empty. The
+/// repo's disk has inodes to spare, it matches production (the store lives on disk), and
+/// `cargo clean` reclaims it.
+///
+/// Keep the per-fixture tag short: a launch's egress proxy binds a Unix socket under the data dir,
+/// and `sun_path` caps the whole path at 108 bytes, which this tree already spends most of.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
 /// A unique temp dir removed on drop.
 struct TmpDir(PathBuf);
 
@@ -31,8 +52,8 @@ impl TmpDir {
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
-        d.push(format!("sbx-stop-it-{tag}-{}-{n}", std::process::id()));
+        let mut d = fixture_root();
+        d.push(format!("s-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }

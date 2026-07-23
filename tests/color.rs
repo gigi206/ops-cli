@@ -10,6 +10,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
+///
+/// Deliberately **not** `std::env::temp_dir()`, which resolves to `/tmp` when `TMPDIR` is unset.
+/// These fixtures are small, but the repo's tree is the safe default: a fixture that ends up
+/// holding a provisioned nix store is inode-heavy enough to exhaust a tmpfs's machine-wide inode
+/// budget, which then surfaces as "no space left on device" in *unrelated* work while the disk is
+/// nearly empty. Disk has inodes to spare, and `cargo clean` reclaims it.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
 /// A unique temp dir removed on drop, so a command's data-dir reads land in a throwaway location
 /// instead of the real `$HOME`.
 struct TmpDir(PathBuf);
@@ -18,8 +35,8 @@ impl TmpDir {
     fn new() -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
-        d.push(format!("sbx-color-{}-{n}", std::process::id()));
+        let mut d = fixture_root();
+        d.push(format!("color-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }

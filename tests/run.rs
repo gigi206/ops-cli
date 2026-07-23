@@ -26,7 +26,6 @@ fn sbx() -> Command {
     cmd
 }
 
-/// A unique temp dir removed on drop.
 /// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
 /// `SBX_TEST_TMPDIR`.
 ///

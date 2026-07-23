@@ -8,6 +8,23 @@ fn sbx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
 }
 
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
+///
+/// Deliberately **not** `std::env::temp_dir()`, which resolves to `/tmp` when `TMPDIR` is unset. A
+/// fixture here may hold a provisioned nix store, which is inode-heavy enough to exhaust a tmpfs's
+/// machine-wide inode budget — surfacing as "no space left on device" in *unrelated* work while the
+/// disk is nearly empty. Disk has inodes to spare, it matches production (the store lives on disk),
+/// and `cargo clean` reclaims it.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
 /// A unique temp dir removed on drop, so the binary's lock writes land in a throwaway
 /// location instead of the real `$HOME`.
 struct TmpDir(PathBuf);
@@ -16,8 +33,8 @@ impl TmpDir {
     fn new() -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
-        d.push(format!("sbx-upgrade-it-{}-{n}", std::process::id()));
+        let mut d = fixture_root();
+        d.push(format!("upg-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }

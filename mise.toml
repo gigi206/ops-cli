@@ -49,10 +49,13 @@ run = "cargo test"
 description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministic; pass --html for a browsable report)"
 # `--bins` measures the unit tests only — fast, network-free, and reproducible everywhere (the
 # scope CI runs). The heavy sandbox e2e are left out on purpose: under coverage instrumentation
-# the full suite runs ~25 min, its parallel nix-store seeds can exhaust the /tmp tmpfs, and one
-# flaky e2e would sink the whole report. For the complete picture on a sandbox-capable host —
-# the e2e spawn the instrumented binary, so they add real coverage of the launch/proxy paths —
-# run: `cargo llvm-cov --ignore-run-fail -- --test-threads=6` (bounded threads keep /tmp in budget).
+# the full suite runs ~25 min, its parallel nix-store seeds are large, and one flaky e2e would
+# sink the whole report. For the complete picture on a sandbox-capable host — the e2e spawn the
+# instrumented binary, so they add real coverage of the launch/proxy paths — run:
+# `cargo llvm-cov --ignore-run-fail -- --test-threads=6` (bounded threads bound the peak disk the
+# concurrent stores take under `target/test-tmp`). A killed run leaks its fixtures there; reclaim
+# them with `chmod -R u+w target/test-tmp && rm -rf target/test-tmp` — a bare `rm -rf` walks into a
+# store's `0555` directories and silently leaves most of the tree behind.
 run = "cargo llvm-cov --bins"
 
 [tasks.build]
