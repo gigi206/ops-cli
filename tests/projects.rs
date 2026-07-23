@@ -16,14 +16,29 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
+///
+/// On the repo's disk, deliberately not the system tmpfs: a fixture may hold a provisioned nix
+/// store, which is inode-heavy enough that concurrent tests exhaust a tmpfs's machine-wide inode
+/// budget — surfacing as "no space left on device" in *unrelated* work while the disk is nearly
+/// empty. Disk has inodes to spare, it matches production, and `cargo clean` reclaims it.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
 /// A unique temp dir removed on drop, on the repo disk (not tmpfs).
 struct TmpDir(PathBuf);
 
 impl TmpDir {
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("target/test-tmp");
+        let mut d = fixture_root();
         d.push(format!("sbx-projects-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)

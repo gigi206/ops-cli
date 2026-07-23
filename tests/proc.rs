@@ -8,22 +8,25 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// Where this suite's throwaway fixtures live, overridable with `SBX_TEST_TMPDIR`.
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
 ///
-/// The default is `/var/tmp`, deliberately **not** `std::env::temp_dir()` (which resolves to `/tmp`
-/// when `TMPDIR` is unset). A fixture here holds a provisioned nix store, which is inode-heavy —
-/// one run of this suite peaks near a million inodes. `/tmp` is usually a tmpfs whose inode count
-/// is capped machine-wide at about that, so a run exhausts it and *unrelated* work then fails with
-/// "no space left on device" while the disk is nearly empty. `/var/tmp` is disk-backed with an
-/// ordinary inode count, and — unlike the repo's `target/test-tmp` — short enough that a Unix
-/// socket under the data dir still fits the 108-byte `sockaddr_un` path limit.
+/// Deliberately **not** `std::env::temp_dir()`, which resolves to `/tmp` when `TMPDIR` is unset. A
+/// fixture here holds a provisioned nix store, which is inode-heavy — one run of this suite peaks
+/// near a million inodes. `/tmp` is usually a tmpfs whose inode count is capped machine-wide at
+/// about that, so a run exhausts it and *unrelated* work then fails with "no space left on device"
+/// while the disk is nearly empty. The repo's disk has inodes to spare, it matches production (the
+/// store lives on disk), and `cargo clean` reclaims it.
 ///
-/// The override exists for a host that mounts `/var/tmp` on a tmpfs, or wants the fixtures on a
-/// specific volume; point it at any disk-backed directory with a short path.
+/// Keep the per-fixture tag short: a launch's egress proxy binds a Unix socket under the data dir,
+/// and `sun_path` caps the whole path at 108 bytes, which this tree already spends most of.
 fn fixture_root() -> PathBuf {
-    std::env::var_os("SBX_TEST_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/tmp"))
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
 }
 
 struct TmpDir(PathBuf);
@@ -33,7 +36,7 @@ impl TmpDir {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut d = fixture_root();
-        d.push(format!("sbx-proc-{}-{n}", std::process::id()));
+        d.push(format!("p-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
