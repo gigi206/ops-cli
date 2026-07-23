@@ -17,7 +17,9 @@ impl TmpDir {
         // cage's structural mounts, so a bind canonicalized under it would (correctly) trip the
         // bind-nesting warning — an artifact of where the temp dir lives, not of the test's intent.
         // The build tree (`<repo>/target/test-tmp`) nests with no structural mount, matching the
-        // other e2e suites.
+        // other e2e suites. This one is fixed on purpose — the sibling suites honour a
+        // `SBX_TEST_TMPDIR` override, but here the location is what the assertions rest on, and
+        // pointing it at `/tmp` would reintroduce the very nesting the tests must not see.
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
         d.push(format!("sbx-config-it-{}-{n}", std::process::id()));

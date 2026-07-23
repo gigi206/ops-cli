@@ -20,6 +20,24 @@ fn sbx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
 }
 
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
+///
+/// On the repo's disk, not the system tmpfs: provisioning a nix store copies a large file count,
+/// which exhausts a tmpfs's inode budget (making the launch fail and the test skip). Disk has
+/// inodes to spare, it matches production (the store lives on disk), and `cargo clean` reclaims it.
+///
+/// Keep the per-fixture tag short: a launch's egress proxy binds a Unix socket under the data dir,
+/// and `sun_path` caps the whole path at 108 bytes, which this tree already spends most of.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
 /// A unique temp dir removed on drop.
 struct TmpDir(PathBuf);
 
@@ -27,13 +45,7 @@ impl TmpDir {
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // On the repo's disk, not the system tmpfs: provisioning a nix store copies a large file
-        // count, which exhausts a tmpfs's inode budget (making the launch fail and the test skip).
-        // Disk has inodes to spare, and it matches production (the store lives on disk). A short
-        // prefix keeps any bound socket path under `sun_path`'s 108-byte cap. `cargo clean`
-        // reclaims it.
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("target/test-tmp");
+        let mut d = fixture_root();
         d.push(format!("sh-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
