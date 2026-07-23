@@ -1011,10 +1011,210 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
     }
 }
 
+/// The per-launch runtime directories under the data dir, each with the filename prefixes whose
+/// entries are keyed by the **launcher pid**.
+///
+/// These hold a launch's live plumbing — the egress MITM CA and its proxy/control sockets, the
+/// inbound forwarder's socket dir, the in-cage portal's runtime dir, the process-observation
+/// sockets — all of which a clean exit unlinks through an RAII guard. A `Drop` does not run on a
+/// signal, and a cage normally ends on one (Ctrl-C, `sbx session stop`'s SIGTERM→SIGKILL, a
+/// detached launch killed later), so the guard covers the minority case and the rest accumulate.
+/// [`sweep_runtime_dirs`] is the backstop: the same doctrine the session registry already applies
+/// to its records — treat what is on disk as a hint, validate it by liveness, self-heal.
+///
+/// An empty prefix matches a bare-pid name (the portal's `<pid>/` directory). `<data>/egress`'s
+/// `stats-<pid>-<ticks>` is deliberately **absent**: it outlives its session by design, as the data
+/// `sbx net stats` aggregates (`sbx net stats --reset` is its purge).
+///
+/// `dbus` is a legacy directory — the filtered host-bus proxy it belonged to was replaced by the
+/// private in-cage portal, so nothing writes there any more; sweeping it reclaims the residue an
+/// older version left behind, after which the directory simply stays empty.
+const RUNTIME_DIRS: &[(&str, &[&str])] = &[
+    ("egress", &["ca-", "proxy-", "control-"]),
+    ("forward", &["fwd-"]),
+    ("portal", &[""]),
+    ("proc", &["control-", "notif-"]),
+    ("dbus", &["proxy-"]),
+];
+
+/// The launcher pid a runtime entry is keyed by, given the `prefixes` of its directory — or `None`
+/// when the name is not one this sweep recognises, which keeps it.
+///
+/// A name matches when it carries one of the prefixes and what follows, up to the first `.` (the
+/// `.sock`/`.pem` extension), parses as a pid. Everything else — an unprefixed name, a
+/// `stats-<pid>-<ticks>` (whose tail is not a bare number), a flush intermediate — yields `None`
+/// and is left alone: the sweep only ever removes what it positively identified.
+fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
+    prefixes.iter().find_map(|prefix| {
+        let rest = name.strip_prefix(prefix)?;
+        let stem = rest.split('.').next()?;
+        stem.parse().ok()
+    })
+}
+
+/// Sweep — or, in a dry run, list — the entries of the per-launch runtime directories
+/// ([`RUNTIME_DIRS`]) whose launcher pid is gone. Returns what was (or would be) removed.
+///
+/// Liveness is by bare pid, the only key these names carry: a pid still taken keeps its entry, so
+/// a *reused* pid merely delays a stale entry to a later pass. The error that would matter — a
+/// live launch losing its socket — cannot happen, because a live launcher's pid always reads as
+/// live. An absent or unreadable directory is skipped, and each removal is best-effort: this is
+/// housekeeping, never a reason to fail the caller.
+pub(crate) fn sweep_runtime_dirs(data_dir: &Path, prune: bool) -> Vec<PathBuf> {
+    sweep_runtime_dirs_with(data_dir, prune, &crate::session::pid_is_live)
+}
+
+/// [`sweep_runtime_dirs`] with the liveness predicate injected, so the sweep is testable without
+/// spawning processes.
+fn sweep_runtime_dirs_with(
+    data_dir: &Path,
+    prune: bool,
+    is_live: &dyn Fn(u32) -> bool,
+) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for (dir_name, prefixes) in RUNTIME_DIRS {
+        let dir = data_dir.join(dir_name);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(pid) = runtime_entry_pid(name, prefixes) else {
+                continue;
+            };
+            if is_live(pid) {
+                continue;
+            }
+            let path = entry.path();
+            if prune {
+                // A directory entry (the portal's runtime dir, the forwarder's socket dir) needs the
+                // recursive removal; a socket or the CA file is a plain unlink. Try the file form
+                // first — the common case — and fall back rather than stat'ing every entry.
+                if std::fs::remove_file(&path).is_err() {
+                    let _ = force_remove_dir_all(&path);
+                }
+            }
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    #[test]
+    fn runtime_entry_pid_reads_only_the_names_it_owns() {
+        // the egress trio, each keyed by the launcher pid before its extension
+        let egress = &["ca-", "proxy-", "control-"][..];
+        assert_eq!(runtime_entry_pid("ca-1234.pem", egress), Some(1234));
+        assert_eq!(runtime_entry_pid("proxy-1234.sock", egress), Some(1234));
+        assert_eq!(runtime_entry_pid("control-99.sock", egress), Some(99));
+
+        // The stats files share the directory but NOT the sweep: they outlive their session as
+        // `sbx net stats`' data. Neither the file nor a flush intermediate may ever be identified.
+        assert_eq!(runtime_entry_pid("stats-1234-99887766", egress), None);
+        assert_eq!(runtime_entry_pid("stats-1234-99887766.tmp.0", egress), None);
+
+        // The other directories' shapes.
+        assert_eq!(runtime_entry_pid("fwd-77", &["fwd-"]), Some(77));
+        assert_eq!(
+            runtime_entry_pid("notif-77.sock", &["control-", "notif-"]),
+            Some(77)
+        );
+        // A bare-pid directory name (the portal's) matches the empty prefix.
+        assert_eq!(runtime_entry_pid("4242", &[""]), Some(4242));
+
+        // Anything not positively identified is left alone — the sweep never guesses.
+        assert_eq!(runtime_entry_pid("ca-notapid.pem", egress), None);
+        assert_eq!(runtime_entry_pid("README", egress), None);
+        assert_eq!(runtime_entry_pid("ca-.pem", egress), None);
+        assert_eq!(runtime_entry_pid("notes.txt", &[""]), None);
+    }
+
+    #[test]
+    fn sweep_runtime_dirs_removes_only_the_entries_of_dead_launches() {
+        let data = TmpDir::new();
+        let root = data.path();
+        let egress = root.join("egress");
+        let forward = root.join("forward");
+        let portal = root.join("portal");
+        std::fs::create_dir_all(&egress).unwrap();
+        std::fs::create_dir_all(&forward).unwrap();
+        std::fs::create_dir_all(&portal).unwrap();
+
+        // pid 1 is live, pid 2 is gone.
+        for name in ["ca-1.pem", "proxy-1.sock", "ca-2.pem", "control-2.sock"] {
+            std::fs::write(egress.join(name), b"x").unwrap();
+        }
+        // The stats of BOTH launches, and an unrecognised file, must survive either way.
+        std::fs::write(egress.join("stats-1-111"), b"x").unwrap();
+        std::fs::write(egress.join("stats-2-222"), b"x").unwrap();
+        std::fs::write(egress.join("keepme"), b"x").unwrap();
+        // Directory-shaped entries: the forwarder's socket dir and the portal's runtime dir.
+        std::fs::create_dir_all(forward.join("fwd-2").join("nested")).unwrap();
+        std::fs::create_dir(portal.join("1")).unwrap();
+        std::fs::create_dir(portal.join("2")).unwrap();
+
+        let live = |pid: u32| pid == 1;
+
+        // A dry run identifies the dead entries and changes nothing.
+        let listed = sweep_runtime_dirs_with(root, false, &live);
+        assert_eq!(
+            listed.len(),
+            4,
+            "ca-2, control-2, fwd-2, portal/2: {listed:?}"
+        );
+        assert!(
+            egress.join("ca-2.pem").exists(),
+            "a dry run removes nothing"
+        );
+        assert!(forward.join("fwd-2").exists());
+
+        // The sweep removes exactly those four — files and directories alike.
+        let removed = sweep_runtime_dirs_with(root, true, &live);
+        assert_eq!(removed.len(), 4);
+        assert!(!egress.join("ca-2.pem").exists());
+        assert!(!egress.join("control-2.sock").exists());
+        assert!(
+            !forward.join("fwd-2").exists(),
+            "a directory entry is removed recursively"
+        );
+        assert!(!portal.join("2").exists());
+
+        // The live launch keeps its plumbing, and the stats of the DEAD launch survive too.
+        assert!(
+            egress.join("ca-1.pem").exists(),
+            "a live launch is never touched"
+        );
+        assert!(egress.join("proxy-1.sock").exists());
+        assert!(portal.join("1").exists());
+        assert!(egress.join("stats-1-111").exists());
+        assert!(
+            egress.join("stats-2-222").exists(),
+            "a dead launch's stats outlive it — they are `sbx net stats`' data"
+        );
+        assert!(
+            egress.join("keepme").exists(),
+            "an unrecognised name is left alone"
+        );
+
+        // Idempotent: a second sweep finds nothing left.
+        assert!(sweep_runtime_dirs_with(root, true, &live).is_empty());
+    }
+
+    #[test]
+    fn sweep_runtime_dirs_tolerates_absent_directories() {
+        let data = TmpDir::new();
+        // None of the runtime directories exist yet (a fresh data dir) — the sweep is a no-op, not
+        // an error, so it can run unconditionally at the head of every launch.
+        assert!(sweep_runtime_dirs_with(data.path(), true, &|_| false).is_empty());
+    }
 
     #[test]
     fn prune_flake_roots_drops_only_removed_packages() {

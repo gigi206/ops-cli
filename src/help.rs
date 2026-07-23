@@ -896,7 +896,8 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "--all",
-                "also collect the shared store across every project (orphaned closures)",
+                "also collect the shared store across every project (orphaned closures), and\n\
+                 sweep the runtime files of launches that are gone",
             ),
             (
                 "--prune",
@@ -908,7 +909,12 @@ const PAGES: &[Page] = &[
             the destructive form is opt-in.\n\
             \n\
             `--all` additionally collects the shared store — the closures no live project or\n\
-            locked channel revision still roots — under an exclusive lock.\n\
+            locked channel revision still roots — under an exclusive lock. It also removes the\n\
+            per-launch runtime files (the egress CA and its sockets, the forwarder and portal\n\
+            runtime directories) left behind when a cage ended on a signal rather than exiting\n\
+            cleanly. Every launch already sweeps those, so this matters for a data directory\n\
+            nothing launches from any more. Per-session egress statistics are never swept — they\n\
+            are what `sbx net stats` reads; `sbx net stats --reset` is their purge.\n\
             \n\
             Removing whole per-project runtime *trees* (a project whose directory is gone, or a\n\
             markerless legacy tree) is `sbx projects rm` — see `sbx help projects`. After a tree\n\

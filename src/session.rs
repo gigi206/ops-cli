@@ -580,25 +580,36 @@ fn parse_record(path: &Path) -> Option<Session> {
 
 /// Whether `session`'s process is still the same one we registered.
 ///
-/// `kill(pid, 0)` is only a cheap pre-filter: `ESRCH` means the pid is gone and
-/// `EPERM` means it now belongs to another user (a reused pid) — both dead. A
-/// success means *a* process holds the pid, which is not enough, so the decisive
-/// test is always the start-time match: only the original incarnation has it.
+/// [`pid_is_live`] is only a cheap pre-filter: a live pid means *a* process holds it, which is not
+/// enough, so the decisive test is always the start-time match — only the original incarnation
+/// has it.
 ///
 /// One harmless transient: a just-exited `sbx run` not yet reaped by its parent is
 /// a zombie whose `/proc/<pid>/stat` still carries the original start time, so it
 /// reads as alive for that brief window. Treating the zombie state as dead would
 /// remove it, but the window is short and self-clears on the next listing.
 fn is_alive(session: &Session) -> bool {
-    let rc = unsafe { libc::kill(session.pid as libc::pid_t, 0) };
+    pid_is_live(session.pid) && read_start_ticks(session.pid) == Some(session.start_ticks)
+}
+
+/// Whether *some* process currently holds `pid` — the cheap pre-filter half of [`is_alive`],
+/// exposed for the callers that have only a pid to go on.
+///
+/// `ESRCH` means the pid is gone and `EPERM` means it now belongs to another user (so the
+/// original is gone either way); both read as dead. An unexpected errno is inconclusive and reads
+/// as live, which is the conservative direction for a caller that deletes what reads as dead.
+///
+/// This answers *"is the pid taken"*, not *"is it the same process"* — a reused pid reads as live.
+/// A caller that recorded a start time must pair this with that match ([`is_alive`] does); one
+/// keyed by a bare pid cannot, and merely keeps a stale entry a while longer.
+pub(crate) fn pid_is_live(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc != 0 {
-        match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) | Some(libc::EPERM) => return false,
-            // An unexpected errno is inconclusive; fall through to the decisive check.
-            _ => {}
+        if let Some(libc::ESRCH) | Some(libc::EPERM) = io::Error::last_os_error().raw_os_error() {
+            return false;
         }
     }
-    read_start_ticks(session.pid) == Some(session.start_ticks)
+    true
 }
 
 /// The start time (clock ticks since boot) of `pid`, or `None` if it is gone.

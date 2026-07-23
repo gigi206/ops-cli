@@ -4,6 +4,10 @@
 //! (a directory with a `project` marker whose recorded path is present = `idle`, absent = `dead`,
 //! or no marker = `markerless`). They never touch the shared store, so `--gc` is exercised only in
 //! its no-op branch here; its real shared-store collection is proven end-to-end in `run.rs`.
+//!
+//! The same host-side-only harness also covers `sbx gc`'s sweep of the per-launch **runtime files**
+//! (fabricated under a redirected data dir and keyed by a reaped pid), including the dry run's
+//! must-touch-nothing contract.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -515,6 +519,75 @@ fn rm_rejects_a_path_shaped_id() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("invalid project id"),
         "should name the invalid id:\n{}",
+        text(&out)
+    );
+}
+
+/// The pid of a process that has run and been reaped — dead by construction, so a liveness check
+/// classifies anything keyed by it as a leftover.
+fn reaped_pid() -> u32 {
+    let mut child = Command::new("/bin/true").spawn().expect("spawn /bin/true");
+    let pid = child.id();
+    let _ = child.wait();
+    pid
+}
+
+/// The per-launch runtime files of a dead launch are swept by `sbx gc --all --prune` — and, the
+/// property that regressed once, left **untouched** by the dry run that merely reports them.
+///
+/// A unit test cannot catch that regression: the sweep function itself was correct, and the bug was
+/// *where it was called from* (a launch-path helper `sbx gc` also runs, so a dry run deleted what it
+/// claimed was merely reclaimable). Only driving the real binary pins it.
+#[test]
+fn gc_sweeps_dead_launch_runtime_files_but_never_on_a_dry_run() {
+    let fx = Fixture::new();
+    let pid = reaped_pid();
+    let sbx_data = fx.data_home.path().join("sbx");
+    let egress = sbx_data.join("egress");
+    let portal = sbx_data.join("portal").join(pid.to_string());
+    std::fs::create_dir_all(&egress).unwrap();
+    std::fs::create_dir_all(&portal).unwrap();
+
+    // What a launch leaves when it ends on a signal: the MITM CA and its two sockets, plus the
+    // portal's runtime directory. The stats file shares the directory but must survive both passes —
+    // it outlives its session as the data `sbx net stats` aggregates.
+    let ca = egress.join(format!("ca-{pid}.pem"));
+    let proxy = egress.join(format!("proxy-{pid}.sock"));
+    let control = egress.join(format!("control-{pid}.sock"));
+    let stats = egress.join(format!("stats-{pid}-12345"));
+    for f in [&ca, &proxy, &control, &stats] {
+        std::fs::write(f, b"x").unwrap();
+    }
+
+    // The dry run identifies them and changes nothing.
+    let out = fx.sbx(&["gc", "--all"]);
+    assert!(
+        text(&out).contains("runtime files"),
+        "a dry run should report the leftovers:\n{}",
+        text(&out)
+    );
+    for f in [&ca, &proxy, &control, &stats, &portal] {
+        assert!(
+            f.exists(),
+            "a dry run must remove nothing, but {} is gone:\n{}",
+            f.display(),
+            text(&out)
+        );
+    }
+
+    // The prune removes exactly the four identified entries — file and directory alike.
+    let out = fx.sbx(&["gc", "--all", "--prune"]);
+    for f in [&ca, &proxy, &control, &portal] {
+        assert!(
+            !f.exists(),
+            "the prune should have removed {}:\n{}",
+            f.display(),
+            text(&out)
+        );
+    }
+    assert!(
+        stats.exists(),
+        "the session's stats outlive it — `sbx net stats` reads them:\n{}",
         text(&out)
     );
 }

@@ -1113,6 +1113,7 @@ pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCod
                 // per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the
                 // nix-store side — the shared store's orphaned closures across every project.
                 let _ = session_housekeeping(&layout, pal);
+                runtime_housekeeping(&layout, prune, pal);
                 shared_store_gc(&layout, prune, pal);
             }
             None => eprintln!(
@@ -1166,6 +1167,30 @@ fn session_housekeeping(
             );
             std::collections::BTreeSet::new()
         }
+    }
+}
+
+/// Reclaim — or, in a dry run, count — the per-launch runtime files left behind by launches that
+/// are gone: the egress MITM CA and its sockets, the inbound forwarder's and in-cage portal's
+/// runtime directories, the process-observation sockets. Every launch already sweeps these, so this
+/// is for the data directory of someone who has stopped launching; it is pure host-side filesystem
+/// work (no sandbox, no nix), and stays silent when there is nothing to reclaim.
+fn runtime_housekeeping(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
+    let stale = super::gc::sweep_runtime_dirs(layout.data_dir(), prune);
+    if stale.is_empty() {
+        return;
+    }
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    if prune {
+        println!(
+            "{h}sbx gc:{r} runtime files — removed {n}{}{r} left by launches that are gone.",
+            stale.len()
+        );
+    } else {
+        println!(
+            "{h}sbx gc:{r} runtime files — {n}{}{r} left by launches that are gone would be removed.",
+            stale.len()
+        );
     }
 }
 
@@ -3131,6 +3156,18 @@ fn build(
     for warning in &prep.cfg.warnings {
         crate::diag::warn(warning);
     }
+
+    // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
+    // Their RAII guards unlink on a clean exit, but a cage normally ends on a signal (Ctrl-C,
+    // `sbx session stop`, a detached session killed later) and a `Drop` does not run then — so each
+    // cage tidies up after its predecessors. Silent and best-effort: routine housekeeping, and a
+    // live launch's files are never touched (its pid still reads as live). The same self-healing
+    // doctrine the session registry applies to its records.
+    //
+    // This sits in `build` — the one function that actually stands up a cage — rather than in
+    // `prepare`, which `sbx gc` also calls: a gc *dry run* must touch nothing, and sweeping from
+    // there would have deleted these files while reporting them as merely reclaimable.
+    super::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
 
     // Provision the project's declared tools into sbx's store, against the project's
     // effective nixpkgs reference; their bin dirs are prepended to PATH below. A

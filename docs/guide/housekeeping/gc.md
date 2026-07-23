@@ -23,7 +23,7 @@ sbx gc --prune            # reclaim this project's store
 |---|---|
 | `sbx gc` | the **current project's** store (dry run) |
 | `sbx gc --prune` | the current project's store (reclaim) |
-| `sbx gc --all` | also the **shared** store's orphaned closures (dry run) |
+| `sbx gc --all` | also the **shared** store's orphaned closures, and the runtime files of launches that are gone (dry run) |
 | `sbx gc --all --prune` | the above, collected under an exclusive lock |
 
 - The per-project sweep reclaims the build of a **removed package** — delete a
@@ -45,6 +45,15 @@ sbx gc --prune            # reclaim this project's store
   costs a re-provision on the next launch.
 - `--all` collects the shared nix store — the closures no live project or locked channel
   revision still roots — under an exclusive lock so a concurrent launch cannot race it.
+- `--all` also sweeps the **per-launch runtime files** — the egress MITM CA and its
+  proxy/control sockets, the inbound forwarder's and in-cage portal's runtime directories, the
+  process-observation sockets. A clean exit unlinks them, but a cage normally ends on a signal
+  (Ctrl-C, [`sbx session stop`](../cli/session.md), a detached session killed later) and the
+  cleanup does not run then. A leftover is identified by its launcher pid: gone, it is removed;
+  still live, it is never touched. Every launch already runs this sweep before adding its own
+  files, so `--all` matters for a data directory nothing launches from any more.
+  Per-session **egress statistics are never swept** — they outlive their session by design, as
+  the data [`sbx net stats`](../cli/net.md) aggregates (`sbx net stats --reset` is their purge).
 - Removing a whole per-project runtime **tree** is [`sbx projects rm`](../cli/projects.md);
   its store closures are then reclaimed by `sbx gc --all --prune` (or in one step,
   `sbx projects rm <id> --gc`).
