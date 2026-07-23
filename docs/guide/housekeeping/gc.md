@@ -5,7 +5,7 @@ superseded closures and the builds of removed packages. `sbx gc` reclaims the ni
 store; whole per-project runtime **trees** (for projects that no longer exist) are removed
 by [`sbx projects rm`](../cli/projects.md).
 
-See also: [`sbx gc`](../cli/gc.md) · [`sbx projects`](../cli/projects.md) · [Provisioning](../concepts/provisioning.md) · [Directory layout](../concepts/directory-layout.md).
+See also: [`sbx gc`](../cli/gc.md) · [`sbx store`](../cli/store.md) · [`sbx projects`](../cli/projects.md) · [Provisioning](../concepts/provisioning.md) · [Directory layout](../concepts/directory-layout.md).
 
 ## Dry run by default
 
@@ -16,6 +16,9 @@ Reclamation is **irreversible**, so `sbx gc` is a **dry run by default** — it 
 sbx gc                    # dry run: what this project's store would reclaim
 sbx gc --prune            # reclaim this project's store
 ```
+
+Deduplication (`--optimise`) is the exception: it deletes nothing, so it applies
+immediately. See [Deduplication](../cli/gc.md#deduplication).
 
 ## Scope
 

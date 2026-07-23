@@ -891,7 +891,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["gc"],
-        synopsis: "sbx gc [--all] [--prune]",
+        synopsis: "sbx gc [--all] [--prune] [--optimise]",
         summary: "reclaim sbx's nix store space",
         options: &[
             (
@@ -902,6 +902,12 @@ const PAGES: &[Page] = &[
             (
                 "--prune",
                 "actually reclaim (default is a dry run that touches nothing)",
+            ),
+            (
+                "--optimise",
+                "deduplicate the store afterwards: replace identical files by hardlinks to one\n\
+                 copy. Applies immediately — asking for it is the consent — and reports the bytes\n\
+                 and inodes freed. Covers this project's store, and the shared store under --all.",
             ),
         ],
         details:
@@ -919,7 +925,20 @@ const PAGES: &[Page] = &[
             Removing whole per-project runtime *trees* (a project whose directory is gone, or a\n\
             markerless legacy tree) is `sbx projects rm` — see `sbx help projects`. After a tree\n\
             is removed, its store closures are reclaimed by `sbx gc --all --prune`, or in one step\n\
-            with `sbx projects rm <id> --gc`.",
+            with `sbx projects rm <id> --gc`.\n\
+            \n\
+            `--optimise` reclaims a different kind of waste: duplication rather than garbage. A\n\
+            per-project store is seeded from the shared store by copy — never by hardlink, since a\n\
+            same-uid write in the cage would otherwise reach through the link and corrupt the\n\
+            shared copy — so every seeded file arrives as its own inode and identical content is\n\
+            held several times over. Deduplicating *within* one store is safe where linking across\n\
+            stores is not: nix keeps its `.links` pool under the store root it is given, so files\n\
+            can only ever be linked to others in the same store, which the cage may already write\n\
+            to freely. Writable files are left alone. Unlike a collection this deletes nothing, so\n\
+            it applies immediately rather than defaulting to a dry run; run it after a `--prune`\n\
+            so nothing about to be collected is deduplicated first (passing both does this).\n\
+            \n\
+            What it occupies before and after is `sbx store`.",
     },
     Page {
         path: &["store"],

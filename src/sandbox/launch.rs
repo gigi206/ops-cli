@@ -1105,7 +1105,7 @@ pub(crate) fn upgrade_mise_packages(
 /// current-project sweep needs — so `sbx gc --all` reclaims even from a directory that is not a
 /// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
 /// the destructive form.
-pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCode {
+pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Palette) -> ExitCode {
     if all {
         match crate::store::Layout::from_env() {
             Some(layout) => {
@@ -1114,14 +1114,14 @@ pub(crate) fn gc(prune: bool, all: bool, pal: &crate::style::Palette) -> ExitCod
                 // nix-store side — the shared store's orphaned closures across every project.
                 let _ = session_housekeeping(&layout, pal);
                 runtime_housekeeping(&layout, prune, pal);
-                shared_store_gc(&layout, prune, pal);
+                shared_store_gc(&layout, prune, optimise, pal);
             }
             None => eprintln!(
                 "sbx gc: cannot locate sbx's data directory; skipping the shared-store housekeeping."
             ),
         }
     }
-    match sweep_current(prune, pal) {
+    match sweep_current(prune, optimise, pal) {
         Ok(()) => ExitCode::SUCCESS,
         // Under `--all` the shared-store collection above already ran, so a current-project sweep
         // that could not run (the host cannot sandbox, nix is unavailable) — or that hit an error —
@@ -1850,7 +1850,7 @@ pub(crate) fn projects_rm(
 
     if do_gc {
         if apply {
-            shared_store_gc(&layout, true, pal);
+            shared_store_gc(&layout, true, false, pal);
         } else {
             eprintln!(
                 "sbx projects rm: {dim}--gc runs the shared-store collection only when the removal \
@@ -1915,7 +1915,12 @@ mod projects_rm_tests {
 /// it is never corruption. Widening the sbx lock to cover provisioning would make this collector
 /// wait behind minutes-long builds, so the narrow lock plus this named residual is the deliberate
 /// trade.
-fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
+fn shared_store_gc(
+    layout: &crate::store::Layout,
+    prune: bool,
+    optimise: bool,
+    pal: &crate::style::Palette,
+) {
     let (h, r) = (pal.head, pal.reset);
     let Some(nix_store) = crate::store::resolve_nix_store(Some(layout)) else {
         eprintln!("sbx gc: nix-store not found; skipping the shared-store gc.");
@@ -1972,6 +1977,34 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
             super::gc::human_bytes(report.bytes)
         );
     }
+
+    // After the collection, so nothing about to be deleted is deduplicated first. Still under the
+    // exclusive lock, which is what keeps a concurrent seed from reading a file mid-relink.
+    if optimise {
+        report_optimise(&nix_store, &layout.store_dir(), "shared store", pal);
+    }
+}
+
+/// Deduplicate one store and report the gain, naming which store it was. Best-effort: a failure is
+/// reported and does not fail the surrounding collection, since nothing was reclaimed either way.
+fn report_optimise(
+    nix_store: &std::path::Path,
+    store_dir: &std::path::Path,
+    label: &str,
+    pal: &crate::style::Palette,
+) {
+    let (h, r, ok) = (pal.head, pal.reset, pal.ok);
+    match super::gc::optimise(nix_store, store_dir) {
+        Ok(report) if report.inodes_freed == 0 && report.bytes_freed == 0 => {
+            println!("{h}sbx gc:{r} {label} — already deduplicated, nothing to reclaim.");
+        }
+        Ok(report) => println!(
+            "{h}sbx gc:{r} {label} — {ok}deduplicated{r}: freed {} across {} inode(s).",
+            super::gc::human_bytes(report.bytes_freed),
+            report.inodes_freed,
+        ),
+        Err(e) => eprintln!("sbx gc: {label} — deduplication failed: {e}"),
+    }
 }
 
 /// Reclaim the current project's own writable store.
@@ -2000,7 +2033,7 @@ fn shared_store_gc(layout: &crate::store::Layout, prune: bool, pal: &crate::styl
 /// --out-link <non-store-path>` it runs itself, outside the supported self-equip paths (`sbx mise`,
 /// `nix profile`, declared `flake:` packages) — is not seen host-side and would be collected. The
 /// supported self-equip paths all root by store path, so they survive.
-fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
+fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let prep = prepare()?;
 
@@ -2147,6 +2180,12 @@ fn sweep_current(prune: bool, pal: &crate::style::Palette) -> Result<(), ExitCod
                 "  {dim}and {pruned} removed-package build(s) + {superseded} superseded build(s) would also be reclaimed.{r}"
             );
         }
+    }
+
+    // After the collection, so nothing about to be deleted is deduplicated first. This is the store
+    // where deduplication pays: a seeded per-project store arrives as fresh inodes by construction.
+    if optimise {
+        report_optimise(&prep.nix_store, &store_dir, "this project's store", pal);
     }
     Ok(())
 }

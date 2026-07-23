@@ -237,6 +237,54 @@ pub(crate) fn prune_superseded_roots(
     removed
 }
 
+/// What deduplicating a store reclaimed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OptimiseReport {
+    pub(crate) bytes_freed: u64,
+    pub(crate) inodes_freed: u64,
+}
+
+/// Deduplicate `store_dir`'s store: replace files with identical content by hardlinks to a single
+/// copy, via `nix-store --optimise`.
+///
+/// This is where a per-project store's cost mostly comes from. A project's store is *seeded* from
+/// the shared store by copy (or reflink, where the filesystem supports it) — never by hardlink,
+/// since a same-uid write in the cage would then reach through the link and corrupt the shared
+/// copy — so every seeded file arrives as a fresh inode, and identical content within the store is
+/// held several times over. The shared store deduplicates as it is built; a seeded store does not.
+///
+/// Deduplicating **within one store** is sound where hardlinking *across* stores is not: nix keeps
+/// its `.links` pool under the store root it was given, so this can only ever link a store's files
+/// to each other. A cage that writes to one of them is writing into its own store, which it is
+/// already free to do; no other project and not the shared store can be reached. Files that are
+/// writable are left alone by nix as "suspicious", so anything deliberately mutable stays separate.
+///
+/// The gain is measured by walking the tree before and after rather than parsing nix's summary, so
+/// the inode count — the figure that matters on a filesystem whose inode table cannot grow — is
+/// reported alongside the bytes.
+pub(crate) fn optimise(nix_store: &Path, store_dir: &Path) -> io::Result<OptimiseReport> {
+    let before = tree_usage(store_dir);
+    let out = Command::new(nix_store)
+        .env("NIX_REMOTE", "")
+        .arg("--store")
+        .arg(store_dir)
+        .arg("--optimise")
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "nix-store --optimise failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let after = tree_usage(store_dir);
+    Ok(OptimiseReport {
+        // Saturating: a concurrent write could grow the tree mid-pass, and a negative "gain" would
+        // be a lie either way — report nothing reclaimed rather than wrap.
+        bytes_freed: before.bytes.saturating_sub(after.bytes),
+        inodes_freed: before.inodes.saturating_sub(after.inodes),
+    })
+}
+
 /// Garbage-collect `store_dir`'s store: compute the dead paths and their size, and delete them
 /// when `prune`. The dead set is found with `--gc --print-dead` (the mark phase without the
 /// sweep), so a dry run measures exactly what a prune would remove. Daemonless (`NIX_REMOTE`

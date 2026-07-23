@@ -737,7 +737,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     // reclamation is a separate manual step, and either way other projects need their own sweep.
     if gc {
         println!();
-        let gc_code = sandbox::gc(true, false, &pal);
+        let gc_code = sandbox::gc(true, false, false, &pal);
         println!(
             "{dim}note: `--gc` swept this project's store; run `sbx gc --prune` in the app's other \
              projects to reclaim their copies too.{r}"

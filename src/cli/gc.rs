@@ -10,10 +10,12 @@ use crate::{help, sandbox, style};
 pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
     let mut prune = false;
     let mut all = false;
+    let mut optimise = false;
     for a in &args {
         match a.to_str() {
             Some("--prune") => prune = true,
             Some("--all") => all = true,
+            Some("--optimise") | Some("--optimize") => optimise = true,
             Some(_) => {
                 eprintln!("sbx: usage: {}", help::synopsis("gc"));
                 return ExitCode::from(2);
@@ -25,5 +27,5 @@ pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
         }
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    sandbox::gc(prune, all, &pal)
+    sandbox::gc(prune, all, optimise, &pal)
 }
