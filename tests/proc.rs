@@ -8,13 +8,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Where this suite's throwaway fixtures live, overridable with `SBX_TEST_TMPDIR`.
+///
+/// The default is `/var/tmp`, deliberately **not** `std::env::temp_dir()` (which resolves to `/tmp`
+/// when `TMPDIR` is unset). A fixture here holds a provisioned nix store, which is inode-heavy —
+/// one run of this suite peaks near a million inodes. `/tmp` is usually a tmpfs whose inode count
+/// is capped machine-wide at about that, so a run exhausts it and *unrelated* work then fails with
+/// "no space left on device" while the disk is nearly empty. `/var/tmp` is disk-backed with an
+/// ordinary inode count, and — unlike the repo's `target/test-tmp` — short enough that a Unix
+/// socket under the data dir still fits the 108-byte `sockaddr_un` path limit.
+///
+/// The override exists for a host that mounts `/var/tmp` on a tmpfs, or wants the fixtures on a
+/// specific volume; point it at any disk-backed directory with a short path.
+fn fixture_root() -> PathBuf {
+    std::env::var_os("SBX_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"))
+}
+
 struct TmpDir(PathBuf);
 
 impl TmpDir {
     fn new() -> Self {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut d = std::env::temp_dir();
+        let mut d = fixture_root();
         d.push(format!("sbx-proc-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
