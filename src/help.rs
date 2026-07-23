@@ -1058,7 +1058,12 @@ const PAGES: &[Page] = &[
             whether it has an installed home on disk (its mise tools + login state, with disk size)\n\
             — which `sbx app rm <name> --purge` removes. An app can have a profile with no home yet\n\
             (never launched), or a home with no profile (launched from an inline/project app, or a\n\
-            profile since removed). `sbx app ls` is the same command. The full resolved app set —\n\
+            profile since removed). The `HOME` column names where that state lives: `global` is the\n\
+            app's single shared home, `N project home(s)` are the per-project homes of a\n\
+            `home_scope = \"project\"` app, and `N project mise pool(s)` are *not* homes — they are\n\
+            the per-project mise install pool a global app gets in each project it has run in\n\
+            (sized and purged with the app; `sbx app show <name>` breaks them down).\n\
+            `sbx app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `sbx config show`.",
     },
     Page {

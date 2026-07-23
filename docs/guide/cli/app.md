@@ -53,6 +53,21 @@ through `run`, so an app is never confused with a subcommand and **may be named 
 cage cannot run it, and the profile stays inert until `sbx app run <name>`. See
 [Portable profiles](../apps/profiles.md).
 
+### Listing apps
+
+`sbx app list` (alias `sbx app ls`) shows one row per app with its `HOME` column: the total
+size a `--purge` would reclaim, and where that state lives.
+
+| Reads | Means |
+|---|---|
+| `global` | the app's single shared home `<data>/apps/<name>/home` — a `home_scope = "global"` app (the default) |
+| `N project home(s)` | one isolated home per project — a [`home_scope = "project"`](../apps/home.md) app |
+| `N project mise pool(s)` | not a home: the per-project [mise pool](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned) a **global** app gets in each project it has been launched in |
+
+So `global + 1 project mise pool` is one home plus a pool — a global app launched in one
+project — not two homes. The pool is usually tiny (it holds only what the app self-equipped
+in that project); `sbx app show <name>` breaks the sizes down per home and per pool.
+
 ### Removing an app
 
 `rm <name>` deletes only the imported profile. To also reclaim what a launch left on

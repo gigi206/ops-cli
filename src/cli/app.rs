@@ -1474,8 +1474,11 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// A compact description of where an app's installed homes live — `global`, `N project home(s)`, or
-/// both joined with ` + ` — for the `sbx app list` installed-homes line.
+/// A compact description of where an app's isolated state lives — `global`, `N project home(s)`, and
+/// `N project mise pool(s)`, joined with ` + ` — for the `sbx app list` installed-homes line. A
+/// per-project *home* belongs to a `home_scope = "project"` app; a global app instead gets a
+/// per-project mise pool at every launch, which is state on disk (and purged with the app) but not a
+/// second home, so the two are named apart rather than counted together.
 fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
     let mut parts = Vec::new();
     if app.global_bytes.is_some() {
@@ -1485,6 +1488,11 @@ fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
         0 => {}
         1 => parts.push("1 project home".to_string()),
         n => parts.push(format!("{n} project homes")),
+    }
+    match app.project_pools {
+        0 => {}
+        1 => parts.push("1 project mise pool".to_string()),
+        n => parts.push(format!("{n} project mise pools")),
     }
     parts.join(" + ")
 }
@@ -1560,18 +1568,29 @@ mod tests {
 
     #[test]
     fn describe_home_locations_names_each_scope() {
-        let app = |global: Option<u64>, homes: usize| sandbox::InstalledApp {
+        let app = |global: Option<u64>, homes: usize, pools: usize| sandbox::InstalledApp {
             name: "x".to_string(),
             global_bytes: global,
             project_homes: homes,
+            project_pools: pools,
             project_bytes: 0,
         };
-        assert_eq!(describe_home_locations(&app(Some(1), 0)), "global");
-        assert_eq!(describe_home_locations(&app(None, 1)), "1 project home");
-        assert_eq!(describe_home_locations(&app(None, 3)), "3 project homes");
+        assert_eq!(describe_home_locations(&app(Some(1), 0, 0)), "global");
+        assert_eq!(describe_home_locations(&app(None, 1, 0)), "1 project home");
+        assert_eq!(describe_home_locations(&app(None, 3, 0)), "3 project homes");
         assert_eq!(
-            describe_home_locations(&app(Some(1), 2)),
+            describe_home_locations(&app(Some(1), 2, 0)),
             "global + 2 project homes"
+        );
+        // A global app's per-project mise pool is state on disk but not a second home: it is named
+        // as a pool, never folded into the home count.
+        assert_eq!(
+            describe_home_locations(&app(Some(1), 0, 1)),
+            "global + 1 project mise pool"
+        );
+        assert_eq!(
+            describe_home_locations(&app(Some(1), 0, 4)),
+            "global + 4 project mise pools"
         );
     }
 

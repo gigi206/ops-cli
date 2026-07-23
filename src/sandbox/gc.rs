@@ -629,32 +629,47 @@ pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
 /// read-only counterpart of [`purge_app_homes`], for the `sbx app list` view: it lets a user see
 /// which apps have installed tools/login state (even ones with no imported profile) before deciding
 /// what to purge. An app may have a global home (shared across projects), per-project homes, or both.
+///
+/// A per-project tree carries a **home** only for a `home_scope = "project"` app. A
+/// `home_scope = "global"` app keeps its single home under `<data>/apps/<name>/` yet still gets a
+/// per-project **mise pool** (`<data>/projects/<id>/apps/<name>/mise`, its install pool kept aligned
+/// with that project's `/nix` store), created at every launch. The two are counted separately, so a
+/// bare pool is never reported as a second isolated home; both are sized into [`project_bytes`], the
+/// disk a purge reclaims.
+///
+/// [`project_bytes`]: InstalledApp::project_bytes
 pub(crate) struct InstalledApp {
     pub(crate) name: String,
     /// Size of the global home `<data>/apps/<name>/`, or `None` when there is none.
     pub(crate) global_bytes: Option<u64>,
-    /// Number of per-project homes `<data>/projects/<id>/apps/<name>/`.
+    /// Number of per-project trees carrying a real home `<data>/projects/<id>/apps/<name>/home`.
     pub(crate) project_homes: usize,
-    /// Total size across the per-project homes.
+    /// Number of per-project trees carrying only a mise pool, with no home of their own.
+    pub(crate) project_pools: usize,
+    /// Total size across every per-project tree, home-bearing or pool-only.
     pub(crate) project_bytes: u64,
 }
 
 impl InstalledApp {
-    /// Total disk a full `sbx app rm <name> --purge` would free (global + every per-project home).
+    /// Total disk a full `sbx app rm <name> --purge` would free (global + every per-project tree).
     pub(crate) fn total_bytes(&self) -> u64 {
         self.global_bytes.unwrap_or(0) + self.project_bytes
     }
 }
 
-/// Enumerate the apps with an isolated home on disk, grouped and sized by name. Scans the global
-/// homes under `<data>/apps/` and the per-project homes under `<data>/projects/<id>/apps/`, sizing
-/// each with [`tree_size`]. Sorted by name. Read-only; a missing tree is simply no homes. Sizing is
-/// a recursive stat, so a very large mise data dir makes this proportionally slower — acceptable for
-/// an interactive management listing, where the size is the point (it drives the purge decision).
+/// Enumerate the apps with isolated state on disk, grouped and sized by name. Scans the global homes
+/// under `<data>/apps/` and the per-project trees under `<data>/projects/<id>/apps/`, sizing each
+/// with [`tree_size`] and classifying a per-project tree as a home or a bare mise pool by whether it
+/// carries a `home/` dir (the same test [`app_home_dirs`] applies). Sorted by name. Read-only; a
+/// missing tree is simply no state. Sizing is a recursive stat, so a very large mise data dir makes
+/// this proportionally slower — acceptable for an interactive management listing, where the size is
+/// the point (it drives the purge decision).
+///
+/// [`app_home_dirs`]: super::inspect::app_home_dirs
 pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
     use std::collections::BTreeMap;
-    // name -> (global_bytes, project_homes, project_bytes)
-    let mut apps: BTreeMap<String, (Option<u64>, usize, u64)> = BTreeMap::new();
+    // name -> (global_bytes, project_homes, project_pools, project_bytes)
+    let mut apps: BTreeMap<String, (Option<u64>, usize, usize, u64)> = BTreeMap::new();
 
     // Global homes: <data>/apps/<name>/
     if let Ok(entries) = std::fs::read_dir(data_dir.join("apps")) {
@@ -669,7 +684,8 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
         }
     }
 
-    // Per-project homes: <data>/projects/<id>/apps/<name>/
+    // Per-project trees: <data>/projects/<id>/apps/<name>/ — a home only when it carries `home/`,
+    // otherwise the global app's mise pool for that project.
     if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
         for project in projects.flatten() {
             if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -683,10 +699,15 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
                     continue;
                 }
                 if let Some(name) = entry.file_name().to_str() {
-                    let bytes = tree_size(&entry.path());
+                    let path = entry.path();
+                    let bytes = tree_size(&path);
                     let e = apps.entry(name.to_string()).or_default();
-                    e.1 += 1;
-                    e.2 += bytes;
+                    if path.join("home").is_dir() {
+                        e.1 += 1;
+                    } else {
+                        e.2 += 1;
+                    }
+                    e.3 += bytes;
                 }
             }
         }
@@ -694,10 +715,11 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
 
     apps.into_iter()
         .map(
-            |(name, (global_bytes, project_homes, project_bytes))| InstalledApp {
+            |(name, (global_bytes, project_homes, project_pools, project_bytes))| InstalledApp {
                 name,
                 global_bytes,
                 project_homes,
+                project_pools,
                 project_bytes,
             },
         )
@@ -1668,6 +1690,7 @@ mod tests {
         let demo_app = &apps[0];
         assert!(demo_app.global_bytes.is_some());
         assert_eq!(demo_app.project_homes, 2);
+        assert_eq!(demo_app.project_pools, 0);
         assert!(demo_app.total_bytes() > 0);
 
         let demo_tool = &apps[1];
@@ -1677,6 +1700,30 @@ mod tests {
         let scratch = &apps[2];
         assert!(scratch.global_bytes.is_none());
         assert_eq!(scratch.project_homes, 1);
+    }
+
+    /// A `home_scope = "global"` app's per-project tree holds only its mise pool, no `home/` — the
+    /// launch-time layout. It is state on disk (sized, and purged with the app) but not a second
+    /// isolated home, so it must be counted as a pool: counting it as a home told the user an app
+    /// had a per-project home it never had.
+    #[test]
+    fn installed_app_homes_counts_a_bare_mise_pool_as_a_pool_not_a_home() {
+        let data = TmpDir::new();
+        let d = data.path();
+        // the global-app layout: one global home, and a per-project tree carrying only `mise/`
+        mk_home(&d.join("apps/demo-app/home"));
+        mk_home(&d.join("projects/p1/apps/demo-app/mise/plugins"));
+        // a per-project tree that carries both is still a home (the home is what names it)
+        mk_home(&d.join("projects/p2/apps/demo-app/home"));
+        mk_home(&d.join("projects/p2/apps/demo-app/mise"));
+
+        let apps = installed_app_homes(d);
+        assert_eq!(apps.len(), 1);
+        let demo_app = &apps[0];
+        assert_eq!(demo_app.project_homes, 1);
+        assert_eq!(demo_app.project_pools, 1);
+        // both per-project trees are sized: a purge reclaims the pool too
+        assert!(demo_app.project_bytes > 0);
     }
 
     #[test]
