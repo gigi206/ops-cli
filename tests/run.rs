@@ -27,18 +27,45 @@ fn sbx() -> Command {
 }
 
 /// A unique temp dir removed on drop.
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`.
+///
+/// On the repo's disk, deliberately not the system tmpfs: provisioning a nix store copies the whole
+/// nixpkgs source tree (a huge file count) into it, and concurrent tests would exhaust a tmpfs's
+/// machine-wide inode budget — which surfaces as "no space left on device" in *unrelated* work
+/// while the disk is nearly empty. Disk has inodes to spare, it matches production (the store lives
+/// on disk), and `cargo clean` reclaims it.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
+/// Kills and reaps a backgrounded child on drop, so a panicking assertion never leaks the running
+/// cage — a `TmpDir` cleans directories, not processes.
+///
+/// The tests that need this tear their session down explicitly before asserting, which covers the
+/// assertions; this covers the panics *inside* the polling loop that runs first (a `serde_json`
+/// shape assumption, an `assert_eq!` on a record field), where nothing else would.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 struct TmpDir(PathBuf);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // On the repo's disk, not the system tmpfs: provisioning a nix store copies
-        // the whole nixpkgs source tree (a huge file count) into it, and concurrent
-        // tests would exhaust a tmpfs's inode budget. Disk has inodes to spare, and
-        // it matches production (the store lives on disk). `cargo clean` reclaims it.
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("target/test-tmp");
+        let mut d = fixture_root();
         // A short prefix on purpose: a launch's egress proxy binds a Unix socket under this
         // data dir (`…/<dir>/sbx/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path
         // at 108 bytes. A longer prefix plus a 7-digit pid (counted twice — here and in the
@@ -2588,23 +2615,25 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
 
     // A background session: one allowed fetch (logged `allow`), one denied fetch (logged `deny`),
     // then a sleep long enough to read its live log. The denied fetch fails; `sh` continues.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args([
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
-             nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
-             sleep 300",
-        ])
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .env("XDG_STATE_HOME", state.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the background sbx run");
+    let child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args([
+                "run",
+                "--",
+                "sh",
+                "-c",
+                "nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info; \
+                 nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
+                 sleep 300",
+            ])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the background sbx run"),
+    );
 
     // Poll the live log until both decisions have been recorded AND the allowed request's upstream
     // status has been amended in (or a generous deadline). The reader globs the one control socket in
@@ -2678,8 +2707,7 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
     let human_out = String::from_utf8_lossy(&human.stdout);
 
     // Tear the background session down before asserting, so a failure never leaks a live cage.
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
 
     assert!(
         saw_allow && saw_deny,
@@ -2742,7 +2770,7 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     );
 
     // The background session: one allowed and one denied egress, then a sleep long enough to tail.
-    let mut session = Command::new(env!("CARGO_BIN_EXE_sbx"))
+    let session = Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args([
             "run",
             "--",
@@ -2759,6 +2787,7 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the background sbx run");
+    let session = KillOnDrop(session);
 
     // Give the session a moment to come up (the seed then catches early events).
     std::thread::sleep(Duration::from_secs(2));
@@ -2790,6 +2819,8 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
             }
         })
     };
+    // Guarded only now: taking its piped stdout above needs the `Child` itself.
+    let follower = KillOnDrop(follower);
 
     let line_has = |buf: &str, host: &str, verdict: &str| {
         buf.lines().any(|l| {
@@ -2830,11 +2861,11 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    let _ = follower.kill();
-    let _ = follower.wait();
+    // Tear both down before asserting, so a failure never leaks a live cage. Dropping the follower
+    // closes the pipe, which ends the reader thread.
+    drop(follower);
     let _ = reader.join();
-    let _ = session.kill();
-    let _ = session.wait();
+    drop(session);
 
     let out = captured.lock().unwrap().clone();
     assert!(
