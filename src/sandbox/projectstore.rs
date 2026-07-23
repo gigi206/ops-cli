@@ -430,7 +430,7 @@ fn reflink(from: &Path, to: &Path) -> io::Result<()> {
 /// files on the same filesystem as the seed's destination). The probe names are
 /// unique per call (pid + counter) so a concurrent same-project seed never collides
 /// on them. The probe files are removed before returning.
-fn supports_reflink(dir: &Path) -> bool {
+pub(crate) fn supports_reflink(dir: &Path) -> bool {
     let src = dir.join(format!(".reflink-probe-src-{}", unique()));
     let dst = dir.join(format!(".reflink-probe-dst-{}", unique()));
     let ok = fs::write(&src, b"probe")

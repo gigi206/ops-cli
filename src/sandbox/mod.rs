@@ -95,6 +95,7 @@ pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
 pub(crate) use netns::run_holder;
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
+pub(crate) use projectstore::supports_reflink;
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use proxy::{builtin_allow_rules, union_with_builtin};

@@ -41,25 +41,30 @@ rendered size.
 A filesystem can run out of **inodes while it still has free space**, and a nix store is
 inode-heavy — many small files.
 
-- **ext4** fixes the size of its inode table when the filesystem is created. It cannot grow. Once
-  exhausted, writes fail with `ENOSPC` even with gigabytes free. Check yours with `df -i`.
-- **btrfs** and **XFS** allocate inodes on demand and have no such limit.
+Some filesystems fix the size of their inode table when they are created; it cannot grow, and once
+it is exhausted, writes fail with `ENOSPC` even with gigabytes free. Others allocate inodes on
+demand and have no such limit. Check yours with `df -i`.
 
 If the count here is a large share of what `df -i` reports for the filesystem, the levers are
 [`sbx gc --all --prune`](gc.md), [`sbx projects rm <id>`](projects.md), `sbx app rm <name> --purge`
-— or moving the data directory to btrfs/XFS.
+— or a data directory on a filesystem that allocates inodes on demand.
 
 ## How the sizes are counted
 
-Two properties worth knowing, because they decide whether the numbers agree with other tools:
+Two properties always hold, because they decide whether the numbers agree with other tools:
 
 - **Allocated blocks, not apparent size** — a sparse file counts what it occupies. Same as `du`.
 - **A hardlinked file counts once**, however many names point at it. This is essential here: a nix
   store deduplicates identical files into `.links`, so counting each name would roughly *double*
   the reported size of any store.
 
-One deliberate blind spot: **extents shared by reflink are not detected.** On a copy-on-write
-filesystem (btrfs, XFS) a per-project store shares nearly every extent with the shared store it was
-seeded from, yet still reports its full size, because no cheap system call exposes extent sharing
-(`du` has the same gap). On such a filesystem the total is an **upper bound** and can exceed what
-`df` reports as used — the per-project trees are far cheaper than they look.
+Whether a size is **exact or an upper bound** then depends on the filesystem, and the last line of
+the report says which case yours is:
+
+- Where the filesystem does **not** share storage between files, each file's blocks are its own and
+  the sizes are **exact**.
+- Where it **does** (copy-on-write), a per-project store reports its full size even though it was
+  seeded by a clone that shares most of its storage with the store it came from — and the real
+  footprint is smaller still where the filesystem compresses. No per-file measurement can see
+  either saving (`du` has the same blind spot), so the sizes are honest **upper bounds**: the true
+  on-disk total is smaller, and can be well below what the report shows.

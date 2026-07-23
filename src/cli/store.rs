@@ -37,6 +37,10 @@ struct StoreView {
     bytes: u64,
     size: String,
     inodes: u64,
+    /// Whether the data directory's filesystem shares storage between files (reflink/copy-on-write).
+    /// When it does, the reported sizes are upper bounds rather than exact; when it does not, each
+    /// file's blocks are its own and the sizes are exact.
+    shares_storage: bool,
     subtrees: Vec<SubtreeView>,
     /// The shared nix store's own detail, absent until it has been provisioned.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +129,9 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
         bytes,
         size: sandbox::human_bytes(bytes),
         inodes: subtrees.iter().map(|s| s.inodes).sum(),
+        // Probe the real filesystem, capability rather than name, so the honesty of the sizes is
+        // decided by what this filesystem actually does — not a hardcoded list of filesystem types.
+        shares_storage: sandbox::supports_reflink(data_dir),
         subtrees,
         shared_store: shared_store_view(store_dir),
     }
@@ -198,13 +205,26 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         );
     }
 
-    // Sizes are what the filesystem allocates, so on a copy-on-write filesystem a per-project store
-    // that shares every extent with the shared store still reports its full size. Say so rather than
-    // let the total silently disagree with `df`.
-    let _ = writeln!(
-        s,
-        "{dim}sizes count allocated blocks, hardlinks once; extents shared by reflink are not detected.{r}"
-    );
+    // How honest the sizes are depends on the filesystem, so say only what is true of this one. A
+    // hardlinked file is always counted once (essential for a nix store, which deduplicates into
+    // `.links`). Whether a size is exact or an upper bound depends on whether the filesystem shares
+    // storage between files: where it does, a store seeded by a copy-on-write clone reports its full
+    // size though it shares most of its storage with the store it was seeded from — and the true
+    // footprint is smaller still if the filesystem compresses. No per-file measurement can see
+    // either saving, so the honest thing is to state the bound, not invent a number.
+    if v.shares_storage {
+        let _ = writeln!(
+            s,
+            "{dim}sizes count allocated blocks and a hardlinked file once. this filesystem shares\n  \
+             storage between files, so each size is an upper bound — the real footprint is smaller\n  \
+             (more so if the filesystem compresses).{r}"
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "{dim}sizes count allocated blocks and a hardlinked file once; on this filesystem they are exact.{r}"
+        );
+    }
     let _ = writeln!(
         s,
         "{dim}reclaim with `sbx gc --all --prune`, `sbx projects rm <id>`, `sbx app rm <name> --purge`.{r}"
@@ -264,6 +284,42 @@ mod tests {
         let store = v.shared_store.expect("the store directory exists");
         assert_eq!(store.paths, 2, "`.links` is not a realised store path");
         assert_eq!(store.deduplicated_files, 1);
+    }
+
+    /// The closing note tells the truth about *this* filesystem: exact where storage is not shared,
+    /// an upper bound where it is. A size we cannot measure precisely is never invented.
+    #[test]
+    fn the_note_states_whether_sizes_are_exact_or_an_upper_bound() {
+        let one = SubtreeView {
+            label: "store/".into(),
+            bytes: 4096,
+            size: "4.0 KiB".into(),
+            inodes: 1,
+            purpose: None,
+        };
+        let exact = StoreView {
+            data_dir: "/d".into(),
+            bytes: 4096,
+            size: "4.0 KiB".into(),
+            inodes: 1,
+            shares_storage: false,
+            subtrees: vec![one],
+            shared_store: None,
+        };
+        let out = render(&exact, &style::Palette::plain());
+        assert!(out.contains("exact"), "{out}");
+        assert!(!out.contains("upper bound"), "{out}");
+
+        let shared = StoreView {
+            shares_storage: true,
+            ..exact
+        };
+        let out = render(&shared, &style::Palette::plain());
+        assert!(out.contains("upper bound"), "{out}");
+        assert!(
+            out.contains("compresses"),
+            "the note must flag compression, which no per-file measure sees: {out}"
+        );
     }
 
     /// Before anything is provisioned the report is empty rather than an error, and it never

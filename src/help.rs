@@ -953,16 +953,18 @@ const PAGES: &[Page] = &[
             terms of what is *reclaimable*, never what is there.\n\
             \n\
             Inodes are reported because a filesystem can run out of them while it still has free\n\
-            space: ext4 fixes the size of its inode table when the filesystem is created, and a\n\
-            nix store is inode-heavy. btrfs and XFS allocate inodes on demand and have no such\n\
-            limit.\n\
+            space: some filesystems fix the size of their inode table when they are created, and a\n\
+            nix store is inode-heavy. Others allocate inodes on demand and have no such limit.\n\
             \n\
             Sizes count the blocks the filesystem allocates, and count a hardlinked file once —\n\
             a nix store deduplicates identical files, so counting each name would roughly double\n\
-            the figure. Extents shared by reflink (copy-on-write, on btrfs or XFS) are *not*\n\
-            detected, because no cheap system call exposes them: on such a filesystem a\n\
-            per-project store reports its full size even though its seed shares nearly every\n\
-            extent with the shared store, so the total can exceed what `df` reports as used.\n\
+            the figure. Whether a size is exact depends on the filesystem, so the last line says\n\
+            which case this one is. A filesystem that shares storage between files (copy-on-write)\n\
+            reports a store's full size even though a store seeded by a clone shares most of its\n\
+            storage with the store it came from — and the real footprint is smaller still where\n\
+            the filesystem compresses. No per-file measurement can see either saving, so the\n\
+            sizes are stated as upper bounds rather than guessed at; where the filesystem shares\n\
+            nothing, they are exact.\n\
             \n\
             Read-only, and free: a filesystem walk, no nix, no network, no sandbox. Nothing is\n\
             reclaimed here — that is `sbx gc --all --prune` for store closures, `sbx projects rm\n\
