@@ -923,28 +923,88 @@ pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
     std::fs::remove_dir(path)
 }
 
-/// The on-disk size of a tree, summing each file's allocated blocks (the `du` semantic, which
-/// accounts for sparse files). Symlinks are not followed. Best-effort: an unreadable entry is
-/// skipped rather than failing the report. Reflinked content shared with another project counts
-/// per file, so the figure is an upper bound on what a prune actually frees.
-pub(crate) fn tree_size(path: &Path) -> u64 {
+/// What a tree occupies on disk: its allocated bytes and the number of distinct inodes it holds.
+///
+/// Both figures are what the host filesystem actually spends, so both count a **hardlinked file
+/// once**, however many links point at it — the `du` semantic. That matters everywhere in sbx: a
+/// nix store deduplicates identical files into `.links`, so summing per directory entry would
+/// report roughly twice the truth for any optimised store.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TreeUsage {
+    /// Allocated bytes, from each file's block count (so a sparse file counts what it occupies,
+    /// not its apparent length).
+    pub(crate) bytes: u64,
+    /// Distinct inodes — the metric an inode-bounded filesystem (ext4 sizes its table at mkfs)
+    /// actually runs out of.
+    pub(crate) inodes: u64,
+}
+
+/// The on-disk usage of a tree — allocated bytes and distinct inodes — walked once.
+///
+/// Symlinks are not followed. Best-effort: an unreadable entry is skipped rather than failing the
+/// report. A file with several links is counted once per call, tracked by `(dev, ino)`; the set
+/// only ever holds multiply-linked files, so it stays small on a tree with none. Per-call dedup is
+/// the correct scope here because sbx's trees never share inodes with one another: hardlinking the
+/// shared store into a project store was rejected by design (a same-uid write would reach through
+/// the link and corrupt the shared copy), the seed is a reflink-or-copy that yields fresh inodes,
+/// and a nix store's `.links` pool lives under its own store root.
+///
+/// **Not reflink-aware**: a copy-on-write file reports its full block count even when it shares
+/// every extent with another tree, because no cheap syscall exposes extent sharing (`du` has the
+/// same blind spot). On a filesystem with reflink the per-tree figures are therefore an upper
+/// bound, and their sum can exceed what the filesystem reports as used.
+pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
     use std::os::unix::fs::MetadataExt;
-    let mut total = 0;
+    let mut usage = TreeUsage::default();
+    // The root counts as part of what the tree occupies — removing the tree removes it too.
+    let Ok(root) = path.symlink_metadata() else {
+        return usage;
+    };
+    usage.bytes += root.blocks() * 512;
+    usage.inodes += 1;
+    let mut seen = std::collections::HashSet::new();
+    accumulate_usage(path, &mut seen, &mut usage);
+    usage
+}
+
+fn accumulate_usage(
+    path: &Path,
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+    usage: &mut TreeUsage,
+) {
+    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(path) else {
-        return total;
+        return;
     };
     for entry in entries.flatten() {
+        let child = entry.path();
         match entry.file_type() {
-            Ok(t) if t.is_dir() => total += tree_size(&entry.path()),
-            Ok(_) => {
-                if let Ok(m) = entry.path().symlink_metadata() {
-                    total += m.blocks() * 512;
+            Ok(t) if t.is_dir() => {
+                if let Ok(m) = child.symlink_metadata() {
+                    usage.bytes += m.blocks() * 512;
+                    usage.inodes += 1;
                 }
+                accumulate_usage(&child, seen, usage);
+            }
+            Ok(_) => {
+                let Ok(m) = child.symlink_metadata() else {
+                    continue;
+                };
+                // Only a multiply-linked file can be reached twice, so only those need remembering.
+                if m.nlink() > 1 && !seen.insert((m.dev(), m.ino())) {
+                    continue;
+                }
+                usage.bytes += m.blocks() * 512;
+                usage.inodes += 1;
             }
             Err(_) => {}
         }
     }
-    total
+}
+
+/// The on-disk size of a tree in bytes — [`tree_usage`] with the inode count dropped.
+pub(crate) fn tree_size(path: &Path) -> u64 {
+    tree_usage(path).bytes
 }
 
 /// Prune — or, in a dry run, list — the stale gc roots of the **shared** store, returning the root
@@ -1107,6 +1167,43 @@ fn sweep_runtime_dirs_with(
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A hardlinked file occupies one inode and one set of blocks however many names point at it,
+    /// so the walk must count it once — the property that makes every reported size honest for a
+    /// nix store, which deduplicates identical content into `.links`.
+    #[test]
+    fn tree_usage_counts_a_hardlinked_file_once() {
+        let tmp = TmpDir::new();
+        let root = tmp.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        // One 8 KiB payload, reachable under three names in two directories.
+        let payload = vec![b'x'; 8192];
+        std::fs::write(root.join("original"), &payload).unwrap();
+        std::fs::hard_link(root.join("original"), root.join("link-a")).unwrap();
+        std::fs::hard_link(root.join("original"), root.join("sub/link-b")).unwrap();
+
+        let linked = tree_usage(&root);
+
+        // The same tree with the two extra names removed: identical occupancy, since the links
+        // never held storage of their own.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(plain.join("sub")).unwrap();
+        std::fs::write(plain.join("original"), &payload).unwrap();
+        let unlinked = tree_usage(&plain);
+
+        assert_eq!(
+            linked, unlinked,
+            "the two extra links must add neither bytes nor inodes"
+        );
+        // Teeth on the absolute count too, so a walk that silently skipped files cannot pass:
+        // `tree/`, `tree/sub/`, and the single payload inode.
+        assert_eq!(linked.inodes, 3);
+        assert!(
+            linked.bytes >= 8192,
+            "the payload's blocks are counted once"
+        );
+    }
 
     #[test]
     fn runtime_entry_pid_reads_only_the_names_it_owns() {
