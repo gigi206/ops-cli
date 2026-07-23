@@ -2184,6 +2184,11 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
 
     // After the collection, so nothing about to be deleted is deduplicated first. This is the store
     // where deduplication pays: a seeded per-project store arrives as fresh inodes by construction.
+    //
+    // Unlike the shared store's pass this takes no exclusive lock — a per-project store has none.
+    // What guards it is the live-session refusal above: the sweep already declines to touch a store
+    // a running cage holds, and this rides that same check, with the same window between it and the
+    // work that `--prune` already has here.
     if optimise {
         report_optimise(&prep.nix_store, &store_dir, "this project's store", pal);
     }
