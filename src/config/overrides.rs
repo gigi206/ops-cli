@@ -1203,8 +1203,7 @@ mod tests {
 
     #[test]
     fn a_config_file_reference_reads_the_file() {
-        let dir = std::env::temp_dir().join(format!("sbx-ov-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::TmpDir::new();
         let file = dir.join("ov.toml");
         std::fs::write(&file, b"network = \"none\"\n").unwrap();
         let arg = format!("@{}", file.display());
@@ -1214,7 +1213,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ov.raw.network, Some(posture("none")));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

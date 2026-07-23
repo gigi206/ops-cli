@@ -522,9 +522,8 @@ mod tests {
     #[test]
     fn host_dir_create_makes_an_owner_only_dir_and_drop_removes_it() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!("sbx-portal-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let layout = Layout::under(&tmp);
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = Layout::under(tmp.path());
         let path;
         {
             let hd = HostDir::create(&layout).expect("create host dir");
@@ -538,7 +537,6 @@ mod tests {
         }
         // dropped → removed
         assert!(!path.exists());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

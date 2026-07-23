@@ -457,7 +457,8 @@ mod tests {
 
     #[test]
     fn mise_installed_reads_tools_and_versions_skipping_metadata() {
-        let tmp = std::env::temp_dir().join(format!("sbx-inspect-{}", std::process::id()));
+        let dir = crate::testutil::TmpDir::new();
+        let tmp = dir.path();
         let installs = tmp.join(".local/share/mise/installs");
         std::fs::create_dir_all(installs.join("aqua-example-demo-tool/2.1.209")).unwrap();
         std::fs::create_dir_all(installs.join("aqua-example-demo-tool/latest")).unwrap();
@@ -471,7 +472,7 @@ mod tests {
         )
         .unwrap();
 
-        let tools = mise_installed(&tmp);
+        let tools = mise_installed(tmp);
         assert_eq!(tools.len(), 2, "two tools, metadata skipped");
         assert_eq!(tools[0].name, "aqua-example-demo-tool");
         assert_eq!(tools[0].token.as_deref(), Some("aqua:example/demo-tool"));
@@ -484,16 +485,12 @@ mod tests {
         assert_eq!(tools[1].token, None);
         assert_eq!(tools[1].label(), "bare-tool");
         assert!(tools[1].is("bare-tool"));
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn mise_installed_is_empty_without_a_mise_dir() {
-        let tmp = std::env::temp_dir().join(format!("sbx-inspect-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        assert!(mise_installed(&tmp).is_empty());
-        std::fs::remove_dir_all(&tmp).ok();
+        let dir = crate::testutil::TmpDir::new();
+        assert!(mise_installed(dir.path()).is_empty());
     }
 
     #[test]
@@ -502,8 +499,8 @@ mod tests {
         // mise's data dir, so its tools live directly under `<pool>/installs/` (not `.local/share/mise`,
         // the home layout `mise_installed` assumes). Pin that the enumeration finds only projects with a
         // pool and that `mise_installed_in` reads the pool's `installs/` at the right depth.
-        let data = std::env::temp_dir().join(format!("sbx-inspect-pools-{}", std::process::id()));
-        std::fs::remove_dir_all(&data).ok();
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
         // two projects each with a per-project pool holding one self-equipped tool
         for id in ["p1", "p2"] {
             let installs = data.join(format!("projects/{id}/apps/ag/mise/installs"));
@@ -517,7 +514,7 @@ mod tests {
         // a project where this app has only a home (a per-project app, or no self-equip) — no pool
         std::fs::create_dir_all(data.join("projects/p3/apps/ag/home")).unwrap();
 
-        let pools = app_per_project_mise_pools(&data, "ag");
+        let pools = app_per_project_mise_pools(data, "ag");
         assert_eq!(
             pools
                 .iter()
@@ -531,13 +528,12 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].label(), "nix:jq");
         assert_eq!(concrete_versions(&tools[0]), vec!["1.8.1"]);
-
-        std::fs::remove_dir_all(&data).ok();
     }
 
     #[test]
     fn prebuilt_pin_trees_finds_the_locator_across_trees() {
-        let data = std::env::temp_dir().join(format!("sbx-inspect-pins-{}", std::process::id()));
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
         let mk = |id: &str, body: &str| {
             let dir = data.join("projects").join(id);
             std::fs::create_dir_all(&dir).unwrap();
@@ -557,7 +553,7 @@ mod tests {
             "https://other.example/x.deb\tsha256-00\n",
         );
 
-        let hits = prebuilt_pin_trees(&data, "deb-packages.lock", "https://example.com/app.deb");
+        let hits = prebuilt_pin_trees(data, "deb-packages.lock", "https://example.com/app.deb");
         assert_eq!(hits.len(), 2, "two trees pin it: {hits:?}");
         assert_eq!(hits[0], ("aaaaaaaaaaaaaaaa".into(), "DEADBEEF".into()));
         assert_eq!(hits[1].0, "bbbbbbbbbbbbbbbb");
@@ -571,8 +567,6 @@ mod tests {
             prebuilt_pin_in(&one, "deb-packages.lock", "https://nope"),
             None
         );
-
-        std::fs::remove_dir_all(&data).ok();
     }
 
     #[test]
@@ -600,40 +594,40 @@ mod tests {
 
     #[test]
     fn gcroot_names_lists_roots_skipping_expr_siblings() {
-        let data = std::env::temp_dir().join(format!("sbx-inspect-gc-{}", std::process::id()));
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
         let dir = data.join("gcroots/projects/abc123");
         std::fs::create_dir_all(&dir).unwrap();
         for f in ["chromium", "deb-demo-app", "deb-demo-app.expr", "node"] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
-        let names = gcroot_names(&data, "abc123");
+        let names = gcroot_names(data, "abc123");
         assert_eq!(
             names,
             vec!["chromium", "deb-demo-app", "node"],
             "expr skipped"
         );
-        assert!(gcroot_names(&data, "absent").is_empty());
-        std::fs::remove_dir_all(&data).ok();
+        assert!(gcroot_names(data, "absent").is_empty());
     }
 
     #[test]
     fn nix_tools_locked_reads_pkg_and_resolved_version() {
-        let tree = std::env::temp_dir().join(format!("sbx-inspect-tl-{}", std::process::id()));
-        std::fs::create_dir_all(&tree).unwrap();
+        let scratch = crate::testutil::TmpDir::new();
+        let tree = scratch.path();
         std::fs::write(
             tree.join("tools.lock"),
             "jq\tlatest\tx86_64-linux\taaaa\tjq\t1.7.1\nrg\t14\tx86_64-linux\tbbbb\tripgrep\t14.1.0\n",
         )
         .unwrap();
-        let locked = nix_tools_locked(&tree);
+        let locked = nix_tools_locked(tree);
         assert_eq!(locked.get("jq"), Some(&"1.7.1".to_string()));
         assert_eq!(locked.get("rg"), Some(&"14.1.0".to_string()));
-        std::fs::remove_dir_all(&tree).ok();
     }
 
     #[test]
     fn flake_built_finds_a_warm_out_link_floating_or_pinned() {
-        let home = std::env::temp_dir().join(format!("sbx-inspect-flk-{}", std::process::id()));
+        let scratch = crate::testutil::TmpDir::new();
+        let home = scratch.path();
         // The read path is the same constant the launch writes to — pinning it here means a rename of
         // the out-link directory cannot silently make `flake_built` miss a warm build (the `ops`→`sbx`
         // drift this constant closed).
@@ -646,25 +640,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            flake_built(&home, "demo-app"),
+            flake_built(home, "demo-app"),
             Some("demo-agent-0.18.2".to_string()),
             "the store-path label, hash stripped"
         );
         // A pinned out-link is keyed `<name>-<rev>`; still matched by the name.
-        assert!(flake_built(&home, "other").is_none());
+        assert!(flake_built(home, "other").is_none());
         std::os::unix::fs::symlink(
             "/nix/store/abcd1234abcd1234abcd1234abcd1234abcd1234-other-1.0",
             flake.join("other-deadbeef"),
         )
         .unwrap();
-        assert!(flake_built(&home, "other").is_some());
-        std::fs::remove_dir_all(&home).ok();
+        assert!(flake_built(home, "other").is_some());
     }
 
     #[test]
     fn flake_built_falls_back_to_the_pre_rename_out_link_dir() {
-        let home =
-            std::env::temp_dir().join(format!("sbx-inspect-flk-legacy-{}", std::process::id()));
+        let scratch = crate::testutil::TmpDir::new();
+        let home = scratch.path();
         // A home built before the ops→sbx rename carries the out-link only at the legacy path; it must
         // still be reported so the fix does not regress an existing home to `not installed`.
         let legacy = home.join(FLAKE_ROOTS_REL_LEGACY);
@@ -675,16 +668,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            flake_built(&home, "demo-desktop"),
+            flake_built(home, "demo-desktop"),
             Some("demo-desktop-0.17.0".to_string()),
             "a pre-rename home's out-link must still be found via the legacy fallback"
         );
-        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn nix_built_trees_finds_the_package_gcroot_across_trees() {
-        let data = std::env::temp_dir().join(format!("sbx-inspect-nbt-{}", std::process::id()));
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
         // Two trees gcrooted `chromium`; a third gcrooted only something else.
         for id in ["t1", "t3"] {
             let g = data.join("gcroots/projects").join(id);
@@ -698,20 +691,20 @@ mod tests {
         std::fs::write(t2.join("jq"), "").unwrap();
 
         assert_eq!(
-            nix_built_trees(&data, "chromium"),
+            nix_built_trees(data, "chromium"),
             vec!["t1".to_string(), "t3".to_string()],
             "the trees that gcrooted the package, sorted"
         );
-        assert_eq!(nix_built_trees(&data, "jq"), vec!["t2".to_string()]);
+        assert_eq!(nix_built_trees(data, "jq"), vec!["t2".to_string()]);
         // A package no tree built, and an absent gcroots dir, are both empty.
-        assert!(nix_built_trees(&data, "ripgrep").is_empty());
+        assert!(nix_built_trees(data, "ripgrep").is_empty());
         assert!(nix_built_trees(&data.join("nope"), "chromium").is_empty());
-        std::fs::remove_dir_all(&data).ok();
     }
 
     #[test]
     fn nixpkgs_pin_prefers_the_per_project_lock_then_falls_back_to_global() {
-        let data = std::env::temp_dir().join(format!("sbx-inspect-np-{}", std::process::id()));
+        let scratch = crate::testutil::TmpDir::new();
+        let data = scratch.path();
         let tree = data.join("projects/t1");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(
@@ -721,7 +714,7 @@ mod tests {
         .unwrap();
 
         // No per-project lock → the global one, per_project = false.
-        let (source, rev, per) = nixpkgs_pin(&tree, &data).unwrap();
+        let (source, rev, per) = nixpkgs_pin(&tree, data).unwrap();
         assert_eq!(
             (source.as_str(), rev.as_str(), per),
             ("nixos-unstable", "12345678", false)
@@ -729,12 +722,10 @@ mod tests {
 
         // A per-project pin wins and is flagged.
         std::fs::write(tree.join("nixpkgs.lock"), "nixos-23.11\nfedcba0987654321\n").unwrap();
-        let (source, rev, per) = nixpkgs_pin(&tree, &data).unwrap();
+        let (source, rev, per) = nixpkgs_pin(&tree, data).unwrap();
         assert_eq!(
             (source.as_str(), rev.as_str(), per),
             ("nixos-23.11", "fedcba09", true)
         );
-
-        std::fs::remove_dir_all(&data).ok();
     }
 }
