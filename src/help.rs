@@ -1061,8 +1061,9 @@ const PAGES: &[Page] = &[
             profile since removed). The `HOME` column names where that state lives: `global` is the\n\
             app's single shared home, `N project home(s)` are the per-project homes of a\n\
             `home_scope = \"project\"` app, and `N project mise pool(s)` are *not* homes — they are\n\
-            the per-project mise install pool a global app gets in each project it has run in\n\
-            (sized and purged with the app; `sbx app show <name>` breaks them down).\n\
+            the per-project mise install pools a global app self-equipped a tool into. The empty\n\
+            pool every launch creates is not listed, though its size still counts (a purge removes\n\
+            it); `sbx app show <name>` breaks every pool down, empty ones included.\n\
             `sbx app ls` is the same command. The full resolved app set —\n\
             inline, project, and profile apps with their gating — is `sbx config show`.",
     },

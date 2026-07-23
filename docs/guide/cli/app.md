@@ -62,11 +62,15 @@ size a `--purge` would reclaim, and where that state lives.
 |---|---|
 | `global` | the app's single shared home `<data>/apps/<name>/home` — a `home_scope = "global"` app (the default) |
 | `N project home(s)` | one isolated home per project — a [`home_scope = "project"`](../apps/home.md) app |
-| `N project mise pool(s)` | not a home: the per-project [mise pool](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned) a **global** app gets in each project it has been launched in |
+| `N project mise pool(s)` | not a home: a per-project [mise pool](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned) a **global** app self-equipped a tool into |
 
-So `global + 1 project mise pool` is one home plus a pool — a global app launched in one
-project — not two homes. The pool is usually tiny (it holds only what the app self-equipped
-in that project); `sbx app show <name>` breaks the sizes down per home and per pool.
+So `global + 1 project mise pool` is one home plus a pool — not two homes.
+
+Every launch creates the pool directory, so an app that has merely *run* in a project has an
+**empty** pool there; an empty pool is **not listed** (it would report per-project state the
+app does not have). Only a pool holding an installed tool counts. Its size is included in the
+row's total either way, since `--purge` removes it. `sbx app show <name>` breaks the sizes
+down per home and per pool, empty ones included.
 
 ### Removing an app
 

@@ -633,9 +633,15 @@ pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
 /// A per-project tree carries a **home** only for a `home_scope = "project"` app. A
 /// `home_scope = "global"` app keeps its single home under `<data>/apps/<name>/` yet still gets a
 /// per-project **mise pool** (`<data>/projects/<id>/apps/<name>/mise`, its install pool kept aligned
-/// with that project's `/nix` store), created at every launch. The two are counted separately, so a
-/// bare pool is never reported as a second isolated home; both are sized into [`project_bytes`], the
-/// disk a purge reclaims.
+/// with that project's `/nix` store). The two are counted separately, so a bare pool is never
+/// reported as a second isolated home; both are sized into [`project_bytes`], the disk a purge
+/// reclaims.
+///
+/// A pool that holds **no tool** is not counted at all: every launch creates the pool dir (the
+/// writable bind needs an existing source), so an app that has merely *run* in a project carries an
+/// empty pool there, and reporting it would say the app has per-project state it does not. Only a
+/// pool the agent actually self-equipped into is state worth listing. Its size still counts (it is
+/// a handful of directory blocks, and a purge does remove it).
 ///
 /// [`project_bytes`]: InstalledApp::project_bytes
 pub(crate) struct InstalledApp {
@@ -644,9 +650,10 @@ pub(crate) struct InstalledApp {
     pub(crate) global_bytes: Option<u64>,
     /// Number of per-project trees carrying a real home `<data>/projects/<id>/apps/<name>/home`.
     pub(crate) project_homes: usize,
-    /// Number of per-project trees carrying only a mise pool, with no home of their own.
+    /// Number of per-project trees carrying a mise pool with at least one installed tool, and no
+    /// home of their own. An empty pool — the dir every launch creates — is not counted.
     pub(crate) project_pools: usize,
-    /// Total size across every per-project tree, home-bearing or pool-only.
+    /// Total size across every per-project tree: homes, tool-bearing pools, and empty pools alike.
     pub(crate) project_bytes: u64,
 }
 
@@ -657,13 +664,23 @@ impl InstalledApp {
     }
 }
 
+/// Whether a mise pool dir holds at least one installed tool — the test that separates a pool worth
+/// reporting from the empty one every launch creates. The pool *is* mise's data dir, so its tools
+/// live directly under `<pool>/installs/` (unlike a home, whose mise data sits under
+/// `.local/share/mise`). A pool with no `installs/`, or an empty one, carries only the plugin symlink
+/// and the migration markers a launch writes — nothing the user installed.
+fn pool_holds_a_tool(pool: &Path) -> bool {
+    std::fs::read_dir(pool.join("installs")).is_ok_and(|mut e| e.next().is_some())
+}
+
 /// Enumerate the apps with isolated state on disk, grouped and sized by name. Scans the global homes
 /// under `<data>/apps/` and the per-project trees under `<data>/projects/<id>/apps/`, sizing each
-/// with [`tree_size`] and classifying a per-project tree as a home or a bare mise pool by whether it
-/// carries a `home/` dir (the same test [`app_home_dirs`] applies). Sorted by name. Read-only; a
-/// missing tree is simply no state. Sizing is a recursive stat, so a very large mise data dir makes
-/// this proportionally slower — acceptable for an interactive management listing, where the size is
-/// the point (it drives the purge decision).
+/// with [`tree_size`] and classifying a per-project tree as a home when it carries a `home/` dir
+/// (the same test [`app_home_dirs`] applies), else as a mise pool — counted only when the pool holds
+/// an installed tool ([`pool_holds_a_tool`]). Sorted by name. Read-only; a missing tree is simply no
+/// state. Sizing is a recursive stat, so a very large mise data dir makes this proportionally slower
+/// — acceptable for an interactive management listing, where the size is the point (it drives the
+/// purge decision).
 ///
 /// [`app_home_dirs`]: super::inspect::app_home_dirs
 pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
@@ -704,7 +721,7 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
                     let e = apps.entry(name.to_string()).or_default();
                     if path.join("home").is_dir() {
                         e.1 += 1;
-                    } else {
+                    } else if pool_holds_a_tool(&path.join("mise")) {
                         e.2 += 1;
                     }
                     e.3 += bytes;
@@ -1703,16 +1720,16 @@ mod tests {
     }
 
     /// A `home_scope = "global"` app's per-project tree holds only its mise pool, no `home/` — the
-    /// launch-time layout. It is state on disk (sized, and purged with the app) but not a second
-    /// isolated home, so it must be counted as a pool: counting it as a home told the user an app
-    /// had a per-project home it never had.
+    /// launch-time layout. A pool the agent self-equipped into is state on disk (sized, and purged
+    /// with the app) but not a second isolated home, so it must be counted as a pool: counting it as
+    /// a home told the user an app had a per-project home it never had.
     #[test]
     fn installed_app_homes_counts_a_bare_mise_pool_as_a_pool_not_a_home() {
         let data = TmpDir::new();
         let d = data.path();
         // the global-app layout: one global home, and a per-project tree carrying only `mise/`
         mk_home(&d.join("apps/demo-app/home"));
-        mk_home(&d.join("projects/p1/apps/demo-app/mise/plugins"));
+        mk_home(&d.join("projects/p1/apps/demo-app/mise/installs/demo-tool"));
         // a per-project tree that carries both is still a home (the home is what names it)
         mk_home(&d.join("projects/p2/apps/demo-app/home"));
         mk_home(&d.join("projects/p2/apps/demo-app/mise"));
@@ -1723,6 +1740,30 @@ mod tests {
         assert_eq!(demo_app.project_homes, 1);
         assert_eq!(demo_app.project_pools, 1);
         // both per-project trees are sized: a purge reclaims the pool too
+        assert!(demo_app.project_bytes > 0);
+    }
+
+    /// Every launch creates the per-project pool dir (the writable bind needs an existing source),
+    /// so an app that has merely *run* in a project carries an empty pool there. Counting it would
+    /// report per-project state the app does not have — it holds no installed tool, only the plugin
+    /// symlink and migration markers a launch writes.
+    #[test]
+    fn installed_app_homes_ignores_an_empty_mise_pool() {
+        let data = TmpDir::new();
+        let d = data.path();
+        mk_home(&d.join("apps/demo-app/home"));
+        // the launch-created layout: a pool with the plugin registration but no installed tool
+        mk_home(&d.join("projects/p1/apps/demo-app/mise/plugins"));
+        // and one where mise created `installs/` without ever populating it
+        mk_home(&d.join("projects/p2/apps/demo-app/mise"));
+        std::fs::create_dir_all(d.join("projects/p2/apps/demo-app/mise/installs")).unwrap();
+
+        let apps = installed_app_homes(d);
+        assert_eq!(apps.len(), 1);
+        let demo_app = &apps[0];
+        assert_eq!(demo_app.project_homes, 0);
+        assert_eq!(demo_app.project_pools, 0);
+        // still sized: `sbx app rm --purge` removes those dirs, so the total must not lie
         assert!(demo_app.project_bytes > 0);
     }
 

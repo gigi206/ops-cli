@@ -1477,8 +1477,10 @@ fn app_prune(args: &[OsString]) -> ExitCode {
 /// A compact description of where an app's isolated state lives — `global`, `N project home(s)`, and
 /// `N project mise pool(s)`, joined with ` + ` — for the `sbx app list` installed-homes line. A
 /// per-project *home* belongs to a `home_scope = "project"` app; a global app instead gets a
-/// per-project mise pool at every launch, which is state on disk (and purged with the app) but not a
-/// second home, so the two are named apart rather than counted together.
+/// per-project mise pool holding what the agent self-equipped there, which is state on disk (and
+/// purged with the app) but not a second home, so the two are named apart rather than counted
+/// together. An app whose only per-project state is the empty pool a launch creates counts neither,
+/// and reads as its global home alone.
 fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
     let mut parts = Vec::new();
     if app.global_bytes.is_some() {
@@ -1493,6 +1495,12 @@ fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
         0 => {}
         1 => parts.push("1 project mise pool".to_string()),
         n => parts.push(format!("{n} project mise pools")),
+    }
+    if parts.is_empty() {
+        // The app is listed, so it has *some* state, yet nothing countable: only empty pools —
+        // reachable when its global home was removed by hand after a launch. Name that rather than
+        // render an empty cell.
+        return "empty mise pool".to_string();
     }
     parts.join(" + ")
 }
@@ -1592,6 +1600,8 @@ mod tests {
             describe_home_locations(&app(Some(1), 0, 4)),
             "global + 4 project mise pools"
         );
+        // Nothing countable (only empty pools, the global home removed by hand): named, not blank.
+        assert_eq!(describe_home_locations(&app(None, 0, 0)), "empty mise pool");
     }
 
     #[test]
