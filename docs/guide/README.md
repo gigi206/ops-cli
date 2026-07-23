@@ -73,6 +73,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`config`](cli/config.md) | inspect and edit the configuration |
 | [`upgrade`](cli/upgrade.md) | roll managed toolchains forward |
 | [`gc`](cli/gc.md) | reclaim per-project store space |
+| [`store`](cli/store.md) | report what sbx occupies on disk |
 
 ## Apps and profiles
 

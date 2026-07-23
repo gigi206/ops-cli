@@ -14,6 +14,7 @@ pub(crate) mod proc;
 pub(crate) mod projects;
 pub(crate) mod search;
 pub(crate) mod session;
+pub(crate) mod store;
 pub(crate) mod test;
 pub(crate) mod trust;
 pub(crate) mod upgrade;
@@ -45,6 +46,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "upgrade" => upgrade::upgrade_cmd(rest),
         "gc" => gc::run(rest),
         "projects" | "project" => projects::projects_cmd(rest),
+        "store" => store::store_cmd(rest),
         "path" => crate::path_cmd(&rest),
         "run" => {
             let mut cmd: Vec<OsString> = rest;

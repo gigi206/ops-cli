@@ -922,6 +922,34 @@ const PAGES: &[Page] = &[
             with `sbx projects rm <id> --gc`.",
     },
     Page {
+        path: &["store"],
+        synopsis: "sbx store [--json]",
+        summary: "report what sbx occupies on disk, subtree by subtree",
+        options: &[("--json", "emit the report as a JSON document")],
+        details:
+            "The footprint of sbx's whole data directory, largest subtree first, each with its\n\
+            size and its inode count. `sbx app list` accounts for the app homes and `sbx projects\n\
+            list` for the per-project runtime trees; this covers everything, including the shared\n\
+            nix store, which is routinely the largest tree and which `sbx gc` describes only in\n\
+            terms of what is *reclaimable*, never what is there.\n\
+            \n\
+            Inodes are reported because a filesystem can run out of them while it still has free\n\
+            space: ext4 fixes the size of its inode table when the filesystem is created, and a\n\
+            nix store is inode-heavy. btrfs and XFS allocate inodes on demand and have no such\n\
+            limit.\n\
+            \n\
+            Sizes count the blocks the filesystem allocates, and count a hardlinked file once —\n\
+            a nix store deduplicates identical files, so counting each name would roughly double\n\
+            the figure. Extents shared by reflink (copy-on-write, on btrfs or XFS) are *not*\n\
+            detected, because no cheap system call exposes them: on such a filesystem a\n\
+            per-project store reports its full size even though its seed shares nearly every\n\
+            extent with the shared store, so the total can exceed what `df` reports as used.\n\
+            \n\
+            Read-only, and free: a filesystem walk, no nix, no network, no sandbox. Nothing is\n\
+            reclaimed here — that is `sbx gc --all --prune` for store closures, `sbx projects rm\n\
+            <id>` for a runtime tree, and `sbx app rm <name> --purge` for an app's home.",
+    },
+    Page {
         path: &["projects"],
         synopsis: "sbx projects list [--json]\n       \
                    sbx projects rm <id>... [--dead] [--markerless] [-n] [-y] [--gc] [-f]",

@@ -95,6 +95,54 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "mise-plugin/",
+        rel: "mise-plugin",
+        desc: "the `nix:` mise backend plugin, staged content-keyed",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "fontconfig/",
+        rel: "fontconfig",
+        desc: "generated fontconfig for the Wayland hole",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "audio/",
+        rel: "audio",
+        desc: "generated ALSA config for the audio hole",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "dbus/",
+        rel: "dbus",
+        desc: "per-launch filtered D-Bus proxy sockets",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "portal/",
+        rel: "portal",
+        desc: "per-launch in-cage desktop portal state",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "forward/",
+        rel: "forward",
+        desc: "per-launch inbound port-forward sockets",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "proc/",
+        rel: "proc",
+        desc: "per-launch exec-enforcement sockets",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "logs/",
+        rel: "logs",
+        desc: "per-launch egress logs read by `sbx net log`",
+        enumerate: Enumerate::None,
+    },
+    Entry {
         label: "projects/",
         rel: "projects",
         desc: "per-project runtime trees (store, home, locks)",
@@ -107,6 +155,14 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::Dirs,
     },
 ];
+
+/// What a data-directory subtree is for, keyed by its directory name, for a caller that enumerates
+/// the directory itself (`sbx store`) and wants to label what it found. `None` for an entry sbx does
+/// not document — enumeration stays the source of truth, so an unlisted entry is still reported,
+/// just without a description.
+pub(crate) fn data_entry_purpose(name: &str) -> Option<&'static str> {
+    DATA_ENTRIES.iter().find(|e| e.rel == name).map(|e| e.desc)
+}
 
 const CONFIG_ENTRIES: &[Entry] = &[
     Entry {
