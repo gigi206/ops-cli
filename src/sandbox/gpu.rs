@@ -24,10 +24,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// The mesa package the GPU hole provisions: `(nixpkgs attribute, a directory the output
-/// must contain, gcroot name)`. `lib/dri` holds the gallium DRI drivers (`iris`, `radeonsi`,
-/// `nouveau`, `swrast`, …); the same output also carries `lib/gbm` (the gbm backend the
-/// error path complains about) and the GLVND EGL vendor JSON. Keyed on `lib/dri`, the
-/// directory `LIBGL_DRIVERS_PATH` points at.
+/// must contain, gcroot name)`. `lib/dri` is the DRI driver directory `LIBGL_DRIVERS_PATH`
+/// points at — on mesa 26.x it holds the `dri_gbm.so` loader with the per-hardware drivers
+/// (`iris`, `radeonsi`, `nouveau`, `swrast`, …) merged into a single `libgallium-*.so` (older
+/// mesa shipped a separate `<driver>_dri.so` per GPU). Pointing at the directory, not a driver
+/// filename, is robust to either layout. The same output also carries `lib/gbm` (the gbm backend
+/// the error path complains about) and the GLVND EGL vendor JSON. Keyed on `lib/dri`.
 const MESA: (&str, &str, &str) = ("mesa", "lib/dri", "mesa");
 
 /// The device directory the render nodes live under. The whole directory is granted (its
