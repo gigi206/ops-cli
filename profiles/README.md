@@ -22,6 +22,7 @@ with `sbx app export <name>`.
 | `claude-code`     | `mise:aqua:anthropics/claude-code`   | `api.anthropic.com`     |
 | `codex`           | `mise:aqua:openai/codex`             | `api.openai.com`        |
 | `kiro`            | `nix:kiro-cli` (nixpkgs native CLI — AWS's rebranded Amazon Q CLI; `unfree`) | `*.kiro.dev` services (browser login / BYOK) |
+| `kiro-desktop`    | `tarball:resolve` prebuilt `.tar.gz` (Electron GUI IDE / VS Code fork, `gui`/`gpu`/`dbus`, auto-upgraded) | `*.kiro.dev` services + Open VSX (account, in-cage browser — see note on the upstream login bug) |
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
 | `opencode-web`    | `mise:opencode` (`opencode web` + `forward`) | provider-dependent |
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
@@ -137,6 +138,21 @@ can only reach the provider you listed.
 > not fabricated here). Like every desktop profile it imports + resolves (test-covered); the
 > autoPatchelf of a large VS Code-fork app, the display bring-up, the filtered model traffic, and the
 > login are all still to be proven live.
+>
+> `kiro-desktop` (the Kiro agentic **IDE** — the GUI sibling of the `kiro` CLI) is an Electron profile
+> in the `cursor` mould: AWS's prebuilt `.tar.gz` (a Code-OSS / VS Code fork) via the `tarball:resolve`
+> backend (autoPatchelf'd host-side, auto-upgraded from Kiro's release metadata API — the `tarball:`
+> backend is used over `deb:` because Kiro bundles optional native libs, MSAL + an inner `bwrap`, that
+> the strict `deb:` autoPatchelf refuses but the lenient `tarball:` ignores), displayed with
+> `gui = "wayland"` + `gpu` + `dbus`, egress on `*.kiro.dev` + Open VSX. It signs in exactly like the
+> `kiro` CLI — an external browser + a `http://localhost:<port>/oauth/callback` server — so it
+> **reuses the CLI's proven in-cage-browser login fix** (background Chromium, never `exec`;
+> `--host-resolver-rules="MAP localhost 127.0.0.1"` for the dynamic-port loopback callback). The
+> honest caveat is upstream, not sbx: the IDE's OAuth localhost callback is **broken in several open
+> vendor issues that reproduce on a plain host** (kirodotdev/Kiro #10138, #3782, #3158, #7727), so its
+> login is UNVERIFIED — the `kiro` CLI (which works, device flow included) is the reliable path
+> meanwhile. It imports + resolves (test-covered); the display bring-up, the filtered model traffic,
+> and the login are still to be proven live with a real account.
 >
 > `auggie` (Augment Code's CLI, `@augmentcode/auggie`) is an **account** profile like the above:
 > it routes model traffic through Augment's per-user tenant backend (`<tenant>.api.augmentcode.com`,
